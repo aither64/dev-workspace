@@ -24,7 +24,7 @@ Usage:
   devcluster ssh <slug> <machine>
   devcluster reset <slug>
   devcluster cert init [--force]
-  devcluster cert import-vpsf-dev [--force]
+  devcluster cert import <cert-dir> [--force]
   devcluster cert show-ca
 EOF
 }
@@ -392,18 +392,41 @@ cert_init() {
   cert_show_ca
 }
 
-cert_import_vpsf_dev() {
-  local force=0
+cert_import() {
+  local force=0 src=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1 ;;
-      *) usage; exit 2 ;;
+      --source)
+        shift
+        [ $# -gt 0 ] || die "missing certificate directory after --source"
+        src="$1"
+        ;;
+      --*) usage; exit 2 ;;
+      *)
+        [ -z "$src" ] || {
+          usage
+          exit 2
+        }
+        src="$1"
+        ;;
     esac
     shift
   done
 
-  local src="/home/aither/workspace/vpsf-dev/certs"
+  src="${src:-${VPSADMIN_DEVCLUSTER_CERT_IMPORT_DIR:-}}"
+  [ -n "$src" ] || die "missing certificate directory"
   [ -d "$src" ] || die "$src not found"
+
+  local required
+  for required in \
+    vpsadmin-ca.crt \
+    vpsadmin-ca.key \
+    vpsadmin-cert.crt \
+    vpsadmin-cert.key
+  do
+    [ -f "$src/$required" ] || die "$src/$required not found"
+  done
 
   mkdir -p "$CERT_DIR"
 
@@ -411,8 +434,17 @@ cert_import_vpsf_dev() {
     die "certificate already exists in $CERT_DIR; use --force to replace it"
   fi
 
-  cp "$src"/vpsadmin-ca.crt "$src"/vpsadmin-ca.key "$src"/vpsadmin-ca.srl "$CERT_DIR"/
-  cp "$src"/vpsadmin-cert.crt "$src"/vpsadmin-cert.csr "$src"/vpsadmin-cert.ext "$src"/vpsadmin-cert.key "$CERT_DIR"/
+  rm -f "$CERT_DIR"/vpsadmin-ca.* "$CERT_DIR"/vpsadmin-cert.*
+  cp "$src"/vpsadmin-ca.crt "$src"/vpsadmin-ca.key "$CERT_DIR"/
+  cp "$src"/vpsadmin-cert.crt "$src"/vpsadmin-cert.key "$CERT_DIR"/
+
+  local optional
+  for optional in vpsadmin-ca.srl vpsadmin-cert.csr vpsadmin-cert.ext; do
+    if [ -f "$src/$optional" ]; then
+      cp "$src/$optional" "$CERT_DIR"/
+    fi
+  done
+
   local cert_cfg="${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}"
   ensure_cert_domains "$cert_cfg"
   cert_show_ca
@@ -437,13 +469,13 @@ ensure_certs() {
     return
   fi
 
-  if [ -d /home/aither/workspace/vpsf-dev/certs ]; then
-    cert_import_vpsf_dev
-    ensure_cert_domains "$cert_cfg"
+  if [ -n "${VPSADMIN_DEVCLUSTER_CERT_IMPORT_DIR:-}" ]; then
+    cert_import
   else
     cert_init
-    ensure_cert_domains "$cert_cfg"
   fi
+
+  ensure_cert_domains "$cert_cfg"
 }
 
 slug_vpsadmin_path() {
@@ -1062,7 +1094,7 @@ main() {
       shift
       case "$sub" in
         init) cert_init "$@" ;;
-        import-vpsf-dev) cert_import_vpsf_dev "$@" ;;
+        import) cert_import "$@" ;;
         show-ca) cert_show_ca "$@" ;;
         *) usage; exit 2 ;;
       esac

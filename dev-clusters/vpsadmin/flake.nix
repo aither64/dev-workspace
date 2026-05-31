@@ -25,7 +25,7 @@
         in
         if value == "" then default else value;
 
-      workspace = env "VPSADMIN_DEVCLUSTER_WORKSPACE" "/home/aither/workspace/ai/vpsfree.cz";
+      workspace = env "VPSADMIN_DEVCLUSTER_WORKSPACE" (env "PWD" ".");
       slug = env "VPSADMIN_DEVCLUSTER_SLUG" "dev";
       topology = env "VPSADMIN_DEVCLUSTER_TOPOLOGY" "single";
       networkMode = env "VPSADMIN_DEVCLUSTER_NETWORK" "bridge";

@@ -3,9 +3,8 @@
 This directory provides workspace-local vpsAdmin development clusters selected
 from feature worktrees under `worktrees/<slug>/`.
 
-The helper leaves `~/workspace/vpsf-dev` untouched. Runtime state, certificates,
-SSH keys, result links, and logs are stored under `.dev-clusters/` at the
-workspace root and are intentionally not tracked by git.
+Runtime state, certificates, SSH keys, result links, and logs are stored under
+`.dev-clusters/` at the workspace root and are intentionally not tracked by git.
 
 ## Basic Usage
 
@@ -100,13 +99,22 @@ For browser testing in `local` mode, resolve the printed dev hostnames to
 
 ## HTTPS
 
-`start` ensures a certificate set exists. It first imports the existing
-`~/workspace/vpsf-dev/certs` files when present. If those files are unavailable,
-it generates a workspace-local CA and leaf certificate. When the configured
-domains change, the helper reissues the leaf certificate from the current CA.
-If the current CA key is encrypted and cannot sign unattended, it falls back to
-a fresh workspace-local CA. Set `VPSADMIN_DEVCLUSTER_CA_PASSPHRASE` before
-`start` or `update` to reissue from an encrypted imported CA instead.
+`start` ensures a certificate set exists. By default, it generates a
+workspace-local CA and leaf certificate. To reuse an existing CA and server
+certificate, import a directory containing `vpsadmin-ca.crt`,
+`vpsadmin-ca.key`, `vpsadmin-cert.crt`, and `vpsadmin-cert.key`:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster cert import /path/to/certs
+```
+
+Set `VPSADMIN_DEVCLUSTER_CERT_IMPORT_DIR=/path/to/certs` to have `start`
+import an existing certificate set automatically when the cluster has no
+certificate yet. When the configured domains change, the helper reissues the
+leaf certificate from the current CA. If the current CA key is encrypted and
+cannot sign unattended, it falls back to a fresh workspace-local CA. Set
+`VPSADMIN_DEVCLUSTER_CA_PASSPHRASE` before `start` or `update` to reissue from
+an encrypted imported CA instead.
 
 Use:
 
