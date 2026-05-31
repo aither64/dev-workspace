@@ -1,0 +1,1075 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE="$(cd -- "$CLUSTER_DIR/../.." && pwd)"
+STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadmin"
+CERT_DIR="$STATE_ROOT/certs/default"
+SSH_DIR="$STATE_ROOT/ssh"
+SSH_KEY="$SSH_DIR/id_ed25519"
+DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force] [--sudo]
+  devcluster stop <slug>
+  devcluster status <slug>
+  devcluster urls <slug>
+  devcluster config <slug>
+  devcluster refresh <slug>
+  devcluster update <slug> [services|node1|node2|storage1|all]
+  devcluster restart <slug> <machine> <service>
+  devcluster ssh <slug> <machine>
+  devcluster reset <slug>
+  devcluster cert init [--force]
+  devcluster cert import-vpsf-dev [--force]
+  devcluster cert show-ca
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+cluster_dir() {
+  printf '%s/clusters/%s\n' "$STATE_ROOT" "$1"
+}
+
+pid_file() {
+  printf '%s/runner.pid\n' "$(cluster_dir "$1")"
+}
+
+ready_file() {
+  printf '%s/ready\n' "$(cluster_dir "$1")"
+}
+
+socket_dir() {
+  local digest
+  digest="$(printf '%s' "$1" | sha256sum | cut -c1-12)"
+  printf '/tmp/vpsfree-devcluster-%s\n' "$digest"
+}
+
+topology_file() {
+  printf '%s/topology\n' "$(cluster_dir "$1")"
+}
+
+network_file() {
+  printf '%s/network\n' "$(cluster_dir "$1")"
+}
+
+cluster_config_file() {
+  printf '%s/config.json\n' "$(cluster_dir "$1")"
+}
+
+config_json_for_slug() {
+  local slug="$1"
+  local cfg
+  cfg="$(cluster_config_file "$slug")"
+
+  if [ -f "$cfg" ]; then
+    printf '%s\n' "$cfg"
+  else
+    printf '%s\n' "$DEFAULT_CONFIG_FILE"
+  fi
+}
+
+json_get_file() {
+  local file="$1"
+  local filter="$2"
+  jq -r "$filter" "$file"
+}
+
+config_get() {
+  local slug="$1"
+  local filter="$2"
+  json_get_file "$(config_json_for_slug "$slug")" "$filter"
+}
+
+cert_config_for_slug() {
+  local slug="${1:-}"
+
+  if [ -n "$slug" ]; then
+    config_json_for_slug "$slug"
+  else
+    printf '%s\n' "${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}"
+  fi
+}
+
+ensure_cluster_config() {
+  local slug="$1"
+  local cfg
+  cfg="$(cluster_config_file "$slug")"
+
+  need_cmd jq
+  mkdir -p "$(cluster_dir "$slug")"
+
+  if [ ! -f "$cfg" ]; then
+    cp "$DEFAULT_CONFIG_FILE" "$cfg"
+  fi
+
+  jq -e . "$cfg" >/dev/null
+}
+
+result_link() {
+  printf '%s/result-config\n' "$(cluster_dir "$1")"
+}
+
+config_path() {
+  readlink -f "$(result_link "$1")"
+}
+
+machine_ip() {
+  local slug="$1"
+  local machine="$2"
+
+  case "$machine" in
+    services) config_get "$slug" '.services.ip' ;;
+    *)
+      local ip
+      ip="$(
+        jq -r --arg machine "$machine" '
+          .nodes[$machine].ip // .dns.servers[$machine].ip // empty
+        ' "$(config_json_for_slug "$slug")"
+      )"
+      [ -n "$ip" ] || die "unknown machine '$machine'"
+      printf '%s\n' "$ip"
+      ;;
+  esac
+}
+
+topology_machines() {
+  local slug="$1"
+  local topology="$2"
+  local cfg
+  cfg="$(config_json_for_slug "$slug")"
+
+  if ! jq -e --arg topology "$topology" '.topologies[$topology] | type == "array"' "$cfg" >/dev/null; then
+    die "unknown topology '$topology'"
+  fi
+
+  printf 'services\n'
+  jq -r --arg topology "$topology" '.topologies[$topology][]' "$cfg"
+  jq -r '
+    if .dns.enable == true then
+      (.dns.servers // {}) | keys[]
+    else
+      empty
+    end
+  ' "$cfg"
+}
+
+machine_ssh_port() {
+  local slug="$1"
+  local machine="$2"
+
+  case "$machine" in
+    services)
+      printf '10022\n'
+      return
+      ;;
+  esac
+
+  local port
+  port="$(
+    jq -r --arg machine "$machine" '
+      .nodes[$machine].sshPort // .dns.servers[$machine].sshPort // empty
+    ' "$(config_json_for_slug "$slug")"
+  )"
+
+  [ -n "$port" ] || die "unknown machine '$machine'"
+  printf '%s\n' "$port"
+}
+
+is_running() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+kill_socket_processes() {
+  local slug="$1"
+  local sock_dir pid
+  sock_dir="$(socket_dir "$slug")"
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done < <(pgrep -f "$sock_dir" || true)
+
+  sleep 2
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done < <(pgrep -f "$sock_dir" || true)
+}
+
+ensure_ssh_key() {
+  mkdir -p "$SSH_DIR"
+
+  if [ ! -f "$SSH_KEY" ]; then
+    need_cmd ssh-keygen
+    ssh-keygen -t ed25519 -N '' -C 'vpsfree-devcluster' -f "$SSH_KEY" >/dev/null
+  fi
+}
+
+write_cert_ext() {
+  local path="$1"
+  local cert_cfg="${2:-${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}}"
+  local webui_domain
+
+  need_cmd jq
+  webui_domain="$(cert_common_name "$cert_cfg")"
+
+  cat > "$path" <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[ req_distinguished_name ]
+C  = CZ
+ST = Czech Republic
+L  = Prague
+O  = vpsFree.cz
+CN = $webui_domain
+
+[alt_names]
+$(cert_required_domains "$cert_cfg" | awk '{ printf "DNS.%d = %s\n", NR, $0 }')
+EOF
+}
+
+cert_common_name() {
+  local cert_cfg="$1"
+  jq -r '.domains.webui // (.domains | values[0])' "$cert_cfg"
+}
+
+cert_required_domains() {
+  local cert_cfg="$1"
+  jq -r '
+    [
+      (.domains | values[]),
+      (.tmpDomains | values[])
+    ]
+    | map(select(. != null and . != ""))
+    | unique[]
+  ' "$cert_cfg"
+}
+
+cert_missing_domains() {
+  local cert_cfg="$1"
+  local cert="$CERT_DIR/vpsadmin-cert.crt"
+  local san status=0 domain
+
+  san="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null || true)"
+
+  while IFS= read -r domain; do
+    [ -n "$domain" ] || continue
+    if ! grep -F "DNS:$domain" <<<"$san" >/dev/null; then
+      printf '%s\n' "$domain"
+      status=1
+    fi
+  done < <(cert_required_domains "$cert_cfg")
+
+  return "$status"
+}
+
+cert_reissue_server() {
+  local cert_cfg="${1:-${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}}"
+  local -a passin_args=(-passin pass:)
+
+  if [ -n "${VPSADMIN_DEVCLUSTER_CA_PASSPHRASE:-}" ]; then
+    passin_args=(-passin env:VPSADMIN_DEVCLUSTER_CA_PASSPHRASE)
+  fi
+
+  need_cmd openssl
+  [ -f "$CERT_DIR/vpsadmin-ca.crt" ] || die "CA certificate not found; run 'devcluster cert init'"
+  [ -f "$CERT_DIR/vpsadmin-ca.key" ] || die "CA key not found; cannot reissue server certificate"
+
+  if ! openssl pkey -in "$CERT_DIR/vpsadmin-ca.key" -noout "${passin_args[@]}" >/dev/null 2>&1; then
+    return 2
+  fi
+
+  if [ ! -f "$CERT_DIR/vpsadmin-cert.key" ]; then
+    openssl genrsa -out "$CERT_DIR/vpsadmin-cert.key" 2048 >/dev/null 2>&1
+  fi
+
+  write_cert_ext "$CERT_DIR/vpsadmin-cert.ext" "$cert_cfg"
+  openssl req -new \
+    -key "$CERT_DIR/vpsadmin-cert.key" \
+    -out "$CERT_DIR/vpsadmin-cert.csr" \
+    -subj "/CN=$(cert_common_name "$cert_cfg")" >/dev/null 2>&1
+
+  local -a serial_args=(-CAcreateserial)
+  if [ -f "$CERT_DIR/vpsadmin-ca.srl" ]; then
+    serial_args=(-CAserial "$CERT_DIR/vpsadmin-ca.srl")
+  fi
+
+  local tmp_cert="$CERT_DIR/vpsadmin-cert.crt.tmp"
+  openssl x509 -req \
+    -in "$CERT_DIR/vpsadmin-cert.csr" \
+    -CA "$CERT_DIR/vpsadmin-ca.crt" \
+    -CAkey "$CERT_DIR/vpsadmin-ca.key" \
+    "${passin_args[@]}" \
+    "${serial_args[@]}" \
+    -out "$tmp_cert" \
+    -days 3650 -sha256 \
+    -extfile "$CERT_DIR/vpsadmin-cert.ext" >/dev/null 2>&1
+  mv "$tmp_cert" "$CERT_DIR/vpsadmin-cert.crt"
+}
+
+ensure_cert_domains() {
+  local cert_cfg="$1"
+  local missing
+  missing="$(cert_missing_domains "$cert_cfg" || true)"
+  if [ -z "$missing" ]; then
+    return 0
+  fi
+
+  printf 'Reissuing server certificate to cover missing domains:\n%s\n' "$missing"
+  if cert_reissue_server "$cert_cfg"; then
+    return
+  fi
+
+  printf 'Existing CA key cannot sign unattended; generating a fresh devcluster CA\n'
+  cert_init --force
+
+  missing="$(cert_missing_domains "$cert_cfg" || true)"
+  if [ -n "$missing" ]; then
+    printf 'Reissuing server certificate to cover missing domains:\n%s\n' "$missing"
+    cert_reissue_server "$cert_cfg"
+  fi
+}
+
+cert_init() {
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      *) usage; exit 2 ;;
+    esac
+    shift
+  done
+
+  need_cmd openssl
+  mkdir -p "$CERT_DIR"
+
+  if [ "$force" -ne 1 ] && [ -f "$CERT_DIR/vpsadmin-cert.crt" ]; then
+    die "certificate already exists in $CERT_DIR; use --force to replace it"
+  fi
+
+  rm -f "$CERT_DIR"/vpsadmin-ca.* "$CERT_DIR"/vpsadmin-cert.*
+  openssl genrsa -out "$CERT_DIR/vpsadmin-ca.key" 2048 >/dev/null 2>&1
+  openssl req -x509 -new -nodes \
+    -key "$CERT_DIR/vpsadmin-ca.key" \
+    -sha256 -days 3650 \
+    -subj "/C=CZ/ST=Czech Republic/L=Prague/O=vpsFree.cz/CN=vpsadmin-devcluster-ca" \
+    -out "$CERT_DIR/vpsadmin-ca.crt" >/dev/null 2>&1
+  openssl genrsa -out "$CERT_DIR/vpsadmin-cert.key" 2048 >/dev/null 2>&1
+  write_cert_ext "$CERT_DIR/vpsadmin-cert.ext"
+  openssl req -new \
+    -key "$CERT_DIR/vpsadmin-cert.key" \
+    -out "$CERT_DIR/vpsadmin-cert.csr" \
+    -subj "/CN=$(cert_common_name "${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}")" >/dev/null 2>&1
+  openssl x509 -req \
+    -in "$CERT_DIR/vpsadmin-cert.csr" \
+    -CA "$CERT_DIR/vpsadmin-ca.crt" \
+    -CAkey "$CERT_DIR/vpsadmin-ca.key" \
+    -CAcreateserial \
+    -out "$CERT_DIR/vpsadmin-cert.crt" \
+    -days 3650 -sha256 \
+    -extfile "$CERT_DIR/vpsadmin-cert.ext" >/dev/null 2>&1
+
+  cert_show_ca
+}
+
+cert_import_vpsf_dev() {
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      *) usage; exit 2 ;;
+    esac
+    shift
+  done
+
+  local src="/home/aither/workspace/vpsf-dev/certs"
+  [ -d "$src" ] || die "$src not found"
+
+  mkdir -p "$CERT_DIR"
+
+  if [ "$force" -ne 1 ] && [ -f "$CERT_DIR/vpsadmin-cert.crt" ]; then
+    die "certificate already exists in $CERT_DIR; use --force to replace it"
+  fi
+
+  cp "$src"/vpsadmin-ca.crt "$src"/vpsadmin-ca.key "$src"/vpsadmin-ca.srl "$CERT_DIR"/
+  cp "$src"/vpsadmin-cert.crt "$src"/vpsadmin-cert.csr "$src"/vpsadmin-cert.ext "$src"/vpsadmin-cert.key "$CERT_DIR"/
+  local cert_cfg="${VPSADMIN_DEVCLUSTER_CERT_CONFIG:-$DEFAULT_CONFIG_FILE}"
+  ensure_cert_domains "$cert_cfg"
+  cert_show_ca
+}
+
+cert_show_ca() {
+  [ -f "$CERT_DIR/vpsadmin-ca.crt" ] || die "CA certificate not found; run 'devcluster cert init'"
+
+  printf 'CA certificate: %s\n' "$CERT_DIR/vpsadmin-ca.crt"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl x509 -in "$CERT_DIR/vpsadmin-ca.crt" -noout -subject -fingerprint -sha256
+  fi
+}
+
+ensure_certs() {
+  local slug="${1:-}"
+  local cert_cfg
+  cert_cfg="$(cert_config_for_slug "$slug")"
+
+  if [ -f "$CERT_DIR/vpsadmin-cert.crt" ] && [ -f "$CERT_DIR/vpsadmin-cert.key" ]; then
+    ensure_cert_domains "$cert_cfg"
+    return
+  fi
+
+  if [ -d /home/aither/workspace/vpsf-dev/certs ]; then
+    cert_import_vpsf_dev
+    ensure_cert_domains "$cert_cfg"
+  else
+    cert_init
+    ensure_cert_domains "$cert_cfg"
+  fi
+}
+
+slug_vpsadmin_path() {
+  local slug="$1"
+  local path="$WORKSPACE/worktrees/$slug/vpsadmin"
+  [ -d "$path" ] || die "vpsadmin worktree not found at $path"
+  printf '%s\n' "$path"
+}
+
+slug_optional_path() {
+  local slug="$1"
+  local project="$2"
+  local path="$WORKSPACE/worktrees/$slug/$project"
+  [ -d "$path" ] && printf '%s\n' "$path"
+}
+
+vpsadminos_input() {
+  local slug="$1"
+  local path
+  path="$(slug_optional_path "$slug" vpsadminos || true)"
+
+  if [ -n "$path" ]; then
+    printf 'path:%s\n' "$path"
+  else
+    printf 'git+file://%s/repos/vpsadminos.git?ref=refs/remotes/origin/staging\n' "$WORKSPACE"
+  fi
+}
+
+nix_common_env() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+  local vpsadmin_path="$4"
+  local vpsadminos_path="$5"
+  local haveapi_path="$6"
+  local config_path="$7"
+  local mail_templates_path="$8"
+
+  export VPSADMIN_DEVCLUSTER_WORKSPACE="$WORKSPACE"
+  export VPSADMIN_DEVCLUSTER_SLUG="$slug"
+  export VPSADMIN_DEVCLUSTER_TOPOLOGY="$topology"
+  export VPSADMIN_DEVCLUSTER_NETWORK="$network"
+  export VPSADMIN_DEVCLUSTER_CERT_DIR="$CERT_DIR"
+  export VPSADMIN_DEVCLUSTER_CONFIG_FILE
+  VPSADMIN_DEVCLUSTER_CONFIG_FILE="$(cluster_config_file "$slug")"
+  export VPSADMIN_DEVCLUSTER_SSH_PUBKEY="$SSH_KEY.pub"
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_SOURCE="$vpsadmin_path"
+  export VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE="$vpsadminos_path"
+  export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
+  export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
+  export VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE="$mail_templates_path"
+}
+
+nix_overrides() {
+  local slug="$1"
+  local vpsadmin_path="$2"
+  local vpsadminos_input_value="$3"
+
+  printf '%s\0%s\0' --override-input vpsadmin
+  printf 'path:%s\0' "$vpsadmin_path"
+  printf '%s\0%s\0%s\0' --override-input vpsadminos "$vpsadminos_input_value"
+  printf '%s\0%s\0%s\0' --override-input vpsadmin/vpsadminos "$vpsadminos_input_value"
+}
+
+build_config() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+  local dir
+  local vpsadmin_path
+  local vpsadminos_path
+  local haveapi_path
+  local config_source_path
+  local mail_templates_path
+  local vpsadminos_input_value
+
+  dir="$(cluster_dir "$slug")"
+  mkdir -p "$dir"
+  ensure_cluster_config "$slug"
+
+  vpsadmin_path="$(slug_vpsadmin_path "$slug")"
+  vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
+  haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
+  config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
+  mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
+  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+
+  if [ -z "$vpsadminos_path" ]; then
+    vpsadminos_path=""
+  fi
+
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path"
+
+  local -a overrides=()
+  while IFS= read -r -d '' item; do
+    overrides+=("$item")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value")
+
+  nix build \
+    --impure \
+    "${overrides[@]}" \
+    --out-link "$(result_link "$slug")" \
+    "path:$CLUSTER_DIR#cluster-config"
+}
+
+ssh_opts() {
+  local slug="$1"
+  local machine="${2:-}"
+  printf -- '-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR' "$SSH_KEY"
+
+  if [ -n "$machine" ] && [ "$(cluster_network "$slug")" = "local" ]; then
+    printf ' -p %s' "$(machine_ssh_port "$slug" "$machine")"
+  fi
+}
+
+machine_host() {
+  local slug="$1"
+  local machine="$2"
+
+  if [ "$(cluster_network "$slug")" = "local" ]; then
+    printf '127.0.0.1\n'
+  else
+    machine_ip "$slug" "$machine"
+  fi
+}
+
+ssh_cmd() {
+  local slug="$1"
+  local machine="$2"
+  shift 2
+  local host
+  host="$(machine_host "$slug" "$machine")"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$slug" "$machine") "root@$host" "$@"
+}
+
+wait_for_seeded_pool() {
+  local slug="$1"
+  local pool_fs
+  pool_fs="$(config_get "$slug" '.seed.pools.filesystem')"
+
+  printf 'Waiting for services seed to publish pool %s\n' "$pool_fs"
+  ssh_cmd "$slug" services sh -s -- "$pool_fs" <<'EOF'
+set -eu
+pool_fs="$1"
+
+for _ in $(seq 1 180); do
+  if systemctl is-active --quiet vpsadmin-api.service \
+    && mysql -N -B vpsadmin -e 'SELECT filesystem FROM pools' 2>/dev/null | grep -Fx "$pool_fs" >/dev/null; then
+    exit 0
+  fi
+
+  sleep 1
+done
+
+echo "pool $pool_fs was not seeded in time" >&2
+exit 1
+EOF
+}
+
+refresh_nodes_after_seed() {
+  local slug="$1"
+  local topology pool_fs cfg
+  topology="$(cluster_topology "$slug")"
+  pool_fs="$(config_get "$slug" '.seed.pools.filesystem')"
+  cfg="$(config_json_for_slug "$slug")"
+
+  wait_for_seeded_pool "$slug"
+
+  local machine role
+  while IFS= read -r machine; do
+    [ "$machine" != "services" ] || continue
+
+    role="$(jq -r --arg machine "$machine" '.nodes[$machine].role // empty' "$cfg")"
+    [ "$role" = "node" ] || continue
+
+    printf 'Preparing %s pool runtime and restarting nodectld\n' "$machine"
+    ssh_cmd "$slug" "$machine" sh -s -- "$pool_fs" <<'EOF'
+set -eu
+pool_fs="$1"
+pool_name="${pool_fs%%/*}"
+
+for _ in $(seq 1 180); do
+  zpool list -H "$pool_name" >/dev/null 2>&1 && break
+  sleep 1
+done
+
+if ! zpool list -H "$pool_name" >/dev/null 2>&1; then
+  echo "pool $pool_name was not ready in time" >&2
+  zpool list || true
+  exit 1
+fi
+
+for ds in \
+  "$pool_fs/vpsadmin" \
+  "$pool_fs/vpsadmin/config" \
+  "$pool_fs/vpsadmin/download" \
+  "$pool_fs/vpsadmin/mount"
+do
+  zfs list -H "$ds" >/dev/null 2>&1 || zfs create -p "$ds"
+done
+
+mkdir -p "/$pool_fs/vpsadmin/config/vps"
+pool_parent="$(dirname "$pool_fs")"
+[ "$pool_parent" != "." ] || pool_parent="$pool_fs"
+mkdir -p "/$pool_parent/hook/ct"
+
+sv restart nodectld >/dev/null
+for _ in $(seq 1 90); do
+  if sv check nodectld >/dev/null 2>&1 \
+    && test -S /run/nodectl/nodectld.sock \
+    && nodectl status 2>/dev/null | grep -q 'State: running'; then
+    exit 0
+  fi
+
+  sleep 1
+done
+
+nodectl status
+exit 1
+EOF
+  done < <(topology_machines "$slug" "$topology")
+}
+
+cluster_topology() {
+  local slug="$1"
+  if [ -f "$(topology_file "$slug")" ]; then
+    cat "$(topology_file "$slug")"
+  else
+    printf 'single\n'
+  fi
+}
+
+cluster_network() {
+  local slug="$1"
+  if [ -f "$(network_file "$slug")" ]; then
+    cat "$(network_file "$slug")"
+  else
+    printf 'bridge\n'
+  fi
+}
+
+start_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  shift
+
+  local topology="single"
+  local network="${VPSADMIN_DEVCLUSTER_NETWORK:-bridge}"
+  local force=0
+  local use_sudo="${VPSADMIN_DEVCLUSTER_USE_SUDO:-0}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --topology)
+        topology="${2:-}"
+        [ -n "$topology" ] || die "--topology requires a value"
+        shift 2
+        ;;
+      --network)
+        network="${2:-}"
+        [ -n "$network" ] || die "--network requires a value"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --sudo)
+        use_sudo=1
+        shift
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
+  done
+
+  ensure_cluster_config "$slug"
+  topology_machines "$slug" "$topology" >/dev/null
+  case "$network" in
+    bridge|local) ;;
+    *) die "unknown network mode '$network'" ;;
+  esac
+
+  local pid_path
+  pid_path="$(pid_file "$slug")"
+  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+    die "cluster '$slug' is already running with PID $(cat "$pid_path")"
+  fi
+
+  local service_ip
+  service_ip="$(machine_ip "$slug" services)"
+  if [ "$network" = "bridge" ] && [ "$force" -ne 1 ] && ping -c 1 -W 1 "$service_ip" >/dev/null 2>&1; then
+    die "$service_ip responds; stop the existing dev frontend or use --force"
+  fi
+
+  kill_socket_processes "$slug"
+  ensure_ssh_key
+  ensure_certs "$slug"
+
+  build_config "$slug" "$topology" "$network"
+  printf '%s\n' "$topology" > "$(topology_file "$slug")"
+  printf '%s\n' "$network" > "$(network_file "$slug")"
+
+  local vpsadmin_path vpsadminos_input_value
+  vpsadmin_path="$(slug_vpsadmin_path "$slug")"
+  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+
+  local -a runner_overrides=()
+  while IFS= read -r -d '' item; do
+    runner_overrides+=("$item")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value")
+
+  local dir log ready sock_dir
+  dir="$(cluster_dir "$slug")"
+  log="$dir/runner.log"
+  ready="$(ready_file "$slug")"
+  sock_dir="$(socket_dir "$slug")"
+  rm -f "$ready" "$pid_path"
+  rm -rf "$sock_dir"
+  mkdir -p "$sock_dir"
+  printf '\n=== devcluster start %s ===\n' "$(date -Is)" >>"$log"
+
+  local -a command=(
+    nix run
+    --impure
+    "${runner_overrides[@]}"
+    "path:$CLUSTER_DIR#runner"
+    --
+    start
+    --config "$(config_path "$slug")"
+    --state-dir "$dir/state"
+    --sock-dir "$sock_dir"
+    --pid-file "$pid_path"
+    --ready-file "$ready"
+  )
+
+  if [ "$use_sudo" = "1" ]; then
+    command=(sudo -E "${command[@]}")
+  fi
+
+  (
+    cd "$WORKSPACE"
+    exec nohup setsid "${command[@]}"
+  ) >>"$log" 2>&1 &
+
+  local launcher_pid=$!
+  printf 'launcher pid: %s\n' "$launcher_pid" >>"$log"
+
+  printf 'Starting cluster %s (%s, %s network), log: %s\n' "$slug" "$topology" "$network" "$log"
+
+  for _ in $(seq 1 900); do
+    if [ -f "$ready" ]; then
+      refresh_nodes_after_seed "$slug"
+      urls_cluster "$slug"
+      return
+    fi
+
+    if [ -f "$pid_path" ] && ! is_running "$(cat "$pid_path")"; then
+      die "runner exited before becoming ready; see $log"
+    fi
+
+    if [ ! -f "$pid_path" ] && ! is_running "$launcher_pid"; then
+      die "launcher exited before cluster became ready; see $log"
+    fi
+
+    sleep 1
+  done
+
+  die "timed out waiting for cluster readiness; see $log"
+}
+
+stop_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  local pid_path pid
+  pid_path="$(pid_file "$slug")"
+  [ -f "$pid_path" ] || die "cluster '$slug' has no pid file"
+  pid="$(cat "$pid_path")"
+
+  if ! is_running "$pid"; then
+    rm -f "$pid_path" "$(ready_file "$slug")"
+    kill_socket_processes "$slug"
+    printf 'cluster %s was not running\n' "$slug"
+    return
+  fi
+
+  kill -TERM "$pid"
+
+  for _ in $(seq 1 120); do
+    is_running "$pid" || {
+      kill_socket_processes "$slug"
+      printf 'cluster %s stopped\n' "$slug"
+      return
+    }
+    sleep 1
+  done
+
+  kill -KILL "$pid" 2>/dev/null || true
+  kill_socket_processes "$slug"
+  printf 'cluster %s killed after timeout\n' "$slug"
+}
+
+status_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  local pid_path
+  pid_path="$(pid_file "$slug")"
+
+  local running=0
+  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+    running=1
+    printf 'cluster: %s\nstatus: running\npid: %s\n' "$slug" "$(cat "$pid_path")"
+  else
+    printf 'cluster: %s\nstatus: stopped\n' "$slug"
+  fi
+
+  [ -f "$(topology_file "$slug")" ] && printf 'topology: %s\n' "$(cluster_topology "$slug")"
+  [ -f "$(network_file "$slug")" ] && printf 'network: %s\n' "$(cluster_network "$slug")"
+  if [ -f "$(ready_file "$slug")" ]; then
+    if [ "$running" = "1" ]; then
+      printf 'ready: yes\n'
+    else
+      printf 'ready: stale\n'
+    fi
+  fi
+}
+
+urls_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  local api_domain auth_domain console_domain webui_domain mailpit_domain mailpit_user mailpit_password
+  api_domain="$(config_get "$slug" '.domains.api')"
+  auth_domain="$(config_get "$slug" '.domains.auth')"
+  console_domain="$(config_get "$slug" '.domains.console')"
+  webui_domain="$(config_get "$slug" '.domains.webui')"
+  mailpit_domain="$(config_get "$slug" '.domains.mailpit')"
+  mailpit_user="$(config_get "$slug" '.mail.capture.webAuth.username')"
+  mailpit_password="$(config_get "$slug" '.mail.capture.webAuth.password')"
+
+  cat <<EOF
+Cluster: $slug
+Config:  $(cluster_config_file "$slug")
+Web UI:  https://$webui_domain/
+API:     https://$api_domain/
+Auth:    https://$auth_domain/
+Console: https://$console_domain/
+Mailpit: https://$mailpit_domain/
+
+Admin login: test-admin
+Admin password: testAdminPassword
+User login: test-user1
+User password: testUser1Password
+User login: test-user2
+User password: testUser2Password
+Mailpit login: $mailpit_user
+Mailpit password: $mailpit_password
+CA: $CERT_DIR/vpsadmin-ca.crt
+EOF
+
+  if [ "$(cluster_network "$slug")" = "local" ]; then
+    cat <<EOF
+
+Local network forwards:
+  HTTPS: 127.0.0.1:10443 -> services:443
+EOF
+    while IFS= read -r machine; do
+      printf '  SSH %-10s 127.0.0.1:%s\n' "$machine:" "$(machine_ssh_port "$slug" "$machine")"
+    done < <(topology_machines "$slug" "$(cluster_topology "$slug")")
+
+    cat <<EOF
+
+Local browser URLs require these hostnames to resolve to 127.0.0.1 and use
+port 10443:
+  https://$webui_domain:10443/
+  https://$api_domain:10443/
+  https://$auth_domain:10443/
+  https://$console_domain:10443/
+  https://$mailpit_domain:10443/
+EOF
+  fi
+}
+
+config_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  ensure_cluster_config "$slug"
+  printf 'Config: %s\n' "$(cluster_config_file "$slug")"
+  cat "$(cluster_config_file "$slug")"
+}
+
+update_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  local target="${2:-all}"
+  local topology
+  topology="$(cluster_topology "$slug")"
+  local network
+  network="$(cluster_network "$slug")"
+
+  ensure_ssh_key
+  ensure_certs "$slug"
+  build_config "$slug" "$topology" "$network"
+
+  need_cmd jq
+
+  local machines=()
+  if [ "$target" = "all" ]; then
+    mapfile -t machines < <(topology_machines "$slug" "$topology")
+  else
+    machines=("$target")
+  fi
+
+  local cfg
+  cfg="$(config_path "$slug")"
+
+  local services_updated=0
+  for machine in "${machines[@]}"; do
+    local host toplevel opts
+    host="$(machine_host "$slug" "$machine")"
+    toplevel="$(jq -r --arg machine "$machine" '.machines[$machine].toplevel // empty' "$cfg")"
+    [ -n "$toplevel" ] || die "no toplevel found for $machine in $cfg"
+    opts="$(ssh_opts "$slug" "$machine")"
+
+    printf 'Updating %s (%s) to %s\n' "$machine" "$host" "$toplevel"
+    NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel"
+    # shellcheck disable=SC2086
+    ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch
+
+    if [ "$machine" = "services" ]; then
+      services_updated=1
+      # shellcheck disable=SC2086
+      ssh $opts "root@$host" '
+        if systemctl cat vpsadmin-devcluster-seed.service >/dev/null 2>&1; then
+          systemctl restart vpsadmin-api.service
+        fi
+      '
+    fi
+  done
+
+  if [ "$services_updated" = "1" ]; then
+    refresh_nodes_after_seed "$slug"
+  fi
+}
+
+restart_service() {
+  local slug="${1:-}"
+  local machine="${2:-}"
+  local service="${3:-}"
+  [ -n "$slug" ] || die "missing slug"
+  [ -n "$machine" ] || die "missing machine"
+  [ -n "$service" ] || die "missing service"
+
+  if [ "$machine" = "services" ]; then
+    ssh_cmd "$slug" "$machine" systemctl restart "$service"
+  else
+    ssh_cmd "$slug" "$machine" "sv restart '$service' || sv restart '/run/service/$service' || systemctl restart '$service'"
+  fi
+}
+
+ssh_cluster() {
+  local slug="${1:-}"
+  local machine="${2:-}"
+  [ -n "$slug" ] || die "missing slug"
+  [ -n "$machine" ] || die "missing machine"
+  local host
+  host="$(machine_host "$slug" "$machine")"
+  # shellcheck disable=SC2046
+  exec ssh $(ssh_opts "$slug" "$machine") "root@$host"
+}
+
+reset_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  if [ -f "$(pid_file "$slug")" ] && is_running "$(cat "$(pid_file "$slug")")"; then
+    stop_cluster "$slug"
+  fi
+
+  kill_socket_processes "$slug"
+  rm -rf "$(cluster_dir "$slug")"
+  rm -rf "$(socket_dir "$slug")"
+  printf 'cluster %s state removed\n' "$slug"
+}
+
+main() {
+  local cmd="${1:-}"
+  [ -n "$cmd" ] || {
+    usage
+    exit 2
+  }
+  shift
+
+  case "$cmd" in
+    start) start_cluster "$@" ;;
+    stop) stop_cluster "$@" ;;
+    status) status_cluster "$@" ;;
+    urls) urls_cluster "$@" ;;
+    config) config_cluster "$@" ;;
+    refresh) refresh_nodes_after_seed "$@" ;;
+    update) update_cluster "$@" ;;
+    restart) restart_service "$@" ;;
+    ssh) ssh_cluster "$@" ;;
+    reset) reset_cluster "$@" ;;
+    cert)
+      local sub="${1:-}"
+      [ -n "$sub" ] || {
+        usage
+        exit 2
+      }
+      shift
+      case "$sub" in
+        init) cert_init "$@" ;;
+        import-vpsf-dev) cert_import_vpsf_dev "$@" ;;
+        show-ca) cert_show_ca "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,228 @@
+{
+  "domains": {
+    "api": "api.aitherdev.int.vpsfree.cz",
+    "auth": "auth.aitherdev.int.vpsfree.cz",
+    "console": "console.aitherdev.int.vpsfree.cz",
+    "download": "download.aitherdev.int.vpsfree.cz",
+    "frontend": "frontend.aitherdev.int.vpsfree.cz",
+    "mailpit": "mailpit.aitherdev.int.vpsfree.cz",
+    "webui": "webui.aitherdev.int.vpsfree.cz"
+  },
+  "tmpDomains": {
+    "api": "api-tmp.aitherdev.int.vpsfree.cz",
+    "auth": "auth-tmp.aitherdev.int.vpsfree.cz",
+    "console": "console-tmp.aitherdev.int.vpsfree.cz",
+    "webui": "webui-tmp.aitherdev.int.vpsfree.cz"
+  },
+  "network": {
+    "bridge": "br0",
+    "gateway": "172.16.106.1"
+  },
+  "resolver": {
+    "mode": "cluster",
+    "upstreamNameservers": ["172.16.9.90", "172.19.9.90"]
+  },
+  "plugins": {
+    "enabled": "all"
+  },
+  "services": {
+    "ip": "172.16.106.53",
+    "name": "vpsadmin-services"
+  },
+  "nodes": {
+    "node1": {
+      "id": 101,
+      "name": "dev-node1",
+      "ip": "172.16.106.41",
+      "role": "node",
+      "maxVps": 30,
+      "cpus": 4,
+      "memoryMiB": 8192,
+      "swapMiB": 0,
+      "sshPort": 10122
+    },
+    "node2": {
+      "id": 102,
+      "name": "dev-node2",
+      "ip": "172.16.106.42",
+      "role": "node",
+      "maxVps": 30,
+      "cpus": 4,
+      "memoryMiB": 8192,
+      "swapMiB": 0,
+      "sshPort": 10222
+    },
+    "storage1": {
+      "id": 201,
+      "name": "dev-storage1",
+      "ip": "172.16.106.45",
+      "role": "storage",
+      "maxVps": 0,
+      "cpus": 4,
+      "memoryMiB": 4096,
+      "swapMiB": 0,
+      "sshPort": 10322
+    }
+  },
+  "topologies": {
+    "single": ["node1"],
+    "dual": ["node1", "node2"],
+    "storage": ["node1", "node2", "storage1"]
+  },
+  "mail": {
+    "capture": {
+      "enable": true,
+      "smtpPort": 1025,
+      "webPort": 8025,
+      "webAuth": {
+        "enable": true,
+        "username": "mailpit",
+        "password": "mailpitPassword"
+      }
+    },
+    "templates": {
+      "install": true
+    }
+  },
+  "dns": {
+    "enable": true,
+    "servers": {
+      "dns-primary": {
+        "id": 301,
+        "name": "dev-dns-primary",
+        "serverName": "ns-hidden.aitherdev.int.vpsfree.cz",
+        "ip": "172.16.106.61",
+        "hidden": true,
+        "enableUserDnsZones": true,
+        "userDnsZoneType": "primary_type",
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "sshPort": 10422
+      },
+      "dns-secondary": {
+        "id": 302,
+        "name": "dev-dns-secondary",
+        "serverName": "ns-public.aitherdev.int.vpsfree.cz",
+        "ip": "172.16.106.62",
+        "hidden": false,
+        "enableUserDnsZones": true,
+        "userDnsZoneType": "secondary_type",
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "sshPort": 10522
+      }
+    }
+  },
+  "seed": {
+    "defaultVpsResources": {
+      "cpu": 1,
+      "memory": 1024,
+      "swap": 512,
+      "diskspace": 4096
+    },
+    "userResources": {
+      "cpu": 16,
+      "memory": 65536,
+      "swap": 32768,
+      "diskspace": 1048576,
+      "ipv4": 32,
+      "ipv4_private": 256
+    },
+    "mailRecipients": [
+      {
+        "label": "Dev admins",
+        "to": "dev-admin@example.test",
+        "templates": ["daily_report"]
+      }
+    ],
+    "users": [
+      {
+        "login": "test-user1",
+        "password": "testUser1Password",
+        "fullName": "Test User One",
+        "email": "test-user1@example.test",
+        "level": 1,
+        "namespace": {
+          "blockStart": 9,
+          "blockCount": 8
+        },
+        "maxVpsCount": 5
+      },
+      {
+        "login": "test-user2",
+        "password": "testUser2Password",
+        "fullName": "Test User Two",
+        "email": "test-user2@example.test",
+        "level": 1,
+        "namespace": {
+          "blockStart": 17,
+          "blockCount": 8
+        },
+        "maxVpsCount": 5
+      }
+    ],
+    "pools": {
+      "label": "tank",
+      "filesystem": "tank/ct",
+      "role": "hypervisor",
+      "maxDatasets": 1024,
+      "totalSpaceMiB": 20971520,
+      "availableSpaceMiB": 16777216,
+      "usedSpaceMiB": 4194304
+    },
+    "networks": [
+      {
+        "label": "Dev public IPv4",
+        "address": "198.51.100.0",
+        "prefix": 24,
+        "ipVersion": 4,
+        "role": "public_access",
+        "managed": true,
+        "splitAccess": "no_access",
+        "splitPrefix": 32,
+        "purpose": "any",
+        "autopick": true,
+        "userpick": true,
+        "reverseZone": true,
+        "addresses": [
+          "198.51.100.10",
+          "198.51.100.11",
+          "198.51.100.12",
+          "198.51.100.13",
+          "198.51.100.14",
+          "198.51.100.15",
+          "198.51.100.16",
+          "198.51.100.17",
+          "198.51.100.18",
+          "198.51.100.19"
+        ]
+      },
+      {
+        "label": "Dev private IPv4",
+        "address": "10.106.0.0",
+        "prefix": 24,
+        "ipVersion": 4,
+        "role": "private_access",
+        "managed": true,
+        "splitAccess": "no_access",
+        "splitPrefix": 32,
+        "purpose": "vps",
+        "autopick": true,
+        "userpick": true,
+        "reverseZone": true,
+        "addresses": [
+          "10.106.0.10",
+          "10.106.0.11",
+          "10.106.0.12",
+          "10.106.0.13",
+          "10.106.0.14",
+          "10.106.0.15",
+          "10.106.0.16",
+          "10.106.0.17",
+          "10.106.0.18",
+          "10.106.0.19"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,162 @@
+# vpsAdmin Dev Clusters
+
+This directory provides workspace-local vpsAdmin development clusters selected
+from feature worktrees under `worktrees/<slug>/`.
+
+The helper leaves `~/workspace/vpsf-dev` untouched. Runtime state, certificates,
+SSH keys, result links, and logs are stored under `.dev-clusters/` at the
+workspace root and are intentionally not tracked by git.
+
+## Basic Usage
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster start 2026-05-29-security-advisories --topology dual
+dev-clusters/vpsadmin/bin/devcluster urls 2026-05-29-security-advisories
+dev-clusters/vpsadmin/bin/devcluster config 2026-05-29-security-advisories
+dev-clusters/vpsadmin/bin/devcluster refresh 2026-05-29-security-advisories
+dev-clusters/vpsadmin/bin/devcluster update 2026-05-29-security-advisories services
+dev-clusters/vpsadmin/bin/devcluster ssh 2026-05-29-security-advisories services
+dev-clusters/vpsadmin/bin/devcluster stop 2026-05-29-security-advisories
+```
+
+Topologies:
+
+- `single`: services VM and one vpsAdminOS node.
+- `dual`: services VM and two vpsAdminOS nodes.
+- `storage`: services VM, two regular nodes, and one storage node.
+
+Only one VPN-visible dev cluster should be active at a time. The cluster uses
+the existing `aitherdev` dev-network names and IPs, especially
+`webui.aitherdev.int.vpsfree.cz`. The `*-tmp.aitherdev.int.vpsfree.cz`
+names are configured as secondary frontend entries for internal/maintenance
+access tests.
+
+Network modes:
+
+- `bridge` is the default. It attaches VMs to `br0` and uses the predictable
+  `172.16.106.*` dev addresses. This needs a usable `qemu-bridge-helper` or
+  root privileges. On `aitherdev`, deploy the host configuration that provides
+  `/run/wrappers/bin/qemu-bridge-helper` and keeps `/etc/qemu/bridge.conf`
+  restricted to the allowed bridges.
+- `local` runs without bridge privileges. VMs talk to each other on a QEMU
+  socket network and expose host forwards on localhost:
+  `10443` for HTTPS, `10022` for services SSH, `10122` for node1 SSH, `10222`
+  for node2 SSH, and `10322` for storage1 SSH.
+
+The bridge helper path defaults to `/run/wrappers/bin/qemu-bridge-helper`.
+Override it with `VPSADMIN_DEVCLUSTER_BRIDGE_HELPER=/path/to/helper`, or set it
+to an empty value to omit the QEMU `helper=` option.
+
+Resolver behavior is configured in `config.json` under `resolver`. The default
+mode, `cluster`, runs dnsmasq on the services VM, serves all devcluster host
+records from the same config, and forwards other lookups to configurable
+upstream nameservers. The default upstreams are the vpsFree.cz internal
+resolvers `172.16.9.90` and `172.19.9.90`. Other supported modes are
+`upstream`, which points every VM directly at `resolver.upstreamNameservers`;
+`gateway`, which points every VM at `network.gateway`; and `none`, which leaves
+the machine defaults alone.
+
+## Configuration And Seed Data
+
+Each cluster gets its own editable config at:
+
+```sh
+.dev-clusters/vpsadmin/clusters/<slug>/config.json
+```
+
+It is copied from `dev-clusters/vpsadmin/default-config.json` on first use and
+is merged over the tracked defaults. Use it to change domains, service and node
+IP addresses, topology membership, seeded users, resource packages, pool
+settings, networks, IP addresses, and mail recipients.
+
+The default seed creates:
+
+- one hypervisor pool on each regular node, using filesystem `tank/ct`;
+- public and private IPv4 networks with allocatable addresses;
+- two non-admin users, `test-user1` and `test-user2`;
+- default VPS resource values and per-user resource packages;
+- mail recipients for admin daily reports;
+- vpsfree mail templates, when the matching worktree exists.
+
+The plugin set is configured with `plugins.enabled`. The default value is
+`"all"`, which enables every plugin directory bundled in the selected vpsAdmin
+worktree. Set it to a JSON array such as `["webui", "payments"]` to test a
+smaller set, or to `"none"` to disable plugins.
+
+After a services seed has changed pool data, `devcluster refresh <slug>` prepares
+the vpsAdmin pool working directories on regular nodes and restarts nodectld so
+DB-seeded pools are usable by node transactions. `start` and `update ... services`
+run the same refresh automatically.
+
+Example local start:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster start 2026-05-29-security-advisories --topology single --network local
+```
+
+For browser testing in `local` mode, resolve the printed dev hostnames to
+`127.0.0.1` and use port `10443`, for example
+`https://webui.aitherdev.int.vpsfree.cz:10443/`.
+
+## HTTPS
+
+`start` ensures a certificate set exists. It first imports the existing
+`~/workspace/vpsf-dev/certs` files when present. If those files are unavailable,
+it generates a workspace-local CA and leaf certificate. When the configured
+domains change, the helper reissues the leaf certificate from the current CA.
+If the current CA key is encrypted and cannot sign unattended, it falls back to
+a fresh workspace-local CA. Set `VPSADMIN_DEVCLUSTER_CA_PASSPHRASE` before
+`start` or `update` to reissue from an encrypted imported CA instead.
+
+Use:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster cert show-ca
+```
+
+to print the CA certificate path and fingerprint for browser trust setup.
+
+## Email
+
+Outgoing vpsAdmin mail is captured by Mailpit in the mailer container. The
+Mailpit UI is exposed through the services nginx frontend at the HTTPS URL
+printed by `devcluster urls`, currently
+`https://mailpit.aitherdev.int.vpsfree.cz/`, and is protected with the
+configured development basic-auth credentials. The raw Mailpit HTTP listener is
+bound to `127.0.0.1` inside the services VM.
+
+If `worktrees/<slug>/vpsfree-mail-templates` exists, its templates are copied
+into the Nix closure and installed by the services seed. Re-run:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster update <slug> services
+```
+
+after changing template files or the cluster mail seed config. Runtime virtiofs
+mounts cannot be added to an already-running VM, so templates are intentionally
+closure-copied instead of mounted live.
+
+## Runtime Updates
+
+The web UI is served from a live symlink tree backed by the selected vpsAdmin
+worktree, with Composer/vendor dependencies coming from the Nix package.
+Changes to existing PHP/templates/static files are visible after normal
+PHP-FPM/nginx behavior.
+
+Ruby services and system-level changes use:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster update <slug> services
+dev-clusters/vpsadmin/bin/devcluster update <slug> node1
+```
+
+which rebuilds the machine config, copies the new closure to the running VM,
+and runs `switch-to-configuration`.
+
+When changing Ruby code packaged as gems, rebuild vpsAdmin packaged gems before
+updating the cluster:
+
+```sh
+cd worktrees/<slug>/vpsadmin
+nix develop -c rake vpsadmin:gems
+```
