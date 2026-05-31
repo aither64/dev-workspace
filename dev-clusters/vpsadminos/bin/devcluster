@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE="$(cd -- "$CLUSTER_DIR/../.." && pwd)"
+STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadminos"
+SSH_DIR="$STATE_ROOT/ssh"
+SSH_KEY="$SSH_DIR/id_ed25519"
+DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  devcluster start <slug> [--topology single|dual|triple] [--network local|bridge] [--timeout seconds] [--force] [--sudo]
+  devcluster stop <slug>
+  devcluster status <slug>
+  devcluster info <slug>
+  devcluster config <slug>
+  devcluster update <slug> [node|all]
+  devcluster restart <slug> <node> <service>
+  devcluster ssh <slug> <node>
+  devcluster reset <slug>
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+cluster_dir() {
+  printf '%s/clusters/%s\n' "$STATE_ROOT" "$1"
+}
+
+pid_file() {
+  printf '%s/runner.pid\n' "$(cluster_dir "$1")"
+}
+
+ready_file() {
+  printf '%s/ready\n' "$(cluster_dir "$1")"
+}
+
+socket_dir() {
+  local digest
+  digest="$(printf '%s' "$1" | sha256sum | cut -c1-12)"
+  printf '/tmp/vpsadminos-devcluster-%s\n' "$digest"
+}
+
+topology_file() {
+  printf '%s/topology\n' "$(cluster_dir "$1")"
+}
+
+network_file() {
+  printf '%s/network\n' "$(cluster_dir "$1")"
+}
+
+cluster_config_file() {
+  printf '%s/config.json\n' "$(cluster_dir "$1")"
+}
+
+config_json_for_slug() {
+  local slug="$1"
+  local cfg
+  cfg="$(cluster_config_file "$slug")"
+
+  if [ -f "$cfg" ]; then
+    printf '%s\n' "$cfg"
+  else
+    printf '%s\n' "$DEFAULT_CONFIG_FILE"
+  fi
+}
+
+json_get_file() {
+  local file="$1"
+  local filter="$2"
+  jq -r "$filter" "$file"
+}
+
+config_get() {
+  local slug="$1"
+  local filter="$2"
+  json_get_file "$(config_json_for_slug "$slug")" "$filter"
+}
+
+ensure_cluster_config() {
+  local slug="$1"
+  local cfg
+  cfg="$(cluster_config_file "$slug")"
+
+  need_cmd jq
+  mkdir -p "$(cluster_dir "$slug")"
+
+  if [ ! -f "$cfg" ]; then
+    cp "$DEFAULT_CONFIG_FILE" "$cfg"
+  fi
+
+  jq -e . "$cfg" >/dev/null
+}
+
+result_link() {
+  printf '%s/result-config\n' "$(cluster_dir "$1")"
+}
+
+config_path() {
+  readlink -f "$(result_link "$1")"
+}
+
+cluster_topology() {
+  local slug="$1"
+  if [ -f "$(topology_file "$slug")" ]; then
+    cat "$(topology_file "$slug")"
+  else
+    printf 'single\n'
+  fi
+}
+
+cluster_network() {
+  local slug="$1"
+  if [ -f "$(network_file "$slug")" ]; then
+    cat "$(network_file "$slug")"
+  else
+    printf 'local\n'
+  fi
+}
+
+node_names() {
+  local slug="$1"
+  local topology="$2"
+  local cfg
+  cfg="$(config_json_for_slug "$slug")"
+
+  if ! jq -e --arg topology "$topology" '.topologies[$topology] | type == "array"' "$cfg" >/dev/null; then
+    die "unknown topology '$topology'"
+  fi
+
+  jq -r --arg topology "$topology" '.topologies[$topology][]' "$cfg"
+}
+
+node_known() {
+  local slug="$1"
+  local topology="$2"
+  local node="$3"
+
+  node_names "$slug" "$topology" | grep -Fx "$node" >/dev/null
+}
+
+node_ip() {
+  local slug="$1"
+  local node="$2"
+  local network="${3:-$(cluster_network "$slug")}"
+  local field
+
+  case "$network" in
+    bridge) field="bridgeIp" ;;
+    local) field="localIp" ;;
+    *) die "unknown network mode '$network'" ;;
+  esac
+
+  local ip
+  ip="$(jq -r --arg node "$node" --arg field "$field" '.nodes[$node][$field] // empty' "$(config_json_for_slug "$slug")")"
+  [ -n "$ip" ] || die "unknown node '$node'"
+  printf '%s\n' "$ip"
+}
+
+node_name() {
+  local slug="$1"
+  local node="$2"
+  local name
+  name="$(jq -r --arg node "$node" '.nodes[$node].name // empty' "$(config_json_for_slug "$slug")")"
+  [ -n "$name" ] || die "unknown node '$node'"
+  printf '%s\n' "$name"
+}
+
+node_ssh_port() {
+  local slug="$1"
+  local node="$2"
+  local port
+  port="$(jq -r --arg node "$node" '.nodes[$node].sshPort // empty' "$(config_json_for_slug "$slug")")"
+  [ -n "$port" ] || die "node '$node' has no sshPort"
+  printf '%s\n' "$port"
+}
+
+is_running() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+kill_socket_processes() {
+  local slug="$1"
+  local sock_dir pid
+  sock_dir="$(socket_dir "$slug")"
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done < <(pgrep -f "$sock_dir" || true)
+
+  sleep 2
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] && continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done < <(pgrep -f "$sock_dir" || true)
+}
+
+ensure_ssh_key() {
+  mkdir -p "$SSH_DIR"
+
+  if [ ! -f "$SSH_KEY" ]; then
+    need_cmd ssh-keygen
+    ssh-keygen -t ed25519 -N '' -C 'vpsadminos-devcluster' -f "$SSH_KEY" >/dev/null
+  fi
+}
+
+slug_optional_path() {
+  local slug="$1"
+  local project="$2"
+  local path="$WORKSPACE/worktrees/$slug/$project"
+  [ -d "$path" ] && printf '%s\n' "$path"
+}
+
+vpsadminos_input() {
+  local slug="$1"
+  local path
+  path="$(slug_optional_path "$slug" vpsadminos || true)"
+
+  if [ -n "$path" ]; then
+    printf 'path:%s\n' "$path"
+  else
+    printf 'git+file://%s/repos/vpsadminos.git?ref=refs/remotes/origin/staging\n' "$WORKSPACE"
+  fi
+}
+
+nix_common_env() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+  local vpsadminos_path="$4"
+
+  export VPSADMINOS_DEVCLUSTER_WORKSPACE="$WORKSPACE"
+  export VPSADMINOS_DEVCLUSTER_SLUG="$slug"
+  export VPSADMINOS_DEVCLUSTER_TOPOLOGY="$topology"
+  export VPSADMINOS_DEVCLUSTER_NETWORK="$network"
+  export VPSADMINOS_DEVCLUSTER_CONFIG_FILE
+  VPSADMINOS_DEVCLUSTER_CONFIG_FILE="$(cluster_config_file "$slug")"
+  export VPSADMINOS_DEVCLUSTER_SSH_PUBKEY="$SSH_KEY.pub"
+  export VPSADMINOS_DEVCLUSTER_VPSADMINOS_SOURCE="$vpsadminos_path"
+}
+
+nix_overrides() {
+  local vpsadminos_input_value="$1"
+
+  printf '%s\0%s\0%s\0' --override-input vpsadminos "$vpsadminos_input_value"
+}
+
+build_config() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+  local dir
+  local vpsadminos_path
+  local vpsadminos_input_value
+
+  dir="$(cluster_dir "$slug")"
+  mkdir -p "$dir"
+  ensure_cluster_config "$slug"
+
+  vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
+  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+
+  nix_common_env "$slug" "$topology" "$network" "$vpsadminos_path"
+
+  local -a overrides=()
+  while IFS= read -r -d '' item; do
+    overrides+=("$item")
+  done < <(nix_overrides "$vpsadminos_input_value")
+
+  nix build \
+    --impure \
+    "${overrides[@]}" \
+    --out-link "$(result_link "$slug")" \
+    "path:$CLUSTER_DIR#cluster-config"
+}
+
+ssh_opts() {
+  local slug="$1"
+  local node="${2:-}"
+  printf -- '-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR' "$SSH_KEY"
+
+  if [ -n "$node" ] && [ "$(cluster_network "$slug")" = "local" ]; then
+    printf ' -p %s' "$(node_ssh_port "$slug" "$node")"
+  fi
+}
+
+node_host() {
+  local slug="$1"
+  local node="$2"
+
+  if [ "$(cluster_network "$slug")" = "local" ]; then
+    printf '127.0.0.1\n'
+  else
+    node_ip "$slug" "$node" bridge
+  fi
+}
+
+ssh_cmd() {
+  local slug="$1"
+  local node="$2"
+  shift 2
+  local host
+  host="$(node_host "$slug" "$node")"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$slug" "$node") "root@$host" "$@"
+}
+
+start_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  shift
+
+  local topology="single"
+  local network="${VPSADMINOS_DEVCLUSTER_NETWORK:-local}"
+  local timeout="${VPSADMINOS_DEVCLUSTER_TIMEOUT:-900}"
+  local force=0
+  local use_sudo="${VPSADMINOS_DEVCLUSTER_USE_SUDO:-0}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --topology)
+        topology="${2:-}"
+        [ -n "$topology" ] || die "--topology requires a value"
+        shift 2
+        ;;
+      --network)
+        network="${2:-}"
+        [ -n "$network" ] || die "--network requires a value"
+        shift 2
+        ;;
+      --timeout)
+        timeout="${2:-}"
+        [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout requires a positive integer value"
+        [ "$timeout" -gt 0 ] || die "--timeout requires a positive integer value"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --sudo)
+        use_sudo=1
+        shift
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
+  done
+
+  ensure_cluster_config "$slug"
+  node_names "$slug" "$topology" >/dev/null
+  case "$network" in
+    bridge|local) ;;
+    *) die "unknown network mode '$network'" ;;
+  esac
+
+  local pid_path
+  pid_path="$(pid_file "$slug")"
+  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+    die "cluster '$slug' is already running with PID $(cat "$pid_path")"
+  fi
+
+  if [ "$network" = "bridge" ] && [ "$force" -ne 1 ]; then
+    local node ip
+    while IFS= read -r node; do
+      ip="$(node_ip "$slug" "$node" bridge)"
+      if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+        die "$ip responds; stop the existing dev VM or use --force"
+      fi
+    done < <(node_names "$slug" "$topology")
+  fi
+
+  kill_socket_processes "$slug"
+  ensure_ssh_key
+  build_config "$slug" "$topology" "$network"
+  printf '%s\n' "$topology" > "$(topology_file "$slug")"
+  printf '%s\n' "$network" > "$(network_file "$slug")"
+
+  local vpsadminos_input_value
+  vpsadminos_input_value="$(vpsadminos_input "$slug")"
+
+  local -a runner_overrides=()
+  while IFS= read -r -d '' item; do
+    runner_overrides+=("$item")
+  done < <(nix_overrides "$vpsadminos_input_value")
+
+  local dir log ready sock_dir
+  dir="$(cluster_dir "$slug")"
+  log="$dir/runner.log"
+  ready="$(ready_file "$slug")"
+  sock_dir="$(socket_dir "$slug")"
+  rm -f "$ready" "$pid_path"
+  rm -rf "$sock_dir"
+  mkdir -p "$sock_dir"
+  printf '\n=== devcluster start %s ===\n' "$(date -Is)" >>"$log"
+
+  local -a command=(
+    nix run
+    --impure
+    "${runner_overrides[@]}"
+    "path:$CLUSTER_DIR#runner"
+    --
+    start
+    --config "$(config_path "$slug")"
+    --state-dir "$dir/state"
+    --sock-dir "$sock_dir"
+    --pid-file "$pid_path"
+    --ready-file "$ready"
+    --timeout "$timeout"
+  )
+
+  if [ "$use_sudo" = "1" ]; then
+    command=(sudo -E "${command[@]}")
+  fi
+
+  (
+    cd "$WORKSPACE"
+    exec nohup setsid "${command[@]}"
+  ) >>"$log" 2>&1 &
+
+  local launcher_pid=$!
+  printf 'launcher pid: %s\n' "$launcher_pid" >>"$log"
+
+  printf 'Starting vpsAdminOS cluster %s (%s, %s network), log: %s\n' "$slug" "$topology" "$network" "$log"
+
+  for _ in $(seq 1 "$timeout"); do
+    if [ -f "$ready" ]; then
+      info_cluster "$slug"
+      return
+    fi
+
+    if [ -f "$pid_path" ] && ! is_running "$(cat "$pid_path")"; then
+      die "runner exited before becoming ready; see $log"
+    fi
+
+    if [ ! -f "$pid_path" ] && ! is_running "$launcher_pid"; then
+      die "launcher exited before cluster became ready; see $log"
+    fi
+
+    sleep 1
+  done
+
+  die "timed out after ${timeout}s waiting for cluster readiness; see $log"
+}
+
+stop_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  local pid_path pid
+  pid_path="$(pid_file "$slug")"
+  [ -f "$pid_path" ] || die "cluster '$slug' has no pid file"
+  pid="$(cat "$pid_path")"
+
+  if ! is_running "$pid"; then
+    rm -f "$pid_path" "$(ready_file "$slug")"
+    kill_socket_processes "$slug"
+    printf 'cluster %s was not running\n' "$slug"
+    return
+  fi
+
+  kill -TERM "$pid"
+
+  for _ in $(seq 1 120); do
+    is_running "$pid" || {
+      kill_socket_processes "$slug"
+      printf 'cluster %s stopped\n' "$slug"
+      return
+    }
+    sleep 1
+  done
+
+  kill -KILL "$pid" 2>/dev/null || true
+  kill_socket_processes "$slug"
+  printf 'cluster %s killed after timeout\n' "$slug"
+}
+
+status_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  local pid_path
+  pid_path="$(pid_file "$slug")"
+
+  local running=0
+  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+    running=1
+    printf 'cluster: %s\nstatus: running\npid: %s\n' "$slug" "$(cat "$pid_path")"
+  else
+    printf 'cluster: %s\nstatus: stopped\n' "$slug"
+  fi
+
+  [ -f "$(topology_file "$slug")" ] && printf 'topology: %s\n' "$(cluster_topology "$slug")"
+  [ -f "$(network_file "$slug")" ] && printf 'network: %s\n' "$(cluster_network "$slug")"
+  if [ -f "$(ready_file "$slug")" ]; then
+    if [ "$running" = "1" ]; then
+      printf 'ready: yes\n'
+    else
+      printf 'ready: stale\n'
+    fi
+  fi
+}
+
+info_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  local topology network
+  topology="$(cluster_topology "$slug")"
+  network="$(cluster_network "$slug")"
+
+  cat <<EOF
+Cluster:  $slug
+Config:   $(cluster_config_file "$slug")
+Topology: $topology
+Network:  $network
+EOF
+
+  local node host ip ssh_port display_name
+  while IFS= read -r node; do
+    display_name="$(node_name "$slug" "$node")"
+    ip="$(node_ip "$slug" "$node" "$network")"
+    host="$(node_host "$slug" "$node")"
+    ssh_port="$(node_ssh_port "$slug" "$node")"
+
+    if [ "$network" = "local" ]; then
+      printf 'SSH %-6s ssh -i %s root@%s -p %s  internal=%s  name=%s\n' "$node:" "$SSH_KEY" "$host" "$ssh_port" "$ip" "$display_name"
+    else
+      printf 'SSH %-6s ssh -i %s root@%s  name=%s\n' "$node:" "$SSH_KEY" "$host" "$display_name"
+    fi
+  done < <(node_names "$slug" "$topology")
+}
+
+config_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  ensure_cluster_config "$slug"
+  printf 'Config: %s\n' "$(cluster_config_file "$slug")"
+  cat "$(cluster_config_file "$slug")"
+}
+
+update_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+  local target="${2:-all}"
+  local topology network
+  topology="$(cluster_topology "$slug")"
+  network="$(cluster_network "$slug")"
+
+  ensure_ssh_key
+  build_config "$slug" "$topology" "$network"
+
+  need_cmd jq
+
+  local machines=()
+  if [ "$target" = "all" ]; then
+    mapfile -t machines < <(node_names "$slug" "$topology")
+  else
+    node_known "$slug" "$topology" "$target" || die "unknown node '$target' for topology '$topology'"
+    machines=("$target")
+  fi
+
+  local cfg
+  cfg="$(config_path "$slug")"
+
+  local node host toplevel opts
+  for node in "${machines[@]}"; do
+    host="$(node_host "$slug" "$node")"
+    toplevel="$(jq -r --arg node "$node" '.machines[$node].toplevel // empty' "$cfg")"
+    [ -n "$toplevel" ] || die "no toplevel found for $node in $cfg"
+    opts="$(ssh_opts "$slug" "$node")"
+
+    printf 'Updating %s (%s) to %s\n' "$node" "$host" "$toplevel"
+    NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel"
+    # shellcheck disable=SC2086
+    ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch
+  done
+}
+
+restart_service() {
+  local slug="${1:-}"
+  local node="${2:-}"
+  local service="${3:-}"
+  [ -n "$slug" ] || die "missing slug"
+  [ -n "$node" ] || die "missing node"
+  [ -n "$service" ] || die "missing service"
+
+  ssh_cmd "$slug" "$node" "sv restart '$service' || sv restart '/run/service/$service'"
+}
+
+ssh_cluster() {
+  local slug="${1:-}"
+  local node="${2:-}"
+  [ -n "$slug" ] || die "missing slug"
+  [ -n "$node" ] || die "missing node"
+  local host
+  host="$(node_host "$slug" "$node")"
+  # shellcheck disable=SC2046
+  exec ssh $(ssh_opts "$slug" "$node") "root@$host"
+}
+
+reset_cluster() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "missing slug"
+
+  if [ -f "$(pid_file "$slug")" ] && is_running "$(cat "$(pid_file "$slug")")"; then
+    stop_cluster "$slug"
+  fi
+
+  kill_socket_processes "$slug"
+  rm -rf "$(cluster_dir "$slug")"
+  rm -rf "$(socket_dir "$slug")"
+  printf 'cluster %s state removed\n' "$slug"
+}
+
+main() {
+  local cmd="${1:-}"
+  [ -n "$cmd" ] || {
+    usage
+    exit 2
+  }
+  shift
+
+  case "$cmd" in
+    start) start_cluster "$@" ;;
+    stop) stop_cluster "$@" ;;
+    status) status_cluster "$@" ;;
+    info) info_cluster "$@" ;;
+    config) config_cluster "$@" ;;
+    update) update_cluster "$@" ;;
+    restart) restart_service "$@" ;;
+    ssh) ssh_cluster "$@" ;;
+    reset) reset_cluster "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

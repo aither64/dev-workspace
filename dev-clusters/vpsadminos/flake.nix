@@ -1,8 +1,7 @@
 {
-  description = "Workspace-local vpsAdmin development clusters";
+  description = "Workspace-local vpsAdminOS development clusters";
 
   inputs = {
-    vpsadmin.url = "github:vpsfreecz/vpsadmin/master";
     vpsadminos.url = "github:vpsfreecz/vpsadminos/staging";
     nixpkgs.follows = "vpsadminos/nixpkgs";
   };
@@ -11,7 +10,6 @@
     {
       self,
       nixpkgs,
-      vpsadmin,
       vpsadminos,
     }:
     let
@@ -25,19 +23,14 @@
         in
         if value == "" then default else value;
 
-      workspace = env "VPSADMIN_DEVCLUSTER_WORKSPACE" (env "PWD" ".");
-      slug = env "VPSADMIN_DEVCLUSTER_SLUG" "dev";
-      topology = env "VPSADMIN_DEVCLUSTER_TOPOLOGY" "single";
-      networkMode = env "VPSADMIN_DEVCLUSTER_NETWORK" "bridge";
-      bridgeHelper = env "VPSADMIN_DEVCLUSTER_BRIDGE_HELPER" "/run/wrappers/bin/qemu-bridge-helper";
-      certDir = env "VPSADMIN_DEVCLUSTER_CERT_DIR" "${workspace}/.dev-clusters/vpsadmin/certs/default";
-      clusterConfigFile = env "VPSADMIN_DEVCLUSTER_CONFIG_FILE" "";
-      sshPubKey = env "VPSADMIN_DEVCLUSTER_SSH_PUBKEY" "${workspace}/.dev-clusters/vpsadmin/ssh/id_ed25519.pub";
-      vpsadminSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_SOURCE" vpsadmin.outPath;
-      vpsadminosSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE" vpsadminos.outPath;
-      haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
-      configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
-      mailTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE" "";
+      workspace = env "VPSADMINOS_DEVCLUSTER_WORKSPACE" (env "PWD" ".");
+      slug = env "VPSADMINOS_DEVCLUSTER_SLUG" "dev";
+      topology = env "VPSADMINOS_DEVCLUSTER_TOPOLOGY" "single";
+      networkMode = env "VPSADMINOS_DEVCLUSTER_NETWORK" "local";
+      bridgeHelper = env "VPSADMINOS_DEVCLUSTER_BRIDGE_HELPER" "/run/wrappers/bin/qemu-bridge-helper";
+      clusterConfigFile = env "VPSADMINOS_DEVCLUSTER_CONFIG_FILE" "";
+      sshPubKey = env "VPSADMINOS_DEVCLUSTER_SSH_PUBKEY" "${workspace}/.dev-clusters/vpsadminos/ssh/id_ed25519.pub";
+      vpsadminosSourcePath = env "VPSADMINOS_DEVCLUSTER_VPSADMINOS_SOURCE" vpsadminos.outPath;
       sharedRunnerLib = builtins.path {
         path = "${workspace}/dev-clusters/lib";
         name = "devcluster-runner-lib";
@@ -51,21 +44,15 @@
       clusterTest = import ./nix/test.nix {
         inherit
           lib
-          vpsadmin
           vpsadminos
           workspace
           slug
           topology
           networkMode
           bridgeHelper
-          certDir
           clusterConfigFile
           sshPubKey
-          vpsadminSourcePath
           vpsadminosSourcePath
-          haveapiSourcePath
-          configSourcePath
-          mailTemplatesSourcePath
           ;
       };
 
@@ -79,7 +66,7 @@
 
       ruby = pkgs.ruby_vpsadminos;
       runnerDeps = pkgs.bundlerEnv {
-        name = "vpsadmin-devcluster-runner-deps";
+        name = "vpsadminos-devcluster-runner-deps";
         gemfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile";
         lockfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile.lock";
         gemset = vpsadminos.outPath + "/os/packages/test-runner/gemset.nix";
@@ -87,7 +74,7 @@
         inherit ruby;
       };
 
-      runner = pkgs.writeShellScriptBin "vpsadmin-devcluster-runner" ''
+      runner = pkgs.writeShellScriptBin "vpsadminos-devcluster-runner" ''
         export GEM_HOME=${runnerDeps}/${ruby.gemPath}
         export GEM_PATH=${runnerDeps}/${ruby.gemPath}
         export RUBYLIB=${./lib}:${sharedRunnerLib}:${vpsadminos.outPath}/test-runner/lib:${vpsadminos.outPath}/osvm/lib:${vpsadminos.outPath}/libosctl/lib
@@ -105,7 +92,7 @@
       apps.${system} = {
         runner = {
           type = "app";
-          program = "${runner}/bin/vpsadmin-devcluster-runner";
+          program = "${runner}/bin/vpsadminos-devcluster-runner";
         };
         default = self.apps.${system}.runner;
       };

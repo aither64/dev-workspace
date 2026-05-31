@@ -1,0 +1,45 @@
+{
+  "network": {
+    "bridge": "br0",
+    "gateway": "172.16.106.1",
+    "prefixLength": 24,
+    "localPrefixLength": 24,
+    "socketPort": 23106,
+    "localNameservers": ["1.1.1.1", "9.9.9.9"],
+    "upstreamNameservers": ["172.16.9.90", "172.19.9.90"]
+  },
+  "nodes": {
+    "node1": {
+      "name": "dev-os1",
+      "localIp": "192.168.106.11",
+      "bridgeIp": "172.16.106.71",
+      "cpus": 4,
+      "memoryMiB": 8192,
+      "diskSize": "20G",
+      "sshPort": 11122
+    },
+    "node2": {
+      "name": "dev-os2",
+      "localIp": "192.168.106.12",
+      "bridgeIp": "172.16.106.72",
+      "cpus": 4,
+      "memoryMiB": 8192,
+      "diskSize": "20G",
+      "sshPort": 11222
+    },
+    "node3": {
+      "name": "dev-os3",
+      "localIp": "192.168.106.13",
+      "bridgeIp": "172.16.106.73",
+      "cpus": 4,
+      "memoryMiB": 8192,
+      "diskSize": "20G",
+      "sshPort": 11322
+    }
+  },
+  "topologies": {
+    "single": ["node1"],
+    "dual": ["node1", "node2"],
+    "triple": ["node1", "node2", "node3"]
+  }
+}

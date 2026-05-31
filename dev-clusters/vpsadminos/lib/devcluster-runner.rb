@@ -5,6 +5,5 @@ require 'devcluster_runner'
 
 exit DevClusters::OsVmRunner.run(
   ARGV,
-  hash_base: 'vpsadmin-devcluster',
-  priority_machines: ['services']
+  hash_base: 'vpsadminos-devcluster'
 )
