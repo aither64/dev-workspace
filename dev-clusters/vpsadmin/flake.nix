@@ -4,6 +4,12 @@
   inputs = {
     vpsadmin.url = "github:vpsfreecz/vpsadmin/master";
     vpsadminos.url = "github:vpsfreecz/vpsadminos/staging";
+    vpsfStatus = {
+      url = "github:vpsfreecz/vpsf-status/master";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.vpsadmin.follows = "vpsadmin";
+      inputs.vpsadminos.follows = "vpsadminos";
+    };
     nixpkgs.follows = "vpsadminos/nixpkgs";
   };
 
@@ -13,6 +19,7 @@
       nixpkgs,
       vpsadmin,
       vpsadminos,
+      vpsfStatus,
     }:
     let
       system = "x86_64-linux";
@@ -38,6 +45,8 @@
       haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
       configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
       mailTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE" "";
+      vpsfStatusSourcePath = env "VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE" "";
+      vpsadminGoClientSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE" "";
       sharedRunnerLib = builtins.path {
         path = "${workspace}/dev-clusters/lib";
         name = "devcluster-runner-lib";
@@ -53,6 +62,7 @@
           lib
           vpsadmin
           vpsadminos
+          vpsfStatus
           workspace
           slug
           topology
@@ -66,6 +76,8 @@
           haveapiSourcePath
           configSourcePath
           mailTemplatesSourcePath
+          vpsfStatusSourcePath
+          vpsadminGoClientSourcePath
           ;
       };
 

@@ -2,6 +2,7 @@
   lib,
   vpsadmin,
   vpsadminos,
+  vpsfStatus,
   workspace,
   slug,
   topology,
@@ -15,6 +16,8 @@
   haveapiSourcePath,
   configSourcePath,
   mailTemplatesSourcePath,
+  vpsfStatusSourcePath,
+  vpsadminGoClientSourcePath,
 }:
 { pkgs, ... }:
 let
@@ -280,6 +283,49 @@ let
     else
       null;
   mailTemplatePaths = if installMailTemplates then [ "${mailTemplatesStorePath}" ] else [ ];
+  vpsfStatusLocalSource =
+    if vpsfStatusSourcePath != "" then
+      builtins.path {
+        path = vpsfStatusSourcePath;
+        name = "vpsf-status-source";
+      }
+    else
+      null;
+  vpsadminGoClientSource =
+    if vpsadminGoClientSourcePath != "" then
+      builtins.path {
+        path = vpsadminGoClientSourcePath;
+        name = "vpsadmin-go-client-source";
+      }
+    else
+      null;
+  vpsfStatusPackage =
+    if vpsfStatusLocalSource != null then
+      pkgs.callPackage (vpsfStatusLocalSource + "/nix/package.nix") {
+        src = vpsfStatusLocalSource;
+        version = "dev";
+        vpsadminGoClientSource = vpsadminGoClientSource;
+      }
+    else
+      vpsfStatus.packages.${pkgs.stdenv.hostPlatform.system}.vpsf-status;
+  vpsfStatusModule =
+    if vpsfStatusLocalSource != null then
+      import (vpsfStatusLocalSource + "/nix/module.nix")
+    else
+      vpsfStatus.nixosModules.vpsf-status;
+  vpsfStatusLocation = {
+    id = seed.location.id;
+    label = seed.location.label;
+    nodes = map (node: {
+      id = node.id;
+      name = node.domainName;
+      ip_address = node.ip;
+    }) nodeList;
+    dns_resolvers = map (node: {
+      name = node.serverName;
+      ip_address = node.ip;
+    }) dnsServerList;
+  };
 
   devSeed = pkgs.writeText "vpsadmin-devcluster-seed.rb" ''
     require 'ipaddress'
@@ -918,7 +964,10 @@ let
       ...
     }:
     {
-      imports = [ sshModule ];
+      imports = [
+        sshModule
+        vpsfStatusModule
+      ];
 
       boot.initrd.kernelModules = [ "virtiofs" ];
       boot.supportedFilesystems.virtiofs = true;
@@ -958,6 +1007,24 @@ let
           ];
           server = resolverUpstreamNameservers;
           host-record = dnsmasqHostRecords;
+        };
+      };
+
+      services.vpsf-status = {
+        enable = true;
+        package = vpsfStatusPackage;
+        settings = {
+          check_interval = 5;
+          check_timeout = 10;
+          history_days = 7;
+          vpsadmin = {
+            api_url = "https://${domains.api}";
+            webui_url = "https://${domains.webui}";
+            console_url = "https://${domains.console}/console.js";
+          };
+          locations = [ vpsfStatusLocation ];
+          web_services = [ ];
+          nameservers = [ ];
         };
       };
 
@@ -1043,6 +1110,14 @@ let
           locations."/" = {
             proxyPass = "http://127.0.0.1:${toString mailCapture.webPort}";
             proxyWebsockets = true;
+          };
+        };
+        "${domains.status}" = {
+          addSSL = true;
+          sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+          sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+          locations."/" = {
+            proxyPass = "http://127.0.0.1:${toString config.services.vpsf-status.port}";
           };
         };
         "${domains.adminer}" = {

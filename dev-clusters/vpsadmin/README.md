@@ -77,7 +77,9 @@ The default seed creates:
 - mail recipients for admin daily reports;
 - vpsfree mail templates, when the matching worktree exists;
 - Adminer database browser, exposed as
-  `https://adminer.aitherdev.int.vpsfree.cz/`.
+  `https://adminer.aitherdev.int.vpsfree.cz/`;
+- a vpsf-status instance on the services VM, exposed as
+  `https://status.aitherdev.int.vpsfree.cz/`.
 
 The plugin set is configured with `plugins.enabled`. The default value is
 `"all"`, which enables every plugin directory bundled in the selected vpsAdmin
@@ -149,11 +151,27 @@ closure-copied instead of mounted live.
 ## Database Browser
 
 Adminer runs on the services VM and is exposed through the same nginx HTTPS
-frontend as the Web UI, API, and Mailpit. The default basic-auth credentials are
-printed by `devcluster urls`.
+frontend as the Web UI, API, Mailpit, and status page. The default basic-auth
+credentials are printed by `devcluster urls`.
 
 Use `MySQL`, server `127.0.0.1`, user `vpsadmin`, and password
 `testMariadbApiPassword` to browse the vpsAdmin database.
+
+## Status Page
+
+vpsf-status runs on the services VM and is exposed through the same nginx HTTPS
+frontend as the Web UI, API, and Mailpit. If `worktrees/<slug>/vpsf-status`
+exists, it is used as the source for the status package. If
+`worktrees/<slug>/vpsadmin-go-client` exists, it is made available to that
+package for local generated-client testing.
+
+Re-run:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster update <slug> services
+```
+
+after changing vpsf-status or the generated Go client.
 
 ## Runtime Updates
 

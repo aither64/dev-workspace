@@ -518,6 +518,8 @@ nix_common_env() {
   local haveapi_path="$6"
   local config_path="$7"
   local mail_templates_path="$8"
+  local vpsf_status_path="$9"
+  local vpsadmin_go_client_path="${10}"
 
   export VPSADMIN_DEVCLUSTER_WORKSPACE="$WORKSPACE"
   export VPSADMIN_DEVCLUSTER_SLUG="$slug"
@@ -532,17 +534,25 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
   export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
   export VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE="$mail_templates_path"
+  export VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE="$vpsf_status_path"
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE="$vpsadmin_go_client_path"
 }
 
 nix_overrides() {
   local slug="$1"
   local vpsadmin_path="$2"
   local vpsadminos_input_value="$3"
+  local vpsf_status_path="$4"
 
   printf '%s\0%s\0' --override-input vpsadmin
   printf 'path:%s\0' "$vpsadmin_path"
   printf '%s\0%s\0%s\0' --override-input vpsadminos "$vpsadminos_input_value"
   printf '%s\0%s\0%s\0' --override-input vpsadmin/vpsadminos "$vpsadminos_input_value"
+
+  if [ -n "$vpsf_status_path" ]; then
+    printf '%s\0%s\0' --override-input vpsfStatus
+    printf 'path:%s\0' "$vpsf_status_path"
+  fi
 }
 
 build_config() {
@@ -555,6 +565,8 @@ build_config() {
   local haveapi_path
   local config_source_path
   local mail_templates_path
+  local vpsf_status_path
+  local vpsadmin_go_client_path
   local vpsadminos_input_value
 
   dir="$(cluster_dir "$slug")"
@@ -566,18 +578,20 @@ build_config() {
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
   mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
+  vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
+  vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
 
   if [ -z "$vpsadminos_path" ]; then
     vpsadminos_path=""
   fi
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path"
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$vpsf_status_path" "$vpsadmin_go_client_path"
 
   local -a overrides=()
   while IFS= read -r -d '' item; do
     overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
 
   nix build \
     --impure \
@@ -787,14 +801,15 @@ start_cluster() {
   printf '%s\n' "$topology" > "$(topology_file "$slug")"
   printf '%s\n' "$network" > "$(network_file "$slug")"
 
-  local vpsadmin_path vpsadminos_input_value
+  local vpsadmin_path vpsadminos_input_value vpsf_status_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
+  vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
 
   local -a runner_overrides=()
   while IFS= read -r -d '' item; do
     runner_overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
 
   local dir log ready sock_dir
   dir="$(cluster_dir "$slug")"
@@ -917,7 +932,7 @@ urls_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
   ensure_cluster_config "$slug"
-  local api_domain adminer_domain auth_domain console_domain webui_domain mailpit_domain
+  local api_domain adminer_domain auth_domain console_domain webui_domain mailpit_domain status_domain
   local adminer_user adminer_password mailpit_user mailpit_password
   api_domain="$(config_get "$slug" '.domains.api')"
   adminer_domain="$(config_get "$slug" '.domains.adminer')"
@@ -925,6 +940,7 @@ urls_cluster() {
   console_domain="$(config_get "$slug" '.domains.console')"
   webui_domain="$(config_get "$slug" '.domains.webui')"
   mailpit_domain="$(config_get "$slug" '.domains.mailpit')"
+  status_domain="$(config_get "$slug" '.domains.status')"
   adminer_user="$(config_get "$slug" '.adminer.webAuth.username')"
   adminer_password="$(config_get "$slug" '.adminer.webAuth.password')"
   mailpit_user="$(config_get "$slug" '.mail.capture.webAuth.username')"
@@ -938,6 +954,7 @@ API:     https://$api_domain/
 Auth:    https://$auth_domain/
 Console: https://$console_domain/
 Mailpit: https://$mailpit_domain/
+Status:  https://$status_domain/
 Adminer: https://$adminer_domain/
 
 Admin login: test-admin
@@ -976,6 +993,7 @@ port 10443:
   https://$auth_domain:10443/
   https://$console_domain:10443/
   https://$mailpit_domain:10443/
+  https://$status_domain:10443/
   https://$adminer_domain:10443/
 EOF
   fi
