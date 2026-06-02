@@ -1,6 +1,7 @@
 {
   "domains": {
     "api": "api.aitherdev.int.vpsfree.cz",
+    "adminer": "adminer.aitherdev.int.vpsfree.cz",
     "auth": "auth.aitherdev.int.vpsfree.cz",
     "console": "console.aitherdev.int.vpsfree.cz",
     "download": "download.aitherdev.int.vpsfree.cz",
@@ -82,6 +83,14 @@
     },
     "templates": {
       "install": true
+    }
+  },
+  "adminer": {
+    "port": 18081,
+    "webAuth": {
+      "enable": true,
+      "username": "adminer",
+      "password": "adminerPassword"
     }
   },
   "dns": {

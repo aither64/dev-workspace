@@ -75,7 +75,9 @@ The default seed creates:
 - two non-admin users, `test-user1` and `test-user2`;
 - default VPS resource values and per-user resource packages;
 - mail recipients for admin daily reports;
-- vpsfree mail templates, when the matching worktree exists.
+- vpsfree mail templates, when the matching worktree exists;
+- Adminer database browser, exposed as
+  `https://adminer.aitherdev.int.vpsfree.cz/`.
 
 The plugin set is configured with `plugins.enabled`. The default value is
 `"all"`, which enables every plugin directory bundled in the selected vpsAdmin
@@ -143,6 +145,15 @@ dev-clusters/vpsadmin/bin/devcluster update <slug> services
 after changing template files or the cluster mail seed config. Runtime virtiofs
 mounts cannot be added to an already-running VM, so templates are intentionally
 closure-copied instead of mounted live.
+
+## Database Browser
+
+Adminer runs on the services VM and is exposed through the same nginx HTTPS
+frontend as the Web UI, API, and Mailpit. The default basic-auth credentials are
+printed by `devcluster urls`.
+
+Use `MySQL`, server `127.0.0.1`, user `vpsadmin`, and password
+`testMariadbApiPassword` to browse the vpsAdmin database.
 
 ## Runtime Updates
 

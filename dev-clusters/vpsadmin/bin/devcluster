@@ -916,12 +916,17 @@ status_cluster() {
 urls_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
-  local api_domain auth_domain console_domain webui_domain mailpit_domain mailpit_user mailpit_password
+  ensure_cluster_config "$slug"
+  local api_domain adminer_domain auth_domain console_domain webui_domain mailpit_domain
+  local adminer_user adminer_password mailpit_user mailpit_password
   api_domain="$(config_get "$slug" '.domains.api')"
+  adminer_domain="$(config_get "$slug" '.domains.adminer')"
   auth_domain="$(config_get "$slug" '.domains.auth')"
   console_domain="$(config_get "$slug" '.domains.console')"
   webui_domain="$(config_get "$slug" '.domains.webui')"
   mailpit_domain="$(config_get "$slug" '.domains.mailpit')"
+  adminer_user="$(config_get "$slug" '.adminer.webAuth.username')"
+  adminer_password="$(config_get "$slug" '.adminer.webAuth.password')"
   mailpit_user="$(config_get "$slug" '.mail.capture.webAuth.username')"
   mailpit_password="$(config_get "$slug" '.mail.capture.webAuth.password')"
 
@@ -933,6 +938,7 @@ API:     https://$api_domain/
 Auth:    https://$auth_domain/
 Console: https://$console_domain/
 Mailpit: https://$mailpit_domain/
+Adminer: https://$adminer_domain/
 
 Admin login: test-admin
 Admin password: testAdminPassword
@@ -940,6 +946,12 @@ User login: test-user1
 User password: testUser1Password
 User login: test-user2
 User password: testUser2Password
+Adminer login: $adminer_user
+Adminer password: $adminer_password
+Adminer DB system: MySQL
+Adminer DB server: 127.0.0.1
+Adminer DB user: vpsadmin
+Adminer DB password: testMariadbApiPassword
 Mailpit login: $mailpit_user
 Mailpit password: $mailpit_password
 CA: $CERT_DIR/vpsadmin-ca.crt
@@ -964,6 +976,7 @@ port 10443:
   https://$auth_domain:10443/
   https://$console_domain:10443/
   https://$mailpit_domain:10443/
+  https://$adminer_domain:10443/
 EOF
   fi
 }

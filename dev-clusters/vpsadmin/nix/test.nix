@@ -97,6 +97,19 @@ let
     else
       throw "Unsupported devcluster plugins.enabled value";
   mailCapture = devConfig.mail.capture;
+  adminerConfig = devConfig.adminer or { };
+  adminerAuth =
+    adminerConfig.webAuth or {
+      enable = false;
+    };
+  adminerBasicAuth =
+    if adminerAuth.enable or false then
+      {
+        "${adminerAuth.username}" = adminerAuth.password;
+      }
+    else
+      { };
+  adminerPort = adminerConfig.port or 18081;
   dnsEnabled = devConfig.dns.enable or false;
   dnsServersConfig = if dnsEnabled then devConfig.dns.servers or { } else { };
   mailpitAuth =
@@ -948,6 +961,20 @@ let
         };
       };
 
+      systemd.services.adminer = {
+        description = "Adminer database browser";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "network.target"
+          "mysql.service"
+        ];
+        serviceConfig = {
+          ExecStart = "${pkgs.php}/bin/php -S 127.0.0.1:${toString adminerPort} -t ${pkgs.adminer} ${pkgs.adminer}/adminer.php";
+          Restart = "always";
+          RestartSec = "2s";
+        };
+      };
+
       virtualisation.fileSystems = sharedMounts;
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
@@ -1016,6 +1043,15 @@ let
           locations."/" = {
             proxyPass = "http://127.0.0.1:${toString mailCapture.webPort}";
             proxyWebsockets = true;
+          };
+        };
+        "${domains.adminer}" = {
+          addSSL = true;
+          sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+          sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+          basicAuth = adminerBasicAuth;
+          locations."/" = {
+            proxyPass = "http://127.0.0.1:${toString adminerPort}";
           };
         };
       };
