@@ -114,6 +114,11 @@ ensure_cluster_config() {
     cp "$DEFAULT_CONFIG_FILE" "$cfg"
   fi
 
+  local tmp
+  tmp="$(mktemp)"
+  jq -s '.[0] * .[1]' "$DEFAULT_CONFIG_FILE" "$cfg" > "$tmp"
+  mv "$tmp" "$cfg"
+
   jq -e . "$cfg" >/dev/null
 }
 
