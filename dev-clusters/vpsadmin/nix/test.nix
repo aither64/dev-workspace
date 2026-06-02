@@ -1412,6 +1412,7 @@ in
             "test.nix"
             "${devSeed}"
           ];
+          mailpit.enable = false;
           inherit rabbitmqNodeUsers;
         };
       };
