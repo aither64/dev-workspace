@@ -1193,8 +1193,18 @@ let
                   "https://${domains.auth}"
                   "https://${tmpDomains.auth}"
                 ];
+                extraConfig = ''
+                  ini_set('session.save_path', '/run/vpsadmin-webui-sessions');
+                  ini_set('session.gc_probability', '1');
+                  ini_set('session.gc_divisor', '1');
+                  ini_set('session.gc_maxlifetime', '3600');
+                '';
               };
             };
+
+            systemd.tmpfiles.rules = [
+              "d /run/vpsadmin-webui-sessions 0750 vpsadmin-webui vpsadmin-webui - -"
+            ];
 
             systemd.services.vpsadmin-webui-live-root = {
               description = "Create live vpsAdmin web UI source tree";
