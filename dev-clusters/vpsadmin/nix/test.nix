@@ -1187,7 +1187,7 @@ let
                 domain = lib.mkForce domains.webui;
                 sourceCodeDir = lib.mkForce "/run/vpsadmin-live-webui";
                 api.externalUrl = lib.mkForce "https://${domains.api}";
-                api.internalUrl = lib.mkForce "http://api.vpsadmin.test";
+                api.internalUrl = lib.mkForce "http://${domains.api}";
                 api.oauth2TrustedOrigins = [
                   "https://${domains.api}"
                   "https://${domains.auth}"
