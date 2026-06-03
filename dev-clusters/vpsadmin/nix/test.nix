@@ -1014,7 +1014,7 @@ let
         enable = true;
         package = vpsfStatusPackage;
         settings = {
-          check_interval = 5;
+          check_interval = 30;
           check_timeout = 10;
           history_days = 7;
           vpsadmin = {
@@ -1205,6 +1205,28 @@ let
             systemd.tmpfiles.rules = [
               "d /run/vpsadmin-webui-sessions 0750 vpsadmin-webui vpsadmin-webui - -"
             ];
+
+            systemd.services.vpsadmin-webui-prune-sessions = {
+              description = "Prune expired vpsAdmin web UI sessions";
+              after = [ "systemd-tmpfiles-setup.service" ];
+              unitConfig.ConditionPathIsDirectory = "/run/vpsadmin-webui-sessions";
+              serviceConfig = {
+                Type = "oneshot";
+                User = "vpsadmin-webui";
+                Group = "vpsadmin-webui";
+                ExecStart = "${pkgs.findutils}/bin/find /run/vpsadmin-webui-sessions -maxdepth 1 -type f -name 'sess_*' -mmin +60 -delete";
+              };
+            };
+
+            systemd.timers.vpsadmin-webui-prune-sessions = {
+              description = "Prune expired vpsAdmin web UI sessions";
+              wantedBy = [ "timers.target" ];
+              timerConfig = {
+                OnBootSec = "5min";
+                OnUnitActiveSec = "5min";
+                AccuracySec = "1min";
+              };
+            };
 
             systemd.services.vpsadmin-webui-live-root = {
               description = "Create live vpsAdmin web UI source tree";
