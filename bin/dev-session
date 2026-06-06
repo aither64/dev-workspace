@@ -279,14 +279,13 @@ module VpsfreeDevSession
         raise Error, "worktree has uncommitted changes: #{paths}"
       end
 
-      @tmux.run('kill-session', '-t', slug) if session_exists
-
       entries.each do |entry|
         remove_worktree_path(entry.fetch(:path), force:)
       end
 
       remove_empty_dir(worktrees_dir(slug))
       FileUtils.rm_rf(work_dir(slug)) if all
+      @tmux.run('kill-session', '-t', slug) if session_exists
     end
 
     def list(input = nil, as_is: false)

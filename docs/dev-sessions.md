@@ -81,9 +81,11 @@ session.
 bin/dev-session remove api-token-rotation
 ```
 
-It kills the managed tmux session when one exists, removes clean git worktrees
-under `worktrees/<slug>/`, and removes the empty worktree group directory.
-Branches are kept. `work/<slug>/plan.md` and `state.md` are kept by default.
+It removes clean git worktrees under `worktrees/<slug>/`, removes the empty
+worktree group directory, and then kills the managed tmux session when one
+exists. This order makes it safe to run from inside its own managed session:
+the session is killed only after cleanup has completed. Branches are kept.
+`work/<slug>/plan.md` and `state.md` are kept by default.
 
 Dirty worktrees are refused unless `--force` is passed:
 

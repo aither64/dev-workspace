@@ -39,6 +39,31 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  class ManagedTmux < NullTmux
+    attr_reader :killed
+
+    def initialize(slug, on_kill: nil)
+      @slug = slug
+      @on_kill = on_kill
+      @killed = false
+    end
+
+    def session_exists?(slug)
+      slug == @slug && !@killed
+    end
+
+    def managed_session?(slug)
+      slug == @slug
+    end
+
+    def run(*args)
+      return unless args == ['kill-session', '-t', @slug]
+
+      @on_kill&.call
+      @killed = true
+    end
+  end
+
   TODAY = Date.new(2026, 6, 6)
 
   def test_build_slug_prefixes_current_date
@@ -381,6 +406,36 @@ class DevSessionTest < Minitest::Test
         '--quiet',
         'refs/heads/2026-06-06-demo'
       )
+    end
+  end
+
+  def test_remove_kills_session_after_worktrees_are_removed
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+
+      add_runner = runner_for(workspace)
+      add_runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      tmux = ManagedTmux.new(slug, on_kill: -> { refute(File.exist?(path)) })
+      remove_runner = runner_for(workspace, tmux:)
+
+      remove_runner.remove('demo', as_is: false, force: false, all: false)
+
+      assert(tmux.killed)
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      assert(File.exist?(File.join(workspace, 'work', slug)))
     end
   end
 
