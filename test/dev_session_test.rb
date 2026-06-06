@@ -4,6 +4,7 @@ require 'date'
 require 'fileutils'
 require 'minitest/autorun'
 require 'open3'
+require 'shellwords'
 require 'stringio'
 require 'tmpdir'
 
@@ -21,6 +22,20 @@ class DevSessionTest < Minitest::Test
 
     def managed_session?(_slug)
       false
+    end
+
+    def current_session
+      nil
+    end
+  end
+
+  class CurrentTmux < NullTmux
+    def initialize(slug)
+      @slug = slug
+    end
+
+    def current_session
+      @slug
     end
   end
 
@@ -214,6 +229,91 @@ class DevSessionTest < Minitest::Test
         assert_match(/[0-9]/, line[worktrees_column, 'WORKTREES'.length])
         assert_equal('none', line[tmux_column, 4])
       end
+    end
+  end
+
+  def test_current_uses_environment_slug
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      runner = runner_for(
+        workspace,
+        env: { VpsfreeDevSession::ENV_SLUG => slug },
+        out:
+      )
+
+      assert_equal(slug, runner.current)
+      assert_equal("#{slug}\n", out.string)
+    end
+  end
+
+  def test_current_uses_managed_tmux_session_slug
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      runner = runner_for(workspace, tmux: CurrentTmux.new(slug), out:)
+
+      assert_equal(slug, runner.current)
+      assert_equal("#{slug}\n", out.string)
+    end
+  end
+
+  def test_current_uses_work_directory_slug
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      cwd = File.join(workspace, 'work', slug, 'notes')
+      FileUtils.mkdir_p(cwd)
+
+      runner = runner_for(workspace, cwd:)
+
+      assert_equal(slug, runner.current_slug)
+    end
+  end
+
+  def test_current_uses_worktrees_directory_slug
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      cwd = File.join(workspace, 'worktrees', slug, 'vpsadmin', 'app')
+      FileUtils.mkdir_p(cwd)
+
+      runner = runner_for(workspace, cwd:)
+
+      assert_equal(slug, runner.current_slug)
+    end
+  end
+
+  def test_current_reports_missing_active_session
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.current
+      end
+
+      assert_match(/no current dev session/, error.message)
+    end
+  end
+
+  def test_current_reports_conflicting_sources
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      other_slug = '2026-06-06-other'
+      cwd = File.join(workspace, 'work', other_slug)
+      FileUtils.mkdir_p(cwd)
+
+      runner = runner_for(
+        workspace,
+        env: { VpsfreeDevSession::ENV_SLUG => slug },
+        cwd:
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.current
+      end
+
+      assert_match(/sources disagree/, error.message)
+      assert_match(/#{VpsfreeDevSession::ENV_SLUG}=#{slug}/, error.message)
+      assert_match(/cwd=#{other_slug}/, error.message)
     end
   end
 
@@ -435,6 +535,21 @@ class DevSessionTest < Minitest::Test
 
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
 
+      session_env = tmux_capture(socket, 'show-environment', '-t', slug)
+      assert_includes(session_env, "#{VpsfreeDevSession::ENV_SLUG}=#{slug}\n")
+      assert_includes(
+        session_env,
+        "#{VpsfreeDevSession::ENV_WORKSPACE}=#{workspace}\n"
+      )
+      assert_includes(
+        session_env,
+        "#{VpsfreeDevSession::ENV_WORK_DIR}=#{File.join(workspace, 'work', slug)}\n"
+      )
+      assert_includes(
+        session_env,
+        "#{VpsfreeDevSession::ENV_WORKTREES_DIR}=#{File.join(workspace, 'worktrees', slug)}\n"
+      )
+
       panes = tmux_capture(socket, 'list-panes', '-t', "#{slug}:dev", '-F', '#{pane_current_path}')
               .lines
               .map(&:chomp)
@@ -454,6 +569,12 @@ class DevSessionTest < Minitest::Test
       ).lines.map(&:chomp)
 
       assert_includes(windows, 'alpha:worktree')
+
+      probe = File.join(workspace, 'alpha-env.txt')
+      command = "printf '%s\\n' \"$#{VpsfreeDevSession::ENV_SLUG}\" > #{Shellwords.escape(probe)}"
+      tmux_run(socket, 'send-keys', '-t', "#{slug}:alpha", command, 'Enter')
+      wait_for_file(probe)
+      assert_equal(slug, File.read(probe).strip)
 
       tmux_run(socket, 'new-window', '-d', '-t', slug, '-n', 'custom', '-c', workspace)
       FileUtils.rm_rf(worktree)
@@ -481,13 +602,18 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def runner_for(workspace)
+  def runner_for(workspace, env: {}, cwd: nil, tmux: nil, out: nil)
+    out ||= StringIO.new
+    tmux ||= NullTmux.new
+
     VpsfreeDevSession::Runner.new(
       workspace:,
-      tmux: NullTmux.new,
-      out: StringIO.new,
+      tmux:,
+      out:,
       err: StringIO.new,
-      today: TODAY
+      today: TODAY,
+      env:,
+      cwd: cwd || workspace
     )
   end
 
@@ -524,6 +650,16 @@ class DevSessionTest < Minitest::Test
   def tmux_session_exists?(socket, slug)
     _stdout, _stderr, status = Open3.capture3('tmux', '-L', socket, 'has-session', '-t', slug)
     status.success?
+  end
+
+  def wait_for_file(path)
+    deadline = Time.now + 5
+
+    until File.exist?(path)
+      raise "timed out waiting for #{path}" if Time.now > deadline
+
+      sleep 0.05
+    end
   end
 
   def command_available?(cmd)

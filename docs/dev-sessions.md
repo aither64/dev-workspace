@@ -34,6 +34,13 @@ The first window is named `dev` and contains three panes:
 - right top: shell, with cwd set to `work/<slug>`;
 - right bottom: shell, with cwd set to `worktrees/<slug>`.
 
+Managed tmux panes and worktree windows receive these environment variables:
+
+- `VPSFREE_DEV_SESSION_SLUG`;
+- `VPSFREE_DEV_SESSION_WORKSPACE`;
+- `VPSFREE_DEV_SESSION_WORK_DIR`;
+- `VPSFREE_DEV_SESSION_WORKTREES_DIR`.
+
 `start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`, and
 `worktrees/<slug>/` when missing. Existing plan and state files are never
 overwritten.
@@ -46,6 +53,7 @@ bin/dev-session sync api-token-rotation
 bin/dev-session stop api-token-rotation
 bin/dev-session remove api-token-rotation
 bin/dev-session list
+bin/dev-session current
 ```
 
 Lookup commands accept a short name when it resolves to exactly one known slug
@@ -59,6 +67,13 @@ longer exists, and it leaves user-created windows untouched.
 
 `stop` only kills the managed tmux session. It leaves all files and worktrees in
 place.
+
+`current` prints the active slug and nothing else. It resolves the slug from the
+managed tmux session environment, the current managed tmux session, or a cwd
+under `work/<slug>` / `worktrees/<slug>`. It exits with an error when no active
+session can be found or when those sources disagree. Codex instances should run
+it before creating a new initiative slug; if it prints a slug, continue in that
+session.
 
 `remove` cleans up a development session:
 

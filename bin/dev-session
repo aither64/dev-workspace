@@ -15,6 +15,11 @@ module VpsfreeDevSession
   WINDOW_KIND = '@vpsfree_dev_session_window'
   WINDOW_WORKTREE = '@vpsfree_dev_session_worktree'
 
+  ENV_SLUG = 'VPSFREE_DEV_SESSION_SLUG'
+  ENV_WORKSPACE = 'VPSFREE_DEV_SESSION_WORKSPACE'
+  ENV_WORK_DIR = 'VPSFREE_DEV_SESSION_WORK_DIR'
+  ENV_WORKTREES_DIR = 'VPSFREE_DEV_SESSION_WORKTREES_DIR'
+
   USAGE = <<~USAGE
     Usage:
       dev-session [--workspace DIR] [--tmux-socket NAME] start <name-or-slug>
@@ -25,6 +30,7 @@ module VpsfreeDevSession
       dev-session [--workspace DIR] [--tmux-socket NAME] remove <name-or-slug>
         [--as-is] [--force] [--all]
       dev-session [--workspace DIR] [--tmux-socket NAME] list [<name-or-slug>] [--as-is]
+      dev-session [--workspace DIR] [--tmux-socket NAME] current
 
       dev-session [--workspace DIR] [--tmux-socket NAME] worktree add
         <name-or-slug> <project> [--as-is] [--name NAME] [--branch BRANCH]
@@ -132,6 +138,17 @@ module VpsfreeDevSession
       end
     end
 
+    def current_session
+      format = "\#{session_name}\t\#{@vpsfree_dev_session}\t\#{@vpsfree_dev_session_slug}"
+      stdout, _stderr, status = capture('display-message', '-p', format, allow_failure: true)
+      return nil unless status.success?
+
+      name, mark, opt_slug = stdout.chomp.split("\t", -1)
+      return nil unless mark == '1'
+
+      opt_slug.empty? ? name : opt_slug
+    end
+
     def session_option(slug, option)
       stdout, _stderr, status = capture(
         'show-options',
@@ -181,7 +198,9 @@ module VpsfreeDevSession
       err: $stderr,
       today: Date.today,
       command_runner: nil,
-      tmux: nil
+      tmux: nil,
+      env: ENV,
+      cwd: Dir.pwd
     )
       @workspace = File.expand_path(workspace)
       @out = out
@@ -189,6 +208,8 @@ module VpsfreeDevSession
       @today = today
       @command_runner = command_runner || CommandRunner.new(out:, err:)
       @tmux = tmux || Tmux.new(runner: @command_runner, socket: tmux_socket)
+      @env = env
+      @cwd = cwd
       @codex_command = codex_command || ENV.fetch('VPSFREE_DEV_SESSION_CODEX', 'codex')
     end
 
@@ -292,6 +313,12 @@ module VpsfreeDevSession
       end
 
       print_rows(rows)
+    end
+
+    def current
+      slug = current_slug
+      @out.puts slug
+      slug
     end
 
     def worktree_add(input, project, as_is:, name:, branch:, base:, fetch:)
@@ -412,6 +439,36 @@ module VpsfreeDevSession
       write_once(state_file(slug), state_skeleton(slug))
     end
 
+    def current_slug
+      sources = []
+
+      env_slug = @env[ENV_SLUG]
+      unless env_slug.nil? || env_slug.empty?
+        validate_part!(env_slug, "#{ENV_SLUG} value")
+        sources << [ENV_SLUG, env_slug]
+      end
+
+      tmux_slug = @tmux.current_session
+      unless tmux_slug.nil? || tmux_slug.empty?
+        validate_part!(tmux_slug, 'tmux session slug')
+        sources << ['tmux', tmux_slug]
+      end
+
+      cwd_slug = slug_from_path(@cwd)
+      sources << ['cwd', cwd_slug] if cwd_slug
+
+      slugs = sources.map(&:last).uniq
+      case slugs.length
+      when 0
+        raise Error, 'no current dev session found'
+      when 1
+        slugs.first
+      else
+        details = sources.map { |source, slug| "#{source}=#{slug}" }.join(', ')
+        raise Error, "current dev session sources disagree: #{details}"
+      end
+    end
+
     private
 
     def print_rows(rows)
@@ -467,10 +524,21 @@ module VpsfreeDevSession
     def create_tmux_session(slug, run_codex:)
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
-      command = ['new-session', '-d', '-s', slug, '-n', 'dev', '-c', workspace]
+      command = [
+        'new-session',
+        '-d',
+        '-s',
+        slug,
+        '-n',
+        'dev',
+        '-c',
+        workspace,
+        *tmux_environment_args(slug)
+      ]
       command << @codex_command if run_codex
 
       @tmux.run(*command)
+      set_tmux_environment(slug)
       @tmux.run('set-option', '-t', slug, SESSION_MARK, '1')
       @tmux.run('set-option', '-t', slug, SESSION_SLUG, slug)
       @tmux.run('set-window-option', '-t', "#{slug}:dev", WINDOW_KIND, 'dev')
@@ -486,6 +554,7 @@ module VpsfreeDevSession
       right = @tmux.capture(
         'split-window',
         '-h',
+        *tmux_environment_args(slug),
         '-P',
         '-F',
         '#{pane_id}',
@@ -498,6 +567,7 @@ module VpsfreeDevSession
       @tmux.capture(
         'split-window',
         '-v',
+        *tmux_environment_args(slug),
         '-P',
         '-F',
         '#{pane_id}',
@@ -518,6 +588,7 @@ module VpsfreeDevSession
       end
 
       ensure_managed_session!(slug)
+      set_tmux_environment(slug)
 
       desired = worktree_entries(slug)
       desired_paths = desired.map { |entry| entry.fetch(:path) }
@@ -539,6 +610,7 @@ module VpsfreeDevSession
           slug,
           '-n',
           entry.fetch(:name),
+          *tmux_environment_args(slug),
           '-c',
           entry.fetch(:path)
         ).first.strip
@@ -572,6 +644,27 @@ module VpsfreeDevSession
 
     def attach_command(slug)
       @tmux.argv('attach-session', '-t', slug)
+    end
+
+    def session_environment(slug)
+      {
+        ENV_SLUG => slug,
+        ENV_WORKSPACE => workspace,
+        ENV_WORK_DIR => work_dir(slug),
+        ENV_WORKTREES_DIR => worktrees_dir(slug)
+      }
+    end
+
+    def tmux_environment_args(slug)
+      session_environment(slug).flat_map do |key, value|
+        ['-e', "#{key}=#{value}"]
+      end
+    end
+
+    def set_tmux_environment(slug)
+      session_environment(slug).each do |key, value|
+        @tmux.run('set-environment', '-t', slug, key, value)
+      end
     end
 
     def worktree_entries(slug)
@@ -618,6 +711,32 @@ module VpsfreeDevSession
 
     def state_file(slug)
       File.join(work_dir(slug), 'state.md')
+    end
+
+    def slug_from_path(path)
+      expanded = File.expand_path(path)
+
+      [
+        File.join(workspace, 'work'),
+        File.join(workspace, 'worktrees')
+      ].each do |root|
+        slug = slug_from_path_under_root(root, expanded)
+        return slug if slug
+      end
+
+      nil
+    end
+
+    def slug_from_path_under_root(root, path)
+      expanded_root = File.expand_path(root)
+      prefix = "#{expanded_root}#{File::SEPARATOR}"
+      return nil unless path.start_with?(prefix)
+
+      slug = path.delete_prefix(prefix).split(File::SEPARATOR, 2).first
+      return nil if slug.nil? || slug.empty?
+      return nil unless valid_part?(slug)
+
+      slug
     end
 
     def write_once(path, content)
@@ -742,6 +861,8 @@ module VpsfreeDevSession
         run_remove
       when 'list'
         run_list
+      when 'current'
+        run_current
       when 'worktree'
         run_worktree
       else
@@ -819,6 +940,12 @@ module VpsfreeDevSession
       require_arity!(0..1, @argv, 'list')
 
       runner.list(@argv.first, as_is: opts[:as_is])
+    end
+
+    def run_current
+      require_arity!(0, @argv, 'current')
+
+      runner.current
     end
 
     def run_remove
