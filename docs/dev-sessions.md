@@ -12,8 +12,17 @@ Pass a short name by default:
 bin/dev-session start api-token-rotation
 ```
 
-On June 6, 2026, this resolves to `2026-06-06-api-token-rotation`. Use
-`--as-is` when the argument is already the slug:
+If a unique existing slug already matches that name, `start` resumes it. If no
+existing slug matches, it creates today's slug. On June 6, 2026, a new
+`api-token-rotation` session resolves to `2026-06-06-api-token-rotation`.
+
+Use `--new` to force today's slug even when older matching sessions exist:
+
+```sh
+bin/dev-session start api-token-rotation --new
+```
+
+Use `--as-is` when the argument is already the slug:
 
 ```sh
 bin/dev-session start 2026-06-06-api-token-rotation --as-is
@@ -21,7 +30,7 @@ bin/dev-session start 2026-06-06-api-token-rotation --as-is
 
 The first window is named `dev` and contains three panes:
 
-- left: `codex`, with cwd set to `work/<slug>`;
+- left: `codex`, with cwd set to the workspace repository root;
 - right top: shell, with cwd set to `work/<slug>`;
 - right bottom: shell, with cwd set to `worktrees/<slug>`.
 

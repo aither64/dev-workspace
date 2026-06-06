@@ -71,6 +71,95 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_slug_resolution_reuses_existing_unique_match
+    with_workspace do |workspace|
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-05-service-health-checks'))
+
+      runner = runner_for(workspace)
+
+      assert_equal(
+        '2026-06-05-service-health-checks',
+        runner.resolve_start_slug('service-health-checks', as_is: false, new: false)
+      )
+    end
+  end
+
+  def test_start_slug_resolution_creates_today_slug_when_no_match_exists
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+
+      assert_equal(
+        '2026-06-06-demo',
+        runner.resolve_start_slug('demo', as_is: false, new: false)
+      )
+    end
+  end
+
+  def test_start_slug_resolution_reports_ambiguity
+    with_workspace do |workspace|
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-05-demo'))
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-06-demo'))
+
+      runner = runner_for(workspace)
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.resolve_start_slug('demo', as_is: false, new: false)
+      end
+
+      assert_match(/ambiguous/, error.message)
+    end
+  end
+
+  def test_start_new_uses_today_slug_despite_existing_matches
+    with_workspace do |workspace|
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-04-demo'))
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-05-demo'))
+
+      runner = runner_for(workspace)
+
+      assert_equal(
+        '2026-06-06-demo',
+        runner.resolve_start_slug('demo', as_is: false, new: true)
+      )
+    end
+  end
+
+  def test_start_new_reuses_today_slug_when_it_already_exists
+    with_workspace do |workspace|
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-06-demo'))
+
+      runner = runner_for(workspace)
+
+      assert_equal(
+        '2026-06-06-demo',
+        runner.resolve_start_slug('demo', as_is: false, new: true)
+      )
+    end
+  end
+
+  def test_start_new_and_as_is_are_mutually_exclusive
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.resolve_start_slug('demo', as_is: true, new: true)
+      end
+
+      assert_match(/cannot be used together/, error.message)
+    end
+  end
+
+  def test_start_new_rejects_dated_slug
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.resolve_start_slug('2026-06-05-demo', as_is: false, new: true)
+      end
+
+      assert_match(/requires a short name/, error.message)
+    end
+  end
+
   def test_tracking_files_are_created_once
     with_workspace do |workspace|
       runner = runner_for(workspace)
@@ -281,7 +370,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
-      runner.start('demo', as_is: false, attach: false, run_codex: false)
+      runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       assert(tmux_session_exists?(socket, slug))
 
       runner.remove('demo', as_is: false, force: false, all: false)
@@ -344,13 +433,14 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
-      runner.start('demo', as_is: false, attach: false, run_codex: false)
+      runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
 
       panes = tmux_capture(socket, 'list-panes', '-t', "#{slug}:dev", '-F', '#{pane_current_path}')
               .lines
               .map(&:chomp)
 
       assert_equal(3, panes.length)
+      assert_includes(panes, workspace)
       assert_includes(panes, File.join(workspace, 'work', slug))
       assert_includes(panes, File.join(workspace, 'worktrees', slug))
 

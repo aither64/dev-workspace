@@ -18,7 +18,7 @@ module VpsfreeDevSession
   USAGE = <<~USAGE
     Usage:
       dev-session [--workspace DIR] [--tmux-socket NAME] start <name-or-slug>
-        [--as-is] [--attach] [--no-attach] [--no-codex]
+        [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
       dev-session [--workspace DIR] [--tmux-socket NAME] attach <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
@@ -192,8 +192,8 @@ module VpsfreeDevSession
       @codex_command = codex_command || ENV.fetch('VPSFREE_DEV_SESSION_CODEX', 'codex')
     end
 
-    def start(input, as_is:, attach:, run_codex:)
-      slug = build_slug(input, as_is:)
+    def start(input, as_is:, new:, attach:, run_codex:)
+      slug = resolve_start_slug(input, as_is:, new:)
 
       ensure_tracking_files(slug)
 
@@ -366,6 +366,26 @@ module VpsfreeDevSession
       as_is ? input : "#{today.strftime('%F')}-#{input}"
     end
 
+    def resolve_start_slug(input, as_is:, new:)
+      raise Error, '--as-is and --new cannot be used together' if as_is && new
+
+      if new
+        if dated_slug?(input)
+          raise Error, '--new requires a short name, not a dated slug'
+        end
+
+        return build_slug(input, as_is: false)
+      end
+
+      return input if as_is
+
+      lookup_slug(input, as_is: false)
+    rescue Error => e
+      raise unless e.message.start_with?('no slug found for ')
+
+      build_slug(input, as_is: false)
+    end
+
     def lookup_slug(input, as_is:)
       validate_part!(input, as_is ? 'slug' : 'name')
       return input if as_is
@@ -447,7 +467,7 @@ module VpsfreeDevSession
     def create_tmux_session(slug, run_codex:)
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
-      command = ['new-session', '-d', '-s', slug, '-n', 'dev', '-c', work_path]
+      command = ['new-session', '-d', '-s', slug, '-n', 'dev', '-c', workspace]
       command << @codex_command if run_codex
 
       @tmux.run(*command)
@@ -689,6 +709,10 @@ module VpsfreeDevSession
     def valid_part?(value)
       value.is_a?(String) && value.match?(SAFE_PART)
     end
+
+    def dated_slug?(value)
+      value.match?(/\A\d{4}-\d{2}-\d{2}-/)
+    end
   end
 
   class CLI
@@ -761,9 +785,10 @@ module VpsfreeDevSession
     end
 
     def run_start
-      opts = { as_is: false, attach: nil, run_codex: true }
+      opts = { as_is: false, new: false, attach: nil, run_codex: true }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--new') { opts[:new] = true }
         parser_opts.on('--attach') { opts[:attach] = true }
         parser_opts.on('--no-attach') { opts[:attach] = false }
         parser_opts.on('--no-codex') { opts[:run_codex] = false }
