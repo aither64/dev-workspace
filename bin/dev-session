@@ -1,0 +1,876 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'date'
+require 'fileutils'
+require 'open3'
+require 'optparse'
+require 'shellwords'
+
+module VpsfreeDevSession
+  SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
+
+  SESSION_MARK = '@vpsfree_dev_session'
+  SESSION_SLUG = '@vpsfree_dev_session_slug'
+  WINDOW_KIND = '@vpsfree_dev_session_window'
+  WINDOW_WORKTREE = '@vpsfree_dev_session_worktree'
+
+  USAGE = <<~USAGE
+    Usage:
+      dev-session [--workspace DIR] [--tmux-socket NAME] start <name-or-slug>
+        [--as-is] [--attach] [--no-attach] [--no-codex]
+      dev-session [--workspace DIR] [--tmux-socket NAME] attach <name-or-slug> [--as-is]
+      dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
+      dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
+      dev-session [--workspace DIR] [--tmux-socket NAME] remove <name-or-slug>
+        [--as-is] [--force] [--all]
+      dev-session [--workspace DIR] [--tmux-socket NAME] list [<name-or-slug>] [--as-is]
+
+      dev-session [--workspace DIR] [--tmux-socket NAME] worktree add
+        <name-or-slug> <project> [--as-is] [--name NAME] [--branch BRANCH]
+        [--base REF] [--no-fetch]
+      dev-session [--workspace DIR] [--tmux-socket NAME] worktree remove
+        <name-or-slug> <name> [--as-is] [--force]
+  USAGE
+
+  class Error < StandardError; end
+
+  class CommandError < Error
+    attr_reader :argv, :status, :stdout, :stderr
+
+    def initialize(argv, status, stdout, stderr)
+      @argv = argv
+      @status = status
+      @stdout = stdout
+      @stderr = stderr
+      super(message)
+    end
+
+    def message
+      parts = [
+        "command failed with exit #{status.exitstatus}: #{argv.map(&:shellescape).join(' ')}"
+      ]
+      parts << stdout.strip unless stdout.empty?
+      parts << stderr.strip unless stderr.empty?
+      parts.join("\n")
+    end
+  end
+
+  class CommandRunner
+    def initialize(out:, err:)
+      @out = out
+      @err = err
+    end
+
+    def capture(argv, allow_failure: false)
+      stdout, stderr, status = Open3.capture3(*argv.map(&:to_s))
+
+      unless allow_failure || status.success?
+        raise CommandError.new(argv, status, stdout, stderr)
+      end
+
+      [stdout, stderr, status]
+    end
+
+    def run(argv)
+      stdout, stderr, status = capture(argv, allow_failure: true)
+
+      @out.write(stdout)
+      @err.write(stderr)
+
+      raise CommandError.new(argv, status, stdout, stderr) unless status.success?
+
+      status
+    end
+  end
+
+  class Tmux
+    Window = Struct.new(:id, :name, :kind, :worktree, keyword_init: true)
+
+    def initialize(runner:, socket: nil)
+      @runner = runner
+      @socket = socket
+    end
+
+    def argv(*args)
+      base = ['tmux']
+      base += ['-L', @socket] if @socket
+      base + args
+    end
+
+    def capture(*args, allow_failure: false)
+      @runner.capture(argv(*args), allow_failure:)
+    end
+
+    def run(*args)
+      @runner.run(argv(*args))
+    end
+
+    def success?(*args)
+      _stdout, _stderr, status = capture(*args, allow_failure: true)
+      status.success?
+    end
+
+    def session_exists?(slug)
+      success?('has-session', '-t', slug)
+    end
+
+    def managed_session?(slug)
+      session_option(slug, SESSION_MARK) == '1'
+    end
+
+    def managed_sessions
+      format = "\#{session_name}\t\#{@vpsfree_dev_session}\t\#{@vpsfree_dev_session_slug}"
+      stdout, _stderr, status = capture('list-sessions', '-F', format, allow_failure: true)
+      return [] unless status.success?
+
+      stdout.lines.filter_map do |line|
+        name, mark, opt_slug = line.chomp.split("\t", -1)
+        next unless mark == '1'
+
+        opt_slug.empty? ? name : opt_slug
+      end
+    end
+
+    def session_option(slug, option)
+      stdout, _stderr, status = capture(
+        'show-options',
+        '-qv',
+        '-t',
+        slug,
+        option,
+        allow_failure: true
+      )
+      return nil unless status.success?
+
+      stdout.strip
+    end
+
+    def windows(slug)
+      format = [
+        "\#{window_id}",
+        "\#{window_name}",
+        "\#{@vpsfree_dev_session_window}",
+        "\#{@vpsfree_dev_session_worktree}"
+      ].join("\t")
+      stdout, _stderr, status = capture(
+        'list-windows',
+        '-t',
+        slug,
+        '-F',
+        format,
+        allow_failure: true
+      )
+      return [] unless status.success?
+
+      stdout.lines.map do |line|
+        id, name, kind, worktree = line.chomp.split("\t", -1)
+        Window.new(id:, name:, kind:, worktree:)
+      end
+    end
+  end
+
+  class Runner
+    attr_reader :workspace, :today
+
+    def initialize(
+      workspace:,
+      tmux_socket: nil,
+      codex_command: nil,
+      out: $stdout,
+      err: $stderr,
+      today: Date.today,
+      command_runner: nil,
+      tmux: nil
+    )
+      @workspace = File.expand_path(workspace)
+      @out = out
+      @err = err
+      @today = today
+      @command_runner = command_runner || CommandRunner.new(out:, err:)
+      @tmux = tmux || Tmux.new(runner: @command_runner, socket: tmux_socket)
+      @codex_command = codex_command || ENV.fetch('VPSFREE_DEV_SESSION_CODEX', 'codex')
+    end
+
+    def start(input, as_is:, attach:, run_codex:)
+      slug = build_slug(input, as_is:)
+
+      ensure_tracking_files(slug)
+
+      if @tmux.session_exists?(slug)
+        ensure_managed_session!(slug)
+      else
+        create_tmux_session(slug, run_codex:)
+      end
+
+      sync_slug(slug, require_session: true)
+
+      if attach.nil?
+        attach = $stdout.tty?
+      end
+
+      if attach
+        attach_to_session(slug)
+      else
+        @out.puts "session: #{slug}"
+        @out.puts "attach: #{attach_command(slug).map(&:shellescape).join(' ')}"
+      end
+    end
+
+    def attach(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      ensure_managed_session!(slug)
+      attach_to_session(slug)
+    end
+
+    def sync(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      sync_slug(slug, require_session: true)
+    end
+
+    def stop(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      ensure_managed_session!(slug)
+      @tmux.run('kill-session', '-t', slug)
+    end
+
+    def remove(input, as_is:, force:, all:)
+      slug = lookup_slug(input, as_is:)
+      session_exists = @tmux.session_exists?(slug)
+
+      known_state = session_exists ||
+                    File.directory?(work_dir(slug)) ||
+                    File.directory?(worktrees_dir(slug))
+
+      unless known_state
+        raise Error, "no dev session state found for #{slug}"
+      end
+
+      if session_exists && !@tmux.managed_session?(slug)
+        raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
+      end
+
+      entries = worktree_entries(slug)
+      dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
+
+      if !force && !dirty_entries.empty?
+        paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
+        raise Error, "worktree has uncommitted changes: #{paths}"
+      end
+
+      @tmux.run('kill-session', '-t', slug) if session_exists
+
+      entries.each do |entry|
+        remove_worktree_path(entry.fetch(:path), force:)
+      end
+
+      remove_empty_dir(worktrees_dir(slug))
+      FileUtils.rm_rf(work_dir(slug)) if all
+    end
+
+    def list(input = nil, as_is: false)
+      slugs = if input
+                [lookup_slug(input, as_is:)]
+              else
+                known_slugs
+              end
+
+      rows = slugs.sort.map do |slug|
+        session = if @tmux.session_exists?(slug)
+                    @tmux.managed_session?(slug) ? 'managed' : 'unmanaged'
+                  else
+                    'none'
+                  end
+
+        work = File.directory?(work_dir(slug)) ? 'yes' : 'no'
+        {
+          slug:,
+          work:,
+          worktrees: worktree_entries(slug).length.to_s,
+          tmux: session
+        }
+      end
+
+      print_rows(rows)
+    end
+
+    def worktree_add(input, project, as_is:, name:, branch:, base:, fetch:)
+      slug = build_slug(input, as_is:)
+      validate_part!(project, 'project')
+      validate_part!(name, 'worktree name') if name
+
+      branch ||= slug
+      validate_git_branch!(branch)
+
+      ensure_tracking_files(slug)
+
+      repo = repo_dir(project)
+      raise Error, "repository not found: #{repo}" unless File.directory?(repo)
+
+      @command_runner.run(['git', "--git-dir=#{repo}", 'fetch', 'origin']) if fetch
+
+      base ||= origin_head(repo)
+      name ||= project
+      path = File.join(worktrees_dir(slug), name)
+
+      raise Error, "worktree path already exists: #{path}" if File.exist?(path)
+
+      FileUtils.mkdir_p(File.dirname(path))
+
+      if branch_exists?(repo, branch)
+        @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
+      else
+        @command_runner.run([
+          'git',
+          "--git-dir=#{repo}",
+          'worktree',
+          'add',
+          '-b',
+          branch,
+          path,
+          base
+        ])
+      end
+
+      sync_slug(slug, require_session: false)
+      @out.puts path
+    end
+
+    def worktree_remove(input, name, as_is:, force:)
+      slug = lookup_slug(input, as_is:)
+      validate_part!(name, 'worktree name')
+
+      path = File.join(worktrees_dir(slug), name)
+      raise Error, "worktree not found: #{path}" unless File.directory?(path)
+
+      unless force || !worktree_dirty?(path)
+        raise Error, "worktree has uncommitted changes: #{path}"
+      end
+
+      remove_worktree_path(path, force:)
+      sync_slug(slug, require_session: false)
+    end
+
+    def remove_worktree_path(path, force:)
+      common_dir = git_capture(['git', '-C', path, 'rev-parse', '--git-common-dir']).strip
+      common_dir = File.expand_path(common_dir, path)
+
+      argv = ['git', "--git-dir=#{common_dir}", 'worktree', 'remove']
+      argv << '--force' if force
+      argv << path
+      @command_runner.run(argv)
+    end
+
+    def build_slug(input, as_is:)
+      validate_part!(input, as_is ? 'slug' : 'name')
+      as_is ? input : "#{today.strftime('%F')}-#{input}"
+    end
+
+    def lookup_slug(input, as_is:)
+      validate_part!(input, as_is ? 'slug' : 'name')
+      return input if as_is
+
+      slugs = known_slugs
+      return input if slugs.include?(input)
+
+      matches = slugs.select { |slug| slug.end_with?("-#{input}") }
+
+      case matches.length
+      when 0
+        raise Error, "no slug found for #{input.inspect}"
+      when 1
+        matches.first
+      else
+        raise Error, "slug #{input.inspect} is ambiguous: #{matches.sort.join(', ')}"
+      end
+    end
+
+    def ensure_tracking_files(slug)
+      FileUtils.mkdir_p(work_dir(slug))
+      FileUtils.mkdir_p(worktrees_dir(slug))
+      write_once(plan_file(slug), plan_skeleton(slug))
+      write_once(state_file(slug), state_skeleton(slug))
+    end
+
+    private
+
+    def print_rows(rows)
+      return if rows.empty?
+
+      columns = [
+        [:slug, 'SLUG', :left],
+        [:work, 'WORK', :left],
+        [:worktrees, 'WORKTREES', :right],
+        [:tmux, 'TMUX', :left]
+      ]
+
+      widths = columns.to_h do |key, title, _align|
+        [
+          key,
+          ([title.length] + rows.map { |row| row.fetch(key).length }).max
+        ]
+      end
+
+      @out.puts format_row(
+        columns.to_h { |key, title, _align| [key, title] },
+        columns,
+        widths,
+        header: true
+      )
+
+      rows.each do |row|
+        @out.puts format_row(row, columns, widths, header: false)
+      end
+    end
+
+    def format_row(row, columns, widths, header:)
+      columns.map do |key, _title, align|
+        value = row.fetch(key)
+        if !header && align == :right
+          value.rjust(widths.fetch(key))
+        else
+          value.ljust(widths.fetch(key))
+        end
+      end.join('  ')
+    end
+
+    def worktree_dirty?(path)
+      !git_capture(['git', '-C', path, 'status', '--porcelain']).empty?
+    end
+
+    def remove_empty_dir(path)
+      FileUtils.rmdir(path)
+    rescue Errno::ENOENT, Errno::ENOTEMPTY, Errno::EEXIST
+      nil
+    end
+
+    def create_tmux_session(slug, run_codex:)
+      work_path = work_dir(slug)
+      worktrees_path = worktrees_dir(slug)
+      command = ['new-session', '-d', '-s', slug, '-n', 'dev', '-c', work_path]
+      command << @codex_command if run_codex
+
+      @tmux.run(*command)
+      @tmux.run('set-option', '-t', slug, SESSION_MARK, '1')
+      @tmux.run('set-option', '-t', slug, SESSION_SLUG, slug)
+      @tmux.run('set-window-option', '-t', "#{slug}:dev", WINDOW_KIND, 'dev')
+
+      left = @tmux.capture(
+        'display-message',
+        '-p',
+        '-t',
+        "#{slug}:dev",
+        '#{pane_id}'
+      ).first.strip
+
+      right = @tmux.capture(
+        'split-window',
+        '-h',
+        '-P',
+        '-F',
+        '#{pane_id}',
+        '-t',
+        "#{slug}:dev",
+        '-c',
+        work_path
+      ).first.strip
+
+      @tmux.capture(
+        'split-window',
+        '-v',
+        '-P',
+        '-F',
+        '#{pane_id}',
+        '-t',
+        right,
+        '-c',
+        worktrees_path
+      )
+
+      @tmux.run('select-pane', '-t', left)
+    end
+
+    def sync_slug(slug, require_session:)
+      unless @tmux.session_exists?(slug)
+        return unless require_session
+
+        raise Error, "tmux session not found: #{slug}"
+      end
+
+      ensure_managed_session!(slug)
+
+      desired = worktree_entries(slug)
+      desired_paths = desired.map { |entry| entry.fetch(:path) }
+      windows = @tmux.windows(slug)
+      managed_paths = windows
+                      .select { |window| window.kind == 'worktree' }
+                      .map(&:worktree)
+
+      desired.each do |entry|
+        next if managed_paths.include?(entry.fetch(:path))
+
+        window_id = @tmux.capture(
+          'new-window',
+          '-d',
+          '-P',
+          '-F',
+          '#{window_id}',
+          '-t',
+          slug,
+          '-n',
+          entry.fetch(:name),
+          '-c',
+          entry.fetch(:path)
+        ).first.strip
+
+        @tmux.run('set-window-option', '-t', window_id, WINDOW_KIND, 'worktree')
+        @tmux.run('set-window-option', '-t', window_id, WINDOW_WORKTREE, entry.fetch(:path))
+      end
+
+      windows.each do |window|
+        next unless window.kind == 'worktree'
+        next if desired_paths.include?(window.worktree)
+
+        @tmux.run('kill-window', '-t', window.id)
+      end
+    end
+
+    def ensure_managed_session!(slug)
+      raise Error, "tmux session not found: #{slug}" unless @tmux.session_exists?(slug)
+      return if @tmux.managed_session?(slug)
+
+      raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
+    end
+
+    def attach_to_session(slug)
+      if ENV['TMUX'] && !ENV['TMUX'].empty?
+        @tmux.run('switch-client', '-t', slug)
+      else
+        exec(*attach_command(slug))
+      end
+    end
+
+    def attach_command(slug)
+      @tmux.argv('attach-session', '-t', slug)
+    end
+
+    def worktree_entries(slug)
+      root = worktrees_dir(slug)
+      return [] unless File.directory?(root)
+
+      Dir.children(root).sort.filter_map do |name|
+        path = File.join(root, name)
+        next unless File.directory?(path)
+        next unless File.exist?(File.join(path, '.git'))
+
+        { name:, path: File.expand_path(path) }
+      end
+    end
+
+    def known_slugs
+      (slug_dirs('work') + slug_dirs('worktrees') + @tmux.managed_sessions).uniq.sort
+    end
+
+    def slug_dirs(name)
+      root = File.join(workspace, name)
+      return [] unless File.directory?(root)
+
+      Dir.children(root).select do |child|
+        File.directory?(File.join(root, child)) && valid_part?(child)
+      end
+    end
+
+    def repo_dir(project)
+      File.join(workspace, 'repos', "#{project}.git")
+    end
+
+    def work_dir(slug)
+      File.join(workspace, 'work', slug)
+    end
+
+    def worktrees_dir(slug)
+      File.join(workspace, 'worktrees', slug)
+    end
+
+    def plan_file(slug)
+      File.join(work_dir(slug), 'plan.md')
+    end
+
+    def state_file(slug)
+      File.join(work_dir(slug), 'state.md')
+    end
+
+    def write_once(path, content)
+      return if File.exist?(path)
+
+      File.write(path, content)
+    end
+
+    def plan_skeleton(slug)
+      <<~PLAN
+        # #{slug}
+
+        ## Goal
+
+        ## Affected repositories
+
+        ## Approach
+
+        ## Compatibility and deployment
+
+        ## Testing plan
+      PLAN
+    end
+
+    def state_skeleton(slug)
+      <<~STATE
+        # #{slug}
+
+        ## Repositories
+
+        ## Status
+
+        ## Commands run
+
+        ## Results
+
+        ## Open questions
+
+        ## Cleanup
+      STATE
+    end
+
+    def origin_head(repo)
+      stdout, _stderr, status = @command_runner.capture(
+        [
+          'git',
+          "--git-dir=#{repo}",
+          'symbolic-ref',
+          '--quiet',
+          '--short',
+          'refs/remotes/origin/HEAD'
+        ],
+        allow_failure: true
+      )
+      return stdout.strip if status.success? && !stdout.strip.empty?
+
+      'origin/master'
+    end
+
+    def branch_exists?(repo, branch)
+      _stdout, _stderr, status = @command_runner.capture(
+        ['git', "--git-dir=#{repo}", 'show-ref', '--verify', '--quiet', "refs/heads/#{branch}"],
+        allow_failure: true
+      )
+      status.success?
+    end
+
+    def validate_git_branch!(branch)
+      stdout, _stderr, status = @command_runner.capture(
+        ['git', 'check-ref-format', '--branch', branch],
+        allow_failure: true
+      )
+      return if status.success? && stdout.strip == branch
+
+      raise Error, "invalid branch name: #{branch.inspect}"
+    end
+
+    def git_capture(argv)
+      stdout, _stderr, _status = @command_runner.capture(argv)
+      stdout
+    end
+
+    def validate_part!(value, label)
+      return if valid_part?(value)
+
+      raise Error, "invalid #{label}: #{value.inspect}"
+    end
+
+    def valid_part?(value)
+      value.is_a?(String) && value.match?(SAFE_PART)
+    end
+  end
+
+  class CLI
+    def initialize(argv, out: $stdout, err: $stderr)
+      @argv = argv.dup
+      @out = out
+      @err = err
+      @workspace = File.expand_path('..', __dir__)
+      @tmux_socket = nil
+    end
+
+    def run
+      parse_global_options
+      command = @argv.shift
+      raise Error, USAGE unless command
+
+      case command
+      when 'start'
+        run_start
+      when 'attach'
+        run_single_slug { |runner, slug, opts| runner.attach(slug, as_is: opts[:as_is]) }
+      when 'sync'
+        run_single_slug { |runner, slug, opts| runner.sync(slug, as_is: opts[:as_is]) }
+      when 'stop'
+        run_single_slug { |runner, slug, opts| runner.stop(slug, as_is: opts[:as_is]) }
+      when 'remove'
+        run_remove
+      when 'list'
+        run_list
+      when 'worktree'
+        run_worktree
+      else
+        raise Error, "unknown command: #{command}"
+      end
+
+      0
+    rescue OptionParser::ParseError, Error => e
+      @err.puts "error: #{e.message}"
+      1
+    end
+
+    private
+
+    def parse_global_options
+      until @argv.empty?
+        case @argv.first
+        when '--workspace'
+          @argv.shift
+          @workspace = File.expand_path(@argv.shift || raise(Error, '--workspace requires DIR'))
+        when /\A--workspace=(.+)\z/
+          @workspace = File.expand_path(Regexp.last_match(1))
+          @argv.shift
+        when '--tmux-socket'
+          @argv.shift
+          @tmux_socket = @argv.shift || raise(Error, '--tmux-socket requires NAME')
+        when /\A--tmux-socket=(.+)\z/
+          @tmux_socket = Regexp.last_match(1)
+          @argv.shift
+        when '-h', '--help'
+          @out.puts USAGE
+          exit 0
+        else
+          break
+        end
+      end
+    end
+
+    def runner
+      @runner ||= Runner.new(workspace: @workspace, tmux_socket: @tmux_socket, out: @out, err: @err)
+    end
+
+    def run_start
+      opts = { as_is: false, attach: nil, run_codex: true }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--attach') { opts[:attach] = true }
+        parser_opts.on('--no-attach') { opts[:attach] = false }
+        parser_opts.on('--no-codex') { opts[:run_codex] = false }
+      end
+      parser.parse!(@argv)
+      require_arity!(1, @argv, 'start')
+
+      runner.start(@argv.fetch(0), **opts)
+    end
+
+    def run_single_slug
+      opts = { as_is: false }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+      end
+      parser.parse!(@argv)
+      require_arity!(1, @argv, 'command')
+
+      yield runner, @argv.fetch(0), opts
+    end
+
+    def run_list
+      opts = { as_is: false }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+      end
+      parser.parse!(@argv)
+      require_arity!(0..1, @argv, 'list')
+
+      runner.list(@argv.first, as_is: opts[:as_is])
+    end
+
+    def run_remove
+      opts = { as_is: false, force: false, all: false }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--force') { opts[:force] = true }
+        parser_opts.on('--all') { opts[:all] = true }
+      end
+      parser.parse!(@argv)
+      require_arity!(1, @argv, 'remove')
+
+      runner.remove(@argv.fetch(0), **opts)
+    end
+
+    def run_worktree
+      subcommand = @argv.shift
+      raise Error, 'missing worktree subcommand' unless subcommand
+
+      case subcommand
+      when 'add'
+        run_worktree_add
+      when 'remove'
+        run_worktree_remove
+      else
+        raise Error, "unknown worktree subcommand: #{subcommand}"
+      end
+    end
+
+    def run_worktree_add
+      opts = {
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: nil,
+        fetch: true
+      }
+
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--name NAME') { |v| opts[:name] = v }
+        parser_opts.on('--branch BRANCH') { |v| opts[:branch] = v }
+        parser_opts.on('--base REF') { |v| opts[:base] = v }
+        parser_opts.on('--no-fetch') { opts[:fetch] = false }
+      end
+      parser.parse!(@argv)
+      require_arity!(2, @argv, 'worktree add')
+
+      runner.worktree_add(@argv.fetch(0), @argv.fetch(1), **opts)
+    end
+
+    def run_worktree_remove
+      opts = { as_is: false, force: false }
+
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--force') { opts[:force] = true }
+      end
+      parser.parse!(@argv)
+      require_arity!(2, @argv, 'worktree remove')
+
+      runner.worktree_remove(@argv.fetch(0), @argv.fetch(1), **opts)
+    end
+
+    def require_arity!(expected, args, command)
+      ok = if expected.is_a?(Range)
+             expected.cover?(args.length)
+           else
+             args.length == expected
+           end
+      return if ok
+
+      raise Error, "wrong number of arguments for #{command}"
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  exit VpsfreeDevSession::CLI.new(ARGV).run
+end
