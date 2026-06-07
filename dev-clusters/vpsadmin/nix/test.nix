@@ -118,6 +118,19 @@ let
   webEnabled = (webConfig.enable or true) && webSourcePath != "";
   webEnvironmentId = webConfig.environmentId or 1;
   webRoot = "/run/vpsfree-web-live";
+  webPackage =
+    if webEnabled then
+      import
+        (builtins.path {
+          path = webSourcePath;
+          name = "vpsfree-web-source";
+        })
+        {
+          inherit pkgs;
+          noDev = true;
+        }
+    else
+      null;
   dnsEnabled = devConfig.dns.enable or false;
   dnsServersConfig = if dnsEnabled then devConfig.dns.servers or { } else { };
   mailpitAuth =
@@ -1150,22 +1163,43 @@ let
           rm -rf "$dst"
           mkdir -p "$dst"
 
+          cat > "$dst/config.php" <<'PHP'
+          <?php
+          define ('API_URL', 'https://${domains.api}');
+          define ('ENVIRONMENT_ID', ${toString webEnvironmentId});
+          PHP
+
+          if [ -L "$src/config.php" ] || [ ! -e "$src/config.php" ]; then
+            ln -sfn "$dst/config.php" "$src/config.php"
+          fi
+
+          mkdir -p "$src/vendor"
+
           shopt -s dotglob nullglob
+          for entry in "$src/vendor"/*; do
+            if [ -L "$entry" ]; then
+              rm -f "$entry"
+            fi
+          done
+
+          for entry in ${webPackage}/vendor/*; do
+            base="$(basename "$entry")"
+            if [ -L "$src/vendor/$base" ] || [ ! -e "$src/vendor/$base" ]; then
+              ln -sfn "$entry" "$src/vendor/$base"
+            fi
+          done
+
           for entry in "$src"/*; do
             base="$(basename "$entry")"
             case "$base" in
-              .git|config.php|result|result-*)
+              .git|config.php|result|result-*|vendor)
                 continue
                 ;;
             esac
             ln -s "$entry" "$dst/$base"
           done
 
-          cat > "$dst/config.php" <<'PHP'
-          <?php
-          define ('API_URL', 'https://${domains.api}');
-          define ('ENVIRONMENT_ID', ${toString webEnvironmentId});
-          PHP
+          ln -s "$src/vendor" "$dst/vendor"
         '';
       };
 
