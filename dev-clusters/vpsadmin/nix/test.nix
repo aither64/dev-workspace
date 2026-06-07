@@ -1090,7 +1090,7 @@ let
         };
       };
 
-      virtualisation.fileSystems = sharedMounts;
+      fileSystems = sharedMounts;
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
