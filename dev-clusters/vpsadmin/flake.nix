@@ -45,6 +45,7 @@
       haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
       configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
       mailTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE" "";
+      webSourcePath = env "VPSADMIN_DEVCLUSTER_WEB_SOURCE" "";
       vpsfStatusSourcePath = env "VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE" "";
       vpsadminGoClientSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE" "";
       sharedRunnerLib = builtins.path {
@@ -76,6 +77,7 @@
           haveapiSourcePath
           configSourcePath
           mailTemplatesSourcePath
+          webSourcePath
           vpsfStatusSourcePath
           vpsadminGoClientSourcePath
           ;

@@ -78,6 +78,9 @@ The default seed creates:
 - vpsfree mail templates, when the matching worktree exists;
 - Adminer database browser, exposed as
   `https://adminer.aitherdev.int.vpsfree.cz/`;
+- vpsFree.cz web, exposed as `https://web-cs.aitherdev.int.vpsfree.cz/`
+  and `https://web-en.aitherdev.int.vpsfree.cz/`, when the matching
+  worktree exists;
 - a vpsf-status instance on the services VM, exposed as
   `https://status.aitherdev.int.vpsfree.cz/`.
 
@@ -179,6 +182,10 @@ The web UI is served from a live symlink tree backed by the selected vpsAdmin
 worktree, with Composer/vendor dependencies coming from the Nix package.
 Changes to existing PHP/templates/static files are visible after normal
 PHP-FPM/nginx behavior.
+
+When `worktrees/<slug>/web` exists, the vpsFree.cz web is served from a live
+symlink tree backed by that worktree. Its generated `config.php` points to the
+devcluster API.
 
 Ruby services and system-level changes use:
 

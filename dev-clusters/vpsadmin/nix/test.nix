@@ -16,6 +16,7 @@
   haveapiSourcePath,
   configSourcePath,
   mailTemplatesSourcePath,
+  webSourcePath,
   vpsfStatusSourcePath,
   vpsadminGoClientSourcePath,
 }:
@@ -113,6 +114,10 @@ let
     else
       { };
   adminerPort = adminerConfig.port or 18081;
+  webConfig = devConfig.web or { };
+  webEnabled = (webConfig.enable or true) && webSourcePath != "";
+  webEnvironmentId = webConfig.environmentId or 1;
+  webRoot = "/run/vpsfree-web-live";
   dnsEnabled = devConfig.dns.enable or false;
   dnsServersConfig = if dnsEnabled then devConfig.dns.servers or { } else { };
   mailpitAuth =
@@ -847,6 +852,9 @@ let
   }
   // optionalAttrs (configSourcePath != "") {
     config = configSourcePath;
+  }
+  // optionalAttrs (webSourcePath != "") {
+    web = webSourcePath;
   };
 
   sharedMounts = {
@@ -871,6 +879,13 @@ let
   // optionalAttrs (configSourcePath != "") {
     "/mnt/configuration" = {
       device = "config";
+      fsType = "virtiofs";
+      options = [ "nofail" ];
+    };
+  }
+  // optionalAttrs (webSourcePath != "") {
+    "/mnt/web" = {
+      device = "web";
       fsType = "virtiofs";
       options = [ "nofail" ];
     };
@@ -963,6 +978,39 @@ let
       lib,
       ...
     }:
+    let
+      mkVpsfreeWebHost = language: {
+        addSSL = true;
+        sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+        sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+        root = "${webRoot}/${language}/";
+        locations."~ \\.php$".extraConfig = ''
+          ssi on;
+          gzip off;
+          fastcgi_pass unix:${config.services.phpfpm.pools.vpsfree.socket};
+        '';
+        locations."/".extraConfig = ''
+          gzip off;
+          ssi on;
+        '';
+        locations."/prihlaska/".extraConfig = ''
+          gzip off;
+          ssi on;
+        '';
+        locations."/css/".extraConfig = ''
+          alias ${webRoot}/css/;
+        '';
+        locations."/js/".extraConfig = ''
+          alias ${webRoot}/js/;
+        '';
+        locations."/obrazky/".extraConfig = ''
+          alias ${webRoot}/obrazky/;
+        '';
+        locations."/download/".extraConfig = ''
+          alias ${webRoot}/download/;
+        '';
+      };
+    in
     {
       imports = [
         sshModule
@@ -1046,6 +1094,91 @@ let
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
+      environment.systemPackages = lib.mkIf webEnabled (
+        with pkgs;
+        [
+          xz
+        ]
+      );
+
+      users = lib.mkIf webEnabled {
+        users.vpsfree = {
+          isSystemUser = true;
+          group = "vpsfree";
+          description = "vpsfree main web account";
+        };
+
+        groups.vpsfree = { };
+      };
+
+      services.phpfpm.pools.vpsfree = lib.mkIf webEnabled {
+        user = "vpsfree";
+        group = "vpsfree";
+
+        settings = {
+          "pm" = "dynamic";
+          "listen.owner" = config.services.nginx.user;
+          "pm.max_children" = 5;
+          "pm.start_servers" = 2;
+          "pm.min_spare_servers" = 1;
+          "pm.max_spare_servers" = 3;
+          "pm.max_requests" = 500;
+        };
+      };
+
+      systemd.services.vpsfree-web-live-root = lib.mkIf webEnabled {
+        description = "Create live vpsFree.cz web source tree";
+        wantedBy = [ "multi-user.target" ];
+        before = [
+          "nginx.service"
+          "phpfpm-vpsfree.service"
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        path = with pkgs; [
+          bash
+          coreutils
+        ];
+        script = ''
+          set -euo pipefail
+
+          src=/mnt/web
+          dst=${webRoot}
+
+          rm -rf "$dst"
+          mkdir -p "$dst"
+
+          shopt -s dotglob nullglob
+          for entry in "$src"/*; do
+            base="$(basename "$entry")"
+            case "$base" in
+              .git|config.php|result|result-*)
+                continue
+                ;;
+            esac
+            ln -s "$entry" "$dst/$base"
+          done
+
+          cat > "$dst/config.php" <<'PHP'
+          <?php
+          define ('API_URL', 'https://${domains.api}');
+          define ('ENVIRONMENT_ID', ${toString webEnvironmentId});
+          PHP
+        '';
+      };
+
+      systemd.services.phpfpm-vpsfree = lib.mkIf webEnabled {
+        requires = [ "vpsfree-web-live-root.service" ];
+        after = [ "vpsfree-web-live-root.service" ];
+      };
+
+      systemd.services.nginx = lib.mkIf webEnabled {
+        requires = [ "vpsfree-web-live-root.service" ];
+        after = [ "vpsfree-web-live-root.service" ];
+      };
+
       vpsadmin = {
         plugins = lib.mkForce enabledPlugins;
 
@@ -1101,35 +1234,41 @@ let
         };
       };
 
-      services.nginx.virtualHosts = sslVirtualHosts // {
-        "${domains.mailpit}" = {
-          addSSL = true;
-          sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
-          sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
-          basicAuth = mailpitBasicAuth;
-          locations."/" = {
-            proxyPass = "http://127.0.0.1:${toString mailCapture.webPort}";
-            proxyWebsockets = true;
+      services.nginx.virtualHosts =
+        sslVirtualHosts
+        // {
+          "${domains.mailpit}" = {
+            addSSL = true;
+            sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+            sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+            basicAuth = mailpitBasicAuth;
+            locations."/" = {
+              proxyPass = "http://127.0.0.1:${toString mailCapture.webPort}";
+              proxyWebsockets = true;
+            };
           };
-        };
-        "${domains.status}" = {
-          addSSL = true;
-          sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
-          sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
-          locations."/" = {
-            proxyPass = "http://127.0.0.1:${toString config.services.vpsf-status.port}";
+          "${domains.status}" = {
+            addSSL = true;
+            sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+            sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+            locations."/" = {
+              proxyPass = "http://127.0.0.1:${toString config.services.vpsf-status.port}";
+            };
           };
-        };
-        "${domains.adminer}" = {
-          addSSL = true;
-          sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
-          sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
-          basicAuth = adminerBasicAuth;
-          locations."/" = {
-            proxyPass = "http://127.0.0.1:${toString adminerPort}";
+          "${domains.adminer}" = {
+            addSSL = true;
+            sslCertificate = "${certStoreDir}/vpsadmin-cert.crt";
+            sslCertificateKey = "${certStoreDir}/vpsadmin-cert.key";
+            basicAuth = adminerBasicAuth;
+            locations."/" = {
+              proxyPass = "http://127.0.0.1:${toString adminerPort}";
+            };
           };
+        }
+        // optionalAttrs webEnabled {
+          "${domains.webCs}" = mkVpsfreeWebHost "cs";
+          "${domains.webEn}" = mkVpsfreeWebHost "en";
         };
-      };
 
       systemd.services.vpsadmin-devcluster-seed =
         let

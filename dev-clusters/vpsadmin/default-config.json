@@ -8,6 +8,8 @@
     "frontend": "frontend.aitherdev.int.vpsfree.cz",
     "mailpit": "mailpit.aitherdev.int.vpsfree.cz",
     "status": "status.aitherdev.int.vpsfree.cz",
+    "webCs": "web-cs.aitherdev.int.vpsfree.cz",
+    "webEn": "web-en.aitherdev.int.vpsfree.cz",
     "webui": "webui.aitherdev.int.vpsfree.cz"
   },
   "tmpDomains": {
@@ -93,6 +95,9 @@
       "username": "adminer",
       "password": "adminerPassword"
     }
+  },
+  "web": {
+    "environmentId": 1
   },
   "dns": {
     "enable": true,
