@@ -8,6 +8,7 @@ STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadminos"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
+DEV_SESSION_BIN="$WORKSPACE/bin/dev-session"
 
 usage() {
   cat <<'EOF'
@@ -19,7 +20,7 @@ Usage:
   devcluster config <slug>
   devcluster update <slug> [node|all]
   devcluster restart <slug> <node> <service>
-  devcluster ssh <slug> <node>
+  devcluster ssh [<slug>] <node> [ssh-options...] [-- <remote-command>...]
   devcluster reset <slug>
 EOF
 }
@@ -87,6 +88,19 @@ config_get() {
   json_get_file "$(config_json_for_slug "$slug")" "$filter"
 }
 
+current_slug() {
+  if [ -n "${VPSFREE_DEV_SESSION_SLUG:-}" ]; then
+    printf '%s\n' "$VPSFREE_DEV_SESSION_SLUG"
+    return
+  fi
+
+  if [ -x "$DEV_SESSION_BIN" ]; then
+    "$DEV_SESSION_BIN" current 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 ensure_cluster_config() {
   local slug="$1"
   local cfg
@@ -147,6 +161,13 @@ node_known() {
   local node="$3"
 
   node_names "$slug" "$topology" | grep -Fx "$node" >/dev/null
+}
+
+node_exists() {
+  local slug="$1"
+  local node="$2"
+
+  jq -e --arg node "$node" '.nodes | has($node)' "$(config_json_for_slug "$slug")" >/dev/null
 }
 
 node_ip() {
@@ -606,14 +627,56 @@ restart_service() {
 }
 
 ssh_cluster() {
-  local slug="${1:-}"
-  local node="${2:-}"
-  [ -n "$slug" ] || die "missing slug"
-  [ -n "$node" ] || die "missing node"
+  local first="${1:-}"
+  [ -n "$first" ] || die "missing node or slug"
+  shift
+
+  local slug=""
+  local node=""
+  local session_slug=""
+
+  if session_slug="$(current_slug 2>/dev/null)" && node_exists "$session_slug" "$first"; then
+    slug="$session_slug"
+    node="$first"
+  else
+    if [ $# -eq 0 ]; then
+      if [ -n "$session_slug" ]; then
+        die "unknown node '$first' for current dev session '$session_slug'"
+      else
+        die "missing slug; run inside a dev session or use 'devcluster ssh <slug> <node>'"
+      fi
+    fi
+
+    slug="$first"
+    node="$1"
+    shift
+  fi
+
+  local -a ssh_extra=()
+  local -a remote_cmd=()
+  local remote=0
+
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--" ] && [ "$remote" -eq 0 ]; then
+      remote=1
+      shift
+      continue
+    fi
+
+    if [ "$remote" -eq 1 ]; then
+      remote_cmd+=("$1")
+    else
+      ssh_extra+=("$1")
+    fi
+    shift
+  done
+
   local host
+  local -a base_opts
   host="$(node_host "$slug" "$node")"
-  # shellcheck disable=SC2046
-  exec ssh $(ssh_opts "$slug" "$node") "root@$host"
+  # shellcheck disable=SC2206
+  base_opts=($(ssh_opts "$slug" "$node"))
+  exec ssh "${base_opts[@]}" "${ssh_extra[@]}" "root@$host" "${remote_cmd[@]}"
 }
 
 reset_cluster() {

@@ -9,6 +9,7 @@ CERT_DIR="$STATE_ROOT/certs/default"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
+DEV_SESSION_BIN="$WORKSPACE/bin/dev-session"
 
 usage() {
   cat <<'EOF'
@@ -21,7 +22,7 @@ Usage:
   devcluster refresh <slug>
   devcluster update <slug> [services|node1|node2|storage1|all]
   devcluster restart <slug> <machine> <service>
-  devcluster ssh <slug> <machine>
+  devcluster ssh [<slug>] <machine> [ssh-options...] [-- <remote-command>...]
   devcluster reset <slug>
   devcluster cert init [--force]
   devcluster cert import <cert-dir> [--force]
@@ -90,6 +91,19 @@ config_get() {
   local slug="$1"
   local filter="$2"
   json_get_file "$(config_json_for_slug "$slug")" "$filter"
+}
+
+current_slug() {
+  if [ -n "${VPSFREE_DEV_SESSION_SLUG:-}" ]; then
+    printf '%s\n' "$VPSFREE_DEV_SESSION_SLUG"
+    return
+  fi
+
+  if [ -x "$DEV_SESSION_BIN" ]; then
+    "$DEV_SESSION_BIN" current 2>/dev/null
+  else
+    return 1
+  fi
 }
 
 cert_config_for_slug() {
@@ -190,6 +204,19 @@ machine_ssh_port() {
 
   [ -n "$port" ] || die "unknown machine '$machine'"
   printf '%s\n' "$port"
+}
+
+machine_known() {
+  local slug="$1"
+  local machine="$2"
+
+  case "$machine" in
+    services) return 0 ;;
+  esac
+
+  jq -e --arg machine "$machine" '
+    (.nodes | has($machine)) or ((.dns.servers // {}) | has($machine))
+  ' "$(config_json_for_slug "$slug")" >/dev/null
 }
 
 is_running() {
@@ -1088,14 +1115,56 @@ restart_service() {
 }
 
 ssh_cluster() {
-  local slug="${1:-}"
-  local machine="${2:-}"
-  [ -n "$slug" ] || die "missing slug"
-  [ -n "$machine" ] || die "missing machine"
+  local first="${1:-}"
+  [ -n "$first" ] || die "missing machine or slug"
+  shift
+
+  local slug=""
+  local machine=""
+  local session_slug=""
+
+  if session_slug="$(current_slug 2>/dev/null)" && machine_known "$session_slug" "$first"; then
+    slug="$session_slug"
+    machine="$first"
+  else
+    if [ $# -eq 0 ]; then
+      if [ -n "$session_slug" ]; then
+        die "unknown machine '$first' for current dev session '$session_slug'"
+      else
+        die "missing slug; run inside a dev session or use 'devcluster ssh <slug> <machine>'"
+      fi
+    fi
+
+    slug="$first"
+    machine="$1"
+    shift
+  fi
+
+  local -a ssh_extra=()
+  local -a remote_cmd=()
+  local remote=0
+
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--" ] && [ "$remote" -eq 0 ]; then
+      remote=1
+      shift
+      continue
+    fi
+
+    if [ "$remote" -eq 1 ]; then
+      remote_cmd+=("$1")
+    else
+      ssh_extra+=("$1")
+    fi
+    shift
+  done
+
   local host
+  local -a base_opts
   host="$(machine_host "$slug" "$machine")"
-  # shellcheck disable=SC2046
-  exec ssh $(ssh_opts "$slug" "$machine") "root@$host"
+  # shellcheck disable=SC2206
+  base_opts=($(ssh_opts "$slug" "$machine"))
+  exec ssh "${base_opts[@]}" "${ssh_extra[@]}" "root@$host" "${remote_cmd[@]}"
 }
 
 reset_cluster() {

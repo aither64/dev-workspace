@@ -18,6 +18,15 @@ dev-clusters/vpsadminos/bin/devcluster update 2026-05-31-example node1
 dev-clusters/vpsadminos/bin/devcluster stop 2026-05-31-example
 ```
 
+When running inside a `dev-session` shell, `ssh` can use
+`VPSFREE_DEV_SESSION_SLUG` automatically:
+
+```sh
+dev-clusters/vpsadminos/bin/devcluster ssh node1
+dev-clusters/vpsadminos/bin/devcluster ssh node1 -- hostname
+dev-clusters/vpsadminos/bin/devcluster ssh node1 -t -- bash -l
+```
+
 Topologies:
 
 - `single`: one vpsAdminOS VM. This is the default.

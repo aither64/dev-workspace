@@ -18,6 +18,15 @@ dev-clusters/vpsadmin/bin/devcluster ssh 2026-05-29-security-advisories services
 dev-clusters/vpsadmin/bin/devcluster stop 2026-05-29-security-advisories
 ```
 
+When running inside a `dev-session` shell, `ssh` can use
+`VPSFREE_DEV_SESSION_SLUG` automatically:
+
+```sh
+dev-clusters/vpsadmin/bin/devcluster ssh node1
+dev-clusters/vpsadmin/bin/devcluster ssh services -- hostname
+dev-clusters/vpsadmin/bin/devcluster ssh node1 -t -- bash -l
+```
+
 Topologies:
 
 - `single`: services VM and one vpsAdminOS node.
