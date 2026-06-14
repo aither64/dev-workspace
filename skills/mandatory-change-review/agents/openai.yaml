@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mandatory Change Review"
+  short_description: "Review committed changes before long tests."
+  default_prompt: "Use $mandatory-change-review to review the committed changes before integration tests."
