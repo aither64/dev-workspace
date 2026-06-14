@@ -733,6 +733,28 @@ pool_parent="$(dirname "$pool_fs")"
 [ "$pool_parent" != "." ] || pool_parent="$pool_fs"
 mkdir -p "/$pool_parent/hook/ct"
 
+add_pool_device() {
+  err="$(mktemp)"
+  if osctl --pool "$pool_name" group devices add -p /default "$@" 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+
+  if grep -q 'device already exists' "$err"; then
+    rm -f "$err"
+    return 0
+  fi
+
+  cat "$err" >&2
+  rm -f "$err"
+  return 1
+}
+
+add_pool_device char 10 200 rwm /dev/net/tun
+add_pool_device char 10 229 rwm /dev/fuse
+add_pool_device char 108 0 rwm /dev/ppp
+add_pool_device char 10 232 rwm /dev/kvm
+
 sv restart nodectld >/dev/null
 for _ in $(seq 1 90); do
   if sv check nodectld >/dev/null 2>&1 \

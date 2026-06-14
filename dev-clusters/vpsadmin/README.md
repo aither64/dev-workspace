@@ -105,9 +105,9 @@ and VPS replacement testing. Set it in a cluster config only when the delay
 itself is what you need to test.
 
 After a services seed has changed pool data, `devcluster refresh <slug>` prepares
-the vpsAdmin pool working directories on regular nodes and restarts nodectld so
-DB-seeded pools are usable by node transactions. `start` and `update ... services`
-run the same refresh automatically.
+the vpsAdmin pool working directories and default pool device grants on regular
+nodes, then restarts nodectld so DB-seeded pools are usable by node transactions.
+`start` and `update ... services` run the same refresh automatically.
 
 Example local start:
 
