@@ -40,6 +40,8 @@ First decide which role you are in:
    - requested outcome and acceptance criteria;
    - initiative slug, plan/state files, affected repositories and worktrees;
    - base and head commits for every repository;
+   - the intended commit split, including any user- or plan-requested separate
+     commits;
    - relevant dependency pins or configuration repository changes;
    - quick verification commands and results;
    - known compatibility or deployment assumptions.
@@ -55,6 +57,22 @@ First decide which role you are in:
 Review committed changes across all affected projects. Inspect diffs, commit
 history, local `AGENTS.md` files, relevant tests, documentation, and project
 context before forming conclusions.
+
+Assess the commit series, not only the final tree. Compare the history against
+the user request and the initiative plan/state:
+
+- Verify that each commit is independently reviewable and matches one logical
+  purpose.
+- Verify that mechanical moves/refactors, behavior changes, generated updates,
+  dependency bumps, tests, documentation, and deployment/configuration changes
+  are separated when review clarity, repository rules, or the plan call for it.
+- Report bundled unrelated or independently reviewable changes as findings even
+  when the final combined diff is correct.
+- When the plan or user explicitly asks for separate commits, verify that the
+  history follows that split.
+- Subject-only commits are acceptable only when repository rules allow them for
+  that change type, or when the subject fully explains a trivial mechanical
+  change; otherwise report missing rationale as a commit-quality finding.
 
 Check at least:
 
