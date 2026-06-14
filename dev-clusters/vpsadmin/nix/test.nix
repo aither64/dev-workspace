@@ -836,7 +836,13 @@ let
       recipient.save!
 
       attrs.fetch('templates', []).each do |template_name|
-        template = MailTemplate.find_by!(name: template_name)
+        template = MailTemplate.find_by(name: template_name)
+
+        if template.nil?
+          warn "Skipping missing mail template #{template_name.inspect} for recipient #{recipient.label.inspect}"
+          next
+        end
+
         MailTemplateRecipient.find_or_create_by!(
           mail_template: template,
           mail_recipient: recipient

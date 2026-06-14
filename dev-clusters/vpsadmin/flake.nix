@@ -55,7 +55,9 @@
 
       pkgs = import nixpkgs {
         inherit system;
-        overlays = import (vpsadminos.outPath + "/os/overlays");
+        overlays = import (vpsadminos.outPath + "/os/overlays") {
+          inherit (vpsadminos.inputs) netlinkrb ruby-lxc;
+        };
       };
 
       clusterTest = import ./nix/test.nix {
@@ -94,11 +96,14 @@
       ruby = pkgs.ruby_vpsadminos;
       runnerDeps = pkgs.bundlerEnv {
         name = "vpsadmin-devcluster-runner-deps";
+
         gemfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile";
         lockfile = vpsadminos.outPath + "/os/packages/test-runner/Gemfile.lock";
         gemset = vpsadminos.outPath + "/os/packages/test-runner/gemset.nix";
         groups = [ "default" ];
+
         inherit ruby;
+        gemConfig = pkgs.vpsadminosRubyGemConfig;
       };
 
       runner = pkgs.writeShellScriptBin "vpsadmin-devcluster-runner" ''
