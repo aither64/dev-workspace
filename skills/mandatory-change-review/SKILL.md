@@ -80,6 +80,10 @@ Check at least:
   regression coverage for non-golden paths such as unexpected input, missing
   state, conflicting state, rollback/error paths, authorization failures,
   mixed-version flows, and repeated or partially completed operations.
+- Whether tests that transfer containers, VPS datasets, backups, or replacement
+  datasets verify data integrity, not just metadata. Expect a known file path
+  with known contents, or an equivalent checksum assertion, to be created before
+  the transfer and verified after the operation completes.
 - Whether appropriate documentation, man pages, API docs, migration notes, or
   operational docs were updated when behavior changes.
 - Whether deployment to running systems is safe with older versions still
