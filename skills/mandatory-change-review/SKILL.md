@@ -84,6 +84,11 @@ Check at least:
   correct, or tidy behavior introduced by earlier still-unmerged commits in the
   same feature branch should usually be squashed into those commits unless
   keeping them separate improves reviewability.
+- Whether dependency update history is clean. A feature branch should not
+  contain multiple commits updating the same flake input, nor multiple commits
+  updating the same gem dependency set or generated gem metadata for one
+  update stream. Follow-up commits that only advance the same input or gem
+  update should be squashed into one dependency update commit.
 - Whether commit messages follow the applicable `AGENTS.md` rules, wrap and
   format correctly, and describe the final end result and rationale rather than
   the development process. Do not enforce formatting on generated messages such
