@@ -89,6 +89,12 @@ The plugin set is configured with `plugins.enabled`. The default value is
 worktree. Set it to a JSON array such as `["webui", "payments"]` to test a
 smaller set, or to `"none"` to disable plugins.
 
+Regular devcluster nodes set nodectld's `zfs_send` and `zfs_recv` queue
+`start_delay` to `nodectld.zfsTransferStartDelay`, which defaults to `0`.
+This avoids production transfer pacing during manual migration, clone, backup,
+and VPS replacement testing. Set it in a cluster config only when the delay
+itself is what you need to test.
+
 After a services seed has changed pool data, `devcluster refresh <slug>` prepares
 the vpsAdmin pool working directories on regular nodes and restarts nodectld so
 DB-seeded pools are usable by node transactions. `start` and `update ... services`

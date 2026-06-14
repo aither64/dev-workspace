@@ -48,6 +48,7 @@ let
   domains = devConfig.domains;
   tmpDomains = devConfig.tmpDomains;
   serviceIp = devConfig.services.ip;
+  zfsTransferStartDelay = devConfig.nodectld.zfsTransferStartDelay or 0;
   devGateway = devConfig.network.gateway;
   resolverConfig = devConfig.resolver or { };
   resolverMode = resolverConfig.mode or "cluster";
@@ -1581,6 +1582,11 @@ let
           vpsadmin-services = serviceIp;
         }
         // listToAttrs (map (peer: nameValuePair peer.name peer.ip) allNodeList);
+      };
+
+      vpsadmin.nodectld.settings.vpsadmin.queues = {
+        zfs_send.start_delay = zfsTransferStartDelay;
+        zfs_recv.start_delay = zfsTransferStartDelay;
       };
     };
   };

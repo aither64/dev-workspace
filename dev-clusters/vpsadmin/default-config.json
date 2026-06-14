@@ -33,6 +33,9 @@
     "ip": "172.16.106.53",
     "name": "vpsadmin-services"
   },
+  "nodectld": {
+    "zfsTransferStartDelay": 0
+  },
   "nodes": {
     "node1": {
       "id": 101,
