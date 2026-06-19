@@ -97,6 +97,11 @@ Check at least:
 - Whether the design fits existing project architecture and abstractions,
   especially across vpsAdmin, vpsAdminOS, HaveAPI, clients, and configuration
   repositories.
+- For vpsAdmin API changes, whether plugin-specific functionality stays in the
+  owning plugin unless a generic core extension point is intentionally changed.
+  Flag plugin-owned API resources, event/type registrations, mail templates,
+  sysconfig keys, metrics, routes, or transaction behavior added to core files
+  without explicit rationale.
 - Whether the changes introduce vulnerabilities or tenant-isolation risks in
   the context of the whole system and cross-project interactions.
 - Whether the changes are appropriately tested. Check unit/spec coverage,
