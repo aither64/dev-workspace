@@ -19,6 +19,8 @@
   webSourcePath,
   vpsfStatusSourcePath,
   vpsadminGoClientSourcePath,
+  telegramEnable,
+  telegramSecretsSourcePath,
 }:
 { pkgs, ... }:
 let
@@ -102,6 +104,30 @@ let
     else
       throw "Unsupported devcluster plugins.enabled value";
   mailCapture = devConfig.mail.capture;
+  telegramConfig = devConfig.telegram or { };
+  telegramReceiveMode = telegramConfig.receiveMode or "polling";
+  telegramReceiveModeChecked =
+    if
+      builtins.elem telegramReceiveMode [
+        "polling"
+        "webhook"
+      ]
+    then
+      telegramReceiveMode
+    else
+      throw "Unsupported devcluster Telegram receiveMode '${telegramReceiveMode}'";
+  telegramWebhookPath = telegramConfig.webhookPath or "/_telegram/webhook";
+  telegramEnabled = telegramEnable == "1";
+  telegramSecretsConfigured = telegramSecretsSourcePath != "";
+  telegramBotTokenHostFile = "${telegramSecretsSourcePath}/bot-token";
+  telegramWebhookSecretHostFile = "${telegramSecretsSourcePath}/webhook-secret";
+  telegramBotTokenConfigured =
+    telegramEnabled && telegramSecretsConfigured && builtins.pathExists telegramBotTokenHostFile;
+  telegramWebhookSecretConfigured =
+    telegramBotTokenConfigured && builtins.pathExists telegramWebhookSecretHostFile;
+  telegramSecretsVmDir = "/var/lib/vpsadmin/devcluster-telegram";
+  telegramBotTokenFile = "${telegramSecretsVmDir}/bot-token";
+  telegramWebhookSecretFile = "${telegramSecretsVmDir}/webhook-secret";
   adminerConfig = devConfig.adminer or { };
   adminerAuth =
     adminerConfig.webAuth or {
@@ -797,24 +823,24 @@ let
       upsert_dev_user(admin, environment, attrs, user_resources)
     end
 
-    def install_mail_templates_from(path)
+    def install_notification_templates_from(path)
       return unless Dir.exist?(path)
 
-      templates = VpsAdmin::API::MailTemplates.find_templates([path])
-      templates = VpsAdmin::API::MailTemplates.send(:unique_templates, templates)
-      templates = VpsAdmin::API::MailTemplates.send(:registered_templates, templates)
+      templates = VpsAdmin::API::NotificationTemplates.find_templates([path])
+      templates = VpsAdmin::API::NotificationTemplates.send(:unique_templates, templates)
+      templates = VpsAdmin::API::NotificationTemplates.send(:registered_templates, templates)
 
       templates.each do |template|
-        record = MailTemplate.find_or_initialize_by(name: template.name)
+        record = NotificationTemplate.find_or_initialize_by(name: template.name)
         record.assign_attributes(template.params)
         record.save!
 
-        template.translations.each do |translation|
-          language = VpsAdmin::API::MailTemplates.send(:ensure_language!, translation.lang)
-          record.mail_template_translations
-            .find_or_initialize_by(language: language)
+        template.variants.each do |variant|
+          language = VpsAdmin::API::NotificationTemplates.send(:ensure_language!, variant.lang)
+          record.notification_template_variants
+            .find_or_initialize_by(language: language, protocol: variant.protocol)
             .tap do |tr|
-              tr.assign_attributes(translation.params.merge(language: language))
+              tr.assign_attributes(variant.params.merge(language: language))
               tr.save!
             end
         end
@@ -822,13 +848,13 @@ let
     end
 
     JSON.parse(${builtins.toJSON (builtins.toJSON mailTemplatePaths)}).each do |path|
-      install_mail_templates_from(path)
+      install_notification_templates_from(path)
     end
 
     JSON.parse(${
       builtins.toJSON (builtins.toJSON (devConfig.seed.mailRecipients or [ ]))
     }).each do |attrs|
-      recipient = MailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
+      recipient = EmailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
       recipient.assign_attributes(
         to: attrs['to'],
         cc: attrs['cc'],
@@ -837,16 +863,16 @@ let
       recipient.save!
 
       attrs.fetch('templates', []).each do |template_name|
-        template = MailTemplate.find_by(name: template_name)
+        template = NotificationTemplate.find_by(name: template_name)
 
         if template.nil?
-          warn "Skipping missing mail template #{template_name.inspect} for recipient #{recipient.label.inspect}"
+          warn "Skipping missing notification template #{template_name.inspect} for recipient #{recipient.label.inspect}"
           next
         end
 
-        MailTemplateRecipient.find_or_create_by!(
-          mail_template: template,
-          mail_recipient: recipient
+        NotificationTemplateEmailRecipient.find_or_create_by!(
+          notification_template: template,
+          email_recipient: recipient
         )
       end
     end
@@ -1220,6 +1246,10 @@ let
         after = [ "vpsfree-web-live-root.service" ];
       };
 
+      systemd.tmpfiles.rules = lib.mkIf telegramBotTokenConfigured [
+        "d ${telegramSecretsVmDir} 0700 root root - -"
+      ];
+
       vpsadmin = {
         plugins = lib.mkForce enabledPlugins;
 
@@ -1242,6 +1272,13 @@ let
 
           api = {
             test.domain = lib.mkForce domains.api;
+            test.telegramWebhook =
+              lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook")
+                {
+                  enable = true;
+                  path = telegramWebhookPath;
+                  backend.address = "unix:/run/haproxy/vpsadmin-telegram-receiver.sock";
+                };
             maintenance = {
               domain = tmpDomains.api;
               backend.address = "unix:/run/varnish/vpsadmin-varnish.sock";
@@ -1273,6 +1310,48 @@ let
             backend.address = "unix:/run/haproxy/vpsadmin-webui.sock";
           };
         };
+
+        notifications.telegram = lib.mkIf telegramBotTokenConfigured ({
+          enable = true;
+          botTokenFile = telegramBotTokenFile;
+          apiBaseUrl = telegramConfig.apiBaseUrl or "https://api.telegram.org";
+          receiveMode = telegramReceiveModeChecked;
+          webhook = {
+            listenAddress = "127.0.0.1";
+            port = telegramConfig.webhookPort or 9293;
+            path = telegramWebhookPath;
+            publicUrl = "https://${domains.api}${telegramWebhookPath}";
+          }
+          // optionalAttrs telegramWebhookSecretConfigured {
+            secretTokenFile = telegramWebhookSecretFile;
+          };
+        });
+
+        telegramReceiver = lib.mkIf telegramBotTokenConfigured {
+          enable = true;
+          configDirectory = config.vpsadmin.api.configDirectory;
+          database = config.vpsadmin.api.database;
+        };
+
+        notificationDispatcher.actions = lib.mkIf telegramBotTokenConfigured (
+          lib.mkForce [
+            "email"
+            "telegram"
+            "webhook"
+          ]
+        );
+
+        haproxy.telegram-receiver.test =
+          lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook")
+            {
+              frontend.bind = [ "unix@/run/haproxy/vpsadmin-telegram-receiver.sock mode 0666" ];
+              backends = [
+                {
+                  host = "127.0.0.1";
+                  port = telegramConfig.webhookPort or 9293;
+                }
+              ];
+            };
       };
 
       services.nginx.virtualHosts =
@@ -1474,6 +1553,22 @@ let
 
           vpsadmin.nodectld.settings.mailer.smtp_port = lib.mkForce mailCapture.smtpPort;
         };
+
+      vpsadmin.notificationDispatcher.smtp = lib.mkIf mailCapture.enable {
+        address = lib.mkForce "127.0.0.1";
+        port = lib.mkForce mailCapture.smtpPort;
+      };
+
+      systemd.services.vpsadmin-webhook-test-server = {
+        description = "Development webhook test server";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ];
+        serviceConfig = {
+          ExecStart = "${config.vpsadmin.notificationDispatcher.package}/ruby-env-wrapped/bin/ruby /mnt/vpsadmin/tools/webhook-test-server.rb --host 127.0.0.1 --port 18080 --log-dir /tmp/vpsadmin-webhook-test";
+          Restart = "always";
+          RestartSec = "2s";
+        };
+      };
     };
 
   nodeModule =

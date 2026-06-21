@@ -91,6 +91,11 @@
       "install": true
     }
   },
+  "telegram": {
+    "receiveMode": "polling",
+    "webhookPath": "/_telegram/webhook",
+    "webhookPort": 9293
+  },
   "adminer": {
     "port": 18081,
     "webAuth": {

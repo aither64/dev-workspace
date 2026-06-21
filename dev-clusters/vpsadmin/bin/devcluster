@@ -6,6 +6,8 @@ CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE="$(cd -- "$CLUSTER_DIR/../.." && pwd)"
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadmin"
 CERT_DIR="$STATE_ROOT/certs/default"
+TELEGRAM_DIR="$STATE_ROOT/telegram"
+TELEGRAM_VM_DIR="/var/lib/vpsadmin/devcluster-telegram"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
@@ -222,6 +224,13 @@ machine_known() {
 is_running() {
   local pid="$1"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cluster_running() {
+  local slug="$1"
+  local pid_path
+  pid_path="$(pid_file "$slug")"
+  [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"
 }
 
 kill_socket_processes() {
@@ -565,6 +574,13 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_WEB_SOURCE="$web_path"
   export VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE="$vpsf_status_path"
   export VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE="$vpsadmin_go_client_path"
+  mkdir -p "$TELEGRAM_DIR"
+  export VPSADMIN_DEVCLUSTER_TELEGRAM_SECRETS="$TELEGRAM_DIR"
+  if [ -f "$TELEGRAM_DIR/bot-token" ] && cluster_running "$slug"; then
+    export VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE=1
+  else
+    export VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE=0
+  fi
 }
 
 nix_overrides() {
@@ -641,6 +657,16 @@ ssh_opts() {
   fi
 }
 
+scp_opts() {
+  local slug="$1"
+  local machine="${2:-}"
+  printf -- '-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR' "$SSH_KEY"
+
+  if [ -n "$machine" ] && [ "$(cluster_network "$slug")" = "local" ]; then
+    printf ' -P %s' "$(machine_ssh_port "$slug" "$machine")"
+  fi
+}
+
 machine_host() {
   local slug="$1"
   local machine="$2"
@@ -660,6 +686,36 @@ ssh_cmd() {
   host="$(machine_host "$slug" "$machine")"
   # shellcheck disable=SC2046
   ssh $(ssh_opts "$slug" "$machine") "root@$host" "$@"
+}
+
+sync_telegram_secret_file() {
+  local slug="$1"
+  local host="$2"
+  local source="$3"
+  local target="$4"
+  local tmp="${target}.tmp"
+
+  if [ -f "$source" ]; then
+    # shellcheck disable=SC2046
+    scp $(scp_opts "$slug" services) "$source" "root@$host:$tmp"
+    # shellcheck disable=SC2046
+    ssh $(ssh_opts "$slug" services) "root@$host" \
+      "chown root:root '$tmp' && chmod 0600 '$tmp' && mv '$tmp' '$target'"
+  else
+    # shellcheck disable=SC2046
+    ssh $(ssh_opts "$slug" services) "root@$host" "rm -f '$target' '$tmp'"
+  fi
+}
+
+sync_telegram_secrets() {
+  local slug="$1"
+  local host
+  host="$(machine_host "$slug" services)"
+
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$slug" services) "root@$host" "install -d -m 0700 '$TELEGRAM_VM_DIR'"
+  sync_telegram_secret_file "$slug" "$host" "$TELEGRAM_DIR/bot-token" "$TELEGRAM_VM_DIR/bot-token"
+  sync_telegram_secret_file "$slug" "$host" "$TELEGRAM_DIR/webhook-secret" "$TELEGRAM_VM_DIR/webhook-secret"
 }
 
 wait_for_seeded_pool() {
@@ -1101,6 +1157,9 @@ update_cluster() {
     opts="$(ssh_opts "$slug" "$machine")"
 
     printf 'Updating %s (%s) to %s\n' "$machine" "$host" "$toplevel"
+    if [ "$machine" = "services" ]; then
+      sync_telegram_secrets "$slug"
+    fi
     NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel"
     # shellcheck disable=SC2086
     ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch

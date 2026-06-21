@@ -166,6 +166,51 @@ after changing template files or the cluster mail seed config. Runtime virtiofs
 mounts cannot be added to an already-running VM, so templates are intentionally
 closure-copied instead of mounted live.
 
+## Webhook Test Server
+
+The services VM runs `vpsadmin-webhook-test-server.service` for notification
+webhook testing. Use `http://127.0.0.1:18080/events` as the webhook URL from
+vpsAdmin. The latest request is written to
+`/tmp/vpsadmin-webhook-test/request.json` inside the services VM.
+
+## Telegram
+
+Telegram notifications are enabled only when a bot token file exists on the
+host:
+
+```sh
+mkdir -p .dev-clusters/vpsadmin/telegram
+printf '%s\n' '<bot-token>' > .dev-clusters/vpsadmin/telegram/bot-token
+chmod 0600 .dev-clusters/vpsadmin/telegram/bot-token
+```
+
+`devcluster update <slug> services` copies the token into the services VM and
+enables Telegram for the API, notification dispatcher, and Telegram receiver
+services. Re-run it after creating, changing, or removing the token file. If the
+token file already exists before a fresh cluster is started, start the cluster
+first and then run the services update to copy and enable it.
+
+The default receive mode is polling. To test webhook mode, add this to the
+cluster config:
+
+```json
+{
+  "telegram": {
+    "receiveMode": "webhook"
+  }
+}
+```
+
+Webhook mode also needs a secret token:
+
+```sh
+openssl rand -hex 32 > .dev-clusters/vpsadmin/telegram/webhook-secret
+chmod 0600 .dev-clusters/vpsadmin/telegram/webhook-secret
+```
+
+The dev cluster registers the webhook URL on the API domain at
+`https://api.aitherdev.int.vpsfree.cz/_telegram/webhook`.
+
 ## Database Browser
 
 Adminer runs on the services VM and is exposed through the same nginx HTTPS

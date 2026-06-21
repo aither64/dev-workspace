@@ -48,6 +48,8 @@
       webSourcePath = env "VPSADMIN_DEVCLUSTER_WEB_SOURCE" "";
       vpsfStatusSourcePath = env "VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE" "";
       vpsadminGoClientSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE" "";
+      telegramSecretsSourcePath = env "VPSADMIN_DEVCLUSTER_TELEGRAM_SECRETS" "";
+      telegramEnable = env "VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE" "0";
       sharedRunnerLib = builtins.path {
         path = "${workspace}/dev-clusters/lib";
         name = "devcluster-runner-lib";
@@ -82,6 +84,8 @@
           webSourcePath
           vpsfStatusSourcePath
           vpsadminGoClientSourcePath
+          telegramEnable
+          telegramSecretsSourcePath
           ;
       };
 
