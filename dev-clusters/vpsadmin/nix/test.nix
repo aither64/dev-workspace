@@ -120,9 +120,16 @@ let
   telegramEnabled = telegramEnable == "1";
   telegramSecretsConfigured = telegramSecretsSourcePath != "";
   telegramBotTokenHostFile = "${telegramSecretsSourcePath}/bot-token";
+  telegramBotUsernameHostFile = "${telegramSecretsSourcePath}/bot-username";
   telegramWebhookSecretHostFile = "${telegramSecretsSourcePath}/webhook-secret";
   telegramBotTokenConfigured =
     telegramEnabled && telegramSecretsConfigured && builtins.pathExists telegramBotTokenHostFile;
+  telegramBotUsernameFromFile =
+    if telegramSecretsConfigured && builtins.pathExists telegramBotUsernameHostFile then
+      lib.removeSuffix "\n" (builtins.readFile telegramBotUsernameHostFile)
+    else
+      null;
+  telegramBotUsername = telegramConfig.botUsername or telegramBotUsernameFromFile;
   telegramWebhookSecretConfigured =
     telegramBotTokenConfigured && builtins.pathExists telegramWebhookSecretHostFile;
   telegramSecretsVmDir = "/var/lib/vpsadmin/devcluster-telegram";
@@ -1316,7 +1323,7 @@ let
           botTokenFile = telegramBotTokenFile;
           apiBaseUrl = telegramConfig.apiBaseUrl or "https://api.telegram.org";
           receiveMode = telegramReceiveModeChecked;
-          webhook = {
+          webhook = ({
             listenAddress = "127.0.0.1";
             port = telegramConfig.webhookPort or 9293;
             path = telegramWebhookPath;
@@ -1324,7 +1331,9 @@ let
           }
           // optionalAttrs telegramWebhookSecretConfigured {
             secretTokenFile = telegramWebhookSecretFile;
-          };
+          });
+        } // optionalAttrs (telegramBotUsername != null) {
+          botUsername = telegramBotUsername;
         });
 
         telegramReceiver = lib.mkIf telegramBotTokenConfigured {

@@ -181,6 +181,7 @@ host:
 ```sh
 mkdir -p .dev-clusters/vpsadmin/telegram
 printf '%s\n' '<bot-token>' > .dev-clusters/vpsadmin/telegram/bot-token
+printf '%s\n' 'vpsadmin_aitherdev_bot' > .dev-clusters/vpsadmin/telegram/bot-username
 chmod 0600 .dev-clusters/vpsadmin/telegram/bot-token
 ```
 
@@ -189,6 +190,12 @@ enables Telegram for the API, notification dispatcher, and Telegram receiver
 services. Re-run it after creating, changing, or removing the token file. If the
 token file already exists before a fresh cluster is started, start the cluster
 first and then run the services update to copy and enable it.
+
+The bot username is not secret. It is used to show pairing links in vpsAdmin,
+for example `https://t.me/vpsadmin_aitherdev_bot?start=<token>`. If you use a
+different development bot, replace `vpsadmin_aitherdev_bot` with the username
+shown by BotFather, without the leading `@`. BotFather shows it after bot
+creation as the final `_bot` username and in the `t.me/<username>` link.
 
 The default receive mode is polling. To test webhook mode, add this to the
 cluster config:
