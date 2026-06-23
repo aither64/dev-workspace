@@ -855,7 +855,6 @@ let
         enable_multi_factor_auth: false,
         password_reset: false,
         lockout: false,
-        mailer_enabled: true,
         object_state: :active
       )
       if user.respond_to?(:sms_notifications_enabled=)
@@ -863,6 +862,27 @@ let
       end
       user.set_password(attrs.fetch('password'))
       user.save!
+
+      if user.respond_to?(:set_notification_delivery_method!) &&
+         ActiveRecord::Base.connection.data_source_exists?('user_notification_delivery_methods')
+        user.set_notification_delivery_method!(:email, true)
+
+        if attrs.key?('smsNotificationsEnabled') &&
+           defined?(UserNotificationDeliveryMethod) &&
+           UserNotificationDeliveryMethod.known_delivery_method?(:sms)
+          user.set_notification_delivery_method!(
+            :sms,
+            attrs.fetch('smsNotificationsEnabled', false)
+          )
+        end
+      end
+
+      if defined?(NotificationReceiver) &&
+         NotificationReceiver.respond_to?(:ensure_defaults_for!) &&
+         ActiveRecord::Base.connection.data_source_exists?('notification_receivers') &&
+         ActiveRecord::Base.connection.data_source_exists?('event_routes')
+        NotificationReceiver.ensure_defaults_for!(user)
+      end
 
       if ActiveRecord::Base.connection.data_source_exists?('user_accounts')
         account = UserAccount.find_or_initialize_by(user_id: user.id)
