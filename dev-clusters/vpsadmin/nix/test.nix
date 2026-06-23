@@ -3,6 +3,7 @@
   vpsadmin,
   vpsadminos,
   vpsfStatus,
+  vpsfreeSmsGateway,
   workspace,
   slug,
   topology,
@@ -135,6 +136,70 @@ let
   telegramSecretsVmDir = "/var/lib/vpsadmin/devcluster-telegram";
   telegramBotTokenFile = "${telegramSecretsVmDir}/bot-token";
   telegramWebhookSecretFile = "${telegramSecretsVmDir}/webhook-secret";
+  vpsadminNotificationsModule = vpsadmin.outPath + "/nixos/modules/vpsadmin/notifications.nix";
+  vpsadminNotificationsModuleText =
+    if builtins.pathExists vpsadminNotificationsModule then
+      builtins.readFile vpsadminNotificationsModule
+    else
+      "";
+  vpsadminSupportsSms = lib.hasInfix "sms = {" vpsadminNotificationsModuleText;
+  smsConfig = devConfig.sms or { };
+  smsGatewayEnabled = (smsConfig.enable or true) && vpsadminSupportsSms;
+  smsGatewayName = smsConfig.name or "dev";
+  smsGatewayPort = smsConfig.port or 9876;
+  smsGatewayVpsAdminToken = smsConfig.vpsadminToken or "dev-vpsadmin-sms-gateway-token";
+  smsGatewayAlertmanagerToken = smsConfig.alertmanagerToken or "dev-alertmanager-sms-gateway-token";
+  smsGatewayStatusToken = smsConfig.statusToken or "dev-vpsfree-sms-gateway-status-token";
+  smsGatewayCallbackToken = smsConfig.callbackToken or "dev-vpsadmin-sms-callback-token";
+  smsModemConfig = smsConfig.modem or { };
+  smsFakeConfig = smsModemConfig.fake or { };
+  smsLimitsConfig = smsConfig.limits or { };
+  smsCallbackConfig = smsConfig.callback or { };
+  smsInboundConfig = smsConfig.inbound or { };
+  smsInboundEnabled = smsInboundConfig.enable or false;
+  smsInboundWebhooks = smsInboundConfig.webhooks or [ ];
+  smsGatewayPackage = vpsfreeSmsGateway.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  smsGatewayVpsAdminTokenFile = pkgs.writeText "vpsadmin-dev-sms-gateway-token" "${smsGatewayVpsAdminToken}\n";
+  smsGatewayCallbackTokenFile = pkgs.writeText "vpsadmin-dev-sms-callback-token" "${smsGatewayCallbackToken}\n";
+  smsGatewayConfigFile = pkgs.writeText "vpsfree-sms-gateway-dev.json" (
+    builtins.toJSON {
+      listen_address = "127.0.0.1:${toString smsGatewayPort}";
+      database_path = "/var/lib/vpsfree-sms-gateway/gateway.db";
+      gateway_name = smsGatewayName;
+      auth = {
+        alertmanager_token = smsGatewayAlertmanagerToken;
+        vpsadmin_token = smsGatewayVpsAdminToken;
+        status_token = smsGatewayStatusToken;
+        callback_token = smsGatewayCallbackToken;
+      };
+      modem = {
+        driver = "fake";
+        mode = smsModemConfig.mode or "pdu";
+        timeout = smsModemConfig.timeout or "5s";
+        attempts = smsModemConfig.attempts or 5;
+        cooldown = smsModemConfig.cooldown or "1s";
+        fake = {
+          send_delay = smsFakeConfig.sendDelay or "0s";
+          fail_sends = smsFakeConfig.failSends or false;
+        };
+      };
+      limits = {
+        alertmanager_max_segments = smsLimitsConfig.alertmanagerMaxSegments or 6;
+        vpsadmin_max_segments = smsLimitsConfig.vpsadminMaxSegments or 3;
+      };
+      alertmanager = {
+        receivers = smsConfig.alertmanagerReceivers or { };
+      };
+      inbound = {
+        enabled = smsInboundEnabled;
+        webhooks = smsInboundWebhooks;
+      };
+      callback = {
+        timeout = smsCallbackConfig.timeout or "10s";
+        cooldown = smsCallbackConfig.cooldown or "30s";
+      };
+    }
+  );
   adminerConfig = devConfig.adminer or { };
   adminerAuth =
     adminerConfig.webAuth or {
@@ -793,6 +858,9 @@ let
         mailer_enabled: true,
         object_state: :active
       )
+      if user.respond_to?(:sms_notifications_enabled=)
+        user.sms_notifications_enabled = attrs.fetch('smsNotificationsEnabled', false)
+      end
       user.set_password(attrs.fetch('password'))
       user.save!
 
@@ -1143,6 +1211,19 @@ let
         };
       };
 
+      systemd.services.vpsfree-sms-gateway = lib.mkIf smsGatewayEnabled {
+        description = "Development vpsFree.cz SMS gateway";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ];
+        serviceConfig = {
+          DynamicUser = true;
+          StateDirectory = "vpsfree-sms-gateway";
+          ExecStart = "${smsGatewayPackage}/bin/vpsfree-sms-gateway --config ${smsGatewayConfigFile}";
+          Restart = "always";
+          RestartSec = "2s";
+        };
+      };
+
       fileSystems = sharedMounts;
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
@@ -1318,23 +1399,41 @@ let
           };
         };
 
-        notifications.telegram = lib.mkIf telegramBotTokenConfigured ({
-          enable = true;
-          botTokenFile = telegramBotTokenFile;
-          apiBaseUrl = telegramConfig.apiBaseUrl or "https://api.telegram.org";
-          receiveMode = telegramReceiveModeChecked;
-          webhook = ({
-            listenAddress = "127.0.0.1";
-            port = telegramConfig.webhookPort or 9293;
-            path = telegramWebhookPath;
-            publicUrl = "https://${domains.api}${telegramWebhookPath}";
+        notifications.telegram = lib.mkIf telegramBotTokenConfigured (
+          {
+            enable = true;
+            botTokenFile = telegramBotTokenFile;
+            apiBaseUrl = telegramConfig.apiBaseUrl or "https://api.telegram.org";
+            receiveMode = telegramReceiveModeChecked;
+            webhook = (
+              {
+                listenAddress = "127.0.0.1";
+                port = telegramConfig.webhookPort or 9293;
+                path = telegramWebhookPath;
+                publicUrl = "https://${domains.api}${telegramWebhookPath}";
+              }
+              // optionalAttrs telegramWebhookSecretConfigured {
+                secretTokenFile = telegramWebhookSecretFile;
+              }
+            );
           }
-          // optionalAttrs telegramWebhookSecretConfigured {
-            secretTokenFile = telegramWebhookSecretFile;
-          });
-        } // optionalAttrs (telegramBotUsername != null) {
-          botUsername = telegramBotUsername;
-        });
+          // optionalAttrs (telegramBotUsername != null) {
+            botUsername = telegramBotUsername;
+          }
+        );
+
+        notifications.sms = lib.mkIf smsGatewayEnabled {
+          enable = true;
+          callbackUrl = "https://${domains.api}/internal/notifications/sms/callback";
+          callbackTokenFile = smsGatewayCallbackTokenFile;
+          gateways = [
+            {
+              name = smsGatewayName;
+              url = "http://127.0.0.1:${toString smsGatewayPort}/v1/sms";
+              tokenFile = smsGatewayVpsAdminTokenFile;
+            }
+          ];
+        };
 
         telegramReceiver = lib.mkIf telegramBotTokenConfigured {
           enable = true;
@@ -1342,12 +1441,13 @@ let
           database = config.vpsadmin.api.database;
         };
 
-        notificationDispatcher.actions = lib.mkIf telegramBotTokenConfigured (
-          lib.mkForce [
+        notificationDispatcher.actions = lib.mkForce (
+          [
             "email"
-            "telegram"
             "webhook"
           ]
+          ++ lib.optional telegramBotTokenConfigured "telegram"
+          ++ lib.optional smsGatewayEnabled "sms"
         );
 
         haproxy.telegram-receiver.test =

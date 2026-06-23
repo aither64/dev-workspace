@@ -10,6 +10,10 @@
       inputs.vpsadmin.follows = "vpsadmin";
       inputs.vpsadminos.follows = "vpsadminos";
     };
+    vpsfreeSmsGateway = {
+      url = "github:vpsfreecz/vpsfree-sms-gateway/2026-06-15-vpsadmin-events";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     nixpkgs.follows = "vpsadminos/nixpkgs";
   };
 
@@ -20,6 +24,7 @@
       vpsadmin,
       vpsadminos,
       vpsfStatus,
+      vpsfreeSmsGateway,
     }:
     let
       system = "x86_64-linux";
@@ -68,6 +73,7 @@
           vpsadmin
           vpsadminos
           vpsfStatus
+          vpsfreeSmsGateway
           workspace
           slug
           topology

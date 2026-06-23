@@ -173,6 +173,40 @@ webhook testing. Use `http://127.0.0.1:18080/events` as the webhook URL from
 vpsAdmin. The latest request is written to
 `/tmp/vpsadmin-webhook-test/request.json` inside the services VM.
 
+## SMS
+
+The services VM runs `vpsfree-sms-gateway.service` with the gateway's fake
+driver when the selected vpsAdmin checkout supports SMS notifications. vpsAdmin
+uses `http://127.0.0.1:9876/v1/sms` as its SMS gateway, and the SMS dispatcher
+is enabled by default. The seeded dev users have SMS notifications enabled so
+receiver actions can be created and verified without production GSM modems.
+
+The fake gateway stores its SQLite database in
+`/var/lib/vpsfree-sms-gateway/gateway.db` inside the services VM. Inbound SMS
+persistence is disabled by default. To disable the gateway, edit the cluster
+config:
+
+```json
+{
+  "sms": {
+    "enable": false
+  }
+}
+```
+
+To opt into inbound persistence, keep the gateway enabled and set:
+
+```json
+{
+  "sms": {
+    "inbound": {
+      "enable": true,
+      "webhooks": []
+    }
+  }
+}
+```
+
 ## Telegram
 
 Telegram notifications are enabled only when a bot token file exists on the

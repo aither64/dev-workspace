@@ -96,6 +96,14 @@
     "webhookPath": "/_telegram/webhook",
     "webhookPort": 9293
   },
+  "sms": {
+    "enable": true,
+    "port": 9876,
+    "inbound": {
+      "enable": false,
+      "webhooks": []
+    }
+  },
   "adminer": {
     "port": 18081,
     "webAuth": {
@@ -164,6 +172,7 @@
         "password": "testUser1Password",
         "fullName": "Test User One",
         "email": "test-user1@example.test",
+        "smsNotificationsEnabled": true,
         "level": 1,
         "namespace": {
           "blockStart": 9,
@@ -176,6 +185,7 @@
         "password": "testUser2Password",
         "fullName": "Test User Two",
         "email": "test-user2@example.test",
+        "smsNotificationsEnabled": true,
         "level": 1,
         "namespace": {
           "blockStart": 17,

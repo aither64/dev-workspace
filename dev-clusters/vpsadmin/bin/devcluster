@@ -588,6 +588,7 @@ nix_overrides() {
   local vpsadmin_path="$2"
   local vpsadminos_input_value="$3"
   local vpsf_status_path="$4"
+  local sms_gateway_path="$5"
 
   printf '%s\0%s\0' --override-input vpsadmin
   printf 'path:%s\0' "$vpsadmin_path"
@@ -597,6 +598,11 @@ nix_overrides() {
   if [ -n "$vpsf_status_path" ]; then
     printf '%s\0%s\0' --override-input vpsfStatus
     printf 'path:%s\0' "$vpsf_status_path"
+  fi
+
+  if [ -n "$sms_gateway_path" ]; then
+    printf '%s\0%s\0' --override-input vpsfreeSmsGateway
+    printf 'path:%s\0' "$sms_gateway_path"
   fi
 }
 
@@ -613,6 +619,7 @@ build_config() {
   local web_path
   local vpsf_status_path
   local vpsadmin_go_client_path
+  local sms_gateway_path
   local vpsadminos_input_value
 
   dir="$(cluster_dir "$slug")"
@@ -627,6 +634,7 @@ build_config() {
   web_path="$(slug_optional_path "$slug" web || true)"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
+  sms_gateway_path="$(slug_optional_path "$slug" vpsfree-sms-gateway || true)"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
 
   if [ -z "$vpsadminos_path" ]; then
@@ -638,7 +646,7 @@ build_config() {
   local -a overrides=()
   while IFS= read -r -d '' item; do
     overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$sms_gateway_path")
 
   nix build \
     --impure \
@@ -910,15 +918,16 @@ start_cluster() {
   printf '%s\n' "$topology" > "$(topology_file "$slug")"
   printf '%s\n' "$network" > "$(network_file "$slug")"
 
-  local vpsadmin_path vpsadminos_input_value vpsf_status_path
+  local vpsadmin_path vpsadminos_input_value vpsf_status_path sms_gateway_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
+  sms_gateway_path="$(slug_optional_path "$slug" vpsfree-sms-gateway || true)"
 
   local -a runner_overrides=()
   while IFS= read -r -d '' item; do
     runner_overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$sms_gateway_path")
 
   local dir log ready sock_dir
   dir="$(cluster_dir "$slug")"
