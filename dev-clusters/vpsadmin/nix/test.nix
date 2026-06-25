@@ -1248,12 +1248,14 @@ let
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
-      environment.systemPackages = lib.mkIf webEnabled (
-        with pkgs;
-        [
-          xz
-        ]
-      );
+      environment.systemPackages =
+        lib.optionals webEnabled (
+          with pkgs;
+          [
+            xz
+          ]
+        )
+        ++ lib.optional smsGatewayEnabled smsGatewayPackage;
 
       users = lib.mkIf webEnabled {
         users.vpsfree = {

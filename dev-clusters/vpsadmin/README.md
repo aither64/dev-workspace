@@ -186,6 +186,17 @@ The fake gateway stores its SQLite database in
 persistence is disabled by default. To disable the gateway, edit the cluster
 config:
 
+Inspect sent and queued fake-driver SMSes with `vpsfree-sms-gatewayctl`:
+
+```sh
+bin/devcluster ssh <slug> services -- vpsfree-sms-gatewayctl stats
+bin/devcluster ssh <slug> services -- \
+  vpsfree-sms-gatewayctl outbound list --source vpsadmin
+```
+
+Sent fake-driver SMSes show up as `sent` outbound messages with a `fake-*`
+provider ID.
+
 ```json
 {
   "sms": {
