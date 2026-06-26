@@ -1690,6 +1690,12 @@ let
         port = lib.mkForce mailCapture.smtpPort;
       };
 
+      vpsadmin.api.notifications.smtp = lib.mkIf mailCapture.enable {
+        enable = true;
+        address = lib.mkForce "127.0.0.1";
+        port = lib.mkForce mailCapture.smtpPort;
+      };
+
       systemd.services.vpsadmin-webhook-test-server = {
         description = "Development webhook test server";
         wantedBy = [ "multi-user.target" ];
