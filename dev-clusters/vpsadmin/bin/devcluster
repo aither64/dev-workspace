@@ -726,6 +726,17 @@ sync_telegram_secrets() {
   sync_telegram_secret_file "$slug" "$host" "$TELEGRAM_DIR/webhook-secret" "$TELEGRAM_VM_DIR/webhook-secret"
 }
 
+enable_telegram_after_start() {
+  local slug="$1"
+
+  if [ -f "$TELEGRAM_DIR/bot-token" ]; then
+    printf 'Enabling Telegram notifications from %s\n' "$TELEGRAM_DIR/bot-token"
+    update_cluster "$slug" services
+  else
+    refresh_nodes_after_seed "$slug"
+  fi
+}
+
 wait_for_seeded_pool() {
   local slug="$1"
   local pool_fs
@@ -969,7 +980,7 @@ start_cluster() {
 
   for _ in $(seq 1 900); do
     if [ -f "$ready" ]; then
-      refresh_nodes_after_seed "$slug"
+      enable_telegram_after_start "$slug"
       urls_cluster "$slug"
       return
     fi

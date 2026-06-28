@@ -232,9 +232,10 @@ chmod 0600 .dev-clusters/vpsadmin/telegram/bot-token
 
 `devcluster update <slug> services` copies the token into the services VM and
 enables Telegram for the API, notification dispatcher, and Telegram receiver
-services. Re-run it after creating, changing, or removing the token file. If the
-token file already exists before a fresh cluster is started, start the cluster
-first and then run the services update to copy and enable it.
+services. Re-run it after creating, changing, or removing the token file in an
+already-running cluster. When the token file exists before a fresh cluster is
+started, startup automatically performs the services update after the cluster
+becomes ready.
 
 The bot username is not secret. It is used to show pairing links in vpsAdmin,
 for example `https://t.me/vpsadmin_aitherdev_bot?start=<token>`. If you use a
