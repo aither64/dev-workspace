@@ -148,9 +148,9 @@ to print the CA certificate path and fingerprint for browser trust setup.
 
 ## Email
 
-Outgoing vpsAdmin mail is captured by Mailpit in the mailer container. The
-Mailpit UI is exposed through the services nginx frontend at the HTTPS URL
-printed by `devcluster urls`, currently
+Outgoing vpsAdmin notification e-mail is captured by Mailpit on the services
+VM. The Mailpit UI is exposed through the services nginx frontend at the HTTPS
+URL printed by `devcluster urls`, currently
 `https://mailpit.aitherdev.int.vpsfree.cz/`, and is protected with the
 configured development basic-auth credentials. The raw Mailpit HTTP listener is
 bound to `127.0.0.1` inside the services VM.

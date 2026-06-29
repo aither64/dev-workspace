@@ -271,7 +271,6 @@ let
         {
           node = 0;
           storage = 1;
-          mailer = 2;
           dns_server = 3;
         }
         .${role};
@@ -445,6 +444,7 @@ let
   };
 
   devSeed = pkgs.writeText "vpsadmin-devcluster-seed.rb" ''
+    require 'digest'
     require 'ipaddress'
     require 'json'
 
@@ -946,30 +946,165 @@ let
       install_notification_templates_from(path)
     end
 
-    JSON.parse(${
-      builtins.toJSON (builtins.toJSON (devConfig.seed.mailRecipients or [ ]))
-    }).each do |attrs|
-      recipient = EmailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
-      recipient.assign_attributes(
-        to: attrs['to'],
-        cc: attrs['cc'],
-        bcc: attrs['bcc']
-      )
-      recipient.save!
+    def legacy_mail_recipients_available?
+      defined?(EmailRecipient) &&
+        defined?(NotificationTemplateEmailRecipient) &&
+        ActiveRecord::Base.connection.data_source_exists?('email_recipients') &&
+        ActiveRecord::Base.connection.data_source_exists?('notification_template_email_recipients')
+    end
 
-      attrs.fetch('templates', []).each do |template_name|
-        template = NotificationTemplate.find_by(name: template_name)
+    def notification_routes_available?
+      defined?(NotificationReceiver) &&
+        defined?(NotificationTarget) &&
+        defined?(NotificationReceiverTarget) &&
+        defined?(EventRoute) &&
+        defined?(EventRouteMatcher) &&
+        ActiveRecord::Base.connection.data_source_exists?('notification_receivers') &&
+        ActiveRecord::Base.connection.data_source_exists?('notification_targets') &&
+        ActiveRecord::Base.connection.data_source_exists?('notification_receiver_targets') &&
+        ActiveRecord::Base.connection.data_source_exists?('event_routes') &&
+        ActiveRecord::Base.connection.data_source_exists?('event_route_matchers') &&
+        EventRoute.column_names.include?('subject_scope')
+    end
 
-        if template.nil?
-          warn "Skipping missing notification template #{template_name.inspect} for recipient #{recipient.label.inspect}"
-          next
-        end
-
-        NotificationTemplateEmailRecipient.find_or_create_by!(
-          notification_template: template,
-          email_recipient: recipient
-        )
+    def event_route_config_for_template(template_name)
+      case template_name.to_s
+      when 'daily_report'
+        {
+          event_type: 'system.daily_report',
+          template_name: 'daily_report'
+        }
+      when 'payments_overview'
+        {
+          event_type: 'payments.overview',
+          template_name: 'payments_overview'
+        }
       end
+    end
+
+    def mail_recipient_addresses(attrs)
+      %w[to cc bcc].flat_map do |field|
+        attrs[field].to_s.split(',').map(&:strip)
+      end.reject(&:empty?).uniq
+    end
+
+    def upsert_notification_route_target(user, address)
+      identity_key = "custom:#{Digest::SHA256.hexdigest(address.gsub(/\s/, ""))}"
+      target = NotificationTarget.find_or_initialize_by(
+        user: user,
+        action: 'email',
+        identity_key: identity_key
+      )
+      target.assign_attributes(
+        label: "Dev e-mail #{address}"[0, 255],
+        target_kind: 'custom',
+        target_value: address,
+        enabled: true,
+        verified_at: target.verified_at || Time.now
+      )
+      target.skip_delivery_method_enabled_validation = true
+      target.save!
+      target
+    end
+
+    def upsert_notification_route_receiver(user, label, target)
+      receiver = NotificationReceiver.find_or_initialize_by(
+        user: user,
+        label: label[0, 255]
+      )
+      receiver.assign_attributes(
+        description: 'Created from devcluster mail recipient seed',
+        enabled: true,
+        mute: false
+      )
+      receiver.save!
+
+      link = receiver.notification_receiver_targets.find_or_initialize_by(
+        notification_target: target
+      )
+      link.position ||= NotificationReceiver.next_receiver_target_position(receiver)
+      link.save!
+
+      receiver
+    end
+
+    def upsert_notification_route(user, receiver, label, config)
+      route = EventRoute.find_or_initialize_by(
+        user: user,
+        notification_receiver: receiver,
+        label: label[0, 255],
+        event_type: config.fetch(:event_type),
+        template_name: config.fetch(:template_name),
+        subject_scope: 'visible'
+      )
+      route.assign_attributes(
+        position: route.position || EventRoute.next_position_for(user, nil),
+        enabled: true,
+        default_route: false,
+        single_use: false,
+        continue: false
+      )
+      route.save!
+
+      route
+    end
+
+    mail_recipient_seed = JSON.parse(${
+      builtins.toJSON (builtins.toJSON (devConfig.seed.mailRecipients or [ ]))
+    })
+
+    if legacy_mail_recipients_available?
+      mail_recipient_seed.each do |attrs|
+        recipient = EmailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
+        recipient.assign_attributes(
+          to: attrs['to'],
+          cc: attrs['cc'],
+          bcc: attrs['bcc']
+        )
+        recipient.save!
+
+        attrs.fetch('templates', []).each do |template_name|
+          template = NotificationTemplate.find_by(name: template_name)
+
+          if template.nil?
+            warn "Skipping missing notification template #{template_name.inspect} for recipient #{recipient.label.inspect}"
+            next
+          end
+
+          NotificationTemplateEmailRecipient.find_or_create_by!(
+            notification_template: template,
+            email_recipient: recipient
+          )
+        end
+      end
+    elsif notification_routes_available?
+      mail_recipient_seed.each do |attrs|
+        attrs.fetch('templates', []).each do |template_name|
+          config = event_route_config_for_template(template_name)
+
+          if config.nil?
+            warn "Skipping devcluster mail recipient #{attrs.fetch('label').inspect} for unsupported template #{template_name.inspect}"
+            next
+          end
+
+          mail_recipient_addresses(attrs).each do |address|
+            target = upsert_notification_route_target(admin, address)
+            receiver = upsert_notification_route_receiver(
+              admin,
+              "#{attrs.fetch('label')} #{address}",
+              target
+            )
+            upsert_notification_route(
+              admin,
+              receiver,
+              "#{attrs.fetch('label')} #{template_name}",
+              config
+            )
+          end
+        end
+      end
+    elsif mail_recipient_seed.any?
+      warn 'Skipping devcluster mail recipient seed: neither legacy recipients nor event routes are available'
     end
   '';
 
@@ -1668,23 +1803,6 @@ let
           };
       };
 
-      containers.mailer.config =
-        { pkgs, lib, ... }:
-        lib.mkIf mailCapture.enable {
-          systemd.services.mailpit = {
-            description = "Development mail capture service";
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network.target" ];
-            serviceConfig = {
-              ExecStart = "${pkgs.mailpit}/bin/mailpit --smtp 127.0.0.1:${toString mailCapture.smtpPort} --listen 127.0.0.1:${toString mailCapture.webPort}";
-              Restart = "always";
-              RestartSec = "2s";
-            };
-          };
-
-          vpsadmin.nodectld.settings.mailer.smtp_port = lib.mkForce mailCapture.smtpPort;
-        };
-
       vpsadmin.notificationDispatcher.smtp = lib.mkIf mailCapture.enable {
         address = lib.mkForce "127.0.0.1";
         port = lib.mkForce mailCapture.smtpPort;
@@ -1861,7 +1979,11 @@ in
             "test.nix"
             "${devSeed}"
           ];
-          mailpit.enable = false;
+          mailpit = {
+            enable = mailCapture.enable;
+            smtpPort = mailCapture.smtpPort;
+            webPort = mailCapture.webPort;
+          };
           inherit rabbitmqNodeUsers;
         };
       };
