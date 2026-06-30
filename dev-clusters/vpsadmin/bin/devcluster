@@ -553,7 +553,7 @@ nix_common_env() {
   local vpsadminos_path="$5"
   local haveapi_path="$6"
   local config_path="$7"
-  local mail_templates_path="$8"
+  local notification_templates_path="$8"
   local web_path="$9"
   local vpsf_status_path="${10}"
   local vpsadmin_go_client_path="${11}"
@@ -570,7 +570,7 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE="$vpsadminos_path"
   export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
   export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
-  export VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE="$mail_templates_path"
+  export VPSADMIN_DEVCLUSTER_NOTIFICATION_TEMPLATES_SOURCE="$notification_templates_path"
   export VPSADMIN_DEVCLUSTER_WEB_SOURCE="$web_path"
   export VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE="$vpsf_status_path"
   export VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE="$vpsadmin_go_client_path"
@@ -615,7 +615,7 @@ build_config() {
   local vpsadminos_path
   local haveapi_path
   local config_source_path
-  local mail_templates_path
+  local notification_templates_path
   local web_path
   local vpsf_status_path
   local vpsadmin_go_client_path
@@ -630,7 +630,7 @@ build_config() {
   vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
-  mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
+  notification_templates_path="$(slug_optional_path "$slug" vpsfree-notification-templates || true)"
   web_path="$(slug_optional_path "$slug" web || true)"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
@@ -641,7 +641,7 @@ build_config() {
     vpsadminos_path=""
   fi
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path"
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$notification_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path"
 
   local -a overrides=()
   while IFS= read -r -d '' item; do

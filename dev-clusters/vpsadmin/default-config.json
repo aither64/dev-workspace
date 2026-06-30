@@ -86,9 +86,6 @@
         "username": "mailpit",
         "password": "mailpitPassword"
       }
-    },
-    "templates": {
-      "install": true
     }
   },
   "telegram": {

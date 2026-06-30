@@ -155,16 +155,17 @@ URL printed by `devcluster urls`, currently
 configured development basic-auth credentials. The raw Mailpit HTTP listener is
 bound to `127.0.0.1` inside the services VM.
 
-If `worktrees/<slug>/vpsfree-mail-templates` exists, its templates are copied
-into the Nix closure and installed by the services seed. Re-run:
+If `worktrees/<slug>/vpsfree-notification-templates` exists, its templates are
+copied into the Nix closure and installed as managed notification templates by
+the API service. Re-run:
 
 ```sh
 dev-clusters/vpsadmin/bin/devcluster update <slug> services
 ```
 
-after changing template files or the cluster mail seed config. Runtime virtiofs
-mounts cannot be added to an already-running VM, so templates are intentionally
-closure-copied instead of mounted live.
+after changing template files. Runtime virtiofs mounts cannot be added to an
+already-running VM, so templates are intentionally closure-copied instead of
+mounted live.
 
 ## Webhook Test Server
 

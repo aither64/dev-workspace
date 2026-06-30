@@ -16,7 +16,7 @@
   vpsadminosSourcePath,
   haveapiSourcePath,
   configSourcePath,
-  mailTemplatesSourcePath,
+  notificationTemplatesSourcePath,
   webSourcePath,
   vpsfStatusSourcePath,
   vpsadminGoClientSourcePath,
@@ -388,17 +388,20 @@ let
     user_dns_zone_type = node.userDnsZoneType;
   }) dnsServerList;
   rabbitmqNodeUsers = map (node: node.domainName) allNodeList;
-  installMailTemplates =
-    mailTemplatesSourcePath != "" && ((devConfig.mail.templates.install or false) == true);
-  mailTemplatesStorePath =
-    if installMailTemplates then
+  installNotificationTemplates = notificationTemplatesSourcePath != "";
+  notificationTemplatesStorePath =
+    if installNotificationTemplates then
       builtins.path {
-        path = mailTemplatesSourcePath;
-        name = "vpsfree-mail-templates";
+        path = notificationTemplatesSourcePath;
+        name = "vpsfree-notification-templates";
       }
     else
       null;
-  mailTemplatePaths = if installMailTemplates then [ "${mailTemplatesStorePath}" ] else [ ];
+  notificationTemplatesSourceId =
+    if installNotificationTemplates then
+      "devcluster:${toString notificationTemplatesStorePath}"
+    else
+      null;
   vpsfStatusLocalSource =
     if vpsfStatusSourcePath != "" then
       builtins.path {
@@ -916,34 +919,6 @@ let
     user_resources = JSON.parse(${builtins.toJSON (builtins.toJSON devConfig.seed.userResources)})
     JSON.parse(${builtins.toJSON (builtins.toJSON devConfig.seed.users)}).each do |attrs|
       upsert_dev_user(admin, environment, attrs, user_resources)
-    end
-
-    def install_notification_templates_from(path)
-      return unless Dir.exist?(path)
-
-      templates = VpsAdmin::API::NotificationTemplates.find_templates([path])
-      templates = VpsAdmin::API::NotificationTemplates.send(:unique_templates, templates)
-      templates = VpsAdmin::API::NotificationTemplates.send(:registered_templates, templates)
-
-      templates.each do |template|
-        record = NotificationTemplate.find_or_initialize_by(name: template.name)
-        record.assign_attributes(template.params)
-        record.save!
-
-        template.variants.each do |variant|
-          language = VpsAdmin::API::NotificationTemplates.send(:ensure_language!, variant.lang)
-          record.notification_template_variants
-            .find_or_initialize_by(language: language, protocol: variant.protocol)
-            .tap do |tr|
-              tr.assign_attributes(variant.params.merge(language: language))
-              tr.save!
-            end
-        end
-      end
-    end
-
-    JSON.parse(${builtins.toJSON (builtins.toJSON mailTemplatePaths)}).each do |path|
-      install_notification_templates_from(path)
     end
 
     def legacy_mail_recipients_available?
@@ -1502,6 +1477,11 @@ let
           "test.nix"
           "${devSeed}"
         ];
+
+        api.managedNotificationTemplates = lib.mkIf installNotificationTemplates {
+          paths = [ notificationTemplatesStorePath ];
+          sourceId = notificationTemplatesSourceId;
+        };
 
         varnish.api = {
           test.domain = lib.mkForce domains.api;
