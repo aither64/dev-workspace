@@ -1015,7 +1015,6 @@ let
       route.assign_attributes(
         position: route.position || EventRoute.next_position_for(user, nil),
         enabled: true,
-        default_route: false,
         single_use: false,
         continue: false
       )
