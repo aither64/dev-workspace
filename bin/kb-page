@@ -1,0 +1,422 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'json'
+require 'net/http'
+require 'optparse'
+require 'uri'
+
+module KbPage
+  WIKIS = {
+    'cz' => {
+      url: 'https://kb.vpsfree.cz',
+      token_path: '/home/aither/.codex/codex-kb-vpsfree-cz-aither-key'
+    },
+    'org' => {
+      url: 'https://kb.vpsfree.org',
+      token_path: '/home/aither/.codex/codex-kb-vpsfree-org-aither-key'
+    }
+  }.freeze
+
+  ACL_EDIT = 2
+  ACL_CREATE = 4
+  ACL_DELETE = 16
+
+  USAGE = <<~USAGE
+    Usage:
+      kb-page whoami --wiki cz|org
+      kb-page acl --wiki cz|org PAGE
+      kb-page get --wiki cz|org PAGE
+      kb-page save --wiki cz|org PAGE FILE --summary TEXT (--create|--update)
+        [--minor] [--approved-non-draft]
+      kb-page delete --wiki cz|org PAGE --summary TEXT --yes
+        [--approved-non-draft]
+      kb-page rename --wiki cz|org OLD_PAGE NEW_PAGE --summary TEXT
+        [--overwrite] [--approved-non-draft]
+  USAGE
+
+  class Error < StandardError; end
+
+  class RpcError < Error
+    attr_reader :code, :rpc_message
+
+    def initialize(code, rpc_message)
+      @code = code
+      @rpc_message = rpc_message
+      super("RPC failed: #{code} #{rpc_message}")
+    end
+  end
+
+  def self.wiki_config(name)
+    WIKIS.fetch(name) do
+      raise Error, "unknown wiki '#{name}', expected one of: #{WIKIS.keys.join(', ')}"
+    end
+  end
+
+  def self.draft_page?(page)
+    page.start_with?('drafts:')
+  end
+
+  class JsonRpcClient
+    def initialize(base_url:, token_path:, transport: nil)
+      @base_url = base_url
+      @token_path = token_path
+      @transport = transport || method(:perform_request)
+    end
+
+    def call(method, params = nil)
+      status, body = @transport.call(
+        endpoint_uri,
+        request_headers,
+        JSON.generate(
+          jsonrpc: '2.0',
+          method:,
+          params:,
+          id: method
+        )
+      )
+
+      response = JSON.parse(body)
+
+      if response['error']
+        error = response.fetch('error')
+        raise RpcError.new(error['code'], error['message'])
+      end
+
+      unless status.between?(200, 299)
+        raise Error, "HTTP #{status} from DokuWiki JSON-RPC endpoint"
+      end
+
+      response['result']
+    rescue JSON::ParserError => e
+      raise Error, "invalid JSON-RPC response: #{e.message}"
+    end
+
+    private
+
+    def endpoint_uri
+      URI.join("#{@base_url}/", 'lib/exe/jsonrpc.php')
+    end
+
+    def request_headers
+      {
+        'Content-Type' => 'application/json',
+        'Authorization' => "Bearer #{token}"
+      }
+    end
+
+    def token
+      File.read(@token_path).strip
+    rescue Errno::ENOENT
+      raise Error, "token file not found: #{@token_path}"
+    end
+
+    def perform_request(uri, headers, body)
+      request = Net::HTTP::Post.new(uri)
+      headers.each { |key, value| request[key] = value }
+      request.body = body
+
+      response = Net::HTTP.start(
+        uri.hostname,
+        uri.port,
+        use_ssl: uri.scheme == 'https'
+      ) do |http|
+        http.request(request)
+      end
+
+      [response.code.to_i, response.body]
+    end
+  end
+
+  class Runner
+    def initialize(out: $stdout, err: $stderr, client_factory: nil)
+      @out = out
+      @err = err
+      @client_factory = client_factory || method(:build_client)
+    end
+
+    def run(argv)
+      command = argv.shift
+      raise Error, USAGE unless command
+
+      case command
+      when 'whoami'
+        opts = parse_common(argv)
+        no_more_args!(argv)
+        whoami(opts)
+      when 'acl'
+        opts = parse_common(argv)
+        page = require_arg!(argv, 'PAGE')
+        no_more_args!(argv)
+        acl(opts, page)
+      when 'get'
+        opts = parse_common(argv)
+        page = require_arg!(argv, 'PAGE')
+        no_more_args!(argv)
+        get(opts, page)
+      when 'save'
+        save(argv)
+      when 'delete'
+        delete(argv)
+      when 'rename'
+        rename(argv)
+      when '-h', '--help', 'help'
+        @out.write(USAGE)
+      else
+        raise Error, "unknown command '#{command}'\n#{USAGE}"
+      end
+    end
+
+    def whoami(opts)
+      @out.puts(JSON.pretty_generate(client_for(opts).call('core.whoAmI')))
+    end
+
+    def acl(opts, page)
+      @out.puts(client_for(opts).call('core.aclCheck', page:).to_i)
+    end
+
+    def get(opts, page)
+      client = client_for(opts)
+      raise Error, "page does not exist: #{page}" unless page_exists?(client, page)
+
+      @out.write(client.call('core.getPage', page:))
+    end
+
+    def save(argv)
+      opts = parse_write_options(argv, create_update: true)
+      page = require_arg!(argv, 'PAGE')
+      file = require_arg!(argv, 'FILE')
+      no_more_args!(argv)
+      require_summary!(opts)
+
+      text = File.read(file)
+      client = client_for(opts)
+      exists = page_exists?(client, page)
+
+      if opts[:create] && exists
+        raise Error, "page already exists, refusing --create: #{page}"
+      elsif opts[:update] && !exists
+        raise Error, "page does not exist, refusing --update: #{page}"
+      end
+
+      require_non_draft_approval!([page], opts)
+      verify_identity!(client)
+      verify_permission!(
+        client,
+        page,
+        exists ? ACL_EDIT : ACL_CREATE,
+        exists ? 'update' : 'create'
+      )
+
+      save_page!(
+        client,
+        'core.savePage',
+        page:,
+        text:,
+        summary: opts[:summary],
+        isminor: opts[:minor]
+      )
+
+      @out.puts("saved #{page} on #{opts[:wiki]}")
+    end
+
+    def delete(argv)
+      opts = parse_write_options(argv, require_yes: true)
+      page = require_arg!(argv, 'PAGE')
+      no_more_args!(argv)
+      require_summary!(opts)
+      raise Error, 'delete requires --yes' unless opts[:yes]
+
+      client = client_for(opts)
+      raise Error, "page does not exist: #{page}" unless page_exists?(client, page)
+
+      require_non_draft_approval!([page], opts)
+      verify_identity!(client)
+      verify_permission!(client, page, ACL_DELETE, 'delete')
+
+      save_page!(
+        client,
+        'core.savePage',
+        page:,
+        text: '',
+        summary: opts[:summary],
+        isminor: false
+      )
+
+      @out.puts("deleted #{page} on #{opts[:wiki]}")
+    end
+
+    def rename(argv)
+      opts = parse_write_options(argv, allow_overwrite: true)
+      old_page = require_arg!(argv, 'OLD_PAGE')
+      new_page = require_arg!(argv, 'NEW_PAGE')
+      no_more_args!(argv)
+      require_summary!(opts)
+
+      client = client_for(opts)
+      raise Error, "source page does not exist: #{old_page}" unless page_exists?(client, old_page)
+
+      dest_exists = page_exists?(client, new_page)
+      if dest_exists && !opts[:overwrite]
+        raise Error, "destination page already exists, use --overwrite: #{new_page}"
+      end
+
+      require_non_draft_approval!([old_page, new_page], opts)
+      verify_identity!(client)
+      verify_permission!(client, old_page, ACL_DELETE, 'delete source page')
+      verify_permission!(
+        client,
+        new_page,
+        dest_exists ? ACL_EDIT : ACL_CREATE,
+        dest_exists ? 'overwrite destination page' : 'create destination page'
+      )
+
+      text = client.call('core.getPage', page: old_page)
+      save_page!(
+        client,
+        'core.savePage',
+        page: new_page,
+        text:,
+        summary: opts[:summary],
+        isminor: false
+      )
+      save_page!(
+        client,
+        'core.savePage',
+        page: old_page,
+        text: '',
+        summary: opts[:summary],
+        isminor: false
+      )
+
+      @out.puts("renamed #{old_page} to #{new_page} on #{opts[:wiki]}")
+    end
+
+    private
+
+    def parse_common(argv)
+      opts = {}
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--wiki WIKI', 'Wiki: cz or org') { |v| opts[:wiki] = v }
+      end
+      parser.permute!(argv)
+      require_wiki!(opts)
+      opts
+    end
+
+    def parse_write_options(
+      argv,
+      create_update: false,
+      require_yes: false,
+      allow_overwrite: false
+    )
+      opts = { minor: false }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--wiki WIKI', 'Wiki: cz or org') { |v| opts[:wiki] = v }
+        parser_opts.on('--summary TEXT', 'Edit summary') { |v| opts[:summary] = v }
+        parser_opts.on('--approved-non-draft', 'Allow non-draft page writes') do
+          opts[:approved_non_draft] = true
+        end
+        parser_opts.on('--minor', 'Mark save as minor') { opts[:minor] = true }
+
+        if create_update
+          parser_opts.on('--create', 'Require that the page does not exist') do
+            opts[:create] = true
+          end
+          parser_opts.on('--update', 'Require that the page already exists') do
+            opts[:update] = true
+          end
+        end
+
+        parser_opts.on('--yes', 'Confirm deletion') { opts[:yes] = true } if require_yes
+        if allow_overwrite
+          parser_opts.on('--overwrite', 'Allow overwriting destination') do
+            opts[:overwrite] = true
+          end
+        end
+      end
+
+      parser.permute!(argv)
+      require_wiki!(opts)
+
+      if create_update
+        unless opts[:create] ^ opts[:update]
+          raise Error, 'save requires exactly one of --create or --update'
+        end
+      end
+
+      opts
+    end
+
+    def require_wiki!(opts)
+      raise Error, '--wiki is required' unless opts[:wiki]
+
+      KbPage.wiki_config(opts[:wiki])
+    end
+
+    def require_summary!(opts)
+      return if opts[:summary] && !opts[:summary].strip.empty?
+
+      raise Error, '--summary is required for writes'
+    end
+
+    def require_arg!(argv, name)
+      argv.shift || raise(Error, "missing #{name}")
+    end
+
+    def no_more_args!(argv)
+      raise Error, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+    end
+
+    def client_for(opts)
+      @client_factory.call(KbPage.wiki_config(opts[:wiki]))
+    end
+
+    def build_client(wiki)
+      JsonRpcClient.new(base_url: wiki.fetch(:url), token_path: wiki.fetch(:token_path))
+    end
+
+    def page_exists?(client, page)
+      client.call('core.getPageInfo', page:)
+      true
+    rescue RpcError => e
+      raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
+
+      false
+    end
+
+    def require_non_draft_approval!(pages, opts)
+      return if opts[:approved_non_draft]
+      return if pages.all? { |page| KbPage.draft_page?(page) }
+
+      raise Error, 'non-draft page writes require --approved-non-draft'
+    end
+
+    def verify_identity!(client)
+      client.call('core.whoAmI')
+    end
+
+    def verify_permission!(client, page, required, action)
+      acl = client.call('core.aclCheck', page:).to_i
+      return if acl >= required
+
+      raise Error, "insufficient ACL for #{action} on #{page}: #{acl} < #{required}"
+    end
+
+    def save_page!(client, method, params)
+      result = client.call(method, params)
+      return if result == true
+
+      raise Error, "#{method} did not report success"
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    KbPage::Runner.new.run(ARGV)
+  rescue KbPage::Error, OptionParser::ParseError => e
+    warn e.message
+    exit(1)
+  end
+end
