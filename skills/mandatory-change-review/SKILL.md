@@ -42,6 +42,8 @@ First decide which role you are in:
    - base and head commits for every repository;
    - the intended commit split, including any user- or plan-requested separate
      commits;
+   - any deliberately bundled changes, with a concrete rationale for why they
+     cannot be reviewed, reverted, tested, or explained separately;
    - relevant dependency pins or configuration repository changes;
    - quick verification commands and results;
    - known compatibility or deployment assumptions.
@@ -74,6 +76,29 @@ the user request and the initiative plan/state:
   that change type, or when the subject fully explains a trivial mechanical
   change; otherwise report missing rationale as a commit-quality finding.
 
+Commit split review is mandatory. Treat a commit as too broad when it contains
+two or more changes that could reasonably be reviewed, reverted, tested, or
+explained separately while keeping the branch sequence coherent. A commit
+message that lists every included change does not make the commit focused.
+Report bundled independent changes as `Blocking` by default, because the
+author should split them before long integration tests. Downgrade only when the
+review packet gives an explicit, convincing reason that the changes are
+indivisible.
+
+Use these concrete red flags when reviewing vpsAdmin-style feature branches:
+
+- A managed notification-template installer commit must not also introduce
+  Markdown rendering helpers, Telegram HTML/link rendering changes, synthetic
+  test-notification behavior changes, or standalone uploader removal unless
+  the packet explains why those changes are inseparable.
+- A notification-delivery rate-limit commit must not also replace route-match
+  schema/API/WebUI attribution, change event persistence semantics, expand
+  test-notification authorization or route scope behavior, or rename generated
+  defaults unless the packet explains why those changes are inseparable.
+- Cross-cutting support edits, migrations, docs, and tests may stay with the
+  behavior they support. If a test or support edit primarily validates a
+  different behavior, it belongs with that behavior in a separate commit.
+
 Check at least:
 
 - Whether the committed changes match the requested feature, bugfix, or
@@ -97,6 +122,15 @@ Check at least:
 - Whether the design fits existing project architecture and abstractions,
   especially across vpsAdmin, vpsAdminOS, HaveAPI, clients, and configuration
   repositories.
+- Whether new or changed code uses defensive shape or capability probing
+  instead of explicit contracts. Flag runtime method/property/type probes such
+  as Ruby `respond_to?`, PHP `method_exists`/`property_exists`, Python
+  `hasattr`, reflection checks, optional chaining used to mask uncertain data
+  shapes, or helpers that try several possible input shapes unless the code or
+  review packet shows a concrete boundary reason: external API compatibility,
+  intentional polymorphism, generated/legacy migration data, or validated
+  untrusted input normalization. Prefer validating and normalizing data at the
+  boundary so internal code knows what it is passing.
 - For vpsAdmin API changes, whether plugin-specific functionality stays in the
   owning plugin unless a generic core extension point is intentionally changed.
   Flag plugin-owned API resources, event/type registrations, mail templates,
