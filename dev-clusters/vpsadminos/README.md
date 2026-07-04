@@ -16,6 +16,7 @@ dev-clusters/vpsadminos/bin/devcluster info 2026-05-31-example
 dev-clusters/vpsadminos/bin/devcluster ssh 2026-05-31-example node1
 dev-clusters/vpsadminos/bin/devcluster update 2026-05-31-example node1
 dev-clusters/vpsadminos/bin/devcluster stop 2026-05-31-example
+dev-clusters/vpsadminos/bin/devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
@@ -89,6 +90,13 @@ port, local resolvers, or upstream resolvers.
 
 If `worktrees/<slug>/vpsadminos` exists, the cluster is built from that worktree.
 Otherwise it is built from `repos/vpsadminos.git` `origin/staging`.
+
+`start` and `update` keep the built cluster config rooted at
+`.dev-clusters/vpsadminos/clusters/<slug>/result-config` while the cluster is in
+use. `stop` removes that root after the runner exits, and `reset` removes it
+with the rest of the cluster state. Use `devcluster gcroots` to list retained
+cluster config roots and `devcluster gcroots --cleanup` to remove roots for
+stopped clusters left by older tooling.
 
 ## Runtime Updates
 

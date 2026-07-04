@@ -19,6 +19,7 @@ Usage:
   devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force] [--sudo]
   devcluster stop <slug>
   devcluster status <slug>
+  devcluster gcroots [--cleanup] [<slug>...]
   devcluster urls <slug>
   devcluster config <slug>
   devcluster refresh <slug>
@@ -144,6 +145,27 @@ result_link() {
 
 config_path() {
   readlink -f "$(result_link "$1")"
+}
+
+list_cluster_slugs() {
+  local dir
+  [ -d "$STATE_ROOT/clusters" ] || return 0
+
+  for dir in "$STATE_ROOT"/clusters/*; do
+    [ -d "$dir" ] || continue
+    basename "$dir"
+  done | sort
+}
+
+remove_result_link() {
+  local slug="$1"
+  local link
+  link="$(result_link "$slug")"
+
+  if [ -L "$link" ] || [ -e "$link" ]; then
+    rm -f -- "$link"
+    printf 'removed GC root: %s\n' "$link"
+  fi
 }
 
 machine_ip() {
@@ -1005,21 +1027,30 @@ stop_cluster() {
 
   local pid_path pid
   pid_path="$(pid_file "$slug")"
-  [ -f "$pid_path" ] || die "cluster '$slug' has no pid file"
+  if [ ! -f "$pid_path" ]; then
+    rm -f "$(ready_file "$slug")"
+    kill_socket_processes "$slug"
+    remove_result_link "$slug"
+    printf 'cluster %s was not running\n' "$slug"
+    return
+  fi
+
   pid="$(cat "$pid_path")"
 
   if ! is_running "$pid"; then
     rm -f "$pid_path" "$(ready_file "$slug")"
     kill_socket_processes "$slug"
+    remove_result_link "$slug"
     printf 'cluster %s was not running\n' "$slug"
     return
   fi
 
-  kill -TERM "$pid"
+  kill -TERM "$pid" 2>/dev/null || true
 
   for _ in $(seq 1 120); do
     is_running "$pid" || {
       kill_socket_processes "$slug"
+      remove_result_link "$slug"
       printf 'cluster %s stopped\n' "$slug"
       return
     }
@@ -1028,6 +1059,7 @@ stop_cluster() {
 
   kill -KILL "$pid" 2>/dev/null || true
   kill_socket_processes "$slug"
+  remove_result_link "$slug"
   printf 'cluster %s killed after timeout\n' "$slug"
 }
 
@@ -1055,6 +1087,63 @@ status_cluster() {
       printf 'ready: stale\n'
     fi
   fi
+
+  if [ -L "$(result_link "$slug")" ]; then
+    printf 'gcroot: %s\n' "$(result_link "$slug")"
+  fi
+}
+
+gcroots_cluster() {
+  local cleanup=0
+  local -a slugs=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cleanup)
+        cleanup=1
+        ;;
+      --*)
+        usage
+        exit 2
+        ;;
+      *)
+        slugs+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  if [ "${#slugs[@]}" -eq 0 ]; then
+    mapfile -t slugs < <(list_cluster_slugs)
+  fi
+
+  local slug link target state
+  for slug in "${slugs[@]}"; do
+    link="$(result_link "$slug")"
+
+    if cluster_running "$slug"; then
+      state="running"
+    elif [ -f "$(ready_file "$slug")" ]; then
+      state="stopped-stale-ready"
+    else
+      state="stopped"
+    fi
+
+    if [ ! -L "$link" ] && [ ! -e "$link" ]; then
+      printf '%s %s no-gcroot\n' "$slug" "$state"
+      continue
+    fi
+
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+
+    if [ "$cleanup" = "1" ] && [ "$state" != "running" ]; then
+      remove_result_link "$slug"
+    else
+      printf '%s %s %s' "$slug" "$state" "$link"
+      [ -n "$target" ] && printf ' -> %s' "$target"
+      printf '\n'
+    fi
+  done
 }
 
 urls_cluster() {
@@ -1277,6 +1366,7 @@ reset_cluster() {
   fi
 
   kill_socket_processes "$slug"
+  remove_result_link "$slug"
   rm -rf "$(cluster_dir "$slug")"
   rm -rf "$(socket_dir "$slug")"
   printf 'cluster %s state removed\n' "$slug"
@@ -1294,6 +1384,7 @@ main() {
     start) start_cluster "$@" ;;
     stop) stop_cluster "$@" ;;
     status) status_cluster "$@" ;;
+    gcroots) gcroots_cluster "$@" ;;
     urls) urls_cluster "$@" ;;
     config) config_cluster "$@" ;;
     refresh) refresh_nodes_after_seed "$@" ;;

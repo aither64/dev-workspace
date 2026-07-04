@@ -16,6 +16,7 @@ dev-clusters/vpsadmin/bin/devcluster refresh 2026-05-29-security-advisories
 dev-clusters/vpsadmin/bin/devcluster update 2026-05-29-security-advisories services
 dev-clusters/vpsadmin/bin/devcluster ssh 2026-05-29-security-advisories services
 dev-clusters/vpsadmin/bin/devcluster stop 2026-05-29-security-advisories
+dev-clusters/vpsadmin/bin/devcluster gcroots --cleanup
 ```
 
 When running inside a `dev-session` shell, `ssh` can use
@@ -54,6 +55,13 @@ Network modes:
 The bridge helper path defaults to `/run/wrappers/bin/qemu-bridge-helper`.
 Override it with `VPSADMIN_DEVCLUSTER_BRIDGE_HELPER=/path/to/helper`, or set it
 to an empty value to omit the QEMU `helper=` option.
+
+`start` and `update` keep the built cluster config rooted at
+`.dev-clusters/vpsadmin/clusters/<slug>/result-config` while the cluster is in
+use. `stop` removes that root after the runner exits, and `reset` removes it
+with the rest of the cluster state. Use `devcluster gcroots` to list retained
+cluster config roots and `devcluster gcroots --cleanup` to remove roots for
+stopped clusters left by older tooling.
 
 Resolver behavior is configured in `config.json` under `resolver`. The default
 mode, `cluster`, runs dnsmasq on the services VM, serves all devcluster host
