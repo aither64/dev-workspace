@@ -51,6 +51,7 @@ let
   domains = devConfig.domains;
   tmpDomains = devConfig.tmpDomains;
   serviceIp = devConfig.services.ip;
+  serviceRootDiskMiB = devConfig.services.rootDiskMiB or (12 * 1024);
   zfsTransferStartDelay = devConfig.nodectld.zfsTransferStartDelay or 0;
   devGateway = devConfig.network.gateway;
   resolverConfig = devConfig.resolver or { };
@@ -1943,6 +1944,7 @@ in
       memory = 8192;
       cpus = 4;
       cores = 4;
+      diskSize = serviceRootDiskMiB;
       networks = machineNetworks "services";
       sharedFileSystems = sharedFileSystems;
       config = {

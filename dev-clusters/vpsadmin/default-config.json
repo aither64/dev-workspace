@@ -31,7 +31,8 @@
   },
   "services": {
     "ip": "172.16.106.53",
-    "name": "vpsadmin-services"
+    "name": "vpsadmin-services",
+    "rootDiskMiB": 12288
   },
   "nodectld": {
     "zfsTransferStartDelay": 0
