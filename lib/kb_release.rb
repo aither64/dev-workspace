@@ -81,6 +81,7 @@ module KbRelease
         %w[id file sha256].each { |key| entry.fetch(key) }
         policy = entry.fetch('policy', 'create')
         raise Error, "invalid media policy #{policy}" unless %w[create update].include?(policy)
+        entry.fetch('source_sha256') if policy == 'update'
       end
     rescue KeyError => e
       raise Error, "incomplete release manifest: #{e.message}"
@@ -230,11 +231,16 @@ module KbRelease
       @manifest.media.each do |entry|
         exists = media_exists?(client, entry.fetch('id'))
         policy = entry.fetch('policy', 'create')
-        if policy == 'create' && exists
+        if exists
           current = Base64.strict_decode64(client.call('core.getMedia', media: entry.fetch('id')))
-          next if Digest::SHA256.hexdigest(current) == entry.fetch('sha256')
+          current_hash = Digest::SHA256.hexdigest(current)
+          next if current_hash == entry.fetch('sha256')
 
-          raise Error, "create-only media already exists with different content: #{entry.fetch('id')}"
+          if policy == 'create'
+            raise Error, "create-only media already exists with different content: #{entry.fetch('id')}"
+          elsif current_hash != entry.fetch('source_sha256')
+            raise Error, "update media source drift: #{entry.fetch('id')}"
+          end
         elsif policy == 'update' && !exists
           raise Error, "update-only media does not exist: #{entry.fetch('id')}"
         end

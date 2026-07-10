@@ -280,6 +280,55 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_update_media_refuses_unrecorded_source_content
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "candidate media"
+        File.binwrite(File.join(release_dir, 'media.bin'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 1,
+            'wiki' => 'cz',
+            'pages' => [],
+            'media' => [
+              {
+                'id' => 'media.bin',
+                'file' => 'media.bin',
+                'sha256' => Digest::SHA256.hexdigest(candidate),
+                'policy' => 'update',
+                'source_sha256' => Digest::SHA256.hexdigest('expected source')
+              }
+            ]
+          )
+        )
+        staging = FakeClient.new
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+        staging.expect('core.aclCheck', { page: 'media.bin' }, result: 255)
+        staging.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+        staging.expect(
+          'core.getMedia',
+          { media: 'media.bin' },
+          result: Base64.strict_encode64('unexpected source')
+        )
+        clients = { 'cz' => FakeClient.new, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+        assert_match(/media source drift/, error.message)
+        assert(staging.done?)
+      end
+    end
+  end
+
   private
 
   def stub_kb_stage(name, value)
