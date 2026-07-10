@@ -518,10 +518,187 @@ class KbPageTest < Minitest::Test
     end
   end
 
+  def test_media_info_requests_hash
+    client = FakeClient.new
+    client.expect(
+      'core.getMediaInfo',
+      { media: 'drafts:test.png', hash: true },
+      result: { 'id' => 'drafts:test.png', 'hash' => 'abc' }
+    )
+
+    out = run_with(client, 'media-info', '--wiki', 'cz', 'drafts:test.png')
+
+    assert_equal("{\n  \"id\": \"drafts:test.png\",\n  \"hash\": \"abc\"\n}\n", out)
+    client.assert_done(self)
+  end
+
+  def test_media_get_decodes_file_and_refuses_local_overwrite
+    Dir.mktmpdir do |dir|
+      file = File.join(dir, 'image.png')
+      data = png_data
+      client = FakeClient.new
+      client.expect(
+        'core.getMedia',
+        { media: 'drafts:test.png' },
+        result: Base64.strict_encode64(data)
+      )
+
+      out = run_with(
+        client,
+        'media-get',
+        '--wiki',
+        'cz',
+        'drafts:test.png',
+        file
+      )
+
+      assert_equal(data, File.binread(file))
+      assert_match(/saved drafts:test\.png/, out)
+      client.assert_done(self)
+
+      error = assert_raises(KbPage::Error) do
+        run_with(
+          FakeClient.new,
+          'media-get',
+          '--wiki',
+          'cz',
+          'drafts:test.png',
+          file
+        )
+      end
+      assert_match(/local file already exists/, error.message)
+    end
+  end
+
+  def test_media_save_creates_draft_without_overwrite
+    with_temp_media(png_data) do |file|
+      client = FakeClient.new
+      client.expect(
+        'core.getMediaInfo',
+        { media: 'drafts:test.png' },
+        result: media_not_found
+      )
+      client.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+      client.expect('core.aclCheck', { page: 'drafts:test.png' }, result: 4)
+      client.expect(
+        'core.saveMedia',
+        {
+          media: 'drafts:test.png',
+          base64: Base64.strict_encode64(png_data),
+          overwrite: false
+        },
+        result: true
+      )
+
+      out = run_with(
+        client,
+        'media-save',
+        '--wiki',
+        'cz',
+        'drafts:test.png',
+        file,
+        '--create'
+      )
+
+      assert_equal("saved media drafts:test.png on cz\n", out)
+      client.assert_done(self)
+    end
+  end
+
+  def test_media_save_refuses_existing_media
+    with_temp_media(png_data) do |file|
+      client = FakeClient.new
+      client.expect('core.getMediaInfo', { media: 'drafts:test.png' }, result: {})
+
+      error = assert_raises(KbPage::Error) do
+        run_with(
+          client,
+          'media-save',
+          '--wiki',
+          'cz',
+          'drafts:test.png',
+          file,
+          '--create'
+        )
+      end
+
+      assert_match(/already exists/, error.message)
+      client.assert_done(self)
+    end
+  end
+
+  def test_media_save_refuses_non_draft_without_approval
+    with_temp_media(png_data) do |file|
+      client = FakeClient.new
+      client.expect(
+        'core.getMediaInfo',
+        { media: 'screenshots:test.png' },
+        result: media_not_found
+      )
+
+      error = assert_raises(KbPage::Error) do
+        run_with(
+          client,
+          'media-save',
+          '--wiki',
+          'cz',
+          'screenshots:test.png',
+          file,
+          '--create'
+        )
+      end
+
+      assert_match(/approved-non-draft/, error.message)
+      client.assert_done(self)
+    end
+  end
+
+  def test_media_save_validates_extension_and_content
+    with_temp_media('not a PNG') do |file|
+      error = assert_raises(KbPage::Error) do
+        run_with(
+          FakeClient.new,
+          'media-save',
+          '--wiki',
+          'cz',
+          'drafts:test.png',
+          file,
+          '--create'
+        )
+      end
+
+      assert_match(/does not match/, error.message)
+    end
+  end
+
+  def test_media_delete_deletes_draft
+    client = FakeClient.new
+    client.expect('core.getMediaInfo', { media: 'drafts:test.png' }, result: {})
+    client.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+    client.expect('core.aclCheck', { page: 'drafts:test.png' }, result: 16)
+    client.expect('core.deleteMedia', { media: 'drafts:test.png' }, result: true)
+
+    out = run_with(
+      client,
+      'media-delete',
+      '--wiki',
+      'cz',
+      'drafts:test.png',
+      '--yes'
+    )
+
+    assert_equal("deleted media drafts:test.png on cz\n", out)
+    client.assert_done(self)
+  end
+
   private
 
   def not_found
     KbPage::RpcError.new(1, 'Page does not exist')
+  end
+
+  def media_not_found
+    KbPage::RpcError.new(221, 'The requested media file does not exist')
   end
 
   def run_with(client, *argv)
@@ -541,5 +718,17 @@ class KbPageTest < Minitest::Test
       File.write(path, content)
       yield path
     end
+  end
+
+  def with_temp_media(content)
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, 'image.png')
+      File.binwrite(path, content)
+      yield path
+    end
+  end
+
+  def png_data
+    "\x89PNG\r\n\x1A\nfixture".b
   end
 end

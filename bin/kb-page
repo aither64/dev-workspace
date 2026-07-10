@@ -5,6 +5,7 @@ require 'json'
 require 'net/http'
 require 'optparse'
 require 'uri'
+require 'base64'
 
 module KbPage
   WIKIS = {
@@ -33,6 +34,12 @@ module KbPage
         [--approved-non-draft]
       kb-page rename --wiki cz|org OLD_PAGE NEW_PAGE --summary TEXT
         [--overwrite] [--approved-non-draft]
+      kb-page media-info --wiki cz|org MEDIA
+      kb-page media-get --wiki cz|org MEDIA FILE [--overwrite]
+      kb-page media-save --wiki cz|org MEDIA FILE --create
+        [--approved-non-draft]
+      kb-page media-delete --wiki cz|org MEDIA --yes
+        [--approved-non-draft]
   USAGE
 
   class Error < StandardError; end
@@ -160,6 +167,17 @@ module KbPage
         delete(argv)
       when 'rename'
         rename(argv)
+      when 'media-info'
+        opts = parse_common(argv)
+        media = require_arg!(argv, 'MEDIA')
+        no_more_args!(argv)
+        media_info(opts, media)
+      when 'media-get'
+        media_get(argv)
+      when 'media-save'
+        media_save(argv)
+      when 'media-delete'
+        media_delete(argv)
       when '-h', '--help', 'help'
         @out.write(USAGE)
       else
@@ -292,6 +310,75 @@ module KbPage
       @out.puts("renamed #{old_page} to #{new_page} on #{opts[:wiki]}")
     end
 
+    def media_info(opts, media)
+      info = client_for(opts).call('core.getMediaInfo', media:, hash: true)
+      @out.puts(JSON.pretty_generate(info))
+    end
+
+    def media_get(argv)
+      opts = parse_media_get_options(argv)
+      media = require_arg!(argv, 'MEDIA')
+      file = require_arg!(argv, 'FILE')
+      no_more_args!(argv)
+
+      if File.exist?(file) && !opts[:overwrite]
+        raise Error, "local file already exists, use --overwrite: #{file}"
+      end
+
+      encoded = client_for(opts).call('core.getMedia', media:)
+      data = Base64.strict_decode64(encoded)
+      File.binwrite(file, data)
+      @out.puts("saved #{media} from #{opts[:wiki]} to #{file}")
+    rescue ArgumentError => e
+      raise Error, "invalid base64 media response: #{e.message}"
+    end
+
+    def media_save(argv)
+      opts = parse_media_write_options(argv, require_create: true)
+      media = require_arg!(argv, 'MEDIA')
+      file = require_arg!(argv, 'FILE')
+      no_more_args!(argv)
+      raise Error, 'media-save requires --create' unless opts[:create]
+
+      data = File.binread(file)
+      validate_media_file!(media, data)
+
+      client = client_for(opts)
+      if media_exists?(client, media)
+        raise Error, "media already exists, refusing --create: #{media}"
+      end
+
+      require_non_draft_approval!([media], opts)
+      verify_identity!(client)
+      verify_permission!(client, media, ACL_CREATE, 'create media')
+      save_page!(
+        client,
+        'core.saveMedia',
+        media:,
+        base64: Base64.strict_encode64(data),
+        overwrite: false
+      )
+
+      @out.puts("saved media #{media} on #{opts[:wiki]}")
+    end
+
+    def media_delete(argv)
+      opts = parse_media_write_options(argv, require_yes: true)
+      media = require_arg!(argv, 'MEDIA')
+      no_more_args!(argv)
+      raise Error, 'media-delete requires --yes' unless opts[:yes]
+
+      client = client_for(opts)
+      raise Error, "media does not exist: #{media}" unless media_exists?(client, media)
+
+      require_non_draft_approval!([media], opts)
+      verify_identity!(client)
+      verify_permission!(client, media, ACL_DELETE, 'delete media')
+      save_page!(client, 'core.deleteMedia', media:)
+
+      @out.puts("deleted media #{media} on #{opts[:wiki]}")
+    end
+
     private
 
     def parse_common(argv)
@@ -348,6 +435,38 @@ module KbPage
       opts
     end
 
+    def parse_media_get_options(argv)
+      opts = {}
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--wiki WIKI', 'Wiki: cz or org') { |v| opts[:wiki] = v }
+        parser_opts.on('--overwrite', 'Overwrite an existing local file') do
+          opts[:overwrite] = true
+        end
+      end
+      parser.permute!(argv)
+      require_wiki!(opts)
+      opts
+    end
+
+    def parse_media_write_options(argv, require_create: false, require_yes: false)
+      opts = {}
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--wiki WIKI', 'Wiki: cz or org') { |v| opts[:wiki] = v }
+        if require_create
+          parser_opts.on('--create', 'Require that the media ID does not exist') do
+            opts[:create] = true
+          end
+        end
+        parser_opts.on('--yes', 'Confirm deletion') { opts[:yes] = true } if require_yes
+        parser_opts.on('--approved-non-draft', 'Allow non-draft media writes') do
+          opts[:approved_non_draft] = true
+        end
+      end
+      parser.permute!(argv)
+      require_wiki!(opts)
+      opts
+    end
+
     def require_wiki!(opts)
       raise Error, '--wiki is required' unless opts[:wiki]
 
@@ -383,6 +502,33 @@ module KbPage
       raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
 
       false
+    end
+
+    def media_exists?(client, media)
+      client.call('core.getMediaInfo', media:)
+      true
+    rescue RpcError => e
+      raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
+
+      false
+    end
+
+    def validate_media_file!(media, data)
+      raise Error, 'media file is empty' if data.empty?
+
+      extension = File.extname(media).downcase
+      signatures = {
+        '.png' => data.start_with?("\x89PNG\r\n\x1A\n".b),
+        '.jpg' => data.start_with?("\xFF\xD8\xFF".b),
+        '.jpeg' => data.start_with?("\xFF\xD8\xFF".b),
+        '.gif' => data.start_with?('GIF87a'.b, 'GIF89a'.b),
+        '.webp' => data.start_with?('RIFF'.b) && data.byteslice(8, 4) == 'WEBP'.b
+      }
+
+      valid = signatures.fetch(extension) do
+        raise Error, "unsupported media extension: #{extension.empty? ? '(none)' : extension}"
+      end
+      raise Error, "file content does not match media extension #{extension}" unless valid
     end
 
     def require_non_draft_approval!(pages, opts)
