@@ -268,7 +268,8 @@ class KbPageTest < Minitest::Test
         out: StringIO.new,
         err: StringIO.new,
         client_factory: ->(_wiki) { client },
-        staging_owner_verifier: -> { raise KbPage::Error, 'owned elsewhere' }
+        staging_owner_verifier: -> { raise KbPage::Error, 'owned elsewhere' },
+        staging_write_wrapper: ->(&block) { block.call }
       )
 
       error = assert_raises(KbPage::Error) do
@@ -278,6 +279,47 @@ class KbPageTest < Minitest::Test
       end
       assert_match(/owned elsewhere/, error.message)
     end
+  end
+
+  def test_staging_write_with_equals_form_runs_inside_wrapper
+    with_temp_file('hello') do |file|
+      client = FakeClient.new
+      client.expect('core.getPageInfo', { page: 'public:test' }, result: not_found)
+      client.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+      client.expect('core.aclCheck', { page: 'public:test' }, result: 4)
+      client.expect(
+        'core.savePage',
+        {
+          page: 'public:test', text: 'hello', summary: 'test', isminor: false
+        },
+        result: true
+      )
+      wrapped = false
+      runner = KbPage::Runner.new(
+        out: StringIO.new,
+        err: StringIO.new,
+        client_factory: ->(_wiki) { client },
+        staging_owner_verifier: -> { true },
+        staging_write_wrapper: lambda do |&block|
+          wrapped = true
+          block.call
+        end
+      )
+
+      runner.run(
+        ['save', '--wiki=cz-staging', 'public:test', file, '--summary', 'test', '--create']
+      )
+      assert(wrapped)
+      client.assert_done(self)
+    end
+  end
+
+  def test_abbreviated_wiki_option_is_rejected
+    error = assert_raises(OptionParser::InvalidOption) do
+      run_with(FakeClient.new, 'save', '--wik=cz-staging', 'page', 'file', '--create')
+    end
+
+    assert_match(/--wik/, error.message)
   end
 
   def test_save_refuses_create_when_page_exists
@@ -782,7 +824,8 @@ class KbPageTest < Minitest::Test
       out:,
       err: StringIO.new,
       client_factory: ->(_wiki) { client },
-      staging_owner_verifier: -> { true }
+      staging_owner_verifier: -> { true },
+      staging_write_wrapper: ->(&block) { block.call }
     )
     runner.run(argv)
     out.string

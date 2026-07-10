@@ -61,6 +61,17 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_staging_mutation_invalidates_pending_release
+    with_state do
+      stub_kb_stage(:current_slug, 'session-one') do
+        KbStage.claim!
+        KbStage.write_json(KbStage.pending_release_path, 'sha256' => 'test')
+        KbStage.with_staging_mutation { true }
+        refute_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
   def test_credentials_are_generated_outside_the_repository
     with_state do |state, codex|
       KbStage.ensure_credentials!
@@ -123,7 +134,7 @@ class KbStageTest < Minitest::Test
           out: StringIO.new
         )
 
-        stub_kb_stage(:verify_current_owner!, true) do
+        stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
           stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
         end
 
@@ -145,11 +156,63 @@ class KbStageTest < Minitest::Test
     assert_match(/explicit approval/, error.message)
   end
 
+  def test_promotion_refuses_staging_content_changed_after_review
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "reviewed\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 1,
+            'wiki' => 'cz',
+            'pages' => [
+              {
+                'id' => 'page',
+                'source_revision' => 123,
+                'source_sha256' => Digest::SHA256.hexdigest("old\n"),
+                'file' => 'page.txt',
+                'sha256' => Digest::SHA256.hexdigest(candidate)
+              }
+            ],
+            'media' => []
+          )
+        )
+        manifest = KbRelease::Manifest.new(manifest_path)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'sha256' => manifest.digest,
+          'slug' => 'session-one'
+        )
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: "changed\n")
+        runner = KbRelease::Runner.new(
+          manifest:,
+          client_factory: ->(name) { name == 'cz-staging' ? staging : raise('must not use production') },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') do
+            assert_raises(KbRelease::Error) do
+              runner.promote!(approved_production: true)
+            end
+          end
+        end
+        assert_match(/page verification failed/, error.message)
+        assert(staging.done?)
+      end
+    end
+  end
+
   private
 
   def stub_kb_stage(name, value)
     original = KbStage.method(name)
-    KbStage.define_singleton_method(name) { value }
+    KbStage.define_singleton_method(name) do |*args, &block|
+      value.respond_to?(:call) ? value.call(*args, &block) : value
+    end
     yield
   ensure
     KbStage.define_singleton_method(name, original)

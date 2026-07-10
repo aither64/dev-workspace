@@ -94,15 +94,27 @@ module KbStage
   end
 
   def release!(discard_pending: false)
-    with_lock do
-      verify_current_owner!
+    with_owned_lock do
       if File.exist?(pending_release_path) && !discard_pending
         raise Error, 'a staged release is pending; promote it or pass --discard-pending'
       end
 
+      yield if block_given?
       FileUtils.rm_f(owner_path)
       FileUtils.rm_f(pending_release_path) if discard_pending
     end
+  end
+
+  def with_owned_lock(invalidate_pending: false)
+    with_lock do
+      verify_current_owner!
+      FileUtils.rm_f(pending_release_path) if invalidate_pending
+      yield
+    end
+  end
+
+  def with_staging_mutation(&block)
+    with_owned_lock(invalidate_pending: true, &block)
   end
 
   def ensure_credentials!
@@ -150,20 +162,34 @@ module KbStage
     end
 
     def reset!
-      KbStage.verify_current_owner!
-      raise Error, 'start the staging container before resetting it' unless container_running?
-      unless system('sudo', 'nixos-container', 'run', CONTAINER, '--', 'kb-staging-clear')
-        raise Error, 'failed to clear the staging DokuWiki state'
+      KbStage.with_staging_mutation do
+        raise Error, 'start the staging container before resetting it' unless container_running?
+        clear_state!
+        mirror_all
       end
+    end
 
-      result = {}
-      SITES.each do |site|
+    private
+
+    def container_running?
+      _out, status = Open3.capture2('sudo', 'nixos-container', 'status', CONTAINER)
+      status.success? && _out.strip == 'UP'
+    end
+
+    def clear_state!
+      return if system('sudo', 'nixos-container', 'run', CONTAINER, '--', 'kb-staging-clear')
+
+      raise Error, 'failed to clear the staging DokuWiki state'
+    end
+
+    def mirror_all
+      result = SITES.to_h do |site|
         source = @client_factory.call(site)
         target = @client_factory.call("#{site}-staging")
         pages = fetch_pages(source)
         verify_identity!(target)
         replace_pages(target, pages)
-        result[site] = { 'pages' => pages.length }
+        [site, { 'pages' => pages.length }]
       end
 
       media = fetch_media(@client_factory.call('cz'))
@@ -174,13 +200,6 @@ module KbStage
       result['mirrored_at'] = Time.now.utc.iso8601
       KbStage.write_json(KbStage.mirror_path, result)
       result
-    end
-
-    private
-
-    def container_running?
-      _out, status = Open3.capture2('sudo', 'nixos-container', 'status', CONTAINER)
-      status.success? && _out.strip == 'UP'
     end
 
     def fetch_pages(client)

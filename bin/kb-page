@@ -160,17 +160,34 @@ module KbPage
   end
 
   class Runner
-    def initialize(out: $stdout, err: $stderr, client_factory: nil, staging_owner_verifier: nil)
+    WRITE_COMMANDS = %w[save delete rename media-save media-delete].freeze
+
+    def initialize(
+      out: $stdout,
+      err: $stderr,
+      client_factory: nil,
+      staging_owner_verifier: nil,
+      staging_write_wrapper: nil
+    )
       @out = out
       @err = err
       @client_factory = client_factory || method(:build_client)
       @staging_owner_verifier = staging_owner_verifier || method(:verify_staging_owner!)
+      @staging_write_wrapper = staging_write_wrapper || method(:with_staging_write_lock!)
     end
 
     def run(argv)
       command = argv.shift
       raise Error, USAGE unless command
 
+      if staging_write?(command, argv)
+        return @staging_write_wrapper.call { dispatch(command, argv) }
+      end
+
+      dispatch(command, argv)
+    end
+
+    def dispatch(command, argv)
       case command
       when 'whoami'
         opts = parse_common(argv)
@@ -417,6 +434,7 @@ module KbPage
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--wiki WIKI', 'Configured wiki name') { |v| opts[:wiki] = v }
       end
+      parser.require_exact = true
       parser.permute!(argv)
       require_wiki!(opts)
       opts
@@ -457,6 +475,7 @@ module KbPage
         end
       end
 
+      parser.require_exact = true
       parser.permute!(argv)
       require_wiki!(opts)
 
@@ -477,6 +496,7 @@ module KbPage
           opts[:overwrite] = true
         end
       end
+      parser.require_exact = true
       parser.permute!(argv)
       require_wiki!(opts)
       opts
@@ -502,6 +522,7 @@ module KbPage
           raise Error, '--approved-non-draft was replaced by --approved-production'
         end
       end
+      parser.require_exact = true
       parser.permute!(argv)
       require_wiki!(opts)
       if create_update && !(opts[:create] ^ opts[:update])
@@ -594,6 +615,27 @@ module KbPage
       require_relative '../lib/kb_stage'
 
       KbStage.verify_current_owner!
+    end
+
+    def with_staging_write_lock!(&block)
+      require_relative '../lib/kb_stage'
+
+      KbStage.with_staging_mutation(&block)
+    end
+
+    def staging_write?(command, argv)
+      return false unless WRITE_COMMANDS.include?(command)
+
+      wiki = argv.each_with_index.filter_map do |argument, index|
+        if argument == '--wiki'
+          argv[index + 1]
+        elsif argument.start_with?('--wiki=')
+          argument.delete_prefix('--wiki=')
+        end
+      end.last
+      return false unless wiki
+
+      KbPage.wiki_config(wiki).fetch(:environment) == :staging
     end
 
     def verify_identity!(client)

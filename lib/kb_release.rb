@@ -99,21 +99,22 @@ module KbRelease
     end
 
     def stage!
-      KbStage.verify_current_owner!
-      check_production_baseline!
-      staging = @client_factory.call(@manifest.staging_wiki)
-      verify_staging_baseline!(staging)
-      verify_write_access!(staging)
-      save_media!(staging)
-      save_pages!(staging, summary: 'Stage reviewed KB release')
-      verify_client!(staging)
-      KbStage.write_json(
-        KbStage.pending_release_path,
-        'manifest' => @manifest.path,
-        'sha256' => @manifest.digest,
-        'staged_at' => Time.now.utc.iso8601,
-        'slug' => KbStage.current_slug
-      )
+      KbStage.with_staging_mutation do
+        check_production_baseline!
+        staging = @client_factory.call(@manifest.staging_wiki)
+        verify_staging_baseline!(staging)
+        verify_write_access!(staging)
+        save_media!(staging)
+        save_pages!(staging, summary: 'Stage reviewed KB release')
+        verify_client!(staging)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'manifest' => @manifest.path,
+          'sha256' => @manifest.digest,
+          'staged_at' => Time.now.utc.iso8601,
+          'slug' => KbStage.current_slug
+        )
+      end
       @out.puts("staged #{@manifest.pages.length} pages and #{@manifest.media.length} media objects")
     end
 
@@ -127,15 +128,17 @@ module KbRelease
     def promote!(approved_production: false)
       raise Error, 'production promotion requires explicit approval' unless approved_production
 
-      KbStage.verify_current_owner!
-      verify_pending!
-      check_production_baseline!
-      production = @client_factory.call(@manifest.wiki)
-      verify_write_access!(production)
-      save_media!(production)
-      save_pages!(production, summary: 'Publish reviewed KB release')
-      verify_client!(production)
-      File.delete(KbStage.pending_release_path)
+      KbStage.with_owned_lock do
+        verify_pending!
+        verify_client!(@client_factory.call(@manifest.staging_wiki))
+        check_production_baseline!
+        production = @client_factory.call(@manifest.wiki)
+        verify_write_access!(production)
+        save_media!(production)
+        save_pages!(production, summary: 'Publish reviewed KB release')
+        verify_client!(production)
+        File.delete(KbStage.pending_release_path)
+      end
       @out.puts("promoted #{@manifest.pages.length} pages and #{@manifest.media.length} media objects")
     end
 
