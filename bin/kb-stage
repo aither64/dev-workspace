@@ -1,0 +1,175 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'json'
+require 'net/http'
+require 'optparse'
+require 'open3'
+require 'uri'
+
+require_relative '../lib/kb_stage'
+load File.expand_path('kb-page', __dir__)
+
+module KbStageCli
+  class Runner
+    URLS = %w[
+      http://kb-cs.aitherdev.int.vpsfree.cz/
+      http://kb-en.aitherdev.int.vpsfree.cz/
+    ].freeze
+
+    def initialize(out: $stdout)
+      @out = out
+    end
+
+    def run(argv)
+      command = argv.shift
+      case command
+      when 'start' then start(argv)
+      when 'stop' then stop(argv)
+      when 'status' then status(argv)
+      when 'reset' then reset(argv)
+      when 'release' then release(argv)
+      else
+        raise KbStage::Error, usage
+      end
+    end
+
+    private
+
+    def usage
+      <<~USAGE
+        Usage:
+          kb-stage start
+          kb-stage stop
+          kb-stage status
+          kb-stage reset --yes
+          kb-stage release --yes [--discard-pending]
+      USAGE
+    end
+
+    def no_args!(argv)
+      raise KbStage::Error, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+    end
+
+    def start(argv)
+      no_args!(argv)
+      KbStage.claim!
+      KbStage.ensure_credentials!
+      system!('sudo', 'nixos-container', 'start', KbStage::CONTAINER)
+      wait_for_sites
+      verify_api_identities
+      @out.puts('KB staging is running')
+    end
+
+    def stop(argv)
+      no_args!(argv)
+      KbStage.verify_current_owner!
+      system!('sudo', 'nixos-container', 'stop', KbStage::CONTAINER)
+      @out.puts('KB staging is stopped; ownership and data are retained')
+    end
+
+    def status(argv)
+      no_args!(argv)
+      owner = KbStage.owner
+      runtime, status = Open3.capture2('sudo', 'nixos-container', 'status', KbStage::CONTAINER)
+      value = {
+        'owner' => owner,
+        'container' => status.success? ? runtime.strip : 'unavailable',
+        'mirror' => read_json(KbStage.mirror_path),
+        'pending_release' => read_json(KbStage.pending_release_path)
+      }
+      @out.puts(JSON.pretty_generate(value))
+    end
+
+    def reset(argv)
+      yes = false
+      OptionParser.new { |opts| opts.on('--yes') { yes = true } }.parse!(argv)
+      no_args!(argv)
+      raise KbStage::Error, 'reset is destructive and requires --yes' unless yes
+
+      KbStage.ensure_credentials!
+      mirror = KbStage::Mirror.new(client_factory: method(:client_for), out: @out)
+      result = mirror.reset!
+      @out.puts("reset complete: #{JSON.generate(result)}")
+    end
+
+    def release(argv)
+      yes = false
+      discard = false
+      OptionParser.new do |opts|
+        opts.on('--yes') { yes = true }
+        opts.on('--discard-pending') { discard = true }
+      end.parse!(argv)
+      no_args!(argv)
+      raise KbStage::Error, 'release requires --yes' unless yes
+
+      KbStage.verify_current_owner!
+      system!('sudo', 'nixos-container', 'stop', KbStage::CONTAINER)
+      KbStage.release!(discard_pending: discard)
+      @out.puts('KB staging ownership released; data are retained')
+    end
+
+    def client_for(name)
+      wiki = KbPage.wiki_config(name)
+      KbPage::JsonRpcClient.new(
+        base_url: wiki.fetch(:url),
+        token_path: wiki[:token_path],
+        username: wiki[:username],
+        password_path: wiki[:password_path]
+      )
+    end
+
+    def read_json(path)
+      JSON.parse(File.read(path))
+    rescue Errno::ENOENT
+      nil
+    end
+
+    def wait_for_sites
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
+      pending = URLS.dup
+      until pending.empty?
+        pending.reject! { |url| reachable?(url) }
+        break if pending.empty?
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          raise KbStage::Error, "staging did not become ready: #{pending.join(', ')}"
+        end
+
+        sleep 1
+      end
+    end
+
+    def verify_api_identities
+      %w[cz-staging org-staging].each do |name|
+        identity = client_for(name).call('core.whoAmI')
+        login = identity.is_a?(Hash) ? identity['login'] : nil
+        raise KbStage::Error, "#{name} API authentication failed" if login.nil? || login.empty?
+      end
+    end
+
+    def reachable?(url)
+      uri = URI(url)
+      response = Net::HTTP.start(uri.hostname, uri.port, open_timeout: 2, read_timeout: 2) do |http|
+        http.get(uri.request_uri)
+      end
+      response.code.to_i.between?(200, 399)
+    rescue SystemCallError, Timeout::Error
+      false
+    end
+
+    def system!(*command)
+      return if system(*command)
+
+      raise KbStage::Error, "command failed: #{command.join(' ')}"
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    KbStageCli::Runner.new.run(ARGV)
+  rescue KbStage::Error, KbPage::Error, OptionParser::ParseError => e
+    warn e.message
+    exit 1
+  end
+end

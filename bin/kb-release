@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+
+load File.expand_path('kb-page', __dir__)
+require_relative '../lib/kb_release'
+
+module KbReleaseCli
+  class Runner
+    def initialize(out: $stdout)
+      @out = out
+    end
+
+    def run(argv)
+      command = argv.shift
+      options = parse(argv, command)
+      manifest = KbRelease::Manifest.new(options.fetch(:manifest))
+      runner = KbRelease::Runner.new(
+        manifest:,
+        client_factory: method(:client_for),
+        out: @out
+      )
+
+      case command
+      when 'stage'
+        require_yes!(options)
+        runner.stage!
+      when 'verify'
+        runner.verify!(options.fetch(:environment))
+      when 'promote'
+        require_yes!(options)
+        raise KbRelease::Error, 'promotion requires --approved-production' unless options[:approved]
+        runner.promote!(approved_production: true)
+      else
+        raise KbRelease::Error, usage
+      end
+    end
+
+    private
+
+    def usage
+      <<~USAGE
+        Usage:
+          kb-release stage --manifest FILE --yes
+          kb-release verify --manifest FILE [--production]
+          kb-release promote --manifest FILE --yes --approved-production
+      USAGE
+    end
+
+    def parse(argv, command)
+      options = { environment: :staging }
+      OptionParser.new do |opts|
+        opts.on('--manifest FILE') { |value| options[:manifest] = value }
+        opts.on('--yes') { options[:yes] = true }
+        opts.on('--approved-production') { options[:approved] = true }
+        opts.on('--production') { options[:environment] = :production }
+      end.parse!(argv)
+      raise KbRelease::Error, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+      raise KbRelease::Error, usage unless %w[stage verify promote].include?(command)
+      raise KbRelease::Error, '--manifest is required' unless options[:manifest]
+
+      options
+    end
+
+    def require_yes!(options)
+      raise KbRelease::Error, 'this write requires --yes' unless options[:yes]
+    end
+
+    def client_for(name)
+      wiki = KbPage.wiki_config(name)
+      KbPage::JsonRpcClient.new(
+        base_url: wiki.fetch(:url),
+        token_path: wiki[:token_path],
+        username: wiki[:username],
+        password_path: wiki[:password_path]
+      )
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    KbReleaseCli::Runner.new.run(ARGV)
+  rescue KbRelease::Error, KbStage::Error, KbPage::Error, OptionParser::ParseError => e
+    warn e.message
+    exit 1
+  end
+end

@@ -72,6 +72,30 @@ class KbPageTest < Minitest::Test
     end
   end
 
+  def test_json_rpc_client_uses_basic_auth_for_staging
+    Dir.mktmpdir do |dir|
+      password_path = File.join(dir, 'password')
+      File.write(password_path, "secret-password\n")
+      captured = {}
+      transport = lambda do |_uri, headers, body|
+        captured[:headers] = headers
+        captured[:body] = body
+        [200, JSON.generate('result' => 'ok')]
+      end
+      client = KbPage::JsonRpcClient.new(
+        base_url: 'http://kb.example',
+        username: 'aither',
+        password_path:,
+        transport:
+      )
+
+      assert_equal('ok', client.call('core.whoAmI'))
+      expected = "Basic #{Base64.strict_encode64('aither:secret-password')}"
+      assert_equal(expected, captured.fetch(:headers).fetch('Authorization'))
+      refute_includes(captured.fetch(:body), 'secret-password')
+    end
+  end
+
   def test_json_rpc_client_parses_json_rpc_error_from_http_error_response
     Dir.mktmpdir do |dir|
       token_path = File.join(dir, 'token')
@@ -129,7 +153,7 @@ class KbPageTest < Minitest::Test
     client.assert_done(self)
   end
 
-  def test_save_creates_draft_without_non_draft_approval
+  def test_save_creates_page_on_owned_staging_without_production_approval
     with_temp_file('hello') do |file|
       client = FakeClient.new
       client.expect(
@@ -154,7 +178,7 @@ class KbPageTest < Minitest::Test
         client,
         'save',
         '--wiki',
-        'cz',
+        'cz-staging',
         'drafts:test',
         file,
         '--summary',
@@ -162,7 +186,7 @@ class KbPageTest < Minitest::Test
         '--create'
       )
 
-      assert_equal("saved drafts:test on cz\n", out)
+      assert_equal("saved drafts:test on cz-staging\n", out)
       client.assert_done(self)
     end
   end
@@ -193,7 +217,7 @@ class KbPageTest < Minitest::Test
           client,
           'save',
           '--wiki',
-          'cz',
+          'cz-staging',
           'drafts:test',
           file,
           '--summary',
@@ -230,9 +254,29 @@ class KbPageTest < Minitest::Test
         )
       end
 
-      assert_match(/approved-non-draft/, error.message)
+      assert_match(/approved-production/, error.message)
       assert_equal([['core.getPageInfo', { page: 'public:test' }]], client.calls)
       client.assert_done(self)
+    end
+  end
+
+  def test_staging_write_requires_current_owner
+    with_temp_file('hello') do |file|
+      client = FakeClient.new
+      client.expect('core.getPageInfo', { page: 'public:test' }, result: not_found)
+      runner = KbPage::Runner.new(
+        out: StringIO.new,
+        err: StringIO.new,
+        client_factory: ->(_wiki) { client },
+        staging_owner_verifier: -> { raise KbPage::Error, 'owned elsewhere' }
+      )
+
+      error = assert_raises(KbPage::Error) do
+        runner.run(
+          ['save', '--wiki', 'cz-staging', 'public:test', file, '--summary', 'test', '--create']
+        )
+      end
+      assert_match(/owned elsewhere/, error.message)
     end
   end
 
@@ -308,14 +352,14 @@ class KbPageTest < Minitest::Test
       client,
       'delete',
       '--wiki',
-      'cz',
+      'cz-staging',
       'drafts:old',
       '--summary',
       'remove draft',
       '--yes'
     )
 
-    assert_equal("deleted drafts:old on cz\n", out)
+    assert_equal("deleted drafts:old on cz-staging\n", out)
     client.assert_done(self)
   end
 
@@ -352,7 +396,7 @@ class KbPageTest < Minitest::Test
       )
     end
 
-    assert_match(/approved-non-draft/, error.message)
+    assert_match(/approved-production/, error.message)
     client.assert_done(self)
   end
 
@@ -389,14 +433,14 @@ class KbPageTest < Minitest::Test
       client,
       'rename',
       '--wiki',
-      'cz',
+      'cz-staging',
       'drafts:old',
       'drafts:new',
       '--summary',
       'move draft'
     )
 
-    assert_equal("renamed drafts:old to drafts:new on cz\n", out)
+    assert_equal("renamed drafts:old to drafts:new on cz-staging\n", out)
     client.assert_done(self)
   end
 
@@ -418,7 +462,7 @@ class KbPageTest < Minitest::Test
       )
     end
 
-    assert_match(/approved-non-draft/, error.message)
+    assert_match(/approved-production/, error.message)
     client.assert_done(self)
   end
 
@@ -446,7 +490,7 @@ class KbPageTest < Minitest::Test
         client,
         'rename',
         '--wiki',
-        'cz',
+        'cz-staging',
         'drafts:old',
         'drafts:new',
         '--summary',
@@ -511,7 +555,7 @@ class KbPageTest < Minitest::Test
         '--summary',
         'create public',
         '--create',
-        '--approved-non-draft'
+        '--approved-production'
       )
 
       client.assert_done(self)
@@ -547,7 +591,7 @@ class KbPageTest < Minitest::Test
         client,
         'media-get',
         '--wiki',
-        'cz',
+        'cz-staging',
         'drafts:test.png',
         file
       )
@@ -579,7 +623,7 @@ class KbPageTest < Minitest::Test
         result: media_not_found
       )
       client.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
-      client.expect('core.aclCheck', { page: 'drafts:test.png' }, result: 4)
+      client.expect('core.aclCheck', { page: 'drafts:test.png' }, result: 8)
       client.expect(
         'core.saveMedia',
         {
@@ -594,13 +638,13 @@ class KbPageTest < Minitest::Test
         client,
         'media-save',
         '--wiki',
-        'cz',
+        'cz-staging',
         'drafts:test.png',
         file,
         '--create'
       )
 
-      assert_equal("saved media drafts:test.png on cz\n", out)
+      assert_equal("saved media drafts:test.png on cz-staging\n", out)
       client.assert_done(self)
     end
   end
@@ -627,6 +671,37 @@ class KbPageTest < Minitest::Test
     end
   end
 
+  def test_media_save_updates_existing_staging_media
+    with_temp_media(png_data) do |file|
+      client = FakeClient.new
+      client.expect('core.getMediaInfo', { media: 'screenshots:test.png' }, result: {})
+      client.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+      client.expect('core.aclCheck', { page: 'screenshots:test.png' }, result: 16)
+      client.expect(
+        'core.saveMedia',
+        {
+          media: 'screenshots:test.png',
+          base64: Base64.strict_encode64(png_data),
+          overwrite: true
+        },
+        result: true
+      )
+
+      out = run_with(
+        client,
+        'media-save',
+        '--wiki',
+        'cz-staging',
+        'screenshots:test.png',
+        file,
+        '--update'
+      )
+
+      assert_equal("saved media screenshots:test.png on cz-staging\n", out)
+      client.assert_done(self)
+    end
+  end
+
   def test_media_save_refuses_non_draft_without_approval
     with_temp_media(png_data) do |file|
       client = FakeClient.new
@@ -648,7 +723,7 @@ class KbPageTest < Minitest::Test
         )
       end
 
-      assert_match(/approved-non-draft/, error.message)
+      assert_match(/approved-production/, error.message)
       client.assert_done(self)
     end
   end
@@ -682,12 +757,12 @@ class KbPageTest < Minitest::Test
       client,
       'media-delete',
       '--wiki',
-      'cz',
+      'cz-staging',
       'drafts:test.png',
       '--yes'
     )
 
-    assert_equal("deleted media drafts:test.png on cz\n", out)
+    assert_equal("deleted media drafts:test.png on cz-staging\n", out)
     client.assert_done(self)
   end
 
@@ -706,7 +781,8 @@ class KbPageTest < Minitest::Test
     runner = KbPage::Runner.new(
       out:,
       err: StringIO.new,
-      client_factory: ->(_wiki) { client }
+      client_factory: ->(_wiki) { client },
+      staging_owner_verifier: -> { true }
     )
     runner.run(argv)
     out.string
