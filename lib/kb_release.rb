@@ -131,11 +131,11 @@ module KbRelease
       KbStage.with_owned_lock do
         verify_pending!
         verify_client!(@client_factory.call(@manifest.staging_wiki))
-        check_production_baseline!
+        states = check_production_baseline!(allow_candidate: true)
         production = @client_factory.call(@manifest.wiki)
         verify_write_access!(production)
         save_media!(production)
-        save_pages!(production, summary: 'Publish reviewed KB release')
+        save_pages!(production, summary: 'Publish reviewed KB release', states:)
         verify_client!(production)
         File.delete(KbStage.pending_release_path)
       end
@@ -144,17 +144,23 @@ module KbRelease
 
     private
 
-    def check_production_baseline!
+    def check_production_baseline!(allow_candidate: false)
       production = @client_factory.call(@manifest.wiki)
-      @manifest.pages.each do |entry|
+      @manifest.pages.to_h do |entry|
         id = entry.fetch('id')
         info = production.call('core.getPageInfo', page: id)
         revision = info['rev'] || info['lastModified'] || info['revision']
-        unless revision.to_s == entry.fetch('source_revision').to_s
-          raise Error, "production revision drift for #{id}: #{revision.inspect}"
-        end
         content = production.call('core.getPage', page: id)
-        unless Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+        hash = Digest::SHA256.hexdigest(content)
+
+        if hash == entry.fetch('source_sha256')
+          unless revision.to_s == entry.fetch('source_revision').to_s
+            raise Error, "production revision drift for #{id}: #{revision.inspect}"
+          end
+          [id, :source]
+        elsif allow_candidate && hash == entry.fetch('sha256')
+          [id, :candidate]
+        else
           raise Error, "production content drift for #{id}"
         end
       end
@@ -169,8 +175,11 @@ module KbRelease
       end
     end
 
-    def save_pages!(client, summary:)
+    def save_pages!(client, summary:, states: nil)
       @manifest.pages.each do |entry|
+        next if states && states.fetch(entry.fetch('id')) == :candidate
+        verify_source_page!(client, entry) if states
+
         result = client.call(
           'core.savePage',
           page: entry.fetch('id'),
@@ -180,6 +189,20 @@ module KbRelease
         )
         raise Error, "failed to save page #{entry.fetch('id')}" unless result == true
       end
+    end
+
+    def verify_source_page!(client, entry)
+      id = entry.fetch('id')
+      info = client.call('core.getPageInfo', page: id)
+      revision = info['rev'] || info['lastModified'] || info['revision']
+      unless revision.to_s == entry.fetch('source_revision').to_s
+        raise Error, "production revision drift before save for #{id}: #{revision.inspect}"
+      end
+
+      content = client.call('core.getPage', page: id)
+      return if Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+
+      raise Error, "production content drift before save for #{id}"
     end
 
     def verify_write_access!(client)

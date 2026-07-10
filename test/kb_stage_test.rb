@@ -206,6 +206,80 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_promotion_retries_pages_already_saved_by_a_partial_attempt
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        sources = { 'one' => "old one\n", 'two' => "old two\n" }
+        candidates = { 'one' => "new one\n", 'two' => "new two\n" }
+        pages = candidates.map do |id, content|
+          file = "#{id}.txt"
+          File.write(File.join(release_dir, file), content)
+          {
+            'id' => id,
+            'source_revision' => id == 'one' ? 101 : 102,
+            'source_sha256' => Digest::SHA256.hexdigest(sources.fetch(id)),
+            'file' => file,
+            'sha256' => Digest::SHA256.hexdigest(content)
+          }
+        end
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump('schema' => 1, 'wiki' => 'cz', 'pages' => pages, 'media' => [])
+        )
+        manifest = KbRelease::Manifest.new(manifest_path)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'sha256' => manifest.digest,
+          'slug' => 'session-one'
+        )
+
+        staging = FakeClient.new
+        candidates.each do |id, content|
+          staging.expect('core.getPage', { page: id }, result: content)
+        end
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'one' }, result: { 'revision' => 999 })
+        production.expect('core.getPage', { page: 'one' }, result: candidates.fetch('one'))
+        production.expect('core.getPageInfo', { page: 'two' }, result: { 'revision' => 102 })
+        production.expect('core.getPage', { page: 'two' }, result: sources.fetch('two'))
+        production.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        production.expect('core.aclCheck', { page: 'one' }, result: 255)
+        production.expect('core.aclCheck', { page: 'two' }, result: 255)
+        production.expect('core.getPageInfo', { page: 'two' }, result: { 'revision' => 102 })
+        production.expect('core.getPage', { page: 'two' }, result: sources.fetch('two'))
+        production.expect(
+          'core.savePage',
+          {
+            page: 'two',
+            text: candidates.fetch('two'),
+            summary: 'Publish reviewed KB release',
+            isminor: false
+          },
+          result: true
+        )
+        candidates.each do |id, content|
+          production.expect('core.getPage', { page: id }, result: content)
+        end
+        clients = { 'cz-staging' => staging, 'cz' => production }
+        runner = KbRelease::Runner.new(
+          manifest:,
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') do
+            runner.promote!(approved_production: true)
+          end
+        end
+        assert(staging.done?)
+        assert(production.done?)
+        refute_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
   private
 
   def stub_kb_stage(name, value)
