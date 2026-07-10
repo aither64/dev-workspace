@@ -30,7 +30,8 @@ bin/dev-session start 2026-06-06-api-token-rotation --as-is
 
 The first window is named `dev` and contains three panes:
 
-- left: `codex`, with cwd set to the workspace repository root;
+- left: login shell with cwd set to the workspace repository root; the helper
+  launches `codex` in this shell, so exiting Codex returns to the shell prompt;
 - right top: shell, with cwd set to `work/<slug>`;
 - right bottom: shell, with cwd set to `worktrees/<slug>`.
 

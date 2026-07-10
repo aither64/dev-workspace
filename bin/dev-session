@@ -534,7 +534,6 @@ module VpsfreeDevSession
         workspace,
         *tmux_environment_args(slug)
       ]
-      command << @codex_command if run_codex
 
       @tmux.run(*command)
       set_tmux_environment(slug)
@@ -577,6 +576,11 @@ module VpsfreeDevSession
       )
 
       @tmux.run('select-pane', '-t', left)
+
+      if run_codex
+        @tmux.run('send-keys', '-t', left, '-l', @codex_command)
+        @tmux.run('send-keys', '-t', left, 'Enter')
+      end
     end
 
     def sync_slug(slug, require_session:)

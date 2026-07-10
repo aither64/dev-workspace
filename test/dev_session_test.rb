@@ -568,6 +568,51 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_tmux_codex_runs_from_shell_and_leaves_shell_available
+    skip 'tmux is not available' unless command_available?('tmux')
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+
+    with_workspace do |workspace|
+      codex_probe = File.join(workspace, 'codex-ran.txt')
+      shell_probe = File.join(workspace, 'shell-remained.txt')
+      codex_command = "printf codex > #{Shellwords.escape(codex_probe)}"
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux_socket: socket,
+        codex_command:,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY
+      )
+
+      runner.start('demo', as_is: false, new: false, attach: false, run_codex: true)
+      wait_for_file(codex_probe)
+
+      panes = tmux_capture(
+        socket,
+        'list-panes',
+        '-t',
+        "#{slug}:dev",
+        '-F',
+        "\#{pane_id}\t\#{pane_current_path}"
+      ).lines.map { |line| line.chomp.split("\t", 2) }
+      left = panes.find { |_id, path| path == workspace }.fetch(0)
+      command = "printf shell > #{Shellwords.escape(shell_probe)}"
+
+      tmux_run(socket, 'send-keys', '-t', left, '-l', command)
+      tmux_run(socket, 'send-keys', '-t', left, 'Enter')
+      wait_for_file(shell_probe)
+
+      assert_equal('codex', File.read(codex_probe))
+      assert_equal('shell', File.read(shell_probe))
+      assert(tmux_session_exists?(socket, slug))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
   def test_tmux_start_and_sync_manage_only_worktree_windows
     skip 'tmux is not available' unless command_available?('tmux')
 
