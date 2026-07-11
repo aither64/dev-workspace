@@ -108,6 +108,7 @@ module KbRelease
         save_media!(staging)
         save_pages!(staging, summary: 'Stage reviewed KB release')
         verify_client!(staging)
+        verify_language_links!
         KbStage.write_json(
           KbStage.pending_release_path,
           'manifest' => @manifest.path,
@@ -123,6 +124,7 @@ module KbRelease
       KbStage.verify_current_owner! if environment == :staging
       name = environment == :staging ? @manifest.staging_wiki : @manifest.wiki
       verify_client!(@client_factory.call(name))
+      verify_language_links! if environment == :staging
       @out.puts("verified #{name}")
     end
 
@@ -170,7 +172,8 @@ module KbRelease
     def verify_staging_baseline!(client)
       @manifest.pages.each do |entry|
         content = client.call('core.getPage', page: entry.fetch('id'))
-        unless Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+        hash = Digest::SHA256.hexdigest(content)
+        unless [entry.fetch('source_sha256'), entry.fetch('sha256')].include?(hash)
           raise Error, "staging is not a clean production mirror at #{entry.fetch('id')}"
         end
       end
@@ -275,6 +278,15 @@ module KbRelease
       raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
 
       false
+    end
+
+    def verify_language_links!
+      return unless @manifest.wiki == 'cz'
+
+      pages = @manifest.pages.to_h do |entry|
+        [entry.fetch('id'), @manifest.read(entry).force_encoding(Encoding::UTF_8)]
+      end
+      KbStage::LanguageLinks.new(out: @out).warm_and_verify(pages)
     end
 
     def verify_pending!

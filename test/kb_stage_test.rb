@@ -98,6 +98,32 @@ class KbStageTest < Minitest::Test
     refute(KbStage.container_running?(runner: ->(*_args) { ["up\n", failed] }))
   end
 
+  def test_language_links_warm_english_first_and_verify_both_pages
+    calls = []
+    pages = {
+      'informace:novacci' => "<page>information:new_members</page>\ntext\n",
+      'navody:server:ssh' => "unpaired\n"
+    }
+    czech = 'http://kb-cs.aitherdev.int.vpsfree.cz/informace/novacci'
+    english = 'http://kb-en.aitherdev.int.vpsfree.cz/information/new_members'
+    html = %(<a href="#{czech}">cs</a><a href="#{english}">en</a>)
+    links = KbStage::LanguageLinks.new(
+      fetcher: ->(url) { calls << url; html },
+      out: StringIO.new
+    )
+
+    assert_equal(1, links.warm_and_verify(pages))
+    assert_equal([english, czech, english, czech], calls)
+  end
+
+  def test_language_links_reject_an_incomplete_pair
+    pages = { 'informace:novacci' => '<page>information:new_members</page>' }
+    links = KbStage::LanguageLinks.new(fetcher: ->(_url) { '<a href="only-one">cs</a>' })
+
+    error = assert_raises(KbStage::Error) { links.warm_and_verify(pages) }
+    assert_match(/informace:novacci/, error.message)
+  end
+
   def test_release_stages_only_when_production_and_staging_match_source
     with_state do
       Dir.mktmpdir do |release_dir|
@@ -153,6 +179,64 @@ class KbStageTest < Minitest::Test
         assert(production.done?)
         assert(staging.done?)
         assert_equal('session-one', JSON.parse(File.read(KbStage.pending_release_path)).fetch('slug'))
+      end
+    end
+  end
+
+  def test_release_stage_can_retry_when_candidate_pages_were_already_saved
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        source = "old\n"
+        candidate = "new\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 1,
+            'wiki' => 'cz',
+            'pages' => [
+              {
+                'id' => 'page',
+                'source_revision' => 123,
+                'source_sha256' => Digest::SHA256.hexdigest(source),
+                'file' => 'page.txt',
+                'sha256' => Digest::SHA256.hexdigest(candidate)
+              }
+            ],
+            'media' => []
+          )
+        )
+
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'page' }, result: { 'revision' => 123 })
+        production.expect('core.getPage', { page: 'page' }, result: source)
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect('core.aclCheck', { page: 'page' }, result: 255)
+        staging.expect(
+          'core.savePage',
+          {
+            page: 'page', text: candidate, summary: 'Stage reviewed KB release', isminor: false
+          },
+          result: true
+        )
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+
+        clients = { 'cz' => production, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
+        end
+
+        assert(production.done?)
+        assert(staging.done?)
       end
     end
   end

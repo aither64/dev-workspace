@@ -3,9 +3,11 @@
 require 'base64'
 require 'fileutils'
 require 'json'
+require 'net/http'
 require 'open3'
 require 'securerandom'
 require 'time'
+require 'uri'
 
 module KbStage
   class Error < StandardError; end
@@ -161,6 +163,56 @@ module KbStage
     FileUtils.rm_f(temporary) if defined?(temporary)
   end
 
+  class LanguageLinks
+    SITE_URLS = {
+      'cz' => 'http://kb-cs.aitherdev.int.vpsfree.cz',
+      'org' => 'http://kb-en.aitherdev.int.vpsfree.cz'
+    }.freeze
+    PAGE_TAG = /<page>\s*([^<]+?)\s*<\/page>/
+
+    def initialize(fetcher: nil, out: $stdout)
+      @fetcher = fetcher || method(:fetch)
+      @out = out
+    end
+
+    def warm_and_verify(czech_pages)
+      pairs = czech_pages.filter_map do |id, content|
+        target = content.match(PAGE_TAG)&.captures&.first
+        [id, target] if target
+      end
+
+      pairs.each do |czech_id, english_id|
+        english_url = page_url('org', english_id)
+        czech_url = page_url('cz', czech_id)
+        @fetcher.call(english_url)
+        @fetcher.call(czech_url)
+        [@fetcher.call(english_url), @fetcher.call(czech_url)].each do |html|
+          unless html.include?(%{href="#{english_url}"}) && html.include?(%{href="#{czech_url}"})
+            raise Error, "staging language links are incomplete for #{czech_id} / #{english_id}"
+          end
+        end
+      end
+      @out.puts("warmed and verified #{pairs.length} Czech/English page pairs")
+      pairs.length
+    end
+
+    private
+
+    def page_url(site, id)
+      path = id.split(':').map { |part| URI.encode_uri_component(part) }.join('/')
+      "#{SITE_URLS.fetch(site)}/#{path}"
+    end
+
+    def fetch(url)
+      response = Net::HTTP.get_response(URI(url))
+      return response.body if response.is_a?(Net::HTTPSuccess)
+
+      raise Error, "unable to render staging page #{url}: HTTP #{response.code}"
+    rescue SystemCallError, Timeout::Error => e
+      raise Error, "unable to render staging page #{url}: #{e.message}"
+    end
+  end
+
   class Mirror
     def initialize(client_factory:, out: $stdout)
       @client_factory = client_factory
@@ -184,10 +236,12 @@ module KbStage
     end
 
     def mirror_all
+      pages_by_site = {}
       result = SITES.to_h do |site|
         source = @client_factory.call(site)
         target = @client_factory.call("#{site}-staging")
         pages = fetch_pages(source)
+        pages_by_site[site] = pages
         verify_identity!(target)
         replace_pages(target, pages)
         [site, { 'pages' => pages.length }]
@@ -197,6 +251,9 @@ module KbStage
       media_target = @client_factory.call('cz-staging')
       verify_identity!(media_target)
       replace_media(media_target, media)
+      result['language_pairs'] = LanguageLinks.new(out: @out).warm_and_verify(
+        pages_by_site.fetch('cz')
+      )
       result['shared_media'] = media.length
       result['mirrored_at'] = Time.now.utc.iso8601
       KbStage.write_json(KbStage.mirror_path, result)
