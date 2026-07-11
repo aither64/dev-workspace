@@ -12,6 +12,7 @@ module KbStage
 
   ROOT = File.expand_path('..', __dir__)
   CONTAINER = 'kb-staging'
+  CONTAINERCTL = '/run/current-system/sw/bin/kb-staging-containerctl'
   SITES = %w[cz org].freeze
   DEFAULT_STATE_DIR = File.expand_path('~/.local/state/kb-stage')
   DEFAULT_CODEX_DIR = File.expand_path('~/.codex')
@@ -177,7 +178,7 @@ module KbStage
     private
 
     def clear_state!
-      return if system('sudo', 'kb-staging-containerctl', 'clear')
+      return if system('sudo', CONTAINERCTL, 'clear')
 
       raise Error, 'failed to clear the staging DokuWiki state'
     end

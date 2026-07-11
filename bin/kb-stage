@@ -12,6 +12,8 @@ load File.expand_path('kb-page', __dir__)
 
 module KbStageCli
   class Runner
+    CONTAINERCTL = '/run/current-system/sw/bin/kb-staging-containerctl'
+
     URLS = %w[
       http://kb-cs.aitherdev.int.vpsfree.cz/
       http://kb-en.aitherdev.int.vpsfree.cz/
@@ -56,7 +58,7 @@ module KbStageCli
       KbStage.claim!
       KbStage.with_owned_lock do
         KbStage.ensure_credentials!
-        system!('sudo', 'kb-staging-containerctl', 'start')
+        system!('sudo', CONTAINERCTL, 'start')
         wait_for_sites
         verify_api_identities
       end
@@ -66,7 +68,7 @@ module KbStageCli
     def stop(argv)
       no_args!(argv)
       KbStage.with_owned_lock do
-        system!('sudo', 'kb-staging-containerctl', 'stop')
+        system!('sudo', CONTAINERCTL, 'stop')
       end
       @out.puts('KB staging is stopped; ownership and data are retained')
     end
@@ -107,7 +109,7 @@ module KbStageCli
       raise KbStage::Error, 'release requires --yes' unless yes
 
       KbStage.release!(discard_pending: discard) do
-        system!('sudo', 'kb-staging-containerctl', 'stop')
+        system!('sudo', CONTAINERCTL, 'stop')
       end
       @out.puts('KB staging ownership released; data are retained')
     end
