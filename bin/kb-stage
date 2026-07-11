@@ -56,7 +56,7 @@ module KbStageCli
       KbStage.claim!
       KbStage.with_owned_lock do
         KbStage.ensure_credentials!
-        system!('sudo', 'nixos-container', 'start', KbStage::CONTAINER)
+        system!('sudo', 'kb-staging-containerctl', 'start')
         wait_for_sites
         verify_api_identities
       end
@@ -66,7 +66,7 @@ module KbStageCli
     def stop(argv)
       no_args!(argv)
       KbStage.with_owned_lock do
-        system!('sudo', 'nixos-container', 'stop', KbStage::CONTAINER)
+        system!('sudo', 'kb-staging-containerctl', 'stop')
       end
       @out.puts('KB staging is stopped; ownership and data are retained')
     end
@@ -74,7 +74,7 @@ module KbStageCli
     def status(argv)
       no_args!(argv)
       owner = KbStage.owner
-      runtime, status = Open3.capture2('sudo', 'nixos-container', 'status', KbStage::CONTAINER)
+      runtime, status = Open3.capture2('nixos-container', 'status', KbStage::CONTAINER)
       value = {
         'owner' => owner,
         'container' => status.success? ? runtime.strip : 'unavailable',
@@ -107,7 +107,7 @@ module KbStageCli
       raise KbStage::Error, 'release requires --yes' unless yes
 
       KbStage.release!(discard_pending: discard) do
-        system!('sudo', 'nixos-container', 'stop', KbStage::CONTAINER)
+        system!('sudo', 'kb-staging-containerctl', 'stop')
       end
       @out.puts('KB staging ownership released; data are retained')
     end

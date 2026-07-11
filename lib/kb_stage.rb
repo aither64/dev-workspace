@@ -138,6 +138,11 @@ module KbStage
     end
   end
 
+  def container_running?(runner: Open3.method(:capture2))
+    output, status = runner.call('nixos-container', 'status', CONTAINER)
+    status.success? && output.strip == 'up'
+  end
+
   def write_json(path, value)
     atomic_write(path, "#{JSON.pretty_generate(value)}\n", 0o600)
   end
@@ -163,7 +168,7 @@ module KbStage
 
     def reset!
       KbStage.with_staging_mutation do
-        raise Error, 'start the staging container before resetting it' unless container_running?
+        raise Error, 'start the staging container before resetting it' unless KbStage.container_running?
         clear_state!
         mirror_all
       end
@@ -171,13 +176,8 @@ module KbStage
 
     private
 
-    def container_running?
-      _out, status = Open3.capture2('sudo', 'nixos-container', 'status', CONTAINER)
-      status.success? && _out.strip == 'UP'
-    end
-
     def clear_state!
-      return if system('sudo', 'nixos-container', 'run', CONTAINER, '--', 'kb-staging-clear')
+      return if system('sudo', 'kb-staging-containerctl', 'clear')
 
       raise Error, 'failed to clear the staging DokuWiki state'
     end

@@ -86,6 +86,18 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_container_status_uses_lowercase_nixos_container_output
+    successful = Object.new
+    successful.define_singleton_method(:success?) { true }
+    failed = Object.new
+    failed.define_singleton_method(:success?) { false }
+
+    assert(KbStage.container_running?(runner: ->(*_args) { ["up\n", successful] }))
+    refute(KbStage.container_running?(runner: ->(*_args) { ["down\n", successful] }))
+    refute(KbStage.container_running?(runner: ->(*_args) { ["UP\n", successful] }))
+    refute(KbStage.container_running?(runner: ->(*_args) { ["up\n", failed] }))
+  end
+
   def test_release_stages_only_when_production_and_staging_match_source
     with_state do
       Dir.mktmpdir do |release_dir|
