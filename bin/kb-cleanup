@@ -1,0 +1,42 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+
+load File.expand_path('kb-page', __dir__)
+require_relative '../lib/kb_cleanup'
+
+begin
+  options = {}
+  OptionParser.new do |parser|
+    parser.banner = <<~USAGE
+      Usage:
+        kb-cleanup --manifest FILE --check
+        kb-cleanup --manifest FILE --yes --approved-production
+    USAGE
+    parser.on('--manifest FILE') { |value| options[:manifest] = value }
+    parser.on('--check') { options[:check] = true }
+    parser.on('--yes') { options[:yes] = true }
+    parser.on('--approved-production') { options[:approved] = true }
+  end.parse!
+
+  raise KbCleanup::Error, '--manifest is required' unless options[:manifest]
+  if options[:check]
+    raise KbCleanup::Error, '--check cannot be combined with write approval' if options[:yes] || options[:approved]
+  else
+    raise KbCleanup::Error, 'cleanup requires --yes' unless options[:yes]
+    raise KbCleanup::Error, 'cleanup requires --approved-production' unless options[:approved]
+  end
+  raise KbCleanup::Error, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+
+  manifest = KbCleanup::Manifest.new(options.fetch(:manifest))
+  factory = lambda do |name|
+    wiki = KbPage.wiki_config(name)
+    KbPage::JsonRpcClient.new(base_url: wiki.fetch(:url), token_path: wiki.fetch(:token_path))
+  end
+  runner = KbCleanup::Runner.new(manifest:, client_factory: factory)
+  options[:check] ? runner.check! : runner.cleanup!
+rescue KbCleanup::Error, KbPage::Error, OptionParser::ParseError => e
+  warn e.message
+  exit 1
+end
