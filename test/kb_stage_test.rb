@@ -165,6 +165,57 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_release_manifest_rejects_multiline_production_summary
+    Dir.mktmpdir do |release_dir|
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(
+        manifest_path,
+        YAML.dump(
+          'schema' => 1,
+          'wiki' => 'cz',
+          'production_summary' => "first line\nsecond line",
+          'pages' => [],
+          'media' => []
+        )
+      )
+
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/single line/, error.message)
+    end
+  end
+
+  def test_schema_two_release_manifest_requires_production_summary
+    Dir.mktmpdir do |release_dir|
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(
+        manifest_path,
+        YAML.dump('schema' => 2, 'wiki' => 'org', 'pages' => [], 'media' => [])
+      )
+
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/production_summary/, error.message)
+    end
+  end
+
+  def test_release_manifest_rejects_blank_production_summary
+    Dir.mktmpdir do |release_dir|
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(
+        manifest_path,
+        YAML.dump(
+          'schema' => 2,
+          'wiki' => 'org',
+          'production_summary' => '   ',
+          'pages' => [],
+          'media' => []
+        )
+      )
+
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/non-empty single line/, error.message)
+    end
+  end
+
   def test_english_release_verifies_every_explicit_counterpart_pair
     Dir.mktmpdir do |release_dir|
       pages = {
@@ -409,7 +460,13 @@ class KbStageTest < Minitest::Test
         manifest_path = File.join(release_dir, 'release.yml')
         File.write(
           manifest_path,
-          YAML.dump('schema' => 1, 'wiki' => 'cz', 'pages' => pages, 'media' => [])
+          YAML.dump(
+            'schema' => 1,
+            'wiki' => 'cz',
+            'production_summary' => 'Aktualizovat snímky obrazovky',
+            'pages' => pages,
+            'media' => []
+          )
         )
         manifest = KbRelease::Manifest.new(manifest_path)
         KbStage.write_json(
@@ -437,7 +494,7 @@ class KbStageTest < Minitest::Test
           {
             page: 'two',
             text: candidates.fetch('two'),
-            summary: 'Publish reviewed KB release',
+            summary: 'Aktualizovat snímky obrazovky',
             isminor: false
           },
           result: true

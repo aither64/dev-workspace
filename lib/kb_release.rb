@@ -46,6 +46,13 @@ module KbRelease
       data.fetch('media')
     end
 
+    def production_summary
+      return data.fetch('production_summary') if data.key?('production_summary')
+      return 'Publish reviewed KB release' if data.fetch('schema') == 1
+
+      data.fetch('production_summary')
+    end
+
     def read(entry)
       file = File.expand_path(entry.fetch('file'), root)
       unless file.start_with?("#{root}/")
@@ -65,8 +72,17 @@ module KbRelease
     private
 
     def validate!
-      raise Error, 'release manifest schema must be 1' unless data['schema'] == 1
+      unless [1, 2].include?(data['schema'])
+        raise Error, 'release manifest schema must be 1 or 2'
+      end
       raise Error, 'release wiki must be cz or org' unless %w[cz org].include?(data['wiki'])
+
+      if data['schema'] == 2 || data.key?('production_summary')
+        summary = data.fetch('production_summary')
+        unless summary.is_a?(String) && !summary.strip.empty? && !summary.match?(/[\r\n]/)
+          raise Error, 'production summary must be a non-empty single line'
+        end
+      end
 
       %w[pages media].each do |kind|
         entries = data.fetch(kind)
@@ -145,7 +161,7 @@ module KbRelease
         production = @client_factory.call(@manifest.wiki)
         verify_write_access!(production)
         save_media!(production)
-        save_pages!(production, summary: 'Publish reviewed KB release', states:)
+        save_pages!(production, summary: @manifest.production_summary, states:)
         verify_client!(production)
         File.delete(KbStage.pending_release_path)
       end

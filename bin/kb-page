@@ -538,9 +538,15 @@ module KbPage
     end
 
     def require_summary!(opts)
-      return if opts[:summary] && !opts[:summary].strip.empty?
+      summary = opts[:summary]
+      raise Error, '--summary is required for writes' unless summary && !summary.strip.empty?
 
-      raise Error, '--summary is required for writes'
+      wiki = KbPage.wiki_config(opts.fetch(:wiki))
+      if wiki.fetch(:environment) == :production && summary.match?(/[\r\n]/)
+        raise Error, 'production --summary must be a single line'
+      end
+
+      true
     end
 
     def require_arg!(argv, name)

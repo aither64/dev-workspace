@@ -604,6 +604,30 @@ class KbPageTest < Minitest::Test
     end
   end
 
+  def test_production_write_rejects_multiline_summary
+    with_temp_file('hello') do |file|
+      client = FakeClient.new
+
+      error = assert_raises(KbPage::Error) do
+        run_with(
+          client,
+          'save',
+          '--wiki',
+          'org',
+          'public:test',
+          file,
+          '--summary',
+          "first line\nsecond line",
+          '--create',
+          '--approved-production'
+        )
+      end
+
+      assert_match(/single line/, error.message)
+      client.assert_done(self)
+    end
+  end
+
   def test_media_info_requests_hash
     client = FakeClient.new
     client.expect(
