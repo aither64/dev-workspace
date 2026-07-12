@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'optparse'
+require 'pathname'
+require 'yaml'
+
+options = {}
+OptionParser.new do |parser|
+  parser.banner = 'Usage: kb-contract-manifest --source DIR --candidate DIR --language cs|en --summary TEXT --output FILE'
+  parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
+  parser.on('--candidate DIR') { |value| options[:candidate] = File.expand_path(value) }
+  parser.on('--language LANGUAGE') { |value| options[:language] = value }
+  parser.on('--summary TEXT') { |value| options[:summary] = value }
+  parser.on('--output FILE') { |value| options[:output] = File.expand_path(value) }
+end.parse!
+abort 'unexpected arguments' unless ARGV.empty?
+%i[source candidate language summary output].each do |key|
+  abort "--#{key} is required" unless options[key]
+end
+abort '--language must be cs or en' unless %w[cs en].include?(options[:language])
+abort '--summary must be a non-empty single line' if options[:summary].strip.empty? || options[:summary].match?(/[\r\n]/)
+
+source_index = JSON.parse(File.read(File.join(options.fetch(:source), 'index.json')))
+candidate_index = JSON.parse(File.read(File.join(options.fetch(:candidate), 'index.json')))
+source_by_key = source_index.flat_map do |language, pages|
+  pages.map { |page| [[language, page.fetch('id')], page] }
+end.to_h
+
+czech_counterparts = candidate_index.fetch('pages').filter_map do |page|
+  next unless page.fetch('language') == 'cs'
+
+  content = File.binread(File.join(options.fetch(:candidate), page.fetch('file')))
+  english_id = content[/<page>\s*([^<]+?)\s*<\/page>/, 1]
+  [english_id, page.fetch('id')] if english_id
+end.to_h
+
+manifest_root = File.dirname(options.fetch(:output))
+candidate_root = Pathname.new(options.fetch(:candidate))
+root = Pathname.new(manifest_root)
+begin
+  candidate_relative = candidate_root.relative_path_from(root).to_s
+rescue ArgumentError
+  abort 'candidate directory must be below the manifest directory'
+end
+abort 'candidate directory must be below the manifest directory' if candidate_relative == '..' || candidate_relative.start_with?('../')
+
+language = options.fetch(:language)
+pages = candidate_index.fetch('pages').select do |page|
+  page.fetch('language') == language && page.fetch('changed')
+end.map do |page|
+  source = source_by_key.fetch([language, page.fetch('id')])
+  source_content = File.binread(File.join(options.fetch(:source), source.fetch('file')))
+  candidate_content = File.binread(File.join(options.fetch(:candidate), page.fetch('file')))
+  unless Digest::SHA256.hexdigest(source_content) == source.fetch('sha256')
+    abort "source checksum drift for #{page.fetch('id')}"
+  end
+  unless Digest::SHA256.hexdigest(candidate_content) == page.fetch('candidate_sha256')
+    abort "candidate checksum drift for #{page.fetch('id')}"
+  end
+  entry = {
+    'id' => page.fetch('id'),
+    'source_revision' => source.fetch('revision'),
+    'source_sha256' => source.fetch('sha256'),
+    'file' => File.join(candidate_relative, page.fetch('file')),
+    'sha256' => page.fetch('candidate_sha256')
+  }
+  if language == 'en'
+    counterpart = czech_counterparts[page.fetch('id')]
+    abort "missing Czech counterpart for #{page.fetch('id')}" unless counterpart
+
+    entry['language_counterpart'] = counterpart
+  end
+  entry
+end
+
+manifest = {
+  'schema' => 2,
+  'wiki' => language == 'cs' ? 'cz' : 'org',
+  'production_summary' => options.fetch(:summary),
+  'pages' => pages,
+  'media' => []
+}
+FileUtils.mkdir_p(File.dirname(options.fetch(:output)))
+File.write(options.fetch(:output), YAML.dump(manifest))
+puts "Prepared #{options.fetch(:output)} with #{pages.length} pages"

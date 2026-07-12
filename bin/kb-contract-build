@@ -1,0 +1,134 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'optparse'
+require 'yaml'
+
+options = {}
+OptionParser.new do |parser|
+  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR'
+  parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
+  parser.on('--plan FILE') { |value| options[:plan] = File.expand_path(value) }
+  parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
+end.parse!
+abort 'unexpected arguments' unless ARGV.empty?
+%i[source plan output].each { |key| abort "--#{key} is required" unless options[key] }
+abort 'source and output directories must differ' if options[:source] == options[:output]
+
+plan_file = YAML.safe_load_file(options.fetch(:plan))
+abort 'replacement plan schema must be 1' unless plan_file.fetch('schema') == 1
+replacements = plan_file.fetch('replacements')
+exceptions = plan_file.fetch('exceptions', [])
+abort 'replacements must be a list' unless replacements.is_a?(Array)
+abort 'exceptions must be a list' unless exceptions.is_a?(Array)
+
+source_root = options.fetch(:source)
+output_root = options.fetch(:output)
+source_index = JSON.parse(File.read(File.join(source_root, 'index.json')))
+pages = source_index.flat_map do |language, entries|
+  entries.map do |entry|
+    key = [language, entry.fetch('id')]
+    [key, File.binread(File.join(source_root, entry.fetch('file')))]
+  end
+end.to_h
+
+annotation_plan = replacements.map do |replacement|
+  language = replacement.fetch('language')
+  page = replacement.fetch('page')
+  path = replacement.fetch('path')
+  before = replacement.fetch('before')
+  count = replacement.fetch('count', 1)
+  abort "#{language}:#{page}: replacement count must be positive" unless count.is_a?(Integer) && count.positive?
+
+  key = [language, page]
+  content = pages.fetch(key)
+  actual_count = content.scan(before).length
+  unless actual_count == count
+    abort "#{language}:#{page}: #{path} expected #{count} matches, found #{actual_count}"
+  end
+
+  body = replacement.fetch('body', before)
+  tagged = replacement.fetch(
+    'replacement',
+    %(<vpsadmin-nav id="#{path}">#{body}</vpsadmin-nav>)
+  )
+  tag_pattern = /<vpsadmin-nav\s+id="#{Regexp.escape(path)}">.*?<\/vpsadmin-nav>/m
+  unless tagged.scan(tag_pattern).length == 1 &&
+         tagged.scan('<vpsadmin-nav').length == 1 &&
+         tagged.scan('</vpsadmin-nav>').length == 1
+    abort "#{language}:#{page}: #{path} replacement must contain exactly one matching tag"
+  end
+
+  pages[key] = content.gsub(before) { tagged }
+  {
+    'language' => language,
+    'page' => page,
+    'path' => path,
+    'count' => count,
+    'before' => before,
+    'body' => body
+  }
+end
+
+candidate_index = {
+  'pages' => [],
+  'annotations' => annotation_plan,
+  'exceptions' => exceptions
+}
+pages.sort.each do |(language, page_id), content|
+  relative = File.join(language, *page_id.split(':')) + '.txt'
+  source = File.binread(File.join(source_root, relative))
+  destination = File.join(output_root, relative)
+  FileUtils.mkdir_p(File.dirname(destination))
+  File.binwrite(destination, content)
+  candidate_index.fetch('pages') << {
+    'language' => language,
+    'id' => page_id,
+    'file' => relative,
+    'changed' => content != source,
+    'source_sha256' => Digest::SHA256.hexdigest(source),
+    'candidate_sha256' => Digest::SHA256.hexdigest(content)
+  }
+end
+
+FileUtils.mkdir_p(output_root)
+File.write(
+  File.join(output_root, 'index.json'),
+  "#{JSON.pretty_generate(candidate_index)}\n"
+)
+
+cell = lambda do |value|
+  value.to_s.gsub('|', '\\|').gsub("\n", ' ↵ ')
+end
+review = [
+  '# KB navigation annotation review',
+  '',
+  "Changed pages: #{candidate_index.fetch('pages').count { |page| page.fetch('changed') }}",
+  "Annotation tags: #{annotation_plan.sum { |entry| entry.fetch('count') }}",
+  '',
+  '| Language | Page | Semantic path | Count | Existing text | Candidate text |',
+  '| --- | --- | --- | ---: | --- | --- |'
+]
+annotation_plan.each do |entry|
+  review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
+            "| `#{cell.call(entry.fetch('path'))}` | #{entry.fetch('count')} " \
+            "| #{cell.call(entry.fetch('before'))} | #{cell.call(entry.fetch('body'))} |"
+end
+review.concat([
+  '',
+  '## Explicit exceptions',
+  '',
+  '| Language | Page | Semantic path | Reason |',
+  '| --- | --- | --- | --- |'
+])
+exceptions.each do |entry|
+  review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
+            "| `#{cell.call(entry.fetch('path'))}` | #{cell.call(entry.fetch('reason'))} |"
+end
+File.write(File.join(output_root, 'review.md'), "#{review.join("\n")}\n")
+
+puts "Prepared #{candidate_index.fetch('pages').count { |page| page.fetch('changed') }} changed pages " \
+     "with #{annotation_plan.sum { |entry| entry.fetch('count') }} annotations"

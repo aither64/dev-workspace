@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'optparse'
+
+options = {}
+OptionParser.new do |parser|
+  parser.banner = 'Usage: kb-contract-fetch --output DIR'
+  parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
+end.parse!
+abort 'unexpected arguments' unless ARGV.empty?
+abort '--output is required' unless options[:output]
+
+workspace = File.expand_path('..', __dir__)
+load File.join(workspace, 'bin/kb-page')
+
+output_root = options.fetch(:output)
+wikis = { 'cs' => 'cz', 'en' => 'org' }.freeze
+index = {}
+
+wikis.each do |language, wiki|
+  config = KbPage.wiki_config(wiki)
+  client = KbPage::JsonRpcClient.new(
+    base_url: config.fetch(:url),
+    token_path: config.fetch(:token_path)
+  )
+  page_ids = client.call('core.listPages', namespace: '', depth: 20).filter_map do |page|
+    page['id'] || page['page']
+  end.uniq.sort
+  abort "#{wiki}: core.listPages returned no pages" if page_ids.empty?
+
+  index[language] = page_ids.map do |page_id|
+    info = client.call('core.getPageInfo', page: page_id)
+    content = client.call('core.getPage', page: page_id)
+    revision = info['revision'] || info['rev'] || info['lastModified']
+    abort "#{wiki}:#{page_id}: source revision is missing" unless revision
+
+    relative = File.join(language, *page_id.split(':')) + '.txt'
+    destination = File.join(output_root, relative)
+    FileUtils.mkdir_p(File.dirname(destination))
+    File.binwrite(destination, content)
+    {
+      'id' => page_id,
+      'file' => relative,
+      'revision' => revision,
+      'sha256' => Digest::SHA256.hexdigest(content)
+    }
+  end
+end
+
+FileUtils.mkdir_p(output_root)
+File.write(File.join(output_root, 'index.json'), "#{JSON.pretty_generate(index)}\n")
+puts "Fetched #{index.fetch('cs').length} Czech and #{index.fetch('en').length} English pages"
