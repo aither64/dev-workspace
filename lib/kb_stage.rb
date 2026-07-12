@@ -181,6 +181,12 @@ module KbStage
         [id, target] if target
       end
 
+      warm_and_verify_pairs(pairs)
+    end
+
+    def warm_and_verify_pairs(pairs)
+      pairs = pairs.to_a
+
       pairs.each do |czech_id, english_id|
         english_url = page_url('org', english_id)
         czech_url = page_url('cz', czech_id)

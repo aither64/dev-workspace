@@ -76,6 +76,7 @@ module KbRelease
       end
       pages.each do |entry|
         %w[id file sha256 source_revision source_sha256].each { |key| entry.fetch(key) }
+        entry.fetch('language_counterpart') if wiki == 'org'
       end
       media.each do |entry|
         %w[id file sha256].each { |key| entry.fetch(key) }
@@ -93,10 +94,16 @@ module KbRelease
     ACL_UPLOAD = 8
     ACL_DELETE = 16
 
-    def initialize(manifest:, client_factory:, out: $stdout)
+    def initialize(
+      manifest:,
+      client_factory:,
+      out: $stdout,
+      language_links: KbStage::LanguageLinks.new(out: out)
+    )
       @manifest = manifest
       @client_factory = client_factory
       @out = out
+      @language_links = language_links
     end
 
     def stage!
@@ -281,12 +288,17 @@ module KbRelease
     end
 
     def verify_language_links!
-      return unless @manifest.wiki == 'cz'
-
-      pages = @manifest.pages.to_h do |entry|
-        [entry.fetch('id'), @manifest.read(entry).force_encoding(Encoding::UTF_8)]
+      if @manifest.wiki == 'cz'
+        pages = @manifest.pages.to_h do |entry|
+          [entry.fetch('id'), @manifest.read(entry).force_encoding(Encoding::UTF_8)]
+        end
+        @language_links.warm_and_verify(pages)
+      else
+        pairs = @manifest.pages.map do |entry|
+          [entry.fetch('language_counterpart'), entry.fetch('id')]
+        end
+        @language_links.warm_and_verify_pairs(pairs)
       end
-      KbStage::LanguageLinks.new(out: @out).warm_and_verify(pages)
     end
 
     def verify_pending!

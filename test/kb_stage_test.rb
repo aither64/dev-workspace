@@ -124,6 +124,94 @@ class KbStageTest < Minitest::Test
     assert_match(/informace:novacci/, error.message)
   end
 
+  def test_language_links_can_verify_explicit_pairs_for_english_releases
+    calls = []
+    czech = 'http://kb-cs.aitherdev.int.vpsfree.cz/navody/vps/zalohy'
+    english = 'http://kb-en.aitherdev.int.vpsfree.cz/manuals/vps/backups'
+    html = %(<a href="#{czech}">cs</a><a href="#{english}">en</a>)
+    links = KbStage::LanguageLinks.new(
+      fetcher: ->(url) { calls << url; html },
+      out: StringIO.new
+    )
+
+    assert_equal(1, links.warm_and_verify_pairs([['navody:vps:zalohy', 'manuals:vps:backups']]))
+    assert_equal([english, czech, english, czech], calls)
+  end
+
+  def test_english_release_manifest_requires_language_counterparts
+    Dir.mktmpdir do |release_dir|
+      File.write(File.join(release_dir, 'page.txt'), "candidate\n")
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(
+        manifest_path,
+        YAML.dump(
+          'schema' => 1,
+          'wiki' => 'org',
+          'pages' => [
+            {
+              'id' => 'manuals:vps:backups',
+              'source_revision' => 123,
+              'source_sha256' => Digest::SHA256.hexdigest("source\n"),
+              'file' => 'page.txt',
+              'sha256' => Digest::SHA256.hexdigest("candidate\n")
+            }
+          ],
+          'media' => []
+        )
+      )
+
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/language_counterpart/, error.message)
+    end
+  end
+
+  def test_english_release_verifies_every_explicit_counterpart_pair
+    Dir.mktmpdir do |release_dir|
+      pages = {
+        'manuals:vps:backups' => 'navody:vps:zalohy',
+        'manuals:vps:console' => 'navody:vps:konzole'
+      }.map do |id, counterpart|
+        file = "#{id.tr(':', '-')}.txt"
+        content = "candidate for #{id}\n"
+        File.write(File.join(release_dir, file), content)
+        {
+          'id' => id,
+          'language_counterpart' => counterpart,
+          'source_revision' => 123,
+          'source_sha256' => Digest::SHA256.hexdigest("source for #{id}\n"),
+          'file' => file,
+          'sha256' => Digest::SHA256.hexdigest(content)
+        }
+      end
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(
+        manifest_path,
+        YAML.dump('schema' => 1, 'wiki' => 'org', 'pages' => pages, 'media' => [])
+      )
+      received = nil
+      language_links = Object.new
+      language_links.define_singleton_method(:warm_and_verify_pairs) do |pairs|
+        received = pairs
+      end
+      runner = KbRelease::Runner.new(
+        manifest: KbRelease::Manifest.new(manifest_path),
+        client_factory: ->(_name) { raise 'must not connect' },
+        language_links:,
+        out: StringIO.new
+      )
+
+      runner.send(:verify_language_links!)
+
+      assert_equal(
+        [
+          ['navody:vps:zalohy', 'manuals:vps:backups'],
+          ['navody:vps:konzole', 'manuals:vps:console']
+        ],
+        received
+      )
+    end
+  end
+
   def test_release_stages_only_when_production_and_staging_match_source
     with_state do
       Dir.mktmpdir do |release_dir|
