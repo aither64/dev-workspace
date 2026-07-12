@@ -7,6 +7,7 @@ require 'json'
 require 'optparse'
 require 'pathname'
 require 'yaml'
+require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
@@ -26,17 +27,50 @@ abort '--summary must be a non-empty single line' if options[:summary].strip.emp
 
 source_index = JSON.parse(File.read(File.join(options.fetch(:source), 'index.json')))
 candidate_index = JSON.parse(File.read(File.join(options.fetch(:candidate), 'index.json')))
+abort 'source index languages must be cs and en' unless source_index.keys.sort == %w[cs en]
+source_keys = []
+source_files = []
 source_by_key = source_index.flat_map do |language, pages|
-  pages.map { |page| [[language, page.fetch('id')], page] }
+  abort "#{language}: source pages must be a list" unless pages.is_a?(Array)
+  pages.map do |page|
+    page_id = KbContractFiles.validate_page_id!(page.fetch('id'))
+    source_file = page.fetch('file')
+    source_path = KbContractFiles.path_within(options.fetch(:source), source_file)
+    source_keys << [language, page_id]
+    source_files << source_path
+    [[language, page_id], page]
+  end
 end.to_h
+abort 'duplicate source page IDs' unless source_keys.uniq.length == source_keys.length
+abort 'duplicate source page files' unless source_files.uniq.length == source_files.length
 
-czech_counterparts = candidate_index.fetch('pages').filter_map do |page|
+candidate_pages = candidate_index.fetch('pages')
+abort 'candidate pages must be a list' unless candidate_pages.is_a?(Array)
+candidate_files = []
+candidate_keys = candidate_pages.map do |page|
+  language = page.fetch('language')
+  abort "unknown candidate language #{language.inspect}" unless %w[cs en].include?(language)
+  page_id = KbContractFiles.validate_page_id!(page.fetch('id'))
+  candidate_files << KbContractFiles.path_within(
+    options.fetch(:candidate),
+    page.fetch('file')
+  )
+  [language, page_id]
+end
+abort 'duplicate candidate page IDs' unless candidate_keys.uniq.length == candidate_keys.length
+abort 'duplicate candidate page files' unless candidate_files.uniq.length == candidate_files.length
+
+czech_counterpart_pairs = candidate_pages.filter_map do |page|
   next unless page.fetch('language') == 'cs'
 
-  content = File.binread(File.join(options.fetch(:candidate), page.fetch('file')))
+  content = File.binread(KbContractFiles.path_within(options.fetch(:candidate), page.fetch('file')))
   english_id = content[/<page>\s*([^<]+?)\s*<\/page>/, 1]
+  KbContractFiles.validate_page_id!(english_id) if english_id
   [english_id, page.fetch('id')] if english_id
-end.to_h
+end
+counterpart_ids = czech_counterpart_pairs.map(&:first)
+abort 'duplicate English language counterparts' unless counterpart_ids.uniq.length == counterpart_ids.length
+czech_counterparts = czech_counterpart_pairs.to_h
 
 manifest_root = File.dirname(options.fetch(:output))
 candidate_root = Pathname.new(options.fetch(:candidate))
@@ -49,12 +83,15 @@ end
 abort 'candidate directory must be below the manifest directory' if candidate_relative == '..' || candidate_relative.start_with?('../')
 
 language = options.fetch(:language)
-pages = candidate_index.fetch('pages').select do |page|
+pages = candidate_pages.select do |page|
   page.fetch('language') == language && page.fetch('changed')
 end.map do |page|
   source = source_by_key.fetch([language, page.fetch('id')])
-  source_content = File.binread(File.join(options.fetch(:source), source.fetch('file')))
-  candidate_content = File.binread(File.join(options.fetch(:candidate), page.fetch('file')))
+  unless page.fetch('source_sha256') == source.fetch('sha256')
+    abort "candidate was built from a different source snapshot for #{page.fetch('id')}"
+  end
+  source_content = File.binread(KbContractFiles.path_within(options.fetch(:source), source.fetch('file')))
+  candidate_content = File.binread(KbContractFiles.path_within(options.fetch(:candidate), page.fetch('file')))
   unless Digest::SHA256.hexdigest(source_content) == source.fetch('sha256')
     abort "source checksum drift for #{page.fetch('id')}"
   end

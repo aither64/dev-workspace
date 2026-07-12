@@ -6,6 +6,7 @@ require 'fileutils'
 require 'json'
 require 'optparse'
 require 'yaml'
+require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
@@ -28,18 +29,32 @@ abort 'exceptions must be a list' unless exceptions.is_a?(Array)
 source_root = options.fetch(:source)
 output_root = options.fetch(:output)
 source_index = JSON.parse(File.read(File.join(source_root, 'index.json')))
+abort 'source index languages must be cs and en' unless source_index.keys.sort == %w[cs en]
+source_page_keys = []
+source_files = []
 pages = source_index.flat_map do |language, entries|
+  abort "#{language}: source pages must be a list" unless entries.is_a?(Array)
   entries.map do |entry|
-    key = [language, entry.fetch('id')]
-    [key, File.binread(File.join(source_root, entry.fetch('file')))]
+    page_id = KbContractFiles.validate_page_id!(entry.fetch('id'))
+    source_file = entry.fetch('file')
+    source_path = KbContractFiles.path_within(source_root, source_file)
+    key = [language, page_id]
+    source_page_keys << key
+    source_files << source_path
+    [key, File.read(source_path, encoding: Encoding::UTF_8)]
   end
 end.to_h
+abort 'duplicate source page IDs' unless source_page_keys.uniq.length == source_page_keys.length
+abort 'duplicate source page files' unless source_files.uniq.length == source_files.length
 
 annotation_plan = replacements.map do |replacement|
   language = replacement.fetch('language')
+  abort "unknown replacement language #{language.inspect}" unless %w[cs en].include?(language)
   page = replacement.fetch('page')
-  path = replacement.fetch('path')
+  KbContractFiles.validate_page_id!(page)
+  path = KbContractFiles.validate_semantic_id!(replacement.fetch('path'))
   before = replacement.fetch('before')
+  abort "#{language}:#{page}: before must not be blank" unless before.is_a?(String) && !before.empty?
   count = replacement.fetch('count', 1)
   abort "#{language}:#{page}: replacement count must be positive" unless count.is_a?(Integer) && count.positive?
 
@@ -51,6 +66,7 @@ annotation_plan = replacements.map do |replacement|
   end
 
   body = replacement.fetch('body', before)
+  abort "#{language}:#{page}: body must be a string" unless body.is_a?(String)
   tagged = replacement.fetch(
     'replacement',
     %(<vpsadmin-nav id="#{path}">#{body}</vpsadmin-nav>)
@@ -61,6 +77,10 @@ annotation_plan = replacements.map do |replacement|
          tagged.scan('</vpsadmin-nav>').length == 1
     abort "#{language}:#{page}: #{path} replacement must contain exactly one matching tag"
   end
+  tag_body = tagged.match(tag_pattern)[0][/<vpsadmin-nav\s+id="[^"]+">(.*?)<\/vpsadmin-nav>/m, 1]
+  unless tag_body == body
+    abort "#{language}:#{page}: #{path} replacement tag body differs from body"
+  end
 
   pages[key] = content.gsub(before) { tagged }
   {
@@ -69,8 +89,18 @@ annotation_plan = replacements.map do |replacement|
     'path' => path,
     'count' => count,
     'before' => before,
-    'body' => body
+    'body' => body,
+    'replacement' => tagged
   }
+end
+
+exceptions.each do |entry|
+  language = entry.fetch('language')
+  abort "unknown exception language #{language.inspect}" unless %w[cs en].include?(language)
+  KbContractFiles.validate_page_id!(entry.fetch('page'))
+  KbContractFiles.validate_semantic_id!(entry.fetch('path'))
+  reason = entry.fetch('reason')
+  abort 'exception reason must not be blank' unless reason.is_a?(String) && !reason.strip.empty?
 end
 
 candidate_index = {
@@ -80,8 +110,11 @@ candidate_index = {
 }
 pages.sort.each do |(language, page_id), content|
   relative = File.join(language, *page_id.split(':')) + '.txt'
-  source = File.binread(File.join(source_root, relative))
-  destination = File.join(output_root, relative)
+  source = File.read(
+    KbContractFiles.path_within(source_root, relative),
+    encoding: Encoding::UTF_8
+  )
+  destination = KbContractFiles.path_within(output_root, relative)
   FileUtils.mkdir_p(File.dirname(destination))
   File.binwrite(destination, content)
   candidate_index.fetch('pages') << {
@@ -115,7 +148,7 @@ review = [
 annotation_plan.each do |entry|
   review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
             "| `#{cell.call(entry.fetch('path'))}` | #{entry.fetch('count')} " \
-            "| #{cell.call(entry.fetch('before'))} | #{cell.call(entry.fetch('body'))} |"
+            "| #{cell.call(entry.fetch('before'))} | #{cell.call(entry.fetch('replacement'))} |"
 end
 review.concat([
   '',

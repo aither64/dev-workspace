@@ -5,6 +5,7 @@ require 'digest'
 require 'fileutils'
 require 'json'
 require 'optparse'
+require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
@@ -33,13 +34,14 @@ wikis.each do |language, wiki|
   abort "#{wiki}: core.listPages returned no pages" if page_ids.empty?
 
   index[language] = page_ids.map do |page_id|
+    KbContractFiles.validate_page_id!(page_id)
     info = client.call('core.getPageInfo', page: page_id)
     content = client.call('core.getPage', page: page_id)
     revision = info['revision'] || info['rev'] || info['lastModified']
     abort "#{wiki}:#{page_id}: source revision is missing" unless revision
 
     relative = File.join(language, *page_id.split(':')) + '.txt'
-    destination = File.join(output_root, relative)
+    destination = KbContractFiles.path_within(output_root, relative)
     FileUtils.mkdir_p(File.dirname(destination))
     File.binwrite(destination, content)
     {

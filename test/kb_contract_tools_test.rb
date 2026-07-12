@@ -78,6 +78,100 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_manifest_rejects_candidate_from_an_older_source_snapshot
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      build_candidate(source, write_plan(dir), candidate)
+
+      index_path = File.join(source, 'index.json')
+      index = JSON.parse(File.read(index_path))
+      page = index.fetch('en').first
+      content = "A concurrently updated production page.\n"
+      File.binwrite(File.join(source, page.fetch('file')), content)
+      page['revision'] = '124'
+      page['sha256'] = Digest::SHA256.hexdigest(content)
+      File.write(index_path, JSON.dump(index))
+
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'en',
+        '--summary', 'English change summary',
+        '--output', File.join(dir, 'kb-release-en.yml')
+      )
+      refute(status.success?)
+      assert_match(/candidate was built from a different source snapshot/, error)
+    end
+  end
+
+  def test_review_ledger_shows_the_complete_explicit_replacement
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      plan_path = write_plan(dir)
+      plan = YAML.safe_load_file(plan_path)
+      replacement = plan.fetch('replacements').first
+      replacement['before'] = 'Použij Upravit profil.'
+      replacement['body'] = 'Upravit profil'
+      replacement['replacement'] = 'Použij <vpsadmin-nav id="member.edit-profile.open">Upravit profil</vpsadmin-nav> bezpečně.'
+      plan['replacements'] = [replacement]
+      File.write(plan_path, YAML.dump(plan))
+
+      build_candidate(source, plan_path, candidate)
+
+      review = File.read(File.join(candidate, 'review.md'))
+      assert_includes(review, replacement.fetch('replacement'))
+      assert_includes(
+        File.read(File.join(candidate, 'cs/navody/test.txt')),
+        replacement.fetch('replacement')
+      )
+    end
+  end
+
+  def test_build_rejects_index_paths_outside_the_source_root
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      index_path = File.join(source, 'index.json')
+      index = JSON.parse(File.read(index_path))
+      index.fetch('cs').first['file'] = '../outside.txt'
+      File.write(index_path, JSON.dump(index))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_plan(dir),
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/file path escapes its root/, error)
+    end
+  end
+
+  def test_build_rejects_malformed_semantic_ids
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      plan_path = write_plan(dir)
+      plan = YAML.safe_load_file(plan_path)
+      plan.fetch('replacements').first['path'] = '../not-semantic'
+      File.write(plan_path, YAML.dump(plan))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan_path,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/invalid semantic path ID/, error)
+    end
+  end
+
   private
 
   def write_sources(root)
@@ -139,6 +233,16 @@ class KbContractToolsTest < Minitest::Test
       '--language', language,
       '--summary', summary,
       '--output', output
+    )
+    assert(status.success?, error)
+  end
+
+  def build_candidate(source, plan, candidate)
+    _output, error, status = Open3.capture3(
+      BUILD,
+      '--source', source,
+      '--plan', plan,
+      '--output', candidate
     )
     assert(status.success?, error)
   end
