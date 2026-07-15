@@ -47,6 +47,10 @@
       sshPubKey = env "VPSADMIN_DEVCLUSTER_SSH_PUBKEY" "${workspace}/.dev-clusters/vpsadmin/ssh/id_ed25519.pub";
       vpsadminSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_SOURCE" vpsadmin.outPath;
       vpsadminosSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE" vpsadminos.outPath;
+      vpsadminRevision = env "VPSADMIN_DEVCLUSTER_VPSADMIN_REVISION" (vpsadmin.rev or "");
+      vpsadminRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY" "0" == "1";
+      vpsadminosRevision = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION" (vpsadminos.rev or "");
+      vpsadminosRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY" "0" == "1";
       haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
       configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
       notificationTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_NOTIFICATION_TEMPLATES_SOURCE" "";
@@ -84,6 +88,10 @@
           sshPubKey
           vpsadminSourcePath
           vpsadminosSourcePath
+          vpsadminRevision
+          vpsadminRevisionDirty
+          vpsadminosRevision
+          vpsadminosRevisionDirty
           haveapiSourcePath
           configSourcePath
           notificationTemplatesSourcePath

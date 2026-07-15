@@ -567,6 +567,23 @@ vpsadminos_input() {
   fi
 }
 
+source_revision() {
+  local path="$1"
+
+  [ -n "$path" ] || return 0
+  git -C "$path" rev-parse --verify HEAD
+}
+
+source_dirty() {
+  local path="$1"
+
+  if [ -n "$path" ] && [ -n "$(git -C "$path" status --porcelain --untracked-files=normal)" ]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
 nix_common_env() {
   local slug="$1"
   local topology="$2"
@@ -590,6 +607,14 @@ nix_common_env() {
   export VPSADMIN_DEVCLUSTER_SSH_PUBKEY="$SSH_KEY.pub"
   export VPSADMIN_DEVCLUSTER_VPSADMIN_SOURCE="$vpsadmin_path"
   export VPSADMIN_DEVCLUSTER_VPSADMINOS_SOURCE="$vpsadminos_path"
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_REVISION
+  VPSADMIN_DEVCLUSTER_VPSADMIN_REVISION="$(source_revision "$vpsadmin_path")"
+  export VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY
+  VPSADMIN_DEVCLUSTER_VPSADMIN_DIRTY="$(source_dirty "$vpsadmin_path")"
+  export VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION
+  VPSADMIN_DEVCLUSTER_VPSADMINOS_REVISION="$(source_revision "$vpsadminos_path")"
+  export VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY
+  VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")"
   export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
   export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
   export VPSADMIN_DEVCLUSTER_NOTIFICATION_TEMPLATES_SOURCE="$notification_templates_path"

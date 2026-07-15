@@ -14,6 +14,10 @@
   sshPubKey,
   vpsadminSourcePath,
   vpsadminosSourcePath,
+  vpsadminRevision,
+  vpsadminRevisionDirty,
+  vpsadminosRevision,
+  vpsadminosRevisionDirty,
   haveapiSourcePath,
   configSourcePath,
   notificationTemplatesSourcePath,
@@ -1893,6 +1897,11 @@ let
     networks = machineNetworks machineName;
     sharedFileSystems = sharedFileSystems;
     config = {
+      _module.args = {
+        vpsadminRev = if vpsadminRevision == "" then null else vpsadminRevision;
+        vpsadminRevisionDirty = vpsadminRevisionDirty;
+      };
+
       imports = [
         (vpsadminos.outPath + "/tests/configs/vpsadminos/pool-tank.nix")
         (vpsadmin.outPath + "/tests/configs/vpsadminos/node.nix")
@@ -1901,6 +1910,11 @@ let
 
       boot.qemu.memory = if node.role == "storage" then 4096 else 8192;
       boot.qemu.cpus = 4;
+
+      system.vpsadminos = {
+        revision = if vpsadminosRevision == "" then null else vpsadminosRevision;
+        revisionDirty = vpsadminosRevisionDirty;
+      };
 
       vpsadmin.test.node = {
         socketAddress = node.ip;
