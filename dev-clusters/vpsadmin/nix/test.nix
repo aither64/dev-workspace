@@ -1773,6 +1773,7 @@ let
                 done
 
                 ln -s ${config.vpsadmin.webui.package}/vendor "$dst/vendor"
+                ln -s ${config.vpsadmin.webui.package}/.git-revision "$dst/.git-revision"
               '';
             };
 
