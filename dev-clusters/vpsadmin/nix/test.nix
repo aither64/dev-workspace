@@ -1962,6 +1962,11 @@ in
       networks = machineNetworks "services";
       sharedFileSystems = sharedFileSystems;
       config = {
+        _module.args = {
+          vpsadminRev = if vpsadminRevision == "" then null else vpsadminRevision;
+          vpsadminRevisionDirty = vpsadminRevisionDirty;
+        };
+
         imports = [
           (vpsadmin.outPath + "/tests/configs/nixos/vpsadmin-services.nix")
           servicesModule
