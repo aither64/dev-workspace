@@ -109,6 +109,13 @@ Check at least:
   correct, or tidy behavior introduced by earlier still-unmerged commits in the
   same feature branch should usually be squashed into those commits unless
   keeping them separate improves reviewability.
+- Whether a new feature that evolved entirely on the feature branch converges
+  on one final design. Flag superseded protocol versions, schema variants,
+  migrations, dual-read/write paths, and compatibility shims kept only for code
+  or state that never reached the default branch. Prefer rewriting unmerged
+  history so the final series introduces the final form directly. Preserve
+  compatibility with merged, released, deployed, or externally consumed
+  behavior, and require a concrete rationale for any other compatibility layer.
 - Whether dependency update history is clean. A feature branch should not
   contain multiple commits updating the same flake input. The same rule applies
   to gem dependency update commits: repeated commits that only update the same
@@ -122,6 +129,22 @@ Check at least:
 - Whether the design fits existing project architecture and abstractions,
   especially across vpsAdmin, vpsAdminOS, HaveAPI, clients, and configuration
   repositories.
+- For new or changed vpsAdmin API definitions, whether relationships to live
+  resources use HaveAPI `resource` parameters and attributes instead of raw
+  integer IDs. Prefer `resource Node` to `integer :node_id`, with an explicit
+  `name` when needed. Allow raw IDs only when a resource association cannot
+  represent the data safely, such as historical records or references to
+  resources that may no longer exist, and require a concrete rationale. This
+  check applies to the API contract, not database foreign-key storage.
+- For vpsAdmin API resources, whether every top-level resource has a standalone
+  source file matching that resource. Nested resources may remain in the same
+  file as their parent resource.
+- For new or changed ActiveRecord migrations, whether schema changes use the
+  `change` method and direction-dependent data changes use `reversible` blocks
+  within it. Prefer ActiveRecord-managed rollback over duplicated `up` and
+  `down` methods that can drift apart. Allow `up` and `down` when the operation
+  demands them or they make the migration materially clearer, and require the
+  choice to be justified.
 - Whether new or changed code uses defensive shape or capability probing
   instead of explicit contracts. Flag runtime method/property/type probes such
   as Ruby `respond_to?`, PHP `method_exists`/`property_exists`, Python
