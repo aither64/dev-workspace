@@ -117,6 +117,7 @@ module KbRelease
 
   class Runner
     ACL_EDIT = 2
+    ACL_CREATE = 4
     ACL_UPLOAD = 8
     ACL_DELETE = 16
 
@@ -278,7 +279,9 @@ module KbRelease
       raise Error, 'DokuWiki API identity is anonymous' if login.nil? || login.empty?
 
       @manifest.pages.each do |entry|
-        verify_acl!(client, entry.fetch('id'), ACL_EDIT, 'edit page')
+        create = page_create?(entry)
+        required = create ? ACL_CREATE : ACL_EDIT
+        verify_acl!(client, entry.fetch('id'), required, create ? 'create page' : 'edit page')
       end
       @manifest.media.each do |entry|
         required = media_exists?(client, entry.fetch('id')) ? ACL_DELETE : ACL_UPLOAD

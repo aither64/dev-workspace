@@ -420,7 +420,7 @@ class KbStageTest < Minitest::Test
           result: missing
         )
         staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
-        staging.expect('core.aclCheck', { page: 'navody:notifikace' }, result: 255)
+        staging.expect('core.aclCheck', { page: 'navody:notifikace' }, result: 4)
         staging.expect(
           'core.savePage',
           {
@@ -447,6 +447,33 @@ class KbStageTest < Minitest::Test
         assert(staging.done?)
       end
     end
+  end
+
+  def test_release_requires_create_acl_for_create_only_pages
+    manifest_class = Struct.new(:pages, :media) do
+      def page_policy(entry)
+        entry.fetch('policy', 'update')
+      end
+    end
+    manifest = manifest_class.new(
+      [{ 'id' => 'navody:notifikace', 'policy' => 'create' }],
+      []
+    )
+    client = FakeClient.new
+    client.expect('core.whoAmI', nil, result: { 'login' => 'editor' })
+    client.expect('core.aclCheck', { page: 'navody:notifikace' }, result: 2)
+    runner = KbRelease::Runner.new(
+      manifest:,
+      client_factory: ->(_name) { client },
+      out: StringIO.new
+    )
+
+    error = assert_raises(KbRelease::Error) do
+      runner.send(:verify_write_access!, client)
+    end
+
+    assert_match(/insufficient ACL to create page/, error.message)
+    assert(client.done?)
   end
 
   def test_release_refuses_create_only_page_that_appeared_in_production
