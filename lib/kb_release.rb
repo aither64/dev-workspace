@@ -53,6 +53,10 @@ module KbRelease
       data.fetch('production_summary')
     end
 
+    def page_policy(entry)
+      entry.fetch('policy', 'update')
+    end
+
     def read(entry)
       file = File.expand_path(entry.fetch('file'), root)
       unless file.start_with?("#{root}/")
@@ -72,12 +76,12 @@ module KbRelease
     private
 
     def validate!
-      unless [1, 2].include?(data['schema'])
-        raise Error, 'release manifest schema must be 1 or 2'
+      unless [1, 2, 3].include?(data['schema'])
+        raise Error, 'release manifest schema must be 1, 2 or 3'
       end
       raise Error, 'release wiki must be cz or org' unless %w[cz org].include?(data['wiki'])
 
-      if data['schema'] == 2 || data.key?('production_summary')
+      if data['schema'] >= 2 || data.key?('production_summary')
         summary = data.fetch('production_summary')
         unless summary.is_a?(String) && !summary.strip.empty? && !summary.match?(/[\r\n]/)
           raise Error, 'production summary must be a non-empty single line'
@@ -91,7 +95,13 @@ module KbRelease
         raise Error, "duplicate #{kind} IDs" unless ids.uniq.length == ids.length
       end
       pages.each do |entry|
-        %w[id file sha256 source_revision source_sha256].each { |key| entry.fetch(key) }
+        %w[id file sha256 source_sha256].each { |key| entry.fetch(key) }
+        policy = page_policy(entry)
+        raise Error, "invalid page policy #{policy}" unless %w[create update].include?(policy)
+        entry.fetch('source_revision') if policy == 'update'
+        if policy == 'create' && entry.fetch('source_sha256') != Digest::SHA256.hexdigest('')
+          raise Error, "create page source must be empty: #{entry.fetch('id')}"
+        end
         entry.fetch('language_counterpart') if wiki == 'org'
       end
       media.each do |entry|
@@ -131,7 +141,7 @@ module KbRelease
         save_media!(staging)
         save_pages!(staging, summary: 'Stage reviewed KB release')
         verify_client!(staging)
-        verify_language_links!
+        verify_language_links! unless @manifest.pages.any? { |entry| page_create?(entry) }
         KbStage.write_json(
           KbStage.pending_release_path,
           'manifest' => @manifest.path,
@@ -174,6 +184,20 @@ module KbRelease
       production = @client_factory.call(@manifest.wiki)
       @manifest.pages.to_h do |entry|
         id = entry.fetch('id')
+        if page_create?(entry)
+          info = page_info(production, id)
+          if info.nil?
+            next [id, :source]
+          end
+
+          content = production.call('core.getPage', page: id)
+          if allow_candidate && Digest::SHA256.hexdigest(content) == entry.fetch('sha256')
+            next [id, :candidate]
+          end
+
+          raise Error, "create-only page already exists: #{id}"
+        end
+
         info = production.call('core.getPageInfo', page: id)
         revision = info['rev'] || info['lastModified'] || info['revision']
         content = production.call('core.getPage', page: id)
@@ -194,6 +218,16 @@ module KbRelease
 
     def verify_staging_baseline!(client)
       @manifest.pages.each do |entry|
+        if page_create?(entry)
+          info = page_info(client, entry.fetch('id'))
+          next if info.nil?
+
+          content = client.call('core.getPage', page: entry.fetch('id'))
+          next if Digest::SHA256.hexdigest(content) == entry.fetch('sha256')
+
+          raise Error, "staging create-only page has unexpected content at #{entry.fetch('id')}"
+        end
+
         content = client.call('core.getPage', page: entry.fetch('id'))
         hash = Digest::SHA256.hexdigest(content)
         unless [entry.fetch('source_sha256'), entry.fetch('sha256')].include?(hash)
@@ -220,6 +254,12 @@ module KbRelease
 
     def verify_source_page!(client, entry)
       id = entry.fetch('id')
+      if page_create?(entry)
+        return unless page_info(client, id)
+
+        raise Error, "create-only page appeared before save: #{id}"
+      end
+
       info = client.call('core.getPageInfo', page: id)
       revision = info['rev'] || info['lastModified'] || info['revision']
       unless revision.to_s == entry.fetch('source_revision').to_s
@@ -301,6 +341,18 @@ module KbRelease
       raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
 
       false
+    end
+
+    def page_create?(entry)
+      @manifest.page_policy(entry) == 'create'
+    end
+
+    def page_info(client, id)
+      client.call('core.getPageInfo', page: id)
+    rescue KbPage::RpcError => e
+      raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
+
+      nil
     end
 
     def verify_language_links!

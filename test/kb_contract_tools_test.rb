@@ -78,6 +78,148 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_builds_guarded_new_pages_and_selected_capture_media
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      captures = File.join(dir, 'captures')
+      write_sources(source)
+      add_missing_source(source, 'cs', 'navody:notifikace')
+      add_missing_source(source, 'en', 'manuals:notifications')
+      write_capture_fixture(captures)
+      plan = File.join(dir, 'plan.yml')
+      File.write(
+        plan,
+        YAML.dump(
+          'schema' => 2,
+          'replacements' => [],
+          'new_pages' => [
+            {
+              'language' => 'cs',
+              'page' => 'navody:notifikace',
+              'body' => "<page>manuals:notifications</page>\n====== Notifikace ======\n"
+            },
+            {
+              'language' => 'en',
+              'page' => 'manuals:notifications',
+              'body' => "====== Notifications ======\n"
+            }
+          ],
+          'media' => %w[cs en].map do |language|
+            { 'language' => language, 'capture' => 'notifications/routes' }
+          end,
+          'exceptions' => []
+        )
+      )
+
+      output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--captures', captures,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      assert_match(/2 changed pages with 0 annotations and 2 media objects/, output)
+
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      assert_equal(%w[create create], index.fetch('pages').filter_map do |page|
+        page.fetch('policy') if page.fetch('changed')
+      end)
+      assert_equal(2, index.fetch('media').length)
+      assert_equal(
+        'cs:screenshots:vpsadmin:notifications:routes.png',
+        index.fetch('media').first.fetch('id')
+      )
+
+      cs_manifest = File.join(dir, 'kb-release-cs.yml')
+      en_manifest = File.join(dir, 'kb-release-en.yml')
+      run_manifest(source, candidate, 'cs', 'Přidat návod k notifikacím', cs_manifest)
+      run_manifest(source, candidate, 'en', 'Add notifications guide', en_manifest)
+      cs = YAML.safe_load_file(cs_manifest)
+      en = YAML.safe_load_file(en_manifest)
+      assert_equal(3, cs.fetch('schema'))
+      assert_equal(1, cs.fetch('pages').length)
+      assert_equal('create', cs.fetch('pages').first.fetch('policy'))
+      refute(cs.fetch('pages').first.key?('source_revision'))
+      assert_equal('create', cs.fetch('media').first.fetch('policy'))
+      assert_equal('navody:notifikace', en.fetch('pages').first.fetch('language_counterpart'))
+    end
+  end
+
+  def test_build_refuses_new_page_without_missing_source_guard
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      plan = File.join(dir, 'plan.yml')
+      File.write(
+        plan,
+        YAML.dump(
+          'schema' => 2,
+          'replacements' => [],
+          'new_pages' => [
+            { 'language' => 'cs', 'page' => 'navody:test', 'body' => 'replacement' }
+          ],
+          'media' => [],
+          'exceptions' => []
+        )
+      )
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/does not mark the page missing/, error)
+    end
+  end
+
+  def test_build_rejects_malformed_capture_asset_ids
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      captures = File.join(dir, 'captures')
+      write_sources(source)
+      write_capture_fixture(captures)
+      plan = write_media_plan(dir, '../notifications/routes')
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--captures', captures,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/invalid capture asset ID/, error)
+    end
+  end
+
+  def test_build_rejects_capture_media_in_another_language_namespace
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      captures = File.join(dir, 'captures')
+      write_sources(source)
+      write_capture_fixture(captures)
+      capture_index_path = File.join(captures, 'captures.json')
+      capture_index = JSON.parse(File.read(capture_index_path))
+      capture_index.fetch('assets').first.fetch('variants').fetch('cs')
+                   .fetch('wiki')['media_id'] = 'en:screenshots:vpsadmin:notifications:routes.png'
+      File.write(capture_index_path, JSON.dump(capture_index))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_media_plan(dir, 'notifications/routes'),
+        '--captures', captures,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/media ID is in another language namespace/, error)
+    end
+  end
+
   def test_manifest_rejects_candidate_from_an_older_source_snapshot
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
@@ -222,6 +364,64 @@ class KbContractToolsTest < Minitest::Test
       'exceptions' => []
     }
     File.write(path, YAML.dump(plan))
+    path
+  end
+
+  def add_missing_source(root, language, page_id)
+    index_path = File.join(root, 'index.json')
+    index = JSON.parse(File.read(index_path))
+    relative = File.join(language, *page_id.split(':')) + '.txt'
+    destination = File.join(root, relative)
+    FileUtils.mkdir_p(File.dirname(destination))
+    File.binwrite(destination, '')
+    index.fetch(language) << {
+      'id' => page_id,
+      'file' => relative,
+      'missing' => true,
+      'sha256' => Digest::SHA256.hexdigest('')
+    }
+    File.write(index_path, JSON.dump(index))
+  end
+
+  def write_capture_fixture(root)
+    png = "\x89PNG\r\n\x1a\nfixture".b
+    assets = {
+      'schema' => 5,
+      'assets' => [
+        {
+          'id' => 'notifications/routes',
+          'variants' => %w[cs en].to_h do |language|
+            output = "screenshots/#{language}/notifications/routes.png"
+            destination = File.join(root, output)
+            FileUtils.mkdir_p(File.dirname(destination))
+            File.binwrite(destination, png)
+            [language, {
+              'wiki' => {
+                'media_id' => "#{language}:screenshots:vpsadmin:notifications:routes.png"
+              },
+              'output' => output,
+              'sha256' => Digest::SHA256.hexdigest(png)
+            }]
+          end
+        }
+      ]
+    }
+    FileUtils.mkdir_p(root)
+    File.write(File.join(root, 'captures.json'), JSON.dump(assets))
+  end
+
+  def write_media_plan(root, capture_id)
+    path = File.join(root, 'media-plan.yml')
+    File.write(
+      path,
+      YAML.dump(
+        'schema' => 2,
+        'replacements' => [],
+        'new_pages' => [],
+        'media' => [{ 'language' => 'cs', 'capture' => capture_id }],
+        'exceptions' => []
+      )
+    )
     path
   end
 

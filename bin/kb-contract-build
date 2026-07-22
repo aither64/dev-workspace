@@ -10,21 +10,30 @@ require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR'
+  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR [--captures DIR]'
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--plan FILE') { |value| options[:plan] = File.expand_path(value) }
   parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
+  parser.on('--captures DIR') { |value| options[:captures] = File.expand_path(value) }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
 %i[source plan output].each { |key| abort "--#{key} is required" unless options[key] }
 abort 'source and output directories must differ' if options[:source] == options[:output]
 
 plan_file = YAML.safe_load_file(options.fetch(:plan))
-abort 'replacement plan schema must be 1' unless plan_file.fetch('schema') == 1
+schema = plan_file.fetch('schema')
+abort 'replacement plan schema must be 1 or 2' unless [1, 2].include?(schema)
 replacements = plan_file.fetch('replacements')
 exceptions = plan_file.fetch('exceptions', [])
+new_pages = plan_file.fetch('new_pages', [])
+media_plan = plan_file.fetch('media', [])
 abort 'replacements must be a list' unless replacements.is_a?(Array)
 abort 'exceptions must be a list' unless exceptions.is_a?(Array)
+abort 'new_pages must be a list' unless new_pages.is_a?(Array)
+abort 'media must be a list' unless media_plan.is_a?(Array)
+if schema == 1 && (!new_pages.empty? || !media_plan.empty?)
+  abort 'new_pages and media require replacement plan schema 2'
+end
 
 source_root = options.fetch(:source)
 output_root = options.fetch(:output)
@@ -32,6 +41,7 @@ source_index = JSON.parse(File.read(File.join(source_root, 'index.json')))
 abort 'source index languages must be cs and en' unless source_index.keys.sort == %w[cs en]
 source_page_keys = []
 source_files = []
+source_entries = {}
 pages = source_index.flat_map do |language, entries|
   abort "#{language}: source pages must be a list" unless entries.is_a?(Array)
   entries.map do |entry|
@@ -41,11 +51,40 @@ pages = source_index.flat_map do |language, entries|
     key = [language, page_id]
     source_page_keys << key
     source_files << source_path
+    source_entries[key] = entry
     [key, File.read(source_path, encoding: Encoding::UTF_8)]
   end
 end.to_h
 abort 'duplicate source page IDs' unless source_page_keys.uniq.length == source_page_keys.length
 abort 'duplicate source page files' unless source_files.uniq.length == source_files.length
+
+new_page_plan = new_pages.map do |entry|
+  language = entry.fetch('language')
+  abort "unknown new-page language #{language.inspect}" unless %w[cs en].include?(language)
+  page_id = KbContractFiles.validate_page_id!(entry.fetch('page'))
+  body = entry.fetch('body')
+  abort "#{language}:#{page_id}: new page body must not be blank" unless body.is_a?(String) && !body.strip.empty?
+
+  key = [language, page_id]
+  source = source_entries.fetch(key) do
+    abort "#{language}:#{page_id}: new page is missing from the guarded source inventory"
+  end
+  abort "#{language}:#{page_id}: source inventory does not mark the page missing" unless source['missing'] == true
+  abort "#{language}:#{page_id}: guarded new-page source is not empty" unless pages.fetch(key).empty?
+
+  pages[key] = body
+  {
+    'language' => language,
+    'page' => page_id,
+    'body' => body
+  }
+end
+new_page_keys = new_page_plan.map { |entry| [entry.fetch('language'), entry.fetch('page')] }
+abort 'duplicate new page IDs' unless new_page_keys.uniq.length == new_page_keys.length
+missing_source_keys = source_entries.filter_map { |key, entry| key if entry['missing'] == true }
+unless missing_source_keys.sort == new_page_keys.sort
+  abort 'every guarded missing source page must have exactly one new_pages entry'
+end
 
 annotation_plan = replacements.map do |replacement|
   language = replacement.fetch('language')
@@ -105,7 +144,9 @@ end
 
 candidate_index = {
   'pages' => [],
+  'media' => [],
   'annotations' => annotation_plan,
+  'new_pages' => new_page_plan,
   'exceptions' => exceptions
 }
 pages.sort.each do |(language, page_id), content|
@@ -121,11 +162,57 @@ pages.sort.each do |(language, page_id), content|
     'language' => language,
     'id' => page_id,
     'file' => relative,
+    'policy' => source_entries.fetch([language, page_id])['missing'] == true ? 'create' : 'update',
     'changed' => content != source,
     'source_sha256' => Digest::SHA256.hexdigest(source),
     'candidate_sha256' => Digest::SHA256.hexdigest(content)
   }
 end
+
+unless media_plan.empty?
+  abort '--captures is required when the plan contains media' unless options[:captures]
+  capture_root = options.fetch(:captures)
+  capture_index = JSON.parse(File.read(File.join(capture_root, 'captures.json')))
+  assets = capture_index.fetch('assets')
+  abort 'capture assets must be a list' unless assets.is_a?(Array)
+  assets_by_id = assets.to_h do |asset|
+    capture_id = KbContractFiles.validate_capture_id!(asset.fetch('id'))
+    [capture_id, asset]
+  end
+  abort 'duplicate capture asset IDs' unless assets_by_id.length == assets.length
+
+  media_plan.each do |entry|
+    language = entry.fetch('language')
+    abort "unknown media language #{language.inspect}" unless %w[cs en].include?(language)
+    capture_id = KbContractFiles.validate_capture_id!(entry.fetch('capture'))
+    asset = assets_by_id.fetch(capture_id) { abort "unknown capture asset #{capture_id.inspect}" }
+    variant = asset.fetch('variants').fetch(language)
+    media_id = KbContractFiles.validate_media_id!(variant.fetch('wiki').fetch('media_id'))
+    unless media_id.start_with?("#{language}:")
+      abort "#{capture_id}: #{language} media ID is in another language namespace: #{media_id}"
+    end
+    output = KbContractFiles.path_within(capture_root, variant.fetch('output'))
+    content = File.binread(output)
+    abort "#{capture_id}: #{language} capture is not a PNG" unless content.start_with?("\x89PNG\r\n\x1a\n".b)
+    sha256 = Digest::SHA256.hexdigest(content)
+    abort "#{capture_id}: #{language} capture checksum drift" unless sha256 == variant.fetch('sha256')
+
+    relative = File.join('media', language, *media_id.split(':'))
+    destination = KbContractFiles.path_within(output_root, relative)
+    FileUtils.mkdir_p(File.dirname(destination))
+    File.binwrite(destination, content)
+    candidate_index.fetch('media') << {
+      'language' => language,
+      'id' => media_id,
+      'capture' => capture_id,
+      'file' => relative,
+      'policy' => 'create',
+      'sha256' => sha256
+    }
+  end
+end
+media_keys = candidate_index.fetch('media').map { |entry| [entry.fetch('language'), entry.fetch('id')] }
+abort 'duplicate candidate media IDs' unless media_keys.uniq.length == media_keys.length
 
 FileUtils.mkdir_p(output_root)
 File.write(
@@ -140,6 +227,8 @@ review = [
   '# KB navigation annotation review',
   '',
   "Changed pages: #{candidate_index.fetch('pages').count { |page| page.fetch('changed') }}",
+  "New pages: #{new_page_plan.length}",
+  "Selected media: #{candidate_index.fetch('media').length}",
   "Annotation tags: #{annotation_plan.sum { |entry| entry.fetch('count') }}",
   '',
   '| Language | Page | Semantic path | Count | Existing text | Candidate text |',
@@ -161,7 +250,32 @@ exceptions.each do |entry|
   review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
             "| `#{cell.call(entry.fetch('path'))}` | #{cell.call(entry.fetch('reason'))} |"
 end
+review.concat([
+  '',
+  '## New pages',
+  '',
+  '| Language | Page | SHA-256 |',
+  '| --- | --- | --- |'
+])
+new_page_plan.each do |entry|
+  page = candidate_index.fetch('pages').find do |candidate|
+    candidate.fetch('language') == entry.fetch('language') && candidate.fetch('id') == entry.fetch('page')
+  end
+  review << "| #{entry.fetch('language')} | #{entry.fetch('page')} | `#{page.fetch('candidate_sha256')}` |"
+end
+review.concat([
+  '',
+  '## Selected capture media',
+  '',
+  '| Language | Capture | Media ID | SHA-256 |',
+  '| --- | --- | --- | --- |'
+])
+candidate_index.fetch('media').each do |entry|
+  review << "| #{entry.fetch('language')} | `#{entry.fetch('capture')}` | " \
+            "#{entry.fetch('id')} | `#{entry.fetch('sha256')}` |"
+end
 File.write(File.join(output_root, 'review.md'), "#{review.join("\n")}\n")
 
 puts "Prepared #{candidate_index.fetch('pages').count { |page| page.fetch('changed') }} changed pages " \
-     "with #{annotation_plan.sum { |entry| entry.fetch('count') }} annotations"
+     "with #{annotation_plan.sum { |entry| entry.fetch('count') }} annotations and " \
+     "#{candidate_index.fetch('media').length} media objects"

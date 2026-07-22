@@ -87,6 +87,13 @@ pages = candidate_pages.select do |page|
   page.fetch('language') == language && page.fetch('changed')
 end.map do |page|
   source = source_by_key.fetch([language, page.fetch('id')])
+  policy = page.fetch('policy', 'update')
+  abort "invalid page policy #{policy.inspect}" unless %w[create update].include?(policy)
+  if policy == 'create'
+    abort "source inventory does not guard new page #{page.fetch('id')}" unless source['missing'] == true
+  elsif source['missing'] == true
+    abort "missing source page #{page.fetch('id')} must use create policy"
+  end
   unless page.fetch('source_sha256') == source.fetch('sha256')
     abort "candidate was built from a different source snapshot for #{page.fetch('id')}"
   end
@@ -100,11 +107,12 @@ end.map do |page|
   end
   entry = {
     'id' => page.fetch('id'),
-    'source_revision' => source.fetch('revision'),
+    'policy' => policy,
     'source_sha256' => source.fetch('sha256'),
     'file' => File.join(candidate_relative, page.fetch('file')),
     'sha256' => page.fetch('candidate_sha256')
   }
+  entry['source_revision'] = source.fetch('revision') if policy == 'update'
   if language == 'en'
     counterpart = czech_counterparts[page.fetch('id')]
     abort "missing Czech counterpart for #{page.fetch('id')}" unless counterpart
@@ -114,13 +122,42 @@ end.map do |page|
   entry
 end
 
+candidate_media = candidate_index.fetch('media', [])
+abort 'candidate media must be a list' unless candidate_media.is_a?(Array)
+candidate_media.each do |entry|
+  media_language = entry.fetch('language')
+  abort "unknown candidate media language #{media_language.inspect}" unless %w[cs en].include?(media_language)
+  media_id = KbContractFiles.validate_media_id!(entry.fetch('id'))
+  unless media_id.start_with?("#{media_language}:")
+    abort "candidate media ID is in another language namespace: #{media_id}"
+  end
+end
+media = candidate_media.select { |entry| entry.fetch('language') == language }.map do |entry|
+  media_id = KbContractFiles.validate_media_id!(entry.fetch('id'))
+  file = KbContractFiles.path_within(options.fetch(:candidate), entry.fetch('file'))
+  content = File.binread(file)
+  sha256 = Digest::SHA256.hexdigest(content)
+  abort "candidate media checksum drift for #{media_id}" unless sha256 == entry.fetch('sha256')
+  policy = entry.fetch('policy', 'create')
+  abort "invalid media policy #{policy.inspect}" unless %w[create update].include?(policy)
+
+  manifest_entry = {
+    'id' => media_id,
+    'file' => File.join(candidate_relative, entry.fetch('file')),
+    'sha256' => sha256,
+    'policy' => policy
+  }
+  manifest_entry['source_sha256'] = entry.fetch('source_sha256') if policy == 'update'
+  manifest_entry
+end
+
 manifest = {
-  'schema' => 2,
+  'schema' => 3,
   'wiki' => language == 'cs' ? 'cz' : 'org',
   'production_summary' => options.fetch(:summary),
   'pages' => pages,
-  'media' => []
+  'media' => media
 }
 FileUtils.mkdir_p(File.dirname(options.fetch(:output)))
 File.write(options.fetch(:output), YAML.dump(manifest))
-puts "Prepared #{options.fetch(:output)} with #{pages.length} pages"
+puts "Prepared #{options.fetch(:output)} with #{pages.length} pages and #{media.length} media objects"

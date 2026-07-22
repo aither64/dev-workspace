@@ -29,6 +29,8 @@ class KbStageTest < Minitest::Test
         raise "expected #{[exp_method, exp_params].inspect}, got #{[method, params].inspect}"
       end
 
+      raise result if result.is_a?(Exception)
+
       result
     end
 
@@ -375,6 +377,186 @@ class KbStageTest < Minitest::Test
         end
 
         assert(production.done?)
+        assert(staging.done?)
+      end
+    end
+  end
+
+  def test_release_stages_a_guarded_create_only_page
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "<page>manuals:notifications</page>\n====== Notifikace ======\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 3,
+            'wiki' => 'cz',
+            'production_summary' => 'Přidat návod k notifikacím',
+            'pages' => [
+              {
+                'id' => 'navody:notifikace',
+                'policy' => 'create',
+                'source_sha256' => Digest::SHA256.hexdigest(''),
+                'file' => 'page.txt',
+                'sha256' => Digest::SHA256.hexdigest(candidate)
+              }
+            ],
+            'media' => []
+          )
+        )
+        missing = KbPage::RpcError.new(221, 'The requested page does not exist')
+        production = FakeClient.new
+        production.expect(
+          'core.getPageInfo',
+          { page: 'navody:notifikace' },
+          result: missing
+        )
+        staging = FakeClient.new
+        staging.expect(
+          'core.getPageInfo',
+          { page: 'navody:notifikace' },
+          result: missing
+        )
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect('core.aclCheck', { page: 'navody:notifikace' }, result: 255)
+        staging.expect(
+          'core.savePage',
+          {
+            page: 'navody:notifikace',
+            text: candidate,
+            summary: 'Stage reviewed KB release',
+            isminor: false
+          },
+          result: true
+        )
+        staging.expect('core.getPage', { page: 'navody:notifikace' }, result: candidate)
+        clients = { 'cz' => production, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
+        end
+
+        assert(production.done?)
+        assert(staging.done?)
+      end
+    end
+  end
+
+  def test_release_refuses_create_only_page_that_appeared_in_production
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "new page\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 3,
+            'wiki' => 'cz',
+            'production_summary' => 'Přidat nový návod',
+            'pages' => [
+              {
+                'id' => 'navody:new',
+                'policy' => 'create',
+                'source_sha256' => Digest::SHA256.hexdigest(''),
+                'file' => 'page.txt',
+                'sha256' => Digest::SHA256.hexdigest(candidate)
+              }
+            ],
+            'media' => []
+          )
+        )
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'navody:new' }, result: { 'revision' => 999 })
+        production.expect('core.getPage', { page: 'navody:new' }, result: "concurrent page\n")
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { name == 'cz' ? production : raise('must not stage') },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+        assert_match(/create-only page already exists/, error.message)
+        assert(production.done?)
+      end
+    end
+  end
+
+  def test_release_stages_create_only_media
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "\x89PNG\r\n\x1a\nfixture".b
+        File.binwrite(File.join(release_dir, 'capture.png'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 3,
+            'wiki' => 'cz',
+            'production_summary' => 'Přidat snímek notifikací',
+            'pages' => [],
+            'media' => [
+              {
+                'id' => 'cs:screenshots:vpsadmin:notifications:routes.png',
+                'policy' => 'create',
+                'file' => 'capture.png',
+                'sha256' => Digest::SHA256.hexdigest(candidate)
+              }
+            ]
+          )
+        )
+        missing = KbPage::RpcError.new(221, 'The requested media does not exist')
+        staging = FakeClient.new
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect(
+          'core.getMediaInfo',
+          { media: 'cs:screenshots:vpsadmin:notifications:routes.png' },
+          result: missing
+        )
+        staging.expect(
+          'core.aclCheck',
+          { page: 'cs:screenshots:vpsadmin:notifications:routes.png' },
+          result: 8
+        )
+        staging.expect(
+          'core.getMediaInfo',
+          { media: 'cs:screenshots:vpsadmin:notifications:routes.png' },
+          result: missing
+        )
+        staging.expect(
+          'core.saveMedia',
+          {
+            media: 'cs:screenshots:vpsadmin:notifications:routes.png',
+            base64: Base64.strict_encode64(candidate),
+            overwrite: false
+          },
+          result: true
+        )
+        staging.expect(
+          'core.getMedia',
+          { media: 'cs:screenshots:vpsadmin:notifications:routes.png' },
+          result: Base64.strict_encode64(candidate)
+        )
+        clients = { 'cz' => FakeClient.new, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
+        end
+
         assert(staging.done?)
       end
     end

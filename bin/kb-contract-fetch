@@ -7,10 +7,11 @@ require 'json'
 require 'optparse'
 require_relative '../lib/kb_contract_files'
 
-options = {}
+options = { expect_new: [] }
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-fetch --output DIR'
+  parser.banner = 'Usage: kb-contract-fetch --output DIR [--expect-new LANGUAGE:PAGE]'
   parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
+  parser.on('--expect-new LANGUAGE:PAGE') { |value| options[:expect_new] << value }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
 abort '--output is required' unless options[:output]
@@ -21,6 +22,13 @@ load File.join(workspace, 'bin/kb-page')
 output_root = options.fetch(:output)
 wikis = { 'cs' => 'cz', 'en' => 'org' }.freeze
 index = {}
+expected_new = options.fetch(:expect_new).map do |value|
+  language, page_id = value.split(':', 2)
+  abort "invalid --expect-new value #{value.inspect}" unless wikis.key?(language) && page_id
+
+  [language, KbContractFiles.validate_page_id!(page_id)]
+end
+abort 'duplicate --expect-new page IDs' unless expected_new.uniq.length == expected_new.length
 
 wikis.each do |language, wiki|
   config = KbPage.wiki_config(wiki)
@@ -32,6 +40,9 @@ wikis.each do |language, wiki|
     page['id'] || page['page']
   end.uniq.sort
   abort "#{wiki}: core.listPages returned no pages" if page_ids.empty?
+  expected_new.select { |entry| entry.first == language }.each do |_, page_id|
+    abort "#{wiki}: expected new page already exists: #{page_id}" if page_ids.include?(page_id)
+  end
 
   index[language] = page_ids.map do |page_id|
     KbContractFiles.validate_page_id!(page_id)
@@ -51,6 +62,20 @@ wikis.each do |language, wiki|
       'sha256' => Digest::SHA256.hexdigest(content)
     }
   end
+
+  expected_new.select { |entry| entry.first == language }.each do |_, page_id|
+    relative = File.join(language, *page_id.split(':')) + '.txt'
+    destination = KbContractFiles.path_within(output_root, relative)
+    FileUtils.mkdir_p(File.dirname(destination))
+    File.binwrite(destination, '')
+    index.fetch(language) << {
+      'id' => page_id,
+      'file' => relative,
+      'missing' => true,
+      'sha256' => Digest::SHA256.hexdigest('')
+    }
+  end
+  index.fetch(language).sort_by! { |entry| entry.fetch('id') }
 end
 
 FileUtils.mkdir_p(output_root)
