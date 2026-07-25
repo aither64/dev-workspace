@@ -57,6 +57,13 @@ let
   serviceIp = devConfig.services.ip;
   serviceRootDiskMiB = devConfig.services.rootDiskMiB or (12 * 1024);
   zfsTransferStartDelay = devConfig.nodectld.zfsTransferStartDelay or 0;
+  notificationDefaultsSourcePath =
+    if configSourcePath == "" then
+      null
+    else
+      "${configSourcePath}/configs/vpsadmin/api/notification_defaults.rb";
+  notificationDefaultsAvailable =
+    notificationDefaultsSourcePath != null && builtins.pathExists notificationDefaultsSourcePath;
   devGateway = devConfig.network.gateway;
   resolverConfig = devConfig.resolver or { };
   resolverMode = resolverConfig.mode or "cluster";
@@ -455,6 +462,10 @@ let
     require 'digest'
     require 'ipaddress'
     require 'json'
+
+    ${lib.optionalString notificationDefaultsAvailable ''
+      load '/mnt/configuration/configs/vpsadmin/api/notification_defaults.rb'
+    ''}
 
     def upsert_sys_config(category, name, value, min_user_level: 0, data_type: 'String')
       record = SysConfig.find_or_initialize_by(category: category, name: name)
@@ -925,6 +936,12 @@ let
     JSON.parse(${builtins.toJSON (builtins.toJSON devConfig.seed.users)}).each do |attrs|
       upsert_dev_user(admin, environment, attrs, user_resources)
     end
+
+    ${lib.optionalString notificationDefaultsAvailable ''
+      User.find_each do |user|
+        ensure_vpsfree_oom_event_route!(user)
+      end
+    ''}
 
     def legacy_mail_recipients_available?
       defined?(EmailRecipient) &&
