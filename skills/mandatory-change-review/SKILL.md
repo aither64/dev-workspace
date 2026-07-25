@@ -145,6 +145,14 @@ Check at least:
   `down` methods that can drift apart. Allow `up` and `down` when the operation
   demands them or they make the migration materially clearer, and require the
   choice to be justified.
+- For migrations that have not been merged, released, or deployed, whether
+  schema-existence guards such as `table_exists?`, `column_exists?`,
+  `index_exists?`, `if_exists`, or `if_not_exists` merely accommodate a stale
+  disposable development or test database. Require resetting that database and
+  making the migration assume its exact predecessor schema. Report unexplained
+  guards as `Blocking`. Allow them only for documented supported predecessor
+  schemas with tests for every path; do not confuse real data-integrity or
+  conversion checks with schema-existence guards.
 - Whether new or changed code uses defensive shape or capability probing
   instead of explicit contracts. Flag runtime method/property/type probes such
   as Ruby `respond_to?`, PHP `method_exists`/`property_exists`, Python
