@@ -147,6 +147,132 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_build_injects_canonical_code_samples
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      add_missing_source(source, 'cs', 'navody:notifikace')
+      FileUtils.mkdir_p(code_root)
+      File.write(File.join(code_root, 'server.py'), "print('verified')\n")
+      plan = File.join(dir, 'plan.yml')
+      File.write(
+        plan,
+        YAML.dump(
+          'schema' => 3,
+          'replacements' => [],
+          'new_pages' => [
+            {
+              'language' => 'cs',
+              'page' => 'navody:notifikace',
+              'body' => "====== Notifikace ======\n\n<kb-code-sample id=\"notifications.webhook-server\" />\n"
+            }
+          ],
+          'code_samples' => [
+            {
+              'id' => 'notifications.webhook-server',
+              'file' => 'server.py',
+              'language' => 'python'
+            }
+          ],
+          'media' => [],
+          'exceptions' => []
+        )
+      )
+
+      output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      assert_match(/1 changed pages/, output)
+
+      page = File.read(File.join(candidate, 'cs/navody/notifikace.txt'))
+      assert_includes(page, "<code python>\nprint('verified')\n</code>")
+      refute_includes(page, 'kb-code-sample')
+
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      assert_equal(1, index.fetch('code_samples').length)
+      sample = index.fetch('code_samples').fetch(0)
+      assert_equal('notifications.webhook-server', sample.fetch('id'))
+      assert_equal(Digest::SHA256.hexdigest("print('verified')\n"), sample.fetch('sha256'))
+      assert_includes(
+        File.read(File.join(candidate, 'review.md')),
+        '`notifications.webhook-server`'
+      )
+    end
+  end
+
+  def test_build_rejects_unused_code_samples
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      FileUtils.mkdir_p(code_root)
+      File.write(File.join(code_root, 'server.py'), "print('unused')\n")
+      plan = write_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['schema'] = 3
+      data['code_samples'] = [
+        {
+          'id' => 'notifications.webhook-server',
+          'file' => 'server.py',
+          'language' => 'python'
+        }
+      ]
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/unused code samples: notifications.webhook-server/, error)
+    end
+  end
+
+  def test_build_rejects_physically_wrapped_new_page_list_items
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      add_missing_source(source, 'en', 'manuals:notifications')
+      plan = File.join(dir, 'plan.yml')
+      File.write(
+        plan,
+        YAML.dump(
+          'schema' => 3,
+          'replacements' => [],
+          'new_pages' => [
+            {
+              'language' => 'en',
+              'page' => 'manuals:notifications',
+              'body' => "====== Notifications ======\n\n  * a target is an e-mail,\n    telephone, or webhook\n"
+            }
+          ],
+          'code_samples' => [],
+          'media' => [],
+          'exceptions' => []
+        )
+      )
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/list item on line 3 is physically wrapped/, error)
+    end
+  end
+
   def test_build_refuses_new_page_without_missing_source_guard
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')

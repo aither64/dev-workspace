@@ -10,11 +10,12 @@ require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR [--captures DIR]'
+  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR [--captures DIR] [--code-root DIR]'
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--plan FILE') { |value| options[:plan] = File.expand_path(value) }
   parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
   parser.on('--captures DIR') { |value| options[:captures] = File.expand_path(value) }
+  parser.on('--code-root DIR') { |value| options[:code_root] = File.expand_path(value) }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
 %i[source plan output].each { |key| abort "--#{key} is required" unless options[key] }
@@ -22,18 +23,47 @@ abort 'source and output directories must differ' if options[:source] == options
 
 plan_file = YAML.safe_load_file(options.fetch(:plan))
 schema = plan_file.fetch('schema')
-abort 'replacement plan schema must be 1 or 2' unless [1, 2].include?(schema)
+abort 'replacement plan schema must be 1, 2, or 3' unless [1, 2, 3].include?(schema)
 replacements = plan_file.fetch('replacements')
 exceptions = plan_file.fetch('exceptions', [])
 new_pages = plan_file.fetch('new_pages', [])
 media_plan = plan_file.fetch('media', [])
+code_sample_plan = plan_file.fetch('code_samples', [])
 abort 'replacements must be a list' unless replacements.is_a?(Array)
 abort 'exceptions must be a list' unless exceptions.is_a?(Array)
 abort 'new_pages must be a list' unless new_pages.is_a?(Array)
 abort 'media must be a list' unless media_plan.is_a?(Array)
+abort 'code_samples must be a list' unless code_sample_plan.is_a?(Array)
 if schema == 1 && (!new_pages.empty? || !media_plan.empty?)
   abort 'new_pages and media require replacement plan schema 2'
 end
+abort 'code_samples require replacement plan schema 3' if schema < 3 && !code_sample_plan.empty?
+
+unless code_sample_plan.empty?
+  abort '--code-root is required when the plan contains code_samples' unless options[:code_root]
+end
+code_samples = code_sample_plan.map do |entry|
+  id = KbContractFiles.validate_semantic_id!(entry.fetch('id'))
+  relative = entry.fetch('file')
+  language = entry.fetch('language')
+  unless language.is_a?(String) && language.match?(/\A[a-zA-Z0-9_+-]+\z/)
+    abort "#{id}: invalid DokuWiki code language #{language.inspect}"
+  end
+  path = KbContractFiles.path_within(options.fetch(:code_root), relative)
+  content = File.read(path, encoding: Encoding::UTF_8)
+  abort "#{id}: code sample must not be blank" if content.strip.empty?
+  abort "#{id}: code sample contains a closing code tag" if content.include?('</code>')
+
+  {
+    'id' => id,
+    'file' => relative,
+    'language' => language,
+    'sha256' => Digest::SHA256.hexdigest(content),
+    'content' => content
+  }
+end
+code_samples_by_id = code_samples.to_h { |entry| [entry.fetch('id'), entry] }
+abort 'duplicate code sample IDs' unless code_samples_by_id.length == code_samples.length
 
 source_root = options.fetch(:source)
 output_root = options.fetch(:output)
@@ -64,6 +94,15 @@ new_page_plan = new_pages.map do |entry|
   page_id = KbContractFiles.validate_page_id!(entry.fetch('page'))
   body = entry.fetch('body')
   abort "#{language}:#{page_id}: new page body must not be blank" unless body.is_a?(String) && !body.strip.empty?
+  if schema >= 3
+    body.lines.each_cons(2).with_index(1) do |(line, following), line_number|
+      next unless line.match?(/^\s{2,}[*-]\s+\S/)
+      next unless following.match?(/^\s{4,}\S/)
+      next if following.match?(/^\s{2,}[*-]\s+\S/)
+
+      abort "#{language}:#{page_id}: list item on line #{line_number} is physically wrapped"
+    end
+  end
 
   key = [language, page_id]
   source = source_entries.fetch(key) do
@@ -142,11 +181,33 @@ exceptions.each do |entry|
   abort 'exception reason must not be blank' unless reason.is_a?(String) && !reason.strip.empty?
 end
 
+code_sample_uses = Hash.new(0)
+placeholder_pattern = /<kb-code-sample\s+id="([^"]+)"\s*\/>/
+pages.transform_values! do |content|
+  content.gsub(placeholder_pattern) do
+    id = Regexp.last_match(1)
+    sample = code_samples_by_id.fetch(id) { abort "unknown code sample #{id.inspect}" }
+    code_sample_uses[id] += 1
+    sample_content = sample.fetch('content').sub(/\n*\z/, "\n")
+    "<code #{sample.fetch('language')}>\n#{sample_content}</code>"
+  end
+end
+unused_code_samples = code_samples_by_id.keys - code_sample_uses.keys
+unless unused_code_samples.empty?
+  abort "unused code samples: #{unused_code_samples.join(', ')}"
+end
+pages.each do |(language, page), content|
+  next unless content.include?('<kb-code-sample')
+
+  abort "#{language}:#{page}: unresolved code sample placeholder"
+end
+
 candidate_index = {
   'pages' => [],
   'media' => [],
   'annotations' => annotation_plan,
   'new_pages' => new_page_plan,
+  'code_samples' => code_samples.map { |entry| entry.except('content') },
   'exceptions' => exceptions
 }
 pages.sort.each do |(language, page_id), content|
@@ -262,6 +323,18 @@ new_page_plan.each do |entry|
     candidate.fetch('language') == entry.fetch('language') && candidate.fetch('id') == entry.fetch('page')
   end
   review << "| #{entry.fetch('language')} | #{entry.fetch('page')} | `#{page.fetch('candidate_sha256')}` |"
+end
+review.concat([
+  '',
+  '## Canonical code samples',
+  '',
+  '| ID | File | Language | Uses | SHA-256 |',
+  '| --- | --- | --- | ---: | --- |'
+])
+code_samples.each do |entry|
+  review << "| `#{entry.fetch('id')}` | #{cell.call(entry.fetch('file'))} | " \
+            "#{cell.call(entry.fetch('language'))} | #{code_sample_uses.fetch(entry.fetch('id'))} | " \
+            "`#{entry.fetch('sha256')}` |"
 end
 review.concat([
   '',
