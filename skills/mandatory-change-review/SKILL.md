@@ -136,6 +136,11 @@ Check at least:
   represent the data safely, such as historical records or references to
   resources that may no longer exist, and require a concrete rationale. This
   check applies to the API contract, not database foreign-key storage.
+- For new or changed vpsAdmin API parameters, whether every parameter has a
+  human-friendly label and a description that explains its meaning or purpose.
+  A description may be omitted only when the meaning is obvious and the text
+  would add no useful information. Flag identifier-derived labels such as
+  `Expires_at` as non-human-friendly.
 - For vpsAdmin API resources, whether every top-level resource has a standalone
   source file matching that resource. Nested resources may remain in the same
   file as their parent resource.
