@@ -25,11 +25,13 @@ plan_file = YAML.safe_load_file(options.fetch(:plan))
 schema = plan_file.fetch('schema')
 abort 'replacement plan schema must be 1, 2, or 3' unless [1, 2, 3].include?(schema)
 replacements = plan_file.fetch('replacements')
+content_replacements = plan_file.fetch('content_replacements', [])
 exceptions = plan_file.fetch('exceptions', [])
 new_pages = plan_file.fetch('new_pages', [])
 media_plan = plan_file.fetch('media', [])
 code_sample_plan = plan_file.fetch('code_samples', [])
 abort 'replacements must be a list' unless replacements.is_a?(Array)
+abort 'content_replacements must be a list' unless content_replacements.is_a?(Array)
 abort 'exceptions must be a list' unless exceptions.is_a?(Array)
 abort 'new_pages must be a list' unless new_pages.is_a?(Array)
 abort 'media must be a list' unless media_plan.is_a?(Array)
@@ -38,6 +40,9 @@ if schema == 1 && (!new_pages.empty? || !media_plan.empty?)
   abort 'new_pages and media require replacement plan schema 2'
 end
 abort 'code_samples require replacement plan schema 3' if schema < 3 && !code_sample_plan.empty?
+if schema < 3 && !content_replacements.empty?
+  abort 'content_replacements require replacement plan schema 3'
+end
 
 unless code_sample_plan.empty?
   abort '--code-root is required when the plan contains code_samples' unless options[:code_root]
@@ -125,6 +130,39 @@ unless missing_source_keys.sort == new_page_keys.sort
   abort 'every guarded missing source page must have exactly one new_pages entry'
 end
 
+content_replacement_plan = content_replacements.map do |replacement|
+  language = replacement.fetch('language')
+  abort "unknown content-replacement language #{language.inspect}" unless %w[cs en].include?(language)
+  page = replacement.fetch('page')
+  KbContractFiles.validate_page_id!(page)
+  before = replacement.fetch('before')
+  abort "#{language}:#{page}: before must not be blank" unless before.is_a?(String) && !before.empty?
+  replacement_text = replacement.fetch('replacement')
+  unless replacement_text.is_a?(String)
+    abort "#{language}:#{page}: replacement must be a string"
+  end
+  count = replacement.fetch('count', 1)
+  unless count.is_a?(Integer) && count.positive?
+    abort "#{language}:#{page}: replacement count must be positive"
+  end
+
+  key = [language, page]
+  content = pages.fetch(key)
+  actual_count = content.scan(before).length
+  unless actual_count == count
+    abort "#{language}:#{page}: content replacement expected #{count} matches, found #{actual_count}"
+  end
+
+  pages[key] = content.gsub(before) { replacement_text }
+  {
+    'language' => language,
+    'page' => page,
+    'count' => count,
+    'before' => before,
+    'replacement' => replacement_text
+  }
+end
+
 annotation_plan = replacements.map do |replacement|
   language = replacement.fetch('language')
   abort "unknown replacement language #{language.inspect}" unless %w[cs en].include?(language)
@@ -206,6 +244,7 @@ candidate_index = {
   'pages' => [],
   'media' => [],
   'annotations' => annotation_plan,
+  'content_replacements' => content_replacement_plan,
   'new_pages' => new_page_plan,
   'code_samples' => code_samples.map { |entry| entry.except('content') },
   'exceptions' => exceptions
@@ -291,6 +330,7 @@ review = [
   "New pages: #{new_page_plan.length}",
   "Selected media: #{candidate_index.fetch('media').length}",
   "Annotation tags: #{annotation_plan.sum { |entry| entry.fetch('count') }}",
+  "Content replacements: #{content_replacement_plan.sum { |entry| entry.fetch('count') }}",
   '',
   '| Language | Page | Semantic path | Count | Existing text | Candidate text |',
   '| --- | --- | --- | ---: | --- | --- |'
@@ -299,6 +339,18 @@ annotation_plan.each do |entry|
   review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
             "| `#{cell.call(entry.fetch('path'))}` | #{entry.fetch('count')} " \
             "| #{cell.call(entry.fetch('before'))} | #{cell.call(entry.fetch('replacement'))} |"
+end
+review.concat([
+  '',
+  '## Guarded content replacements',
+  '',
+  '| Language | Page | Count | Existing text | Candidate text |',
+  '| --- | --- | ---: | --- | --- |'
+])
+content_replacement_plan.each do |entry|
+  review << "| #{cell.call(entry.fetch('language'))} | #{cell.call(entry.fetch('page'))} " \
+            "| #{entry.fetch('count')} | #{cell.call(entry.fetch('before'))} " \
+            "| #{cell.call(entry.fetch('replacement'))} |"
 end
 review.concat([
   '',
@@ -351,4 +403,5 @@ File.write(File.join(output_root, 'review.md'), "#{review.join("\n")}\n")
 
 puts "Prepared #{candidate_index.fetch('pages').count { |page| page.fetch('changed') }} changed pages " \
      "with #{annotation_plan.sum { |entry| entry.fetch('count') }} annotations and " \
-     "#{candidate_index.fetch('media').length} media objects"
+     "#{candidate_index.fetch('media').length} media objects and " \
+     "#{content_replacement_plan.sum { |entry| entry.fetch('count') }} content replacements"

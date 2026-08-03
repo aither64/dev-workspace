@@ -78,6 +78,78 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_build_applies_guarded_content_replacements
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      plan = write_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['schema'] = 3
+      data['content_replacements'] = [
+        {
+          'language' => 'cs',
+          'page' => 'navody:test',
+          'before' => "Použij Upravit profil.\n",
+          'replacement' => "Použij Upravit profil.\nPřečti si Notifikace.\n"
+        }
+      ]
+      File.write(plan, YAML.dump(data))
+
+      output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      assert_match(/1 content replacements/, output)
+
+      page = File.read(File.join(candidate, 'cs/navody/test.txt'))
+      assert_includes(
+        page,
+        "Použij <vpsadmin-nav id=\"member.edit-profile.open\">Upravit profil</vpsadmin-nav>.\n" \
+        "Přečti si Notifikace.\n"
+      )
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      replacement = index.fetch('content_replacements').fetch(0)
+      assert_equal('navody:test', replacement.fetch('page'))
+      assert_equal(1, replacement.fetch('count'))
+      assert_includes(
+        File.read(File.join(candidate, 'review.md')),
+        '## Guarded content replacements'
+      )
+    end
+  end
+
+  def test_build_rejects_content_replacement_count_drift
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      plan = write_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['schema'] = 3
+      data['content_replacements'] = [
+        {
+          'language' => 'cs',
+          'page' => 'navody:test',
+          'before' => 'Text that is not present',
+          'replacement' => 'Replacement'
+        }
+      ]
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/content replacement expected 1 matches, found 0/, error)
+    end
+  end
+
   def test_builds_guarded_new_pages_and_selected_capture_media
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
