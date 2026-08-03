@@ -129,6 +129,26 @@ Check at least:
 - Whether the design fits existing project architecture and abstractions,
   especially across vpsAdmin, vpsAdminOS, HaveAPI, clients, and configuration
   repositories.
+- Whether catalogs or registries mirror classes, models, resources, actions,
+  plugins, handlers, or protocols that are already declared elsewhere. Prefer
+  one owning declaration with derived indexes, or require a concrete reason
+  that a central catalog is authoritative. Do not flag finite protocol, state,
+  or public-contract registries merely for being central.
+- Whether adding, renaming, or removing one implementation is localized to its
+  owner. Flag extension points that require coordinated edits across unrelated
+  class-name lists, plugin lists, conditionals, or metadata tables, especially
+  when omissions can silently disable or misclassify behavior. Require
+  duplicate/conflict detection and bidirectional coverage when some metadata
+  cannot be derived.
+- Whether callbacks, closures, reflection, `instance_exec`, `send`, or
+  method-name conventions create a hidden interface on an unrelated receiver.
+  Prefer an explicit class/module interface or a validated DSL with one
+  well-defined evaluation context. Allow reflective framework boundaries only
+  when their contract and validation are clear.
+- Whether a changed module combines unrelated orchestration, persistence,
+  policy, validation, configuration, rendering, and transport responsibilities.
+  Look for central conditionals and shotgun surgery when adding a variant; file
+  length alone is not an architecture finding.
 - For new or changed vpsAdmin API definitions, whether relationships to live
   resources use HaveAPI `resource` parameters and attributes instead of raw
   integer IDs. Prefer `resource Node` to `integer :node_id`, with an explicit
@@ -189,6 +209,18 @@ Check at least:
   present. Consider persisted state, schemas, protocols, generated
   configuration, mixed-version operation, rollback, and whether any all-at-once
   upgrade requirement is justified.
+
+For architecture findings, describe a concrete maintenance or failure scenario
+rather than reporting a pattern or line count alone. Use these severity defaults:
+
+- `Blocking`: the change creates or expands an avoidable duplicated source of
+  truth or hidden protocol that can silently omit, misroute, misclassify, or
+  bypass authorization, persistence, event, plugin, or delivery behavior.
+- `Important`: the change leaves safe but costly shotgun surgery, unclear
+  ownership, or touched multi-responsibility design without a convincing
+  rationale; use this level for existing debt exposed but not worsened.
+- `Advisory`: the issue is limited to smaller extraction, naming, validation, or
+  declaration-locality improvements without a plausible correctness failure.
 
 ## Output
 
