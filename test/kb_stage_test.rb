@@ -842,6 +842,135 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_stage_refuses_candidate_media_already_in_production
+    %w[create update].each do |policy|
+      with_state do
+        Dir.mktmpdir do |release_dir|
+          source = 'source media'
+          candidate = 'candidate media'
+          File.binwrite(File.join(release_dir, 'media.bin'), candidate)
+          media = {
+            'id' => 'media.bin',
+            'file' => 'media.bin',
+            'sha256' => Digest::SHA256.hexdigest(candidate),
+            'policy' => policy
+          }
+          media['source_sha256'] = Digest::SHA256.hexdigest(source) if policy == 'update'
+          manifest_path = File.join(release_dir, 'release.yml')
+          File.write(
+            manifest_path,
+            YAML.dump(
+              'schema' => 3,
+              'wiki' => 'cz',
+              'production_summary' => 'Aktualizovat snímek',
+              'pages' => [],
+              'media' => [media]
+            )
+          )
+          production = FakeClient.new
+          production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+          production.expect(
+            'core.getMedia',
+            { media: 'media.bin' },
+            result: Base64.strict_encode64(candidate)
+          )
+          runner = KbRelease::Runner.new(
+            manifest: KbRelease::Manifest.new(manifest_path),
+            client_factory: ->(name) { name == 'cz' ? production : raise('must not stage') },
+            out: StringIO.new
+          )
+
+          error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+            assert_raises(KbRelease::Error) { runner.stage! }
+          end
+
+          assert_match(/production media|create-only production media/, error.message)
+          assert(production.done?)
+        end
+      end
+    end
+  end
+
+  def test_promotion_retries_media_already_saved_by_a_partial_attempt
+    %w[create update].each do |policy|
+      with_state do
+        Dir.mktmpdir do |release_dir|
+          source = 'source media'
+          candidate = 'candidate media'
+          File.binwrite(File.join(release_dir, 'media.bin'), candidate)
+          media = {
+            'id' => 'media.bin',
+            'file' => 'media.bin',
+            'sha256' => Digest::SHA256.hexdigest(candidate),
+            'policy' => policy
+          }
+          media['source_sha256'] = Digest::SHA256.hexdigest(source) if policy == 'update'
+          manifest_path = File.join(release_dir, 'release.yml')
+          File.write(
+            manifest_path,
+            YAML.dump(
+              'schema' => 3,
+              'wiki' => 'cz',
+              'production_summary' => 'Aktualizovat snímek',
+              'pages' => [],
+              'media' => [media]
+            )
+          )
+          manifest = KbRelease::Manifest.new(manifest_path)
+          KbStage.write_json(
+            KbStage.pending_release_path,
+            'sha256' => manifest.digest,
+            'slug' => 'session-one'
+          )
+
+          staging = FakeClient.new
+          staging.expect(
+            'core.getMedia',
+            { media: 'media.bin' },
+            result: Base64.strict_encode64(candidate)
+          )
+          production = FakeClient.new
+          production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+          production.expect(
+            'core.getMedia',
+            { media: 'media.bin' },
+            result: Base64.strict_encode64(candidate)
+          )
+          production.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+          production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+          production.expect('core.aclCheck', { page: 'media.bin' }, result: 255)
+          production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+          production.expect(
+            'core.getMedia',
+            { media: 'media.bin' },
+            result: Base64.strict_encode64(candidate)
+          )
+          production.expect(
+            'core.getMedia',
+            { media: 'media.bin' },
+            result: Base64.strict_encode64(candidate)
+          )
+          clients = { 'cz-staging' => staging, 'cz' => production }
+          runner = KbRelease::Runner.new(
+            manifest:,
+            client_factory: ->(name) { clients.fetch(name) },
+            out: StringIO.new
+          )
+
+          stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+            stub_kb_stage(:current_slug, 'session-one') do
+              runner.promote!(approved_production: true)
+            end
+          end
+
+          assert(staging.done?)
+          assert(production.done?)
+          refute_path_exists(KbStage.pending_release_path)
+        end
+      end
+    end
+  end
+
   private
 
   def stub_kb_stage(name, value)
