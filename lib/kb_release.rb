@@ -183,7 +183,7 @@ module KbRelease
 
     def check_production_baseline!(allow_candidate: false)
       production = @client_factory.call(@manifest.wiki)
-      @manifest.pages.to_h do |entry|
+      page_states = @manifest.pages.to_h do |entry|
         id = entry.fetch('id')
         if page_create?(entry)
           info = page_info(production, id)
@@ -214,6 +214,34 @@ module KbRelease
         else
           raise Error, "production content drift for #{id}"
         end
+      end
+
+      check_production_media_baseline!(production, allow_candidate:)
+      page_states
+    end
+
+    def check_production_media_baseline!(production, allow_candidate:)
+      @manifest.media.each do |entry|
+        id = entry.fetch('id')
+        exists = media_exists?(production, id)
+        policy = entry.fetch('policy', 'create')
+
+        unless exists
+          raise Error, "update-only production media does not exist: #{id}" if policy == 'update'
+
+          next
+        end
+
+        encoded = production.call('core.getMedia', media: id)
+        current_hash = Digest::SHA256.hexdigest(Base64.strict_decode64(encoded))
+        next if policy == 'update' && current_hash == entry.fetch('source_sha256')
+        next if allow_candidate && current_hash == entry.fetch('sha256')
+
+        if policy == 'create'
+          raise Error, "create-only production media already exists: #{id}"
+        end
+
+        raise Error, "production media drift for #{id}"
       end
     end
 

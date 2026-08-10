@@ -542,6 +542,12 @@ class KbStageTest < Minitest::Test
           )
         )
         missing = KbPage::RpcError.new(221, 'The requested media does not exist')
+        production = FakeClient.new
+        production.expect(
+          'core.getMediaInfo',
+          { media: 'cs:screenshots:vpsadmin:notifications:routes.png' },
+          result: missing
+        )
         staging = FakeClient.new
         staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
         staging.expect(
@@ -573,7 +579,7 @@ class KbStageTest < Minitest::Test
           { media: 'cs:screenshots:vpsadmin:notifications:routes.png' },
           result: Base64.strict_encode64(candidate)
         )
-        clients = { 'cz' => FakeClient.new, 'cz-staging' => staging }
+        clients = { 'cz' => production, 'cz-staging' => staging }
         runner = KbRelease::Runner.new(
           manifest: KbRelease::Manifest.new(manifest_path),
           client_factory: ->(name) { clients.fetch(name) },
@@ -584,6 +590,7 @@ class KbStageTest < Minitest::Test
           stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
         end
 
+        assert(production.done?)
         assert(staging.done?)
       end
     end
@@ -753,6 +760,13 @@ class KbStageTest < Minitest::Test
             ]
           )
         )
+        production = FakeClient.new
+        production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+        production.expect(
+          'core.getMedia',
+          { media: 'media.bin' },
+          result: Base64.strict_encode64('expected source')
+        )
         staging = FakeClient.new
         staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
         staging.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
@@ -763,7 +777,7 @@ class KbStageTest < Minitest::Test
           { media: 'media.bin' },
           result: Base64.strict_encode64('unexpected source')
         )
-        clients = { 'cz' => FakeClient.new, 'cz-staging' => staging }
+        clients = { 'cz' => production, 'cz-staging' => staging }
         runner = KbRelease::Runner.new(
           manifest: KbRelease::Manifest.new(manifest_path),
           client_factory: ->(name) { clients.fetch(name) },
@@ -774,7 +788,56 @@ class KbStageTest < Minitest::Test
           assert_raises(KbRelease::Error) { runner.stage! }
         end
         assert_match(/media source drift/, error.message)
+        assert(production.done?)
         assert(staging.done?)
+      end
+    end
+  end
+
+  def test_update_media_refuses_production_drift_before_staging
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        source = 'expected source'
+        candidate = 'candidate media'
+        File.binwrite(File.join(release_dir, 'media.bin'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(
+            'schema' => 3,
+            'wiki' => 'cz',
+            'production_summary' => 'Aktualizovat snímek',
+            'pages' => [],
+            'media' => [
+              {
+                'id' => 'media.bin',
+                'file' => 'media.bin',
+                'sha256' => Digest::SHA256.hexdigest(candidate),
+                'policy' => 'update',
+                'source_sha256' => Digest::SHA256.hexdigest(source)
+              }
+            ]
+          )
+        )
+        production = FakeClient.new
+        production.expect('core.getMediaInfo', { media: 'media.bin' }, result: {})
+        production.expect(
+          'core.getMedia',
+          { media: 'media.bin' },
+          result: Base64.strict_encode64('concurrent production change')
+        )
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { name == 'cz' ? production : raise('must not stage') },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+
+        assert_match(/production media drift/, error.message)
+        assert(production.done?)
       end
     end
   end
