@@ -284,6 +284,16 @@ unless media_plan.empty?
   media_plan.each do |entry|
     language = entry.fetch('language')
     abort "unknown media language #{language.inspect}" unless %w[cs en].include?(language)
+    policy = entry.fetch('policy', 'create')
+    abort "invalid media policy #{policy.inspect}" unless %w[create update].include?(policy)
+    source_sha256 = entry['source_sha256']
+    if policy == 'update'
+      unless source_sha256.is_a?(String) && source_sha256.match?(/\A[0-9a-f]{64}\z/)
+        abort "update media source_sha256 must be a SHA-256 digest"
+      end
+    elsif entry.key?('source_sha256')
+      abort "create media must not declare source_sha256"
+    end
     capture_id = KbContractFiles.validate_capture_id!(entry.fetch('capture'))
     asset = assets_by_id.fetch(capture_id) { abort "unknown capture asset #{capture_id.inspect}" }
     variant = asset.fetch('variants').fetch(language)
@@ -301,14 +311,16 @@ unless media_plan.empty?
     destination = KbContractFiles.path_within(output_root, relative)
     FileUtils.mkdir_p(File.dirname(destination))
     File.binwrite(destination, content)
-    candidate_index.fetch('media') << {
+    candidate_media = {
       'language' => language,
       'id' => media_id,
       'capture' => capture_id,
       'file' => relative,
-      'policy' => 'create',
+      'policy' => policy,
       'sha256' => sha256
     }
+    candidate_media['source_sha256'] = source_sha256 if policy == 'update'
+    candidate_index.fetch('media') << candidate_media
   end
 end
 media_keys = candidate_index.fetch('media').map { |entry| [entry.fetch('language'), entry.fetch('id')] }

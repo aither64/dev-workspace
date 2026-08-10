@@ -219,6 +219,79 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_builds_guarded_capture_media_updates
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      captures = File.join(dir, 'captures')
+      write_sources(source)
+      write_capture_fixture(captures)
+      source_sha256 = Digest::SHA256.hexdigest('existing production media')
+      plan = File.join(dir, 'plan.yml')
+      File.write(
+        plan,
+        YAML.dump(
+          'schema' => 2,
+          'replacements' => [],
+          'new_pages' => [],
+          'media' => [
+            {
+              'language' => 'cs',
+              'capture' => 'notifications/routes',
+              'policy' => 'update',
+              'source_sha256' => source_sha256
+            }
+          ],
+          'exceptions' => []
+        )
+      )
+
+      output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--captures', captures,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      assert_match(/1 media objects/, output)
+
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      media = index.fetch('media').first
+      assert_equal('update', media.fetch('policy'))
+      assert_equal(source_sha256, media.fetch('source_sha256'))
+
+      manifest_path = File.join(dir, 'kb-release-cs.yml')
+      run_manifest(source, candidate, 'cs', 'Aktualizovat snímek', manifest_path)
+      manifest_media = YAML.safe_load_file(manifest_path).fetch('media').first
+      assert_equal('update', manifest_media.fetch('policy'))
+      assert_equal(source_sha256, manifest_media.fetch('source_sha256'))
+    end
+  end
+
+  def test_build_rejects_unguarded_capture_media_updates
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      captures = File.join(dir, 'captures')
+      write_sources(source)
+      write_capture_fixture(captures)
+      plan = write_media_plan(dir, 'notifications/routes')
+      data = YAML.safe_load_file(plan)
+      data.fetch('media').first['policy'] = 'update'
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--captures', captures,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/source_sha256 must be a SHA-256 digest/, error)
+    end
+  end
+
   def test_build_injects_canonical_code_samples
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
