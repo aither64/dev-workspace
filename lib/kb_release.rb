@@ -104,6 +104,7 @@ module KbRelease
         end
         entry.fetch('language_counterpart') if wiki == 'org'
       end
+      validate_contract! if data.key?('contract')
       media.each do |entry|
         %w[id file sha256].each { |key| entry.fetch(key) }
         policy = entry.fetch('policy', 'create')
@@ -112,6 +113,52 @@ module KbRelease
       end
     rescue KeyError => e
       raise Error, "incomplete release manifest: #{e.message}"
+    end
+
+    def validate_contract!
+      contract = data.fetch('contract')
+      raise Error, 'release contract must be a mapping' unless contract.is_a?(Hash)
+
+      repository = contract.fetch('repository')
+      unless repository.is_a?(String) && repository.match?(%r{\A[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\z})
+        raise Error, 'invalid release contract repository'
+      end
+      %w[base_commit head_commit].each do |key|
+        value = contract.fetch(key)
+        unless value.is_a?(String) && value.match?(/\A[0-9a-f]{40}\z/)
+          raise Error, "invalid release contract #{key}"
+        end
+      end
+      registry_sha256 = contract.fetch('registry_sha256')
+      unless registry_sha256.is_a?(String) && registry_sha256.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid release contract registry_sha256'
+      end
+
+      contract_pages = contract.fetch('pages')
+      raise Error, 'release contract pages must be a list' unless contract_pages.is_a?(Array)
+      ids = contract_pages.map { |page| page.fetch('id') }
+      raise Error, 'duplicate release contract page IDs' unless ids.uniq.length == ids.length
+      release_pages = pages.to_h { |page| [page.fetch('id'), page] }
+      contract_pages.each do |page|
+        article = page.fetch('article')
+        unless article.is_a?(String) && article.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+          raise Error, "invalid release contract article #{article.inspect}"
+        end
+        source = page.fetch('source')
+        if !source.is_a?(String) || source.empty? || source.start_with?('/') || source.split('/').include?('..')
+          raise Error, "invalid release contract source #{source.inspect}"
+        end
+        sha256 = page.fetch('sha256')
+        unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, "invalid release contract page SHA-256 for #{page.fetch('id')}"
+        end
+        release_page = release_pages.fetch(page.fetch('id')) do
+          raise Error, "release contract page is absent from manifest: #{page.fetch('id')}"
+        end
+        unless release_page.fetch('sha256') == sha256
+          raise Error, "release contract checksum differs for #{page.fetch('id')}"
+        end
+      end
     end
   end
 

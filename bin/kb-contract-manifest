@@ -59,6 +59,88 @@ candidate_keys = candidate_pages.map do |page|
 end
 abort 'duplicate candidate page IDs' unless candidate_keys.uniq.length == candidate_keys.length
 abort 'duplicate candidate page files' unless candidate_files.uniq.length == candidate_files.length
+candidate_pages_by_key = candidate_pages.to_h do |page|
+  [[page.fetch('language'), page.fetch('id')], page]
+end
+
+managed_pages = candidate_index.fetch('managed_pages', [])
+abort 'managed_pages must be a list' unless managed_pages.is_a?(Array)
+managed_contract = candidate_index['managed_contract']
+if !managed_pages.empty? && !managed_contract.is_a?(Hash)
+  abort 'managed candidate pages require contract provenance'
+end
+
+managed_contract_pages = []
+managed_pages_by_key = {}
+if managed_contract
+  %w[base_commit head_commit registry_sha256].each do |key|
+    value = managed_contract.fetch(key)
+    pattern = key.end_with?('_commit') ? /\A[0-9a-f]{40}\z/ : /\A[0-9a-f]{64}\z/
+    abort "invalid managed contract #{key}" unless value.is_a?(String) && value.match?(pattern)
+  end
+  repository = managed_contract.fetch('repository')
+  unless repository.is_a?(String) && repository.match?(%r{\A[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\z})
+    abort 'invalid managed contract repository'
+  end
+
+  managed_contract_pages = managed_contract.fetch('pages')
+  abort 'managed contract pages must be a list' unless managed_contract_pages.is_a?(Array)
+  contract_page_keys = managed_contract_pages.map do |page|
+    language = page.fetch('language')
+    abort "unknown managed contract language #{language.inspect}" unless %w[cs en].include?(language)
+    page_id = KbContractFiles.validate_page_id!(page.fetch('page'))
+    KbContractFiles.validate_semantic_id!(page.fetch('article'))
+    KbContractFiles.path_within(options.fetch(:candidate), page.fetch('source'))
+    sha256 = page.fetch('sha256')
+    unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
+      abort "#{language}:#{page_id}: invalid canonical SHA-256"
+    end
+    [language, page_id]
+  end
+  unless contract_page_keys.uniq.length == contract_page_keys.length
+    abort 'duplicate managed contract page IDs'
+  end
+  contract_pages_by_key = managed_contract_pages.to_h do |page|
+    [[page.fetch('language'), page.fetch('page')], page]
+  end
+
+  managed_page_keys = managed_pages.map do |page|
+    key = [page.fetch('language'), page.fetch('page')]
+    contract_page = contract_pages_by_key.fetch(key) do
+      abort "#{key.join(':')}: managed page is absent from contract provenance"
+    end
+    unless page.fetch('article') == contract_page.fetch('article') &&
+           page.fetch('source') == contract_page.fetch('source') &&
+           page.fetch('canonical_sha256') == contract_page.fetch('sha256')
+      abort "#{key.join(':')}: managed page provenance differs from its contract entry"
+    end
+    candidate_page = candidate_pages_by_key.fetch(key) do
+      abort "#{key.join(':')}: managed page is absent from candidate pages"
+    end
+    content = File.binread(
+      KbContractFiles.path_within(options.fetch(:candidate), candidate_page.fetch('file'))
+    )
+    unless Digest::SHA256.hexdigest(content) == contract_page.fetch('sha256') &&
+           candidate_page.fetch('candidate_sha256') == contract_page.fetch('sha256')
+      abort "#{key.join(':')}: managed candidate differs from its canonical source"
+    end
+    key
+  end
+  abort 'duplicate managed page IDs' unless managed_page_keys.uniq.length == managed_page_keys.length
+  managed_pages_by_key = managed_pages.to_h do |page|
+    [[page.fetch('language'), page.fetch('page')], page]
+  end
+
+  contract_pages_by_key.each do |key, contract_page|
+    candidate_page = candidate_pages_by_key.fetch(key) do
+      abort "#{key.join(':')}: registered page is absent from candidate pages"
+    end
+    next unless candidate_page.fetch('changed')
+    next if managed_pages_by_key.key?(key)
+
+    abort "#{key.join(':')}: changed registered page lacks managed reconciliation"
+  end
+end
 
 czech_counterpart_pairs = candidate_pages.filter_map do |page|
   next unless page.fetch('language') == 'cs'
@@ -151,6 +233,27 @@ media = candidate_media.select { |entry| entry.fetch('language') == language }.m
   manifest_entry
 end
 
+contract_manifest = if managed_contract
+                      {
+                        'repository' => managed_contract.fetch('repository'),
+                        'base_commit' => managed_contract.fetch('base_commit'),
+                        'head_commit' => managed_contract.fetch('head_commit'),
+                        'registry_sha256' => managed_contract.fetch('registry_sha256'),
+                        'pages' => managed_contract_pages.filter_map do |page|
+                          key = [page.fetch('language'), page.fetch('page')]
+                          candidate_page = candidate_pages_by_key.fetch(key)
+                          next unless key.first == language && candidate_page.fetch('changed')
+
+                          {
+                            'id' => key.last,
+                            'article' => page.fetch('article'),
+                            'source' => page.fetch('source'),
+                            'sha256' => page.fetch('sha256')
+                          }
+                        end
+                      }
+                    end
+
 manifest = {
   'schema' => 3,
   'wiki' => language == 'cs' ? 'cz' : 'org',
@@ -158,6 +261,7 @@ manifest = {
   'pages' => pages,
   'media' => media
 }
+manifest['contract'] = contract_manifest if contract_manifest
 FileUtils.mkdir_p(File.dirname(options.fetch(:output)))
 File.write(options.fetch(:output), YAML.dump(manifest))
 puts "Prepared #{options.fetch(:output)} with #{pages.length} pages and #{media.length} media objects"

@@ -218,6 +218,48 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_release_manifest_binds_managed_contract_page_checksums
+    Dir.mktmpdir do |release_dir|
+      content = "candidate\n"
+      sha256 = Digest::SHA256.hexdigest(content)
+      File.write(File.join(release_dir, 'page.txt'), content)
+      manifest_path = File.join(release_dir, 'release.yml')
+      manifest = {
+        'schema' => 3,
+        'wiki' => 'cz',
+        'production_summary' => 'Publish managed guide',
+        'pages' => [{
+          'id' => 'navody:vps:kvm',
+          'source_revision' => 123,
+          'source_sha256' => Digest::SHA256.hexdigest("source\n"),
+          'file' => 'page.txt',
+          'sha256' => sha256
+        }],
+        'media' => [],
+        'contract' => {
+          'repository' => 'vpsfreecz/vpsfree-kb-contracts',
+          'base_commit' => '1' * 40,
+          'head_commit' => '2' * 40,
+          'registry_sha256' => '3' * 64,
+          'pages' => [{
+            'id' => 'navody:vps:kvm',
+            'article' => 'kvm',
+            'source' => 'contract/pages/navody-vps-kvm.txt',
+            'sha256' => '4' * 64
+          }]
+        }
+      }
+      File.write(manifest_path, YAML.dump(manifest))
+
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/contract checksum differs/, error.message)
+
+      manifest.fetch('contract').fetch('pages').first['sha256'] = sha256
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_instance_of(KbRelease::Manifest, KbRelease::Manifest.new(manifest_path))
+    end
+  end
+
   def test_english_release_verifies_every_explicit_counterpart_pair
     Dir.mktmpdir do |release_dir|
       pages = {

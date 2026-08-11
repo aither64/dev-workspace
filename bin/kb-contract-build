@@ -11,13 +11,13 @@ require_relative '../lib/kb_managed_articles'
 
 options = {}
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR [--captures DIR] [--code-root DIR --code-base COMMIT]'
+  parser.banner = 'Usage: kb-contract-build --source DIR --plan FILE --output DIR [--captures DIR] [--code-root DIR --code-base FULL-OID]'
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--plan FILE') { |value| options[:plan] = File.expand_path(value) }
   parser.on('--output DIR') { |value| options[:output] = File.expand_path(value) }
   parser.on('--captures DIR') { |value| options[:captures] = File.expand_path(value) }
   parser.on('--code-root DIR') { |value| options[:code_root] = File.expand_path(value) }
-  parser.on('--code-base COMMIT') { |value| options[:code_base] = value }
+  parser.on('--code-base FULL-OID') { |value| options[:code_base] = value }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
 %i[source plan output].each { |key| abort "--#{key} is required" unless options[key] }
@@ -49,9 +49,9 @@ if schema < 3 && !content_replacements.empty?
 end
 abort 'managed_articles require replacement plan schema 4' if schema < 4 && !managed_article_plan.empty?
 
-unless managed_article_plan.empty?
-  abort '--code-root is required when the plan contains managed_articles' unless options[:code_root]
-  abort '--code-base is required when the plan contains managed_articles' unless options[:code_base]
+if schema == 4
+  abort '--code-root is required for replacement plan schema 4' unless options[:code_root]
+  abort '--code-base is required for replacement plan schema 4' unless options[:code_base]
 end
 
 unless code_sample_plan.empty?
@@ -80,6 +80,46 @@ end
 code_samples_by_id = code_samples.to_h { |entry| [entry.fetch('id'), entry] }
 abort 'duplicate code sample IDs' unless code_samples_by_id.length == code_samples.length
 
+managed_contract = nil
+registered_contract_pages = []
+if schema == 4
+  begin
+    managed_contract = KbManagedArticles.contract_provenance(
+      code_root: options.fetch(:code_root),
+      base: options.fetch(:code_base)
+    )
+    registered_contract_pages = KbManagedArticles.registered_pages(
+      code_root: options.fetch(:code_root),
+      contract: managed_contract,
+      require_committed: true
+    )
+  rescue KbManagedArticles::Error => e
+    abort e.message
+  end
+end
+registered_contract_pages_by_key = registered_contract_pages.to_h do |page|
+  [page.values_at(:language, :page), page]
+end
+
+legacy_page_targets = {
+  'new_pages' => new_pages,
+  'content_replacements' => content_replacements,
+  'replacements' => replacements
+}.flat_map do |kind, entries|
+  entries.map do |entry|
+    language = entry.fetch('language')
+    page = entry.fetch('page')
+    [kind, language, page]
+  end
+end
+legacy_page_targets.each do |kind, language, page|
+  managed = registered_contract_pages_by_key[[language, page]]
+  next unless managed
+
+  abort "#{language}:#{page}: registered managed pages cannot be changed through #{kind}; " \
+        "use managed_articles entry #{managed.fetch(:article).inspect}"
+end
+
 source_root = options.fetch(:source)
 output_root = options.fetch(:output)
 source_index = JSON.parse(File.read(File.join(source_root, 'index.json')))
@@ -102,6 +142,7 @@ pages = source_index.flat_map do |language, entries|
 end.to_h
 abort 'duplicate source page IDs' unless source_page_keys.uniq.length == source_page_keys.length
 abort 'duplicate source page files' unless source_files.uniq.length == source_files.length
+wiki_pages = pages.dup
 
 new_page_plan = new_pages.map do |entry|
   language = entry.fetch('language')
@@ -156,7 +197,9 @@ managed_pages = managed_article_plan.flat_map do |entry|
       base: options.fetch(:code_base),
       article_id: article_id,
       wiki_pages: pages,
-      bootstrap: bootstrap
+      bootstrap: bootstrap,
+      contract: managed_contract,
+      require_committed: true
     )
   rescue KbManagedArticles::Error => e
     abort e.message
@@ -184,12 +227,22 @@ managed_pages = managed_article_plan.flat_map do |entry|
       'language' => result.fetch(:language),
       'page' => result.fetch(:page),
       'source' => result.fetch(:source),
-      'status' => result.fetch(:status).to_s
+      'status' => result.fetch(:status).to_s,
+      'canonical_sha256' => result.fetch(:canonical_sha256)
     }
   end
 end
 managed_page_keys = managed_pages.map { |entry| [entry.fetch('language'), entry.fetch('page')] }
 abort 'duplicate managed page IDs' unless managed_page_keys.uniq.length == managed_page_keys.length
+
+unless code_samples.empty?
+  registered_contract_pages.each do |registered|
+    key = registered.values_at(:language, :page)
+    next unless pages.fetch(key).include?('<kb-code-sample')
+
+    abort "#{key.join(':')}: registered managed pages cannot use release-time code sample expansion"
+  end
+end
 
 content_replacement_plan = content_replacements.map do |replacement|
   language = replacement.fetch('language')
@@ -301,6 +354,39 @@ pages.each do |(language, page), content|
   abort "#{language}:#{page}: unresolved code sample placeholder"
 end
 
+managed_pages.each do |managed|
+  key = managed.values_at('language', 'page')
+  canonical = registered_contract_pages_by_key.fetch(key).fetch(:current)
+  next if pages.fetch(key) == canonical
+
+  abort "#{key.join(':')}: managed candidate differs from its canonical contract source"
+end
+registered_contract_pages.each do |registered|
+  key = registered.values_at(:language, :page)
+  next if managed_page_keys.include?(key)
+  next if pages.fetch(key) == wiki_pages.fetch(key)
+
+  abort "#{key.join(':')}: registered managed page changed without a managed_articles entry"
+end
+
+managed_contract_index = if managed_contract
+                           {
+                             'repository' => managed_contract.fetch(:repository),
+                             'base_commit' => managed_contract.fetch(:base_commit),
+                             'head_commit' => managed_contract.fetch(:head_commit),
+                             'registry_sha256' => managed_contract.fetch(:registry_sha256),
+                             'pages' => registered_contract_pages.map do |page|
+                               {
+                                 'article' => page.fetch(:article),
+                                 'language' => page.fetch(:language),
+                                 'page' => page.fetch(:page),
+                                 'source' => page.fetch(:source),
+                                 'sha256' => page.fetch(:sha256)
+                               }
+                             end
+                           }
+                         end
+
 candidate_index = {
   'pages' => [],
   'media' => [],
@@ -311,6 +397,7 @@ candidate_index = {
   'code_samples' => code_samples.map { |entry| entry.except('content') },
   'exceptions' => exceptions
 }
+candidate_index['managed_contract'] = managed_contract_index if managed_contract_index
 pages.sort.each do |(language, page_id), content|
   relative = File.join(language, *page_id.split(':')) + '.txt'
   source = File.read(

@@ -554,6 +554,9 @@ class KbContractToolsTest < Minitest::Test
       write_sources(source)
       base = write_managed_code_root(code_root)
       write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
+      run_git(code_root, 'add', 'contract/pages')
+      run_git(code_root, 'commit', '-m', 'Update managed article fixture')
+      head = run_git(code_root, 'rev-parse', 'HEAD').strip
       plan = write_managed_plan(dir)
 
       output, error, status = Open3.capture3(
@@ -572,6 +575,129 @@ class KbContractToolsTest < Minitest::Test
       )
       index = JSON.parse(File.read(File.join(candidate, 'index.json')))
       assert_equal(%w[git_only git_only], index.fetch('managed_pages').map { |page| page.fetch('status') })
+      provenance = index.fetch('managed_contract')
+      assert_equal(base, provenance.fetch('base_commit'))
+      assert_equal(head, provenance.fetch('head_commit'))
+      assert_equal(2, provenance.fetch('pages').length)
+      assert_equal(
+        Digest::SHA256.file(File.join(code_root, 'contract/articles.yml')).hexdigest,
+        provenance.fetch('registry_sha256')
+      )
+
+      manifest_path = File.join(dir, 'kb-release-cs.yml')
+      run_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
+      manifest_contract = YAML.safe_load_file(manifest_path).fetch('contract')
+      assert_equal(base, manifest_contract.fetch('base_commit'))
+      assert_equal(head, manifest_contract.fetch('head_commit'))
+      assert_equal(
+        [{
+          'id' => 'navody:test',
+          'article' => 'guide',
+          'source' => 'contract/pages/cs.txt',
+          'sha256' => Digest::SHA256.hexdigest("<page>manuals:test</page>\nCanonical Czech.\n")
+        }],
+        manifest_contract.fetch('pages')
+      )
+    end
+  end
+
+  def test_build_rejects_a_legacy_transform_for_a_listed_managed_page
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['content_replacements'] = [{
+        'language' => 'cs',
+        'page' => 'navody:test',
+        'before' => 'Upravit profil',
+        'replacement' => 'Untracked replacement'
+      }]
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/registered managed pages cannot be changed through content_replacements/, error)
+    end
+  end
+
+  def test_build_rejects_a_legacy_transform_for_an_omitted_managed_page
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['managed_articles'] = []
+      data['replacements'] = [{
+        'language' => 'en',
+        'page' => 'manuals:test',
+        'path' => 'member.edit-profile.open',
+        'before' => 'Edit profile'
+      }]
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/registered managed pages cannot be changed through replacements/, error)
+    end
+  end
+
+  def test_build_rejects_uncommitted_canonical_sources
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      write_managed_pages(code_root, "<page>manuals:test</page>\nDirty Czech.\n", "Dirty English.\n")
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_managed_plan(dir),
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/canonical source differs from contract HEAD/, error)
+    end
+  end
+
+  def test_build_rejects_a_symbolic_managed_article_base
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      write_managed_code_root(code_root)
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_managed_plan(dir),
+        '--code-root', code_root,
+        '--code-base', 'HEAD',
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/base must be a full 40-character commit OID/, error)
     end
   end
 
@@ -696,6 +822,8 @@ class KbContractToolsTest < Minitest::Test
       base = initialize_empty_code_root(code_root)
       write_managed_contract(code_root)
       write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
+      run_git(code_root, 'add', 'contract')
+      run_git(code_root, 'commit', '-m', 'Add managed article fixture')
       plan = write_managed_plan(dir)
       data = YAML.safe_load_file(plan)
       data.fetch('managed_articles').first['bootstrap'] = source_hashes(source)
@@ -788,6 +916,7 @@ class KbContractToolsTest < Minitest::Test
       path,
       YAML.dump(
         'schema' => 1,
+        'repository' => 'vpsfreecz/kb-contract-fixture',
         'articles' => {
           'guide' => {
             'pages' => {

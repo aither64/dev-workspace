@@ -10,11 +10,11 @@ require_relative '../lib/kb_managed_articles'
 
 options = { adopt: false, yes: false }
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-reconcile --source DIR --code-root DIR --article ID --base COMMIT [--adopt --yes]'
+  parser.banner = 'Usage: kb-contract-reconcile --source DIR --code-root DIR --article ID --base FULL-OID [--adopt --yes]'
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--code-root DIR') { |value| options[:code_root] = File.expand_path(value) }
   parser.on('--article ID') { |value| options[:article] = value }
-  parser.on('--base COMMIT') { |value| options[:base] = value }
+  parser.on('--base FULL-OID') { |value| options[:base] = value }
   parser.on('--adopt') { options[:adopt] = true }
   parser.on('--yes') { options[:yes] = true }
 end.parse!
