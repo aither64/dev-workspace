@@ -13,6 +13,7 @@ class KbContractToolsTest < Minitest::Test
   BUILD = File.join(ROOT, 'bin/kb-contract-build')
   FETCH = File.join(ROOT, 'bin/kb-contract-fetch')
   MANIFEST = File.join(ROOT, 'bin/kb-contract-manifest')
+  RECONCILE = File.join(ROOT, 'bin/kb-contract-reconcile')
 
   def test_fetch_command_has_a_stable_cli
     output, error, status = Open3.capture3(FETCH, '--help')
@@ -545,6 +546,175 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_build_uses_git_only_managed_article_changes
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
+      plan = write_managed_plan(dir)
+
+      output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      assert_match(/2 changed pages/, output)
+      assert_equal(
+        "<page>manuals:test</page>\nCanonical Czech.\n",
+        File.read(File.join(candidate, 'cs/navody/test.txt'))
+      )
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      assert_equal(%w[git_only git_only], index.fetch('managed_pages').map { |page| page.fetch('status') })
+    end
+  end
+
+  def test_reconcile_reports_an_unchanged_managed_article
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+
+      output, error, status = Open3.capture3(
+        RECONCILE,
+        '--source', source,
+        '--code-root', code_root,
+        '--article', 'guide',
+        '--base', base
+      )
+      assert(status.success?, error)
+      assert_includes(output, 'cs:navody:test in-sync')
+      assert_includes(output, 'en:manuals:test in-sync')
+    end
+  end
+
+  def test_build_rejects_wiki_only_managed_article_changes
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      replace_source_page(source, 'cs', 'navody:test', "<page>manuals:test</page>\nDirect wiki edit.\n")
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_managed_plan(dir),
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+      refute(status.success?)
+      assert_match(/wiki-only/, error)
+      assert_match(/kb-contract-reconcile/, error)
+    end
+  end
+
+  def test_reconcile_explicitly_adopts_wiki_only_changes
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      direct_edit = "<page>manuals:test</page>\nDirect wiki edit.\n"
+      replace_source_page(source, 'cs', 'navody:test', direct_edit)
+
+      _output, error, status = Open3.capture3(
+        RECONCILE,
+        '--source', source,
+        '--code-root', code_root,
+        '--article', 'guide',
+        '--base', base,
+        '--adopt',
+        '--yes'
+      )
+      assert(status.success?, error)
+      assert_equal(direct_edit, File.read(File.join(code_root, 'contract/pages/cs.txt')))
+    end
+  end
+
+  def test_reconcile_accepts_an_already_reconciled_wiki_edit
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      direct_edit = "<page>manuals:test</page>\nDirect wiki edit.\n"
+      replace_source_page(source, 'cs', 'navody:test', direct_edit)
+      File.write(File.join(code_root, 'contract/pages/cs.txt'), direct_edit)
+
+      output, error, status = Open3.capture3(
+        RECONCILE,
+        '--source', source,
+        '--code-root', code_root,
+        '--article', 'guide',
+        '--base', base
+      )
+      assert(status.success?, error)
+      assert_includes(output, 'cs:navody:test reconciled')
+    end
+  end
+
+  def test_reconcile_rejects_concurrent_git_and_wiki_changes
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      replace_source_page(source, 'cs', 'navody:test', "<page>manuals:test</page>\nDirect wiki edit.\n")
+      File.write(
+        File.join(code_root, 'contract/pages/cs.txt'),
+        "<page>manuals:test</page>\nConcurrent Git edit.\n"
+      )
+
+      _output, error, status = Open3.capture3(
+        RECONCILE,
+        '--source', source,
+        '--code-root', code_root,
+        '--article', 'guide',
+        '--base', base
+      )
+      refute(status.success?)
+      assert_match(/Three-way conflict/, error)
+      assert_match(/merge them manually/, error)
+    end
+  end
+
+  def test_build_bootstraps_a_new_managed_article_with_guarded_hashes
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = initialize_empty_code_root(code_root)
+      write_managed_contract(code_root)
+      write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data.fetch('managed_articles').first['bootstrap'] = source_hashes(source)
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      assert_equal(%w[bootstrap bootstrap], index.fetch('managed_pages').map { |page| page.fetch('status') })
+    end
+  end
+
   def test_build_rejects_index_paths_outside_the_source_root
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
@@ -586,6 +756,102 @@ class KbContractToolsTest < Minitest::Test
   end
 
   private
+
+  def initialize_empty_code_root(root)
+    FileUtils.mkdir_p(root)
+    run_git(root, 'init', '--initial-branch=master')
+    run_git(root, 'config', 'user.name', 'KB Test')
+    run_git(root, 'config', 'user.email', 'kb-test@example.test')
+    File.write(File.join(root, 'README.md'), "fixture\n")
+    run_git(root, 'add', 'README.md')
+    run_git(root, 'commit', '-m', 'Initialize fixture')
+    run_git(root, 'rev-parse', 'HEAD').strip
+  end
+
+  def write_managed_code_root(root)
+    initialize_empty_code_root(root)
+    write_managed_contract(root)
+    write_managed_pages(
+      root,
+      "<page>manuals:test</page>\nPoužij Upravit profil.\n",
+      "Use Edit profile.\n"
+    )
+    run_git(root, 'add', 'contract')
+    run_git(root, 'commit', '-m', 'Add managed article fixture')
+    run_git(root, 'rev-parse', 'HEAD').strip
+  end
+
+  def write_managed_contract(root)
+    path = File.join(root, 'contract/articles.yml')
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(
+      path,
+      YAML.dump(
+        'schema' => 1,
+        'articles' => {
+          'guide' => {
+            'pages' => {
+              'cs' => {
+                'id' => 'navody:test',
+                'counterpart' => 'manuals:test',
+                'source' => 'contract/pages/cs.txt'
+              },
+              'en' => {
+                'id' => 'manuals:test',
+                'counterpart' => 'navody:test',
+                'source' => 'contract/pages/en.txt'
+              }
+            }
+          }
+        }
+      )
+    )
+  end
+
+  def write_managed_pages(root, czech, english)
+    pages = File.join(root, 'contract/pages')
+    FileUtils.mkdir_p(pages)
+    File.write(File.join(pages, 'cs.txt'), czech)
+    File.write(File.join(pages, 'en.txt'), english)
+  end
+
+  def write_managed_plan(root)
+    path = File.join(root, 'managed-plan.yml')
+    File.write(
+      path,
+      YAML.dump(
+        'schema' => 4,
+        'replacements' => [],
+        'managed_articles' => [{ 'id' => 'guide' }],
+        'exceptions' => []
+      )
+    )
+    path
+  end
+
+  def replace_source_page(root, language, page_id, content)
+    index_path = File.join(root, 'index.json')
+    index = JSON.parse(File.read(index_path))
+    entry = index.fetch(language).find { |page| page.fetch('id') == page_id }
+    File.write(File.join(root, entry.fetch('file')), content)
+    entry['sha256'] = Digest::SHA256.hexdigest(content)
+    entry['revision'] = entry.fetch('revision').to_i.next.to_s
+    File.write(index_path, JSON.dump(index))
+  end
+
+  def source_hashes(root)
+    index = JSON.parse(File.read(File.join(root, 'index.json')))
+    %w[cs en].to_h do |language|
+      [language, index.fetch(language).first.fetch('sha256')]
+    end
+  end
+
+  def run_git(root, *args)
+    output, error, status = Open3.capture3('git', '-C', root, *args)
+    raise error unless status.success?
+
+    output
+  end
 
   def write_sources(root)
     pages = {
