@@ -205,6 +205,11 @@ Check at least:
   the transfer and verified after the operation completes.
 - Whether appropriate documentation, man pages, API docs, migration notes, or
   operational docs were updated when behavior changes.
+- For KB or DokuWiki changes, whether every instruction to perform a vpsAdmin
+  WebUI action is wrapped in a semantic `<vpsadmin-nav>` annotation bound to the
+  affected language pages. Enumerate action-oriented prose manually, including
+  instructions that do not name a menu or form; do not treat a green discovery
+  heuristic as proof of completeness. Report a missing binding as `Blocking`.
 - Whether deployment to running systems is safe with older versions still
   present. Consider persisted state, schemas, protocols, generated
   configuration, mixed-version operation, rollback, and whether any all-at-once
