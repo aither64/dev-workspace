@@ -1287,7 +1287,13 @@ let
       imports = [
         sshModule
         vpsfStatusModule
-      ];
+      ]
+      ++ lib.optional installNotificationTemplates {
+        vpsadmin.api.managedNotificationTemplates = {
+          paths = [ notificationTemplatesStorePath ];
+          sourceId = notificationTemplatesSourceId;
+        };
+      };
 
       boot.initrd.kernelModules = [ "virtiofs" ];
       boot.supportedFilesystems.virtiofs = true;
@@ -1498,11 +1504,6 @@ let
           "test.nix"
           "${devSeed}"
         ];
-
-        api.managedNotificationTemplates = lib.mkIf installNotificationTemplates {
-          paths = [ notificationTemplatesStorePath ];
-          sourceId = notificationTemplatesSourceId;
-        };
 
         varnish.api = {
           test.domain = lib.mkForce domains.api;
