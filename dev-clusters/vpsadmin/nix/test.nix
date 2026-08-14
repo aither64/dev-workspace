@@ -1518,14 +1518,16 @@ let
           forceSSL = lib.mkForce false;
 
           api = {
-            test.domain = lib.mkForce domains.api;
-            test.telegramWebhook =
-              lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook")
-                {
-                  enable = true;
-                  path = telegramWebhookPath;
-                  backend.address = "unix:/run/haproxy/vpsadmin-telegram-receiver.sock";
-                };
+            test = {
+              domain = lib.mkForce domains.api;
+            }
+            // optionalAttrs (builtins.pathExists vpsadminNotificationsModule) {
+              telegramWebhook = lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook") {
+                enable = true;
+                path = telegramWebhookPath;
+                backend.address = "unix:/run/haproxy/vpsadmin-telegram-receiver.sock";
+              };
+            };
             maintenance = {
               domain = tmpDomains.api;
               backend.address = "unix:/run/varnish/vpsadmin-varnish.sock";
@@ -1555,6 +1557,24 @@ let
           webui.maintenance = {
             domain = tmpDomains.webui;
             backend.address = "unix:/run/haproxy/vpsadmin-webui.sock";
+          };
+        };
+
+      }
+      // optionalAttrs (builtins.pathExists vpsadminNotificationsModule) {
+        notificationDispatcher = {
+          actions = lib.mkForce (
+            [
+              "email"
+              "webhook"
+            ]
+            ++ lib.optional telegramBotTokenConfigured "telegram"
+            ++ lib.optional smsGatewayEnabled "sms"
+          );
+
+          smtp = lib.mkIf mailCapture.enable {
+            address = lib.mkForce "127.0.0.1";
+            port = lib.mkForce mailCapture.smtpPort;
           };
         };
 
@@ -1599,15 +1619,6 @@ let
           configDirectory = config.vpsadmin.api.configDirectory;
           database = config.vpsadmin.api.database;
         };
-
-        notificationDispatcher.actions = lib.mkForce (
-          [
-            "email"
-            "webhook"
-          ]
-          ++ lib.optional telegramBotTokenConfigured "telegram"
-          ++ lib.optional smsGatewayEnabled "sms"
-        );
 
         haproxy.telegram-receiver.test =
           lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook")
@@ -1806,27 +1817,18 @@ let
           };
       };
 
-      vpsadmin.notificationDispatcher.smtp = lib.mkIf mailCapture.enable {
-        address = lib.mkForce "127.0.0.1";
-        port = lib.mkForce mailCapture.smtpPort;
-      };
-
-      vpsadmin.api.notifications.smtp = lib.mkIf mailCapture.enable {
-        enable = true;
-        address = lib.mkForce "127.0.0.1";
-        port = lib.mkForce mailCapture.smtpPort;
-      };
-
-      systemd.services.vpsadmin-webhook-test-server = {
-        description = "Development webhook test server";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
-        serviceConfig = {
-          ExecStart = "${config.vpsadmin.notificationDispatcher.package}/ruby-env-wrapped/bin/ruby /mnt/vpsadmin/tools/webhook-test-server.rb --host 127.0.0.1 --port 18080 --log-dir /tmp/vpsadmin-webhook-test";
-          Restart = "always";
-          RestartSec = "2s";
-        };
-      };
+      systemd.services.vpsadmin-webhook-test-server =
+        lib.mkIf (builtins.pathExists vpsadminNotificationsModule)
+          {
+            description = "Development webhook test server";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network.target" ];
+            serviceConfig = {
+              ExecStart = "${config.vpsadmin.notificationDispatcher.package}/ruby-env-wrapped/bin/ruby /mnt/vpsadmin/tools/webhook-test-server.rb --host 127.0.0.1 --port 18080 --log-dir /tmp/vpsadmin-webhook-test";
+              Restart = "always";
+              RestartSec = "2s";
+            };
+          };
     };
 
   nodeModule =
