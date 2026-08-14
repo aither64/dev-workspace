@@ -100,6 +100,15 @@ end
 registered_contract_pages_by_key = registered_contract_pages.to_h do |page|
   [page.values_at(:language, :page), page]
 end
+managed_article_ids = managed_article_plan.map do |entry|
+  abort 'managed article entry must be a mapping' unless entry.is_a?(Hash)
+
+  KbContractFiles.validate_semantic_id!(entry.fetch('id'))
+end
+abort 'duplicate managed article IDs' unless managed_article_ids.uniq.length == managed_article_ids.length
+managed_plan_page_keys = registered_contract_pages.filter_map do |page|
+  page.values_at(:language, :page) if managed_article_ids.include?(page.fetch(:article))
+end
 
 legacy_page_targets = {
   'new_pages' => new_pages,
@@ -177,8 +186,10 @@ end
 new_page_keys = new_page_plan.map { |entry| [entry.fetch('language'), entry.fetch('page')] }
 abort 'duplicate new page IDs' unless new_page_keys.uniq.length == new_page_keys.length
 missing_source_keys = source_entries.filter_map { |key, entry| key if entry['missing'] == true }
-unless missing_source_keys.sort == new_page_keys.sort
-  abort 'every guarded missing source page must have exactly one new_pages entry'
+managed_missing_source_keys = managed_plan_page_keys & missing_source_keys
+expected_missing_source_keys = new_page_keys + managed_missing_source_keys
+unless missing_source_keys.sort == expected_missing_source_keys.sort
+  abort 'every guarded missing source page must have exactly one new_pages or managed_articles entry'
 end
 
 managed_pages = managed_article_plan.flat_map do |entry|
@@ -219,7 +230,9 @@ managed_pages = managed_article_plan.flat_map do |entry|
     source = source_entries.fetch(key) do
       abort "#{article_id}: managed page #{key.join(':')} is missing from the guarded source inventory"
     end
-    abort "#{article_id}: managed page #{key.join(':')} is marked missing" if source['missing'] == true
+    if source['missing'] == true && result.fetch(:status) != :bootstrap
+      abort "#{article_id}: managed page #{key.join(':')} is marked missing but is not a bootstrap"
+    end
 
     pages[key] = result.fetch(:current)
     {

@@ -843,6 +843,54 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_build_creates_a_missing_managed_bootstrap_page
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      mark_source_missing(source, 'en', 'manuals:test')
+      base = initialize_empty_code_root(code_root)
+      write_managed_contract(code_root)
+      write_managed_pages(
+        code_root,
+        "<page>manuals:test</page>\nCanonical Czech.\n",
+        "Canonical English.\n"
+      )
+      run_git(code_root, 'add', 'contract')
+      run_git(code_root, 'commit', '-m', 'Add managed article fixture')
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data.fetch('managed_articles').first['bootstrap'] = source_hashes(source)
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+      english = index.fetch('pages').find do |page|
+        page.values_at('language', 'id') == %w[en manuals:test]
+      end
+      assert_equal('create', english.fetch('policy'))
+      assert_equal(
+        %w[bootstrap bootstrap],
+        index.fetch('managed_pages').map { |page| page.fetch('status') }
+      )
+
+      manifest_path = File.join(dir, 'kb-release-en.yml')
+      run_manifest(source, candidate, 'en', 'Publish managed guide', manifest_path)
+      manifest_page = YAML.safe_load_file(manifest_path).fetch('pages').first
+      assert_equal('create', manifest_page.fetch('policy'))
+      refute(manifest_page.key?('source_revision'))
+    end
+  end
+
   def test_build_rejects_index_paths_outside_the_source_root
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
@@ -1046,6 +1094,17 @@ class KbContractToolsTest < Minitest::Test
       'missing' => true,
       'sha256' => Digest::SHA256.hexdigest('')
     }
+    File.write(index_path, JSON.dump(index))
+  end
+
+  def mark_source_missing(root, language, page_id)
+    index_path = File.join(root, 'index.json')
+    index = JSON.parse(File.read(index_path))
+    entry = index.fetch(language).find { |page| page.fetch('id') == page_id }
+    File.binwrite(File.join(root, entry.fetch('file')), '')
+    entry.delete('revision')
+    entry['missing'] = true
+    entry['sha256'] = Digest::SHA256.hexdigest('')
     File.write(index_path, JSON.dump(index))
   end
 
