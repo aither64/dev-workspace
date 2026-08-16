@@ -22,7 +22,7 @@ Toto je čistě stylistická redakce, ne přepis obsahu. Za všech okolností pl
 1. **Neměň význam.** Každá věta finálního textu musí říkat totéž co odpovídající místo originálu. Pokud si nejsi jistý, zda přeformulování posouvá význam, zeptej se.
 2. **Nepřidávej obsah.** Žádná nová fakta, čísla, jména, zdroje, příklady, názory, hodnocení ani věty. Ani „neškodné" dovysvětlení.
 3. **Neodebírej obsah.** Každá informace z originálu musí být ve finálním textu dohledatelná. Smíš slučovat a dělit věty, měnit slovosled a nahrazovat formulace — ale nesmíš vypustit žádné věcné sdělení.
-4. **Nevymýšlej.** Když je v originálu vágní tvrzení („odborníci se shodují"), NEnahrazuj ho konkrétním zdrojem, který v textu není. Buď ho přeformuluj neutrálně se zachováním vágnosti, nebo se zeptej uživatele (viz níže).
+4. **Nevymýšlej.** Když je v originálu vágní tvrzení („odborníci se shodují"), NEnahrazuj ho konkrétním zdrojem, který v textu není, ani ho nepřeváděj na vlastní přímé tvrzení. Atribuci zachovej, nebo se zeptej, zda uživatel doplní zdroj či dovolí tvrzení vypustit.
 5. **Zachovej strukturu.** Počet odstavců zůstává. Nadpisy zůstávají (jen se opraví jejich forma). Pořadí informací zůstává, pokud změnu nevynucuje česká větná stavba uvnitř věty.
 6. **Zachovej rejstřík.** Formální text zůstane formální, neformální neformální. Tykání/vykání se nemění bez dotazu.
 7. **Nesahej na citace, názvy a přímou řeč.** Text v uvozovkách, názvy děl, produktů a vlastní jména se nepřeformulovávají (opravuje se jen typografie uvozovek okolo).
@@ -38,6 +38,7 @@ Když narazíš na sporné místo, NEROZHODUJ sám. Polož uživateli konkrétn�
 - **Nevíš, zda jde o citaci, ustálený název nebo termín**, který se nemá měnit (např. „Digitální akademie" — název programu, nebo obecný popis?).
 - **Oprava pravopisu by změnila význam** (např. čárka, která mění smysl věty; velké písmeno, které rozhoduje, zda jde o instituci).
 - **Rejstřík je nejednotný** (text střídá tykání a vykání, formální a hovorové pasáže) — zeptej se, který je zamýšlený.
+- **Tvrzení stojí na vágní autoritě** („odborníci se shodují", „studie ukazují") a bez atribuce by působilo jako autorovo vlastní tvrzení. Atribuci sám neodstraňuj; zeptej se, zda ji zachovat, doložit zdrojem, nebo celé tvrzení vypustit.
 - **Odborný žargon vs. AI slovník**: slovo jako „robustní" nebo „škálovat" může být v oboru autora legitimní termín. Když kontext nestačí k rozhodnutí, zeptej se.
 
 Otázky formuluj konkrétně a s návrhem řešení: „Věta X nenese věcnou informaci. Mám ji (a) vypustit, (b) nechat a jen zestručnit?"
@@ -102,7 +103,7 @@ Pokud uživatel dodá vzorek vlastního psaní, před přepisem ho analyzuj: dé
 
 **Sledovat:** odborníci se shodují, studie ukazují, experti varují, podle mnohých, obecně se má za to, kritici namítají (bez uvedení kterých)
 
-**Problém:** AI připisuje tvrzení anonymním autoritám. POZOR — striktní režim: NIKDY nedoplňuj konkrétní zdroj, který v originálu není. Přeformuluj tak, aby tvrzení neslo autor („Ukazuje se, že…" → přímé tvrzení), nebo se zeptej uživatele, zda zdroj doplní sám.
+**Problém:** AI připisuje tvrzení anonymním autoritám. POZOR — striktní režim: NIKDY nedoplňuj konkrétní zdroj, který v originálu není, ani atribuci nemaž ve prospěch přímého tvrzení. Pokud ji nelze přirozeně přeformulovat a zachovat, zeptej se, zda ji ponechat, doložit, nebo celé tvrzení vypustit.
 
 ### 6. Formulaické sekce „Výzvy a budoucnost"
 
@@ -350,13 +351,13 @@ Když je vidíš, nech prózu na pokoji — nadměrná redakce zničí to, co ji
 
 **Otázky před finálním zněním:**
 1. Věta „Budoucnost vypadá slibně!" nenese věcnou informaci — vypustit, nebo ponechat věcněji formulovanou?
-2. „Experti se shodují" nemá v textu zdroj — mám formulaci zmírnit na obecné tvrzení, nebo doplníš zdroj?
+2. „Experti se shodují" nemá v textu zdroj — mám atribuci zachovat, doplníš zdroj, nebo chceš celé tvrzení vypustit?
 3. Emoji 🚀 — odstranit, nebo je součást tvého stylu pro tento kanál?
 
-**Po (za předpokladu odpovědí: 1 vypustit, 2 zmírnit, 3 odstranit):**
-> Umělá inteligence je pro neziskové organizace důležitý nástroj a mění způsob, jakým pracují. Přináší úsporu času, efektivnější procesy i prostor pro nové postupy. Organizace, které ji nevyužívají, začínají zaostávat. AI přitom může proměnit fungování organizace, její procesy i komunikaci.
+**Po (za předpokladu odpovědí: 1 vypustit, 2 zachovat atribuci, 3 odstranit):**
+> Umělá inteligence je pro neziskové organizace důležitý nástroj a mění způsob, jakým pracují. Přináší úsporu času, efektivnější procesy i prostor pro nové postupy. Odborníci se shodují, že organizace, které ji nevyužívají, zaostávají. AI přitom může proměnit fungování organizace, její procesy i komunikaci.
 
-**Provedené změny:** odstraněn AI slovník (v dnešní digitální době, klíčový, zásadní), negativní paralelismus (nejde jen o…), em dash, anglické uvozovky, pravidlo tří rozbito se zachováním všech tří položek, metakomentář (pojďme se podívat), kalk přivlastňovacích zájmen (vaši/vaše), vágní autorita zmírněna na přímé tvrzení dle odpovědi uživatele, generický závěr a emoji vypuštěny dle odpovědi uživatele. Veškerý věcný obsah zachován.
+**Provedené změny:** odstraněn AI slovník (v dnešní digitální době, klíčový, zásadní), negativní paralelismus (nejde jen o…), em dash, anglické uvozovky, pravidlo tří rozbito se zachováním všech tří položek, metakomentář (pojďme se podívat) a kalk přivlastňovacích zájmen (vaši/vaše). Vágní atribuce zůstala zachována, protože uživatel nedodal zdroj ani nepovolil vypuštění tvrzení. Generický závěr a emoji byly vypuštěny podle jeho odpovědi. Veškerý ostatní věcný obsah zůstal zachován.
 
 ---
 

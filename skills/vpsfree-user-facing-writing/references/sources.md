@@ -33,12 +33,13 @@ otherwise matches upstream v2.9.1.
 - Local `LICENSE` SHA-256:
   `6baf827e0d512db5708ebf71b2cff2e71e24be1fbdd4361547feec5e6fa99c69`
 - Local `SKILL.md` SHA-256:
-  `ed7a108f06aefcd6556cc99ff33403c30213ad14c0739214b1de8c2d3bac3d95`
+  `d6a81649c5deb4b4685a8c5fb81169b73907199a0dd4c553976bd8060895a711`
 - License: MIT
 
 Local packaging changes use the ISO 639-1 `cs` language code, portable
 frontmatter, and OpenAI UI metadata. The local license retains Siqi Chen's MIT
-notice and identifies the Czech adaptation.
+notice and identifies the Czech adaptation. The editorial prompt preserves
+attributed claims unless the user authorizes a content change.
 
 ## Updating the pinned sources
 
