@@ -382,6 +382,14 @@ class KbStageTest < Minitest::Test
       assert_match(/test pattern/, assert_raises(KbRelease::Error) {
         KbRelease::Manifest.new(manifest_path)
       }.message)
+
+      test = manifest.fetch('contract').fetch('tests').first
+      test['pattern'] = 'kb/kvm#*'
+      test['source'] = 'tests/suite/kb/gre.nix'
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_match(/test source must be tests\/suite\/kb\/kvm\.nix/, assert_raises(KbRelease::Error) {
+        KbRelease::Manifest.new(manifest_path)
+      }.message)
     end
   end
 

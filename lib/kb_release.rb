@@ -243,7 +243,12 @@ module KbRelease
                end
           raise Error, "invalid release contract test pattern #{pattern.inspect}"
         end
-        validate_relative_path!(test.fetch('source'), 'release contract test source')
+        source = validate_relative_path!(test.fetch('source'), 'release contract test source')
+        expected_source = "tests/suite/#{suite}.nix"
+        unless source == expected_source
+          raise Error,
+                "release contract test source must be #{expected_source}, got #{source.inspect}"
+        end
         validate_digest!(test.fetch('sha256'), "release contract test #{article}")
         article
       end

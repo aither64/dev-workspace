@@ -769,6 +769,45 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_manifest_rejects_a_candidate_test_source_not_derived_from_its_suite
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      write_managed_pages(code_root, "<page>manuals:test</page>\nNew Czech.\n", "New English.\n")
+      run_git(code_root, 'add', 'contract/pages')
+      run_git(code_root, 'commit', '-m', 'Update managed pages')
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', write_managed_plan(dir),
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', candidate
+      )
+      assert(status.success?, error)
+      index_path = File.join(candidate, 'index.json')
+      index = JSON.parse(File.read(index_path))
+      index.fetch('managed_contract').fetch('tests').first['source'] =
+        'tests/suite/kb/other.nix'
+      File.write(index_path, JSON.pretty_generate(index))
+
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'cs',
+        '--summary', 'Publish managed guide',
+        '--output', File.join(dir, 'kb-release-cs.yml')
+      )
+
+      refute(status.success?)
+      assert_match(/managed test source must be tests\/suite\/kb\/guide\.nix/, error)
+    end
+  end
+
   def test_manifest_preserves_legacy_candidate_without_test_provenance
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')

@@ -176,7 +176,12 @@ if managed_contract
            end
       abort "#{article}: invalid managed test pattern #{pattern.inspect}"
     end
-    KbContractFiles.path_within(options.fetch(:candidate), test.fetch('source'))
+    source = test.fetch('source')
+    KbContractFiles.path_within(options.fetch(:candidate), source)
+    expected_source = "tests/suite/#{suite}.nix"
+    unless source == expected_source
+      abort "#{article}: managed test source must be #{expected_source}, got #{source.inspect}"
+    end
     sha256 = test.fetch('sha256')
     unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
       abort "#{article}: invalid managed test SHA-256"
