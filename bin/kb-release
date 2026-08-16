@@ -19,6 +19,10 @@ module KbReleaseCli
       runner = KbRelease::Runner.new(
         manifest:,
         client_factory: method(:client_for),
+        revision_history: KbRelease::RevisionHistory.new(
+          site_url: ->(name) { KbPage.wiki_config(name).fetch(:url) },
+          headers: method(:history_headers)
+        ),
         out: @out
       )
 
@@ -75,6 +79,24 @@ module KbReleaseCli
         username: wiki[:username],
         password_path: wiki[:password_path]
       )
+    end
+
+    def history_headers(name)
+      wiki = KbPage.wiki_config(name)
+      authorization = if wiki[:token_path]
+                        "Bearer #{read_secret(wiki.fetch(:token_path), 'token')}"
+                      else
+                        credentials = "#{wiki.fetch(:username)}:" \
+                                      "#{read_secret(wiki.fetch(:password_path), 'password')}"
+                        "Basic #{Base64.strict_encode64(credentials)}"
+                      end
+      { 'Authorization' => authorization }
+    end
+
+    def read_secret(path, kind)
+      File.read(path).strip
+    rescue Errno::ENOENT
+      raise KbRelease::Error, "#{kind} file not found: #{path}"
     end
   end
 end

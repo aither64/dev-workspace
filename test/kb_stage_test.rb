@@ -39,6 +39,32 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  class FakeRevisionHistory
+    attr_reader :calls
+
+    def initialize(summaries)
+      @summaries = summaries
+      @calls = []
+    end
+
+    def verify!(wiki, id, expected)
+      @calls << [wiki, id, expected]
+      actual = @summaries.fetch([wiki, id])
+      unless actual == expected
+        raise KbRelease::Error,
+              "revision summary differs for #{id}: expected #{expected.inspect}, got #{actual.inspect}"
+      end
+
+      "https://history.example.test/#{wiki}/#{id.tr(':', '/')}"
+    end
+  end
+
+  class NoopLanguageLinks
+    def warm_and_verify(_pages); end
+
+    def warm_and_verify_pairs(_pairs); end
+  end
+
   def test_claim_serializes_owners_and_release_refuses_pending_bundle
     with_state do
       stub_kb_stage(:current_slug, 'session-one') do
@@ -216,6 +242,67 @@ class KbStageTest < Minitest::Test
       error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
       assert_match(/non-empty single line/, error.message)
     end
+  end
+
+  def test_schema_four_manifest_requires_per_page_summaries_and_guarded_deletions
+    Dir.mktmpdir do |release_dir|
+      candidate = "candidate\n"
+      File.write(File.join(release_dir, 'page.txt'), candidate)
+      manifest = schema_four_manifest(candidate:)
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(manifest_path, YAML.dump(manifest))
+
+      parsed = KbRelease::Manifest.new(manifest_path)
+      assert_equal('Aktualizace návodu', parsed.page_summary(parsed.pages.first))
+      assert_equal('Odstranění starého návodu', parsed.page_summary(parsed.deletions.first))
+
+      manifest['production_summary'] = 'Generic summary'
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_match(/per-page summaries/, assert_raises(KbRelease::Error) {
+        KbRelease::Manifest.new(manifest_path)
+      }.message)
+      manifest.delete('production_summary')
+
+      manifest.fetch('pages').first['summary'] = "first\nsecond"
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_match(/non-empty single line/, assert_raises(KbRelease::Error) {
+        KbRelease::Manifest.new(manifest_path)
+      }.message)
+      manifest.fetch('pages').first['summary'] = 'Aktualizace návodu'
+
+      manifest.fetch('deletions').first['id'] = 'page'
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_match(/overlap/, assert_raises(KbRelease::Error) {
+        KbRelease::Manifest.new(manifest_path)
+      }.message)
+    end
+  end
+
+  def test_revision_history_reads_the_latest_html_summary
+    requested = nil
+    requested_site = nil
+    requested_headers = nil
+    history = KbRelease::RevisionHistory.new(
+      site_url: lambda do |wiki|
+        requested_site = wiki
+        "https://#{wiki}.example.test"
+      end,
+      headers: ->(wiki) { { 'X-Test-Wiki' => wiki } },
+      fetcher: lambda do |url, headers|
+        requested = url
+        requested_headers = headers
+        '<span class="sum"> – Update SSH &amp; firewall</span>'.b
+      end
+    )
+
+    url = history.verify!('org', 'manuals:server:ssh', 'Update SSH & firewall')
+
+    assert_equal(requested, url)
+    assert_equal('org', requested_site)
+    assert_equal({ 'X-Test-Wiki' => 'org' }, requested_headers)
+    assert_includes(url, 'https://org.example.test/doku.php')
+    assert_includes(url, 'id=manuals%3Aserver%3Assh')
+    assert_includes(url, 'do=revisions')
   end
 
   def test_release_manifest_binds_managed_contract_page_checksums
@@ -638,6 +725,175 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_schema_four_stages_writes_and_deletions_with_exact_summaries
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        source = "old\n"
+        candidate = "new\n"
+        obsolete = "obsolete\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(
+          manifest_path,
+          YAML.dump(schema_four_manifest(candidate:, source:, obsolete:))
+        )
+
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'page' }, result: { 'revision' => 123 })
+        production.expect('core.getPage', { page: 'page' }, result: source)
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 456 })
+        production.expect('core.getPage', { page: 'obsolete' }, result: obsolete)
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: source)
+        staging.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 999 })
+        staging.expect('core.getPage', { page: 'obsolete' }, result: obsolete)
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect('core.aclCheck', { page: 'page' }, result: 2)
+        staging.expect('core.aclCheck', { page: 'obsolete' }, result: 16)
+        staging.expect(
+          'core.savePage',
+          {
+            page: 'page', text: candidate, summary: 'Aktualizace návodu', isminor: false
+          },
+          result: true
+        )
+        staging.expect(
+          'core.savePage',
+          {
+            page: 'obsolete', text: '', summary: 'Odstranění starého návodu', isminor: false
+          },
+          result: true
+        )
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+        staging.expect(
+          'core.getPageInfo',
+          { page: 'obsolete' },
+          result: KbPage::RpcError.new(221, 'page does not exist')
+        )
+        history = FakeRevisionHistory.new(
+          ['cz-staging', 'page'] => 'Aktualizace návodu',
+          ['cz-staging', 'obsolete'] => 'Odstranění starého návodu'
+        )
+        clients = { 'cz' => production, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          language_links: NoopLanguageLinks.new,
+          revision_history: history,
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') { runner.stage! }
+        end
+
+        assert(production.done?)
+        assert(staging.done?)
+        assert_equal(2, history.calls.length)
+        assert_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
+  def test_schema_four_retry_rejects_a_staged_page_with_another_summary
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        source = "old\n"
+        candidate = "new\n"
+        obsolete = "obsolete\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(manifest_path, YAML.dump(schema_four_manifest(candidate:, source:, obsolete:)))
+
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'page' }, result: { 'revision' => 123 })
+        production.expect('core.getPage', { page: 'page' }, result: source)
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 456 })
+        production.expect('core.getPage', { page: 'obsolete' }, result: obsolete)
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+        history = FakeRevisionHistory.new(
+          ['cz-staging', 'page'] => 'Unrelated summary'
+        )
+        clients = { 'cz' => production, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          revision_history: history,
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+
+        assert_match(/reset staging and stage this manifest again/, error.message)
+        assert(production.done?)
+        assert(staging.done?)
+      end
+    end
+  end
+
+  def test_schema_four_refuses_deletion_source_drift_before_staging
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        manifest = schema_four_manifest(candidate: "unused\n")
+        manifest['pages'] = []
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(manifest_path, YAML.dump(manifest))
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 456 })
+        production.expect('core.getPage', { page: 'obsolete' }, result: "changed\n")
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { name == 'cz' ? production : raise('must not stage') },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+
+        assert_match(/deletion source drift/, error.message)
+        assert(production.done?)
+      end
+    end
+  end
+
+  def test_schema_four_requires_delete_acl_before_staging
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        obsolete = "obsolete\n"
+        manifest = schema_four_manifest(candidate: "unused\n", obsolete:)
+        manifest['pages'] = []
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(manifest_path, YAML.dump(manifest))
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 456 })
+        production.expect('core.getPage', { page: 'obsolete' }, result: obsolete)
+        staging = FakeClient.new
+        staging.expect('core.getPageInfo', { page: 'obsolete' }, result: { 'revision' => 999 })
+        staging.expect('core.getPage', { page: 'obsolete' }, result: obsolete)
+        staging.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        staging.expect('core.aclCheck', { page: 'obsolete' }, result: 2)
+        clients = { 'cz' => production, 'cz-staging' => staging }
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: ->(name) { clients.fetch(name) },
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+
+        assert_match(/insufficient ACL to delete page obsolete/, error.message)
+        assert(production.done?)
+        assert(staging.done?)
+      end
+    end
+  end
+
   def test_release_library_refuses_promotion_without_explicit_approval
     runner = KbRelease::Runner.new(
       manifest: Object.new,
@@ -776,6 +1032,138 @@ class KbStageTest < Minitest::Test
         assert(production.done?)
         refute_path_exists(KbStage.pending_release_path)
       end
+    end
+  end
+
+  def test_schema_four_promotion_accepts_matching_partial_write_and_deletion
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "new\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(manifest_path, YAML.dump(schema_four_manifest(candidate:)))
+        manifest = KbRelease::Manifest.new(manifest_path)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'sha256' => manifest.digest,
+          'slug' => 'session-one'
+        )
+        missing = KbPage::RpcError.new(221, 'page does not exist')
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+        staging.expect('core.getPageInfo', { page: 'obsolete' }, result: missing)
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'page' }, result: { 'revision' => 999 })
+        production.expect('core.getPage', { page: 'page' }, result: candidate)
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: missing)
+        production.expect('core.whoAmI', nil, result: { 'login' => 'aither' })
+        production.expect('core.aclCheck', { page: 'page' }, result: 2)
+        production.expect('core.getPage', { page: 'page' }, result: candidate)
+        production.expect('core.getPageInfo', { page: 'obsolete' }, result: missing)
+        history = FakeRevisionHistory.new(
+          ['cz-staging', 'page'] => 'Aktualizace návodu',
+          ['cz-staging', 'obsolete'] => 'Odstranění starého návodu',
+          ['cz', 'page'] => 'Aktualizace návodu',
+          ['cz', 'obsolete'] => 'Odstranění starého návodu'
+        )
+        clients = { 'cz-staging' => staging, 'cz' => production }
+        runner = KbRelease::Runner.new(
+          manifest:,
+          client_factory: ->(name) { clients.fetch(name) },
+          revision_history: history,
+          out: StringIO.new
+        )
+
+        stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') do
+            runner.promote!(approved_production: true)
+          end
+        end
+
+        assert(staging.done?)
+        assert(production.done?)
+        refute_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
+  def test_schema_four_promotion_rejects_a_partial_write_with_another_summary
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        candidate = "new\n"
+        File.write(File.join(release_dir, 'page.txt'), candidate)
+        manifest_path = File.join(release_dir, 'release.yml')
+        File.write(manifest_path, YAML.dump(schema_four_manifest(candidate:)))
+        manifest = KbRelease::Manifest.new(manifest_path)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'sha256' => manifest.digest,
+          'slug' => 'session-one'
+        )
+        missing = KbPage::RpcError.new(221, 'page does not exist')
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'page' }, result: candidate)
+        staging.expect('core.getPageInfo', { page: 'obsolete' }, result: missing)
+        production = FakeClient.new
+        production.expect('core.getPageInfo', { page: 'page' }, result: { 'revision' => 999 })
+        production.expect('core.getPage', { page: 'page' }, result: candidate)
+        history = FakeRevisionHistory.new(
+          ['cz-staging', 'page'] => 'Aktualizace návodu',
+          ['cz-staging', 'obsolete'] => 'Odstranění starého návodu',
+          ['cz', 'page'] => 'Another summary'
+        )
+        clients = { 'cz-staging' => staging, 'cz' => production }
+        runner = KbRelease::Runner.new(
+          manifest:,
+          client_factory: ->(name) { clients.fetch(name) },
+          revision_history: history,
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') do
+            assert_raises(KbRelease::Error) do
+              runner.promote!(approved_production: true)
+            end
+          end
+        end
+
+        assert_match(/revision summary differs/, error.message)
+        assert(staging.done?)
+        assert(production.done?)
+        assert_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
+  def test_schema_four_verify_prints_summaries_and_history_links
+    Dir.mktmpdir do |release_dir|
+      candidate = "new\n"
+      File.write(File.join(release_dir, 'page.txt'), candidate)
+      manifest_path = File.join(release_dir, 'release.yml')
+      File.write(manifest_path, YAML.dump(schema_four_manifest(candidate:)))
+      missing = KbPage::RpcError.new(221, 'page does not exist')
+      production = FakeClient.new
+      production.expect('core.getPage', { page: 'page' }, result: candidate)
+      production.expect('core.getPageInfo', { page: 'obsolete' }, result: missing)
+      history = FakeRevisionHistory.new(
+        ['cz', 'page'] => 'Aktualizace návodu',
+        ['cz', 'obsolete'] => 'Odstranění starého návodu'
+      )
+      out = StringIO.new
+      runner = KbRelease::Runner.new(
+        manifest: KbRelease::Manifest.new(manifest_path),
+        client_factory: ->(_name) { production },
+        revision_history: history,
+        out:
+      )
+
+      runner.verify!(:production)
+
+      assert_includes(out.string, 'write page: Aktualizace návodu')
+      assert_includes(out.string, 'delete obsolete: Odstranění starého návodu')
+      assert_includes(out.string, 'https://history.example.test/cz/page')
+      assert(production.done?)
     end
   end
 
@@ -1014,6 +1402,28 @@ class KbStageTest < Minitest::Test
   end
 
   private
+
+  def schema_four_manifest(candidate:, source: "old\n", obsolete: "obsolete\n")
+    {
+      'schema' => 4,
+      'wiki' => 'cz',
+      'pages' => [{
+        'id' => 'page',
+        'source_revision' => 123,
+        'source_sha256' => Digest::SHA256.hexdigest(source),
+        'file' => 'page.txt',
+        'sha256' => Digest::SHA256.hexdigest(candidate),
+        'summary' => 'Aktualizace návodu'
+      }],
+      'deletions' => [{
+        'id' => 'obsolete',
+        'source_revision' => 456,
+        'source_sha256' => Digest::SHA256.hexdigest(obsolete),
+        'summary' => 'Odstranění starého návodu'
+      }],
+      'media' => []
+    }
+  end
 
   def stub_kb_stage(name, value)
     original = KbStage.method(name)

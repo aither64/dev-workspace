@@ -1,9 +1,12 @@
 # frozen_string_literal: true
 
 require 'base64'
+require 'cgi'
 require 'digest'
 require 'json'
+require 'net/http'
 require 'time'
+require 'uri'
 require 'yaml'
 
 require_relative 'kb_stage'
@@ -46,11 +49,31 @@ module KbRelease
       data.fetch('media')
     end
 
+    def deletions
+      data.fetch('deletions', [])
+    end
+
+    def per_page_summaries?
+      data.fetch('schema') == 4
+    end
+
     def production_summary
       return data.fetch('production_summary') if data.key?('production_summary')
       return 'Publish reviewed KB release' if data.fetch('schema') == 1
 
       data.fetch('production_summary')
+    end
+
+    def page_summary(entry)
+      return entry.fetch('summary') if per_page_summaries?
+
+      production_summary
+    end
+
+    def staging_summary(entry)
+      return entry.fetch('summary') if per_page_summaries?
+
+      'Stage reviewed KB release'
     end
 
     def page_policy(entry)
@@ -76,16 +99,16 @@ module KbRelease
     private
 
     def validate!
-      unless [1, 2, 3].include?(data['schema'])
-        raise Error, 'release manifest schema must be 1, 2 or 3'
+      unless [1, 2, 3, 4].include?(data['schema'])
+        raise Error, 'release manifest schema must be 1, 2, 3 or 4'
       end
       raise Error, 'release wiki must be cz or org' unless %w[cz org].include?(data['wiki'])
 
-      if data['schema'] >= 2 || data.key?('production_summary')
+      if data['schema'] == 4
+        raise Error, 'schema 4 uses per-page summaries' if data.key?('production_summary')
+      elsif data['schema'] >= 2 || data.key?('production_summary')
         summary = data.fetch('production_summary')
-        unless summary.is_a?(String) && !summary.strip.empty? && !summary.match?(/[\r\n]/)
-          raise Error, 'production summary must be a non-empty single line'
-        end
+        validate_summary!(summary, 'production summary')
       end
 
       %w[pages media].each do |kind|
@@ -96,6 +119,7 @@ module KbRelease
       end
       pages.each do |entry|
         %w[id file sha256 source_sha256].each { |key| entry.fetch(key) }
+        validate_summary!(entry.fetch('summary'), "page summary for #{entry.fetch('id')}") if per_page_summaries?
         policy = page_policy(entry)
         raise Error, "invalid page policy #{policy}" unless %w[create update].include?(policy)
         entry.fetch('source_revision') if policy == 'update'
@@ -103,6 +127,20 @@ module KbRelease
           raise Error, "create page source must be empty: #{entry.fetch('id')}"
         end
         entry.fetch('language_counterpart') if wiki == 'org'
+      end
+      if per_page_summaries?
+        entries = data.fetch('deletions')
+        raise Error, 'deletions must be a list' unless entries.is_a?(Array)
+        ids = entries.map { |entry| entry.fetch('id') }
+        raise Error, 'duplicate deletion IDs' unless ids.uniq.length == ids.length
+        raise Error, 'page and deletion IDs overlap' unless (pages.map { |entry| entry.fetch('id') } & ids).empty?
+        entries.each do |entry|
+          %w[id source_revision source_sha256 summary].each { |key| entry.fetch(key) }
+          validate_digest!(entry.fetch('source_sha256'), "deletion #{entry.fetch('id')}")
+          validate_summary!(entry.fetch('summary'), "deletion summary for #{entry.fetch('id')}")
+        end
+      elsif data.key?('deletions') && !data.fetch('deletions').empty?
+        raise Error, 'page deletions require release manifest schema 4'
       end
       validate_contract! if data.key?('contract')
       media.each do |entry|
@@ -113,6 +151,18 @@ module KbRelease
       end
     rescue KeyError => e
       raise Error, "incomplete release manifest: #{e.message}"
+    end
+
+    def validate_summary!(value, description)
+      return if value.is_a?(String) && !value.strip.empty? && !value.match?(/[\r\n]/)
+
+      raise Error, "#{description} must be a non-empty single line"
+    end
+
+    def validate_digest!(value, description)
+      return if value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/)
+
+      raise Error, "invalid SHA-256 for #{description}"
     end
 
     def validate_contract!
@@ -162,6 +212,62 @@ module KbRelease
     end
   end
 
+  class RevisionHistory
+    SUMMARY_PATTERN = %r{<span\s+class=["']sum["']>(.*?)</span>}m
+
+    def initialize(site_url:, fetcher: nil, headers: nil)
+      @site_url = site_url
+      @fetcher = fetcher || method(:fetch)
+      @headers = headers || ->(_wiki) { {} }
+    end
+
+    def verify!(wiki, id, expected)
+      actual = latest_summary(wiki, id)
+      return history_url(wiki, id) if actual == expected
+
+      raise Error,
+            "revision summary differs for #{id}: expected #{expected.inspect}, got #{actual.inspect}"
+    end
+
+    def latest_summary(wiki, id)
+      html = @fetcher.call(history_url(wiki, id), @headers.call(wiki))
+      match = html.match(SUMMARY_PATTERN)
+      raise Error, "revision history has no entry for #{id}" unless match
+
+      summary_html = match[1].dup.force_encoding(Encoding::UTF_8)
+      raise Error, "revision history summary is not valid UTF-8 for #{id}" unless summary_html.valid_encoding?
+
+      CGI.unescapeHTML(summary_html.gsub(%r{<[^>]*>}, ''))
+         .sub(/\A\s*[–-]\s*/, '')
+         .strip
+    end
+
+    def history_url(wiki, id)
+      query = URI.encode_www_form('id' => id, 'do' => 'revisions')
+      "#{@site_url.call(wiki)}/doku.php?#{query}"
+    end
+
+    private
+
+    def fetch(url, headers)
+      uri = URI(url)
+      request = Net::HTTP::Get.new(uri)
+      headers.each { |name, value| request[name] = value }
+      response = Net::HTTP.start(
+        uri.hostname,
+        uri.port,
+        use_ssl: uri.scheme == 'https'
+      ) do |http|
+        http.request(request)
+      end
+      return response.body if response.is_a?(Net::HTTPSuccess)
+
+      raise Error, "unable to read revision history #{url}: HTTP #{response.code}"
+    rescue SystemCallError, Timeout::Error => e
+      raise Error, "unable to read revision history #{url}: #{e.message}"
+    end
+  end
+
   class Runner
     ACL_EDIT = 2
     ACL_CREATE = 4
@@ -172,23 +278,27 @@ module KbRelease
       manifest:,
       client_factory:,
       out: $stdout,
-      language_links: KbStage::LanguageLinks.new(out: out)
+      language_links: KbStage::LanguageLinks.new(out: out),
+      revision_history: nil
     )
       @manifest = manifest
       @client_factory = client_factory
       @out = out
       @language_links = language_links
+      @revision_history = revision_history
     end
 
     def stage!
       KbStage.with_staging_mutation do
         check_production_baseline!
         staging = @client_factory.call(@manifest.staging_wiki)
-        verify_staging_baseline!(staging)
-        verify_write_access!(staging)
+        states = verify_staging_baseline!(staging)
+        verify_write_access!(staging, states:)
         save_media!(staging)
-        save_pages!(staging, summary: 'Stage reviewed KB release')
+        save_pages!(staging, states: page_states_for_stage(states), staging: true)
+        delete_pages!(staging, states: states.fetch(:deletions), production: false)
         verify_client!(staging)
+        verify_revision_summaries!(@manifest.staging_wiki)
         verify_language_links! unless @manifest.pages.any? { |entry| page_create?(entry) }
         KbStage.write_json(
           KbStage.pending_release_path,
@@ -198,13 +308,17 @@ module KbRelease
           'slug' => KbStage.current_slug
         )
       end
-      @out.puts("staged #{@manifest.pages.length} pages and #{@manifest.media.length} media objects")
+      @out.puts(
+        "staged #{@manifest.pages.length} pages, #{@manifest.deletions.length} deletions " \
+        "and #{@manifest.media.length} media objects"
+      )
     end
 
     def verify!(environment)
       KbStage.verify_current_owner! if environment == :staging
       name = environment == :staging ? @manifest.staging_wiki : @manifest.wiki
       verify_client!(@client_factory.call(name))
+      verify_revision_summaries!(name, report: true)
       verify_language_links! if environment == :staging
       @out.puts("verified #{name}")
     end
@@ -215,15 +329,21 @@ module KbRelease
       KbStage.with_owned_lock do
         verify_pending!
         verify_client!(@client_factory.call(@manifest.staging_wiki))
+        verify_revision_summaries!(@manifest.staging_wiki)
         states = check_production_baseline!(allow_candidate: true)
         production = @client_factory.call(@manifest.wiki)
-        verify_write_access!(production)
+        verify_write_access!(production, states:)
         save_media!(production)
-        save_pages!(production, summary: @manifest.production_summary, states:)
+        save_pages!(production, states: states.fetch(:pages), staging: false)
+        delete_pages!(production, states: states.fetch(:deletions), production: true)
         verify_client!(production)
+        verify_revision_summaries!(@manifest.wiki)
         File.delete(KbStage.pending_release_path)
       end
-      @out.puts("promoted #{@manifest.pages.length} pages and #{@manifest.media.length} media objects")
+      @out.puts(
+        "promoted #{@manifest.pages.length} pages, #{@manifest.deletions.length} deletions " \
+        "and #{@manifest.media.length} media objects"
+      )
     end
 
     private
@@ -240,6 +360,7 @@ module KbRelease
 
           content = production.call('core.getPage', page: id)
           if allow_candidate && Digest::SHA256.hexdigest(content) == entry.fetch('sha256')
+            verify_entry_summary!(@manifest.wiki, entry) if @manifest.per_page_summaries?
             next [id, :candidate]
           end
 
@@ -257,14 +378,39 @@ module KbRelease
           end
           [id, :source]
         elsif allow_candidate && hash == entry.fetch('sha256')
+          verify_entry_summary!(@manifest.wiki, entry) if @manifest.per_page_summaries?
           [id, :candidate]
         else
           raise Error, "production content drift for #{id}"
         end
       end
 
+      deletion_states = @manifest.deletions.to_h do |entry|
+        id = entry.fetch('id')
+        info = page_info(production, id)
+        unless info
+          if allow_candidate
+            verify_entry_summary!(@manifest.wiki, entry)
+            next [id, :candidate]
+          end
+
+          raise Error, "production page selected for deletion does not exist: #{id}"
+        end
+
+        revision = page_revision(info)
+        content = production.call('core.getPage', page: id)
+        unless Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+          raise Error, "production deletion source drift for #{id}"
+        end
+        unless revision.to_s == entry.fetch('source_revision').to_s
+          raise Error, "production deletion revision drift for #{id}: #{revision.inspect}"
+        end
+
+        [id, :source]
+      end
+
       check_production_media_baseline!(production, allow_candidate:)
-      page_states
+      { pages: page_states, deletions: deletion_states }
     end
 
     def check_production_media_baseline!(production, allow_candidate:)
@@ -293,38 +439,87 @@ module KbRelease
     end
 
     def verify_staging_baseline!(client)
-      @manifest.pages.each do |entry|
+      page_states = @manifest.pages.to_h do |entry|
+        id = entry.fetch('id')
         if page_create?(entry)
-          info = page_info(client, entry.fetch('id'))
-          next if info.nil?
+          info = page_info(client, id)
+          next [id, :source] if info.nil?
 
-          content = client.call('core.getPage', page: entry.fetch('id'))
-          next if Digest::SHA256.hexdigest(content) == entry.fetch('sha256')
+          content = client.call('core.getPage', page: id)
+          if Digest::SHA256.hexdigest(content) == entry.fetch('sha256')
+            verify_entry_summary!(@manifest.staging_wiki, entry) if @manifest.per_page_summaries?
+            next [id, :candidate]
+          end
 
-          raise Error, "staging create-only page has unexpected content at #{entry.fetch('id')}"
+          raise Error, "staging create-only page has unexpected content at #{id}"
         end
 
-        content = client.call('core.getPage', page: entry.fetch('id'))
+        content = client.call('core.getPage', page: id)
         hash = Digest::SHA256.hexdigest(content)
-        unless [entry.fetch('source_sha256'), entry.fetch('sha256')].include?(hash)
-          raise Error, "staging is not a clean production mirror at #{entry.fetch('id')}"
+        if hash == entry.fetch('source_sha256')
+          [id, :source]
+        elsif hash == entry.fetch('sha256')
+          verify_entry_summary!(@manifest.staging_wiki, entry) if @manifest.per_page_summaries?
+          [id, :candidate]
+        else
+          raise Error, "staging is not a clean production mirror at #{id}"
         end
       end
+
+      deletion_states = @manifest.deletions.to_h do |entry|
+        id = entry.fetch('id')
+        info = page_info(client, id)
+        unless info
+          verify_entry_summary!(@manifest.staging_wiki, entry)
+          next [id, :candidate]
+        end
+
+        content = client.call('core.getPage', page: id)
+        unless Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+          raise Error, "staging deletion source drift for #{id}"
+        end
+
+        [id, :source]
+      end
+
+      { pages: page_states, deletions: deletion_states }
     end
 
-    def save_pages!(client, summary:, states: nil)
+    def page_states_for_stage(states)
+      return nil unless @manifest.per_page_summaries?
+
+      states.fetch(:pages)
+    end
+
+    def save_pages!(client, states:, staging:)
       @manifest.pages.each do |entry|
         next if states && states.fetch(entry.fetch('id')) == :candidate
-        verify_source_page!(client, entry) if states
+        verify_source_page!(client, entry) if states && !staging
 
         result = client.call(
           'core.savePage',
           page: entry.fetch('id'),
           text: @manifest.read(entry).force_encoding(Encoding::UTF_8),
-          summary:,
+          summary: staging ? @manifest.staging_summary(entry) : @manifest.page_summary(entry),
           isminor: false
         )
         raise Error, "failed to save page #{entry.fetch('id')}" unless result == true
+      end
+    end
+
+    def delete_pages!(client, states:, production:)
+      @manifest.deletions.each do |entry|
+        next if states.fetch(entry.fetch('id')) == :candidate
+        verify_source_deletion!(client, entry) if production
+
+        result = client.call(
+          'core.savePage',
+          page: entry.fetch('id'),
+          text: '',
+          summary: @manifest.page_summary(entry),
+          isminor: false
+        )
+        raise Error, "failed to delete page #{entry.fetch('id')}" unless result == true
       end
     end
 
@@ -337,7 +532,7 @@ module KbRelease
       end
 
       info = client.call('core.getPageInfo', page: id)
-      revision = info['rev'] || info['lastModified'] || info['revision']
+      revision = page_revision(info)
       unless revision.to_s == entry.fetch('source_revision').to_s
         raise Error, "production revision drift before save for #{id}: #{revision.inspect}"
       end
@@ -348,7 +543,23 @@ module KbRelease
       raise Error, "production content drift before save for #{id}"
     end
 
-    def verify_write_access!(client)
+    def verify_source_deletion!(client, entry)
+      id = entry.fetch('id')
+      info = page_info(client, id)
+      raise Error, "page selected for deletion disappeared before save: #{id}" unless info
+
+      revision = page_revision(info)
+      unless revision.to_s == entry.fetch('source_revision').to_s
+        raise Error, "production deletion revision drift before save for #{id}: #{revision.inspect}"
+      end
+
+      content = client.call('core.getPage', page: id)
+      return if Digest::SHA256.hexdigest(content) == entry.fetch('source_sha256')
+
+      raise Error, "production deletion source drift before save for #{id}"
+    end
+
+    def verify_write_access!(client, states: nil)
       identity = client.call('core.whoAmI')
       login = identity.is_a?(Hash) ? identity['login'] : nil
       raise Error, 'DokuWiki API identity is anonymous' if login.nil? || login.empty?
@@ -361,6 +572,11 @@ module KbRelease
       @manifest.media.each do |entry|
         required = media_exists?(client, entry.fetch('id')) ? ACL_DELETE : ACL_UPLOAD
         verify_acl!(client, entry.fetch('id'), required, 'write media')
+      end
+      @manifest.deletions.each do |entry|
+        next if states && states.fetch(:deletions).fetch(entry.fetch('id')) == :candidate
+
+        verify_acl!(client, entry.fetch('id'), ACL_DELETE, 'delete page')
       end
     end
 
@@ -410,6 +626,42 @@ module KbRelease
         actual = Digest::SHA256.hexdigest(Base64.strict_decode64(encoded))
         raise Error, "media verification failed: #{entry.fetch('id')}" unless actual == entry.fetch('sha256')
       end
+      @manifest.deletions.each do |entry|
+        next unless page_info(client, entry.fetch('id'))
+
+        raise Error, "deleted page verification failed: #{entry.fetch('id')}"
+      end
+    end
+
+    def verify_revision_summaries!(wiki, report: false)
+      return unless @manifest.per_page_summaries?
+
+      rows = @manifest.pages.map { |entry| ['write', entry] } +
+             @manifest.deletions.map { |entry| ['delete', entry] }
+      verified = rows.map do |action, entry|
+        url = verify_entry_summary!(wiki, entry)
+        [action, entry.fetch('id'), entry.fetch('summary'), url]
+      end
+      if report
+        @out.puts('verified revision summaries:')
+        verified.each do |action, id, summary, url|
+          @out.puts("  #{action} #{id}: #{summary}")
+          @out.puts("    history: #{url}")
+        end
+      end
+      verified
+    end
+
+    def verify_entry_summary!(wiki, entry)
+      raise Error, 'revision history reader is required for schema 4' unless @revision_history
+
+      @revision_history.verify!(wiki, entry.fetch('id'), entry.fetch('summary'))
+    rescue Error => e
+      if wiki.end_with?('-staging')
+        raise Error, "#{e.message}; reset staging and stage this manifest again"
+      end
+
+      raise
     end
 
     def media_exists?(client, id)
@@ -431,6 +683,10 @@ module KbRelease
       raise unless e.rpc_message =~ /(does not exist|not exist|not found|doesn't exist)/i
 
       nil
+    end
+
+    def page_revision(info)
+      info['rev'] || info['lastModified'] || info['revision']
     end
 
     def verify_language_links!
