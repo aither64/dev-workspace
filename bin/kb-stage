@@ -58,6 +58,7 @@ module KbStageCli
       KbStage.claim!
       KbStage.with_owned_lock do
         KbStage.ensure_credentials!
+        KbStage.prepare_managed_ref!
         system!('sudo', CONTAINERCTL, 'start')
         wait_for_sites
         verify_api_identities
@@ -80,6 +81,7 @@ module KbStageCli
       value = {
         'owner' => owner,
         'container' => status.success? ? runtime.strip : 'unavailable',
+        'managed_repository_ref' => KbStage.read_managed_ref,
         'mirror' => read_json(KbStage.mirror_path),
         'pending_release' => read_json(KbStage.pending_release_path)
       }

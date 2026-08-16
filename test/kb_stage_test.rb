@@ -114,6 +114,28 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_managed_repository_ref_is_public_validated_and_preserves_pending_release
+    with_state do |state, _codex|
+      KbStage.ensure_credentials!
+      assert_equal('master', KbStage.write_managed_ref!('master'))
+      assert_equal('master', KbStage.read_managed_ref)
+      assert_equal(0o644, File.stat(KbStage.managed_ref_path).mode & 0o777)
+
+      commit = 'a' * 40
+      KbStage.write_json(KbStage.pending_release_path, 'managed_ref' => commit)
+      assert_equal(commit, KbStage.prepare_managed_ref!)
+      assert_equal(commit, File.read(KbStage.managed_ref_path).strip)
+
+      FileUtils.rm_f(KbStage.pending_release_path)
+      assert_equal('master', KbStage.prepare_managed_ref!)
+      assert_raises(KbStage::Error) { KbStage.write_managed_ref!('feature-branch') }
+      assert_raises(KbStage::Error) { KbStage.write_managed_ref!('../master') }
+      File.write(KbStage.managed_ref_path, " master\n")
+      assert_raises(KbStage::Error) { KbStage.read_managed_ref }
+      assert_path_exists(File.join(state, 'credentials', 'managed-repository.ref'))
+    end
+  end
+
   def test_container_status_uses_lowercase_nixos_container_output
     successful = Object.new
     successful.define_singleton_method(:success?) { true }
@@ -342,8 +364,116 @@ class KbStageTest < Minitest::Test
       assert_match(/contract checksum differs/, error.message)
 
       manifest.fetch('contract').fetch('pages').first['sha256'] = sha256
+      manifest.fetch('contract')['tests'] = [{
+        'article' => 'kvm',
+        'pattern' => 'kb/kvm#*',
+        'source' => 'tests/suite/kb/kvm.nix',
+        'sha256' => '5' * 64
+      }]
       File.write(manifest_path, YAML.dump(manifest))
-      assert_instance_of(KbRelease::Manifest, KbRelease::Manifest.new(manifest_path))
+      parsed = KbRelease::Manifest.new(manifest_path)
+      assert_instance_of(KbRelease::Manifest, parsed)
+      assert(parsed.managed_contract?)
+      assert_equal('2' * 40, parsed.managed_ref)
+      assert_equal(2, parsed.managed_sources.length)
+
+      manifest.fetch('contract').fetch('tests').first['pattern'] = 'kb/kvm'
+      File.write(manifest_path, YAML.dump(manifest))
+      assert_match(/test pattern/, assert_raises(KbRelease::Error) {
+        KbRelease::Manifest.new(manifest_path)
+      }.message)
+    end
+  end
+
+  def test_managed_repository_verifies_exact_ref_content_and_reports_links
+    Dir.mktmpdir do |release_dir|
+      content = "candidate\n"
+      test_source = "{ ... }: { }\n"
+      File.write(File.join(release_dir, 'page.txt'), content)
+      manifest_path = File.join(release_dir, 'release.yml')
+      ref = '2' * 40
+      File.write(
+        manifest_path,
+        YAML.dump(
+          'schema' => 3,
+          'wiki' => 'cz',
+          'production_summary' => 'Publish managed guide',
+          'pages' => [{
+            'id' => 'navody:vps:kvm',
+            'source_revision' => 123,
+            'source_sha256' => Digest::SHA256.hexdigest("source\n"),
+            'file' => 'page.txt',
+            'sha256' => Digest::SHA256.hexdigest(content)
+          }],
+          'media' => [],
+          'contract' => {
+            'repository' => 'vpsfreecz/vpsfree-kb-contracts',
+            'base_commit' => '1' * 40,
+            'head_commit' => ref,
+            'registry_sha256' => '3' * 64,
+            'pages' => [{
+              'id' => 'navody:vps:kvm',
+              'article' => 'kvm',
+              'source' => 'contract/pages/navody-vps-kvm.txt',
+              'sha256' => Digest::SHA256.hexdigest(content)
+            }],
+            'tests' => [{
+              'article' => 'kvm',
+              'pattern' => 'kb/kvm#*',
+              'source' => 'tests/suite/kb/kvm.nix',
+              'sha256' => Digest::SHA256.hexdigest(test_source)
+            }]
+          }
+        )
+      )
+      requested = []
+      output = StringIO.new
+      repository = KbRelease::ManagedRepository.new(
+        fetcher: lambda do |url|
+          requested << url
+          url.end_with?('/tests/suite/kb/kvm.nix') ? test_source : content
+        end,
+        out: output
+      )
+
+      rows = repository.verify!(KbRelease::Manifest.new(manifest_path), ref:)
+
+      assert_equal(2, rows.length)
+      assert_equal(2, requested.length)
+      assert(requested.all? { |url| url.include?("/#{ref}/") })
+      assert_includes(output.string, "test kb/kvm#*")
+      assert_includes(output.string, "github.com/vpsfreecz/vpsfree-kb-contracts/blob/#{ref}")
+    end
+  end
+
+  def test_managed_release_checks_remote_commit_before_any_staging_access
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        manifest_path = write_managed_release_manifest(release_dir)
+        client_requested = false
+        repository = Object.new
+        repository.define_singleton_method(:verify!) do |_manifest, ref:|
+          raise KbRelease::Error, "managed commit is unpublished: #{ref}"
+        end
+        runner = KbRelease::Runner.new(
+          manifest: KbRelease::Manifest.new(manifest_path),
+          client_factory: lambda do |_name|
+            client_requested = true
+            raise 'must not connect'
+          end,
+          managed_repository: repository,
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_staging_mutation, ->(&block) { block.call }) do
+          assert_raises(KbRelease::Error) { runner.stage! }
+        end
+
+        assert_match(/unpublished/, error.message)
+        refute(client_requested)
+        assert_nil(KbStage.read_managed_ref)
+        refute_path_exists(KbStage.pending_release_path)
+      end
     end
   end
 
@@ -1402,6 +1532,47 @@ class KbStageTest < Minitest::Test
   end
 
   private
+
+  def write_managed_release_manifest(release_dir)
+    candidate = "candidate\n"
+    File.write(File.join(release_dir, 'page.txt'), candidate)
+    manifest_path = File.join(release_dir, 'release.yml')
+    File.write(
+      manifest_path,
+      YAML.dump(
+        'schema' => 3,
+        'wiki' => 'cz',
+        'production_summary' => 'Publish managed guide',
+        'pages' => [{
+          'id' => 'navody:vps:kvm',
+          'source_revision' => 123,
+          'source_sha256' => Digest::SHA256.hexdigest("source\n"),
+          'file' => 'page.txt',
+          'sha256' => Digest::SHA256.hexdigest(candidate)
+        }],
+        'media' => [],
+        'contract' => {
+          'repository' => 'vpsfreecz/vpsfree-kb-contracts',
+          'base_commit' => '1' * 40,
+          'head_commit' => '2' * 40,
+          'registry_sha256' => '3' * 64,
+          'pages' => [{
+            'id' => 'navody:vps:kvm',
+            'article' => 'kvm',
+            'source' => 'contract/pages/navody-vps-kvm.txt',
+            'sha256' => Digest::SHA256.hexdigest(candidate)
+          }],
+          'tests' => [{
+            'article' => 'kvm',
+            'pattern' => 'kb/kvm#*',
+            'source' => 'tests/suite/kb/kvm.nix',
+            'sha256' => '4' * 64
+          }]
+        }
+      )
+    )
+    manifest_path
+  end
 
   def schema_four_manifest(candidate:, source: "old\n", obsolete: "obsolete\n")
     {

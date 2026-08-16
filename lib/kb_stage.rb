@@ -18,6 +18,7 @@ module KbStage
   SITES = %w[cz org].freeze
   DEFAULT_STATE_DIR = File.expand_path('~/.local/state/kb-stage')
   DEFAULT_CODEX_DIR = File.expand_path('~/.codex')
+  MANAGED_REF_PATTERN = /\A(?:master|[0-9a-f]{40})\z/
 
   module_function
 
@@ -43,6 +44,10 @@ module KbStage
 
   def pending_release_path
     File.join(state_dir, 'pending-release.json')
+  end
+
+  def managed_ref_path
+    File.join(state_dir, 'credentials', 'managed-repository.ref')
   end
 
   def current_slug
@@ -141,6 +146,33 @@ module KbStage
     end
   end
 
+  def validate_managed_ref!(ref)
+    return ref if ref.is_a?(String) && ref.match?(MANAGED_REF_PATTERN)
+
+    raise Error, 'managed repository ref must be master or a full lowercase commit OID'
+  end
+
+  def write_managed_ref!(ref)
+    atomic_write(managed_ref_path, "#{validate_managed_ref!(ref)}\n", 0o644)
+    ref
+  end
+
+  def read_managed_ref
+    content = File.read(managed_ref_path, encoding: Encoding::UTF_8)
+    validate_managed_ref!(content.sub(/[\r\n]+\z/, ''))
+  rescue Errno::ENOENT
+    nil
+  end
+
+  def prepare_managed_ref!
+    pending = JSON.parse(File.read(pending_release_path))
+    write_managed_ref!(pending.fetch('managed_ref', 'master'))
+  rescue Errno::ENOENT
+    write_managed_ref!('master')
+  rescue JSON::ParserError => e
+    raise Error, "invalid pending release state: #{e.message}"
+  end
+
   def container_running?(runner: Open3.method(:capture2))
     output, status = runner.call('nixos-container', 'status', CONTAINER)
     status.success? && output.strip == 'up'
@@ -228,6 +260,7 @@ module KbStage
     def reset!
       KbStage.with_staging_mutation do
         raise Error, 'start the staging container before resetting it' unless KbStage.container_running?
+        KbStage.write_managed_ref!('master')
         clear_state!
         mirror_all
       end

@@ -13,6 +13,7 @@ require_relative 'kb_stage'
 
 module KbRelease
   class Error < StandardError; end
+  MANAGED_REPOSITORY = 'vpsfreecz/vpsfree-kb-contracts'
 
   class Manifest
     attr_reader :path, :data
@@ -51,6 +52,24 @@ module KbRelease
 
     def deletions
       data.fetch('deletions', [])
+    end
+
+    def contract
+      data['contract']
+    end
+
+    def managed_contract?
+      contract.is_a?(Hash) && !contract.fetch('pages').empty?
+    end
+
+    def managed_ref
+      contract&.fetch('head_commit')
+    end
+
+    def managed_sources
+      return [] unless managed_contract?
+
+      contract.fetch('pages') + contract.fetch('tests', [])
     end
 
     def per_page_summaries?
@@ -170,8 +189,9 @@ module KbRelease
       raise Error, 'release contract must be a mapping' unless contract.is_a?(Hash)
 
       repository = contract.fetch('repository')
-      unless repository.is_a?(String) && repository.match?(%r{\A[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\z})
-        raise Error, 'invalid release contract repository'
+      unless repository == MANAGED_REPOSITORY
+        raise Error,
+              "release contract repository must be #{MANAGED_REPOSITORY}, got #{repository.inspect}"
       end
       %w[base_commit head_commit].each do |key|
         value = contract.fetch(key)
@@ -194,10 +214,7 @@ module KbRelease
         unless article.is_a?(String) && article.match?(/\A[a-z0-9][a-z0-9-]*\z/)
           raise Error, "invalid release contract article #{article.inspect}"
         end
-        source = page.fetch('source')
-        if !source.is_a?(String) || source.empty? || source.start_with?('/') || source.split('/').include?('..')
-          raise Error, "invalid release contract source #{source.inspect}"
-        end
+        validate_relative_path!(page.fetch('source'), 'release contract source')
         sha256 = page.fetch('sha256')
         unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
           raise Error, "invalid release contract page SHA-256 for #{page.fetch('id')}"
@@ -209,6 +226,114 @@ module KbRelease
           raise Error, "release contract checksum differs for #{page.fetch('id')}"
         end
       end
+
+      return unless contract.key?('tests')
+
+      contract_tests = contract.fetch('tests')
+      raise Error, 'release contract tests must be a list' unless contract_tests.is_a?(Array)
+      articles = contract_tests.map do |test|
+        article = test.fetch('article')
+        unless article.is_a?(String) && article.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+          raise Error, "invalid release contract test article #{article.inspect}"
+        end
+        pattern = test.fetch('pattern')
+        suite = pattern.delete_suffix('#*') if pattern.is_a?(String) && pattern.end_with?('#*')
+        unless suite&.split('/', -1)&.all? do |component|
+                 component.match?(/\A[a-z0-9][a-z0-9_.-]*\z/) && !%w[. ..].include?(component)
+               end
+          raise Error, "invalid release contract test pattern #{pattern.inspect}"
+        end
+        validate_relative_path!(test.fetch('source'), 'release contract test source')
+        validate_digest!(test.fetch('sha256'), "release contract test #{article}")
+        article
+      end
+      raise Error, 'duplicate release contract test articles' unless articles.uniq.length == articles.length
+      patterns = contract_tests.map { |test| test.fetch('pattern') }
+      raise Error, 'duplicate release contract test patterns' unless patterns.uniq.length == patterns.length
+      sources = contract_tests.map { |test| test.fetch('source') }
+      raise Error, 'duplicate release contract test sources' unless sources.uniq.length == sources.length
+      page_articles = contract_pages.map { |page| page.fetch('article') }.uniq
+      unless page_articles.sort == articles.sort
+        raise Error, 'release contract tests must cover every managed article exactly once'
+      end
+    end
+
+    def validate_relative_path!(value, description)
+      components = value.split('/', -1) if value.is_a?(String) && !value.start_with?('/')
+      unless components&.all? do |component|
+               component.match?(/\A[a-zA-Z0-9_.-]+\z/) && !%w[. ..].include?(component)
+             end
+        raise Error, "invalid #{description} #{value.inspect}"
+      end
+
+      value
+    end
+  end
+
+  class ManagedRepository
+    def initialize(fetcher: nil, out: $stdout)
+      @fetcher = fetcher || method(:fetch)
+      @out = out
+    end
+
+    def verify!(manifest, ref:)
+      return [] unless manifest.managed_contract?
+
+      KbStage.validate_managed_ref!(ref)
+      repository = manifest.contract.fetch('repository')
+      rows = manifest.managed_sources.map do |entry|
+        source = entry.fetch('source')
+        content = @fetcher.call(raw_url(repository, ref, source))
+        actual = Digest::SHA256.hexdigest(content)
+        expected = entry.fetch('sha256')
+        unless actual == expected
+          raise Error,
+                "managed repository content differs at #{repository}@#{ref}:#{source}: " \
+                "expected #{expected}, got #{actual}"
+        end
+
+        [entry.fetch('article'), entry['pattern'], source_url(repository, ref, source)]
+      end
+      @out.puts("verified managed repository #{repository}@#{ref}")
+      rows.each do |article, pattern, url|
+        label = pattern ? "test #{pattern}" : "article #{article}"
+        @out.puts("  #{label}: #{url}")
+      end
+      rows
+    rescue KbStage::Error => e
+      raise Error, e.message
+    end
+
+    private
+
+    def escaped_path(path)
+      path.split('/').map { |part| URI.encode_uri_component(part) }.join('/')
+    end
+
+    def raw_url(repository, ref, source)
+      "https://raw.githubusercontent.com/#{repository}/#{ref}/#{escaped_path(source)}"
+    end
+
+    def source_url(repository, ref, source)
+      "https://github.com/#{repository}/blob/#{ref}/#{escaped_path(source)}"
+    end
+
+    def fetch(url)
+      uri = URI(url)
+      response = Net::HTTP.start(
+        uri.hostname,
+        uri.port,
+        use_ssl: true,
+        open_timeout: 10,
+        read_timeout: 30
+      ) do |http|
+        http.get(uri.request_uri)
+      end
+      return response.body if response.is_a?(Net::HTTPSuccess)
+
+      raise Error, "unable to read managed repository source #{url}: HTTP #{response.code}"
+    rescue SystemCallError, Timeout::Error => e
+      raise Error, "unable to read managed repository source #{url}: #{e.message}"
     end
   end
 
@@ -279,17 +404,21 @@ module KbRelease
       client_factory:,
       out: $stdout,
       language_links: KbStage::LanguageLinks.new(out: out),
-      revision_history: nil
+      revision_history: nil,
+      managed_repository: ManagedRepository.new(out: out)
     )
       @manifest = manifest
       @client_factory = client_factory
       @out = out
       @language_links = language_links
       @revision_history = revision_history
+      @managed_repository = managed_repository
     end
 
     def stage!
       KbStage.with_staging_mutation do
+        verify_managed_repository!(@manifest.managed_ref)
+        KbStage.write_managed_ref!(@manifest.managed_ref || 'master')
         check_production_baseline!
         staging = @client_factory.call(@manifest.staging_wiki)
         states = verify_staging_baseline!(staging)
@@ -305,7 +434,8 @@ module KbRelease
           'manifest' => @manifest.path,
           'sha256' => @manifest.digest,
           'staged_at' => Time.now.utc.iso8601,
-          'slug' => KbStage.current_slug
+          'slug' => KbStage.current_slug,
+          'managed_ref' => @manifest.managed_ref || 'master'
         )
       end
       @out.puts(
@@ -316,6 +446,10 @@ module KbRelease
 
     def verify!(environment)
       KbStage.verify_current_owner! if environment == :staging
+      if environment == :staging
+        verify_active_managed_ref!
+        verify_managed_repository!(@manifest.managed_ref)
+      end
       name = environment == :staging ? @manifest.staging_wiki : @manifest.wiki
       verify_client!(@client_factory.call(name))
       verify_revision_summaries!(name, report: true)
@@ -328,6 +462,7 @@ module KbRelease
 
       KbStage.with_owned_lock do
         verify_pending!
+        verify_active_managed_ref!
         verify_client!(@client_factory.call(@manifest.staging_wiki))
         verify_revision_summaries!(@manifest.staging_wiki)
         states = check_production_baseline!(allow_candidate: true)
@@ -347,6 +482,23 @@ module KbRelease
     end
 
     private
+
+    def verify_managed_repository!(ref)
+      return unless @manifest.managed_contract?
+
+      @managed_repository.verify!(@manifest, ref:)
+    end
+
+    def verify_active_managed_ref!
+      return unless @manifest.managed_contract?
+
+      expected = @manifest.managed_ref || 'master'
+      actual = KbStage.read_managed_ref
+      return if actual == expected
+
+      raise Error,
+            "staging managed repository ref differs: expected #{expected}, got #{actual.inspect}"
+    end
 
     def check_production_baseline!(allow_candidate: false)
       production = @client_factory.call(@manifest.wiki)
@@ -707,6 +859,10 @@ module KbRelease
       pending = JSON.parse(File.read(KbStage.pending_release_path))
       unless pending.fetch('sha256') == @manifest.digest && pending.fetch('slug') == KbStage.current_slug
         raise Error, 'pending release does not match this manifest and session'
+      end
+      expected_ref = @manifest.managed_ref || 'master'
+      unless pending.fetch('managed_ref', 'master') == expected_ref
+        raise Error, 'pending release uses a different managed repository ref'
       end
     rescue Errno::ENOENT
       raise Error, 'this manifest has not been staged'
