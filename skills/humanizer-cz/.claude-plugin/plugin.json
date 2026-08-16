@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "humanizer-cz",
+  "description": "Odstraňuje z českých textů příznaky AI generovaného psaní. Striktní režim: jen stylistika, žádná změna významu, u sporných míst se ptá. Česká adaptace blader/humanizer dle IJP.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Kateřina Švidrnochová",
+    "url": "https://svidrnochova.cz"
+  },
+  "homepage": "https://github.com/katerina-svi/katerinas-humanizer-cz",
+  "repository": "https://github.com/katerina-svi/katerinas-humanizer-cz",
+  "license": "MIT",
+  "keywords": ["cestina", "czech", "writing", "editing", "humanize", "ai-detection", "pravopis", "stylistika"]
+}

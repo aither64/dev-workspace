@@ -1,0 +1,4 @@
+interface:
+  display_name: "vpsFree user-facing writing"
+  short_description: "Natural bilingual vpsFree technical writing"
+  default_prompt: "Use $vpsfree-user-facing-writing to edit this vpsFree user-facing text without changing its technical meaning."

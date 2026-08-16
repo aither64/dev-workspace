@@ -1,0 +1,31 @@
+name: "💬 Zpětná vazba / návrh"
+description: "Nápad na zlepšení, chybějící vzorec nebo obecná zpětná vazba ke skillu."
+title: "[Zpětná vazba]: "
+labels: ["zpětná vazba"]
+body:
+  - type: markdown
+    attributes:
+      value: "Díky, že pomáháš skill zlepšovat! Vyplň, co dává smysl — nic není povinné."
+  - type: textarea
+    id: co
+    attributes:
+      label: "O co jde?"
+      description: "Popiš svůj návrh, postřeh nebo chybějící vzorec."
+      placeholder: "Např. skill by měl hlídat i…"
+    validations:
+      required: true
+  - type: textarea
+    id: priklad
+    attributes:
+      label: "Příklad textu (nepovinné)"
+      description: "Vlož ukázku vstupu a jak by měl vypadat výstup."
+      render: markdown
+  - type: dropdown
+    id: prostredi
+    attributes:
+      label: "Kde skill používáš?"
+      options:
+        - "Claude.ai (web/aplikace)"
+        - "Claude Code (plugin)"
+        - "Skills CLI / jiný agent"
+        - "Jinde / nevím"
