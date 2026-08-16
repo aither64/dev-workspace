@@ -477,6 +477,54 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_managed_promotion_checks_remote_master_before_production_access
+    with_state do
+      Dir.mktmpdir do |release_dir|
+        manifest = KbRelease::Manifest.new(write_managed_release_manifest(release_dir))
+        KbStage.write_managed_ref!(manifest.managed_ref)
+        KbStage.write_json(
+          KbStage.pending_release_path,
+          'sha256' => manifest.digest,
+          'slug' => 'session-one',
+          'managed_ref' => manifest.managed_ref
+        )
+        staging = FakeClient.new
+        staging.expect('core.getPage', { page: 'navody:vps:kvm' }, result: "candidate\n")
+        production_requested = false
+        repository = Object.new
+        repository.define_singleton_method(:verify!) do |_manifest, ref:|
+          raise KbRelease::Error, 'managed master is not ready' if ref == 'master'
+        end
+        runner = KbRelease::Runner.new(
+          manifest:,
+          client_factory: lambda do |name|
+            if name == 'cz-staging'
+              staging
+            else
+              production_requested = true
+              raise 'must not connect to production'
+            end
+          end,
+          managed_repository: repository,
+          out: StringIO.new
+        )
+
+        error = stub_kb_stage(:with_owned_lock, ->(&block) { block.call }) do
+          stub_kb_stage(:current_slug, 'session-one') do
+            assert_raises(KbRelease::Error) do
+              runner.promote!(approved_production: true)
+            end
+          end
+        end
+
+        assert_match(/master is not ready/, error.message)
+        assert(staging.done?)
+        refute(production_requested)
+        assert_path_exists(KbStage.pending_release_path)
+      end
+    end
+  end
+
   def test_english_release_verifies_every_explicit_counterpart_pair
     Dir.mktmpdir do |release_dir|
       pages = {

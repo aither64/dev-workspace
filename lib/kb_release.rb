@@ -449,6 +449,8 @@ module KbRelease
       if environment == :staging
         verify_active_managed_ref!
         verify_managed_repository!(@manifest.managed_ref)
+      else
+        verify_managed_repository!('master')
       end
       name = environment == :staging ? @manifest.staging_wiki : @manifest.wiki
       verify_client!(@client_factory.call(name))
@@ -465,6 +467,7 @@ module KbRelease
         verify_active_managed_ref!
         verify_client!(@client_factory.call(@manifest.staging_wiki))
         verify_revision_summaries!(@manifest.staging_wiki)
+        verify_managed_repository!('master')
         states = check_production_baseline!(allow_candidate: true)
         production = @client_factory.call(@manifest.wiki)
         verify_write_access!(production, states:)
