@@ -1,0 +1,4 @@
+interface:
+  display_name: "Humanizer (English)"
+  short_description: "Make English prose sound natural"
+  default_prompt: "Use $humanizer-en to make this English text sound natural while preserving its meaning and facts."

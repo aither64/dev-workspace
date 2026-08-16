@@ -2,29 +2,43 @@
 
 ## English
 
+- Local skill: `skills/humanizer-en` (`$humanizer-en`)
 - Repository: `https://github.com/blader/humanizer`
 - Revision: `523374dee72d67c7b2b5f858ea0094ffda49c3ac` (`v2.9.1`)
-- `SKILL.md` SHA-256:
+- Upstream `SKILL.md` SHA-256:
   `70938f3cce25970e1ded5fdd194b755c03f1e4e4fa76820958ce78f86b677b1a`
-- `LICENSE` SHA-256:
+- Upstream and local `LICENSE` SHA-256:
   `4ac4810254ab36d45419141aeb8e69bf50652cfafe5b2dab947d06d44e5cbf96`
+- Local `SKILL.md` SHA-256:
+  `81ec80d551d2865e856204b8ce6beb43d3e6f71962328defbcc6fb30ea0a69a4`
 - License: MIT
+
+Local changes are limited to the `humanizer-en` name, an explicit English
+trigger, portable frontmatter, and OpenAI UI metadata. The editorial prompt
+otherwise matches upstream v2.9.1.
 
 ## Czech
 
+- Local skill: `skills/humanizer-cs` (`$humanizer-cs`)
 - Repository: `https://github.com/katerina-svi/katerinas-humanizer-cz`
 - Revision: `bda1f7ae7129142c476187966cfb59b2a32c0013`
-- `SKILL.md` SHA-256:
+- Upstream `SKILL.md` SHA-256:
   `656f0fb59124eb85f0ce620019a5852a46d3b1d44fd86682c478f3a868bb4ada`
-- `LICENSE` SHA-256:
+- Upstream and local `LICENSE` SHA-256:
   `8dbb39f6f49c81b63d96a091d3e1fdcc5f6bad6a18fd1b898849fa54c2d76cc7`
+- Local `SKILL.md` SHA-256:
+  `ed7a108f06aefcd6556cc99ff33403c30213ad14c0739214b1de8c2d3bac3d95`
 - License: MIT
 
-The canonical workspace copies are `skills/humanizer` and
-`skills/humanizer-cz`. Update them with the workspace's installed
-`skill-installer` helper, pinning a reviewed commit instead of a moving branch.
-After an update, record the new revision and checksums here and review the
-vpsFree overrides for conflicts.
+Local packaging changes use the ISO 639-1 `cs` language code, portable
+frontmatter, and OpenAI UI metadata.
+
+## Updating the pinned sources
+
+Fetch and review a proposed upstream revision before updating either local
+copy. Pin the reviewed commit, reapply the documented local changes, run the
+workspace security and behavior checks, and record the revision and hashes
+here. Never update from a moving branch without pinning the reviewed commit.
 
 ## vpsFree deviations
 

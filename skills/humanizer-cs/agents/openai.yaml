@@ -1,0 +1,4 @@
+interface:
+  display_name: "Humanizer (Czech)"
+  short_description: "Make Czech prose sound natural"
+  default_prompt: "Use $humanizer-cs to make this Czech text sound natural while preserving its meaning and facts."

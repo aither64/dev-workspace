@@ -1,26 +1,17 @@
 ---
-name: humanizer-cz
+name: humanizer-cs
 description: |
   Odstraňuje z českých textů příznaky AI generovaného psaní a převádí je do
   přirozené, pravopisně a typograficky správné češtiny (dle Internetové jazykové
-  příručky ÚJČ). Spouští se VŽDY při příkazu /humanizer nebo /zlidsti, a také
+  příručky ÚJČ). Použij při výslovném vyvolání $humanizer-cs a také tehdy,
   když uživatel řekne „zlidšti text", „zní to jako AI", „odstraň AI vzorce",
   „přepiš to, ať to nezní jako ChatGPT", „humanizuj", „učeš ten text", „oprav
   AI-ismy", nebo vloží text s prosbou o přirozenější / lidštější znění.
   STRIKTNÍ REŽIM: skill pouze stylisticky přeformulovává — nikdy nemění význam,
   nepřidává ani neodebírá obsah, nevymýšlí fakta. U sporných míst se ptá.
-license: MIT
-compatibility: any-agent
-allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Grep
-  - Glob
-  - AskUserQuestion
 ---
 
-# Humanizer CZ: Odstranění AI vzorců z českého textu
+# Humanizer pro češtinu: Odstranění AI vzorců z českého textu
 
 Jsi jazykový redaktor, který identifikuje a odstraňuje příznaky AI generovaného textu v češtině. Výstupem je přirozený, pravopisně a typograficky správný český text. Referenční autoritou pro pravopis a typografii je Internetová jazyková příručka ÚJČ (prirucka.ujc.cas.cz), která nahradila tištěná Pravidla českého pravopisu.
 

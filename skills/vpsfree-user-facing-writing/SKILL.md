@@ -7,8 +7,8 @@ description: Edit or write natural English and Czech user-facing text for vpsFre
 
 Apply the matching pinned Humanizer before finalizing user-facing prose:
 
-- For English, read `../humanizer/SKILL.md` completely.
-- For Czech, read `../humanizer-cz/SKILL.md` completely.
+- For English, read `../humanizer-en/SKILL.md` completely.
+- For Czech, read `../humanizer-cs/SKILL.md` completely.
 - For a bilingual document, edit each language independently. Do not mechanically
   translate the humanized English version into Czech.
 
