@@ -82,6 +82,7 @@ abort 'duplicate code sample IDs' unless code_samples_by_id.length == code_sampl
 
 managed_contract = nil
 registered_contract_pages = []
+registered_contract_tests = []
 if schema == 4
   begin
     managed_contract = KbManagedArticles.contract_provenance(
@@ -89,6 +90,11 @@ if schema == 4
       base: options.fetch(:code_base)
     )
     registered_contract_pages = KbManagedArticles.registered_pages(
+      code_root: options.fetch(:code_root),
+      contract: managed_contract,
+      require_committed: true
+    )
+    registered_contract_tests = KbManagedArticles.registered_tests(
       code_root: options.fetch(:code_root),
       contract: managed_contract,
       require_committed: true
@@ -395,6 +401,14 @@ managed_contract_index = if managed_contract
                                  'page' => page.fetch(:page),
                                  'source' => page.fetch(:source),
                                  'sha256' => page.fetch(:sha256)
+                               }
+                             end,
+                             'tests' => registered_contract_tests.map do |test|
+                               {
+                                 'article' => test.fetch(:article),
+                                 'pattern' => test.fetch(:pattern),
+                                 'source' => test.fetch(:source),
+                                 'sha256' => test.fetch(:sha256)
                                }
                              end
                            }

@@ -124,6 +124,57 @@ module KbManagedArticles
     raise Error, "incomplete article contract: #{e.message}"
   end
 
+  def registered_tests(code_root:, contract:, require_committed:)
+    tests = contract.fetch(:registry).fetch('articles').map do |article_id, article|
+      KbContractFiles.validate_semantic_id!(article_id)
+      test = article.fetch('test')
+      suite = test.fetch('suite')
+      components = suite.split('/', -1) if suite.is_a?(String)
+      unless components&.all? do |component|
+               component.match?(/\A[a-z0-9][a-z0-9_.-]*\z/) && !%w[. ..].include?(component)
+             end
+        raise Error, "#{article_id}: invalid managed test suite #{suite.inspect}"
+      end
+
+      relative = test.fetch('source')
+      expected_relative = "tests/suite/#{suite}.nix"
+      unless relative == expected_relative
+        raise Error,
+              "#{article_id}: managed test source must be #{expected_relative}, got #{relative.inspect}"
+      end
+      current_path = KbContractFiles.path_within(code_root, relative)
+      raise Error, "#{article_id}: managed test source is missing" unless File.file?(current_path)
+
+      current = File.binread(current_path)
+      if require_committed
+        committed = git_source(code_root, contract.fetch(:head_commit), relative)
+        raise Error, "#{article_id}: managed test source is absent from contract HEAD" unless committed
+        unless current == committed
+          raise Error, "#{article_id}: managed test source differs from contract HEAD; " \
+                       'commit it before building'
+        end
+      end
+
+      {
+        article: article_id,
+        pattern: "#{suite}#*",
+        source: relative,
+        path: current_path,
+        sha256: Digest::SHA256.hexdigest(current)
+      }
+    end
+
+    patterns = tests.map { |test| test.fetch(:pattern) }
+    raise Error, 'duplicate managed test patterns in article registry' unless patterns.uniq.length == patterns.length
+
+    sources = tests.map { |test| test.fetch(:source) }
+    raise Error, 'duplicate managed test sources in article registry' unless sources.uniq.length == sources.length
+
+    tests
+  rescue KeyError => e
+    raise Error, "incomplete article contract: #{e.message}"
+  end
+
   def reconcile(
     code_root:, base:, article_id:, wiki_pages:, bootstrap: {},
     contract: nil, require_committed: false
