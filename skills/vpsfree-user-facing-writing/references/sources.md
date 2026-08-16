@@ -33,13 +33,14 @@ otherwise matches upstream v2.9.1.
 - Local `LICENSE` SHA-256:
   `6baf827e0d512db5708ebf71b2cff2e71e24be1fbdd4361547feec5e6fa99c69`
 - Local `SKILL.md` SHA-256:
-  `d6a81649c5deb4b4685a8c5fb81169b73907199a0dd4c553976bd8060895a711`
+  `0cfcd9af7c374391f587476b395fa152e5be2bc90e01538136779635e37ca9c9`
 - License: MIT
 
 Local packaging changes use the ISO 639-1 `cs` language code, portable
 frontmatter, and OpenAI UI metadata. The local license retains Siqi Chen's MIT
 notice and identifies the Czech adaptation. The editorial prompt preserves
-attributed claims unless the user authorizes a content change.
+attributed claims unless the user authorizes a content change, and evaluates
+Czech dashes by function rather than imposing a fixed count.
 
 ## Updating the pinned sources
 
@@ -56,7 +57,8 @@ The wrapper deliberately overrides these generic behaviors:
 - Technical and reference material remains neutral; no personality is injected.
 - Czech documentation uses standard Czech and established informal singular
   address, not automatically added colloquial language.
-- Correct Czech en dashes remain in ranges and relations.
+- Correct Czech en dashes remain in ranges, relations, pauses, contrasts, and
+  parenthetical boundaries; no fixed count applies.
 - Paragraphs may be reorganized when clarity improves, provided facts and task
   order remain intact.
 - Known register and product decisions do not trigger interactive questions.

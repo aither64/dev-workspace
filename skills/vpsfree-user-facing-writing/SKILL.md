@@ -52,8 +52,9 @@ the finished result for naturalness and fidelity.
 - Prefer natural Czech word order, concise verbs, and `je` or `má` over formal
   nominal constructions.
 - Preserve correct Czech typography. Remove em dashes. Keep an en dash when it
-  correctly expresses a range or relation; do not replace it with a spaced
-  hyphen merely to follow the English Humanizer.
+  correctly expresses a range, relation, pause, contrast, or parenthetical
+  boundary. Do not impose a numeric limit or replace it with a spaced hyphen
+  merely to follow the English Humanizer.
 - Allow sentence and paragraph reordering when it improves the explanation.
   Preserve the facts and required task sequence, not the original paragraph
   boundaries.

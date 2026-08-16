@@ -234,10 +234,10 @@ Pokud uživatel dodá vzorek vlastního psaní, před přepisem ho analyzuj: dé
 
 **Pravidlo (liší se od anglického humanizeru!):** Pomlčka (–) je legitimní česká interpunkce, ale v běžném textu VZÁCNÁ. Cílem není nula pomlček, ale jejich výjimečnost:
 - **Dlouhá pomlčka — bez mezer** (anglický em dash) je anglicismus a spolehlivý AI tell → vždy odstranit (viz náhrady níže).
-- **Pomlčka jako lepidlo vět** („Světla jsou jen začátek – festival mění, jak se díváte na město.") je kalk anglického em dashe a v češtině se běžně nedělá. Výchozí náhrady v tomto pořadí: (a) rozdělit na dvě věty tečkou, (b) spojit čárkou se spojkou (a, ale, protože, takže), (c) dvojtečka, pokud druhá část vysvětluje nebo uvozuje výčet. Totéž platí pro pomlčku před dovětkem („…nadšenci – a stejně dobře jen za zážitkem") → obyčejná čárka.
-- **Vsuvkové dvojice pomlček** („text – vsuvka – text") → přestav na čárky, závorky nebo samostatnou větu.
-- **Tvrdý limit:** ve finálním textu smí zůstat NEJVÝŠE JEDNA pomlčka s mezerami na celý běžný text (u dlouhých textů na ~5 odstavců), a jen pokud nese skutečný zvrat či důraz, který by tečka zabila. Všechny ostatní přepiš.
-- **Rozsahy a intervaly** píše čeština pomlčkou bez mezer: 9–17 h, s. 12–15, Praha–Brno. Tyto NEODSTRAŇUJ a do limitu se nepočítají.
+- **Pomlčka mezi větami** není automaticky chyba. Zachovej ji, když nese zřetelný předěl, kontrast, pauzu nebo vysvětlení. Pokud jen mechanicky spojuje dvě věty po anglickém vzoru, nahraď ji tečkou, čárkou se spojkou nebo dvojtečkou podle významu.
+- **Vsuvkové dvojice pomlček** jsou v češtině legitimní. Zachovej je, pokud zpřehledňují vsuvku nebo přístavek; při mechanickém opakování zvaž čárky, závorky nebo samostatnou větu.
+- **Žádný číselný limit neplatí.** Každou pomlčku posuzuj podle její funkce a rytmu textu. Upravuj nadužívání, ne správnou interpunkci.
+- **Rozsahy a vztahy** píše čeština pomlčkou bez mezer: 9–17 h, s. 12–15, Praha–Brno. Tyto NEODSTRAŇUJ.
 - Spojovník (-) a pomlčka (–) nejsou totéž: spojovník spojuje (česko-anglický, bude-li), pomlčka odděluje.
 
 ### 23. Velká písmena v nadpisech (Title Case)
@@ -338,7 +338,7 @@ Když je vidíš, nech prózu na pokoji — nadměrná redakce zničí to, co ji
 3. **Napiš pracovní přepis.** Zkontroluj: čte se přirozeně nahlas? Střídá délky vět? Drží české aktuální členění? Používá „je/má" místo opisů? Drží rejstřík originálu?
 4. **Audit:** polož si otázku „Co na tomto textu pořád křičí, že ho psala AI?" — odpověz stručně v bodech.
 5. **Kontrola obsahu proti seznamu z kroku 1:** každá informace originálu je ve finále, žádná nepřibyla. Pokud ne, oprav.
-6. **Finální přepis:** vyřeš zbylé telly, projdi typografii (uvozovky „ ", pomlčky, mezery, procenta, data). Skenuj na: (a) — em dash bez mezer a anglické uvozovky " " — jakýkoli nález znamená, že finále není hotové; (b) spočítej pomlčky s mezerami (rozsahy typu 15.–18. se nepočítají) — víc než jedna na běžný text znamená, že finále není hotové: rozsekej věty tečkou nebo spoj čárkou (viz č. 22).
+6. **Finální přepis:** vyřeš zbylé telly, projdi typografii (uvozovky „ ", pomlčky, mezery, procenta, data). Skenuj na em dash bez mezer a anglické uvozovky " "; jejich nález znamená, že finále není hotové. Pomlčky s mezerami projdi jednotlivě: správné ponech, mechanické nebo nadužívané nahraď podle významu (viz č. 22).
 
 **Odevzdej:** finální text + stručný přehled provedených změn (co a proč) + případný seznam míst, kde ses držel originálu navzdory tellu (např. autorská pomlčka), aby měl uživatel kontrolu.
 
