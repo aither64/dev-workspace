@@ -28,14 +28,17 @@ otherwise matches upstream v2.9.1.
 - Revision: `bda1f7ae7129142c476187966cfb59b2a32c0013`
 - Upstream `SKILL.md` SHA-256:
   `656f0fb59124eb85f0ce620019a5852a46d3b1d44fd86682c478f3a868bb4ada`
-- Upstream and local `LICENSE` SHA-256:
+- Upstream `LICENSE` SHA-256:
   `8dbb39f6f49c81b63d96a091d3e1fdcc5f6bad6a18fd1b898849fa54c2d76cc7`
+- Local `LICENSE` SHA-256:
+  `6baf827e0d512db5708ebf71b2cff2e71e24be1fbdd4361547feec5e6fa99c69`
 - Local `SKILL.md` SHA-256:
   `ed7a108f06aefcd6556cc99ff33403c30213ad14c0739214b1de8c2d3bac3d95`
 - License: MIT
 
 Local packaging changes use the ISO 639-1 `cs` language code, portable
-frontmatter, and OpenAI UI metadata.
+frontmatter, and OpenAI UI metadata. The local license retains Siqi Chen's MIT
+notice and identifies the Czech adaptation.
 
 ## Updating the pinned sources
 
