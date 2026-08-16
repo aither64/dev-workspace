@@ -1,5 +1,9 @@
 # Sources and local policy
 
+The workspace keeps lean, language-specific runtime skills. Upstream repository
+metadata, CI, issue templates, plugin manifests, and READMEs are intentionally
+not copied into the installed skill directories.
+
 ## English
 
 - Local skill: `skills/humanizer-en` (`$humanizer-en`)
@@ -35,10 +39,11 @@ frontmatter, and OpenAI UI metadata.
 
 ## Updating the pinned sources
 
-Fetch and review a proposed upstream revision before updating either local
-copy. Pin the reviewed commit, reapply the documented local changes, run the
-workspace security and behavior checks, and record the revision and hashes
-here. Never update from a moving branch without pinning the reviewed commit.
+Fetch a proposed upstream revision into a temporary directory and review it
+before copying only `SKILL.md` and `LICENSE` into the locale skill. Reapply the
+documented local changes, run the workspace security and behavior checks, then
+record the new revision and both upstream and local hashes here. Never update
+from a moving branch without pinning the reviewed commit.
 
 ## vpsFree deviations
 
