@@ -11,19 +11,57 @@ require_relative '../lib/kb_contract_files'
 
 options = {}
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-manifest --source DIR --candidate DIR --language cs|en --summary TEXT --output FILE'
+  parser.banner = <<~USAGE
+    Usage:
+      kb-contract-manifest --source DIR --candidate DIR --language cs|en \
+        --changes FILE --output FILE
+      kb-contract-manifest --source DIR --candidate DIR --language cs|en \
+        --summary TEXT --output FILE
+  USAGE
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--candidate DIR') { |value| options[:candidate] = File.expand_path(value) }
   parser.on('--language LANGUAGE') { |value| options[:language] = value }
   parser.on('--summary TEXT') { |value| options[:summary] = value }
+  parser.on('--changes FILE') { |value| options[:changes] = File.expand_path(value) }
   parser.on('--output FILE') { |value| options[:output] = File.expand_path(value) }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
-%i[source candidate language summary output].each do |key|
+%i[source candidate language output].each do |key|
   abort "--#{key} is required" unless options[key]
 end
 abort '--language must be cs or en' unless %w[cs en].include?(options[:language])
-abort '--summary must be a non-empty single line' if options[:summary].strip.empty? || options[:summary].match?(/[\r\n]/)
+if options[:summary] && options[:changes]
+  abort '--summary and --changes are mutually exclusive'
+elsif !options[:summary] && !options[:changes]
+  abort '--changes is required for new releases; use --summary only for a legacy schema-3 manifest'
+elsif options[:summary] && (options[:summary].strip.empty? || options[:summary].match?(/[\r\n]/))
+  abort '--summary must be a non-empty single line'
+end
+
+changes = if options[:changes]
+            data = YAML.safe_load_file(options.fetch(:changes))
+            abort 'changes file schema must be 1' unless data.is_a?(Hash) && data['schema'] == 1
+            entries = data.fetch('changes')
+            abort 'changes must be a list' unless entries.is_a?(Array)
+            entries.map do |entry|
+              abort 'each change must be a mapping' unless entry.is_a?(Hash)
+              language = entry.fetch('language')
+              abort "unknown change language #{language.inspect}" unless %w[cs en].include?(language)
+              page_id = KbContractFiles.validate_page_id!(entry.fetch('id'))
+              action = entry.fetch('action')
+              abort "invalid change action #{action.inspect}" unless %w[write delete].include?(action)
+              summary = entry.fetch('summary')
+              unless summary.is_a?(String) && !summary.strip.empty? && !summary.match?(/[\r\n]/)
+                abort "#{language}:#{page_id}: summary must be a non-empty single line"
+              end
+              entry.merge('language' => language, 'id' => page_id)
+            end
+          else
+            []
+          end
+change_keys = changes.map { |entry| [entry.fetch('language'), entry.fetch('id')] }
+abort 'duplicate page IDs in changes file' unless change_keys.uniq.length == change_keys.length
+changes_by_key = changes.to_h { |entry| [[entry.fetch('language'), entry.fetch('id')], entry] }
 
 source_index = JSON.parse(File.read(File.join(options.fetch(:source), 'index.json')))
 candidate_index = JSON.parse(File.read(File.join(options.fetch(:candidate), 'index.json')))
@@ -61,6 +99,29 @@ abort 'duplicate candidate page IDs' unless candidate_keys.uniq.length == candid
 abort 'duplicate candidate page files' unless candidate_files.uniq.length == candidate_files.length
 candidate_pages_by_key = candidate_pages.to_h do |page|
   [[page.fetch('language'), page.fetch('id')], page]
+end
+
+if options[:changes]
+  candidate_write_keys = candidate_pages.filter_map do |page|
+    [page.fetch('language'), page.fetch('id')] if page.fetch('changed')
+  end
+  declared_write_keys = changes.filter_map do |entry|
+    [entry.fetch('language'), entry.fetch('id')] if entry.fetch('action') == 'write'
+  end
+  missing = candidate_write_keys - declared_write_keys
+  extra = declared_write_keys - candidate_write_keys
+  abort "changes file is missing page writes: #{missing.map { |key| key.join(':') }.join(', ')}" unless missing.empty?
+  abort "changes file has extra page writes: #{extra.map { |key| key.join(':') }.join(', ')}" unless extra.empty?
+
+  changes.select { |entry| entry.fetch('action') == 'delete' }.each do |entry|
+    key = [entry.fetch('language'), entry.fetch('id')]
+    source = source_by_key.fetch(key) { abort "#{key.join(':')}: deletion source page is not inventoried" }
+    abort "#{key.join(':')}: deletion source page does not exist" if source['missing'] == true
+    candidate = candidate_pages_by_key.fetch(key) do
+      abort "#{key.join(':')}: deletion page is absent from candidate inventory"
+    end
+    abort "#{key.join(':')}: page cannot be changed and deleted" if candidate.fetch('changed')
+  end
 end
 
 managed_pages = candidate_index.fetch('managed_pages', [])
@@ -201,7 +262,24 @@ end.map do |page|
 
     entry['language_counterpart'] = counterpart
   end
+  entry['summary'] = changes_by_key.fetch([language, page.fetch('id')]).fetch('summary') if options[:changes]
   entry
+end
+
+deletions = changes.filter_map do |change|
+  next unless change.values_at('language', 'action') == [language, 'delete']
+
+  source = source_by_key.fetch([language, change.fetch('id')])
+  source_content = File.binread(KbContractFiles.path_within(options.fetch(:source), source.fetch('file')))
+  unless Digest::SHA256.hexdigest(source_content) == source.fetch('sha256')
+    abort "source checksum drift for deletion #{change.fetch('id')}"
+  end
+  {
+    'id' => change.fetch('id'),
+    'source_revision' => source.fetch('revision'),
+    'source_sha256' => source.fetch('sha256'),
+    'summary' => change.fetch('summary')
+  }
 end
 
 candidate_media = candidate_index.fetch('media', [])
@@ -255,13 +333,20 @@ contract_manifest = if managed_contract
                     end
 
 manifest = {
-  'schema' => 3,
+  'schema' => options[:changes] ? 4 : 3,
   'wiki' => language == 'cs' ? 'cz' : 'org',
-  'production_summary' => options.fetch(:summary),
   'pages' => pages,
   'media' => media
 }
+if options[:changes]
+  manifest['deletions'] = deletions
+else
+  manifest['production_summary'] = options.fetch(:summary)
+end
 manifest['contract'] = contract_manifest if contract_manifest
 FileUtils.mkdir_p(File.dirname(options.fetch(:output)))
 File.write(options.fetch(:output), YAML.dump(manifest))
-puts "Prepared #{options.fetch(:output)} with #{pages.length} pages and #{media.length} media objects"
+puts(
+  "Prepared #{options.fetch(:output)} with #{pages.length} pages, #{deletions.length} deletions " \
+  "and #{media.length} media objects"
+)

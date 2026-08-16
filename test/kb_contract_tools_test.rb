@@ -59,6 +59,133 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_manifest_builds_schema_four_with_per_page_summaries_and_deletions
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      add_source_page(source, 'cs', 'navody:old', "Old guide.\n", revision: '456')
+      build_candidate(source, write_plan(dir), candidate)
+      changes = write_changes(
+        dir,
+        [
+          {
+            'language' => 'cs', 'id' => 'navody:test', 'action' => 'write',
+            'summary' => 'Aktualizace testovacího návodu'
+          },
+          {
+            'language' => 'en', 'id' => 'manuals:test', 'action' => 'write',
+            'summary' => 'Update the test guide'
+          },
+          {
+            'language' => 'cs', 'id' => 'navody:old', 'action' => 'delete',
+            'summary' => 'Odstranění starého návodu'
+          }
+        ]
+      )
+
+      cs_path = File.join(dir, 'kb-release-cs.yml')
+      en_path = File.join(dir, 'kb-release-en.yml')
+      run_changes_manifest(source, candidate, 'cs', changes, cs_path)
+      run_changes_manifest(source, candidate, 'en', changes, en_path)
+
+      cs = YAML.safe_load_file(cs_path)
+      en = YAML.safe_load_file(en_path)
+      assert_equal(4, cs.fetch('schema'))
+      refute(cs.key?('production_summary'))
+      assert_equal('Aktualizace testovacího návodu', cs.fetch('pages').first.fetch('summary'))
+      assert_equal(
+        {
+          'id' => 'navody:old',
+          'source_revision' => '456',
+          'source_sha256' => Digest::SHA256.hexdigest("Old guide.\n"),
+          'summary' => 'Odstranění starého návodu'
+        },
+        cs.fetch('deletions').first
+      )
+      assert_empty(en.fetch('deletions'))
+      assert_equal('Update the test guide', en.fetch('pages').first.fetch('summary'))
+    end
+  end
+
+  def test_schema_four_changes_must_cover_every_candidate_write
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      build_candidate(source, write_plan(dir), candidate)
+      changes = write_changes(
+        dir,
+        [{
+          'language' => 'cs', 'id' => 'navody:test', 'action' => 'write',
+          'summary' => 'Aktualizace testovacího návodu'
+        }]
+      )
+
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'cs',
+        '--changes', changes,
+        '--output', File.join(dir, 'release.yml')
+      )
+
+      refute(status.success?)
+      assert_match(/missing page writes: en:manuals:test/, error)
+    end
+  end
+
+  def test_schema_four_changes_reject_invalid_deletions_and_summaries
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      candidate = File.join(dir, 'kb-candidates')
+      write_sources(source)
+      build_candidate(source, write_plan(dir), candidate)
+      entries = [
+        {
+          'language' => 'cs', 'id' => 'navody:test', 'action' => 'write',
+          'summary' => 'Aktualizace testovacího návodu'
+        },
+        {
+          'language' => 'en', 'id' => 'manuals:test', 'action' => 'write',
+          'summary' => 'Update the test guide'
+        },
+        {
+          'language' => 'cs', 'id' => 'navody:missing', 'action' => 'delete',
+          'summary' => 'Odstranění starého návodu'
+        }
+      ]
+      changes = write_changes(dir, entries)
+
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'cs',
+        '--changes', changes,
+        '--output', File.join(dir, 'release.yml')
+      )
+      refute(status.success?)
+      assert_match(/deletion source page is not inventoried/, error)
+
+      entries.last['id'] = 'navody:old'
+      entries.last['summary'] = "first\nsecond"
+      add_source_page(source, 'cs', 'navody:old', "Old guide.\n", revision: '456')
+      changes = write_changes(dir, entries)
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'cs',
+        '--changes', changes,
+        '--output', File.join(dir, 'release.yml')
+      )
+      refute(status.success?)
+      assert_match(/summary must be a non-empty single line/, error)
+    end
+  end
+
   def test_build_rejects_source_count_drift
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
@@ -1057,6 +1184,28 @@ class KbContractToolsTest < Minitest::Test
     File.write(File.join(root, 'index.json'), JSON.dump(index))
   end
 
+  def add_source_page(root, language, page_id, content, revision:)
+    index_path = File.join(root, 'index.json')
+    index = JSON.parse(File.read(index_path))
+    relative = File.join(language, *page_id.split(':')) + '.txt'
+    destination = File.join(root, relative)
+    FileUtils.mkdir_p(File.dirname(destination))
+    File.binwrite(destination, content)
+    index.fetch(language) << {
+      'id' => page_id,
+      'file' => relative,
+      'revision' => revision,
+      'sha256' => Digest::SHA256.hexdigest(content)
+    }
+    File.write(index_path, JSON.dump(index))
+  end
+
+  def write_changes(root, entries)
+    path = File.join(root, 'release-changes.yml')
+    File.write(path, YAML.dump('schema' => 1, 'changes' => entries))
+    path
+  end
+
   def write_plan(root)
     path = File.join(root, 'plan.yml')
     plan = {
@@ -1157,6 +1306,18 @@ class KbContractToolsTest < Minitest::Test
       '--candidate', candidate,
       '--language', language,
       '--summary', summary,
+      '--output', output
+    )
+    assert(status.success?, error)
+  end
+
+  def run_changes_manifest(source, candidate, language, changes, output)
+    _stdout, error, status = Open3.capture3(
+      MANIFEST,
+      '--source', source,
+      '--candidate', candidate,
+      '--language', language,
+      '--changes', changes,
       '--output', output
     )
     assert(status.success?, error)
