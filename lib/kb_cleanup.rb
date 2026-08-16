@@ -34,10 +34,18 @@ module KbCleanup
       data.fetch('shared_media')
     end
 
+    def page_summary(entry)
+      return entry.fetch('summary') if data.fetch('schema') == 2
+
+      'Remove obsolete localization review draft'
+    end
+
     private
 
     def validate!
-      raise Error, 'cleanup manifest schema must be 1' unless data['schema'] == 1
+      unless [1, 2].include?(data['schema'])
+        raise Error, 'cleanup manifest schema must be 1 or 2'
+      end
       raise Error, 'delete_via must be cz or org' unless %w[cz org].include?(delete_via)
       unless verify_wikis.is_a?(Array) && verify_wikis.sort == %w[cz org]
         raise Error, 'verify_wikis must contain cz and org exactly once'
@@ -47,6 +55,7 @@ module KbCleanup
         %w[wiki id sha256].each { |key| entry.fetch(key) }
         raise Error, "invalid page wiki #{entry['wiki']}" unless verify_wikis.include?(entry['wiki'])
         validate_digest!(entry.fetch('sha256'), "page #{entry.fetch('id')}")
+        validate_summary!(entry.fetch('summary'), entry.fetch('id')) if data.fetch('schema') == 2
       end
       media.each do |entry|
         %w[id sha256].each { |key| entry.fetch(key) }
@@ -65,6 +74,12 @@ module KbCleanup
       return if value.match?(/\A[0-9a-f]{64}\z/)
 
       raise Error, "invalid SHA-256 for #{description}"
+    end
+
+    def validate_summary!(value, id)
+      return if value.is_a?(String) && !value.strip.empty? && !value.match?(/[\r\n]/)
+
+      raise Error, "page summary for #{id} must be a non-empty single line"
     end
   end
 
@@ -154,7 +169,7 @@ module KbCleanup
           'core.savePage',
           page: entry.fetch('id'),
           text: '',
-          summary: 'Remove obsolete localization review draft',
+          summary: @manifest.page_summary(entry),
           isminor: false
         )
         raise Error, "failed to delete page #{entry.fetch('id')}" unless result == true

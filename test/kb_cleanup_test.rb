@@ -73,6 +73,40 @@ class KbCleanupTest < Minitest::Test
     assert_equal 0, org.calls.count { |method, _params| method == 'core.deleteMedia' }
   end
 
+  def test_schema_two_uses_the_page_specific_deletion_summary
+    page = 'draft page'
+    manifest = manifest_with_entries(
+      pages: { 'drafts:test:page' => page },
+      media: {},
+      schema: 2,
+      summary: 'Remove superseded test draft'
+    )
+    cz = FakeClient.new(pages: { 'drafts:test:page' => page })
+    org = FakeClient.new
+
+    KbCleanup::Runner.new(
+      manifest:,
+      client_factory: ->(name) { { 'cz' => cz, 'org' => org }.fetch(name) },
+      out: StringIO.new
+    ).cleanup!
+
+    save = cz.calls.find { |method, _params| method == 'core.savePage' }
+    assert_equal('Remove superseded test draft', save.last.fetch(:summary))
+  end
+
+  def test_schema_two_requires_a_single_line_page_summary
+    error = assert_raises(KbCleanup::Error) do
+      manifest_with_entries(
+        pages: { 'drafts:test:page' => 'draft page' },
+        media: {},
+        schema: 2,
+        summary: "first\nsecond"
+      )
+    end
+
+    assert_match(/non-empty single line/, error.message)
+  end
+
   def test_is_idempotent_when_everything_is_absent
     manifest = manifest_for(page: 'draft page', media: 'media')
     clients = { 'cz' => FakeClient.new, 'org' => FakeClient.new }
@@ -222,19 +256,26 @@ class KbCleanupTest < Minitest::Test
     )
   end
 
-  def manifest_with_entries(pages:, media:)
+  def manifest_with_entries(
+    pages:,
+    media:,
+    schema: 1,
+    summary: 'Remove obsolete localization review draft'
+  )
     file = Tempfile.new(['cleanup', '.yml'])
     file.write(
       YAML.dump(
-        'schema' => 1,
+        'schema' => schema,
         'delete_via' => 'cz',
         'verify_wikis' => %w[cz org],
         'pages' => pages.map do |id, content|
-          {
+          entry = {
             'wiki' => 'cz',
             'id' => id,
             'sha256' => Digest::SHA256.hexdigest(content)
           }
+          entry['summary'] = summary if schema == 2
+          entry
         end,
         'shared_media' => media.map do |id, content|
           {
