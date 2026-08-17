@@ -7,7 +7,7 @@ require 'json'
 require 'optparse'
 require 'yaml'
 require_relative '../lib/kb_contract_files'
-require_relative '../lib/kb_managed_articles'
+require_relative '../lib/kb_managed_pages'
 
 options = {}
 OptionParser.new do |parser|
@@ -25,21 +25,24 @@ abort 'source and output directories must differ' if options[:source] == options
 
 plan_file = YAML.safe_load_file(options.fetch(:plan))
 schema = plan_file.fetch('schema')
-abort 'replacement plan schema must be 1, 2, 3, or 4' unless [1, 2, 3, 4].include?(schema)
+unless [1, 2, 3, 4, 5].include?(schema)
+  abort 'replacement plan schema must be 1, 2, 3, 4, or 5'
+end
 replacements = plan_file.fetch('replacements')
 content_replacements = plan_file.fetch('content_replacements', [])
 exceptions = plan_file.fetch('exceptions', [])
 new_pages = plan_file.fetch('new_pages', [])
 media_plan = plan_file.fetch('media', [])
 code_sample_plan = plan_file.fetch('code_samples', [])
-managed_article_plan = plan_file.fetch('managed_articles', [])
+abort 'managed_articles was replaced by managed_pages in schema 5' if plan_file.key?('managed_articles')
+managed_page_plan = plan_file.fetch('managed_pages', [])
 abort 'replacements must be a list' unless replacements.is_a?(Array)
 abort 'content_replacements must be a list' unless content_replacements.is_a?(Array)
 abort 'exceptions must be a list' unless exceptions.is_a?(Array)
 abort 'new_pages must be a list' unless new_pages.is_a?(Array)
 abort 'media must be a list' unless media_plan.is_a?(Array)
 abort 'code_samples must be a list' unless code_sample_plan.is_a?(Array)
-abort 'managed_articles must be a list' unless managed_article_plan.is_a?(Array)
+abort 'managed_pages must be a list' unless managed_page_plan.is_a?(Array)
 if schema == 1 && (!new_pages.empty? || !media_plan.empty?)
   abort 'new_pages and media require replacement plan schema 2'
 end
@@ -47,11 +50,11 @@ abort 'code_samples require replacement plan schema 3' if schema < 3 && !code_sa
 if schema < 3 && !content_replacements.empty?
   abort 'content_replacements require replacement plan schema 3'
 end
-abort 'managed_articles require replacement plan schema 4' if schema < 4 && !managed_article_plan.empty?
+abort 'managed_pages require replacement plan schema 5' if schema < 5 && !managed_page_plan.empty?
 
-if schema == 4
-  abort '--code-root is required for replacement plan schema 4' unless options[:code_root]
-  abort '--code-base is required for replacement plan schema 4' unless options[:code_base]
+if schema == 5
+  abort '--code-root is required for replacement plan schema 5' unless options[:code_root]
+  abort '--code-base is required for replacement plan schema 5' unless options[:code_base]
 end
 
 unless code_sample_plan.empty?
@@ -83,37 +86,37 @@ abort 'duplicate code sample IDs' unless code_samples_by_id.length == code_sampl
 managed_contract = nil
 registered_contract_pages = []
 registered_contract_tests = []
-if schema == 4
+if schema == 5
   begin
-    managed_contract = KbManagedArticles.contract_provenance(
+    managed_contract = KbManagedPages.contract_provenance(
       code_root: options.fetch(:code_root),
       base: options.fetch(:code_base)
     )
-    registered_contract_pages = KbManagedArticles.registered_pages(
+    registered_contract_pages = KbManagedPages.registered_pages(
       code_root: options.fetch(:code_root),
       contract: managed_contract,
       require_committed: true
     )
-    registered_contract_tests = KbManagedArticles.registered_tests(
+    registered_contract_tests = KbManagedPages.registered_tests(
       code_root: options.fetch(:code_root),
       contract: managed_contract,
       require_committed: true
     )
-  rescue KbManagedArticles::Error => e
+  rescue KbManagedPages::Error => e
     abort e.message
   end
 end
 registered_contract_pages_by_key = registered_contract_pages.to_h do |page|
-  [page.values_at(:language, :page), page]
+  [page.values_at(:language, :id), page]
 end
-managed_article_ids = managed_article_plan.map do |entry|
-  abort 'managed article entry must be a mapping' unless entry.is_a?(Hash)
+managed_page_contract_keys = managed_page_plan.map do |entry|
+  abort 'managed page entry must be a mapping' unless entry.is_a?(Hash)
 
   KbContractFiles.validate_semantic_id!(entry.fetch('id'))
 end
-abort 'duplicate managed article IDs' unless managed_article_ids.uniq.length == managed_article_ids.length
-managed_plan_page_keys = registered_contract_pages.filter_map do |page|
-  page.values_at(:language, :page) if managed_article_ids.include?(page.fetch(:article))
+abort 'duplicate managed page IDs' unless managed_page_contract_keys.uniq.length == managed_page_contract_keys.length
+managed_plan_page_ids = registered_contract_pages.filter_map do |page|
+  page.values_at(:language, :id) if managed_page_contract_keys.include?(page.fetch(:page_key))
 end
 
 legacy_page_targets = {
@@ -132,7 +135,7 @@ legacy_page_targets.each do |kind, language, page|
   next unless managed
 
   abort "#{language}:#{page}: registered managed pages cannot be changed through #{kind}; " \
-        "use managed_articles entry #{managed.fetch(:article).inspect}"
+        "use managed_pages entry #{managed.fetch(:page_key).inspect}"
 end
 
 source_root = options.fetch(:source)
@@ -192,71 +195,71 @@ end
 new_page_keys = new_page_plan.map { |entry| [entry.fetch('language'), entry.fetch('page')] }
 abort 'duplicate new page IDs' unless new_page_keys.uniq.length == new_page_keys.length
 missing_source_keys = source_entries.filter_map { |key, entry| key if entry['missing'] == true }
-managed_missing_source_keys = managed_plan_page_keys & missing_source_keys
+managed_missing_source_keys = managed_plan_page_ids & missing_source_keys
 expected_missing_source_keys = new_page_keys + managed_missing_source_keys
 unless missing_source_keys.sort == expected_missing_source_keys.sort
-  abort 'every guarded missing source page must have exactly one new_pages or managed_articles entry'
+  abort 'every guarded missing source page must have exactly one new_pages or managed_pages entry'
 end
 
-managed_pages = managed_article_plan.flat_map do |entry|
-  abort 'managed article entry must be a mapping' unless entry.is_a?(Hash)
-  article_id = KbContractFiles.validate_semantic_id!(entry.fetch('id'))
+managed_pages = managed_page_plan.flat_map do |entry|
+  abort 'managed page entry must be a mapping' unless entry.is_a?(Hash)
+  page_key = KbContractFiles.validate_semantic_id!(entry.fetch('id'))
   bootstrap = entry.fetch('bootstrap', {})
-  abort "#{article_id}: bootstrap must be a mapping" unless bootstrap.is_a?(Hash)
+  abort "#{page_key}: bootstrap must be a mapping" unless bootstrap.is_a?(Hash)
   unknown_languages = bootstrap.keys - %w[cs en]
   unless unknown_languages.empty?
-    abort "#{article_id}: unknown bootstrap languages #{unknown_languages.join(', ')}"
+    abort "#{page_key}: unknown bootstrap languages #{unknown_languages.join(', ')}"
   end
 
   begin
-    results = KbManagedArticles.reconcile(
+    results = KbManagedPages.reconcile(
       code_root: options.fetch(:code_root),
       base: options.fetch(:code_base),
-      article_id: article_id,
+      page_key: page_key,
       wiki_pages: pages,
       bootstrap: bootstrap,
       contract: managed_contract,
       require_committed: true
     )
-  rescue KbManagedArticles::Error => e
+  rescue KbManagedPages::Error => e
     abort e.message
   end
 
   blocked = results.select { |result| %i[wiki_only conflict].include?(result.fetch(:status)) }
   unless blocked.empty?
     states = blocked.map do |result|
-      "#{result.fetch(:language)}:#{result.fetch(:page)}=#{result.fetch(:status).to_s.tr('_', '-')}"
+      "#{result.fetch(:language)}:#{result.fetch(:id)}=#{result.fetch(:status).to_s.tr('_', '-')}"
     end
-    abort "#{article_id}: managed article reconciliation failed (#{states.join(', ')}); " \
+    abort "#{page_key}: managed page reconciliation failed (#{states.join(', ')}); " \
           'use kb-contract-reconcile before building'
   end
 
   results.map do |result|
-    key = [result.fetch(:language), result.fetch(:page)]
+    key = [result.fetch(:language), result.fetch(:id)]
     source = source_entries.fetch(key) do
-      abort "#{article_id}: managed page #{key.join(':')} is missing from the guarded source inventory"
+      abort "#{page_key}: managed page #{key.join(':')} is missing from the guarded source inventory"
     end
     if source['missing'] == true && result.fetch(:status) != :bootstrap
-      abort "#{article_id}: managed page #{key.join(':')} is marked missing but is not a bootstrap"
+      abort "#{page_key}: managed page #{key.join(':')} is marked missing but is not a bootstrap"
     end
 
     pages[key] = result.fetch(:current)
     {
-      'article' => article_id,
+      'page_key' => page_key,
       'language' => result.fetch(:language),
-      'page' => result.fetch(:page),
+      'id' => result.fetch(:id),
       'source' => result.fetch(:source),
       'status' => result.fetch(:status).to_s,
       'canonical_sha256' => result.fetch(:canonical_sha256)
     }
   end
 end
-managed_page_keys = managed_pages.map { |entry| [entry.fetch('language'), entry.fetch('page')] }
-abort 'duplicate managed page IDs' unless managed_page_keys.uniq.length == managed_page_keys.length
+managed_page_ids = managed_pages.map { |entry| [entry.fetch('language'), entry.fetch('id')] }
+abort 'duplicate managed page IDs' unless managed_page_ids.uniq.length == managed_page_ids.length
 
 unless code_samples.empty?
   registered_contract_pages.each do |registered|
-    key = registered.values_at(:language, :page)
+    key = registered.values_at(:language, :id)
     next unless pages.fetch(key).include?('<kb-code-sample')
 
     abort "#{key.join(':')}: registered managed pages cannot use release-time code sample expansion"
@@ -374,18 +377,18 @@ pages.each do |(language, page), content|
 end
 
 managed_pages.each do |managed|
-  key = managed.values_at('language', 'page')
+  key = managed.values_at('language', 'id')
   canonical = registered_contract_pages_by_key.fetch(key).fetch(:current)
   next if pages.fetch(key) == canonical
 
   abort "#{key.join(':')}: managed candidate differs from its canonical contract source"
 end
 registered_contract_pages.each do |registered|
-  key = registered.values_at(:language, :page)
-  next if managed_page_keys.include?(key)
+  key = registered.values_at(:language, :id)
+  next if managed_page_ids.include?(key)
   next if pages.fetch(key) == wiki_pages.fetch(key)
 
-  abort "#{key.join(':')}: registered managed page changed without a managed_articles entry"
+  abort "#{key.join(':')}: registered managed page changed without a managed_pages entry"
 end
 
 managed_contract_index = if managed_contract
@@ -396,16 +399,16 @@ managed_contract_index = if managed_contract
                              'registry_sha256' => managed_contract.fetch(:registry_sha256),
                              'pages' => registered_contract_pages.map do |page|
                                {
-                                 'article' => page.fetch(:article),
+                                 'page_key' => page.fetch(:page_key),
                                  'language' => page.fetch(:language),
-                                 'page' => page.fetch(:page),
+                                 'id' => page.fetch(:id),
                                  'source' => page.fetch(:source),
                                  'sha256' => page.fetch(:sha256)
                                }
                              end,
                              'tests' => registered_contract_tests.map do |test|
                                {
-                                 'article' => test.fetch(:article),
+                                 'page_key' => test.fetch(:page_key),
                                  'pattern' => test.fetch(:pattern),
                                  'source' => test.fetch(:source),
                                  'sha256' => test.fetch(:sha256)
@@ -543,14 +546,14 @@ content_replacement_plan.each do |entry|
 end
 review.concat([
   '',
-  '## Managed articles',
+  '## Managed pages',
   '',
-  '| Article | Language | Page | Reconciliation | Canonical source |',
+  '| Key | Language | Page | Reconciliation | Canonical source |',
   '| --- | --- | --- | --- | --- |'
 ])
 managed_pages.each do |entry|
-  review << "| `#{entry.fetch('article')}` | #{entry.fetch('language')} | " \
-            "#{entry.fetch('page')} | #{entry.fetch('status').tr('_', '-')} | " \
+  review << "| `#{entry.fetch('page_key')}` | #{entry.fetch('language')} | " \
+            "#{entry.fetch('id')} | #{entry.fetch('status').tr('_', '-')} | " \
             "`#{entry.fetch('source')}` |"
 end
 review.concat([

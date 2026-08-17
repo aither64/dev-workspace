@@ -130,6 +130,9 @@ managed_contract = candidate_index['managed_contract']
 if !managed_pages.empty? && !managed_contract.is_a?(Hash)
   abort 'managed candidate pages require contract provenance'
 end
+if managed_contract && !options[:changes]
+  abort 'managed page releases require --changes and release manifest schema 5'
+end
 
 managed_contract_pages = []
 managed_contract_tests = []
@@ -151,8 +154,8 @@ if managed_contract
   contract_page_keys = managed_contract_pages.map do |page|
     language = page.fetch('language')
     abort "unknown managed contract language #{language.inspect}" unless %w[cs en].include?(language)
-    page_id = KbContractFiles.validate_page_id!(page.fetch('page'))
-    KbContractFiles.validate_semantic_id!(page.fetch('article'))
+    page_id = KbContractFiles.validate_page_id!(page.fetch('id'))
+    KbContractFiles.validate_semantic_id!(page.fetch('page_key'))
     KbContractFiles.path_within(options.fetch(:candidate), page.fetch('source'))
     sha256 = page.fetch('sha256')
     unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
@@ -167,46 +170,46 @@ if managed_contract
   managed_contract_has_tests = managed_contract.key?('tests')
   managed_contract_tests = managed_contract.fetch('tests', [])
   abort 'managed contract tests must be a list' unless managed_contract_tests.is_a?(Array)
-  test_articles = managed_contract_tests.map do |test|
-    article = KbContractFiles.validate_semantic_id!(test.fetch('article'))
+  test_page_keys = managed_contract_tests.map do |test|
+    page_key = KbContractFiles.validate_semantic_id!(test.fetch('page_key'))
     pattern = test.fetch('pattern')
     suite = pattern.delete_suffix('#*') if pattern.is_a?(String) && pattern.end_with?('#*')
     unless suite&.split('/', -1)&.all? do |component|
              component.match?(/\A[a-z0-9][a-z0-9_.-]*\z/) && !%w[. ..].include?(component)
            end
-      abort "#{article}: invalid managed test pattern #{pattern.inspect}"
+      abort "#{page_key}: invalid managed test pattern #{pattern.inspect}"
     end
     source = test.fetch('source')
     KbContractFiles.path_within(options.fetch(:candidate), source)
     expected_source = "tests/suite/#{suite}.nix"
     unless source == expected_source
-      abort "#{article}: managed test source must be #{expected_source}, got #{source.inspect}"
+      abort "#{page_key}: managed test source must be #{expected_source}, got #{source.inspect}"
     end
     sha256 = test.fetch('sha256')
     unless sha256.is_a?(String) && sha256.match?(/\A[0-9a-f]{64}\z/)
-      abort "#{article}: invalid managed test SHA-256"
+      abort "#{page_key}: invalid managed test SHA-256"
     end
-    article
+    page_key
   end
-  abort 'duplicate managed contract test articles' unless test_articles.uniq.length == test_articles.length
+  abort 'duplicate managed contract test page keys' unless test_page_keys.uniq.length == test_page_keys.length
   test_patterns = managed_contract_tests.map { |test| test.fetch('pattern') }
   abort 'duplicate managed contract test patterns' unless test_patterns.uniq.length == test_patterns.length
   test_sources = managed_contract_tests.map { |test| test.fetch('source') }
   abort 'duplicate managed contract test sources' unless test_sources.uniq.length == test_sources.length
-  page_articles = managed_contract_pages.map { |page| page.fetch('article') }.uniq
-  unless managed_contract_tests.empty? || page_articles.sort == test_articles.sort
-    abort 'managed contract tests must cover every registered article exactly once'
+  covered_page_keys = managed_contract_pages.map { |page| page.fetch('page_key') }.uniq
+  unless managed_contract_tests.empty? || covered_page_keys.sort == test_page_keys.sort
+    abort 'managed contract tests must cover every registered page key exactly once'
   end
   contract_pages_by_key = managed_contract_pages.to_h do |page|
-    [[page.fetch('language'), page.fetch('page')], page]
+    [[page.fetch('language'), page.fetch('id')], page]
   end
 
   managed_page_keys = managed_pages.map do |page|
-    key = [page.fetch('language'), page.fetch('page')]
+    key = [page.fetch('language'), page.fetch('id')]
     contract_page = contract_pages_by_key.fetch(key) do
       abort "#{key.join(':')}: managed page is absent from contract provenance"
     end
-    unless page.fetch('article') == contract_page.fetch('article') &&
+    unless page.fetch('page_key') == contract_page.fetch('page_key') &&
            page.fetch('source') == contract_page.fetch('source') &&
            page.fetch('canonical_sha256') == contract_page.fetch('sha256')
       abort "#{key.join(':')}: managed page provenance differs from its contract entry"
@@ -225,7 +228,7 @@ if managed_contract
   end
   abort 'duplicate managed page IDs' unless managed_page_keys.uniq.length == managed_page_keys.length
   managed_pages_by_key = managed_pages.to_h do |page|
-    [[page.fetch('language'), page.fetch('page')], page]
+    [[page.fetch('language'), page.fetch('id')], page]
   end
 
   contract_pages_by_key.each do |key, contract_page|
@@ -349,18 +352,18 @@ end
 
 contract_manifest = if managed_contract
                       selected_pages = managed_contract_pages.filter_map do |page|
-                        key = [page.fetch('language'), page.fetch('page')]
+                        key = [page.fetch('language'), page.fetch('id')]
                         candidate_page = candidate_pages_by_key.fetch(key)
                         next unless key.first == language && candidate_page.fetch('changed')
 
                         {
                           'id' => key.last,
-                          'article' => page.fetch('article'),
+                          'page_key' => page.fetch('page_key'),
                           'source' => page.fetch('source'),
                           'sha256' => page.fetch('sha256')
                         }
                       end
-                      selected_articles = selected_pages.map { |page| page.fetch('article') }.uniq
+                      selected_page_keys = selected_pages.map { |page| page.fetch('page_key') }.uniq
                       if selected_pages.empty?
                         nil
                       else
@@ -373,7 +376,7 @@ contract_manifest = if managed_contract
                         }
                         if managed_contract_has_tests
                           result['tests'] = managed_contract_tests.select do |test|
-                            selected_articles.include?(test.fetch('article'))
+                            selected_page_keys.include?(test.fetch('page_key'))
                           end
                         end
                         result
@@ -381,7 +384,7 @@ contract_manifest = if managed_contract
                     end
 
 manifest = {
-  'schema' => options[:changes] ? 4 : 3,
+  'schema' => options[:changes] ? 5 : 3,
   'wiki' => language == 'cs' ? 'cz' : 'org',
   'pages' => pages,
   'media' => media

@@ -60,7 +60,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_manifest_builds_schema_four_with_per_page_summaries_and_deletions
+  def test_manifest_builds_schema_five_with_per_page_summaries_and_deletions
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       candidate = File.join(dir, 'kb-candidates')
@@ -92,7 +92,7 @@ class KbContractToolsTest < Minitest::Test
 
       cs = YAML.safe_load_file(cs_path)
       en = YAML.safe_load_file(en_path)
-      assert_equal(4, cs.fetch('schema'))
+      assert_equal(5, cs.fetch('schema'))
       refute(cs.key?('production_summary'))
       assert_equal('Aktualizace testovacího návodu', cs.fetch('pages').first.fetch('summary'))
       assert_equal(
@@ -674,7 +674,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_build_uses_git_only_managed_article_changes
+  def test_build_uses_git_only_managed_page_changes
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       candidate = File.join(dir, 'kb-candidates')
@@ -683,7 +683,7 @@ class KbContractToolsTest < Minitest::Test
       base = write_managed_code_root(code_root)
       write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
       run_git(code_root, 'add', 'contract/pages')
-      run_git(code_root, 'commit', '-m', 'Update managed article fixture')
+      run_git(code_root, 'commit', '-m', 'Update managed page fixture')
       head = run_git(code_root, 'rev-parse', 'HEAD').strip
       plan = write_managed_plan(dir)
 
@@ -709,7 +709,7 @@ class KbContractToolsTest < Minitest::Test
       assert_equal(2, provenance.fetch('pages').length)
       assert_equal(
         [{
-          'article' => 'guide',
+          'page_key' => 'guide',
           'pattern' => 'kb/guide#*',
           'source' => 'tests/suite/kb/guide.nix',
           'sha256' => Digest::SHA256.hexdigest("{ ... }: { }\n")
@@ -717,19 +717,21 @@ class KbContractToolsTest < Minitest::Test
         provenance.fetch('tests')
       )
       assert_equal(
-        Digest::SHA256.file(File.join(code_root, 'contract/articles.yml')).hexdigest,
+        Digest::SHA256.file(File.join(code_root, 'contract/pages.yml')).hexdigest,
         provenance.fetch('registry_sha256')
       )
 
       manifest_path = File.join(dir, 'kb-release-cs.yml')
-      run_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
-      manifest_contract = YAML.safe_load_file(manifest_path).fetch('contract')
+      run_managed_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
+      manifest = YAML.safe_load_file(manifest_path)
+      assert_equal(5, manifest.fetch('schema'))
+      manifest_contract = manifest.fetch('contract')
       assert_equal(base, manifest_contract.fetch('base_commit'))
       assert_equal(head, manifest_contract.fetch('head_commit'))
       assert_equal(
         [{
           'id' => 'navody:test',
-          'article' => 'guide',
+          'page_key' => 'guide',
           'source' => 'contract/pages/cs.txt',
           'sha256' => Digest::SHA256.hexdigest("<page>manuals:test</page>\nCanonical Czech.\n")
         }],
@@ -746,13 +748,13 @@ class KbContractToolsTest < Minitest::Test
       code_root = File.join(dir, 'code')
       write_sources(source)
       base = write_managed_code_root(code_root)
-      contract_path = File.join(code_root, 'contract/articles.yml')
+      contract_path = File.join(code_root, 'contract/pages.yml')
       contract = YAML.safe_load_file(contract_path)
-      contract.dig('articles', 'guide', 'test')['source'] = 'tests/suite/kb/other.nix'
+      contract.dig('pages', 'guide', 'test')['source'] = 'tests/suite/kb/other.nix'
       File.write(contract_path, YAML.dump(contract))
       other = File.join(code_root, 'tests/suite/kb/other.nix')
       File.write(other, "{ ... }: { }\n")
-      run_git(code_root, 'add', 'contract/articles.yml', 'tests/suite/kb/other.nix')
+      run_git(code_root, 'add', 'contract/pages.yml', 'tests/suite/kb/other.nix')
       run_git(code_root, 'commit', '-m', 'Change managed test source')
 
       _output, error, status = Open3.capture3(
@@ -793,13 +795,14 @@ class KbContractToolsTest < Minitest::Test
       index.fetch('managed_contract').fetch('tests').first['source'] =
         'tests/suite/kb/other.nix'
       File.write(index_path, JSON.pretty_generate(index))
+      changes = write_managed_changes(candidate, 'Publish managed guide', File.join(dir, 'changes.yml'))
 
       _output, error, status = Open3.capture3(
         MANIFEST,
         '--source', source,
         '--candidate', candidate,
         '--language', 'cs',
-        '--summary', 'Publish managed guide',
+        '--changes', changes,
         '--output', File.join(dir, 'kb-release-cs.yml')
       )
 
@@ -833,7 +836,7 @@ class KbContractToolsTest < Minitest::Test
       File.write(index_path, JSON.pretty_generate(index))
       manifest_path = File.join(dir, 'kb-release-cs.yml')
 
-      run_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
+      run_managed_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
 
       manifest_data = YAML.safe_load_file(manifest_path)
       refute(manifest_data.fetch('contract').key?('tests'))
@@ -870,6 +873,52 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
+  def test_build_rejects_the_managed_articles_key
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      code_root = File.join(dir, 'code')
+      write_sources(source)
+      base = write_managed_code_root(code_root)
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['managed_articles'] = data.delete('managed_pages')
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--code-root', code_root,
+        '--code-base', base,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+
+      refute(status.success?)
+      assert_match(/managed_articles was replaced by managed_pages in schema 5/, error)
+    end
+  end
+
+  def test_managed_pages_require_replacement_plan_schema_five
+    Dir.mktmpdir do |dir|
+      source = File.join(dir, 'kb-sources')
+      write_sources(source)
+      plan = write_managed_plan(dir)
+      data = YAML.safe_load_file(plan)
+      data['schema'] = 4
+      File.write(plan, YAML.dump(data))
+
+      _output, error, status = Open3.capture3(
+        BUILD,
+        '--source', source,
+        '--plan', plan,
+        '--output', File.join(dir, 'kb-candidates')
+      )
+
+      refute(status.success?)
+      assert_match(/managed_pages require replacement plan schema 5/, error)
+    end
+  end
+
   def test_build_rejects_a_legacy_transform_for_an_omitted_managed_page
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
@@ -878,7 +927,7 @@ class KbContractToolsTest < Minitest::Test
       base = write_managed_code_root(code_root)
       plan = write_managed_plan(dir)
       data = YAML.safe_load_file(plan)
-      data['managed_articles'] = []
+      data['managed_pages'] = []
       data['replacements'] = [{
         'language' => 'en',
         'page' => 'manuals:test',
@@ -921,7 +970,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_build_rejects_a_symbolic_managed_article_base
+  def test_build_rejects_a_symbolic_managed_page_base
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       code_root = File.join(dir, 'code')
@@ -941,7 +990,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_reconcile_reports_an_unchanged_managed_article
+  def test_reconcile_reports_an_unchanged_managed_page
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       code_root = File.join(dir, 'code')
@@ -952,7 +1001,7 @@ class KbContractToolsTest < Minitest::Test
         RECONCILE,
         '--source', source,
         '--code-root', code_root,
-        '--article', 'guide',
+        '--page-key', 'guide',
         '--base', base
       )
       assert(status.success?, error)
@@ -961,7 +1010,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_build_rejects_wiki_only_managed_article_changes
+  def test_build_rejects_wiki_only_managed_page_changes
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       code_root = File.join(dir, 'code')
@@ -996,7 +1045,7 @@ class KbContractToolsTest < Minitest::Test
         RECONCILE,
         '--source', source,
         '--code-root', code_root,
-        '--article', 'guide',
+        '--page-key', 'guide',
         '--base', base,
         '--adopt',
         '--yes'
@@ -1020,7 +1069,7 @@ class KbContractToolsTest < Minitest::Test
         RECONCILE,
         '--source', source,
         '--code-root', code_root,
-        '--article', 'guide',
+        '--page-key', 'guide',
         '--base', base
       )
       assert(status.success?, error)
@@ -1044,7 +1093,7 @@ class KbContractToolsTest < Minitest::Test
         RECONCILE,
         '--source', source,
         '--code-root', code_root,
-        '--article', 'guide',
+        '--page-key', 'guide',
         '--base', base
       )
       refute(status.success?)
@@ -1053,7 +1102,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_build_bootstraps_a_new_managed_article_with_guarded_hashes
+  def test_build_bootstraps_a_new_managed_page_with_guarded_hashes
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       candidate = File.join(dir, 'kb-candidates')
@@ -1063,10 +1112,10 @@ class KbContractToolsTest < Minitest::Test
       write_managed_contract(code_root)
       write_managed_pages(code_root, "<page>manuals:test</page>\nCanonical Czech.\n", "Canonical English.\n")
       run_git(code_root, 'add', 'contract', 'tests')
-      run_git(code_root, 'commit', '-m', 'Add managed article fixture')
+      run_git(code_root, 'commit', '-m', 'Add managed page fixture')
       plan = write_managed_plan(dir)
       data = YAML.safe_load_file(plan)
-      data.fetch('managed_articles').first['bootstrap'] = source_hashes(source)
+      data.fetch('managed_pages').first['bootstrap'] = source_hashes(source)
       File.write(plan, YAML.dump(data))
 
       _output, error, status = Open3.capture3(
@@ -1098,10 +1147,10 @@ class KbContractToolsTest < Minitest::Test
         "Canonical English.\n"
       )
       run_git(code_root, 'add', 'contract', 'tests')
-      run_git(code_root, 'commit', '-m', 'Add managed article fixture')
+      run_git(code_root, 'commit', '-m', 'Add managed page fixture')
       plan = write_managed_plan(dir)
       data = YAML.safe_load_file(plan)
-      data.fetch('managed_articles').first['bootstrap'] = source_hashes(source)
+      data.fetch('managed_pages').first['bootstrap'] = source_hashes(source)
       File.write(plan, YAML.dump(data))
 
       _output, error, status = Open3.capture3(
@@ -1124,7 +1173,7 @@ class KbContractToolsTest < Minitest::Test
       )
 
       manifest_path = File.join(dir, 'kb-release-en.yml')
-      run_manifest(source, candidate, 'en', 'Publish managed guide', manifest_path)
+      run_managed_manifest(source, candidate, 'en', 'Publish managed guide', manifest_path)
       manifest_page = YAML.safe_load_file(manifest_path).fetch('pages').first
       assert_equal('create', manifest_page.fetch('policy'))
       refute(manifest_page.key?('source_revision'))
@@ -1193,25 +1242,25 @@ class KbContractToolsTest < Minitest::Test
       "Use Edit profile.\n"
     )
     run_git(root, 'add', 'contract', 'tests')
-    run_git(root, 'commit', '-m', 'Add managed article fixture')
+    run_git(root, 'commit', '-m', 'Add managed page fixture')
     run_git(root, 'rev-parse', 'HEAD').strip
   end
 
   def write_managed_contract(root)
-    path = File.join(root, 'contract/articles.yml')
+    path = File.join(root, 'contract/pages.yml')
     FileUtils.mkdir_p(File.dirname(path))
     File.write(
       path,
       YAML.dump(
-        'schema' => 1,
+        'schema' => 2,
         'repository' => 'vpsfreecz/vpsfree-kb-contracts',
-        'articles' => {
+        'pages' => {
           'guide' => {
             'test' => {
               'suite' => 'kb/guide',
               'source' => 'tests/suite/kb/guide.nix'
             },
-            'pages' => {
+            'variants' => {
               'cs' => {
                 'id' => 'navody:test',
                 'counterpart' => 'manuals:test',
@@ -1244,9 +1293,9 @@ class KbContractToolsTest < Minitest::Test
     File.write(
       path,
       YAML.dump(
-        'schema' => 4,
+        'schema' => 5,
         'replacements' => [],
-        'managed_articles' => [{ 'id' => 'guide' }],
+        'managed_pages' => [{ 'id' => 'guide' }],
         'exceptions' => []
       )
     )
@@ -1429,6 +1478,27 @@ class KbContractToolsTest < Minitest::Test
       '--output', output
     )
     assert(status.success?, error)
+  end
+
+  def run_managed_manifest(source, candidate, language, summary, output)
+    changes_path = write_managed_changes(candidate, summary, "#{output}.changes.yml")
+    run_changes_manifest(source, candidate, language, changes_path, output)
+  end
+
+  def write_managed_changes(candidate, summary, path)
+    index = JSON.parse(File.read(File.join(candidate, 'index.json')))
+    changes = index.fetch('pages').filter_map do |page|
+      next unless page.fetch('changed')
+
+      {
+        'language' => page.fetch('language'),
+        'id' => page.fetch('id'),
+        'action' => 'write',
+        'summary' => summary
+      }
+    end
+    File.write(path, YAML.dump('schema' => 1, 'changes' => changes))
+    path
   end
 
   def run_changes_manifest(source, candidate, language, changes, output)

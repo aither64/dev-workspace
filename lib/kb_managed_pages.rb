@@ -5,38 +5,38 @@ require 'open3'
 require 'yaml'
 require_relative 'kb_contract_files'
 
-module KbManagedArticles
+module KbManagedPages
   class Error < StandardError; end
 
   COMMIT_OID = /\A[0-9a-f]{40}\z/
-  REGISTRY_PATH = 'contract/articles.yml'
+  REGISTRY_PATH = 'contract/pages.yml'
 
   module_function
 
   def registry(code_root, content: nil)
     path = KbContractFiles.path_within(code_root, REGISTRY_PATH)
     data = content ? YAML.safe_load(content) : YAML.safe_load_file(path)
-    raise Error, 'article contract schema must be 1' unless data.fetch('schema') == 1
-    raise Error, 'article contract must declare its repository' unless data.fetch('repository').is_a?(String)
-    raise Error, 'article contract articles must be a mapping' unless data.fetch('articles').is_a?(Hash)
+    raise Error, 'page contract schema must be 2' unless data.fetch('schema') == 2
+    raise Error, 'page contract must declare its repository' unless data.fetch('repository').is_a?(String)
+    raise Error, 'page contract pages must be a mapping' unless data.fetch('pages').is_a?(Hash)
 
     data
   rescue KeyError => e
-    raise Error, "incomplete article contract: #{e.message}"
+    raise Error, "incomplete page contract: #{e.message}"
   end
 
   def resolve_base!(code_root, base)
     unless base.is_a?(String) && base.match?(COMMIT_OID)
-      raise Error, 'article base must be a full 40-character commit OID'
+      raise Error, 'page base must be a full 40-character commit OID'
     end
 
     output, error, status = Open3.capture3(
       'git', '-C', code_root, 'rev-parse', '--verify', "#{base}^{commit}"
     )
-    raise Error, "invalid article base #{base.inspect}: #{error.strip}" unless status.success?
+    raise Error, "invalid page base #{base.inspect}: #{error.strip}" unless status.success?
 
     resolved = output.strip
-    raise Error, "article base resolved unexpectedly to #{resolved}" unless resolved == base
+    raise Error, "page base resolved unexpectedly to #{resolved}" unless resolved == base
 
     resolved
   end
@@ -45,10 +45,10 @@ module KbManagedArticles
     output, error, status = Open3.capture3(
       'git', '-C', code_root, 'rev-parse', '--verify', 'HEAD^{commit}'
     )
-    raise Error, "unable to resolve article contract HEAD: #{error.strip}" unless status.success?
+    raise Error, "unable to resolve page contract HEAD: #{error.strip}" unless status.success?
 
     resolved = output.strip
-    raise Error, "invalid article contract HEAD #{resolved.inspect}" unless resolved.match?(COMMIT_OID)
+    raise Error, "invalid page contract HEAD #{resolved.inspect}" unless resolved.match?(COMMIT_OID)
 
     resolved
   end
@@ -66,9 +66,9 @@ module KbManagedArticles
     registry_path = KbContractFiles.path_within(code_root, REGISTRY_PATH)
     current_registry = File.read(registry_path, encoding: Encoding::UTF_8)
     committed_registry = git_source(code_root, head_commit, REGISTRY_PATH)
-    raise Error, 'article registry is absent from contract HEAD' unless committed_registry
+    raise Error, 'page registry is absent from contract HEAD' unless committed_registry
     unless current_registry == committed_registry
-      raise Error, 'article registry differs from contract HEAD; commit it before building'
+      raise Error, 'page registry differs from contract HEAD; commit it before building'
     end
     registry_data = registry(code_root, content: current_registry)
 
@@ -82,32 +82,32 @@ module KbManagedArticles
   end
 
   def registered_pages(code_root:, contract:, require_committed:)
-    pages = contract.fetch(:registry).fetch('articles').flat_map do |article_id, article|
-      KbContractFiles.validate_semantic_id!(article_id)
-      article.fetch('pages').map do |language, page|
+    pages = contract.fetch(:registry).fetch('pages').flat_map do |page_key, page_contract|
+      KbContractFiles.validate_semantic_id!(page_key)
+      page_contract.fetch('variants').map do |language, page|
         unless %w[cs en].include?(language)
-          raise Error, "#{article_id}: unknown managed page language #{language.inspect}"
+          raise Error, "#{page_key}: unknown managed page language #{language.inspect}"
         end
 
         page_id = KbContractFiles.validate_page_id!(page.fetch('id'))
         relative = page.fetch('source')
         current_path = KbContractFiles.path_within(code_root, relative)
-        raise Error, "#{article_id}: #{language}: canonical source is missing" unless File.file?(current_path)
+        raise Error, "#{page_key}: #{language}: canonical source is missing" unless File.file?(current_path)
 
         current = File.read(current_path, encoding: Encoding::UTF_8)
         if require_committed
           committed = git_source(code_root, contract.fetch(:head_commit), relative)
-          raise Error, "#{article_id}: #{language}: canonical source is absent from contract HEAD" unless committed
+          raise Error, "#{page_key}: #{language}: canonical source is absent from contract HEAD" unless committed
           unless current == committed
-            raise Error, "#{article_id}: #{language}: canonical source differs from contract HEAD; " \
+            raise Error, "#{page_key}: #{language}: canonical source differs from contract HEAD; " \
                          'commit it before building'
           end
         end
 
         {
-          article: article_id,
+          page_key: page_key,
           language: language,
-          page: page_id,
+          id: page_id,
           source: relative,
           path: current_path,
           current: current,
@@ -116,47 +116,47 @@ module KbManagedArticles
       end
     end
 
-    keys = pages.map { |page| page.values_at(:language, :page) }
-    raise Error, 'duplicate managed page IDs in article registry' unless keys.uniq.length == keys.length
+    keys = pages.map { |page| page.values_at(:language, :id) }
+    raise Error, 'duplicate managed page IDs in page registry' unless keys.uniq.length == keys.length
 
     pages
   rescue KeyError => e
-    raise Error, "incomplete article contract: #{e.message}"
+    raise Error, "incomplete page contract: #{e.message}"
   end
 
   def registered_tests(code_root:, contract:, require_committed:)
-    tests = contract.fetch(:registry).fetch('articles').map do |article_id, article|
-      KbContractFiles.validate_semantic_id!(article_id)
-      test = article.fetch('test')
+    tests = contract.fetch(:registry).fetch('pages').map do |page_key, page_contract|
+      KbContractFiles.validate_semantic_id!(page_key)
+      test = page_contract.fetch('test')
       suite = test.fetch('suite')
       components = suite.split('/', -1) if suite.is_a?(String)
       unless components&.all? do |component|
                component.match?(/\A[a-z0-9][a-z0-9_.-]*\z/) && !%w[. ..].include?(component)
              end
-        raise Error, "#{article_id}: invalid managed test suite #{suite.inspect}"
+        raise Error, "#{page_key}: invalid managed test suite #{suite.inspect}"
       end
 
       relative = test.fetch('source')
       expected_relative = "tests/suite/#{suite}.nix"
       unless relative == expected_relative
         raise Error,
-              "#{article_id}: managed test source must be #{expected_relative}, got #{relative.inspect}"
+              "#{page_key}: managed test source must be #{expected_relative}, got #{relative.inspect}"
       end
       current_path = KbContractFiles.path_within(code_root, relative)
-      raise Error, "#{article_id}: managed test source is missing" unless File.file?(current_path)
+      raise Error, "#{page_key}: managed test source is missing" unless File.file?(current_path)
 
       current = File.binread(current_path)
       if require_committed
         committed = git_source(code_root, contract.fetch(:head_commit), relative)
-        raise Error, "#{article_id}: managed test source is absent from contract HEAD" unless committed
+        raise Error, "#{page_key}: managed test source is absent from contract HEAD" unless committed
         unless current == committed
-          raise Error, "#{article_id}: managed test source differs from contract HEAD; " \
+          raise Error, "#{page_key}: managed test source differs from contract HEAD; " \
                        'commit it before building'
         end
       end
 
       {
-        article: article_id,
+        page_key: page_key,
         pattern: "#{suite}#*",
         source: relative,
         path: current_path,
@@ -165,50 +165,50 @@ module KbManagedArticles
     end
 
     patterns = tests.map { |test| test.fetch(:pattern) }
-    raise Error, 'duplicate managed test patterns in article registry' unless patterns.uniq.length == patterns.length
+    raise Error, 'duplicate managed test patterns in page registry' unless patterns.uniq.length == patterns.length
 
     sources = tests.map { |test| test.fetch(:source) }
-    raise Error, 'duplicate managed test sources in article registry' unless sources.uniq.length == sources.length
+    raise Error, 'duplicate managed test sources in page registry' unless sources.uniq.length == sources.length
 
     tests
   rescue KeyError => e
-    raise Error, "incomplete article contract: #{e.message}"
+    raise Error, "incomplete page contract: #{e.message}"
   end
 
   def reconcile(
-    code_root:, base:, article_id:, wiki_pages:, bootstrap: {},
+    code_root:, base:, page_key:, wiki_pages:, bootstrap: {},
     contract: nil, require_committed: false
   )
     contract ||= contract_provenance(code_root: code_root, base: base)
     base_commit = contract.fetch(:base_commit)
-    article = contract.fetch(:registry).fetch('articles').fetch(article_id) do
-      raise Error, "unknown managed article #{article_id.inspect}"
+    contract.fetch(:registry).fetch('pages').fetch(page_key) do
+      raise Error, "unknown managed page #{page_key.inspect}"
     end
     registered = registered_pages(
       code_root: code_root,
       contract: contract,
       require_committed: require_committed
-    ).select { |page| page.fetch(:article) == article_id }
+    ).select { |page| page.fetch(:page_key) == page_key }
 
     registered.map do |registered_page|
       language = registered_page.fetch(:language)
-      page_id = registered_page.fetch(:page)
+      page_id = registered_page.fetch(:id)
       relative = registered_page.fetch(:source)
       current = registered_page.fetch(:current)
       wiki = wiki_pages.fetch([language, page_id]) do
-        raise Error, "#{article_id}: #{language}: fetched wiki page #{page_id} is missing"
+        raise Error, "#{page_key}: #{language}: fetched wiki page #{page_id} is missing"
       end
       base_content = git_source(code_root, base_commit, relative)
 
       status = if base_content.nil?
                  expected = bootstrap[language]
                  unless expected&.match?(/\A[0-9a-f]{64}\z/)
-                   raise Error, "#{article_id}: #{language}: canonical source is absent at the base; " \
+                   raise Error, "#{page_key}: #{language}: canonical source is absent at the base; " \
                                 'a bootstrap SHA-256 is required'
                  end
                  actual = Digest::SHA256.hexdigest(wiki)
                  unless actual == expected
-                   raise Error, "#{article_id}: #{language}: fetched bootstrap page differs: " \
+                   raise Error, "#{page_key}: #{language}: fetched bootstrap page differs: " \
                                 "expected #{expected}, got #{actual}"
                  end
                  :bootstrap
@@ -223,9 +223,9 @@ module KbManagedArticles
                end
 
       {
-        article: article_id,
+        page_key: page_key,
         language: language,
-        page: page_id,
+        id: page_id,
         source: relative,
         path: registered_page.fetch(:path),
         status: status,
@@ -238,6 +238,6 @@ module KbManagedArticles
       }
     end
   rescue KeyError => e
-    raise Error, "incomplete article contract: #{e.message}"
+    raise Error, "incomplete page contract: #{e.message}"
   end
 end

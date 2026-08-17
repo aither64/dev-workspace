@@ -6,20 +6,20 @@ require 'open3'
 require 'optparse'
 require 'tempfile'
 require_relative '../lib/kb_contract_files'
-require_relative '../lib/kb_managed_articles'
+require_relative '../lib/kb_managed_pages'
 
 options = { adopt: false, yes: false }
 OptionParser.new do |parser|
-  parser.banner = 'Usage: kb-contract-reconcile --source DIR --code-root DIR --article ID --base FULL-OID [--adopt --yes]'
+  parser.banner = 'Usage: kb-contract-reconcile --source DIR --code-root DIR --page-key KEY --base FULL-OID [--adopt --yes]'
   parser.on('--source DIR') { |value| options[:source] = File.expand_path(value) }
   parser.on('--code-root DIR') { |value| options[:code_root] = File.expand_path(value) }
-  parser.on('--article ID') { |value| options[:article] = value }
+  parser.on('--page-key KEY') { |value| options[:page_key] = value }
   parser.on('--base FULL-OID') { |value| options[:base] = value }
   parser.on('--adopt') { options[:adopt] = true }
   parser.on('--yes') { options[:yes] = true }
 end.parse!
 abort 'unexpected arguments' unless ARGV.empty?
-%i[source code_root article base].each do |key|
+%i[source code_root page_key base].each do |key|
   abort "--#{key.to_s.tr('_', '-')} is required" unless options[key]
 end
 abort '--adopt requires --yes' if options[:adopt] && !options[:yes]
@@ -41,18 +41,18 @@ abort 'duplicate source page IDs' unless keys.uniq.length == keys.length
 wiki_pages = wiki_page_entries.to_h
 
 begin
-  results = KbManagedArticles.reconcile(
+  results = KbManagedPages.reconcile(
     code_root: options.fetch(:code_root),
     base: options.fetch(:base),
-    article_id: options.fetch(:article),
+    page_key: options.fetch(:page_key),
     wiki_pages: wiki_pages
   )
-rescue KbManagedArticles::Error => e
+rescue KbManagedPages::Error => e
   abort e.message
 end
 
 results.each do |result|
-  puts "#{result.fetch(:language)}:#{result.fetch(:page)} #{result.fetch(:status).to_s.tr('_', '-')}"
+  puts "#{result.fetch(:language)}:#{result.fetch(:id)} #{result.fetch(:status).to_s.tr('_', '-')}"
 end
 
 conflicts = results.select { |result| result.fetch(:status) == :conflict }
@@ -70,18 +70,18 @@ unless conflicts.empty?
       files.fetch(:base).path,
       files.fetch(:wiki).path
     )
-    warn "Three-way conflict for #{result.fetch(:language)}:#{result.fetch(:page)}:"
+    warn "Three-way conflict for #{result.fetch(:language)}:#{result.fetch(:id)}:"
     warn output
   ensure
     files&.each_value(&:unlink)
   end
-  abort 'managed article has concurrent Git and wiki edits; merge them manually'
+  abort 'managed page has concurrent Git and wiki edits; merge them manually'
 end
 
 wiki_only = results.select { |result| result.fetch(:status) == :wiki_only }
 unless options[:adopt]
   unless wiki_only.empty?
-    abort 'managed article has wiki-only edits; rerun with --adopt --yes to import them'
+    abort 'managed page has wiki-only edits; rerun with --adopt --yes to import them'
   end
   exit
 end
@@ -93,5 +93,5 @@ end
 
 wiki_only.each do |result|
   File.write(result.fetch(:path), result.fetch(:wiki))
-  puts "Adopted #{result.fetch(:language)}:#{result.fetch(:page)} into #{result.fetch(:source)}"
+  puts "Adopted #{result.fetch(:language)}:#{result.fetch(:id)} into #{result.fetch(:source)}"
 end
