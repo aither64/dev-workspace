@@ -16,6 +16,8 @@ module KbRelease
   MANAGED_REPOSITORY = 'vpsfreecz/vpsfree-kb-contracts'
 
   class Manifest
+    LEGACY_PAGE_KEY_FIELD = 'article'
+
     attr_reader :path, :data
 
     def initialize(path)
@@ -72,8 +74,13 @@ module KbRelease
       contract.fetch('pages') + contract.fetch('tests', [])
     end
 
+    def contract_page_key(entry)
+      field = data.fetch('schema') >= 5 ? 'page_key' : LEGACY_PAGE_KEY_FIELD
+      entry.fetch(field)
+    end
+
     def per_page_summaries?
-      data.fetch('schema') == 4
+      data.fetch('schema') >= 4
     end
 
     def production_summary
@@ -118,13 +125,13 @@ module KbRelease
     private
 
     def validate!
-      unless [1, 2, 3, 4].include?(data['schema'])
-        raise Error, 'release manifest schema must be 1, 2, 3 or 4'
+      unless [1, 2, 3, 4, 5].include?(data['schema'])
+        raise Error, 'release manifest schema must be 1, 2, 3, 4 or 5'
       end
       raise Error, 'release wiki must be cz or org' unless %w[cz org].include?(data['wiki'])
 
-      if data['schema'] == 4
-        raise Error, 'schema 4 uses per-page summaries' if data.key?('production_summary')
+      if data['schema'] >= 4
+        raise Error, "schema #{data['schema']} uses per-page summaries" if data.key?('production_summary')
       elsif data['schema'] >= 2 || data.key?('production_summary')
         summary = data.fetch('production_summary')
         validate_summary!(summary, 'production summary')
@@ -159,7 +166,7 @@ module KbRelease
           validate_summary!(entry.fetch('summary'), "deletion summary for #{entry.fetch('id')}")
         end
       elsif data.key?('deletions') && !data.fetch('deletions').empty?
-        raise Error, 'page deletions require release manifest schema 4'
+        raise Error, 'page deletions require release manifest schema 4 or 5'
       end
       validate_contract! if data.key?('contract')
       media.each do |entry|
@@ -210,9 +217,9 @@ module KbRelease
       raise Error, 'duplicate release contract page IDs' unless ids.uniq.length == ids.length
       release_pages = pages.to_h { |page| [page.fetch('id'), page] }
       contract_pages.each do |page|
-        article = page.fetch('article')
-        unless article.is_a?(String) && article.match?(/\A[a-z0-9][a-z0-9-]*\z/)
-          raise Error, "invalid release contract article #{article.inspect}"
+        page_key = contract_page_key(page)
+        unless page_key.is_a?(String) && page_key.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+          raise Error, "invalid release contract page key #{page_key.inspect}"
         end
         validate_relative_path!(page.fetch('source'), 'release contract source')
         sha256 = page.fetch('sha256')
@@ -231,10 +238,10 @@ module KbRelease
 
       contract_tests = contract.fetch('tests')
       raise Error, 'release contract tests must be a list' unless contract_tests.is_a?(Array)
-      articles = contract_tests.map do |test|
-        article = test.fetch('article')
-        unless article.is_a?(String) && article.match?(/\A[a-z0-9][a-z0-9-]*\z/)
-          raise Error, "invalid release contract test article #{article.inspect}"
+      test_page_keys = contract_tests.map do |test|
+        page_key = contract_page_key(test)
+        unless page_key.is_a?(String) && page_key.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+          raise Error, "invalid release contract test page key #{page_key.inspect}"
         end
         pattern = test.fetch('pattern')
         suite = pattern.delete_suffix('#*') if pattern.is_a?(String) && pattern.end_with?('#*')
@@ -249,17 +256,19 @@ module KbRelease
           raise Error,
                 "release contract test source must be #{expected_source}, got #{source.inspect}"
         end
-        validate_digest!(test.fetch('sha256'), "release contract test #{article}")
-        article
+        validate_digest!(test.fetch('sha256'), "release contract test #{page_key}")
+        page_key
       end
-      raise Error, 'duplicate release contract test articles' unless articles.uniq.length == articles.length
+      unless test_page_keys.uniq.length == test_page_keys.length
+        raise Error, 'duplicate release contract test page keys'
+      end
       patterns = contract_tests.map { |test| test.fetch('pattern') }
       raise Error, 'duplicate release contract test patterns' unless patterns.uniq.length == patterns.length
       sources = contract_tests.map { |test| test.fetch('source') }
       raise Error, 'duplicate release contract test sources' unless sources.uniq.length == sources.length
-      page_articles = contract_pages.map { |page| page.fetch('article') }.uniq
-      unless page_articles.sort == articles.sort
-        raise Error, 'release contract tests must cover every managed article exactly once'
+      covered_page_keys = contract_pages.map { |page| contract_page_key(page) }.uniq
+      unless covered_page_keys.sort == test_page_keys.sort
+        raise Error, 'release contract tests must cover every managed page exactly once'
       end
     end
 
@@ -297,11 +306,11 @@ module KbRelease
                 "expected #{expected}, got #{actual}"
         end
 
-        [entry.fetch('article'), entry['pattern'], source_url(repository, ref, source)]
+        [manifest.contract_page_key(entry), entry['pattern'], source_url(repository, ref, source)]
       end
       @out.puts("verified managed repository #{repository}@#{ref}")
-      rows.each do |article, pattern, url|
-        label = pattern ? "test #{pattern}" : "article #{article}"
+      rows.each do |page_key, pattern, url|
+        label = pattern ? "test #{pattern}" : "page #{page_key}"
         @out.puts("  #{label}: #{url}")
       end
       rows
@@ -813,7 +822,7 @@ module KbRelease
     end
 
     def verify_entry_summary!(wiki, entry)
-      raise Error, 'revision history reader is required for schema 4' unless @revision_history
+      raise Error, 'revision history reader is required for schema 4 or 5' unless @revision_history
 
       @revision_history.verify!(wiki, entry.fetch('id'), entry.fetch('summary'))
     rescue Error => e

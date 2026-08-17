@@ -334,17 +334,18 @@ class KbStageTest < Minitest::Test
       File.write(File.join(release_dir, 'page.txt'), content)
       manifest_path = File.join(release_dir, 'release.yml')
       manifest = {
-        'schema' => 3,
+        'schema' => 5,
         'wiki' => 'cz',
-        'production_summary' => 'Publish managed guide',
         'pages' => [{
           'id' => 'navody:vps:kvm',
           'source_revision' => 123,
           'source_sha256' => Digest::SHA256.hexdigest("source\n"),
           'file' => 'page.txt',
-          'sha256' => sha256
+          'sha256' => sha256,
+          'summary' => 'Publish managed guide'
         }],
         'media' => [],
+        'deletions' => [],
         'contract' => {
           'repository' => 'vpsfreecz/vpsfree-kb-contracts',
           'base_commit' => '1' * 40,
@@ -352,7 +353,7 @@ class KbStageTest < Minitest::Test
           'registry_sha256' => '3' * 64,
           'pages' => [{
             'id' => 'navody:vps:kvm',
-            'article' => 'kvm',
+            'page_key' => 'kvm',
             'source' => 'contract/pages/navody-vps-kvm.txt',
             'sha256' => '4' * 64
           }]
@@ -365,7 +366,7 @@ class KbStageTest < Minitest::Test
 
       manifest.fetch('contract').fetch('pages').first['sha256'] = sha256
       manifest.fetch('contract')['tests'] = [{
-        'article' => 'kvm',
+        'page_key' => 'kvm',
         'pattern' => 'kb/kvm#*',
         'source' => 'tests/suite/kb/kvm.nix',
         'sha256' => '5' * 64
@@ -393,6 +394,26 @@ class KbStageTest < Minitest::Test
     end
   end
 
+  def test_schema_four_managed_contract_remains_readable
+    Dir.mktmpdir do |release_dir|
+      manifest_path = write_managed_release_manifest(release_dir)
+      manifest = YAML.safe_load_file(manifest_path)
+      manifest['schema'] = 4
+      manifest.fetch('contract').fetch('pages').each do |page|
+        page['article'] = page.delete('page_key')
+      end
+      manifest.fetch('contract').fetch('tests').each do |test|
+        test['article'] = test.delete('page_key')
+      end
+      File.write(manifest_path, YAML.dump(manifest))
+
+      parsed = KbRelease::Manifest.new(manifest_path)
+
+      assert_equal('kvm', parsed.contract_page_key(parsed.contract.fetch('pages').first))
+      assert_equal('kvm', parsed.contract_page_key(parsed.contract.fetch('tests').first))
+    end
+  end
+
   def test_managed_repository_verifies_exact_ref_content_and_reports_links
     Dir.mktmpdir do |release_dir|
       content = "candidate\n"
@@ -403,17 +424,18 @@ class KbStageTest < Minitest::Test
       File.write(
         manifest_path,
         YAML.dump(
-          'schema' => 3,
+          'schema' => 5,
           'wiki' => 'cz',
-          'production_summary' => 'Publish managed guide',
           'pages' => [{
             'id' => 'navody:vps:kvm',
             'source_revision' => 123,
             'source_sha256' => Digest::SHA256.hexdigest("source\n"),
             'file' => 'page.txt',
-            'sha256' => Digest::SHA256.hexdigest(content)
+            'sha256' => Digest::SHA256.hexdigest(content),
+            'summary' => 'Publish managed guide'
           }],
           'media' => [],
+          'deletions' => [],
           'contract' => {
             'repository' => 'vpsfreecz/vpsfree-kb-contracts',
             'base_commit' => '1' * 40,
@@ -421,12 +443,12 @@ class KbStageTest < Minitest::Test
             'registry_sha256' => '3' * 64,
             'pages' => [{
               'id' => 'navody:vps:kvm',
-              'article' => 'kvm',
+              'page_key' => 'kvm',
               'source' => 'contract/pages/navody-vps-kvm.txt',
               'sha256' => Digest::SHA256.hexdigest(content)
             }],
             'tests' => [{
-              'article' => 'kvm',
+              'page_key' => 'kvm',
               'pattern' => 'kb/kvm#*',
               'source' => 'tests/suite/kb/kvm.nix',
               'sha256' => Digest::SHA256.hexdigest(test_source)
@@ -514,6 +536,9 @@ class KbStageTest < Minitest::Test
             end
           end,
           managed_repository: repository,
+          revision_history: FakeRevisionHistory.new(
+            ['cz-staging', 'navody:vps:kvm'] => 'Publish managed guide'
+          ),
           out: StringIO.new
         )
 
@@ -1596,17 +1621,18 @@ class KbStageTest < Minitest::Test
     File.write(
       manifest_path,
       YAML.dump(
-        'schema' => 3,
+        'schema' => 5,
         'wiki' => 'cz',
-        'production_summary' => 'Publish managed guide',
         'pages' => [{
           'id' => 'navody:vps:kvm',
           'source_revision' => 123,
           'source_sha256' => Digest::SHA256.hexdigest("source\n"),
           'file' => 'page.txt',
-          'sha256' => Digest::SHA256.hexdigest(candidate)
+          'sha256' => Digest::SHA256.hexdigest(candidate),
+          'summary' => 'Publish managed guide'
         }],
         'media' => [],
+        'deletions' => [],
         'contract' => {
           'repository' => 'vpsfreecz/vpsfree-kb-contracts',
           'base_commit' => '1' * 40,
@@ -1614,12 +1640,12 @@ class KbStageTest < Minitest::Test
           'registry_sha256' => '3' * 64,
           'pages' => [{
             'id' => 'navody:vps:kvm',
-            'article' => 'kvm',
+            'page_key' => 'kvm',
             'source' => 'contract/pages/navody-vps-kvm.txt',
             'sha256' => Digest::SHA256.hexdigest(candidate)
           }],
           'tests' => [{
-            'article' => 'kvm',
+            'page_key' => 'kvm',
             'pattern' => 'kb/kvm#*',
             'source' => 'tests/suite/kb/kvm.nix',
             'sha256' => '4' * 64
