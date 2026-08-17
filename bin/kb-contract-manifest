@@ -136,7 +136,6 @@ end
 
 managed_contract_pages = []
 managed_contract_tests = []
-managed_contract_has_tests = false
 managed_pages_by_key = {}
 if managed_contract
   %w[base_commit head_commit registry_sha256].each do |key|
@@ -167,8 +166,10 @@ if managed_contract
     abort 'duplicate managed contract page IDs'
   end
 
-  managed_contract_has_tests = managed_contract.key?('tests')
-  managed_contract_tests = managed_contract.fetch('tests', [])
+  unless managed_contract.key?('tests')
+    abort 'schema 5 managed candidates require test provenance'
+  end
+  managed_contract_tests = managed_contract.fetch('tests')
   abort 'managed contract tests must be a list' unless managed_contract_tests.is_a?(Array)
   test_page_keys = managed_contract_tests.map do |test|
     page_key = KbContractFiles.validate_semantic_id!(test.fetch('page_key'))
@@ -197,7 +198,7 @@ if managed_contract
   test_sources = managed_contract_tests.map { |test| test.fetch('source') }
   abort 'duplicate managed contract test sources' unless test_sources.uniq.length == test_sources.length
   covered_page_keys = managed_contract_pages.map { |page| page.fetch('page_key') }.uniq
-  unless managed_contract_tests.empty? || covered_page_keys.sort == test_page_keys.sort
+  unless covered_page_keys.sort == test_page_keys.sort
     abort 'managed contract tests must cover every registered page key exactly once'
   end
   contract_pages_by_key = managed_contract_pages.to_h do |page|
@@ -374,10 +375,8 @@ contract_manifest = if managed_contract
                           'registry_sha256' => managed_contract.fetch('registry_sha256'),
                           'pages' => selected_pages
                         }
-                        if managed_contract_has_tests
-                          result['tests'] = managed_contract_tests.select do |test|
-                            selected_page_keys.include?(test.fetch('page_key'))
-                          end
+                        result['tests'] = managed_contract_tests.select do |test|
+                          selected_page_keys.include?(test.fetch('page_key'))
                         end
                         result
                       end

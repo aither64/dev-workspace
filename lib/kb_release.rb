@@ -234,7 +234,13 @@ module KbRelease
         end
       end
 
-      return unless contract.key?('tests')
+      unless contract.key?('tests')
+        if data.fetch('schema') >= 5
+          raise Error, 'schema 5 managed contracts require test provenance'
+        end
+
+        return
+      end
 
       contract_tests = contract.fetch('tests')
       raise Error, 'release contract tests must be a list' unless contract_tests.is_a?(Array)

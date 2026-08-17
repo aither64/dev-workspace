@@ -811,7 +811,7 @@ class KbContractToolsTest < Minitest::Test
     end
   end
 
-  def test_manifest_preserves_legacy_candidate_without_test_provenance
+  def test_manifest_rejects_schema_five_candidate_without_test_provenance
     Dir.mktmpdir do |dir|
       source = File.join(dir, 'kb-sources')
       candidate = File.join(dir, 'kb-candidates')
@@ -834,13 +834,19 @@ class KbContractToolsTest < Minitest::Test
       index = JSON.parse(File.read(index_path))
       index.fetch('managed_contract').delete('tests')
       File.write(index_path, JSON.pretty_generate(index))
-      manifest_path = File.join(dir, 'kb-release-cs.yml')
+      changes = write_managed_changes(candidate, 'Publish managed guide', File.join(dir, 'changes.yml'))
 
-      run_managed_manifest(source, candidate, 'cs', 'Publish managed guide', manifest_path)
+      _output, error, status = Open3.capture3(
+        MANIFEST,
+        '--source', source,
+        '--candidate', candidate,
+        '--language', 'cs',
+        '--changes', changes,
+        '--output', File.join(dir, 'kb-release-cs.yml')
+      )
 
-      manifest_data = YAML.safe_load_file(manifest_path)
-      refute(manifest_data.fetch('contract').key?('tests'))
-      assert_instance_of(KbRelease::Manifest, KbRelease::Manifest.new(manifest_path))
+      refute(status.success?)
+      assert_match(/schema 5 managed candidates require test provenance/, error)
     end
   end
 

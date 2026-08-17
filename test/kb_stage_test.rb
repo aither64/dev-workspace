@@ -365,6 +365,10 @@ class KbStageTest < Minitest::Test
       assert_match(/contract checksum differs/, error.message)
 
       manifest.fetch('contract').fetch('pages').first['sha256'] = sha256
+      File.write(manifest_path, YAML.dump(manifest))
+      error = assert_raises(KbRelease::Error) { KbRelease::Manifest.new(manifest_path) }
+      assert_match(/schema 5 managed contracts require test provenance/, error.message)
+
       manifest.fetch('contract')['tests'] = [{
         'page_key' => 'kvm',
         'pattern' => 'kb/kvm#*',
@@ -411,6 +415,28 @@ class KbStageTest < Minitest::Test
 
       assert_equal('kvm', parsed.contract_page_key(parsed.contract.fetch('pages').first))
       assert_equal('kvm', parsed.contract_page_key(parsed.contract.fetch('tests').first))
+    end
+  end
+
+  def test_legacy_managed_contract_without_test_provenance_remains_readable
+    [3, 4].each do |schema|
+      Dir.mktmpdir do |release_dir|
+        manifest_path = write_managed_release_manifest(release_dir)
+        manifest = YAML.safe_load_file(manifest_path)
+        manifest['schema'] = schema
+        manifest.fetch('contract').fetch('pages').each do |page|
+          page['article'] = page.delete('page_key')
+        end
+        manifest.fetch('contract').delete('tests')
+        if schema == 3
+          manifest['production_summary'] = 'Publish managed guide'
+          manifest.delete('deletions')
+          manifest.fetch('pages').each { |page| page.delete('summary') }
+        end
+        File.write(manifest_path, YAML.dump(manifest))
+
+        assert_instance_of(KbRelease::Manifest, KbRelease::Manifest.new(manifest_path))
+      end
     end
   end
 
