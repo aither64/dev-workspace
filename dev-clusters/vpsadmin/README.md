@@ -156,122 +156,23 @@ to print the CA certificate path and fingerprint for browser trust setup.
 
 ## Email
 
-Outgoing vpsAdmin notification e-mail is captured by Mailpit on the services
-VM. The Mailpit UI is exposed through the services nginx frontend at the HTTPS
-URL printed by `devcluster urls`, currently
+Outgoing vpsAdmin mail is captured by Mailpit in the mailer container. The
+Mailpit UI is exposed through the services nginx frontend at the HTTPS URL
+printed by `devcluster urls`, currently
 `https://mailpit.aitherdev.int.vpsfree.cz/`, and is protected with the
 configured development basic-auth credentials. The raw Mailpit HTTP listener is
 bound to `127.0.0.1` inside the services VM.
 
-If `worktrees/<slug>/vpsfree-notification-templates` exists, its templates are
-copied into the Nix closure and installed as managed notification templates by
-the API service. Re-run:
+If `worktrees/<slug>/vpsfree-mail-templates` exists, its templates are copied
+into the Nix closure and installed by the services seed. Re-run:
 
 ```sh
 dev-clusters/vpsadmin/bin/devcluster update <slug> services
 ```
 
-after changing template files. Runtime virtiofs mounts cannot be added to an
-already-running VM, so templates are intentionally closure-copied instead of
-mounted live.
-
-## Webhook Test Server
-
-The services VM runs `vpsadmin-webhook-test-server.service` for notification
-webhook testing. Use `http://127.0.0.1:18080/events` as the webhook URL from
-vpsAdmin. The latest request is written to
-`/tmp/vpsadmin-webhook-test/request.json` inside the services VM.
-
-## SMS
-
-The services VM runs `vpsfree-sms-gateway.service` with the gateway's fake
-driver when the selected vpsAdmin checkout supports SMS notifications. vpsAdmin
-uses `http://127.0.0.1:9876/v1/sms` as its SMS gateway, and the SMS dispatcher
-is enabled by default. The seeded dev users have SMS notifications enabled so
-receiver actions can be created and verified without production GSM modems.
-
-The fake gateway stores its SQLite database in
-`/var/lib/vpsfree-sms-gateway/gateway.db` inside the services VM. Inbound SMS
-persistence is disabled by default. To disable the gateway, edit the cluster
-config:
-
-Inspect sent and queued fake-driver SMSes with `vpsfree-sms-gatewayctl`:
-
-```sh
-bin/devcluster ssh <slug> services -- vpsfree-sms-gatewayctl stats
-bin/devcluster ssh <slug> services -- \
-  vpsfree-sms-gatewayctl outbound list --source vpsadmin
-```
-
-Sent fake-driver SMSes show up as `sent` outbound messages with a `fake-*`
-provider ID.
-
-```json
-{
-  "sms": {
-    "enable": false
-  }
-}
-```
-
-To opt into inbound persistence, keep the gateway enabled and set:
-
-```json
-{
-  "sms": {
-    "inbound": {
-      "enable": true,
-      "webhooks": []
-    }
-  }
-}
-```
-
-## Telegram
-
-Telegram notifications are enabled only when a bot token file exists on the
-host:
-
-```sh
-mkdir -p .dev-clusters/vpsadmin/telegram
-printf '%s\n' '<bot-token>' > .dev-clusters/vpsadmin/telegram/bot-token
-printf '%s\n' 'vpsadmin_aitherdev_bot' > .dev-clusters/vpsadmin/telegram/bot-username
-chmod 0600 .dev-clusters/vpsadmin/telegram/bot-token
-```
-
-`devcluster update <slug> services` copies the token into the services VM and
-enables Telegram for the API, notification dispatcher, and Telegram receiver
-services. Re-run it after creating, changing, or removing the token file in an
-already-running cluster. When the token file exists before a fresh cluster is
-started, startup automatically performs the services update after the cluster
-becomes ready.
-
-The bot username is not secret. It is used to show pairing links in vpsAdmin,
-for example `https://t.me/vpsadmin_aitherdev_bot?start=<token>`. If you use a
-different development bot, replace `vpsadmin_aitherdev_bot` with the username
-shown by BotFather, without the leading `@`. BotFather shows it after bot
-creation as the final `_bot` username and in the `t.me/<username>` link.
-
-The default receive mode is polling. To test webhook mode, add this to the
-cluster config:
-
-```json
-{
-  "telegram": {
-    "receiveMode": "webhook"
-  }
-}
-```
-
-Webhook mode also needs a secret token:
-
-```sh
-openssl rand -hex 32 > .dev-clusters/vpsadmin/telegram/webhook-secret
-chmod 0600 .dev-clusters/vpsadmin/telegram/webhook-secret
-```
-
-The dev cluster registers the webhook URL on the API domain at
-`https://api.aitherdev.int.vpsfree.cz/_telegram/webhook`.
+after changing template files or the cluster mail seed config. Runtime virtiofs
+mounts cannot be added to an already-running VM, so templates are intentionally
+closure-copied instead of mounted live.
 
 ## Database Browser
 

@@ -10,10 +10,6 @@
       inputs.vpsadmin.follows = "vpsadmin";
       inputs.vpsadminos.follows = "vpsadminos";
     };
-    vpsfreeSmsGateway = {
-      url = "github:vpsfreecz/vpsfree-sms-gateway/2026-06-15-vpsadmin-events";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     nixpkgs.follows = "vpsadminos/nixpkgs";
   };
 
@@ -24,7 +20,6 @@
       vpsadmin,
       vpsadminos,
       vpsfStatus,
-      vpsfreeSmsGateway,
     }:
     let
       system = "x86_64-linux";
@@ -53,12 +48,10 @@
       vpsadminosRevisionDirty = env "VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY" "0" == "1";
       haveapiSourcePath = env "VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE" "";
       configSourcePath = env "VPSADMIN_DEVCLUSTER_CONFIG_SOURCE" "";
-      notificationTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_NOTIFICATION_TEMPLATES_SOURCE" "";
+      mailTemplatesSourcePath = env "VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE" "";
       webSourcePath = env "VPSADMIN_DEVCLUSTER_WEB_SOURCE" "";
       vpsfStatusSourcePath = env "VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE" "";
       vpsadminGoClientSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE" "";
-      telegramSecretsSourcePath = env "VPSADMIN_DEVCLUSTER_TELEGRAM_SECRETS" "";
-      telegramEnable = env "VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE" "0";
       sharedRunnerLib = builtins.path {
         path = "${workspace}/dev-clusters/lib";
         name = "devcluster-runner-lib";
@@ -77,7 +70,6 @@
           vpsadmin
           vpsadminos
           vpsfStatus
-          vpsfreeSmsGateway
           workspace
           slug
           topology
@@ -94,12 +86,10 @@
           vpsadminosRevisionDirty
           haveapiSourcePath
           configSourcePath
-          notificationTemplatesSourcePath
+          mailTemplatesSourcePath
           webSourcePath
           vpsfStatusSourcePath
           vpsadminGoClientSourcePath
-          telegramEnable
-          telegramSecretsSourcePath
           ;
       };
 

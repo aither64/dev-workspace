@@ -6,8 +6,6 @@ CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE="$(cd -- "$CLUSTER_DIR/../.." && pwd)"
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadmin"
 CERT_DIR="$STATE_ROOT/certs/default"
-TELEGRAM_DIR="$STATE_ROOT/telegram"
-TELEGRAM_VM_DIR="/var/lib/vpsadmin/devcluster-telegram"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
@@ -592,7 +590,7 @@ nix_common_env() {
   local vpsadminos_path="$5"
   local haveapi_path="$6"
   local config_path="$7"
-  local notification_templates_path="$8"
+  local mail_templates_path="$8"
   local web_path="$9"
   local vpsf_status_path="${10}"
   local vpsadmin_go_client_path="${11}"
@@ -617,17 +615,10 @@ nix_common_env() {
   VPSADMIN_DEVCLUSTER_VPSADMINOS_DIRTY="$(source_dirty "$vpsadminos_path")"
   export VPSADMIN_DEVCLUSTER_HAVEAPI_SOURCE="$haveapi_path"
   export VPSADMIN_DEVCLUSTER_CONFIG_SOURCE="$config_path"
-  export VPSADMIN_DEVCLUSTER_NOTIFICATION_TEMPLATES_SOURCE="$notification_templates_path"
+  export VPSADMIN_DEVCLUSTER_MAIL_TEMPLATES_SOURCE="$mail_templates_path"
   export VPSADMIN_DEVCLUSTER_WEB_SOURCE="$web_path"
   export VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE="$vpsf_status_path"
   export VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE="$vpsadmin_go_client_path"
-  mkdir -p "$TELEGRAM_DIR"
-  export VPSADMIN_DEVCLUSTER_TELEGRAM_SECRETS="$TELEGRAM_DIR"
-  if [ -f "$TELEGRAM_DIR/bot-token" ] && cluster_running "$slug"; then
-    export VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE=1
-  else
-    export VPSADMIN_DEVCLUSTER_TELEGRAM_ENABLE=0
-  fi
 }
 
 nix_overrides() {
@@ -635,7 +626,6 @@ nix_overrides() {
   local vpsadmin_path="$2"
   local vpsadminos_input_value="$3"
   local vpsf_status_path="$4"
-  local sms_gateway_path="$5"
 
   printf '%s\0%s\0' --override-input vpsadmin
   printf 'path:%s\0' "$vpsadmin_path"
@@ -645,11 +635,6 @@ nix_overrides() {
   if [ -n "$vpsf_status_path" ]; then
     printf '%s\0%s\0' --override-input vpsfStatus
     printf 'path:%s\0' "$vpsf_status_path"
-  fi
-
-  if [ -n "$sms_gateway_path" ]; then
-    printf '%s\0%s\0' --override-input vpsfreeSmsGateway
-    printf 'path:%s\0' "$sms_gateway_path"
   fi
 }
 
@@ -662,11 +647,10 @@ build_config() {
   local vpsadminos_path
   local haveapi_path
   local config_source_path
-  local notification_templates_path
+  local mail_templates_path
   local web_path
   local vpsf_status_path
   local vpsadmin_go_client_path
-  local sms_gateway_path
   local vpsadminos_input_value
 
   dir="$(cluster_dir "$slug")"
@@ -677,23 +661,22 @@ build_config() {
   vpsadminos_path="$(slug_optional_path "$slug" vpsadminos || true)"
   haveapi_path="$(slug_optional_path "$slug" haveapi || true)"
   config_source_path="$(slug_optional_path "$slug" vpsfree-cz-configuration || true)"
-  notification_templates_path="$(slug_optional_path "$slug" vpsfree-notification-templates || true)"
+  mail_templates_path="$(slug_optional_path "$slug" vpsfree-mail-templates || true)"
   web_path="$(slug_optional_path "$slug" web || true)"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
   vpsadmin_go_client_path="$(slug_optional_path "$slug" vpsadmin-go-client || true)"
-  sms_gateway_path="$(slug_optional_path "$slug" vpsfree-sms-gateway || true)"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
 
   if [ -z "$vpsadminos_path" ]; then
     vpsadminos_path=""
   fi
 
-  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$notification_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path"
+  nix_common_env "$slug" "$topology" "$network" "$vpsadmin_path" "$vpsadminos_path" "$haveapi_path" "$config_source_path" "$mail_templates_path" "$web_path" "$vpsf_status_path" "$vpsadmin_go_client_path"
 
   local -a overrides=()
   while IFS= read -r -d '' item; do
     overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$sms_gateway_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
 
   nix build \
     --impure \
@@ -709,16 +692,6 @@ ssh_opts() {
 
   if [ -n "$machine" ] && [ "$(cluster_network "$slug")" = "local" ]; then
     printf ' -p %s' "$(machine_ssh_port "$slug" "$machine")"
-  fi
-}
-
-scp_opts() {
-  local slug="$1"
-  local machine="${2:-}"
-  printf -- '-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR' "$SSH_KEY"
-
-  if [ -n "$machine" ] && [ "$(cluster_network "$slug")" = "local" ]; then
-    printf ' -P %s' "$(machine_ssh_port "$slug" "$machine")"
   fi
 }
 
@@ -741,47 +714,6 @@ ssh_cmd() {
   host="$(machine_host "$slug" "$machine")"
   # shellcheck disable=SC2046
   ssh $(ssh_opts "$slug" "$machine") "root@$host" "$@"
-}
-
-sync_telegram_secret_file() {
-  local slug="$1"
-  local host="$2"
-  local source="$3"
-  local target="$4"
-  local tmp="${target}.tmp"
-
-  if [ -f "$source" ]; then
-    # shellcheck disable=SC2046
-    scp $(scp_opts "$slug" services) "$source" "root@$host:$tmp"
-    # shellcheck disable=SC2046
-    ssh $(ssh_opts "$slug" services) "root@$host" \
-      "chown root:root '$tmp' && chmod 0600 '$tmp' && mv '$tmp' '$target'"
-  else
-    # shellcheck disable=SC2046
-    ssh $(ssh_opts "$slug" services) "root@$host" "rm -f '$target' '$tmp'"
-  fi
-}
-
-sync_telegram_secrets() {
-  local slug="$1"
-  local host
-  host="$(machine_host "$slug" services)"
-
-  # shellcheck disable=SC2046
-  ssh $(ssh_opts "$slug" services) "root@$host" "install -d -m 0700 '$TELEGRAM_VM_DIR'"
-  sync_telegram_secret_file "$slug" "$host" "$TELEGRAM_DIR/bot-token" "$TELEGRAM_VM_DIR/bot-token"
-  sync_telegram_secret_file "$slug" "$host" "$TELEGRAM_DIR/webhook-secret" "$TELEGRAM_VM_DIR/webhook-secret"
-}
-
-enable_telegram_after_start() {
-  local slug="$1"
-
-  if [ -f "$TELEGRAM_DIR/bot-token" ]; then
-    printf 'Enabling Telegram notifications from %s\n' "$TELEGRAM_DIR/bot-token"
-    update_cluster "$slug" services
-  else
-    refresh_nodes_after_seed "$slug"
-  fi
 }
 
 wait_for_seeded_pool() {
@@ -976,16 +908,15 @@ start_cluster() {
   printf '%s\n' "$topology" > "$(topology_file "$slug")"
   printf '%s\n' "$network" > "$(network_file "$slug")"
 
-  local vpsadmin_path vpsadminos_input_value vpsf_status_path sms_gateway_path
+  local vpsadmin_path vpsadminos_input_value vpsf_status_path
   vpsadmin_path="$(slug_vpsadmin_path "$slug")"
   vpsadminos_input_value="$(vpsadminos_input "$slug")"
   vpsf_status_path="$(slug_optional_path "$slug" vpsf-status || true)"
-  sms_gateway_path="$(slug_optional_path "$slug" vpsfree-sms-gateway || true)"
 
   local -a runner_overrides=()
   while IFS= read -r -d '' item; do
     runner_overrides+=("$item")
-  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path" "$sms_gateway_path")
+  done < <(nix_overrides "$slug" "$vpsadmin_path" "$vpsadminos_input_value" "$vpsf_status_path")
 
   local dir log ready sock_dir
   dir="$(cluster_dir "$slug")"
@@ -1027,7 +958,7 @@ start_cluster() {
 
   for _ in $(seq 1 900); do
     if [ -f "$ready" ]; then
-      enable_telegram_after_start "$slug"
+      refresh_nodes_after_seed "$slug"
       urls_cluster "$slug"
       return
     fi
@@ -1291,9 +1222,6 @@ update_cluster() {
     opts="$(ssh_opts "$slug" "$machine")"
 
     printf 'Updating %s (%s) to %s\n' "$machine" "$host" "$toplevel"
-    if [ "$machine" = "services" ]; then
-      sync_telegram_secrets "$slug"
-    fi
     NIX_SSHOPTS="$opts" nix copy --to "ssh://root@$host" "$toplevel"
     # shellcheck disable=SC2086
     ssh $opts "root@$host" "$toplevel/bin/switch-to-configuration" switch

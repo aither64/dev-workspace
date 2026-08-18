@@ -3,7 +3,6 @@
   vpsadmin,
   vpsadminos,
   vpsfStatus,
-  vpsfreeSmsGateway,
   workspace,
   slug,
   topology,
@@ -20,12 +19,10 @@
   vpsadminosRevisionDirty,
   haveapiSourcePath,
   configSourcePath,
-  notificationTemplatesSourcePath,
+  mailTemplatesSourcePath,
   webSourcePath,
   vpsfStatusSourcePath,
   vpsadminGoClientSourcePath,
-  telegramEnable,
-  telegramSecretsSourcePath,
 }:
 { pkgs, ... }:
 let
@@ -57,13 +54,6 @@ let
   serviceIp = devConfig.services.ip;
   serviceRootDiskMiB = devConfig.services.rootDiskMiB or (12 * 1024);
   zfsTransferStartDelay = devConfig.nodectld.zfsTransferStartDelay or 0;
-  notificationDefaultsSourcePath =
-    if configSourcePath == "" then
-      null
-    else
-      "${configSourcePath}/configs/vpsadmin/api/notification_defaults.rb";
-  notificationDefaultsAvailable =
-    notificationDefaultsSourcePath != null && builtins.pathExists notificationDefaultsSourcePath;
   devGateway = devConfig.network.gateway;
   resolverConfig = devConfig.resolver or { };
   resolverMode = resolverConfig.mode or "cluster";
@@ -117,101 +107,6 @@ let
     else
       throw "Unsupported devcluster plugins.enabled value";
   mailCapture = devConfig.mail.capture;
-  telegramConfig = devConfig.telegram or { };
-  telegramReceiveMode = telegramConfig.receiveMode or "polling";
-  telegramReceiveModeChecked =
-    if
-      builtins.elem telegramReceiveMode [
-        "polling"
-        "webhook"
-      ]
-    then
-      telegramReceiveMode
-    else
-      throw "Unsupported devcluster Telegram receiveMode '${telegramReceiveMode}'";
-  telegramWebhookPath = telegramConfig.webhookPath or "/_telegram/webhook";
-  telegramEnabled = telegramEnable == "1";
-  telegramSecretsConfigured = telegramSecretsSourcePath != "";
-  telegramBotTokenHostFile = "${telegramSecretsSourcePath}/bot-token";
-  telegramBotUsernameHostFile = "${telegramSecretsSourcePath}/bot-username";
-  telegramWebhookSecretHostFile = "${telegramSecretsSourcePath}/webhook-secret";
-  telegramBotTokenConfigured =
-    telegramEnabled && telegramSecretsConfigured && builtins.pathExists telegramBotTokenHostFile;
-  telegramBotUsernameFromFile =
-    if telegramSecretsConfigured && builtins.pathExists telegramBotUsernameHostFile then
-      lib.removeSuffix "\n" (builtins.readFile telegramBotUsernameHostFile)
-    else
-      null;
-  telegramBotUsername = telegramConfig.botUsername or telegramBotUsernameFromFile;
-  telegramWebhookSecretConfigured =
-    telegramBotTokenConfigured && builtins.pathExists telegramWebhookSecretHostFile;
-  telegramSecretsVmDir = "/var/lib/vpsadmin/devcluster-telegram";
-  telegramBotTokenFile = "${telegramSecretsVmDir}/bot-token";
-  telegramWebhookSecretFile = "${telegramSecretsVmDir}/webhook-secret";
-  vpsadminNotificationsModule = vpsadmin.outPath + "/nixos/modules/vpsadmin/notifications.nix";
-  vpsadminNotificationsModuleText =
-    if builtins.pathExists vpsadminNotificationsModule then
-      builtins.readFile vpsadminNotificationsModule
-    else
-      "";
-  vpsadminSupportsSms = lib.hasInfix "sms = {" vpsadminNotificationsModuleText;
-  smsConfig = devConfig.sms or { };
-  smsGatewayEnabled = (smsConfig.enable or true) && vpsadminSupportsSms;
-  smsGatewayName = smsConfig.name or "dev";
-  smsGatewayPort = smsConfig.port or 9876;
-  smsGatewayVpsAdminToken = smsConfig.vpsadminToken or "dev-vpsadmin-sms-gateway-token";
-  smsGatewayAlertmanagerToken = smsConfig.alertmanagerToken or "dev-alertmanager-sms-gateway-token";
-  smsGatewayStatusToken = smsConfig.statusToken or "dev-vpsfree-sms-gateway-status-token";
-  smsGatewayCallbackToken = smsConfig.callbackToken or "dev-vpsadmin-sms-callback-token";
-  smsModemConfig = smsConfig.modem or { };
-  smsFakeConfig = smsModemConfig.fake or { };
-  smsLimitsConfig = smsConfig.limits or { };
-  smsCallbackConfig = smsConfig.callback or { };
-  smsInboundConfig = smsConfig.inbound or { };
-  smsInboundEnabled = smsInboundConfig.enable or false;
-  smsInboundWebhooks = smsInboundConfig.webhooks or [ ];
-  smsGatewayPackage = vpsfreeSmsGateway.packages.${pkgs.stdenv.hostPlatform.system}.default;
-  smsGatewayVpsAdminTokenFile = pkgs.writeText "vpsadmin-dev-sms-gateway-token" "${smsGatewayVpsAdminToken}\n";
-  smsGatewayCallbackTokenFile = pkgs.writeText "vpsadmin-dev-sms-callback-token" "${smsGatewayCallbackToken}\n";
-  smsGatewayConfigFile = pkgs.writeText "vpsfree-sms-gateway-dev.json" (
-    builtins.toJSON {
-      listen_address = "127.0.0.1:${toString smsGatewayPort}";
-      database_path = "/var/lib/vpsfree-sms-gateway/gateway.db";
-      gateway_name = smsGatewayName;
-      auth = {
-        alertmanager_token = smsGatewayAlertmanagerToken;
-        vpsadmin_token = smsGatewayVpsAdminToken;
-        status_token = smsGatewayStatusToken;
-        callback_token = smsGatewayCallbackToken;
-      };
-      modem = {
-        driver = "fake";
-        mode = smsModemConfig.mode or "pdu";
-        timeout = smsModemConfig.timeout or "5s";
-        attempts = smsModemConfig.attempts or 5;
-        cooldown = smsModemConfig.cooldown or "1s";
-        fake = {
-          send_delay = smsFakeConfig.sendDelay or "0s";
-          fail_sends = smsFakeConfig.failSends or false;
-        };
-      };
-      limits = {
-        alertmanager_max_segments = smsLimitsConfig.alertmanagerMaxSegments or 6;
-        vpsadmin_max_segments = smsLimitsConfig.vpsadminMaxSegments or 3;
-      };
-      alertmanager = {
-        receivers = smsConfig.alertmanagerReceivers or { };
-      };
-      inbound = {
-        enabled = smsInboundEnabled;
-        webhooks = smsInboundWebhooks;
-      };
-      callback = {
-        timeout = smsCallbackConfig.timeout or "10s";
-        cooldown = smsCallbackConfig.cooldown or "30s";
-      };
-    }
-  );
   adminerConfig = devConfig.adminer or { };
   adminerAuth =
     adminerConfig.webAuth or {
@@ -283,6 +178,7 @@ let
         {
           node = 0;
           storage = 1;
+          mailer = 2;
           dns_server = 3;
         }
         .${role};
@@ -400,20 +296,17 @@ let
     user_dns_zone_type = node.userDnsZoneType;
   }) dnsServerList;
   rabbitmqNodeUsers = map (node: node.domainName) allNodeList;
-  installNotificationTemplates = notificationTemplatesSourcePath != "";
-  notificationTemplatesStorePath =
-    if installNotificationTemplates then
+  installMailTemplates =
+    mailTemplatesSourcePath != "" && ((devConfig.mail.templates.install or false) == true);
+  mailTemplatesStorePath =
+    if installMailTemplates then
       builtins.path {
-        path = notificationTemplatesSourcePath;
-        name = "vpsfree-notification-templates";
+        path = mailTemplatesSourcePath;
+        name = "vpsfree-mail-templates";
       }
     else
       null;
-  notificationTemplatesSourceId =
-    if installNotificationTemplates then
-      "devcluster:${toString notificationTemplatesStorePath}"
-    else
-      null;
+  mailTemplatePaths = if installMailTemplates then [ "${mailTemplatesStorePath}" ] else [ ];
   vpsfStatusLocalSource =
     if vpsfStatusSourcePath != "" then
       builtins.path {
@@ -459,13 +352,8 @@ let
   };
 
   devSeed = pkgs.writeText "vpsadmin-devcluster-seed.rb" ''
-    require 'digest'
     require 'ipaddress'
     require 'json'
-
-    ${lib.optionalString notificationDefaultsAvailable ''
-      load '/mnt/configuration/configs/vpsadmin/api/notification_defaults.rb'
-    ''}
 
     def upsert_sys_config(category, name, value, min_user_level: 0, data_type: 'String')
       record = SysConfig.find_or_initialize_by(category: category, name: name)
@@ -874,34 +762,11 @@ let
         enable_multi_factor_auth: false,
         password_reset: false,
         lockout: false,
+        mailer_enabled: true,
         object_state: :active
       )
-      if user.respond_to?(:sms_notifications_enabled=)
-        user.sms_notifications_enabled = attrs.fetch('smsNotificationsEnabled', false)
-      end
       user.set_password(attrs.fetch('password'))
       user.save!
-
-      if user.respond_to?(:set_notification_delivery_method!) &&
-         ActiveRecord::Base.connection.data_source_exists?('user_notification_delivery_methods')
-        user.set_notification_delivery_method!(:email, true)
-
-        if attrs.key?('smsNotificationsEnabled') &&
-           defined?(UserNotificationDeliveryMethod) &&
-           UserNotificationDeliveryMethod.known_delivery_method?(:sms)
-          user.set_notification_delivery_method!(
-            :sms,
-            attrs.fetch('smsNotificationsEnabled', false)
-          )
-        end
-      end
-
-      if defined?(NotificationReceiver) &&
-         NotificationReceiver.respond_to?(:ensure_defaults_for!) &&
-         ActiveRecord::Base.connection.data_source_exists?('notification_receivers') &&
-         ActiveRecord::Base.connection.data_source_exists?('event_routes')
-        NotificationReceiver.ensure_defaults_for!(user)
-      end
 
       if ActiveRecord::Base.connection.data_source_exists?('user_accounts')
         account = UserAccount.find_or_initialize_by(user_id: user.id)
@@ -937,170 +802,58 @@ let
       upsert_dev_user(admin, environment, attrs, user_resources)
     end
 
-    ${lib.optionalString notificationDefaultsAvailable ''
-      User.find_each do |user|
-        ensure_vpsfree_oom_event_route!(user)
-      end
-    ''}
+    def install_mail_templates_from(path)
+      return unless Dir.exist?(path)
 
-    def legacy_mail_recipients_available?
-      defined?(EmailRecipient) &&
-        defined?(NotificationTemplateEmailRecipient) &&
-        ActiveRecord::Base.connection.data_source_exists?('email_recipients') &&
-        ActiveRecord::Base.connection.data_source_exists?('notification_template_email_recipients')
-    end
+      templates = VpsAdmin::API::MailTemplates.find_templates([path])
+      templates = VpsAdmin::API::MailTemplates.send(:unique_templates, templates)
+      templates = VpsAdmin::API::MailTemplates.send(:registered_templates, templates)
 
-    def notification_routes_available?
-      defined?(NotificationReceiver) &&
-        defined?(NotificationTarget) &&
-        defined?(NotificationReceiverTarget) &&
-        defined?(EventRoute) &&
-        defined?(EventRouteMatcher) &&
-        ActiveRecord::Base.connection.data_source_exists?('notification_receivers') &&
-        ActiveRecord::Base.connection.data_source_exists?('notification_targets') &&
-        ActiveRecord::Base.connection.data_source_exists?('notification_receiver_targets') &&
-        ActiveRecord::Base.connection.data_source_exists?('event_routes') &&
-        ActiveRecord::Base.connection.data_source_exists?('event_route_matchers') &&
-        EventRoute.column_names.include?('subject_scope')
-    end
+      templates.each do |template|
+        record = MailTemplate.find_or_initialize_by(name: template.name)
+        record.assign_attributes(template.params)
+        record.save!
 
-    def event_route_config_for_template(template_name)
-      case template_name.to_s
-      when 'daily_report'
-        {
-          event_type: 'system.daily_report',
-          template_name: 'daily_report'
-        }
-      when 'payments_overview'
-        {
-          event_type: 'payments.overview',
-          template_name: 'payments_overview'
-        }
+        template.translations.each do |translation|
+          language = VpsAdmin::API::MailTemplates.send(:ensure_language!, translation.lang)
+          record.mail_template_translations
+            .find_or_initialize_by(language: language)
+            .tap do |tr|
+              tr.assign_attributes(translation.params.merge(language: language))
+              tr.save!
+            end
+        end
       end
     end
 
-    def mail_recipient_addresses(attrs)
-      %w[to cc bcc].flat_map do |field|
-        attrs[field].to_s.split(',').map(&:strip)
-      end.reject(&:empty?).uniq
+    JSON.parse(${builtins.toJSON (builtins.toJSON mailTemplatePaths)}).each do |path|
+      install_mail_templates_from(path)
     end
 
-    def upsert_notification_route_target(user, address)
-      identity_key = "custom:#{Digest::SHA256.hexdigest(address.gsub(/\s/, ""))}"
-      target = NotificationTarget.find_or_initialize_by(
-        user: user,
-        action: 'email',
-        identity_key: identity_key
-      )
-      target.assign_attributes(
-        label: "Dev e-mail #{address}"[0, 255],
-        target_kind: 'custom',
-        target_value: address,
-        enabled: true,
-        verified_at: target.verified_at || Time.now
-      )
-      target.skip_delivery_method_enabled_validation = true
-      target.save!
-      target
-    end
-
-    def upsert_notification_route_receiver(user, label, target)
-      receiver = NotificationReceiver.find_or_initialize_by(
-        user: user,
-        label: label[0, 255]
-      )
-      receiver.assign_attributes(
-        description: 'Created from devcluster mail recipient seed',
-        enabled: true,
-        mute: false
-      )
-      receiver.save!
-
-      link = receiver.notification_receiver_targets.find_or_initialize_by(
-        notification_target: target
-      )
-      link.position ||= NotificationReceiver.next_receiver_target_position(receiver)
-      link.save!
-
-      receiver
-    end
-
-    def upsert_notification_route(user, receiver, label, config)
-      route = EventRoute.find_or_initialize_by(
-        user: user,
-        notification_receiver: receiver,
-        label: label[0, 255],
-        event_type: config.fetch(:event_type),
-        template_name: config.fetch(:template_name),
-        subject_scope: 'visible'
-      )
-      route.assign_attributes(
-        position: route.position || EventRoute.next_position_for(user, nil),
-        enabled: true,
-        single_use: false,
-        continue: false
-      )
-      route.save!
-
-      route
-    end
-
-    mail_recipient_seed = JSON.parse(${
+    JSON.parse(${
       builtins.toJSON (builtins.toJSON (devConfig.seed.mailRecipients or [ ]))
-    })
+    }).each do |attrs|
+      recipient = MailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
+      recipient.assign_attributes(
+        to: attrs['to'],
+        cc: attrs['cc'],
+        bcc: attrs['bcc']
+      )
+      recipient.save!
 
-    if legacy_mail_recipients_available?
-      mail_recipient_seed.each do |attrs|
-        recipient = EmailRecipient.find_or_initialize_by(label: attrs.fetch('label'))
-        recipient.assign_attributes(
-          to: attrs['to'],
-          cc: attrs['cc'],
-          bcc: attrs['bcc']
+      attrs.fetch('templates', []).each do |template_name|
+        template = MailTemplate.find_by(name: template_name)
+
+        if template.nil?
+          warn "Skipping missing mail template #{template_name.inspect} for recipient #{recipient.label.inspect}"
+          next
+        end
+
+        MailTemplateRecipient.find_or_create_by!(
+          mail_template: template,
+          mail_recipient: recipient
         )
-        recipient.save!
-
-        attrs.fetch('templates', []).each do |template_name|
-          template = NotificationTemplate.find_by(name: template_name)
-
-          if template.nil?
-            warn "Skipping missing notification template #{template_name.inspect} for recipient #{recipient.label.inspect}"
-            next
-          end
-
-          NotificationTemplateEmailRecipient.find_or_create_by!(
-            notification_template: template,
-            email_recipient: recipient
-          )
-        end
       end
-    elsif notification_routes_available?
-      mail_recipient_seed.each do |attrs|
-        attrs.fetch('templates', []).each do |template_name|
-          config = event_route_config_for_template(template_name)
-
-          if config.nil?
-            warn "Skipping devcluster mail recipient #{attrs.fetch('label').inspect} for unsupported template #{template_name.inspect}"
-            next
-          end
-
-          mail_recipient_addresses(attrs).each do |address|
-            target = upsert_notification_route_target(admin, address)
-            receiver = upsert_notification_route_receiver(
-              admin,
-              "#{attrs.fetch('label')} #{address}",
-              target
-            )
-            upsert_notification_route(
-              admin,
-              receiver,
-              "#{attrs.fetch('label')} #{template_name}",
-              config
-            )
-          end
-        end
-      end
-    elsif mail_recipient_seed.any?
-      warn 'Skipping devcluster mail recipient seed: neither legacy recipients nor event routes are available'
     end
   '';
 
@@ -1287,13 +1040,7 @@ let
       imports = [
         sshModule
         vpsfStatusModule
-      ]
-      ++ lib.optional installNotificationTemplates {
-        vpsadmin.api.managedNotificationTemplates = {
-          paths = [ notificationTemplatesStorePath ];
-          sourceId = notificationTemplatesSourceId;
-        };
-      };
+      ];
 
       boot.initrd.kernelModules = [ "virtiofs" ];
       boot.supportedFilesystems.virtiofs = true;
@@ -1368,31 +1115,16 @@ let
         };
       };
 
-      systemd.services.vpsfree-sms-gateway = lib.mkIf smsGatewayEnabled {
-        description = "Development vpsFree.cz SMS gateway";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
-        serviceConfig = {
-          DynamicUser = true;
-          StateDirectory = "vpsfree-sms-gateway";
-          ExecStart = "${smsGatewayPackage}/bin/vpsfree-sms-gateway --config ${smsGatewayConfigFile}";
-          Restart = "always";
-          RestartSec = "2s";
-        };
-      };
-
       fileSystems = sharedMounts;
 
       security.pki.certificateFiles = [ "${certStoreDir}/vpsadmin-ca.crt" ];
 
-      environment.systemPackages =
-        lib.optionals webEnabled (
-          with pkgs;
-          [
-            xz
-          ]
-        )
-        ++ lib.optional smsGatewayEnabled smsGatewayPackage;
+      environment.systemPackages = lib.mkIf webEnabled (
+        with pkgs;
+        [
+          xz
+        ]
+      );
 
       users = lib.mkIf webEnabled {
         users.vpsfree = {
@@ -1493,10 +1225,6 @@ let
         after = [ "vpsfree-web-live-root.service" ];
       };
 
-      systemd.tmpfiles.rules = lib.mkIf telegramBotTokenConfigured [
-        "d ${telegramSecretsVmDir} 0700 root root - -"
-      ];
-
       vpsadmin = {
         plugins = lib.mkForce enabledPlugins;
 
@@ -1518,16 +1246,7 @@ let
           forceSSL = lib.mkForce false;
 
           api = {
-            test = {
-              domain = lib.mkForce domains.api;
-            }
-            // optionalAttrs (builtins.pathExists vpsadminNotificationsModule) {
-              telegramWebhook = lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook") {
-                enable = true;
-                path = telegramWebhookPath;
-                backend.address = "unix:/run/haproxy/vpsadmin-telegram-receiver.sock";
-              };
-            };
+            test.domain = lib.mkForce domains.api;
             maintenance = {
               domain = tmpDomains.api;
               backend.address = "unix:/run/varnish/vpsadmin-varnish.sock";
@@ -1559,78 +1278,6 @@ let
             backend.address = "unix:/run/haproxy/vpsadmin-webui.sock";
           };
         };
-
-      }
-      // optionalAttrs (builtins.pathExists vpsadminNotificationsModule) {
-        notificationDispatcher = {
-          actions = lib.mkForce (
-            [
-              "email"
-              "webhook"
-            ]
-            ++ lib.optional telegramBotTokenConfigured "telegram"
-            ++ lib.optional smsGatewayEnabled "sms"
-          );
-
-          smtp = lib.mkIf mailCapture.enable {
-            address = lib.mkForce "127.0.0.1";
-            port = lib.mkForce mailCapture.smtpPort;
-          };
-        };
-
-        notifications.telegram = lib.mkIf telegramBotTokenConfigured (
-          {
-            enable = true;
-            botTokenFile = telegramBotTokenFile;
-            apiBaseUrl = telegramConfig.apiBaseUrl or "https://api.telegram.org";
-            receiveMode = telegramReceiveModeChecked;
-            webhook = (
-              {
-                listenAddress = "127.0.0.1";
-                port = telegramConfig.webhookPort or 9293;
-                path = telegramWebhookPath;
-                publicUrl = "https://${domains.api}${telegramWebhookPath}";
-              }
-              // optionalAttrs telegramWebhookSecretConfigured {
-                secretTokenFile = telegramWebhookSecretFile;
-              }
-            );
-          }
-          // optionalAttrs (telegramBotUsername != null) {
-            botUsername = telegramBotUsername;
-          }
-        );
-
-        notifications.sms = lib.mkIf smsGatewayEnabled {
-          enable = true;
-          callbackUrl = "https://${domains.api}/internal/notifications/sms/callback";
-          callbackTokenFile = smsGatewayCallbackTokenFile;
-          gateways = [
-            {
-              name = smsGatewayName;
-              url = "http://127.0.0.1:${toString smsGatewayPort}/v1/sms";
-              tokenFile = smsGatewayVpsAdminTokenFile;
-            }
-          ];
-        };
-
-        telegramReceiver = lib.mkIf telegramBotTokenConfigured {
-          enable = true;
-          configDirectory = config.vpsadmin.api.configDirectory;
-          database = config.vpsadmin.api.database;
-        };
-
-        haproxy.telegram-receiver.test =
-          lib.mkIf (telegramBotTokenConfigured && telegramReceiveModeChecked == "webhook")
-            {
-              frontend.bind = [ "unix@/run/haproxy/vpsadmin-telegram-receiver.sock mode 0666" ];
-              backends = [
-                {
-                  host = "127.0.0.1";
-                  port = telegramConfig.webhookPort or 9293;
-                }
-              ];
-            };
       };
 
       services.nginx.virtualHosts =
@@ -1817,18 +1464,22 @@ let
           };
       };
 
-      systemd.services.vpsadmin-webhook-test-server =
-        lib.mkIf (builtins.pathExists vpsadminNotificationsModule)
-          {
-            description = "Development webhook test server";
+      containers.mailer.config =
+        { pkgs, lib, ... }:
+        lib.mkIf mailCapture.enable {
+          systemd.services.mailpit = {
+            description = "Development mail capture service";
             wantedBy = [ "multi-user.target" ];
             after = [ "network.target" ];
             serviceConfig = {
-              ExecStart = "${config.vpsadmin.notificationDispatcher.package}/ruby-env-wrapped/bin/ruby /mnt/vpsadmin/tools/webhook-test-server.rb --host 127.0.0.1 --port 18080 --log-dir /tmp/vpsadmin-webhook-test";
+              ExecStart = "${pkgs.mailpit}/bin/mailpit --smtp 127.0.0.1:${toString mailCapture.smtpPort} --listen 127.0.0.1:${toString mailCapture.webPort}";
               Restart = "always";
               RestartSec = "2s";
             };
           };
+
+          vpsadmin.nodectld.settings.mailer.smtp_port = lib.mkForce mailCapture.smtpPort;
+        };
     };
 
   nodeModule =
@@ -2000,11 +1651,7 @@ in
             "test.nix"
             "${devSeed}"
           ];
-          mailpit = {
-            enable = mailCapture.enable;
-            smtpPort = mailCapture.smtpPort;
-            webPort = mailCapture.webPort;
-          };
+          mailpit.enable = false;
           inherit rabbitmqNodeUsers;
         };
       };
