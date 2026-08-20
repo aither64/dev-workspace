@@ -377,9 +377,14 @@ let
 
     webui_client = Oauth2Client.find_by(client_id: 'vpsadmin-webui-test')
     if webui_client
-      webui_client.update!(
+      attrs = {
         redirect_uri: 'https://${domains.webui}/?page=login&action=callback'
-      )
+      }
+      if webui_client.respond_to?(:authorization_start_uri=)
+        attrs[:authorization_start_uri] =
+          'https://${domains.webui}/?page=login&action=login'
+      end
+      webui_client.update!(attrs)
     end
 
     location.update!(remote_console_server: 'https://${domains.console}')
