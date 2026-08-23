@@ -384,7 +384,14 @@ let
         attrs[:authorization_start_uri] =
           'https://${domains.webui}/?page=login&action=login'
       end
-      webui_client.update!(attrs)
+      attrs[:is_default] = true if webui_client.respond_to?(:is_default=)
+      webui_client.assign_attributes(attrs)
+
+      if webui_client.respond_to?(:save_with_default!)
+        webui_client.save_with_default!
+      else
+        webui_client.save!
+      end
     end
 
     location.update!(remote_console_server: 'https://${domains.console}')
