@@ -384,7 +384,9 @@ let
         attrs[:authorization_start_uri] =
           'https://${domains.webui}/?page=login&action=login'
       end
-      attrs[:is_default] = true if webui_client.respond_to?(:is_default=)
+      if webui_client.respond_to?(:save_with_default!)
+        attrs[:is_default] = true
+      end
       webui_client.assign_attributes(attrs)
 
       if webui_client.respond_to?(:save_with_default!)
