@@ -779,7 +779,12 @@ let
         mailer_enabled: true,
         object_state: :active
       )
-      user.set_password(attrs.fetch('password'))
+      plaintext_password = attrs.fetch('password')
+      password_matches = user.persisted? &&
+                         VpsAdmin::API::CryptoProviders
+                           .provider(user.password_version)
+                           .matches?(user.password, user.login, plaintext_password)
+      user.set_password(plaintext_password) unless password_matches
       user.save!
 
       if ActiveRecord::Base.connection.data_source_exists?('user_accounts')
