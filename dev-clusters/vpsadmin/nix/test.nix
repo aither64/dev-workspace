@@ -298,8 +298,21 @@ let
   rabbitmqNodeUsers = map (node: node.domainName) allNodeList;
   installMailTemplates =
     mailTemplatesSourcePath != "" && ((devConfig.mail.templates.install or false) == true);
+  mailTemplateApiPath = vpsadmin.outPath + "/api/lib/vpsadmin/api/mail_templates.rb";
+  mailTemplateSourcesCompatible =
+    if !installMailTemplates then
+      true
+    else if
+      !(builtins.pathExists mailTemplateApiPath)
+      || !(lib.hasInfix "def self.reconcile!(path:, source_id:)" (builtins.readFile mailTemplateApiPath))
+    then
+      throw "Installing external mail templates requires vpsAdmin commit ea956e5e or a compatible newer revision with the declarative notification-template reconciler. Set mail.templates.install to false in .dev-clusters/vpsadmin/clusters/${slug}/config.json when using an older vpsAdmin and template pair."
+    else if !(builtins.pathExists "${mailTemplatesSourcePath}/templates") then
+      throw "Installing external mail templates requires the declarative templates/ package layout. Update the matching template worktree or set mail.templates.install to false in .dev-clusters/vpsadmin/clusters/${slug}/config.json when using an older vpsAdmin and template pair."
+    else
+      true;
   mailTemplatesStorePath =
-    if installMailTemplates then
+    if installMailTemplates && mailTemplateSourcesCompatible then
       builtins.path {
         path = mailTemplatesSourcePath;
         name = "vpsfree-mail-templates";
@@ -824,25 +837,7 @@ let
     def install_mail_templates_from(path)
       return unless Dir.exist?(path)
 
-      templates = VpsAdmin::API::MailTemplates.find_templates([path])
-      templates = VpsAdmin::API::MailTemplates.send(:unique_templates, templates)
-      templates = VpsAdmin::API::MailTemplates.send(:registered_templates, templates)
-
-      templates.each do |template|
-        record = MailTemplate.find_or_initialize_by(name: template.name)
-        record.assign_attributes(template.params)
-        record.save!
-
-        template.translations.each do |translation|
-          language = VpsAdmin::API::MailTemplates.send(:ensure_language!, translation.lang)
-          record.mail_template_translations
-            .find_or_initialize_by(language: language)
-            .tap do |tr|
-              tr.assign_attributes(translation.params.merge(language: language))
-              tr.save!
-            end
-        end
-      end
+      VpsAdmin::API::MailTemplates.reconcile!(path: path, source_id: path)
     end
 
     JSON.parse(${builtins.toJSON (builtins.toJSON mailTemplatePaths)}).each do |path|

@@ -174,6 +174,13 @@ after changing template files or the cluster mail seed config. Runtime virtiofs
 mounts cannot be added to an already-running VM, so templates are intentionally
 closure-copied instead of mounted live.
 
+Template installation requires vpsAdmin commit `ea956e5e` or a compatible
+newer revision and the template repository's declarative `templates/` layout.
+Nix evaluation stops with an error when the paired worktrees are incompatible.
+To run an older vpsAdmin and template pair, set `mail.templates.install` to
+`false` in the cluster's `config.json`. The seed then leaves the database's
+existing mail templates unchanged.
+
 ## Database Browser
 
 Adminer runs on the services VM and is exposed through the same nginx HTTPS
