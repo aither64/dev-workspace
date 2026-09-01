@@ -1046,6 +1046,16 @@ let
         vpsfStatusModule
       ];
 
+      assertions = lib.optional installMailTemplates {
+        assertion =
+          builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.after
+          && builtins.elem "vpsadmin-notification-templates.service" config.systemd.services.vpsadmin-devcluster-seed.requires;
+        message = ''
+          External notification templates must be reconciled before the
+          devcluster seed attaches configured mail recipients.
+        '';
+      };
+
       boot.initrd.kernelModules = [ "virtiofs" ];
       boot.supportedFilesystems.virtiofs = true;
 
@@ -1328,13 +1338,20 @@ let
       systemd.services.vpsadmin-devcluster-seed =
         let
           dbCfg = config.vpsadmin.databaseSetup;
+          dependencies = [
+            "vpsadmin-database-setup.service"
+          ]
+          ++ lib.optional installMailTemplates "vpsadmin-notification-templates.service";
         in
         {
           description = "Apply vpsAdmin devcluster seed overrides";
           wantedBy = [ "multi-user.target" ];
-          after = [ "vpsadmin-database-setup.service" ];
-          requires = [ "vpsadmin-database-setup.service" ];
-          before = [ "vpsadmin-api.service" ];
+          after = dependencies;
+          requires = dependencies;
+          before = [
+            "vpsadmin-api.service"
+            "vpsadmin-supervisor.service"
+          ];
           environment = {
             RACK_ENV = "production";
             SCHEMA = "${dbCfg.stateDirectory}/cache/schema.rb";
@@ -1353,6 +1370,11 @@ let
         };
 
       systemd.services.vpsadmin-api = {
+        requires = [ "vpsadmin-devcluster-seed.service" ];
+        after = [ "vpsadmin-devcluster-seed.service" ];
+      };
+
+      systemd.services.vpsadmin-supervisor = {
         requires = [ "vpsadmin-devcluster-seed.service" ];
         after = [ "vpsadmin-devcluster-seed.service" ];
       };

@@ -166,7 +166,8 @@ bound to `127.0.0.1` inside the services VM.
 If `worktrees/<slug>/vpsfree-mail-templates` exists, its templates are copied
 into the Nix closure and used as vpsAdmin's complete notification-template
 source. The notification-template service reconciles them after database setup
-and before the API or supervisor starts. Re-run:
+before the repeatable development seed attaches configured mail recipients.
+Both steps complete before the API or supervisor starts. Re-run:
 
 ```sh
 dev-clusters/vpsadmin/bin/devcluster update <slug> services
