@@ -298,15 +298,16 @@ let
   rabbitmqNodeUsers = map (node: node.domainName) allNodeList;
   installMailTemplates =
     mailTemplatesSourcePath != "" && ((devConfig.mail.templates.install or false) == true);
-  mailTemplateApiPath = vpsadmin.outPath + "/api/lib/vpsadmin/api/mail_templates.rb";
+  mailTemplateApiModulePath = vpsadmin.outPath + "/nixos/modules/vpsadmin/api/default.nix";
   mailTemplateSourcesCompatible =
     if !installMailTemplates then
       true
     else if
-      !(builtins.pathExists mailTemplateApiPath)
-      || !(lib.hasInfix "def self.reconcile!(path:, source_id:)" (builtins.readFile mailTemplateApiPath))
+      !(builtins.pathExists mailTemplateApiModulePath)
+      || !(lib.hasInfix "mode = mkOption {" (builtins.readFile mailTemplateApiModulePath))
+      || !(lib.hasInfix ''"replace"'' (builtins.readFile mailTemplateApiModulePath))
     then
-      throw "Installing external mail templates requires vpsAdmin commit ea956e5e or a compatible newer revision with the declarative notification-template reconciler. Set mail.templates.install to false in .dev-clusters/vpsadmin/clusters/${slug}/config.json when using an older vpsAdmin and template pair."
+      throw "Installing external mail templates requires vpsAdmin commit cbd0fa16 or a compatible newer revision with authoritative notification-template mode. Set mail.templates.install to false in .dev-clusters/vpsadmin/clusters/${slug}/config.json when using an older vpsAdmin and template pair."
     else if !(builtins.pathExists "${mailTemplatesSourcePath}/templates") then
       throw "Installing external mail templates requires the declarative templates/ package layout. Update the matching template worktree or set mail.templates.install to false in .dev-clusters/vpsadmin/clusters/${slug}/config.json when using an older vpsAdmin and template pair."
     else
@@ -319,7 +320,6 @@ let
       }
     else
       null;
-  mailTemplatePaths = if installMailTemplates then [ "${mailTemplatesStorePath}" ] else [ ];
   vpsfStatusLocalSource =
     if vpsfStatusSourcePath != "" then
       builtins.path {
@@ -834,16 +834,6 @@ let
       upsert_dev_user(admin, environment, attrs, user_resources)
     end
 
-    def install_mail_templates_from(path)
-      return unless Dir.exist?(path)
-
-      VpsAdmin::API::MailTemplates.reconcile!(path: path, source_id: path)
-    end
-
-    JSON.parse(${builtins.toJSON (builtins.toJSON mailTemplatePaths)}).each do |path|
-      install_mail_templates_from(path)
-    end
-
     JSON.parse(${
       builtins.toJSON (builtins.toJSON (devConfig.seed.mailRecipients or [ ]))
     }).each do |attrs|
@@ -1241,6 +1231,11 @@ let
 
       vpsadmin = {
         plugins = lib.mkForce enabledPlugins;
+
+        api.notificationTemplates = lib.mkIf installMailTemplates {
+          mode = "replace";
+          source = mailTemplatesStorePath;
+        };
 
         databaseSetup.seedFiles = lib.mkForce [
           "test.nix"

@@ -164,22 +164,25 @@ configured development basic-auth credentials. The raw Mailpit HTTP listener is
 bound to `127.0.0.1` inside the services VM.
 
 If `worktrees/<slug>/vpsfree-mail-templates` exists, its templates are copied
-into the Nix closure and installed by the services seed. Re-run:
+into the Nix closure and used as vpsAdmin's complete notification-template
+source. The notification-template service reconciles them after database setup
+and before the API or supervisor starts. Re-run:
 
 ```sh
 dev-clusters/vpsadmin/bin/devcluster update <slug> services
 ```
 
-after changing template files or the cluster mail seed config. Runtime virtiofs
+after changing template files or the cluster mail config. Runtime virtiofs
 mounts cannot be added to an already-running VM, so templates are intentionally
 closure-copied instead of mounted live.
 
-Template installation requires vpsAdmin commit `ea956e5e` or a compatible
-newer revision and the template repository's declarative `templates/` layout.
-Nix evaluation stops with an error when the paired worktrees are incompatible.
-To run an older vpsAdmin and template pair, set `mail.templates.install` to
-`false` in the cluster's `config.json`. The seed then leaves the database's
-existing mail templates unchanged.
+Template installation requires vpsAdmin commit `cbd0fa16` or a compatible
+newer revision with authoritative notification-template mode, plus the template
+repository's declarative `templates/` layout. Nix evaluation stops with an
+error when the paired worktrees are incompatible. To run an older vpsAdmin and
+template pair, set `mail.templates.install` to `false` in the cluster's
+`config.json`. The cluster then uses vpsAdmin's bundled defaults without
+reconciling the external worktree.
 
 ## Database Browser
 
