@@ -12,7 +12,7 @@ verification has passed, but before long integration tests are started. The
 review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
-The coordinating agent launches an adaptive team of one to three standalone
+The coordinating agent launches an adaptive team of one to four standalone
 reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` and
 the risk-scaled reasoning effort defined below, perform its assigned review
 directly, and not launch nested reviewers or subagents.
@@ -59,6 +59,11 @@ its trigger applies:
   abstraction, extension point, reusable component, or cross-project
   interface. Read
   [references/architecture-review.md](references/architecture-review.md).
+- **Scope and proportionality:** the change is medium or high risk, introduces
+  or expands an abstraction, framework, compatibility layer, generalized
+  safety mechanism, or cross-project capability, or grew materially during
+  implementation or review. Read
+  [references/scope-review.md](references/scope-review.md).
 - **Risk and compatibility:** the change affects authentication,
   authorization, tenant isolation, security boundaries, persisted state,
   schemas, public or cross-project contracts, protocols, host/node behavior,
@@ -89,6 +94,8 @@ required lane.
    - base and head commits for every repository;
    - intended commit split and any deliberately bundled changes, with a
      concrete rationale for why they are inseparable;
+   - explicit non-goals, rejected alternatives, and user decisions that bound
+     the implementation or accepted residual behavior;
    - relevant dependency pins or configuration changes;
    - quick verification commands and results;
    - overall risk classification, its rationale, and selected reasoning
