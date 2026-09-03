@@ -44,7 +44,13 @@ Managed tmux panes and worktree windows receive these environment variables:
 
 `start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`, and
 `worktrees/<slug>/` when missing. Existing plan and state files are never
-overwritten.
+overwritten. New state files start with `- Lifecycle: active`. An exact slug
+already present under `archive/` cannot be reused.
+
+Fill in a substantive plan and initial state and commit them in the workspace
+repository before the first project-code commit or external mutation. Keep
+active tracking committed at meaningful plan, review, test/CI, deployment, and
+handoff checkpoints.
 
 ## Attaching and syncing
 
@@ -53,6 +59,7 @@ bin/dev-session attach api-token-rotation
 bin/dev-session sync api-token-rotation
 bin/dev-session stop api-token-rotation
 bin/dev-session remove api-token-rotation
+bin/dev-session finalize api-token-rotation
 bin/dev-session list
 bin/dev-session current
 ```
@@ -94,11 +101,40 @@ Dirty worktrees are refused unless `--force` is passed:
 bin/dev-session remove api-token-rotation --force
 ```
 
-Use `--all` only when the durable notes should also be removed:
+`remove` is for stopping or cleaning up an active session. It never deletes the
+initiative tracking directory. The former `--all` option is intentionally not
+supported because completed and abandoned initiatives must retain a durable
+record.
+
+## Finalizing an initiative
+
+Use `finalize` only after the initiative is fully complete or explicitly
+abandoned:
 
 ```sh
-bin/dev-session remove api-token-rotation --all
+bin/dev-session finalize api-token-rotation
 ```
+
+Before running it:
+
+- set the single `- Lifecycle:` marker in `state.md` to `complete` or
+  `abandoned`;
+- make sure plan and state have an earlier commit under `work/<slug>/`;
+- resolve all review, CI, merge, approval, deployment, and cleanup work owned by
+  the session;
+- remove credentials, caches, reproducible bulk captures, and transient
+  outputs, keeping plan/state and intentionally durable evidence.
+
+`finalize` performs all safety checks before cleanup. It refuses missing
+tracking files, an active or ambiguous lifecycle, tracking without a prior
+commit, an existing archive destination, unmanaged tmux ownership, dirty git
+worktrees, and unknown entries in the worktree group. It then removes clean
+worktrees, preserves their branches, moves `work/<slug>/` to
+`archive/<slug>/`, and kills the managed tmux session last.
+
+The helper does not stage or commit. Inspect the reported move and commit only
+the exact `work/<slug>/` and `archive/<slug>/` paths in the shared top-level
+repository.
 
 ## Worktree helpers
 

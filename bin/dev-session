@@ -28,7 +28,9 @@ module VpsfreeDevSession
       dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] remove <name-or-slug>
-        [--as-is] [--force] [--all]
+        [--as-is] [--force]
+      dev-session [--workspace DIR] [--tmux-socket NAME] finalize <name-or-slug>
+        [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] list [<name-or-slug>] [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] current
 
@@ -255,7 +257,7 @@ module VpsfreeDevSession
       @tmux.run('kill-session', '-t', slug)
     end
 
-    def remove(input, as_is:, force:, all:)
+    def remove(input, as_is:, force:)
       slug = lookup_slug(input, as_is:)
       session_exists = @tmux.session_exists?(slug)
 
@@ -284,8 +286,49 @@ module VpsfreeDevSession
       end
 
       remove_empty_dir(worktrees_dir(slug))
-      FileUtils.rm_rf(work_dir(slug)) if all
       @tmux.run('kill-session', '-t', slug) if session_exists
+    end
+
+    def finalize(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      source = work_dir(slug)
+      destination = archive_dir(slug)
+
+      raise Error, "work directory not found: #{source}" unless File.directory?(source)
+      raise Error, "archive already exists: #{destination}" if File.exist?(destination)
+
+      validate_tracking_files!(slug)
+      validate_terminal_lifecycle!(slug)
+      validate_tracking_committed!(slug)
+
+      session_exists = @tmux.session_exists?(slug)
+      if session_exists && !@tmux.managed_session?(slug)
+        raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
+      end
+
+      entries = worktree_entries(slug)
+      unexpected = unexpected_worktree_entries(slug, entries)
+      unless unexpected.empty?
+        raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
+      end
+
+      dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
+      unless dirty_entries.empty?
+        paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
+        raise Error, "worktree has uncommitted changes: #{paths}"
+      end
+
+      entries.each do |entry|
+        remove_worktree_path(entry.fetch(:path), force: false)
+      end
+
+      remove_empty_dir(worktrees_dir(slug))
+      FileUtils.mkdir_p(File.dirname(destination))
+      FileUtils.mv(source, destination)
+      @tmux.run('kill-session', '-t', slug) if session_exists
+
+      @out.puts "archived: #{destination}"
+      @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
     end
 
     def list(input = nil, as_is: false)
@@ -432,6 +475,9 @@ module VpsfreeDevSession
     end
 
     def ensure_tracking_files(slug)
+      archived = archive_dir(slug)
+      raise Error, "archived slug cannot be reused: #{archived}" if File.exist?(archived)
+
       FileUtils.mkdir_p(work_dir(slug))
       FileUtils.mkdir_p(worktrees_dir(slug))
       write_once(plan_file(slug), plan_skeleton(slug))
@@ -683,6 +729,14 @@ module VpsfreeDevSession
       end
     end
 
+    def unexpected_worktree_entries(slug, entries)
+      root = worktrees_dir(slug)
+      return [] unless File.directory?(root)
+
+      managed_names = entries.map { |entry| File.basename(entry.fetch(:path)) }
+      Dir.children(root).sort - managed_names
+    end
+
     def known_slugs
       (slug_dirs('work') + slug_dirs('worktrees') + @tmux.managed_sessions).uniq.sort
     end
@@ -702,6 +756,10 @@ module VpsfreeDevSession
 
     def work_dir(slug)
       File.join(workspace, 'work', slug)
+    end
+
+    def archive_dir(slug)
+      File.join(workspace, 'archive', slug)
     end
 
     def worktrees_dir(slug)
@@ -772,6 +830,8 @@ module VpsfreeDevSession
 
         ## Status
 
+        - Lifecycle: active
+
         ## Commands run
 
         ## Results
@@ -780,6 +840,42 @@ module VpsfreeDevSession
 
         ## Cleanup
       STATE
+    end
+
+    def validate_tracking_files!(slug)
+      missing = [plan_file(slug), state_file(slug)].reject { |path| File.file?(path) }
+      return if missing.empty?
+
+      raise Error, "missing tracking files: #{missing.join(', ')}"
+    end
+
+    def validate_terminal_lifecycle!(slug)
+      matches = File.readlines(state_file(slug), chomp: true).filter_map do |line|
+        match = line.match(/\A- Lifecycle: (active|complete|abandoned)\z/)
+        match && match[1]
+      end
+
+      unless matches.length == 1
+        raise Error, 'state.md must contain exactly one lifecycle marker'
+      end
+
+      return if %w[complete abandoned].include?(matches.first)
+
+      raise Error, "initiative lifecycle is not terminal: #{matches.first}"
+    end
+
+    def validate_tracking_committed!(slug)
+      missing = %w[plan.md state.md].reject do |name|
+        path = File.join('work', slug, name)
+        _stdout, _stderr, status = @command_runner.capture(
+          ['git', '-C', workspace, 'cat-file', '-e', "HEAD:#{path}"],
+          allow_failure: true
+        )
+        status.success?
+      end
+      return if missing.empty?
+
+      raise Error, "tracking files have no prior commit: #{missing.join(', ')}"
     end
 
     def origin_head(repo)
@@ -862,6 +958,10 @@ module VpsfreeDevSession
         run_single_slug { |runner, slug, opts| runner.stop(slug, as_is: opts[:as_is]) }
       when 'remove'
         run_remove
+      when 'finalize'
+        run_single_slug do |runner, slug, opts|
+          runner.finalize(slug, as_is: opts[:as_is])
+        end
       when 'list'
         run_list
       when 'current'
@@ -952,11 +1052,10 @@ module VpsfreeDevSession
     end
 
     def run_remove
-      opts = { as_is: false, force: false, all: false }
+      opts = { as_is: false, force: false }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--force') { opts[:force] = true }
-        parser_opts.on('--all') { opts[:all] = true }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'remove')

@@ -64,6 +64,16 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  class UnmanagedTmux < NullTmux
+    def initialize(slug)
+      @slug = slug
+    end
+
+    def session_exists?(slug)
+      slug == @slug
+    end
+  end
+
   TODAY = Date.new(2026, 6, 6)
 
   def test_build_slug_prefixes_current_date
@@ -214,7 +224,22 @@ class DevSessionTest < Minitest::Test
 
       assert_equal("custom plan\n", File.read(plan))
       assert_includes(File.read(state), '## Commands run')
+      assert_includes(File.read(state), '- Lifecycle: active')
       assert(File.directory?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
+  def test_tracking_files_refuse_an_archived_slug
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
+      assert_match(/archived slug cannot be reused/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
     end
   end
 
@@ -394,7 +419,7 @@ class DevSessionTest < Minitest::Test
       )
 
       slug = '2026-06-06-demo'
-      runner.remove('demo', as_is: false, force: false, all: false)
+      runner.remove('demo', as_is: false, force: false)
 
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
       assert(File.exist?(File.join(workspace, 'work', slug, 'plan.md')))
@@ -431,7 +456,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, on_kill: -> { refute(File.exist?(path)) })
       remove_runner = runner_for(workspace, tmux:)
 
-      remove_runner.remove('demo', as_is: false, force: false, all: false)
+      remove_runner.remove('demo', as_is: false, force: false)
 
       assert(tmux.killed)
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
@@ -439,16 +464,17 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_remove_all_deletes_notes
+  def test_remove_all_is_rejected
     with_workspace do |workspace|
-      runner = runner_for(workspace)
-      slug = '2026-06-06-demo'
+      err = StringIO.new
+      status = VpsfreeDevSession::CLI.new(
+        ['--workspace', workspace, 'remove', 'demo', '--all'],
+        out: StringIO.new,
+        err:
+      ).run
 
-      runner.ensure_tracking_files(slug)
-      runner.remove('demo', as_is: false, force: false, all: true)
-
-      refute(File.exist?(File.join(workspace, 'work', slug)))
-      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      assert_equal(1, status)
+      assert_match(/invalid option: --all/, err.string)
     end
   end
 
@@ -473,7 +499,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.remove('demo', as_is: false, force: false, all: false)
+        runner.remove('demo', as_is: false, force: false)
       end
 
       assert_match(/uncommitted changes/, error.message)
@@ -502,7 +528,7 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', slug, 'sample')
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
 
-      runner.remove('demo', as_is: false, force: true, all: false)
+      runner.remove('demo', as_is: false, force: true)
 
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
       assert(File.exist?(File.join(workspace, 'work', slug)))
@@ -528,7 +554,7 @@ class DevSessionTest < Minitest::Test
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       assert(tmux_session_exists?(socket, slug))
 
-      runner.remove('demo', as_is: false, force: false, all: false)
+      runner.remove('demo', as_is: false, force: false)
 
       refute(tmux_session_exists?(socket, slug))
       assert(File.exist?(File.join(workspace, 'work', slug)))
@@ -557,7 +583,7 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.remove('demo', as_is: false, force: false, all: false)
+        runner.remove('demo', as_is: false, force: false)
       end
 
       assert_match(/not managed/, error.message)
@@ -565,6 +591,208 @@ class DevSessionTest < Minitest::Test
       assert(File.exist?(File.join(workspace, 'work', slug)))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
+  def test_finalize_archives_tracking_after_removing_worktrees
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+
+      add_runner = runner_for(workspace)
+      add_runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      out = StringIO.new
+      tmux = ManagedTmux.new(
+        slug,
+        on_kill: lambda do
+          refute(File.exist?(File.join(workspace, 'work', slug)))
+          refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+          assert(File.directory?(File.join(workspace, 'archive', slug)))
+        end
+      )
+
+      runner_for(workspace, tmux:, out:).finalize('demo', as_is: false)
+
+      assert(tmux.killed)
+      assert_includes(out.string, File.join(workspace, 'archive', slug))
+      assert_includes(
+        File.read(File.join(workspace, 'archive', slug, 'state.md')),
+        '- Lifecycle: complete'
+      )
+      assert_git_success(
+        'git',
+        "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+        'show-ref',
+        '--verify',
+        '--quiet',
+        'refs/heads/2026-06-06-demo'
+      )
+    end
+  end
+
+  def test_finalize_accepts_abandoned_lifecycle
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'abandoned')
+
+      runner.finalize('demo', as_is: false)
+
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_finalize_refuses_active_lifecycle
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/lifecycle is not terminal/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_missing_tracking_file
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      FileUtils.rm(File.join(workspace, 'work', slug, 'plan.md'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/missing tracking files/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_tracking_without_a_prior_commit
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      set_lifecycle(workspace, slug, 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/tracking files have no prior commit/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_existing_archive
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/archive already exists/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_dirty_worktree_without_changing_session
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      File.write(File.join(path, 'dirty.txt'), "dirty\n")
+      tmux = ManagedTmux.new(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).finalize('demo', as_is: false)
+      end
+
+      assert_match(/uncommitted changes/, error.message)
+      refute(tmux.killed)
+      assert(File.directory?(path))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_unmanaged_worktree_group_entries
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'cache'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/contains unmanaged entries/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_unmanaged_tmux_session
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux: UnmanagedTmux.new(slug)).finalize(
+          'demo',
+          as_is: false
+        )
+      end
+
+      assert_match(/not managed/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
     end
   end
 
@@ -728,6 +956,21 @@ class DevSessionTest < Minitest::Test
     assert_git_success('git', '-C', source, 'add', 'README.md')
     assert_git_success('git', '-C', source, 'commit', '-m', 'initial')
     assert_git_success('git', 'clone', '--bare', source, bare)
+  end
+
+  def commit_tracking(workspace, slug, lifecycle:)
+    set_lifecycle(workspace, slug, lifecycle)
+    assert_git_success('git', 'init', '-b', 'master', workspace)
+    assert_git_success('git', '-C', workspace, 'config', 'user.email', 'test@example.invalid')
+    assert_git_success('git', '-C', workspace, 'config', 'user.name', 'Test User')
+    assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
+    assert_git_success('git', '-C', workspace, 'commit', '-m', 'track initiative')
+  end
+
+  def set_lifecycle(workspace, slug, lifecycle)
+    state = File.join(workspace, 'work', slug, 'state.md')
+    content = File.read(state).sub('- Lifecycle: active', "- Lifecycle: #{lifecycle}")
+    File.write(state, content)
   end
 
   def assert_git_success(*argv)
