@@ -95,11 +95,6 @@ config_get() {
 }
 
 current_slug() {
-  if [ -n "${VPSFREE_DEV_SESSION_SLUG:-}" ]; then
-    printf '%s\n' "$VPSFREE_DEV_SESSION_SLUG"
-    return
-  fi
-
   if [ -x "$DEV_SESSION_BIN" ]; then
     "$DEV_SESSION_BIN" current 2>/dev/null
   else

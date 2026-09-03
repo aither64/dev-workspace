@@ -77,11 +77,15 @@ longer exists, and it leaves user-created windows untouched.
 place.
 
 `current` prints the active slug and nothing else. It resolves the slug from the
-managed tmux session environment, the current managed tmux session, or a cwd
-under `work/<slug>` / `worktrees/<slug>`. It exits with an error when no active
-session can be found or when those sources disagree. Codex instances should run
-it before creating a new initiative slug; if it prints a slug, continue in that
-session.
+managed tmux session environment, the caller's exact managed tmux pane, or a
+cwd under `work/<slug>` / `worktrees/<slug>`. It never falls back to tmux's
+server-current session when called outside a tmux pane. It exits with an error
+when no active session can be found or when those sources disagree. Codex
+instances should run it before creating a new initiative slug. The helper
+accepts session identity only when both `VPSFREE_DEV_SESSION_SLUG` and the
+canonical `VPSFREE_DEV_SESSION_WORKSPACE` match. It filters managed sessions
+owned by
+other workspaces from listing and short-name lookup.
 
 `remove` cleans up a development session:
 

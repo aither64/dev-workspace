@@ -12,55 +12,112 @@ load File.expand_path('../bin/dev-session', __dir__)
 
 class DevSessionTest < Minitest::Test
   class NullTmux
-    def managed_sessions
+    def session(_slug)
+      nil
+    end
+
+    def session_by_id(_id)
+      nil
+    end
+
+    def managed_session_identities
       []
     end
 
-    def session_exists?(_slug)
-      false
-    end
-
-    def managed_session?(_slug)
-      false
-    end
-
-    def current_session
+    def current_session_identity(_pane)
       nil
     end
+
   end
 
   class CurrentTmux < NullTmux
-    def initialize(slug)
+    def initialize(slug, workspace:)
       @slug = slug
+      @workspace = workspace
     end
 
-    def current_session
-      @slug
+    def current_session_identity(_pane)
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$current',
+        name: @slug,
+        mark: '1',
+        slug: @slug,
+        workspace: @workspace
+      )
     end
   end
 
   class ManagedTmux < NullTmux
     attr_reader :killed
 
-    def initialize(slug, on_kill: nil)
+    def initialize(slug, workspace:, on_kill: nil)
       @slug = slug
+      @workspace = workspace
+      @id = '$managed'
       @on_kill = on_kill
       @killed = false
     end
 
-    def session_exists?(slug)
-      slug == @slug && !@killed
+    def session(slug)
+      return unless slug == @slug && !@killed
+
+      identity
     end
 
-    def managed_session?(slug)
-      slug == @slug
+    def session_by_id(id)
+      return unless id == @id && !@killed
+
+      identity
+    end
+
+    def managed_session_identities
+      @killed ? [] : [identity]
+    end
+
+    def windows(_session)
+      []
+    end
+
+    def argv(*args)
+      ['tmux', *args]
     end
 
     def run(*args)
-      return unless args == ['kill-session', '-t', @slug]
+      targets = ["#{@id}:", @slug]
+      return unless args.first(2) == ['kill-session', '-t'] && targets.include?(args[2])
 
       @on_kill&.call
       @killed = true
+    end
+
+    private
+
+    def identity
+      VpsfreeDevSession::Tmux::Session.new(
+        id: @id,
+        name: @slug,
+        mark: '1',
+        slug: @slug,
+        workspace: @workspace
+      )
+    end
+  end
+
+  class LegacyWorkspaceTmux < ManagedTmux
+    attr_reader :workspace
+
+    def initialize(slug, workspace:)
+      super
+      @workspace = workspace
+    end
+
+    def run(*args)
+      if args.first == 'set-environment' &&
+         args[-2] == VpsfreeDevSession::ENV_WORKSPACE
+        @workspace = args.last
+      else
+        super
+      end
     end
   end
 
@@ -69,8 +126,227 @@ class DevSessionTest < Minitest::Test
       @slug = slug
     end
 
-    def session_exists?(slug)
-      slug == @slug
+    def session(slug)
+      return unless slug == @slug
+
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$unmanaged',
+        name: @slug,
+        mark: '',
+        slug: '',
+        workspace: ''
+      )
+    end
+
+  end
+
+  class ReplacedTmux < NullTmux
+    attr_reader :kill_attempted
+
+    def initialize(slug, workspace:)
+      @slug = slug
+      @workspace = workspace
+      @kill_attempted = false
+    end
+
+    def session(slug)
+      return unless slug == @slug
+
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$original',
+        name: @slug,
+        mark: '1',
+        slug: @slug,
+        workspace: @workspace
+      )
+    end
+
+    def session_by_id(_id)
+      nil
+    end
+
+    def run(*_args)
+      @kill_attempted = true
+    end
+  end
+
+  class ReplacedDuringCreateTmux < NullTmux
+    attr_reader :mutations, :new_session_args, :name_lookups
+
+    def initialize(slug, workspace:)
+      @slug = slug
+      @workspace = workspace
+      @created = false
+      @mutations = []
+      @name_lookups = 0
+    end
+
+    def session(slug)
+      @name_lookups += 1
+      return unless @created && slug == @slug
+
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$replacement',
+        name: @slug,
+        mark: '',
+        slug: '',
+        workspace: @workspace
+      )
+    end
+
+    def session_by_id(_id)
+      nil
+    end
+
+    def capture(*args, allow_failure: false)
+      raise "unexpected allow_failure: #{args.inspect}" if allow_failure
+      raise "unexpected tmux capture: #{args.inspect}" unless args.first == 'new-session'
+
+      @created = true
+      @new_session_args = args
+      ["$original\n", '', nil]
+    end
+
+    def run(*args)
+      @mutations << args
+    end
+  end
+
+  class ReplacedBeforeSyncTmux < NullTmux
+    attr_reader :mutations, :name_lookups
+
+    def initialize(slug, workspace:)
+      @slug = slug
+      @workspace = workspace
+      @created = false
+      @id_lookups = 0
+      @mutations = []
+      @name_lookups = 0
+      @pane = 0
+    end
+
+    def session(slug)
+      @name_lookups += 1
+      return unless @created && slug == @slug
+
+      identity('$replacement', managed: true)
+    end
+
+    def session_by_id(id)
+      return identity(id, managed: true) if id == '$replacement'
+      return unless id == '$original'
+
+      @id_lookups += 1
+      case @id_lookups
+      when 1 then identity(id, managed: false)
+      when 2 then identity(id, managed: true)
+      end
+    end
+
+    def capture(*args, allow_failure: false)
+      raise "unexpected allow_failure: #{args.inspect}" if allow_failure
+
+      output = case args.first
+               when 'new-session'
+                 @created = true
+                 '$original'
+               when 'display-message'
+                 '%left'
+               when 'split-window'
+                 @pane += 1
+                 "%pane#{@pane}"
+               else
+                 raise "unexpected tmux capture: #{args.inspect}"
+               end
+      ["#{output}\n", '', nil]
+    end
+
+    def run(*args)
+      @mutations << args
+    end
+
+    def windows(_session)
+      []
+    end
+
+    private
+
+    def identity(id, managed:)
+      VpsfreeDevSession::Tmux::Session.new(
+        id:,
+        name: @slug,
+        mark: managed ? '1' : '',
+        slug: managed ? @slug : '',
+        workspace: @workspace
+      )
+    end
+  end
+
+  class PartialCreateTmux < NullTmux
+    attr_reader :kill_count, :split_attempts
+
+    def initialize(slug, workspace:)
+      @slug = slug
+      @workspace = workspace
+      @created = false
+      @kill_count = 0
+      @split_attempts = 0
+      @mark = ''
+      @session_slug = ''
+    end
+
+    def session(slug)
+      return unless @created && slug == @slug
+
+      identity
+    end
+
+    def session_by_id(id)
+      return unless @created && id == '$partial'
+
+      identity
+    end
+
+    def capture(*args, allow_failure: false)
+      raise "unexpected allow_failure: #{args.inspect}" if allow_failure
+
+      case args.first
+      when 'new-session'
+        @created = true
+        @mark = ''
+        @session_slug = ''
+        ["$partial\n", '', nil]
+      when 'display-message'
+        ["%left\n", '', nil]
+      when 'split-window'
+        @split_attempts += 1
+        raise VpsfreeDevSession::Error, 'split failed'
+      else
+        raise "unexpected tmux capture: #{args.inspect}"
+      end
+    end
+
+    def run(*args)
+      if args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_MARK
+        @mark = args.last
+      elsif args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_SLUG
+        @session_slug = args.last
+      elsif args.first == 'kill-session'
+        @created = false
+        @kill_count += 1
+      end
+    end
+
+    private
+
+    def identity
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$partial',
+        name: @slug,
+        mark: @mark,
+        slug: @session_slug,
+        workspace: @workspace
+      )
     end
   end
 
@@ -118,6 +394,19 @@ class DevSessionTest < Minitest::Test
       assert_match(/ambiguous/, error.message)
       assert_match(/2026-06-05-demo/, error.message)
       assert_match(/2026-06-06-demo/, error.message)
+    end
+  end
+
+  def test_lookup_slug_ignores_an_unsafe_legacy_managed_session_name
+    with_workspace do |workspace|
+      tmux = ManagedTmux.new('x/2026-06-06-demo', workspace:)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.lookup_slug('demo', as_is: false)
+      end
+
+      assert_match(/no slug found/, error.message)
     end
   end
 
@@ -210,6 +499,18 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_as_is_rejects_an_unsafe_slug
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.resolve_start_slug('../escape', as_is: true, new: false)
+      end
+
+      assert_match(/invalid slug/, error.message)
+    end
+  end
+
   def test_tracking_files_are_created_once
     with_workspace do |workspace|
       runner = runner_for(workspace)
@@ -288,7 +589,10 @@ class DevSessionTest < Minitest::Test
       out = StringIO.new
       runner = runner_for(
         workspace,
-        env: { VpsfreeDevSession::ENV_SLUG => slug },
+        env: {
+          VpsfreeDevSession::ENV_SLUG => slug,
+          VpsfreeDevSession::ENV_WORKSPACE => workspace
+        },
         out:
       )
 
@@ -297,14 +601,54 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_current_rejects_an_environment_from_another_workspace
+    with_workspace do |workspace|
+      Dir.mktmpdir('foreign-dev-session-workspace') do |foreign_workspace|
+        runner = runner_for(
+          workspace,
+          env: {
+            VpsfreeDevSession::ENV_SLUG => '2026-06-06-demo',
+            VpsfreeDevSession::ENV_WORKSPACE => foreign_workspace
+          }
+        )
+
+        error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+
+        assert_match(/not managed by this workspace/, error.message)
+      end
+    end
+  end
+
   def test_current_uses_managed_tmux_session_slug
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       out = StringIO.new
-      runner = runner_for(workspace, tmux: CurrentTmux.new(slug), out:)
+      runner = runner_for(
+        workspace,
+        tmux: CurrentTmux.new(slug, workspace:),
+        env: { 'TMUX' => 'socket', 'TMUX_PANE' => '%1' },
+        out:
+      )
 
       assert_equal(slug, runner.current)
       assert_equal("#{slug}\n", out.string)
+    end
+  end
+
+  def test_current_rejects_a_tmux_session_from_another_workspace
+    with_workspace do |workspace|
+      Dir.mktmpdir('foreign-dev-session-workspace') do |foreign_workspace|
+        tmux = CurrentTmux.new('2026-06-06-demo', workspace: foreign_workspace)
+        runner = runner_for(
+          workspace,
+          tmux:,
+          env: { 'TMUX' => 'socket', 'TMUX_PANE' => '%1' }
+        )
+
+        error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+
+        assert_match(/not managed by this workspace/, error.message)
+      end
     end
   end
 
@@ -344,6 +688,70 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_current_ignores_tmux_server_current_session_outside_a_tmux_pane
+    skip 'tmux is not available' unless command_available?('tmux')
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+
+    with_workspace do |workspace|
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux_socket: socket,
+        codex_command: 'false',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        cwd: workspace
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+
+      assert_match(/no current dev session/, error.message)
+      assert(tmux_session_exists?(socket, slug))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
+  def test_devcluster_shorthands_use_the_workspace_session_resolver
+    scripts = %w[
+      dev-clusters/vpsadmin/bin/devcluster
+      dev-clusters/vpsadminos/bin/devcluster
+    ]
+
+    Dir.mktmpdir('dev-session-resolver') do |directory|
+      resolver = File.join(directory, 'dev-session')
+      File.write(
+        resolver,
+        "#!/usr/bin/env bash\n" \
+        "test \"$1\" = current\n" \
+        "printf 'managed-session\\n'\n"
+      )
+      FileUtils.chmod(0o755, resolver)
+
+      scripts.each do |relative_path|
+        source = File.read(File.expand_path("../#{relative_path}", __dir__))
+        function = source[/^current_slug\(\) \{\n.*?^\}\n/m]
+        refute_nil(function, relative_path)
+
+        stdout, stderr, status = Open3.capture3(
+          { 'VPSFREE_DEV_SESSION_SLUG' => 'foreign-session' },
+          'bash',
+          '-c',
+          "#{function}\nDEV_SESSION_BIN=\"$1\"\ncurrent_slug\n",
+          'devcluster-current-slug-test',
+          resolver
+        )
+
+        assert(status.success?, "#{relative_path}: #{stderr}")
+        assert_equal("managed-session\n", stdout, relative_path)
+      end
+    end
+  end
+
   def test_current_reports_conflicting_sources
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -353,7 +761,10 @@ class DevSessionTest < Minitest::Test
 
       runner = runner_for(
         workspace,
-        env: { VpsfreeDevSession::ENV_SLUG => slug },
+        env: {
+          VpsfreeDevSession::ENV_SLUG => slug,
+          VpsfreeDevSession::ENV_WORKSPACE => workspace
+        },
         cwd:
       )
 
@@ -453,7 +864,11 @@ class DevSessionTest < Minitest::Test
 
       slug = '2026-06-06-demo'
       path = File.join(workspace, 'worktrees', slug, 'sample')
-      tmux = ManagedTmux.new(slug, on_kill: -> { refute(File.exist?(path)) })
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        on_kill: -> { refute(File.exist?(path)) }
+      )
       remove_runner = runner_for(workspace, tmux:)
 
       remove_runner.remove('demo', as_is: false, force: false)
@@ -616,6 +1031,7 @@ class DevSessionTest < Minitest::Test
       out = StringIO.new
       tmux = ManagedTmux.new(
         slug,
+        workspace:,
         on_kill: lambda do
           refute(File.exist?(File.join(workspace, 'work', slug)))
           refute(File.exist?(File.join(workspace, 'worktrees', slug)))
@@ -743,7 +1159,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
       path = File.join(workspace, 'worktrees', slug, 'sample')
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
-      tmux = ManagedTmux.new(slug)
+      tmux = ManagedTmux.new(slug, workspace:)
 
       error = assert_raises(VpsfreeDevSession::Error) do
         runner_for(workspace, tmux:).finalize('demo', as_is: false)
@@ -793,6 +1209,242 @@ class DevSessionTest < Minitest::Test
 
       assert_match(/not managed/, error.message)
       assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tmux_targets_do_not_prefix_match_a_longer_session
+    skip 'tmux is not available' unless command_available?('tmux')
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+    longer_slug = "#{slug}-long"
+
+    with_workspace do |workspace|
+      tmux_run(socket, 'new-session', '-d', '-s', longer_slug, '-c', workspace)
+      command_runner = VpsfreeDevSession::CommandRunner.new(
+        out: StringIO.new,
+        err: StringIO.new
+      )
+      tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket:)
+
+      refute(tmux.session(slug))
+      assert(tmux.session(longer_slug))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).stop(slug, as_is: true)
+      end
+
+      assert_match(/session not found/, error.message)
+      assert(tmux_session_exists?(socket, longer_slug))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
+  def test_start_does_not_adopt_a_replacement_tmux_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ReplacedDuringCreateTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      end
+
+      assert_match(/changed during creation/, error.message)
+      assert_includes(tmux.new_session_args, '-P')
+      assert_includes(tmux.new_session_args, '#{session_id}')
+      assert_equal(1, tmux.name_lookups)
+      assert_empty(tmux.mutations)
+    end
+  end
+
+  def test_start_keeps_the_created_identity_through_sync
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ReplacedBeforeSyncTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      end
+
+      assert_match(/session changed during operation/, error.message)
+      assert_equal(1, tmux.name_lookups)
+      refute(tmux.mutations.flatten.include?('$replacement:'))
+    end
+  end
+
+  def test_start_prints_an_identity_bound_attach_command
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      tmux = ManagedTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:, out:)
+
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      expected = ['tmux', 'attach-session', '-t', '$managed:']
+                 .map(&:shellescape)
+                 .join(' ')
+      assert_includes(out.string, "attach: #{expected}")
+      refute_includes(out.string, "=#{slug}:")
+    end
+  end
+
+  def test_start_normalizes_a_legacy_symlinked_workspace_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      Dir.mktmpdir('dev-session-workspace-alias') do |directory|
+        alias_path = File.join(directory, 'workspace')
+        FileUtils.ln_s(workspace, alias_path)
+        out = StringIO.new
+        tmux = LegacyWorkspaceTmux.new(slug, workspace: alias_path)
+        runner = runner_for(workspace, tmux:, out:)
+
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+        assert_equal(workspace, tmux.workspace)
+        assert_includes(out.string, '$managed:')
+      end
+    end
+  end
+
+  def test_start_rolls_back_a_partial_tmux_layout_and_retries_creation
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = PartialCreateTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+
+      2.times do
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+        end
+        assert_match(/split failed/, error.message)
+      end
+
+      assert_equal(2, tmux.split_attempts)
+      assert_equal(2, tmux.kill_count)
+    end
+  end
+
+  def test_worktree_mutations_use_the_slug_lock
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      lock_path = File.join(workspace, 'worktrees', '.locks', "#{slug}.lock")
+      FileUtils.mkdir_p(File.dirname(lock_path))
+
+      File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+        assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
+
+        add_error = assert_raises(VpsfreeDevSession::Error) do
+          runner.worktree_add(
+            slug,
+            'sample',
+            as_is: true,
+            name: nil,
+            branch: nil,
+            base: nil,
+            fetch: false
+          )
+        end
+        assert_match(/another dev-session command/, add_error.message)
+
+        remove_error = assert_raises(VpsfreeDevSession::Error) do
+          runner.worktree_remove(slug, 'sample', as_is: true, force: false)
+        end
+        assert_match(/another dev-session command/, remove_error.message)
+      end
+    end
+  end
+
+  def test_stop_does_not_kill_a_replacement_tmux_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner_for(workspace).ensure_tracking_files(slug)
+      tmux = ReplacedTmux.new(slug, workspace:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).stop(slug, as_is: true)
+      end
+
+      assert_match(/session changed during operation/, error.message)
+      refute(tmux.kill_attempted)
+    end
+  end
+
+  def test_remove_does_not_kill_a_replacement_tmux_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner_for(workspace).ensure_tracking_files(slug)
+      tmux = ReplacedTmux.new(slug, workspace:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).remove(slug, as_is: true, force: false)
+      end
+
+      assert_match(/session changed during operation/, error.message)
+      refute(tmux.kill_attempted)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_managed_tmux_session_is_bound_to_its_workspace
+    skip 'tmux is not available' unless command_available?('tmux')
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+
+    with_workspace do |workspace|
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux_socket: socket,
+        codex_command: 'false',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY
+      )
+      runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
+      pane = tmux_capture(socket, 'list-panes', '-t', slug, '-F', '#{pane_id}')
+             .lines
+             .first
+             .strip
+
+      Dir.mktmpdir('other-dev-session-workspace') do |other_workspace|
+        other_out = StringIO.new
+        other_runner = VpsfreeDevSession::Runner.new(
+          workspace: other_workspace,
+          tmux_socket: socket,
+          out: other_out,
+          err: StringIO.new,
+          today: TODAY,
+          env: { 'TMUX' => 'socket', 'TMUX_PANE' => pane }
+        )
+
+        current_error = assert_raises(VpsfreeDevSession::Error) do
+          other_runner.current
+        end
+        assert_match(/not managed by this workspace/, current_error.message)
+
+        other_runner.list
+        assert_equal('', other_out.string)
+        lookup_error = assert_raises(VpsfreeDevSession::Error) do
+          other_runner.lookup_slug('demo', as_is: false)
+        end
+        assert_match(/no slug found/, lookup_error.message)
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          other_runner.stop(slug, as_is: true)
+        end
+
+        assert_match(/not managed by this workspace/, error.message)
+      end
+
+      assert(tmux_session_exists?(socket, slug))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
     end
   end
 
@@ -991,7 +1643,8 @@ class DevSessionTest < Minitest::Test
   end
 
   def tmux_session_exists?(socket, slug)
-    _stdout, _stderr, status = Open3.capture3('tmux', '-L', socket, 'has-session', '-t', slug)
+    target = VpsfreeDevSession::Tmux.session_target(slug)
+    _stdout, _stderr, status = Open3.capture3('tmux', '-L', socket, 'has-session', '-t', target)
     status.success?
   end
 

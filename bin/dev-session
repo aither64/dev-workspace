@@ -94,6 +94,27 @@ module VpsfreeDevSession
 
   class Tmux
     Window = Struct.new(:id, :name, :kind, :worktree, keyword_init: true)
+    Session = Struct.new(:id, :name, :mark, :slug, :workspace, keyword_init: true) do
+      def managed?
+        mark == '1' && slug == name
+      end
+    end
+
+    SESSION_FORMAT = [
+      "\#{session_id}",
+      "\#{session_name}",
+      "\#{#{SESSION_MARK}}",
+      "\#{#{SESSION_SLUG}}",
+      "\#{E:#{ENV_WORKSPACE}}"
+    ].join("\t")
+
+    def self.session_target(session)
+      session.start_with?('$') ? "#{session}:" : "=#{session}:"
+    end
+
+    def self.window_target(session, window)
+      "#{session_target(session)}=#{window}"
+    end
 
     def initialize(runner:, socket: nil)
       @runner = runner
@@ -119,53 +140,45 @@ module VpsfreeDevSession
       status.success?
     end
 
-    def session_exists?(slug)
-      success?('has-session', '-t', slug)
+    def session(slug)
+      session_for_target(Tmux.session_target(slug), expected_name: slug)
     end
 
-    def managed_session?(slug)
-      session_option(slug, SESSION_MARK) == '1'
+    def session_by_id(id)
+      session_for_target(Tmux.session_target(id))
     end
 
-    def managed_sessions
-      format = "\#{session_name}\t\#{@vpsfree_dev_session}\t\#{@vpsfree_dev_session_slug}"
-      stdout, _stderr, status = capture('list-sessions', '-F', format, allow_failure: true)
+    def managed_session_identities
+      stdout, _stderr, status = capture(
+        'list-sessions',
+        '-F',
+        SESSION_FORMAT,
+        allow_failure: true
+      )
       return [] unless status.success?
 
       stdout.lines.filter_map do |line|
-        name, mark, opt_slug = line.chomp.split("\t", -1)
-        next unless mark == '1'
-
-        opt_slug.empty? ? name : opt_slug
+        identity = parse_session(line)
+        identity if identity.managed?
       end
     end
 
-    def current_session
-      format = "\#{session_name}\t\#{@vpsfree_dev_session}\t\#{@vpsfree_dev_session_slug}"
-      stdout, _stderr, status = capture('display-message', '-p', format, allow_failure: true)
-      return nil unless status.success?
-
-      name, mark, opt_slug = stdout.chomp.split("\t", -1)
-      return nil unless mark == '1'
-
-      opt_slug.empty? ? name : opt_slug
-    end
-
-    def session_option(slug, option)
+    def current_session_identity(pane)
       stdout, _stderr, status = capture(
-        'show-options',
-        '-qv',
+        'display-message',
+        '-p',
         '-t',
-        slug,
-        option,
+        pane,
+        SESSION_FORMAT,
         allow_failure: true
       )
       return nil unless status.success?
 
-      stdout.strip
+      identity = parse_session(stdout)
+      identity if identity.managed?
     end
 
-    def windows(slug)
+    def windows(session)
       format = [
         "\#{window_id}",
         "\#{window_name}",
@@ -175,7 +188,7 @@ module VpsfreeDevSession
       stdout, _stderr, status = capture(
         'list-windows',
         '-t',
-        slug,
+        Tmux.session_target(session),
         '-F',
         format,
         allow_failure: true
@@ -186,6 +199,30 @@ module VpsfreeDevSession
         id, name, kind, worktree = line.chomp.split("\t", -1)
         Window.new(id:, name:, kind:, worktree:)
       end
+    end
+
+    private
+
+    def session_for_target(target, expected_name: nil)
+      stdout, _stderr, status = capture(
+        'display-message',
+        '-p',
+        '-t',
+        target,
+        SESSION_FORMAT,
+        allow_failure: true
+      )
+      return nil unless status.success?
+
+      identity = parse_session(stdout)
+      return nil if expected_name && identity.name != expected_name
+
+      identity
+    end
+
+    def parse_session(line)
+      id, name, mark, slug, workspace = line.chomp.split("\t", -1)
+      Session.new(id:, name:, mark:, slug:, workspace:)
     end
   end
 
@@ -204,7 +241,11 @@ module VpsfreeDevSession
       env: ENV,
       cwd: Dir.pwd
     )
-      @workspace = File.expand_path(workspace)
+      expanded_workspace = File.expand_path(workspace)
+      unless File.directory?(expanded_workspace)
+        raise Error, "workspace directory not found: #{expanded_workspace}"
+      end
+      @workspace = File.realpath(expanded_workspace)
       @out = out
       @err = err
       @today = today
@@ -218,117 +259,129 @@ module VpsfreeDevSession
     def start(input, as_is:, new:, attach:, run_codex:)
       slug = resolve_start_slug(input, as_is:, new:)
 
-      ensure_tracking_files(slug)
+      session = with_slug_lock(slug) do
+        ensure_tracking_files(slug)
 
-      if @tmux.session_exists?(slug)
-        ensure_managed_session!(slug)
-      else
-        create_tmux_session(slug, run_codex:)
+        selected_session = @tmux.session(slug)
+        selected_session = if selected_session
+                             ensure_managed_session!(slug, session: selected_session)
+                           else
+                             create_tmux_session(slug, run_codex:)
+                           end
+
+        sync_slug(slug, require_session: true, session: selected_session)
       end
-
-      sync_slug(slug, require_session: true)
 
       if attach.nil?
         attach = $stdout.tty?
       end
 
       if attach
-        attach_to_session(slug)
+        attach_to_session(session)
       else
         @out.puts "session: #{slug}"
-        @out.puts "attach: #{attach_command(slug).map(&:shellescape).join(' ')}"
+        @out.puts "attach: #{attach_command(session.id).map(&:shellescape).join(' ')}"
       end
     end
 
     def attach(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      ensure_managed_session!(slug)
-      attach_to_session(slug)
+      session = ensure_managed_session!(slug)
+      attach_to_session(session)
     end
 
     def sync(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      sync_slug(slug, require_session: true)
+      with_slug_lock(slug) { sync_slug(slug, require_session: true) }
     end
 
     def stop(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      ensure_managed_session!(slug)
-      @tmux.run('kill-session', '-t', slug)
+      with_slug_lock(slug) do
+        session = ensure_managed_session!(slug)
+        revalidate_session!(session)
+        @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+      end
     end
 
     def remove(input, as_is:, force:)
       slug = lookup_slug(input, as_is:)
-      session_exists = @tmux.session_exists?(slug)
+      with_slug_lock(slug) do
+        session = @tmux.session(slug)
 
-      known_state = session_exists ||
-                    File.directory?(work_dir(slug)) ||
-                    File.directory?(worktrees_dir(slug))
+        known_state = session ||
+                      File.directory?(work_dir(slug)) ||
+                      File.directory?(worktrees_dir(slug))
 
-      unless known_state
-        raise Error, "no dev session state found for #{slug}"
+        unless known_state
+          raise Error, "no dev session state found for #{slug}"
+        end
+
+        session = ensure_managed_session!(slug, session:) if session
+
+        entries = worktree_entries(slug)
+        dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
+
+        if !force && !dirty_entries.empty?
+          paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
+          raise Error, "worktree has uncommitted changes: #{paths}"
+        end
+
+        entries.each do |entry|
+          remove_worktree_path(entry.fetch(:path), force:)
+        end
+
+        remove_empty_dir(worktrees_dir(slug))
+        if session
+          revalidate_session!(session)
+          @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+        end
       end
-
-      if session_exists && !@tmux.managed_session?(slug)
-        raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
-      end
-
-      entries = worktree_entries(slug)
-      dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
-
-      if !force && !dirty_entries.empty?
-        paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
-        raise Error, "worktree has uncommitted changes: #{paths}"
-      end
-
-      entries.each do |entry|
-        remove_worktree_path(entry.fetch(:path), force:)
-      end
-
-      remove_empty_dir(worktrees_dir(slug))
-      @tmux.run('kill-session', '-t', slug) if session_exists
     end
 
     def finalize(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      source = work_dir(slug)
-      destination = archive_dir(slug)
+      with_slug_lock(slug) do
+        source = work_dir(slug)
+        destination = archive_dir(slug)
 
-      raise Error, "work directory not found: #{source}" unless File.directory?(source)
-      raise Error, "archive already exists: #{destination}" if File.exist?(destination)
+        raise Error, "work directory not found: #{source}" unless File.directory?(source)
+        raise Error, "archive already exists: #{destination}" if File.exist?(destination)
 
-      validate_tracking_files!(slug)
-      validate_terminal_lifecycle!(slug)
-      validate_tracking_committed!(slug)
+        validate_tracking_files!(slug)
+        validate_terminal_lifecycle!(slug)
+        validate_tracking_committed!(slug)
 
-      session_exists = @tmux.session_exists?(slug)
-      if session_exists && !@tmux.managed_session?(slug)
-        raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
+        session = @tmux.session(slug)
+        session = ensure_managed_session!(slug, session:) if session
+
+        entries = worktree_entries(slug)
+        unexpected = unexpected_worktree_entries(slug, entries)
+        unless unexpected.empty?
+          raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
+        end
+
+        dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
+        unless dirty_entries.empty?
+          paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
+          raise Error, "worktree has uncommitted changes: #{paths}"
+        end
+
+        entries.each do |entry|
+          remove_worktree_path(entry.fetch(:path), force: false)
+        end
+
+        remove_empty_dir(worktrees_dir(slug))
+        FileUtils.mkdir_p(File.dirname(destination))
+        FileUtils.mv(source, destination)
+        if session
+          revalidate_session!(session)
+          @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+        end
+
+        @out.puts "archived: #{destination}"
+        @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
       end
-
-      entries = worktree_entries(slug)
-      unexpected = unexpected_worktree_entries(slug, entries)
-      unless unexpected.empty?
-        raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
-      end
-
-      dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
-      unless dirty_entries.empty?
-        paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
-        raise Error, "worktree has uncommitted changes: #{paths}"
-      end
-
-      entries.each do |entry|
-        remove_worktree_path(entry.fetch(:path), force: false)
-      end
-
-      remove_empty_dir(worktrees_dir(slug))
-      FileUtils.mkdir_p(File.dirname(destination))
-      FileUtils.mv(source, destination)
-      @tmux.run('kill-session', '-t', slug) if session_exists
-
-      @out.puts "archived: #{destination}"
-      @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
     end
 
     def list(input = nil, as_is: false)
@@ -339,10 +392,15 @@ module VpsfreeDevSession
               end
 
       rows = slugs.sort.map do |slug|
-        session = if @tmux.session_exists?(slug)
-                    @tmux.managed_session?(slug) ? 'managed' : 'unmanaged'
-                  else
+        identity = @tmux.session(slug)
+        session = if identity.nil?
                     'none'
+                  elsif managed_by_workspace?(identity)
+                    'managed'
+                  elsif identity.managed?
+                    'foreign'
+                  else
+                    'unmanaged'
                   end
 
         work = File.directory?(work_dir(slug)) ? 'yes' : 'no'
@@ -368,56 +426,60 @@ module VpsfreeDevSession
       validate_part!(project, 'project')
       validate_part!(name, 'worktree name') if name
 
-      branch ||= slug
-      validate_git_branch!(branch)
+      with_slug_lock(slug) do
+        branch ||= slug
+        validate_git_branch!(branch)
 
-      ensure_tracking_files(slug)
+        ensure_tracking_files(slug)
 
-      repo = repo_dir(project)
-      raise Error, "repository not found: #{repo}" unless File.directory?(repo)
+        repo = repo_dir(project)
+        raise Error, "repository not found: #{repo}" unless File.directory?(repo)
 
-      @command_runner.run(['git', "--git-dir=#{repo}", 'fetch', 'origin']) if fetch
+        @command_runner.run(['git', "--git-dir=#{repo}", 'fetch', 'origin']) if fetch
 
-      base ||= origin_head(repo)
-      name ||= project
-      path = File.join(worktrees_dir(slug), name)
+        base ||= origin_head(repo)
+        name ||= project
+        path = File.join(worktrees_dir(slug), name)
 
-      raise Error, "worktree path already exists: #{path}" if File.exist?(path)
+        raise Error, "worktree path already exists: #{path}" if File.exist?(path)
 
-      FileUtils.mkdir_p(File.dirname(path))
+        FileUtils.mkdir_p(File.dirname(path))
 
-      if branch_exists?(repo, branch)
-        @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
-      else
-        @command_runner.run([
-          'git',
-          "--git-dir=#{repo}",
-          'worktree',
-          'add',
-          '-b',
-          branch,
-          path,
-          base
-        ])
+        if branch_exists?(repo, branch)
+          @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
+        else
+          @command_runner.run([
+            'git',
+            "--git-dir=#{repo}",
+            'worktree',
+            'add',
+            '-b',
+            branch,
+            path,
+            base
+          ])
+        end
+
+        sync_slug(slug, require_session: false)
+        @out.puts path
       end
-
-      sync_slug(slug, require_session: false)
-      @out.puts path
     end
 
     def worktree_remove(input, name, as_is:, force:)
       slug = lookup_slug(input, as_is:)
       validate_part!(name, 'worktree name')
 
-      path = File.join(worktrees_dir(slug), name)
-      raise Error, "worktree not found: #{path}" unless File.directory?(path)
+      with_slug_lock(slug) do
+        path = File.join(worktrees_dir(slug), name)
+        raise Error, "worktree not found: #{path}" unless File.directory?(path)
 
-      unless force || !worktree_dirty?(path)
-        raise Error, "worktree has uncommitted changes: #{path}"
+        unless force || !worktree_dirty?(path)
+          raise Error, "worktree has uncommitted changes: #{path}"
+        end
+
+        remove_worktree_path(path, force:)
+        sync_slug(slug, require_session: false)
       end
-
-      remove_worktree_path(path, force:)
-      sync_slug(slug, require_session: false)
     end
 
     def remove_worktree_path(path, force:)
@@ -446,7 +508,7 @@ module VpsfreeDevSession
         return build_slug(input, as_is: false)
       end
 
-      return input if as_is
+      return build_slug(input, as_is: true) if as_is
 
       lookup_slug(input, as_is: false)
     rescue Error => e
@@ -490,13 +552,17 @@ module VpsfreeDevSession
       env_slug = @env[ENV_SLUG]
       unless env_slug.nil? || env_slug.empty?
         validate_part!(env_slug, "#{ENV_SLUG} value")
+        validate_workspace_identity!(@env[ENV_WORKSPACE], 'session environment')
         sources << [ENV_SLUG, env_slug]
       end
 
-      tmux_slug = @tmux.current_session
-      unless tmux_slug.nil? || tmux_slug.empty?
-        validate_part!(tmux_slug, 'tmux session slug')
-        sources << ['tmux', tmux_slug]
+      tmux_session = if tmux_caller_context?
+                       @tmux.current_session_identity(@env.fetch('TMUX_PANE'))
+                     end
+      if tmux_session
+        validate_part!(tmux_session.name, 'tmux session slug')
+        validate_workspace_identity!(tmux_session.workspace, 'current tmux session')
+        sources << ['tmux', tmux_session.name]
       end
 
       cwd_slug = slug_from_path(@cwd)
@@ -511,6 +577,13 @@ module VpsfreeDevSession
       else
         details = sources.map { |source, slug| "#{source}=#{slug}" }.join(', ')
         raise Error, "current dev session sources disagree: #{details}"
+      end
+    end
+
+    def tmux_caller_context?
+      %w[TMUX TMUX_PANE].all? do |name|
+        value = @env[name]
+        !value.nil? && !value.empty?
       end
     end
 
@@ -566,12 +639,54 @@ module VpsfreeDevSession
       nil
     end
 
+    def ensure_directory!(path, label, create:)
+      if path_exists?(path)
+        raise Error, "#{label} is a symlink: #{path}" if File.symlink?(path)
+        raise Error, "#{label} is not a directory: #{path}" unless File.directory?(path)
+      elsif create
+        FileUtils.mkdir_p(path)
+      else
+        raise Error, "#{label} not found: #{path}"
+      end
+
+      path
+    end
+
+    def with_slug_lock(slug)
+      root = File.join(workspace, 'worktrees')
+      ensure_directory!(root, 'worktrees root', create: true)
+      lock_root = File.join(root, '.locks')
+      ensure_directory!(lock_root, 'dev-session lock directory', create: true)
+      path = File.join(lock_root, "#{slug}.lock")
+      raise Error, "dev-session lock is a symlink: #{path}" if File.symlink?(path)
+
+      File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
+        unless file.flock(File::LOCK_EX | File::LOCK_NB)
+          raise Error, "another dev-session command is changing #{slug}"
+        end
+
+        yield
+      ensure
+        file.flock(File::LOCK_UN)
+      end
+    end
+
+    def path_exists?(path)
+      File.lstat(path)
+      true
+    rescue Errno::ENOENT
+      false
+    end
+
     def create_tmux_session(slug, run_codex:)
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
       command = [
         'new-session',
         '-d',
+        '-P',
+        '-F',
+        '#{session_id}',
         '-s',
         slug,
         '-n',
@@ -581,67 +696,98 @@ module VpsfreeDevSession
         *tmux_environment_args(slug)
       ]
 
-      @tmux.run(*command)
-      set_tmux_environment(slug)
-      @tmux.run('set-option', '-t', slug, SESSION_MARK, '1')
-      @tmux.run('set-option', '-t', slug, SESSION_SLUG, slug)
-      @tmux.run('set-window-option', '-t', "#{slug}:dev", WINDOW_KIND, 'dev')
+      created_id = @tmux.capture(*command).first.strip
+      session = @tmux.session_by_id(created_id)
+      unless session && session.id == created_id && session.name == slug &&
+             workspace_identity?(session.workspace)
+        raise Error, "new tmux session changed during creation: #{slug}"
+      end
 
-      left = @tmux.capture(
-        'display-message',
-        '-p',
-        '-t',
-        "#{slug}:dev",
-        '#{pane_id}'
-      ).first.strip
+      begin
+        session_target = Tmux.session_target(session.id)
+        dev_target = Tmux.window_target(session.id, 'dev')
+        set_tmux_environment(session.id, slug)
+        @tmux.run('set-window-option', '-t', dev_target, WINDOW_KIND, 'dev')
 
-      right = @tmux.capture(
-        'split-window',
-        '-h',
-        *tmux_environment_args(slug),
-        '-P',
-        '-F',
-        '#{pane_id}',
-        '-t',
-        "#{slug}:dev",
-        '-c',
-        work_path
-      ).first.strip
+        left = @tmux.capture(
+          'display-message',
+          '-p',
+          '-t',
+          dev_target,
+          '#{pane_id}'
+        ).first.strip
 
-      @tmux.capture(
-        'split-window',
-        '-v',
-        *tmux_environment_args(slug),
-        '-P',
-        '-F',
-        '#{pane_id}',
-        '-t',
-        right,
-        '-c',
-        worktrees_path
-      )
+        right = @tmux.capture(
+          'split-window',
+          '-h',
+          *tmux_environment_args(slug),
+          '-P',
+          '-F',
+          '#{pane_id}',
+          '-t',
+          dev_target,
+          '-c',
+          work_path
+        ).first.strip
 
-      @tmux.run('select-pane', '-t', left)
+        @tmux.capture(
+          'split-window',
+          '-v',
+          *tmux_environment_args(slug),
+          '-P',
+          '-F',
+          '#{pane_id}',
+          '-t',
+          right,
+          '-c',
+          worktrees_path
+        )
 
-      if run_codex
-        @tmux.run('send-keys', '-t', left, '-l', @codex_command)
-        @tmux.run('send-keys', '-t', left, 'Enter')
+        @tmux.run('select-pane', '-t', left)
+
+        if run_codex
+          @tmux.run('send-keys', '-t', left, '-l', @codex_command)
+          @tmux.run('send-keys', '-t', left, 'Enter')
+        end
+
+        @tmux.run('set-option', '-t', session_target, SESSION_SLUG, slug)
+        @tmux.run('set-option', '-t', session_target, SESSION_MARK, '1')
+        ensure_managed_session!(slug, session: @tmux.session_by_id(created_id))
+      rescue StandardError
+        cleanup_partial_tmux_session(created_id, slug)
+        raise
       end
     end
 
-    def sync_slug(slug, require_session:)
-      unless @tmux.session_exists?(slug)
-        return unless require_session
+    def cleanup_partial_tmux_session(id, slug)
+      session = @tmux.session_by_id(id)
+      return unless session && session.name == slug && workspace_identity?(session.workspace)
+      return unless ['', slug].include?(session.slug) && ['', '1'].include?(session.mark)
 
-        raise Error, "tmux session not found: #{slug}"
+      @tmux.run('kill-session', '-t', Tmux.session_target(id))
+    rescue StandardError => e
+      @err.puts "warning: unable to remove partial tmux session #{slug}: #{e.message}"
+    end
+
+    def sync_slug(slug, require_session:, session: nil)
+      if session
+        session = revalidate_session!(session)
+      else
+        session = @tmux.session(slug)
+        unless session
+          return unless require_session
+
+          raise Error, "tmux session not found: #{slug}"
+        end
+
+        session = ensure_managed_session!(slug, session:)
       end
-
-      ensure_managed_session!(slug)
-      set_tmux_environment(slug)
+      set_tmux_environment(session.id, slug)
+      session = ensure_managed_session!(slug, session: @tmux.session_by_id(session.id))
 
       desired = worktree_entries(slug)
       desired_paths = desired.map { |entry| entry.fetch(:path) }
-      windows = @tmux.windows(slug)
+      windows = @tmux.windows(session.id)
       managed_paths = windows
                       .select { |window| window.kind == 'worktree' }
                       .map(&:worktree)
@@ -656,7 +802,7 @@ module VpsfreeDevSession
           '-F',
           '#{window_id}',
           '-t',
-          slug,
+          Tmux.session_target(session.id),
           '-n',
           entry.fetch(:name),
           *tmux_environment_args(slug),
@@ -674,25 +820,51 @@ module VpsfreeDevSession
 
         @tmux.run('kill-window', '-t', window.id)
       end
+
+      revalidate_session!(session)
     end
 
-    def ensure_managed_session!(slug)
-      raise Error, "tmux session not found: #{slug}" unless @tmux.session_exists?(slug)
-      return if @tmux.managed_session?(slug)
+    def ensure_managed_session!(slug, session: @tmux.session(slug))
+      raise Error, "tmux session not found: #{slug}" unless session
+      return session if managed_by_workspace?(session)
 
-      raise Error, "tmux session exists but is not managed by dev-session: #{slug}"
+      raise Error, "tmux session is not managed by this workspace: #{slug}"
     end
 
-    def attach_to_session(slug)
+    def managed_by_workspace?(session)
+      session.managed? && workspace_identity?(session.workspace)
+    end
+
+    def workspace_identity?(candidate)
+      candidate && File.realpath(candidate) == workspace
+    rescue Errno::ENOENT, Errno::EACCES
+      false
+    end
+
+    def validate_workspace_identity!(candidate, source)
+      return if workspace_identity?(candidate)
+
+      raise Error, "#{source} is not managed by this workspace"
+    end
+
+    def revalidate_session!(expected)
+      current = @tmux.session_by_id(expected.id)
+      return current if current == expected
+
+      raise Error, "tmux session changed during operation: #{expected.name}"
+    end
+
+    def attach_to_session(session)
+      revalidate_session!(session)
       if ENV['TMUX'] && !ENV['TMUX'].empty?
-        @tmux.run('switch-client', '-t', slug)
+        @tmux.run('switch-client', '-t', Tmux.session_target(session.id))
       else
-        exec(*attach_command(slug))
+        exec(*attach_command(session.id))
       end
     end
 
-    def attach_command(slug)
-      @tmux.argv('attach-session', '-t', slug)
+    def attach_command(session)
+      @tmux.argv('attach-session', '-t', Tmux.session_target(session))
     end
 
     def session_environment(slug)
@@ -710,9 +882,9 @@ module VpsfreeDevSession
       end
     end
 
-    def set_tmux_environment(slug)
+    def set_tmux_environment(target, slug)
       session_environment(slug).each do |key, value|
-        @tmux.run('set-environment', '-t', slug, key, value)
+        @tmux.run('set-environment', '-t', Tmux.session_target(target), key, value)
       end
     end
 
@@ -738,7 +910,11 @@ module VpsfreeDevSession
     end
 
     def known_slugs
-      (slug_dirs('work') + slug_dirs('worktrees') + @tmux.managed_sessions).uniq.sort
+      sessions = @tmux.managed_session_identities
+                      .select { |identity| managed_by_workspace?(identity) }
+                      .select { |identity| valid_part?(identity.name) }
+                      .map(&:name)
+      (slug_dirs('work') + slug_dirs('worktrees') + sessions).uniq.sort
     end
 
     def slug_dirs(name)
