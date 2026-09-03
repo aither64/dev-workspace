@@ -1,6 +1,6 @@
 ---
 name: mandatory-change-review
-description: Run the required standalone review of committed vpsFree.cz development changes after quick verification and before integration tests. Use for feature, bugfix, refactor, or cross-project work that changes code, schemas, APIs, protocols, configuration, documentation, tests, deployment behavior, or security posture; skip only dependency-only or generated update sessions without relevant code changes.
+description: Run the required adaptive review of committed vpsFree.cz development changes after quick verification and before integration tests. Use for feature, bugfix, refactor, or cross-project work that changes code, schemas, APIs, protocols, configuration, documentation, tests, deployment behavior, or security posture; skip only dependency-only or generated update sessions without relevant code changes.
 ---
 
 # Mandatory Change Review
@@ -9,233 +9,107 @@ description: Run the required standalone review of committed vpsFree.cz developm
 
 Use this skill after all intended changes are committed and quick local
 verification has passed, but before long integration tests are started. The
-review is advisory, but significant findings must be addressed or explicitly
-discussed before continuing.
+review is advisory, but Blocking and Important findings must be addressed as
+described below before continuing.
 
-The review must be performed by exactly one standalone agent with fresh context.
-The main agent prepares inputs, launches that reviewer, and then decides with
-the user whether to change the implementation, amend commits, or continue. The
-standalone reviewer performs the review directly and must not launch nested
-reviewers or subagents.
+The coordinating agent launches an adaptive team of one to three standalone
+reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` with
+reasoning effort `max`, perform its assigned review directly, and not launch
+nested reviewers or subagents.
 
 ## Invocation Mode
 
 First decide which role you are in:
 
 - If you are coordinating the development session, follow the Main Agent
-  Workflow below and launch one standalone reviewer.
-- If you are the spawned standalone reviewer, skip the Main Agent Workflow and
-  follow Reviewer Instructions directly. Do not spawn another reviewer.
+  Workflow.
+- If you are a spawned reviewer, read Shared Reviewer Instructions and the
+  reference for your assigned lane. Do not launch another reviewer.
+
+## Review Lanes
+
+Launch the general reviewer for every required review. Add each specialist when
+its trigger applies:
+
+- **General:** always. Read
+  [references/general-review.md](references/general-review.md).
+- **Architecture and repetition:** hand-written implementation, test, build,
+  workflow, or configuration logic changed; or the change affects an
+  abstraction, extension point, reusable component, or cross-project
+  interface. Read
+  [references/architecture-review.md](references/architecture-review.md).
+- **Risk and compatibility:** the change affects authentication,
+  authorization, tenant isolation, security boundaries, persisted state,
+  schemas, public or cross-project contracts, protocols, host/node behavior,
+  destructive or irreversible operations, deployment, rollback, or
+  mixed-version operation. Read
+  [references/risk-review.md](references/risk-review.md).
+
+Documentation-only changes normally use only the general lane. If more than one
+lane applies, launch the reviewers concurrently when capacity permits and
+sequentially otherwise; lack of a free parallel slot is not a reason to omit a
+required lane.
 
 ## Main Agent Workflow
 
 1. Confirm the review is required. Skip only when the session contains no
-   relevant code/design change, such as dependency-only updates, generated
+   relevant code or design change, such as dependency-only updates, generated
    lockfile refreshes, or other mechanical metadata updates.
 2. Make sure all intended changes are committed in every affected repository.
    Do not review a half-staged or partly uncommitted implementation.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
-4. Prepare a review packet for the standalone agent:
+4. Determine the applicable lanes using the triggers above. Read every
+   applicable lane reference before preparing the review.
+5. Prepare a review packet containing:
    - requested outcome and acceptance criteria;
    - initiative slug, plan/state files, affected repositories and worktrees;
    - base and head commits for every repository;
-   - the intended commit split, including any user- or plan-requested separate
-     commits;
-   - any deliberately bundled changes, with a concrete rationale for why they
-     cannot be reviewed, reverted, tested, or explained separately;
-   - relevant dependency pins or configuration repository changes;
+   - intended commit split and any deliberately bundled changes, with a
+     concrete rationale for why they are inseparable;
+   - relevant dependency pins or configuration changes;
    - quick verification commands and results;
-   - known compatibility or deployment assumptions.
-5. Launch exactly one standalone reviewer/subagent with this skill and the
-   review packet. Instruct it to perform the review itself and not spawn nested
-   reviewers. Do not pass hidden conclusions or ask it to rubber-stamp the work.
-6. Treat the review result as a recommendation. Fix or discuss significant
-   findings before integration tests. Record the result and any decision in the
-   initiative `state.md`.
+   - known compatibility and deployment assumptions;
+   - for reusable or cross-project components, the owning component, public
+     interface, and consumers discovered from imports, dependency pins,
+     wrappers, manifests, documentation, and current repository state.
+6. Launch one fresh standalone agent per applicable lane. Set
+   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and
+   `reasoning_effort: "max"`. Give each agent the review packet, its lane, this
+   skill path, and instructions to read the lane reference and perform the
+   review itself. Do not pass hidden conclusions or ask for a rubber stamp.
+7. Collect all findings. Investigate conflicts using the code and repository
+   evidence; do not decide by majority vote. Merge duplicates, retain the
+   highest severity supported by evidence, and identify the originating lane.
+8. Fix Blocking findings before integration tests. Fix Important findings or
+   discuss and record an explicit decision before continuing. Advisory findings
+   may be accepted at the coordinating agent's discretion but must be recorded.
+9. If a fix materially changes code, architecture, contracts, behavior, tests,
+   or commit history, rerun the general lane and every specialist lane affected
+   by the new diff against the updated heads.
+10. Record reviewer lanes, model and effort, reviewed commits, findings,
+    decisions, fixes, and any reruns in the initiative `state.md`.
 
-## Reviewer Instructions
+## Shared Reviewer Instructions
 
 Review committed changes across all affected projects. Inspect diffs, commit
 history, local `AGENTS.md` files, relevant tests, documentation, and project
-context before forming conclusions.
+context before forming conclusions. Review the commit series, not only the
+final tree, and compare it with the user request and initiative plan/state.
 
-Assess the commit series, not only the final tree. Compare the history against
-the user request and the initiative plan/state:
+Stay focused on the assigned lane, but report a concrete serious issue from
+another lane if you encounter one. Do not assume that another reviewer will
+notice it. Architecture findings must describe a plausible maintenance or
+failure scenario instead of relying on pattern names or line counts.
 
-- Verify that each commit is independently reviewable and matches one logical
-  purpose.
-- Verify that mechanical moves/refactors, behavior changes, generated updates,
-  dependency bumps, tests, documentation, and deployment/configuration changes
-  are separated when review clarity, repository rules, or the plan call for it.
-- Report bundled unrelated or independently reviewable changes as findings even
-  when the final combined diff is correct.
-- When the plan or user explicitly asks for separate commits, verify that the
-  history follows that split.
-- Subject-only commits are acceptable only when repository rules allow them for
-  that change type, or when the subject fully explains a trivial mechanical
-  change; otherwise report missing rationale as a commit-quality finding.
+Use these severities:
 
-Commit split review is mandatory. Treat a commit as too broad when it contains
-two or more changes that could reasonably be reviewed, reverted, tested, or
-explained separately while keeping the branch sequence coherent. A commit
-message that lists every included change does not make the commit focused.
-Report bundled independent changes as `Blocking` by default, because the
-author should split them before long integration tests. Downgrade only when the
-review packet gives an explicit, convincing reason that the changes are
-indivisible.
-
-Use these concrete red flags when reviewing vpsAdmin-style feature branches:
-
-- A managed notification-template installer commit must not also introduce
-  Markdown rendering helpers, Telegram HTML/link rendering changes, synthetic
-  test-notification behavior changes, or standalone uploader removal unless
-  the packet explains why those changes are inseparable.
-- A notification-delivery rate-limit commit must not also replace route-match
-  schema/API/WebUI attribution, change event persistence semantics, expand
-  test-notification authorization or route scope behavior, or rename generated
-  defaults unless the packet explains why those changes are inseparable.
-- Cross-cutting support edits, migrations, docs, and tests may stay with the
-  behavior they support. If a test or support edit primarily validates a
-  different behavior, it belongs with that behavior in a separate commit.
-
-Check at least:
-
-- Whether the committed changes match the requested feature, bugfix, or
-  operational goal.
-- Whether commits are logical and focused. Independent changes should not be
-  grouped together, and split commits should still make sense in sequence.
-- Whether the feature branch has clean git history. Commits that only fix,
-  correct, or tidy behavior introduced by earlier still-unmerged commits in the
-  same feature branch should usually be squashed into those commits unless
-  keeping them separate improves reviewability.
-- Whether a new feature that evolved entirely on the feature branch converges
-  on one final design. Flag superseded protocol versions, schema variants,
-  migrations, dual-read/write paths, and compatibility shims kept only for code
-  or state that never reached the default branch. Prefer rewriting unmerged
-  history so the final series introduces the final form directly. Preserve
-  compatibility with merged, released, deployed, or externally consumed
-  behavior, and require a concrete rationale for any other compatibility layer.
-- Whether dependency update history is clean. A feature branch should not
-  contain multiple commits updating the same flake input. The same rule applies
-  to gem dependency update commits: repeated commits that only update the same
-  gem dependency, dependency group, `Gemfile.lock`, Bundix output, or generated
-  gem metadata for one update stream should be squashed into one dependency
-  update commit.
-- Whether commit messages follow the applicable `AGENTS.md` rules, wrap and
-  format correctly, and describe the final end result and rationale rather than
-  the development process. Do not enforce formatting on generated messages such
-  as `confctl` commits.
-- Whether the design fits existing project architecture and abstractions,
-  especially across vpsAdmin, vpsAdminOS, HaveAPI, clients, and configuration
-  repositories.
-- Whether catalogs or registries mirror classes, models, resources, actions,
-  plugins, handlers, or protocols that are already declared elsewhere. Prefer
-  one owning declaration with derived indexes, or require a concrete reason
-  that a central catalog is authoritative. Do not flag finite protocol, state,
-  or public-contract registries merely for being central.
-- Whether adding, renaming, or removing one implementation is localized to its
-  owner. Flag extension points that require coordinated edits across unrelated
-  class-name lists, plugin lists, conditionals, or metadata tables, especially
-  when omissions can silently disable or misclassify behavior. Require
-  duplicate/conflict detection and bidirectional coverage when some metadata
-  cannot be derived.
-- Whether callbacks, closures, reflection, `instance_exec`, `send`, or
-  method-name conventions create a hidden interface on an unrelated receiver.
-  Prefer an explicit class/module interface or a validated DSL with one
-  well-defined evaluation context. Allow reflective framework boundaries only
-  when their contract and validation are clear.
-- Whether a changed module combines unrelated orchestration, persistence,
-  policy, validation, configuration, rendering, and transport responsibilities.
-  Look for central conditionals and shotgun surgery when adding a variant; file
-  length alone is not an architecture finding.
-- For new or changed vpsAdmin API definitions, whether relationships to live
-  resources use HaveAPI `resource` parameters and attributes instead of raw
-  integer IDs. Prefer `resource Node` to `integer :node_id`, with an explicit
-  `name` when needed. Allow raw IDs only when a resource association cannot
-  represent the data safely, such as historical records or references to
-  resources that may no longer exist, and require a concrete rationale. This
-  check applies to the API contract, not database foreign-key storage.
-- For new or changed vpsAdmin API parameters, whether every parameter has a
-  human-friendly label and a description that explains its meaning or purpose.
-  A description may be omitted only when the meaning is obvious and the text
-  would add no useful information. Flag identifier-derived labels such as
-  `Expires_at` as non-human-friendly.
-- For vpsAdmin API resources, whether every top-level resource has a standalone
-  source file matching that resource. Nested resources may remain in the same
-  file as their parent resource.
-- For new or changed ActiveRecord migrations, whether schema changes use the
-  `change` method and direction-dependent data changes use `reversible` blocks
-  within it. Prefer ActiveRecord-managed rollback over duplicated `up` and
-  `down` methods that can drift apart. Allow `up` and `down` when the operation
-  demands them or they make the migration materially clearer, and require the
-  choice to be justified.
-- For migrations that have not been merged, released, or deployed, whether
-  schema-existence guards such as `table_exists?`, `column_exists?`,
-  `index_exists?`, `if_exists`, or `if_not_exists` merely accommodate a stale
-  disposable development or test database. Require resetting that database and
-  making the migration assume its exact predecessor schema. Report unexplained
-  guards as `Blocking`. Allow them only for documented supported predecessor
-  schemas with tests for every path; do not confuse real data-integrity or
-  conversion checks with schema-existence guards.
-- Whether new or changed code uses defensive shape or capability probing
-  instead of explicit contracts. Flag runtime method/property/type probes such
-  as Ruby `respond_to?`, PHP `method_exists`/`property_exists`, Python
-  `hasattr`, reflection checks, optional chaining used to mask uncertain data
-  shapes, or helpers that try several possible input shapes unless the code or
-  review packet shows a concrete boundary reason: external API compatibility,
-  intentional polymorphism, generated/legacy migration data, or validated
-  untrusted input normalization. Prefer validating and normalizing data at the
-  boundary so internal code knows what it is passing.
-- For vpsAdmin API changes, whether plugin-specific functionality stays in the
-  owning plugin unless a generic core extension point is intentionally changed.
-  Flag plugin-owned API resources, event/type registrations, mail templates,
-  sysconfig keys, metrics, routes, or transaction behavior added to core files
-  without explicit rationale.
-- Whether the changes introduce vulnerabilities or tenant-isolation risks in
-  the context of the whole system and cross-project interactions.
-- Whether the changes are appropriately tested. Check unit/spec coverage,
-  integration coverage where the behavior crosses components or daemons, and
-  regression coverage for non-golden paths such as unexpected input, missing
-  state, conflicting state, rollback/error paths, authorization failures,
-  mixed-version flows, and repeated or partially completed operations.
-- Whether tests that transfer containers, VPS datasets, backups, or replacement
-  datasets verify data integrity, not just metadata. Expect a known file path
-  with known contents, or an equivalent checksum assertion, to be created before
-  the transfer and verified after the operation completes.
-- Whether appropriate documentation, man pages, API docs, migration notes, or
-  operational docs were updated when behavior changes.
-- For KB or DokuWiki changes, whether every instruction to perform a vpsAdmin
-  WebUI action is wrapped in a semantic `<vpsadmin-nav>` annotation bound to the
-  affected language pages. Enumerate action-oriented prose manually, including
-  instructions that do not name a menu or form; do not treat a green discovery
-  heuristic as proof of completeness. Report a missing binding as `Blocking`.
-- Whether deployment to running systems is safe with older versions still
-  present. Consider persisted state, schemas, protocols, generated
-  configuration, mixed-version operation, rollback, and whether any all-at-once
-  upgrade requirement is justified.
-
-For architecture findings, describe a concrete maintenance or failure scenario
-rather than reporting a pattern or line count alone. Use these severity defaults:
-
-- `Blocking`: the change creates or expands an avoidable duplicated source of
-  truth or hidden protocol that can silently omit, misroute, misclassify, or
-  bypass authorization, persistence, event, plugin, or delivery behavior.
-- `Important`: the change leaves safe but costly shotgun surgery, unclear
-  ownership, or touched multi-responsibility design without a convincing
-  rationale; use this level for existing debt exposed but not worsened.
-- `Advisory`: the issue is limited to smaller extraction, naming, validation, or
-  declaration-locality improvements without a plausible correctness failure.
-
-## Output
+- `Blocking`: must be fixed before long integration tests.
+- `Important`: may proceed only after a fix or an explicit recorded decision.
+- `Advisory`: a smaller improvement or residual risk that does not block
+  progress.
 
 Start with findings ordered by severity, using file/line and commit references
-where possible. Include:
-
-- `Blocking`: issues that should be fixed before integration tests.
-- `Important`: issues that may be acceptable only after explicit discussion.
-- `Advisory`: smaller design, documentation, or commit-quality improvements.
-
-If there are no findings, say so clearly and list any residual risks or test
-gaps. Keep summaries brief; the value of the review is in concrete findings and
-deployment/security reasoning.
+where possible. If there are no findings, say so clearly and list residual
+risks or test gaps. Keep summaries brief; the value of the review is in
+concrete findings and compatibility, architecture, and security reasoning.
