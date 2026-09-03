@@ -116,12 +116,17 @@ required lane.
 8. Fix Blocking findings before integration tests. Fix Important findings or
    discuss and record an explicit decision before continuing. Advisory findings
    may be accepted at the coordinating agent's discretion but must be recorded.
-9. If a fix materially changes code, architecture, contracts, behavior, tests,
-   or commit history, rerun the general lane and every specialist lane affected
-   by the new diff against the updated heads.
-10. Record the risk classification and rationale, reviewer lanes, model and
-    effort, reviewed commits, findings, decisions, fixes, and any reruns in the
-    initiative `state.md`.
+9. Verify direct review remediations with focused inspection and checks. Do not
+   rerun a reviewer merely to confirm that its requested narrow fix was made,
+   especially when the fix only deletes rejected behavior or reduces scope.
+10. Rerun only the lanes affected when a remediation introduces a new design,
+   expands the accepted boundary, changes a public or cross-project contract,
+   or resolves a finding through behavior the completed review did not assess.
+   Do not rerun unaffected lanes. The high-risk reclassification rule above
+   remains an explicit exception.
+11. Record the risk classification and rationale, reviewer lanes, model and
+   effort, reviewed commits, findings, decisions, fixes, and any reruns in the
+   initiative `state.md`.
 
 ## Shared Reviewer Instructions
 
