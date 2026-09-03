@@ -44,8 +44,18 @@ Managed tmux panes and worktree windows receive these environment variables:
 
 `start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`, and
 `worktrees/<slug>/` when missing. Existing plan and state files are never
-overwritten. New state files start with `- Lifecycle: active`. An exact slug
-already present under `archive/` cannot be reused.
+overwritten. New state files begin with exact YAML front matter containing
+`lifecycle: active`; that anchored field is the only lifecycle authority. An
+exact slug that is present under `archive/`, tracked there, or found there in
+repository history cannot be reused, even if its archive is absent from the
+current working tree. Archive index or history lookup failures are refused
+rather than treated as proof that the slug is unused.
+
+```yaml
+---
+lifecycle: active
+---
+```
 
 Fill in a substantive plan and initial state and commit them in the workspace
 repository before the first project-code commit or external mutation. Keep
@@ -73,8 +83,10 @@ to avoid ambiguity.
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no
 longer exists, and it leaves user-created windows untouched.
 
-`stop` only kills the managed tmux session. It leaves all files and worktrees in
-place.
+`stop` normally only kills the exact managed tmux session and leaves all files
+and worktrees in place. After `finalize` has moved tracking into `archive/`, it
+refuses to stop until that exact archive move and its terminal state are
+committed.
 
 `current` prints the active slug and nothing else. It resolves the slug from the
 managed tmux session environment, the caller's exact managed tmux pane, or a
@@ -84,8 +96,13 @@ when no active session can be found or when those sources disagree. Codex
 instances should run it before creating a new initiative slug. The helper
 accepts session identity only when both `VPSFREE_DEV_SESSION_SLUG` and the
 canonical `VPSFREE_DEV_SESSION_WORKSPACE` match. It filters managed sessions
-owned by
-other workspaces from listing and short-name lookup.
+owned by other workspaces from listing and short-name lookup.
+
+Managed sessions created before workspace identity metadata was introduced are
+not adopted automatically. Inspect and stop such a session manually after its
+writers are quiet, then restart the same active slug with `start --as-is` so it
+receives canonical metadata. Existing symlinked workspace paths are recognized
+and normalized automatically.
 
 `remove` cleans up a development session:
 
@@ -93,13 +110,18 @@ other workspaces from listing and short-name lookup.
 bin/dev-session remove api-token-rotation
 ```
 
-It removes clean git worktrees under `worktrees/<slug>/`, removes the empty
-worktree group directory, and then kills the managed tmux session when one
-exists. This order makes it safe to run from inside its own managed session:
-the session is killed only after cleanup has completed. Branches are kept.
+It removes clean git worktrees whose `HEAD` is attached to a shared
+`refs/heads/*` branch under `worktrees/<slug>/`, removes the empty worktree
+group directory, and then kills the managed tmux session when one exists. This
+order makes it safe to run from inside its own managed session: the session is
+killed only after cleanup has completed. Branches are kept.
 `work/<slug>/plan.md` and `state.md` are kept by default.
 
-Dirty worktrees are refused unless `--force` is passed:
+Worktrees with changes reported by ordinary `git status --porcelain` are
+refused unless `--force` is passed. Detached or locked worktrees and paths
+outside the exact initiative group are always refused. Cleanup then delegates
+removal to `git worktree remove`; if Git refuses a worktree, resolve the reason
+and retry. Branches are retained:
 
 ```sh
 bin/dev-session remove api-token-rotation --force
@@ -121,24 +143,45 @@ bin/dev-session finalize api-token-rotation
 
 Before running it:
 
-- set the single `- Lifecycle:` marker in `state.md` to `complete` or
-  `abandoned`;
+- set the lifecycle field in the exact YAML front matter at the start of
+  `state.md` to `complete` or `abandoned`; lifecycle-looking text anywhere in
+  the Markdown body has no effect;
 - make sure plan and state have an earlier commit under `work/<slug>/`;
+- make sure that history includes a commit whose front matter has
+  `lifecycle: active` before the terminal transition;
 - resolve all review, CI, merge, approval, deployment, and cleanup work owned by
   the session;
+- stop shells, editors, builds, and background processes that can still write
+  into an initiative worktree;
 - remove credentials, caches, reproducible bulk captures, and transient
   outputs, keeping plan/state and intentionally durable evidence.
 
 `finalize` performs all safety checks before cleanup. It refuses missing
 tracking files, an active or ambiguous lifecycle, tracking without a prior
-commit, an existing archive destination, unmanaged tmux ownership, dirty git
-worktrees, and unknown entries in the worktree group. It then removes clean
-worktrees, preserves their branches, moves `work/<slug>/` to
-`archive/<slug>/`, and kills the managed tmux session last.
+commit, an existing archive destination, mismatched or replaced tmux identity,
+worktree changes reported by ordinary `git status --porcelain`, detached or
+locked worktrees, worktrees outside the canonical `repos/*.git` bare clones,
+symlinked paths or roots, and unknown entries in the worktree group. Cleanup
+for one slug is serialized, and every worktree receives the same ordinary
+cleanliness and path checks before any is removed. It then delegates each
+removal to non-force `git worktree remove`, preserves the branches, and uses a
+same-filesystem, atomic no-clobber move from `work/<slug>/` to
+`archive/<slug>/`. If Git refuses a worktree for another reason, cleanup stops;
+already removed worktrees remain available through their retained branches,
+and the command can be retried after resolving the refusal. The helper requires
+GNU `mv` with `--no-copy` and `--update=none-fail`; it verifies option support
+before removing worktrees.
+
+The per-slug lock serializes `dev-session` commands, not external writers. A
+process that writes after the last cleanliness check can still race worktree
+removal, so all worktree writers must be stopped before finalization.
 
 The helper does not stage or commit. Inspect the reported move and commit only
 the exact `work/<slug>/` and `archive/<slug>/` paths in the shared top-level
-repository.
+repository. The managed tmux session remains available for that commit. After
+the commit, `bin/dev-session stop <slug> --as-is` verifies the terminal archive
+and clean task paths before closing the exact workspace-owned tmux identity it
+resolves at stop time.
 
 ## Worktree helpers
 
@@ -156,6 +199,11 @@ This uses:
 - base ref: `origin/HEAD`, falling back to `origin/master`;
 - `git fetch origin` before creation.
 
+Before fetching or creating a branch, the helper resolves the repository and
+requires it to be a bare clone directly under the canonical `repos/` root.
+An in-root alias to another canonical bare clone is accepted; a symlink to an
+external repository is refused.
+
 Useful options:
 
 ```sh
@@ -170,7 +218,11 @@ Remove a worktree without deleting its branch:
 bin/dev-session worktree remove api-token-rotation vpsadmin
 ```
 
-Dirty worktrees are refused unless `--force` is used.
+Worktrees with changes reported by ordinary `git status --porcelain` are
+refused unless `--force` is used. Detached or locked worktrees are always
+refused. Git remains the authority for whether its non-force worktree removal
+can proceed; resolve any refusal and retry, or use the explicit force option
+when discarding the worktree is intentional.
 
 ## Test and automation options
 

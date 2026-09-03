@@ -20,6 +20,17 @@ module VpsfreeDevSession
   ENV_WORK_DIR = 'VPSFREE_DEV_SESSION_WORK_DIR'
   ENV_WORKTREES_DIR = 'VPSFREE_DEV_SESSION_WORKTREES_DIR'
 
+  LIFECYCLE_HEADER = Regexp.new(
+    '\\A---\\r?\\nlifecycle: (active|complete|abandoned)' \
+    '\\r?\\n---(?:\\r?\\n|\\z)'
+  )
+
+  ARCHIVE_MOVE_OPTIONS = %w[
+    --no-copy
+    --no-target-directory
+    --update=none-fail
+  ].freeze
+
   USAGE = <<~USAGE
     Usage:
       dev-session [--workspace DIR] [--tmux-socket NAME] start <name-or-slug>
@@ -227,6 +238,8 @@ module VpsfreeDevSession
   end
 
   class Runner
+    CleanupPlan = Struct.new(:session, :entries, keyword_init: true)
+
     attr_reader :workspace, :today
 
     def initialize(
@@ -299,88 +312,49 @@ module VpsfreeDevSession
       slug = lookup_slug(input, as_is:)
       with_slug_lock(slug) do
         session = ensure_managed_session!(slug)
-        revalidate_session!(session)
-        @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+        close_session!(slug, session)
       end
     end
 
     def remove(input, as_is:, force:)
       slug = lookup_slug(input, as_is:)
       with_slug_lock(slug) do
-        session = @tmux.session(slug)
+        plan = prepare_cleanup(slug, force:)
+        validate_session_closure!(slug)
 
-        known_state = session ||
-                      File.directory?(work_dir(slug)) ||
-                      File.directory?(worktrees_dir(slug))
-
-        unless known_state
-          raise Error, "no dev session state found for #{slug}"
-        end
-
-        session = ensure_managed_session!(slug, session:) if session
-
-        entries = worktree_entries(slug)
-        dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
-
-        if !force && !dirty_entries.empty?
-          paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
-          raise Error, "worktree has uncommitted changes: #{paths}"
-        end
-
-        entries.each do |entry|
-          remove_worktree_path(entry.fetch(:path), force:)
-        end
-
-        remove_empty_dir(worktrees_dir(slug))
-        if session
-          revalidate_session!(session)
-          @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
-        end
+        execute_cleanup(slug, plan, force:)
+        close_session!(slug, plan.session) if plan.session
       end
     end
 
     def finalize(input, as_is:)
       slug = lookup_slug(input, as_is:)
       with_slug_lock(slug) do
-        source = work_dir(slug)
+        source = validate_work_directory!(slug)
         destination = archive_dir(slug)
 
-        raise Error, "work directory not found: #{source}" unless File.directory?(source)
-        raise Error, "archive already exists: #{destination}" if File.exist?(destination)
+        raise Error, "archive already exists: #{destination}" if path_exists?(destination)
 
         validate_tracking_files!(slug)
         validate_terminal_lifecycle!(slug)
         validate_tracking_committed!(slug)
-
-        session = @tmux.session(slug)
-        session = ensure_managed_session!(slug, session:) if session
-
-        entries = worktree_entries(slug)
-        unexpected = unexpected_worktree_entries(slug, entries)
-        unless unexpected.empty?
-          raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
+        archive_root = ensure_archive_root!
+        unless File.stat(source).dev == File.stat(archive_root).dev
+          raise Error, 'work and archive directories must be on the same filesystem'
         end
+        validate_archive_move_command!
 
-        dirty_entries = entries.select { |entry| worktree_dirty?(entry.fetch(:path)) }
-        unless dirty_entries.empty?
-          paths = dirty_entries.map { |entry| entry.fetch(:path) }.join(', ')
-          raise Error, "worktree has uncommitted changes: #{paths}"
-        end
-
-        entries.each do |entry|
-          remove_worktree_path(entry.fetch(:path), force: false)
-        end
-
-        remove_empty_dir(worktrees_dir(slug))
-        FileUtils.mkdir_p(File.dirname(destination))
-        FileUtils.mv(source, destination)
-        if session
-          revalidate_session!(session)
-          @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
-        end
+        plan = prepare_cleanup(slug, force: false)
+        execute_cleanup(slug, plan, force: false)
+        source = validate_work_directory!(slug)
+        ensure_archive_root!
+        atomic_archive_move!(source, destination)
 
         @out.puts "archived: #{destination}"
         @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
+        if plan.session
+          @out.puts "stop after committing: bin/dev-session stop #{slug} --as-is"
+        end
       end
     end
 
@@ -432,8 +406,9 @@ module VpsfreeDevSession
 
         ensure_tracking_files(slug)
 
-        repo = repo_dir(project)
-        raise Error, "repository not found: #{repo}" unless File.directory?(repo)
+        repo_path = repo_dir(project)
+        raise Error, "repository not found: #{repo_path}" unless File.directory?(repo_path)
+        repo = validate_canonical_repository!(repo_path, repo_path)
 
         @command_runner.run(['git', "--git-dir=#{repo}", 'fetch', 'origin']) if fetch
 
@@ -441,9 +416,9 @@ module VpsfreeDevSession
         name ||= project
         path = File.join(worktrees_dir(slug), name)
 
-        raise Error, "worktree path already exists: #{path}" if File.exist?(path)
+        raise Error, "worktree path already exists: #{path}" if path_exists?(path)
 
-        FileUtils.mkdir_p(File.dirname(path))
+        ensure_worktree_group!(slug, create: true)
 
         if branch_exists?(repo, branch)
           @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
@@ -473,23 +448,17 @@ module VpsfreeDevSession
         path = File.join(worktrees_dir(slug), name)
         raise Error, "worktree not found: #{path}" unless File.directory?(path)
 
+        entry = { name:, path: File.expand_path(path) }
+        common_dir = validate_worktree_path!(slug, entry)
+        validate_worktree_head!(path)
+
         unless force || !worktree_dirty?(path)
           raise Error, "worktree has uncommitted changes: #{path}"
         end
 
-        remove_worktree_path(path, force:)
+        remove_worktree_path(slug, entry, common_dir:, force:)
         sync_slug(slug, require_session: false)
       end
-    end
-
-    def remove_worktree_path(path, force:)
-      common_dir = git_capture(['git', '-C', path, 'rev-parse', '--git-common-dir']).strip
-      common_dir = File.expand_path(common_dir, path)
-
-      argv = ['git', "--git-dir=#{common_dir}", 'worktree', 'remove']
-      argv << '--force' if force
-      argv << path
-      @command_runner.run(argv)
     end
 
     def build_slug(input, as_is:)
@@ -538,10 +507,13 @@ module VpsfreeDevSession
 
     def ensure_tracking_files(slug)
       archived = archive_dir(slug)
-      raise Error, "archived slug cannot be reused: #{archived}" if File.exist?(archived)
+      if archived_slug_known?(slug)
+        raise Error, "archived slug cannot be reused: #{archived}"
+      end
 
-      FileUtils.mkdir_p(work_dir(slug))
-      FileUtils.mkdir_p(worktrees_dir(slug))
+      ensure_directory!(File.join(workspace, 'work'), 'work root', create: true)
+      ensure_directory!(work_dir(slug), 'work directory', create: true)
+      ensure_worktree_group!(slug, create: true)
       write_once(plan_file(slug), plan_skeleton(slug))
       write_once(state_file(slug), state_skeleton(slug))
     end
@@ -587,6 +559,21 @@ module VpsfreeDevSession
       end
     end
 
+    def archived_slug_known?(slug)
+      return true if path_exists?(archive_dir(slug))
+      return false unless path_exists?(File.join(workspace, '.git'))
+
+      relative = File.join('archive', slug)
+      indexed = git_capture(['git', '-C', workspace, 'ls-files', '-z', '--', relative])
+      return true unless indexed.empty?
+
+      history = git_capture([
+        'git', '-C', workspace, 'log', '--all',
+        '--format=%H', '--', relative
+      ])
+      !history.empty?
+    end
+
     private
 
     def print_rows(rows)
@@ -630,13 +617,158 @@ module VpsfreeDevSession
     end
 
     def worktree_dirty?(path)
-      !git_capture(['git', '-C', path, 'status', '--porcelain']).empty?
+      !git_capture([
+        'git', '-C', path, 'status', '--porcelain', '--untracked-files=all'
+      ]).empty?
     end
 
-    def remove_empty_dir(path)
+    def prepare_cleanup(slug, force:)
+      session = @tmux.session(slug)
+      known_state = session ||
+                    path_exists?(work_dir(slug)) ||
+                    path_exists?(worktrees_dir(slug))
+      raise Error, "no dev session state found for #{slug}" unless known_state
+
+      session = ensure_managed_session!(slug, session:) if session
+
+      entries = worktree_entries(slug)
+      unexpected = unexpected_worktree_entries(slug, entries)
+      unless unexpected.empty?
+        raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
+      end
+
+      entries = entries.map do |entry|
+        path = entry.fetch(:path)
+        common_dir = validate_worktree_path!(slug, entry)
+        validate_worktree_head!(path)
+        entry.merge(common_dir:)
+      end
+
+      unless force
+        unsafe = entries.select do |entry|
+          worktree_dirty?(entry.fetch(:path))
+        end
+        unless unsafe.empty?
+          paths = unsafe.map { |entry| entry.fetch(:path) }.join(', ')
+          raise Error, "worktree has uncommitted changes: #{paths}"
+        end
+      end
+
+      CleanupPlan.new(session:, entries:)
+    end
+
+    def execute_cleanup(slug, plan, force:)
+      plan.entries.each do |entry|
+        remove_worktree_path(
+          slug,
+          entry,
+          common_dir: entry.fetch(:common_dir),
+          force:
+        )
+      end
+
+      remove_worktree_group!(slug)
+    end
+
+    def remove_worktree_path(slug, entry, common_dir:, force:)
+      current_common_dir = validate_worktree_path!(slug, entry)
+      unless current_common_dir == common_dir
+        raise Error, "worktree registration changed during cleanup: #{entry.fetch(:path)}"
+      end
+
+      validate_worktree_head!(entry.fetch(:path))
+      unless force || !worktree_dirty?(entry.fetch(:path))
+        raise Error,
+              "worktree gained uncommitted changes during cleanup: #{entry.fetch(:path)}"
+      end
+
+      argv = ['git', "--git-dir=#{common_dir}", 'worktree', 'remove']
+      argv << '--force' if force
+      argv << entry.fetch(:path)
+      @command_runner.run(argv)
+    end
+
+    def validate_worktree_path!(slug, entry)
+      root = ensure_worktree_group!(slug, create: false)
+      path = entry.fetch(:path)
+
+      raise Error, "worktree path is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "worktree path is not a directory: #{path}" unless File.directory?(path)
+
+      real_root = File.realpath(root)
+      real_path = File.realpath(path)
+      unless File.dirname(real_path) == real_root
+        raise Error, "worktree path escapes its initiative group: #{path}"
+      end
+
+      top = git_capture(['git', '-C', path, 'rev-parse', '--show-toplevel']).strip
+      unless File.realpath(top) == real_path
+        raise Error, "worktree path is not its repository root: #{path}"
+      end
+
+      common_dir = git_capture(['git', '-C', path, 'rev-parse', '--git-common-dir']).strip
+      common_dir = File.realpath(File.expand_path(common_dir, path))
+      common_dir = validate_canonical_repository!(common_dir, path)
+      listing = git_capture([
+        'git',
+        "--git-dir=#{common_dir}",
+        'worktree',
+        'list',
+        '--porcelain',
+        '-z'
+      ])
+      stanza = listing.split("\0\0").map { |candidate| candidate.split("\0") }.find do |fields|
+        registered = fields.first&.delete_prefix('worktree ')
+        registered && File.expand_path(registered) == real_path
+      end
+      raise Error, "worktree is not registered at its initiative path: #{path}" unless stanza
+      if stanza.any? { |field| field.start_with?('locked') }
+        raise Error, "worktree is locked: #{path}"
+      end
+
+      common_dir
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot validate worktree path #{path}: #{e.message}"
+    end
+
+    def validate_canonical_repository!(repository, source)
+      root = ensure_directory!(File.join(workspace, 'repos'), 'repository root', create: false)
+      real_root = File.realpath(root)
+      common_dir = File.realpath(repository)
+      unless File.dirname(common_dir) == real_root && File.basename(common_dir).end_with?('.git')
+        raise Error, "repository is outside the canonical repository root: #{source}"
+      end
+
+      bare = git_capture([
+        'git', "--git-dir=#{common_dir}", 'rev-parse', '--is-bare-repository'
+      ]).strip
+      return common_dir if bare == 'true'
+
+      raise Error, "repository is not a canonical bare clone: #{source}"
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot validate repository #{source}: #{e.message}"
+    end
+
+    def validate_worktree_head!(path)
+      stdout, _stderr, status = @command_runner.capture(
+        ['git', '-C', path, 'symbolic-ref', '--quiet', 'HEAD'],
+        allow_failure: true
+      )
+      unless status.success? && stdout.strip.start_with?('refs/heads/')
+        raise Error,
+              "worktree has detached HEAD or a non-shared symbolic ref; " \
+              "attach it to a retained shared branch: #{path}"
+      end
+    end
+
+    def remove_worktree_group!(slug)
+      path = worktrees_dir(slug)
+      return unless path_exists?(path)
+
+      ensure_worktree_group!(slug, create: false)
       FileUtils.rmdir(path)
-    rescue Errno::ENOENT, Errno::ENOTEMPTY, Errno::EEXIST
-      nil
+    rescue Errno::ENOTEMPTY, Errno::EEXIST
+      raise Error, "worktree group changed during cleanup or is not empty: #{path}"
     end
 
     def ensure_directory!(path, label, create:)
@@ -650,6 +782,48 @@ module VpsfreeDevSession
       end
 
       path
+    end
+
+    def ensure_worktree_group!(slug, create:)
+      ensure_directory!(worktrees_dir(slug), 'worktree group', create:)
+    end
+
+    def ensure_archive_root!
+      ensure_directory!(File.join(workspace, 'archive'), 'archive root', create: true)
+    end
+
+    def validate_work_directory!(slug)
+      root = ensure_directory!(File.join(workspace, 'work'), 'work root', create: false)
+      source = work_dir(slug)
+      raise Error, "work directory is a symlink: #{source}" if File.symlink?(source)
+      raise Error, "work directory not found: #{source}" unless File.directory?(source)
+
+      unless File.dirname(File.realpath(source)) == File.realpath(root)
+        raise Error, "work directory escapes the workspace root: #{source}"
+      end
+
+      source
+    end
+
+    def atomic_archive_move!(source, destination)
+      @command_runner.run(archive_move_command(source, destination))
+      return unless path_exists?(source) || !File.directory?(destination)
+
+      raise Error, "archive move did not complete: #{source} -> #{destination}"
+    end
+
+    def validate_archive_move_command!
+      _stdout, _stderr, status = @command_runner.capture(
+        archive_move_command('--help'),
+        allow_failure: true
+      )
+      return if status.success?
+
+      raise Error, 'mv does not support the required atomic archive options'
+    end
+
+    def archive_move_command(*arguments)
+      ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
     def with_slug_lock(slug)
@@ -890,10 +1064,13 @@ module VpsfreeDevSession
 
     def worktree_entries(slug)
       root = worktrees_dir(slug)
-      return [] unless File.directory?(root)
+      return [] unless path_exists?(root)
+
+      ensure_worktree_group!(slug, create: false)
 
       Dir.children(root).sort.filter_map do |name|
         path = File.join(root, name)
+        next if File.symlink?(path)
         next unless File.directory?(path)
         next unless File.exist?(File.join(path, '.git'))
 
@@ -903,7 +1080,9 @@ module VpsfreeDevSession
 
     def unexpected_worktree_entries(slug, entries)
       root = worktrees_dir(slug)
-      return [] unless File.directory?(root)
+      return [] unless path_exists?(root)
+
+      ensure_worktree_group!(slug, create: false)
 
       managed_names = entries.map { |entry| File.basename(entry.fetch(:path)) }
       Dir.children(root).sort - managed_names
@@ -977,7 +1156,12 @@ module VpsfreeDevSession
     end
 
     def write_once(path, content)
-      return if File.exist?(path)
+      if path_exists?(path)
+        raise Error, "tracking file is a symlink: #{path}" if File.symlink?(path)
+        raise Error, "tracking path is not a file: #{path}" unless File.file?(path)
+
+        return
+      end
 
       File.write(path, content)
     end
@@ -1000,13 +1184,15 @@ module VpsfreeDevSession
 
     def state_skeleton(slug)
       <<~STATE
+        ---
+        lifecycle: active
+        ---
+
         # #{slug}
 
         ## Repositories
 
         ## Status
-
-        - Lifecycle: active
 
         ## Commands run
 
@@ -1019,39 +1205,158 @@ module VpsfreeDevSession
     end
 
     def validate_tracking_files!(slug)
-      missing = [plan_file(slug), state_file(slug)].reject { |path| File.file?(path) }
+      paths = [plan_file(slug), state_file(slug)]
+      symlinks = paths.select { |path| File.symlink?(path) }
+      unless symlinks.empty?
+        raise Error, "tracking files must not be symlinks: #{symlinks.join(', ')}"
+      end
+
+      missing = paths.reject { |path| File.file?(path) }
       return if missing.empty?
 
       raise Error, "missing tracking files: #{missing.join(', ')}"
     end
 
     def validate_terminal_lifecycle!(slug)
-      matches = File.readlines(state_file(slug), chomp: true).filter_map do |line|
-        match = line.match(/\A- Lifecycle: (active|complete|abandoned)\z/)
-        match && match[1]
-      end
+      validate_terminal_lifecycle_file!(state_file(slug))
+    end
 
-      unless matches.length == 1
-        raise Error, 'state.md must contain exactly one lifecycle marker'
-      end
+    def validate_terminal_lifecycle_file!(path)
+      validate_terminal_lifecycle_content!(File.read(path))
+    end
 
-      return if %w[complete abandoned].include?(matches.first)
+    def validate_terminal_lifecycle_content!(content)
+      lifecycle = lifecycle_state(content)
 
-      raise Error, "initiative lifecycle is not terminal: #{matches.first}"
+      return if %w[complete abandoned].include?(lifecycle)
+
+      raise Error, "initiative lifecycle is not terminal: #{lifecycle}"
     end
 
     def validate_tracking_committed!(slug)
-      missing = %w[plan.md state.md].reject do |name|
-        path = File.join('work', slug, name)
-        _stdout, _stderr, status = @command_runner.capture(
-          ['git', '-C', workspace, 'cat-file', '-e', "HEAD:#{path}"],
-          allow_failure: true
-        )
-        status.success?
+      plan_path = File.join('work', slug, 'plan.md')
+      state_path = File.join('work', slug, 'state.md')
+      missing = [plan_path, state_path].reject { |path| committed_path?('HEAD', path) }
+      unless missing.empty?
+        raise Error, "tracking files have no prior commit: #{missing.join(', ')}"
       end
-      return if missing.empty?
 
-      raise Error, "tracking files have no prior commit: #{missing.join(', ')}"
+      validate_active_lifecycle_history!(slug)
+    end
+
+    def validate_active_lifecycle_history!(slug)
+      plan_path = File.join('work', slug, 'plan.md')
+      state_path = File.join('work', slug, 'state.md')
+      revisions = git_capture([
+        'git', '-C', workspace, 'rev-list', 'HEAD', '--', state_path
+      ]).lines.map(&:strip)
+      active_revision = revisions.find do |revision|
+        next false unless committed_path?(revision, plan_path)
+
+        content = git_capture([
+          'git', '-C', workspace, 'show', "#{revision}:#{state_path}"
+        ])
+        begin
+          lifecycle_state(content) == 'active'
+        rescue Error
+          false
+        end
+      end
+      return if active_revision
+
+      raise Error, 'tracking history has no committed active lifecycle'
+    end
+
+    def committed_path?(revision, path)
+      _stdout, _stderr, status = @command_runner.capture(
+        ['git', '-C', workspace, 'cat-file', '-e', "#{revision}:#{path}"],
+        allow_failure: true
+      )
+      status.success?
+    end
+
+    def lifecycle_state(content)
+      match = content.match(LIFECYCLE_HEADER)
+      return match[1] if match
+
+      raise Error,
+            'state.md must start with lifecycle YAML front matter set to ' \
+            'active, complete, or abandoned'
+    end
+
+    def close_session!(slug, session)
+      validate_session_closure!(slug)
+      revalidate_session!(session)
+      @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+    end
+
+    def validate_session_closure!(slug)
+      active = path_exists?(work_dir(slug))
+      archived = path_exists?(archive_dir(slug))
+
+      if active && archived
+        raise Error, "active and archived tracking both exist for #{slug}"
+      elsif !active && !archived
+        raise Error, "session tracking is missing for #{slug}"
+      elsif archived
+        validate_archive_committed!(slug)
+      else
+        validate_work_directory!(slug)
+        validate_tracking_files!(slug)
+      end
+    end
+
+    def validate_archive_committed!(slug)
+      root = ensure_archive_root!
+      directory = archive_dir(slug)
+      raise Error, "archive directory is a symlink: #{directory}" if File.symlink?(directory)
+      raise Error, "archive directory not found: #{directory}" unless File.directory?(directory)
+      unless File.dirname(File.realpath(directory)) == File.realpath(root)
+        raise Error, "archive directory escapes the workspace root: #{directory}"
+      end
+
+      plan = File.join(directory, 'plan.md')
+      state = File.join(directory, 'state.md')
+      if [plan, state].any? { |path| File.symlink?(path) }
+        raise Error, 'archived tracking files must not be symlinks'
+      end
+      unless [plan, state].all? { |path| File.file?(path) }
+        raise Error, "archive is missing tracking files: #{directory}"
+      end
+      validate_terminal_lifecycle_file!(state)
+
+      relative_paths = [File.join('work', slug), File.join('archive', slug)]
+      status = git_capture([
+        'git',
+        '-C',
+        workspace,
+        'status',
+        '--porcelain',
+        '--untracked-files=all',
+        '--ignored=matching',
+        '--',
+        *relative_paths
+      ])
+      unless status.empty?
+        raise Error, 'archive move must be committed before stopping the session'
+      end
+
+      if committed_path?('HEAD', File.join('work', slug))
+        raise Error, 'active tracking remains committed after the archive move'
+      end
+
+      missing = %w[plan.md state.md].reject do |name|
+        committed_path?('HEAD', File.join('archive', slug, name))
+      end
+      unless missing.empty?
+        raise Error, "archived tracking files are not committed: #{missing.join(', ')}"
+      end
+
+      committed_state = git_capture([
+        'git', '-C', workspace, 'show', "HEAD:#{File.join('archive', slug, 'state.md')}"
+      ])
+      validate_terminal_lifecycle_content!(committed_state)
+      validate_active_lifecycle_history!(slug)
     end
 
     def origin_head(repo)

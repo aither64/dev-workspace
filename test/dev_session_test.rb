@@ -27,7 +27,6 @@ class DevSessionTest < Minitest::Test
     def current_session_identity(_pane)
       nil
     end
-
   end
 
   class CurrentTmux < NullTmux
@@ -137,6 +136,7 @@ class DevSessionTest < Minitest::Test
         workspace: ''
       )
     end
+
 
   end
 
@@ -350,6 +350,23 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  class CallbackCommandRunner
+    def initialize(out:, err:, &callback)
+      @delegate = VpsfreeDevSession::CommandRunner.new(out:, err:)
+      @callback = callback
+    end
+
+    def capture(argv, allow_failure: false)
+      @callback.call(argv)
+      @delegate.capture(argv, allow_failure:)
+    end
+
+    def run(argv)
+      @callback.call(argv)
+      @delegate.run(argv)
+    end
+  end
+
   TODAY = Date.new(2026, 6, 6)
 
   def test_build_slug_prefixes_current_date
@@ -525,7 +542,7 @@ class DevSessionTest < Minitest::Test
 
       assert_equal("custom plan\n", File.read(plan))
       assert_includes(File.read(state), '## Commands run')
-      assert_includes(File.read(state), '- Lifecycle: active')
+      assert_match(/\A---\nlifecycle: active\n---\n/, File.read(state))
       assert(File.directory?(File.join(workspace, 'worktrees', slug)))
     end
   end
@@ -540,6 +557,70 @@ class DevSessionTest < Minitest::Test
       end
 
       assert_match(/archived slug cannot be reused/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tracking_files_refuse_a_dangling_archive_symlink
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      FileUtils.mkdir_p(File.join(workspace, 'archive'))
+      FileUtils.ln_s(
+        File.join(workspace, 'missing-archive-target'),
+        File.join(workspace, 'archive', slug)
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
+      assert_match(/archived slug cannot be reused/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tracking_files_refuse_a_slug_found_only_in_archive_history
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      archive = File.join(workspace, 'archive', slug)
+      FileUtils.mkdir_p(archive)
+      File.write(File.join(archive, 'plan.md'), "# Plan\n")
+      File.write(
+        File.join(archive, 'state.md'),
+        "---\nlifecycle: complete\n---\n\n# #{slug}\n\n## Status\n"
+      )
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'add', File.join('archive', slug))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'archive initiative')
+      FileUtils.rm_r(archive)
+      assert_git_success('git', '-C', workspace, 'add', '-A', '--', File.join('archive', slug))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'remove archive checkout')
+      assert_equal(
+        '',
+        git_capture_success('git', '-C', workspace, 'ls-files', '--', File.join('archive', slug))
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
+      assert_match(/archived slug cannot be reused/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tracking_files_fail_closed_when_archive_history_cannot_be_read
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      File.write(File.join(workspace, '.git'), "not a git directory\n")
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
       refute(File.exist?(File.join(workspace, 'work', slug)))
     end
   end
@@ -812,6 +893,90 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_worktree_add_accepts_an_in_root_repository_alias
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample-storage')
+      FileUtils.ln_s(
+        'sample-storage.git',
+        File.join(workspace, 'repos', 'sample.git')
+      )
+
+      runner_for(workspace).worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      assert(
+        File.directory?(
+          File.join(workspace, 'worktrees', '2026-06-06-demo', 'sample')
+        )
+      )
+    end
+  end
+
+  def test_worktree_add_refuses_an_external_repository_alias
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      Dir.mktmpdir('external-dev-session-repository') do |external|
+        FileUtils.mkdir_p(File.join(external, 'repos'))
+        create_bare_repo(external, 'sample')
+        FileUtils.ln_s(
+          File.join(external, 'repos', 'sample.git'),
+          File.join(workspace, 'repos', 'sample.git')
+        )
+        commands = []
+        command_runner = CallbackCommandRunner.new(
+          out: StringIO.new,
+          err: StringIO.new
+        ) { |argv| commands << argv }
+        runner = VpsfreeDevSession::Runner.new(
+          workspace:,
+          command_runner:,
+          tmux: NullTmux.new,
+          out: StringIO.new,
+          err: StringIO.new,
+          today: TODAY
+        )
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.worktree_add(
+            'demo',
+            'sample',
+            as_is: false,
+            name: nil,
+            branch: nil,
+            base: 'master',
+            fetch: true
+          )
+        end
+
+        assert_match(/outside the canonical repository root/, error.message)
+        refute(commands.any? { |argv| argv.include?('fetch') })
+        refute(
+          File.exist?(
+            File.join(workspace, 'worktrees', '2026-06-06-demo', 'sample')
+          )
+        )
+        refute_git_success(
+          'git',
+          "--git-dir=#{File.join(external, 'repos', 'sample.git')}",
+          'show-ref',
+          '--verify',
+          '--quiet',
+          'refs/heads/2026-06-06-demo'
+        )
+      end
+    end
+  end
+
   def test_remove_cleans_worktrees_but_keeps_notes_and_branch
     skip 'git is not available' unless command_available?('git')
 
@@ -1029,23 +1194,17 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       commit_tracking(workspace, slug, lifecycle: 'complete')
       out = StringIO.new
-      tmux = ManagedTmux.new(
-        slug,
-        workspace:,
-        on_kill: lambda do
-          refute(File.exist?(File.join(workspace, 'work', slug)))
-          refute(File.exist?(File.join(workspace, 'worktrees', slug)))
-          assert(File.directory?(File.join(workspace, 'archive', slug)))
-        end
-      )
+      tmux = ManagedTmux.new(slug, workspace:)
 
-      runner_for(workspace, tmux:, out:).finalize('demo', as_is: false)
+      runner = runner_for(workspace, tmux:, out:)
+      runner.finalize('demo', as_is: false)
 
-      assert(tmux.killed)
+      refute(tmux.killed)
       assert_includes(out.string, File.join(workspace, 'archive', slug))
+      assert_includes(out.string, 'stop after committing')
       assert_includes(
         File.read(File.join(workspace, 'archive', slug, 'state.md')),
-        '- Lifecycle: complete'
+        'lifecycle: complete'
       )
       assert_git_success(
         'git',
@@ -1055,6 +1214,124 @@ class DevSessionTest < Minitest::Test
         '--quiet',
         'refs/heads/2026-06-06-demo'
       )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.stop(slug, as_is: true)
+      end
+      assert_match(/must be committed before stopping/, error.message)
+      refute(tmux.killed)
+
+      remove_error = assert_raises(VpsfreeDevSession::Error) do
+        runner.remove(slug, as_is: true, force: false)
+      end
+      assert_match(/must be committed before stopping/, remove_error.message)
+      refute(tmux.killed)
+
+      commit_archive_move(workspace, slug)
+      runner.stop(slug, as_is: true)
+      assert(tmux.killed)
+    end
+  end
+
+  def test_session_closing_rejects_ambiguous_or_missing_tracking
+    skip 'git is not available' unless command_available?('git')
+
+    %i[stop remove].each do |operation|
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        base_runner = runner_for(workspace)
+        base_runner.ensure_tracking_files(slug)
+        commit_tracking(workspace, slug, lifecycle: 'complete')
+        tmux = ManagedTmux.new(slug, workspace:)
+        runner = runner_for(workspace, tmux:)
+        runner.finalize(slug, as_is: true)
+        FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          if operation == :stop
+            runner.stop(slug, as_is: true)
+          else
+            runner.remove(slug, as_is: true, force: false)
+          end
+        end
+
+        assert_match(/active and archived tracking both exist/, error.message)
+        refute(tmux.killed)
+      end
+
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        tmux = ManagedTmux.new(slug, workspace:)
+        runner = runner_for(workspace, tmux:)
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          if operation == :stop
+            runner.stop(slug, as_is: true)
+          else
+            runner.remove(slug, as_is: true, force: false)
+          end
+        end
+
+        assert_match(/session tracking is missing/, error.message)
+        refute(tmux.killed)
+      end
+    end
+  end
+
+  def test_session_closing_rejects_invalid_active_tracking
+    %i[stop remove].product(%i[symlink file empty_directory]).each do |operation, kind|
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        path = File.join(workspace, 'work', slug)
+        case kind
+        when :symlink
+          FileUtils.ln_s(File.join(workspace, 'missing-work'), path)
+        when :file
+          File.write(path, "not a tracking directory\n")
+        when :empty_directory
+          FileUtils.mkdir_p(path)
+        end
+
+        tmux = ManagedTmux.new(slug, workspace:)
+        runner = runner_for(workspace, tmux:)
+        error = assert_raises(VpsfreeDevSession::Error) do
+          if operation == :stop
+            runner.stop(slug, as_is: true)
+          else
+            runner.remove(slug, as_is: true, force: false)
+          end
+        end
+
+        assert_match(/work directory|missing tracking files/, error.message)
+        refute(tmux.killed)
+      end
+    end
+  end
+
+  def test_stop_rejects_an_archive_without_committed_active_history
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      archive = File.join(workspace, 'archive', slug)
+      FileUtils.mkdir_p(archive)
+      File.write(File.join(archive, 'plan.md'), "# Plan\n")
+      File.write(
+        File.join(archive, 'state.md'),
+        "---\nlifecycle: complete\n---\n\n# #{slug}\n\n## Status\n"
+      )
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'add', File.join('archive', slug))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'terminal archive only')
+
+      tmux = ManagedTmux.new(slug, workspace:)
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).stop(slug, as_is: true)
+      end
+
+      assert_match(/no committed active lifecycle/, error.message)
+      refute(tmux.killed)
     end
   end
 
@@ -1123,12 +1400,173 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_finalize_refuses_tracking_without_a_committed_active_state
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_terminal_tracking_only(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/no committed active lifecycle/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_uses_only_front_matter_for_current_lifecycle
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      state = File.join(workspace, 'work', slug, 'state.md')
+      File.write(
+        state,
+        state_with_body_lifecycle(File.read(state), 'complete')
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize(slug, as_is: true)
+      end
+
+      assert_match(/not terminal: active/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_missing_lifecycle_front_matter
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      state = File.join(workspace, 'work', slug, 'state.md')
+      content = File.read(state).sub(/\A---\nlifecycle: active\n---\n\n/, '')
+      File.write(state, "#{content}\n- Lifecycle: complete\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize(slug, as_is: true)
+      end
+
+      assert_match(/must start with lifecycle YAML front matter/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_lifecycle_front_matter_has_exact_boundaries
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      assert_nil(
+        runner.send(
+          :validate_terminal_lifecycle_content!,
+          "---\r\nlifecycle: complete\r\n---\r\n\r\n# State\r\n"
+        )
+      )
+
+      invalid = [
+        " \n---\nlifecycle: complete\n---\n",
+        "\uFEFF---\nlifecycle: complete\n---\n",
+        "---\nlifecycle: complete\nowner: agent\n---\n",
+        "---\nlifecycle: complete\n--- trailing\n"
+      ]
+      invalid.each do |content|
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.send(:validate_terminal_lifecycle_content!, content)
+        end
+        assert_match(/must start with lifecycle YAML front matter/, error.message)
+      end
+    end
+  end
+
+  def test_finalize_uses_only_front_matter_for_active_history
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      state = File.join(workspace, 'work', slug, 'state.md')
+      set_lifecycle(workspace, slug, 'complete')
+      File.write(
+        state,
+        state_with_body_lifecycle(File.read(state), 'active')
+      )
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'pseudo active state')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize(slug, as_is: true)
+      end
+
+      assert_match(/no committed active lifecycle/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_stop_uses_only_front_matter_for_archived_lifecycle
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      tmux = ManagedTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+      runner.finalize(slug, as_is: true)
+      state = File.join(workspace, 'archive', slug, 'state.md')
+      content = File.read(state).sub('lifecycle: complete', 'lifecycle: active')
+      File.write(state, state_with_body_lifecycle(content, 'complete'))
+      commit_archive_move(workspace, slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.stop(slug, as_is: true)
+      end
+
+      assert_match(/not terminal: active/, error.message)
+      refute(tmux.killed)
+    end
+  end
+
   def test_finalize_refuses_existing_archive
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
       FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/archive already exists/, error.message)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_a_dangling_archive_symlink
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      FileUtils.mkdir_p(File.join(workspace, 'archive'))
+      FileUtils.ln_s(
+        File.join(workspace, 'missing-archive-target'),
+        File.join(workspace, 'archive', slug)
+      )
 
       error = assert_raises(VpsfreeDevSession::Error) do
         runner.finalize('demo', as_is: false)
@@ -1172,6 +1610,343 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_finalize_refuses_a_clean_detached_worktree_head
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      assert_git_success('git', '-C', path, 'switch', '--detach')
+      configure_git_identity(path)
+      File.write(File.join(path, 'detached.txt'), "unique commit\n")
+      assert_git_success('git', '-C', path, 'add', 'detached.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'detached work')
+      detached_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/detached HEAD/, error.message)
+      assert(File.directory?(path))
+      assert_equal(detached_head, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
+    end
+  end
+
+  def test_worktree_remove_refuses_a_per_worktree_symbolic_ref
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      path = File.join(workspace, 'worktrees', '2026-06-06-demo', 'sample')
+      assert_git_success('git', '-C', path, 'symbolic-ref', 'HEAD', 'refs/worktree/private-save')
+      configure_git_identity(path)
+      File.write(File.join(path, 'saved.txt'), "saved commit\n")
+      assert_git_success('git', '-C', path, 'add', 'saved.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'private worktree commit')
+      head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.worktree_remove('demo', 'sample', as_is: false, force: false)
+      end
+
+      assert_match(/retained shared branch/, error.message)
+      assert(File.directory?(path))
+      assert_git_success('git', '-C', path, 'cat-file', '-e', "#{head}^{commit}")
+    end
+  end
+
+  def test_finalize_refuses_a_symlinked_worktree_entry
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      outside = File.join(workspace, 'outside-sample')
+      bare = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success(
+        'git',
+        "--git-dir=#{bare}",
+        'worktree',
+        'add',
+        '-b',
+        'outside',
+        outside,
+        'master'
+      )
+      FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'sample'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/unmanaged entries/, error.message)
+      assert(File.directory?(outside))
+      assert_git_success('git', '-C', outside, 'status', '--short')
+    end
+  end
+
+  def test_finalize_refuses_a_symlinked_work_root
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      work_root = File.join(workspace, 'work')
+      outside_root = File.join(workspace, 'outside-work')
+      FileUtils.mv(work_root, outside_root)
+      FileUtils.ln_s(outside_root, work_root)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/work root is a symlink/, error.message)
+      assert(File.directory?(File.join(outside_root, slug)))
+      assert(File.file?(File.join(outside_root, slug, 'state.md')))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_finalize_preflights_locked_worktrees_before_removing_any
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: 'alpha',
+        branch: 'demo-alpha',
+        base: 'master',
+        fetch: false
+      )
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: 'zeta',
+        branch: 'demo-zeta',
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      alpha = File.join(workspace, 'worktrees', slug, 'alpha')
+      zeta = File.join(workspace, 'worktrees', slug, 'zeta')
+      assert_git_success(
+        'git',
+        "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+        'worktree',
+        'lock',
+        '--reason',
+        'test',
+        zeta
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+
+      assert_match(/worktree is locked/, error.message)
+      assert(File.directory?(alpha), 'first worktree was removed before preflight completed')
+      assert(File.directory?(zeta))
+    end
+  end
+
+  def test_finalize_uses_an_atomic_no_clobber_archive_move
+    skip 'git is not available' unless command_available?('git')
+
+    %i[directory symlink].each do |collision|
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        base_runner = runner_for(workspace)
+        base_runner.ensure_tracking_files(slug)
+        commit_tracking(workspace, slug, lifecycle: 'complete')
+        source = File.join(workspace, 'work', slug)
+        destination = File.join(workspace, 'archive', slug)
+
+        command_runner = CallbackCommandRunner.new(
+          out: StringIO.new,
+          err: StringIO.new
+        ) do |argv|
+          next unless argv.first == 'mv' && argv.last != '--help'
+
+          if collision == :directory
+            FileUtils.mkdir_p(destination)
+          else
+            FileUtils.ln_s(File.join(workspace, 'collision-target'), destination)
+          end
+        end
+        runner = VpsfreeDevSession::Runner.new(
+          workspace:,
+          command_runner:,
+          tmux: NullTmux.new,
+          out: StringIO.new,
+          err: StringIO.new,
+          today: TODAY
+        )
+
+        assert_raises(VpsfreeDevSession::Error) do
+          runner.finalize('demo', as_is: false)
+        end
+
+        assert(File.directory?(source), "#{collision} collision moved the source")
+        assert(File.file?(File.join(source, 'state.md')))
+        if collision == :symlink
+          assert(File.symlink?(destination))
+        else
+          assert_equal([], Dir.children(destination))
+        end
+      end
+    end
+  end
+
+  def test_finalize_checks_atomic_move_support_before_worktree_cleanup
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      base_runner = runner_for(workspace)
+      base_runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      slug = '2026-06-06-demo'
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      command_runner = CallbackCommandRunner.new(
+        out: StringIO.new,
+        err: StringIO.new
+      ) do |argv|
+        next unless argv.first == 'mv' && argv.last == '--help'
+
+        raise VpsfreeDevSession::Error, 'atomic move options unavailable'
+      end
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        command_runner:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize(slug, as_is: true)
+      end
+
+      assert(File.directory?(path))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_preflights_and_executes_one_archive_move_command
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      base_runner = runner_for(workspace)
+      base_runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      move_commands = []
+      command_runner = CallbackCommandRunner.new(
+        out: StringIO.new,
+        err: StringIO.new
+      ) do |argv|
+        move_commands << argv if argv.first == 'mv'
+      end
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        command_runner:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY
+      )
+
+      runner.finalize(slug, as_is: true)
+
+      assert_equal(2, move_commands.length)
+      move_commands.each do |argv|
+        assert_equal(
+          ['mv', *VpsfreeDevSession::ARCHIVE_MOVE_OPTIONS],
+          argv.take(VpsfreeDevSession::ARCHIVE_MOVE_OPTIONS.length + 1)
+        )
+      end
+      assert_equal('--help', move_commands.first.last)
+      assert_equal(File.join(workspace, 'archive', slug), move_commands.last.last)
+    end
+  end
+
+  def test_dev_session_serializes_commands_per_slug
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-06-06-demo'
+      other_slug = '2026-06-06-other'
+      runner.ensure_tracking_files(slug)
+      runner.ensure_tracking_files(other_slug)
+      lock_root = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(lock_root)
+      lock_path = File.join(lock_root, "#{slug}.lock")
+
+      File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+        assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.remove(slug, as_is: true, force: false)
+        end
+        assert_match(/another dev-session command/, error.message)
+
+        runner.remove(other_slug, as_is: true, force: false)
+        refute(File.exist?(File.join(workspace, 'worktrees', other_slug)))
+      end
+
+      runner.remove(slug, as_is: true, force: false)
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
   def test_finalize_refuses_unmanaged_worktree_group_entries
     skip 'git is not available' unless command_available?('git')
 
@@ -1188,6 +1963,32 @@ class DevSessionTest < Minitest::Test
 
       assert_match(/contains unmanaged entries/, error.message)
       assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_finalize_refuses_a_worktree_from_outside_canonical_repositories
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      Dir.mktmpdir('external-dev-session-repository') do |external|
+        FileUtils.mkdir_p(File.join(external, 'repos'))
+        create_bare_repo(external, 'sample')
+        bare = File.join(external, 'repos', 'sample.git')
+        path = File.join(workspace, 'worktrees', slug, 'external')
+        assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.finalize(slug, as_is: true)
+        end
+
+        assert_match(/outside the canonical repository root/, error.message)
+        assert(File.directory?(path))
+      end
     end
   end
 
@@ -1448,6 +2249,40 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_finalize_keeps_real_tmux_session_until_explicit_stop
+    skip 'git is not available' unless command_available?('git')
+    skip 'tmux is not available' unless command_available?('tmux')
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+
+    with_workspace do |workspace|
+      out = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux_socket: socket,
+        codex_command: 'false',
+        out:,
+        err: StringIO.new,
+        today: TODAY
+      )
+      runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      runner.finalize('demo', as_is: false)
+
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      assert(tmux_session_exists?(socket, slug))
+      assert_includes(out.string, 'stop after committing')
+
+      commit_archive_move(workspace, slug)
+      runner.stop(slug, as_is: true)
+      refute(tmux_session_exists?(socket, slug))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
   def test_tmux_codex_runs_from_shell_and_leaves_shell_available
     skip 'tmux is not available' unless command_available?('tmux')
 
@@ -1611,23 +2446,74 @@ class DevSessionTest < Minitest::Test
   end
 
   def commit_tracking(workspace, slug, lifecycle:)
-    set_lifecycle(workspace, slug, lifecycle)
     assert_git_success('git', 'init', '-b', 'master', workspace)
     assert_git_success('git', '-C', workspace, 'config', 'user.email', 'test@example.invalid')
     assert_git_success('git', '-C', workspace, 'config', 'user.name', 'Test User')
     assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
-    assert_git_success('git', '-C', workspace, 'commit', '-m', 'track initiative')
+    assert_git_success('git', '-C', workspace, 'commit', '-m', 'start initiative')
+    return if lifecycle == 'active'
+
+    set_lifecycle(workspace, slug, lifecycle)
+    assert_git_success('git', '-C', workspace, 'add', File.join('work', slug, 'state.md'))
+    assert_git_success('git', '-C', workspace, 'commit', '-m', 'close initiative')
+  end
+
+  def commit_terminal_tracking_only(workspace, slug, lifecycle:)
+    set_lifecycle(workspace, slug, lifecycle)
+    assert_git_success('git', 'init', '-b', 'master', workspace)
+    configure_git_identity(workspace)
+    assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
+    assert_git_success('git', '-C', workspace, 'commit', '-m', 'terminal initiative')
+  end
+
+  def commit_archive_move(workspace, slug)
+    assert_git_success(
+      'git',
+      '-C',
+      workspace,
+      'add',
+      '-A',
+      '--',
+      File.join('work', slug),
+      File.join('archive', slug)
+    )
+    assert_git_success('git', '-C', workspace, 'commit', '-m', 'archive initiative')
   end
 
   def set_lifecycle(workspace, slug, lifecycle)
     state = File.join(workspace, 'work', slug, 'state.md')
-    content = File.read(state).sub('- Lifecycle: active', "- Lifecycle: #{lifecycle}")
+    content = File.read(state).sub(
+      /\A---\nlifecycle: (?:active|complete|abandoned)\n---/,
+      "---\nlifecycle: #{lifecycle}\n---"
+    )
     File.write(state, content)
+  end
+
+  def state_with_body_lifecycle(content, lifecycle)
+    fragment = "# Appendix\n\n- Lifecycle: #{lifecycle}\n\n"
+    content.sub("## Results\n", "#{fragment}## Results\n")
   end
 
   def assert_git_success(*argv)
     stdout, stderr, status = Open3.capture3(*argv)
     assert(status.success?, "command failed: #{argv.join(' ')}\n#{stdout}\n#{stderr}")
+  end
+
+  def refute_git_success(*argv)
+    stdout, stderr, status = Open3.capture3(*argv)
+    message = "command unexpectedly succeeded: #{argv.join(' ')}\n#{stdout}\n#{stderr}"
+    refute(status.success?, message)
+  end
+
+  def git_capture_success(*argv)
+    stdout, stderr, status = Open3.capture3(*argv)
+    assert(status.success?, "command failed: #{argv.join(' ')}\n#{stdout}\n#{stderr}")
+    stdout
+  end
+
+  def configure_git_identity(path)
+    assert_git_success('git', '-C', path, 'config', 'user.email', 'test@example.invalid')
+    assert_git_success('git', '-C', path, 'config', 'user.name', 'Test User')
   end
 
   def tmux_capture(socket, *args)
