@@ -118,10 +118,10 @@ killed only after cleanup has completed. Branches are kept.
 `work/<slug>/plan.md` and `state.md` are kept by default.
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
-refused unless `--force` is passed. Detached or locked worktrees and paths
-outside the exact initiative group are always refused. Cleanup then delegates
-removal to `git worktree remove`; if Git refuses a worktree, resolve the reason
-and retry. Branches are retained:
+refused unless `--force` is passed. Detached worktrees and paths outside the
+exact initiative group are always refused. Cleanup then delegates removal to
+`git worktree remove`; if Git refuses a worktree, resolve the reason and retry.
+Branches are retained:
 
 ```sh
 bin/dev-session remove api-token-rotation --force
@@ -160,12 +160,12 @@ Before running it:
 tracking files, an active or ambiguous lifecycle, tracking without a prior
 commit, an existing archive destination, mismatched or replaced tmux identity,
 worktree changes reported by ordinary `git status --porcelain`, detached or
-locked worktrees, worktrees outside the canonical `repos/*.git` bare clones,
-symlinked paths or roots, and unknown entries in the worktree group. Cleanup
-for one slug is serialized, and every worktree receives the same ordinary
-cleanliness and path checks before any is removed. It then delegates each
-removal to non-force `git worktree remove`, preserves the branches, and uses a
-same-filesystem, atomic no-clobber move from `work/<slug>/` to
+worktrees, worktrees outside the canonical `repos/*.git` bare clones, symlinked
+paths or roots, and unknown entries in the worktree group. Cleanup for one slug
+is serialized, and every worktree receives the same ordinary cleanliness and
+path checks before any is removed. It then delegates each removal to non-force
+`git worktree remove`, preserves the branches, and uses a same-filesystem,
+atomic no-clobber move from `work/<slug>/` to
 `archive/<slug>/`. If Git refuses a worktree for another reason, cleanup stops;
 already removed worktrees remain available through their retained branches,
 and the command can be retried after resolving the refusal. The helper requires
@@ -219,10 +219,10 @@ bin/dev-session worktree remove api-token-rotation vpsadmin
 ```
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
-refused unless `--force` is used. Detached or locked worktrees are always
-refused. Git remains the authority for whether its non-force worktree removal
-can proceed; resolve any refusal and retry, or use the explicit force option
-when discarding the worktree is intentional.
+refused unless `--force` is used. Detached worktrees are always refused. Git
+remains the authority for whether its non-force worktree removal can proceed;
+resolve any refusal and retry, or use the explicit force option when discarding
+the worktree is intentional.
 
 ## Test and automation options
 

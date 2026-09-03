@@ -1739,55 +1739,6 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_finalize_preflights_locked_worktrees_before_removing_any
-    skip 'git is not available' unless command_available?('git')
-
-    with_workspace do |workspace|
-      create_bare_repo(workspace, 'sample')
-      runner = runner_for(workspace)
-      runner.worktree_add(
-        'demo',
-        'sample',
-        as_is: false,
-        name: 'alpha',
-        branch: 'demo-alpha',
-        base: 'master',
-        fetch: false
-      )
-      runner.worktree_add(
-        'demo',
-        'sample',
-        as_is: false,
-        name: 'zeta',
-        branch: 'demo-zeta',
-        base: 'master',
-        fetch: false
-      )
-
-      slug = '2026-06-06-demo'
-      commit_tracking(workspace, slug, lifecycle: 'complete')
-      alpha = File.join(workspace, 'worktrees', slug, 'alpha')
-      zeta = File.join(workspace, 'worktrees', slug, 'zeta')
-      assert_git_success(
-        'git',
-        "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
-        'worktree',
-        'lock',
-        '--reason',
-        'test',
-        zeta
-      )
-
-      error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
-      end
-
-      assert_match(/worktree is locked/, error.message)
-      assert(File.directory?(alpha), 'first worktree was removed before preflight completed')
-      assert(File.directory?(zeta))
-    end
-  end
-
   def test_finalize_uses_an_atomic_no_clobber_archive_move
     skip 'git is not available' unless command_available?('git')
 

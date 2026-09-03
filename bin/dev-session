@@ -722,9 +722,6 @@ module VpsfreeDevSession
         registered && File.expand_path(registered) == real_path
       end
       raise Error, "worktree is not registered at its initiative path: #{path}" unless stanza
-      if stanza.any? { |field| field.start_with?('locked') }
-        raise Error, "worktree is locked: #{path}"
-      end
 
       common_dir
     rescue Errno::ENOENT, Errno::EACCES => e
@@ -1333,7 +1330,6 @@ module VpsfreeDevSession
         'status',
         '--porcelain',
         '--untracked-files=all',
-        '--ignored=matching',
         '--',
         *relative_paths
       ])
