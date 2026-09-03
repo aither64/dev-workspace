@@ -13,9 +13,9 @@ review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
 The coordinating agent launches an adaptive team of one to three standalone
-reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` with
-reasoning effort `max`, perform its assigned review directly, and not launch
-nested reviewers or subagents.
+reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` and
+the risk-scaled reasoning effort defined below, perform its assigned review
+directly, and not launch nested reviewers or subagents.
 
 ## Invocation Mode
 
@@ -25,6 +25,27 @@ First decide which role you are in:
   Workflow.
 - If you are a spawned reviewer, read Shared Reviewer Instructions and the
   reference for your assigned lane. Do not launch another reviewer.
+
+## Reasoning Effort
+
+Before launching reviewers, classify the overall change at the highest risk
+present in any affected component:
+
+- **Low:** a simple, localized, readily reversible change with no security,
+  persisted-state, public-contract, destructive-operation, deployment, or
+  compatibility consequence.
+- **Medium:** a bounded implementation or cross-component change that remains
+  reversible and compatible, with no high-risk characteristic below.
+- **High:** authentication, authorization, tenant isolation, secrets, data
+  loss, schemas or persisted state, incompatible public or cross-project
+  contracts, protocols, host/node behavior, destructive or irreversible
+  operations, deployment ordering, rollback, or mixed-version operation.
+
+Use reasoning effort `xhigh` for low- and medium-risk changes. Use `max` for
+high-risk changes. Apply the selected effort to every lane so reviewers share
+one explicit risk assumption. When uncertain, choose the higher risk. If an
+`xhigh` review uncovers a high-risk characteristic, reclassify the change and
+rerun every applicable lane at `max` before continuing.
 
 ## Review Lanes
 
@@ -59,8 +80,9 @@ required lane.
    Do not review a half-staged or partly uncommitted implementation.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
-4. Determine the applicable lanes using the triggers above. Read every
-   applicable lane reference before preparing the review.
+4. Classify the overall risk and select the reasoning effort, then determine
+   the applicable lanes using the triggers above. Read every applicable lane
+   reference before preparing the review.
 5. Prepare a review packet containing:
    - requested outcome and acceptance criteria;
    - initiative slug, plan/state files, affected repositories and worktrees;
@@ -69,15 +91,18 @@ required lane.
      concrete rationale for why they are inseparable;
    - relevant dependency pins or configuration changes;
    - quick verification commands and results;
+   - overall risk classification, its rationale, and selected reasoning
+     effort;
    - known compatibility and deployment assumptions;
    - for reusable or cross-project components, the owning component, public
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
 6. Launch one fresh standalone agent per applicable lane. Set
-   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and
-   `reasoning_effort: "max"`. Give each agent the review packet, its lane, this
-   skill path, and instructions to read the lane reference and perform the
-   review itself. Do not pass hidden conclusions or ask for a rubber stamp.
+   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort` to the
+   risk-scaled value selected above. Give each agent the review packet, its
+   lane, this skill path, and instructions to read the lane reference and
+   perform the review itself. Do not pass hidden conclusions or ask for a
+   rubber stamp.
 7. Collect all findings. Investigate conflicts using the code and repository
    evidence; do not decide by majority vote. Merge duplicates, retain the
    highest severity supported by evidence, and identify the originating lane.
@@ -87,8 +112,9 @@ required lane.
 9. If a fix materially changes code, architecture, contracts, behavior, tests,
    or commit history, rerun the general lane and every specialist lane affected
    by the new diff against the updated heads.
-10. Record reviewer lanes, model and effort, reviewed commits, findings,
-    decisions, fixes, and any reruns in the initiative `state.md`.
+10. Record the risk classification and rationale, reviewer lanes, model and
+    effort, reviewed commits, findings, decisions, fixes, and any reruns in the
+    initiative `state.md`.
 
 ## Shared Reviewer Instructions
 
