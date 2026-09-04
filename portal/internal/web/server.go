@@ -636,6 +636,9 @@ func (s *Server) pending(w http.ResponseWriter, r *http.Request, threadID string
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+	if prompts == nil {
+		prompts = []codex.Prompt{}
+	}
 	s.writeJSON(w, http.StatusOK, prompts)
 }
 

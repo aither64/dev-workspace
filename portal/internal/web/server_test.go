@@ -573,12 +573,26 @@ func TestBrowserClientIncludesFreeFormOtherInput(t *testing.T) {
 	}
 }
 
+func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
+	server := newTestServer(t)
+	server.config.Codex = &browserContractCodex{emptyPrompts: true}
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/pending", nil)
+	response := httptest.NewRecorder()
+
+	server.pending(response, request, "thread-1")
+
+	if response.Code != http.StatusOK || response.Body.String() != "[]\n" {
+		t.Fatalf("empty pending response = %d %q", response.Code, response.Body.String())
+	}
+}
+
 type browserContractCodex struct {
-	mu        sync.Mutex
-	message   string
-	interrupt bool
-	decision  string
-	answers   map[string]map[string][]string
+	mu           sync.Mutex
+	message      string
+	interrupt    bool
+	decision     string
+	answers      map[string]map[string][]string
+	emptyPrompts bool
 }
 
 func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ string) error {
@@ -624,6 +638,9 @@ func (client *browserContractCodex) Subscribe(_ context.Context, threadID string
 func (client *browserContractCodex) PromptsWithItems(_ context.Context, threadID string) ([]codex.Prompt, error) {
 	if threadID != "thread-1" {
 		return nil, errors.New("unexpected pending thread")
+	}
+	if client.emptyPrompts {
+		return nil, nil
 	}
 	return []codex.Prompt{{
 		ID: "approval-1", Kind: "command", ThreadID: threadID,
