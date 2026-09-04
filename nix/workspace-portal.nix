@@ -70,6 +70,13 @@ buildGoModule {
     install -Dm644 ${src}/portal/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
 
+    substituteInPlace "$out/bin/dev-session" \
+      --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
+    substituteInPlace "$out/bin/workspace-pki" \
+      --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
+    substituteInPlace "$out/bin/workspace-portal-password-hash" \
+      --replace-fail '#!/usr/bin/env bash' '#!${bash}/bin/bash'
+
     runtimePath=${
       lib.makeBinPath [
         coreutils
@@ -85,6 +92,41 @@ buildGoModule {
       wrapProgram "$out/bin/$program" \
         --prefix PATH : "$runtimePath"
     done
+  '';
+
+  postFixup = ''
+    for program in dev-session workspace-pki workspace-portal-password-hash; do
+      wrapped="$out/bin/.$program-wrapped"
+      if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+        echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+        exit 1
+      fi
+    done
+
+    ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+      "$out/bin/dev-session" --help >/dev/null
+
+    set +e
+    pki_usage="$(${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+      "$out/bin/workspace-pki" --help 2>&1)"
+    pki_status=$?
+    set -e
+    if [ "$pki_status" -ne 1 ] || \
+      [[ "$pki_usage" != *'Usage: workspace-pki COMMAND [options]'* ]]; then
+      echo "installed PKI helper failed its empty-PATH execution check" >&2
+      exit 1
+    fi
+
+    set +e
+    password_usage="$(${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+      "$out/bin/workspace-portal-password-hash" 2>&1)"
+    password_status=$?
+    set -e
+    if [ "$password_status" -ne 2 ] || \
+      [ "$password_usage" != 'usage: workspace-portal-password-hash PASSWORD_FILE' ]; then
+      echo "installed password helper failed its empty-PATH execution check" >&2
+      exit 1
+    fi
   '';
 
   passthru.codexPackage = codex;
