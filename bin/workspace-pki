@@ -1,0 +1,831 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'English'
+require 'etc'
+require 'optparse'
+require 'pathname'
+require 'securerandom'
+require 'tmpdir'
+
+module WorkspacePKI
+  HOSTNAME = 'vpsfree-cz-workspace.aitherdev.int.vpsfree.cz'
+  STATE_DIR = '/var/lib/vpsfree-workspace-pki'
+  SAFE_HOSTNAME = /\A(?=.{1,253}\z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z/
+  STATE_MARKER = '.workspace-pki-state'
+  SERVER_MARKER = '.workspace-pki-server'
+
+  class Error < StandardError; end
+
+  class Systemd
+    def initialize(command: 'systemctl')
+      @command = command
+    end
+
+    def active?(service)
+      system(@command, 'is-active', '--quiet', service, out: File::NULL, err: File::NULL)
+    end
+
+    def reload(service)
+      return if system(@command, 'reload', service)
+
+      raise Error, "failed to reload #{service}"
+    end
+  end
+
+  class Runner
+    def initialize(
+      state_dir:,
+      hostname:,
+      openssl: 'openssl',
+      enforce_root: true,
+      state_uid: Process.euid,
+      install_gid: nil,
+      service_manager: Systemd.new
+    )
+      @state_dir = File.expand_path(state_dir)
+      @hostname = hostname
+      @openssl = openssl
+      @enforce_root = enforce_root
+      @state_uid = state_uid
+      @install_gid = install_gid
+      @service_manager = service_manager
+    end
+
+    def init
+      validate_options!
+      if path_exists?(@state_dir)
+        raise Error, "state directory is a symlink: #{@state_dir}" if File.symlink?(@state_dir)
+        require_state_owner!(@state_dir, 'state directory')
+        raise Error, "PKI state already exists: #{@state_dir}"
+      end
+
+      parent = File.dirname(@state_dir)
+      reject_symlink_components!(parent, 'PKI state parent')
+      FileUtils.mkdir_p(parent)
+      reject_symlink_components!(parent, 'PKI state parent')
+      with_temporary_directory(parent) do |directory|
+        original_state_dir = @state_dir
+        begin
+          @state_dir = directory
+          write_directory_marker!(@state_dir, STATE_MARKER)
+          FileUtils.mkdir(authority_dir, mode: 0o700)
+          run(
+            'genpkey', '-algorithm', 'EC',
+            '-pkeyopt', 'ec_paramgen_curve:P-256', '-out', ca_key
+          )
+          File.chmod(0o600, ca_key)
+          run(
+            'req', '-x509', '-new', '-sha256', '-days', '3650',
+            '-key', ca_key,
+            '-subj', '/CN=vpsFree.cz Workspace Development CA',
+            '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
+            '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+            '-addext', 'subjectKeyIdentifier=hash',
+            '-out', ca_certificate
+          )
+          File.chmod(0o644, ca_certificate)
+          validate_key_pair!(ca_certificate, ca_key)
+          renew
+          verify
+        ensure
+          @state_dir = original_state_dir
+        end
+        publish_initial_state(directory)
+      end
+      puts "created filesystem-protected CA and server certificate in #{@state_dir}"
+    end
+
+    def ensure(renew_before: 30 * 24 * 60 * 60)
+      validate_options!
+      init unless path_exists?(@state_dir)
+      require_authority!
+      require_file!(ca_key, private: true)
+      require_file!(ca_certificate, private: false)
+      validate_key_pair!(ca_certificate, ca_key)
+      leaf = current_pair(leaf_root)
+      certificate = File.join(leaf, 'server.pem')
+      key = File.join(leaf, 'server-key.pem')
+      validate_leaf_files!(certificate, key, check_time: false)
+      renew unless certificate_valid_for?(certificate, renew_before)
+      verify
+      puts "ensured certificate state for #{@hostname}"
+    end
+
+    def renew
+      validate_options!
+      require_authority!
+      require_file!(ca_key, private: true)
+      require_file!(ca_certificate, private: false)
+      ensure_leaf_root!
+
+      with_temporary_directory(@state_dir) do |directory|
+        key = File.join(directory, 'server-key.pem')
+        request = File.join(directory, 'server.csr')
+        certificate = File.join(directory, 'server.pem')
+        extensions = File.join(directory, 'server-extensions.cnf')
+        File.write(extensions, <<~CONFIG)
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature
+          extendedKeyUsage=serverAuth
+          subjectAltName=DNS:#{@hostname}
+          subjectKeyIdentifier=hash
+          authorityKeyIdentifier=keyid,issuer
+        CONFIG
+        run(
+          'genpkey', '-algorithm', 'EC',
+          '-pkeyopt', 'ec_paramgen_curve:P-256', '-out', key
+        )
+        File.chmod(0o600, key)
+        run('req', '-new', '-key', key, '-subj', "/CN=#{@hostname}", '-out', request)
+        run(
+          'x509', '-req', '-sha256', '-days', '397',
+          '-in', request,
+          '-CA', ca_certificate,
+          '-CAkey', ca_key,
+          '-set_serial', "0x#{SecureRandom.hex(16)}",
+          '-extfile', extensions,
+          '-out', certificate
+        )
+        File.chmod(0o644, certificate)
+        validate_leaf_files!(certificate, key)
+        File.unlink(request)
+        File.unlink(extensions)
+        publish_pair(directory, leaf_root, 'leaf')
+      end
+      puts "renewed server certificate for #{@hostname}"
+    end
+
+    def verify
+      validate_options!
+      require_authority!
+      require_file!(ca_certificate, private: false)
+      leaf = current_pair(leaf_root)
+      validate_leaf_files!(
+        File.join(leaf, 'server.pem'),
+        File.join(leaf, 'server-key.pem')
+      )
+
+      puts "certificate and key are valid for #{@hostname}"
+    end
+
+    def install_server(output_dir)
+      validate_options!
+      destination = File.expand_path(output_dir)
+      with_install_lock(destination) { install_server_locked(destination) }
+    end
+
+    def install_server_locked(destination)
+      require_authority!
+      require_file!(ca_certificate, private: false)
+      leaf = current_pair(leaf_root)
+      source_certificate = File.join(leaf, 'server.pem')
+      source_key = File.join(leaf, 'server-key.pem')
+      validate_leaf_files!(source_certificate, source_key)
+
+      reject_symlink_components!(destination, 'server certificate destination')
+      reject_git_directory!(destination, 'server certificate destination')
+      if File.exist?(destination)
+        raise Error, "destination is a symlink: #{destination}" if File.symlink?(destination)
+        raise Error, "destination is not a directory: #{destination}" unless File.directory?(destination)
+        claim_managed_directory!(destination, SERVER_MARKER, 'server certificate destination')
+      else
+        FileUtils.mkdir_p(destination, mode: 0o700)
+        write_directory_marker!(destination, SERVER_MARKER)
+      end
+      nginx_gid = shared_server_install? ? server_install_gid : nil
+      if shared_server_install?
+        owner = File.stat(destination)
+        unless owner.uid == server_install_uid
+          raise Error, "destination must be owned by uid #{server_install_uid}: #{destination}"
+        end
+        File.chown(server_install_uid, nginx_gid, destination)
+      end
+      File.chmod(shared_server_install? ? 0o750 : 0o700, destination)
+      pairs = File.join(destination, 'pairs')
+      ensure_real_directory!(pairs, mode: 0o700)
+      if shared_server_install?
+        owner = File.stat(pairs)
+        unless owner.uid == server_install_uid
+          raise Error,
+                "certificate pair directory must be owned by uid #{server_install_uid}: #{pairs}"
+        end
+        File.chown(server_install_uid, nginx_gid, pairs)
+        File.chmod(0o750, pairs)
+      end
+
+      with_temporary_directory(destination) do |directory|
+        key = File.join(directory, 'server-key.pem')
+        certificate = File.join(directory, 'server.pem')
+        FileUtils.cp(source_key, key)
+        FileUtils.cp(source_certificate, certificate)
+        File.chmod(0o600, key)
+        File.chmod(0o644, certificate)
+        validate_leaf_files!(certificate, key)
+        if shared_server_install?
+          File.chown(server_install_uid, nginx_gid, directory)
+          File.chown(server_install_uid, nginx_gid, key)
+          File.chown(server_install_uid, nginx_gid, certificate)
+          File.chmod(0o750, directory)
+          File.chmod(0o640, key)
+        end
+        current = installed_pair(pairs, destination)
+        if current && same_pair?(current, certificate, key)
+          FileUtils.remove_entry_secure(directory)
+          puts "nginx certificate and key are already current in #{destination}"
+          return
+        end
+
+        published = publish_pair(directory, pairs, 'pair', link_root: destination)
+        prune_installed_pairs(pairs, published, current)
+      end
+      puts "installed nginx certificate and key in #{destination}"
+    end
+
+    private :install_server_locked
+
+    def reconcile_nginx(
+      server_dir:,
+      public_ca:,
+      applied_marker:,
+      lock_file:,
+      service: 'nginx.service'
+    )
+      validate_options!
+      with_reconcile_lock(lock_file) do
+        self.ensure
+        applied_target = read_applied_target(applied_marker)
+        install_server(server_dir)
+        current_target = File.realpath(File.join(File.expand_path(server_dir), 'current'))
+        export_ca(public_ca)
+        next if applied_target == current_target || !@service_manager.active?(service)
+
+        @service_manager.reload(service)
+        publish_applied_target(applied_marker, current_target)
+      end
+    end
+
+    def inspect
+      validate_options!
+      require_authority!
+      require_file!(ca_certificate, private: false)
+      leaf = current_pair(leaf_root)
+      certificate = File.join(leaf, 'server.pem')
+      require_file!(certificate, private: false)
+      run('x509', '-in', ca_certificate, '-noout', '-subject', '-dates', '-fingerprint', '-sha256')
+      run(
+        'x509', '-in', certificate, '-noout',
+        '-subject', '-issuer', '-dates', '-fingerprint', '-sha256', '-ext', 'subjectAltName'
+      )
+    end
+
+    def export_ca(output)
+      validate_options!
+      require_authority!
+      require_file!(ca_certificate, private: false)
+      destination = File.expand_path(output)
+      raise Error, "export destination is a symlink: #{destination}" if File.symlink?(destination)
+      if File.exist?(destination) && !File.file?(destination)
+        raise Error, "export destination is not a regular file: #{destination}"
+      end
+
+      parent = File.dirname(destination)
+      reject_symlink_components!(parent, 'export destination')
+      FileUtils.mkdir_p(parent, mode: 0o755)
+      reject_symlink_components!(parent, 'export destination')
+      temporary = File.join(parent, ".#{File.basename(destination)}.#{$$}.#{SecureRandom.hex(4)}")
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+          File.open(ca_certificate, File::RDONLY) { |source| IO.copy_stream(source, file) }
+          file.flush
+          file.fsync
+        end
+        File.chmod(0o644, temporary)
+        fsync_file(temporary)
+        File.rename(temporary, destination)
+        fsync_directory(parent)
+      ensure
+        File.unlink(temporary) if File.exist?(temporary)
+      end
+      puts destination
+    end
+
+    private
+
+    def validate_options!
+      if @enforce_root && Process.euid != 0
+        raise Error, 'workspace-pki must run as root to protect CA state'
+      end
+      raise Error, "invalid hostname: #{@hostname.inspect}" unless @hostname.match?(SAFE_HOSTNAME)
+      reject_git_state_directory!
+    end
+
+    def installed_pair(pairs, destination)
+      current = File.join(destination, 'current')
+      return nil unless path_exists?(current)
+
+      require_installed_directory!(pairs, 'installed certificate version directory')
+      unless File.symlink?(current)
+        raise Error, "current installed certificate pair is not a symlink: #{current}"
+      end
+      require_installed_symlink_owner!(current, 'installed certificate symlink')
+      resolved = File.realpath(current)
+      root = File.realpath(pairs)
+      unless File.dirname(resolved) == root && File.directory?(resolved) && !File.symlink?(resolved)
+        raise Error, "current installed certificate pair escapes its version directory: #{current}"
+      end
+      require_installed_directory!(resolved, 'installed certificate directory')
+      resolved
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot resolve current installed certificate pair: #{e.message}"
+    end
+
+    def same_pair?(installed, certificate, key)
+      installed_certificate = File.join(installed, 'server.pem')
+      installed_key = File.join(installed, 'server-key.pem')
+      require_installed_file!(installed_certificate, 0o644, 'installed certificate')
+      require_installed_file!(
+        installed_key,
+        shared_server_install? ? 0o640 : 0o600,
+        'installed private key'
+      )
+      verify_files!(installed_certificate)
+      validate_key_pair!(installed_certificate, installed_key)
+      File.binread(installed_certificate) == File.binread(certificate) &&
+        File.binread(installed_key) == File.binread(key)
+    end
+
+    def shared_server_install?
+      @enforce_root || !@install_gid.nil?
+    end
+
+    def server_install_uid
+      @enforce_root ? 0 : @state_uid
+    end
+
+    def server_install_gid
+      @install_gid || Etc.getgrnam('nginx').gid
+    end
+
+    def require_installed_directory!(path, label)
+      unless File.directory?(path) && !File.symlink?(path)
+        raise Error, "#{label} is missing or unsafe: #{path}"
+      end
+      require_installed_owner!(path, shared_server_install? ? 0o750 : 0o700, label)
+    end
+
+    def require_installed_file!(path, mode, label)
+      raise Error, "#{label} is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "#{label} is not a regular file: #{path}" unless File.file?(path)
+
+      require_installed_owner!(path, mode, label)
+    end
+
+    def require_installed_owner!(path, mode, label)
+      stat = File.lstat(path)
+      unless stat.uid == server_install_uid &&
+             (!shared_server_install? || stat.gid == server_install_gid) &&
+             (mode.nil? || (stat.mode & 0o777) == mode)
+        expected = "uid #{server_install_uid}"
+        expected += " gid #{server_install_gid}" if shared_server_install?
+        expected += format(' mode %04o', mode) if mode
+        raise Error, "#{label} must have #{expected}: #{path}"
+      end
+    end
+
+    def require_installed_symlink_owner!(path, label)
+      stat = File.lstat(path)
+      return if stat.uid == server_install_uid
+
+      raise Error, "#{label} must have uid #{server_install_uid}: #{path}"
+    end
+
+    def with_install_lock(destination)
+      reject_symlink_components!(destination, 'server certificate destination')
+      reject_git_directory!(destination, 'server certificate destination')
+      parent = File.dirname(destination)
+      FileUtils.mkdir_p(parent, mode: 0o700)
+      reject_symlink_components!(parent, 'server certificate destination parent')
+      path = "#{destination}.lock"
+      flags = File::RDWR | File::CREAT
+      flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+      File.open(path, flags, 0o600) do |file|
+        stat = file.stat
+        unless stat.file? && stat.uid == @state_uid && (stat.mode & 0o777) == 0o600
+          raise Error, "server certificate lock must be a uid #{@state_uid} mode-0600 file: #{path}"
+        end
+        raise Error, "cannot lock server certificate destination: #{path}" unless file.flock(File::LOCK_EX)
+
+        yield
+      end
+    rescue Errno::ELOOP, Errno::EACCES => e
+      raise Error, "server certificate lock is unsafe: #{e.message}"
+    end
+
+    def with_reconcile_lock(path)
+      lock = File.expand_path(path)
+      parent = File.dirname(lock)
+      reject_symlink_components!(parent, 'reconciliation lock parent')
+      FileUtils.mkdir_p(parent, mode: 0o755)
+      reject_symlink_components!(parent, 'reconciliation lock parent')
+      flags = File::RDWR | File::CREAT
+      flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+      File.open(lock, flags, 0o600) do |file|
+        stat = file.stat
+        unless stat.file? && stat.uid == @state_uid && (stat.mode & 0o777) == 0o600
+          raise Error, "reconciliation lock must be a uid #{@state_uid} mode-0600 file: #{lock}"
+        end
+        raise Error, "cannot lock reconciliation: #{lock}" unless file.flock(File::LOCK_EX)
+
+        yield
+      end
+    rescue Errno::ELOOP, Errno::EACCES => e
+      raise Error, "reconciliation lock is unsafe: #{e.message}"
+    end
+
+    def read_applied_target(path)
+      marker = File.expand_path(path)
+      return unless path_exists?(marker)
+
+      stat = File.lstat(marker)
+      unless stat.file? && !stat.symlink? && stat.uid == @state_uid && (stat.mode & 0o777) == 0o600
+        raise Error, "applied marker must be a uid #{@state_uid} mode-0600 file: #{marker}"
+      end
+      value = File.binread(marker, 4097)
+      unless value.bytesize <= 4096 && value.end_with?("\n") && value.count("\n") == 1
+        raise Error, "applied marker has invalid content: #{marker}"
+      end
+
+      value.chomp
+    end
+
+    def publish_applied_target(path, target)
+      marker = File.expand_path(path)
+      parent = File.dirname(marker)
+      reject_symlink_components!(parent, 'applied marker parent')
+      temporary = File.join(parent, ".#{File.basename(marker)}.#{$$}.#{SecureRandom.hex(4)}")
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write("#{target}\n")
+          file.flush
+          file.fsync
+        end
+        File.chmod(0o600, temporary)
+        File.rename(temporary, marker)
+        fsync_directory(parent)
+      ensure
+        File.unlink(temporary) if File.exist?(temporary)
+      end
+    end
+
+    def prune_installed_pairs(pairs, current, predecessor)
+      retained = [current, predecessor].compact.map { |path| File.realpath(path) }
+      Dir.children(pairs).each do |entry|
+        path = File.join(pairs, entry)
+        next if retained.include?(path)
+        next unless File.directory?(path) && !File.symlink?(path)
+
+        FileUtils.remove_entry_secure(path)
+      end
+      fsync_directory(pairs)
+    end
+
+    def reject_git_state_directory!
+      reject_symlink_components!(@state_dir, 'PKI state')
+      reject_git_directory!(@state_dir, 'PKI state')
+    end
+
+    def reject_symlink_components!(path, label)
+      current = Pathname.new(File::SEPARATOR)
+      Pathname.new(File.expand_path(path)).each_filename do |component|
+        current = current.join(component)
+        begin
+          stat = File.lstat(current)
+        rescue Errno::ENOENT
+          break
+        end
+        raise Error, "#{label} has a symlink component: #{current}" if stat.symlink?
+      end
+    end
+
+    def reject_git_directory!(path, label)
+      candidate = path
+      loop do
+        if File.exist?(File.join(candidate, '.git'))
+          raise Error, "#{label} must be stored outside a git working tree"
+        end
+        parent = File.dirname(candidate)
+        break if parent == candidate
+
+        candidate = parent
+      end
+    end
+
+    def claim_managed_directory!(path, marker, label)
+      marker_path = File.join(path, marker)
+      if path_exists?(marker_path)
+        stat = File.lstat(marker_path)
+        unless stat.file? && !stat.symlink? && stat.uid == File.stat(path).uid &&
+               (stat.mode & 0o777) == 0o600 && File.binread(marker_path) == "workspace-pki-v1\n"
+          raise Error, "#{label} has an invalid workspace-pki marker: #{marker_path}"
+        end
+        return
+      end
+      unless Dir.empty?(path) && (File.stat(path).mode & 0o777) == 0o700
+        raise Error, "#{label} is not an empty mode-0700 directory or managed by workspace-pki"
+      end
+
+      write_directory_marker!(path, marker)
+    end
+
+    def write_directory_marker!(path, marker)
+      marker_path = File.join(path, marker)
+      File.open(marker_path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+        file.write("workspace-pki-v1\n")
+        file.flush
+        file.fsync
+      end
+      File.chmod(0o600, marker_path)
+      fsync_file(marker_path)
+      fsync_directory(path)
+    end
+
+    def ensure_leaf_root!
+      ensure_real_directory!(leaf_root, mode: 0o700)
+    end
+
+    def ensure_real_directory!(path, mode:)
+      if path_exists?(path)
+        raise Error, "directory is a symlink: #{path}" if File.symlink?(path)
+        raise Error, "path is not a directory: #{path}" unless File.directory?(path)
+      else
+        FileUtils.mkdir_p(path, mode:)
+      end
+      require_state_owner!(path, 'directory')
+      File.chmod(mode, path)
+      path
+    end
+
+    def require_authority!
+      require_private_state_directory!(@state_dir, 'state directory')
+      unless File.directory?(authority_dir) && !File.symlink?(authority_dir)
+        raise Error, "CA authority directory is missing or unsafe: #{authority_dir}"
+      end
+      require_private_state_directory!(authority_dir, 'CA authority directory')
+    end
+
+    def require_file!(path, private:)
+      raise Error, "file is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "required file not found: #{path}" unless File.file?(path)
+      require_state_owner!(path, 'PKI file') if state_path?(path)
+      if private && File.stat(path).mode & 0o077 != 0
+        raise Error, "private file must not be accessible by group or others: #{path}"
+      end
+    end
+
+    def with_temporary_directory(parent = @state_dir)
+      directory = Dir.mktmpdir('.generate-', parent)
+      File.chmod(0o700, directory)
+      yield directory
+    ensure
+      FileUtils.remove_entry_secure(directory) if directory && File.exist?(directory)
+    end
+
+    def publish_pair(directory, versions_root, prefix, link_root: @state_dir)
+      identifier = "#{prefix}-#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{SecureRandom.hex(6)}"
+      published = File.join(versions_root, identifier)
+      fsync_tree(directory)
+      File.rename(directory, published)
+      fsync_directory(versions_root)
+      switch_current(link_root, versions_root, published)
+      published
+    rescue StandardError
+      current = File.join(link_root, 'current')
+      linked = begin
+        File.symlink?(current) && File.realpath(current) == File.realpath(published)
+      rescue Errno::ENOENT, Errno::EACCES
+        false
+      end
+      if published && File.directory?(published) && !linked
+        FileUtils.remove_entry_secure(published)
+        fsync_directory(versions_root)
+      end
+      raise
+    end
+
+    def switch_current(link_root, versions_root, published)
+      current = File.join(link_root, 'current')
+      if path_exists?(current) && !File.symlink?(current)
+        raise Error, "current certificate pair is not a symlink: #{current}"
+      end
+      relative_target = Pathname.new(published).relative_path_from(
+        Pathname.new(link_root)
+      ).to_s
+      temporary = File.join(link_root, ".current.#{$$}.#{SecureRandom.hex(4)}")
+      File.symlink(relative_target, temporary)
+      File.rename(temporary, current)
+      fsync_directory(link_root)
+    ensure
+      File.unlink(temporary) if temporary && File.symlink?(temporary)
+    end
+
+    def current_pair(versions_root, link_root: @state_dir)
+      unless File.directory?(versions_root) && !File.symlink?(versions_root)
+        raise Error, "certificate version directory is missing or unsafe: #{versions_root}"
+      end
+      require_private_state_directory!(versions_root, 'certificate version directory')
+      current = File.join(link_root, 'current')
+      raise Error, "current certificate pair is not a symlink: #{current}" unless File.symlink?(current)
+      require_state_owner!(current, 'current certificate symlink') if state_path?(current)
+
+      resolved = File.realpath(current)
+      root = File.realpath(versions_root)
+      unless File.dirname(resolved) == root && File.directory?(resolved) && !File.symlink?(resolved)
+        raise Error, "current certificate pair escapes its version directory: #{current}"
+      end
+      require_private_state_directory!(resolved, 'current certificate directory') if state_path?(resolved)
+      resolved
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot resolve current certificate pair: #{e.message}"
+    end
+
+    def verify_files!(certificate, check_time: true)
+      arguments = ['verify']
+      arguments << '-no_check_time' unless check_time
+      run(*arguments, '-CAfile', ca_certificate, '-verify_hostname', @hostname, certificate)
+    end
+
+    def validate_leaf_files!(certificate, key, check_time: true)
+      require_file!(certificate, private: false)
+      require_file!(key, private: true)
+      verify_files!(certificate, check_time:)
+      validate_key_pair!(certificate, key)
+    end
+
+    def validate_key_pair!(certificate, key)
+      certificate_public_key = capture('x509', '-in', certificate, '-pubkey', '-noout')
+      private_public_key = capture('pkey', '-in', key, '-pubout')
+      return if certificate_public_key == private_public_key
+
+      raise Error, 'server certificate and private key do not match'
+    end
+
+    def certificate_valid_for?(certificate, seconds)
+      system(
+        @openssl, 'x509', '-checkend', Integer(seconds).to_s, '-noout', '-in', certificate,
+        out: File::NULL, err: File::NULL
+      )
+    end
+
+    def publish_initial_state(directory)
+      raise Error, "PKI state appeared during initialization: #{@state_dir}" if path_exists?(@state_dir)
+
+      fsync_tree(directory)
+      File.rename(directory, @state_dir)
+      fsync_directory(File.dirname(@state_dir))
+    end
+
+    def fsync_tree(directory)
+      Dir.children(directory).each do |entry|
+        path = File.join(directory, entry)
+        next if File.symlink?(path)
+
+        if File.directory?(path)
+          fsync_tree(path)
+        elsif File.file?(path)
+          fsync_file(path)
+        end
+      end
+      fsync_directory(directory)
+    end
+
+    def fsync_file(path)
+      File.open(path, File::RDONLY, &:fsync)
+    end
+
+    def fsync_directory(path)
+      File.open(path, File::RDONLY, &:fsync)
+    end
+
+    def run(*arguments)
+      return if system(@openssl, *arguments)
+
+      raise Error, "openssl #{arguments.first} failed"
+    end
+
+    def capture(*arguments)
+      output = IO.popen([@openssl, *arguments], err: [:child, :out], &:read)
+      raise Error, "openssl #{arguments.first} failed" unless $CHILD_STATUS.success?
+
+      output
+    end
+
+    def ca_key
+      File.join(authority_dir, 'ca-key.pem')
+    end
+
+    def ca_certificate
+      File.join(authority_dir, 'ca.pem')
+    end
+
+    def authority_dir
+      File.join(@state_dir, 'authority')
+    end
+
+    def leaf_root
+      File.join(@state_dir, 'leaves')
+    end
+
+    def path_exists?(path)
+      File.lstat(path)
+      true
+    rescue Errno::ENOENT
+      false
+    end
+
+    def state_path?(path)
+      expanded = File.expand_path(path)
+      expanded == @state_dir || expanded.start_with?("#{@state_dir}#{File::SEPARATOR}")
+    end
+
+    def require_state_owner!(path, label)
+      owner = File.lstat(path)
+      return if owner.uid == @state_uid
+
+      raise Error, "#{label} must be owned by uid #{@state_uid}: #{path}"
+    end
+
+    def require_private_state_directory!(path, label)
+      unless File.directory?(path) && !File.symlink?(path)
+        raise Error, "#{label} is missing or unsafe: #{path}"
+      end
+      require_state_owner!(path, label)
+      return if File.stat(path).mode & 0o777 == 0o700
+
+      raise Error, "#{label} must have mode 0700: #{path}"
+    end
+  end
+
+  class CLI
+    def self.run(argv)
+      command = argv.shift
+      commands = %w[init ensure renew verify inspect export-ca install-server reconcile-nginx]
+      raise Error, usage unless commands.include?(command)
+
+      options = {state_dir: STATE_DIR, hostname: HOSTNAME}
+      reconcile_options = {service: 'nginx.service'}
+      systemctl = 'systemctl'
+      parser = OptionParser.new do |opts|
+        opts.on('--state-dir DIR') { |value| options[:state_dir] = value }
+        opts.on('--hostname HOST') { |value| options[:hostname] = value }
+        opts.on('--server-dir DIR') { |value| reconcile_options[:server_dir] = value }
+        opts.on('--public-ca FILE') { |value| reconcile_options[:public_ca] = value }
+        opts.on('--applied-marker FILE') { |value| reconcile_options[:applied_marker] = value }
+        opts.on('--lock-file FILE') { |value| reconcile_options[:lock_file] = value }
+        opts.on('--service NAME') { |value| reconcile_options[:service] = value }
+        opts.on('--systemctl PATH') { |value| systemctl = value }
+      end
+      parser.parse!(argv)
+      runner = Runner.new(**options, service_manager: Systemd.new(command: systemctl))
+      if %w[export-ca install-server].include?(command)
+        raise Error, "#{command} requires exactly one output path" unless argv.length == 1
+
+        runner.public_send(command.tr('-', '_'), argv.fetch(0))
+      elsif command == 'reconcile-nginx'
+        raise Error, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+        required = %i[server_dir public_ca applied_marker lock_file]
+        missing = required.reject { |name| reconcile_options.key?(name) }
+        raise Error, "reconcile-nginx is missing #{missing.join(', ')}" unless missing.empty?
+
+        runner.reconcile_nginx(**reconcile_options)
+      else
+        raise Error, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+
+        runner.public_send(command.tr('-', '_'))
+      end
+      0
+    rescue OptionParser::ParseError, Error => e
+      warn "workspace-pki: #{e.message}"
+      1
+    end
+
+    def self.usage
+      <<~USAGE
+        Usage: workspace-pki COMMAND [options]
+
+        Commands:
+          init       Create a CA and the first server certificate
+          ensure     Create or renew a complete certificate state as needed
+          renew      Publish a new server certificate and retain old versions
+          verify     Verify hostname, chain, and server private key
+          inspect    Print certificate identities, validity, and fingerprints
+          export-ca  Copy the public CA certificate to the given path
+          install-server  Copy only the nginx leaf certificate and key
+          reconcile-nginx  Reconcile certificates and reload nginx if needed
+      USAGE
+    end
+  end
+end
+
+exit WorkspacePKI::CLI.run(ARGV) if $PROGRAM_NAME == __FILE__
