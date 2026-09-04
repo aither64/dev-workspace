@@ -59,8 +59,18 @@ lifecycle: active
 
 Fill in a substantive plan and initial state and commit them in the workspace
 repository before the first project-code commit or external mutation. Keep
-active tracking committed at meaningful plan, review, test/CI, deployment, and
-handoff checkpoints.
+active tracking current in the working tree, but do not commit each plan,
+review, test/CI, deployment, or status update separately.
+
+Short initiatives normally have only the initial active tracking commit and the
+final archive commit. For an initiative that remains unfinished at the end of
+an active working day, at most one consolidated tracking-only checkpoint may be
+committed for that day when material progress is worth preserving. This is a
+ceiling, not a requirement, and inactive calendar days do not count. An
+additional same-day checkpoint is reserved for a genuine ownership handoff or
+an explicit user request. A pause until a future working day can justify that
+day's consolidated checkpoint, but not a second one. Ordinary functional
+commits are not tracking-only checkpoints.
 
 ## Attaching and syncing
 
@@ -176,12 +186,15 @@ The per-slug lock serializes `dev-session` commands, not external writers. A
 process that writes after the last cleanliness check can still race worktree
 removal, so all worktree writers must be stopped before finalization.
 
-The helper does not stage or commit. Inspect the reported move and commit only
-the exact `work/<slug>/` and `archive/<slug>/` paths in the shared top-level
-repository. The managed tmux session remains available for that commit. After
-the commit, `bin/dev-session stop <slug> --as-is` verifies the terminal archive
-and clean task paths before closing the exact workspace-owned tmux identity it
-resolves at stop time.
+The terminal lifecycle and final state do not need a separate commit before
+`finalize`; the earlier committed active snapshot is sufficient. The helper
+does not stage or commit. Inspect the reported move and commit only the exact
+`work/<slug>/` and `archive/<slug>/` paths in the shared top-level repository,
+including the final tracking content, as one archive commit. The managed tmux
+session remains available for that commit. After the commit,
+`bin/dev-session stop <slug> --as-is` verifies the terminal archive and clean
+task paths before closing the exact workspace-owned tmux identity it resolves
+at stop time.
 
 ## Worktree helpers
 
