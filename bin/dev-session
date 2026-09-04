@@ -2,10 +2,15 @@
 # frozen_string_literal: true
 
 require 'date'
+require 'digest'
 require 'fileutils'
+require 'json'
 require 'open3'
 require 'optparse'
+require 'pathname'
 require 'shellwords'
+require 'time'
+require 'yaml'
 
 module VpsfreeDevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -14,11 +19,45 @@ module VpsfreeDevSession
   SESSION_SLUG = '@vpsfree_dev_session_slug'
   WINDOW_KIND = '@vpsfree_dev_session_window'
   WINDOW_WORKTREE = '@vpsfree_dev_session_worktree'
+  SESSION_CODEX_THREAD = '@vpsfree_dev_session_codex_thread'
+  SESSION_CODEX_SOCKET = '@vpsfree_dev_session_codex_socket'
+  SESSION_CODEX_VERSION = '@vpsfree_dev_session_codex_version'
+  SESSION_CODEX_PANE = '@vpsfree_dev_session_codex_pane'
 
   ENV_SLUG = 'VPSFREE_DEV_SESSION_SLUG'
   ENV_WORKSPACE = 'VPSFREE_DEV_SESSION_WORKSPACE'
   ENV_WORK_DIR = 'VPSFREE_DEV_SESSION_WORK_DIR'
   ENV_WORKTREES_DIR = 'VPSFREE_DEV_SESSION_WORKTREES_DIR'
+  ENV_PORTAL_BASE_URL = 'VPSFREE_DEV_SESSION_PORTAL_BASE_URL'
+  ENV_PORTAL_URL = 'VPSFREE_DEV_SESSION_URL'
+  ENV_PORTAL_COMMAND = 'VPSFREE_DEV_SESSION_PORTAL_COMMAND'
+  ENV_AUTHORITY_DIR = 'VPSFREE_DEV_SESSION_AUTHORITY_DIR'
+  ENV_TMUX_SOCKET = 'VPSFREE_DEV_SESSION_TMUX_SOCKET'
+  ENV_CODEX_COMMAND = 'VPSFREE_DEV_SESSION_CODEX'
+  ENV_CODEX_SOCKET = 'VPSFREE_DEV_SESSION_CODEX_SOCKET'
+  ENV_CODEX_VERSION = 'VPSFREE_DEV_SESSION_CODEX_VERSION'
+  ENV_REQUIRE_RUNTIME = 'VPSFREE_DEV_SESSION_REQUIRE_RUNTIME'
+
+  THREAD_ENV_ARGUMENTS = {
+    ENV_SLUG => '--session-slug',
+    ENV_WORKSPACE => '--workspace',
+    ENV_WORK_DIR => '--cwd',
+    ENV_WORKTREES_DIR => '--worktrees-dir',
+    ENV_PORTAL_BASE_URL => '--portal-base-url',
+    ENV_PORTAL_URL => '--portal-url',
+    ENV_AUTHORITY_DIR => '--authority-dir',
+    ENV_TMUX_SOCKET => '--tmux-socket',
+    ENV_CODEX_COMMAND => '--codex-command',
+    ENV_CODEX_SOCKET => '--socket',
+    ENV_CODEX_VERSION => '--codex-version',
+    ENV_PORTAL_COMMAND => '--portal-command'
+  }.freeze
+
+  DEFAULT_PORTAL_BASE_URL = 'https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz'
+  PORTAL_MANIFEST = 'portal.yml'
+  TRACKING_MAX_SIZE = 1024 * 1024
+  AUTHORITY_MAX_SIZE = 64 * 1024
+  MAX_MESSAGE_BYTES = 20_000
 
   LIFECYCLE_HEADER = Regexp.new(
     '\\A---\\r?\\nlifecycle: (active|complete|abandoned)' \
@@ -33,17 +72,27 @@ module VpsfreeDevSession
 
   USAGE = <<~USAGE
     Usage:
-      dev-session [--workspace DIR] [--tmux-socket NAME] start <name-or-slug>
+      dev-session [--workspace DIR] [--tmux-socket NAME-OR-PATH]
+        [--authority-dir DIR] [--codex-socket PATH] [--codex-version VERSION]
+        [--codex-command PATH] [--portal-command PATH] [--portal-base-url URL]
+        [--require-runtime]
+        start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
+        [--goal-file FILE] [--json] [--exclusive]
       dev-session [--workspace DIR] [--tmux-socket NAME] attach <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
+      dev-session [--workspace DIR] [--authority-dir DIR] recover-stale
+        <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] remove <name-or-slug>
         [--as-is] [--force]
       dev-session [--workspace DIR] [--tmux-socket NAME] finalize <name-or-slug>
         [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] list [<name-or-slug>] [--as-is]
+      dev-session [--workspace DIR] validate
       dev-session [--workspace DIR] [--tmux-socket NAME] current
+      dev-session [--workspace DIR] [--tmux-socket NAME] url
+        [<name-or-slug>] [--as-is]
 
       dev-session [--workspace DIR] [--tmux-socket NAME] worktree add
         <name-or-slug> <project> [--as-is] [--name NAME] [--branch BRANCH]
@@ -105,7 +154,20 @@ module VpsfreeDevSession
 
   class Tmux
     Window = Struct.new(:id, :name, :kind, :worktree, keyword_init: true)
-    Session = Struct.new(:id, :name, :mark, :slug, :workspace, keyword_init: true) do
+    Session = Struct.new(
+      :id,
+      :name,
+      :mark,
+      :slug,
+      :workspace,
+      :environment_slug,
+      :socket_path,
+      :codex_thread_id,
+      :codex_socket_path,
+      :codex_client_version,
+      :codex_pane_id,
+      keyword_init: true
+    ) do
       def managed?
         mark == '1' && slug == name
       end
@@ -116,7 +178,13 @@ module VpsfreeDevSession
       "\#{session_name}",
       "\#{#{SESSION_MARK}}",
       "\#{#{SESSION_SLUG}}",
-      "\#{E:#{ENV_WORKSPACE}}"
+      "\#{E:#{ENV_WORKSPACE}}",
+      "\#{E:#{ENV_SLUG}}",
+      "\#{socket_path}",
+      "\#{#{SESSION_CODEX_THREAD}}",
+      "\#{#{SESSION_CODEX_SOCKET}}",
+      "\#{#{SESSION_CODEX_VERSION}}",
+      "\#{#{SESSION_CODEX_PANE}}"
     ].join("\t")
 
     def self.session_target(session)
@@ -132,9 +200,11 @@ module VpsfreeDevSession
       @socket = socket
     end
 
+    attr_reader :socket
+
     def argv(*args)
       base = ['tmux']
-      base += ['-L', @socket] if @socket
+      base += [@socket.start_with?('/') ? '-S' : '-L', @socket] if @socket
       base + args
     end
 
@@ -189,6 +259,22 @@ module VpsfreeDevSession
       identity if identity.managed?
     end
 
+    def pane_session_id(pane)
+      stdout, _stderr, status = capture(
+        'display-message', '-p', '-t', pane, '#{session_id}',
+        allow_failure: true
+      )
+      status.success? ? stdout.strip : nil
+    end
+
+    def pane_current_command(pane)
+      stdout, _stderr, status = capture(
+        'display-message', '-p', '-t', pane, '#{pane_current_command}',
+        allow_failure: true
+      )
+      status.success? ? stdout.strip : nil
+    end
+
     def windows(session)
       format = [
         "\#{window_id}",
@@ -232,8 +318,13 @@ module VpsfreeDevSession
     end
 
     def parse_session(line)
-      id, name, mark, slug, workspace = line.chomp.split("\t", -1)
-      Session.new(id:, name:, mark:, slug:, workspace:)
+      id, name, mark, slug, workspace, environment_slug, socket_path,
+        codex_thread_id, codex_socket_path, codex_client_version, codex_pane_id =
+        line.chomp.split("\t", -1)
+      Session.new(
+        id:, name:, mark:, slug:, workspace:, environment_slug:, socket_path:,
+        codex_thread_id:, codex_socket_path:, codex_client_version:, codex_pane_id:
+      )
     end
   end
 
@@ -245,12 +336,19 @@ module VpsfreeDevSession
     def initialize(
       workspace:,
       tmux_socket: nil,
+      authority_dir: nil,
+      codex_socket: nil,
+      codex_version: nil,
       codex_command: nil,
       out: $stdout,
       err: $stderr,
       today: Date.today,
       command_runner: nil,
       tmux: nil,
+      process_exec: nil,
+      portal_command: nil,
+      portal_url: nil,
+      require_runtime: nil,
       env: ENV,
       cwd: Dir.pwd
     )
@@ -259,30 +357,185 @@ module VpsfreeDevSession
         raise Error, "workspace directory not found: #{expanded_workspace}"
       end
       @workspace = File.realpath(expanded_workspace)
+      @env = env
       @out = out
       @err = err
       @today = today
       @command_runner = command_runner || CommandRunner.new(out:, err:)
+      tmux_socket ||= env[ENV_TMUX_SOCKET]
+      @tmux_socket_explicit = !tmux_socket.nil?
+      @configured_tmux_socket = tmux_socket
+      @tmux_injected = !tmux.nil?
       @tmux = tmux || Tmux.new(runner: @command_runner, socket: tmux_socket)
-      @env = env
+      @default_tmux = @tmux
+      @process_exec = process_exec || lambda { |environment, argv| exec(environment, *argv) }
+      @selected_authority = nil
       @cwd = cwd
-      @codex_command = codex_command || ENV.fetch('VPSFREE_DEV_SESSION_CODEX', 'codex')
+      @shell_command = env['SHELL'] || ENV['SHELL'] || '/bin/sh'
+      unless @shell_command.start_with?(File::SEPARATOR) && File.executable?(@shell_command)
+        raise Error, "session shell is not an absolute executable: #{@shell_command.inspect}"
+      end
+      @authority_dir = authority_dir || env[ENV_AUTHORITY_DIR]
+      @authority_dir = File.expand_path(@authority_dir) if @authority_dir
+      @codex_command = codex_command || env.fetch(ENV_CODEX_COMMAND, 'codex')
+      @codex_command_argv = Shellwords.split(@codex_command)
+      raise Error, 'Codex command must not be empty' if @codex_command_argv.empty?
+      @codex_socket = codex_socket || env[ENV_CODEX_SOCKET]
+      @codex_version = codex_version || env[ENV_CODEX_VERSION]
+      @portal_command = portal_command || env[ENV_PORTAL_COMMAND]
+      @portal_command ||= executable_in_path('workspace-portal', env['PATH'])
+      @portal_command = Shellwords.split(@portal_command) if @portal_command.is_a?(String)
+      @portal_url = (
+        portal_url || env.fetch(ENV_PORTAL_BASE_URL, DEFAULT_PORTAL_BASE_URL)
+      ).sub(%r{/+\z}, '')
+      @require_runtime = require_runtime.nil? ? env[ENV_REQUIRE_RUNTIME] == '1' : require_runtime
+      validate_required_runtime! if @require_runtime
     end
 
-    def start(input, as_is:, new:, attach:, run_codex:)
+    def start(
+      input,
+      as_is:,
+      new:,
+      attach:,
+      run_codex:,
+      goal_file: nil,
+      json: false,
+      exclusive: false
+    )
+      raise Error, '--json cannot be combined with --attach' if json && attach
+
       slug = resolve_start_slug(input, as_is:, new:)
+      trusted_thread_id = nil
+      replayed = false
 
-      session = with_slug_lock(slug) do
-        ensure_tracking_files(slug)
+      session = with_creation_lock(slug) do
+        creation_journal = nil
+        manifest = nil
+        thread_id = nil
+        goal_pending = false
 
-        selected_session = @tmux.session(slug)
-        selected_session = if selected_session
-                             ensure_managed_session!(slug, session: selected_session)
-                           else
-                             create_tmux_session(slug, run_codex:)
-                           end
+        selected_session = with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          creation_journal = prepare_creation_journal(
+            slug,
+            goal_file,
+            exclusive:,
+            run_codex:
+          )
+          ensure_tracking_files(slug)
+          validate_creation_tracking_files!(slug) if creation_journal
+          manifest = ensure_portal_manifest(slug, creation_journal:)
+          if creation_journal &&
+             manifest.dig('creation', 'goal_sha256') != creation_journal.fetch('goal_sha256')
+            raise Error, "creation request does not match the recorded goal for #{slug}"
+          end
+          if exclusive && creation_journal&.fetch('state', nil) == 'ready' &&
+             manifest.dig('creation', 'state') == 'ready'
+            trusted_thread_id = manifest.dig('codex', 'thread_id')
+            replayed = true
+            selected = @tmux.session(slug)
+            if selected && managed_by_workspace?(selected)
+              selected = ensure_managed_session!(slug, session: selected)
+              selected = reconcile_native_client!(slug, selected) if run_codex
+              write_session_authority(slug, selected, state: 'ready') if @selected_authority
+              next selected
+            end
+            next nil
+          end
+          seed_goal(slug, goal_file) if goal_file && creation_journal&.fetch('state', nil) != 'ready'
 
-        sync_slug(slug, require_session: true, session: selected_session)
+          thread_id = @selected_authority&.fetch('codex_thread_id', nil)
+          selected = @tmux.session(slug)
+          if @selected_authority && selected.nil?
+            delete_session_authority(slug)
+            @selected_authority = nil
+          end
+          if run_codex && (thread_id.nil? || thread_id.empty?) &&
+             manifest.dig('creation', 'state') == 'ready' && selected &&
+             managed_by_workspace?(selected) && creation_journal.nil?
+            raise Error,
+                  "existing tmux session has no shared Codex thread; stop it before enabling portal interaction: #{slug}"
+          end
+          if run_codex && (thread_id.nil? || thread_id.empty?)
+            persisted_thread = manifest.dig('codex', 'thread_id')
+            thread_id = create_portal_thread(slug, persisted_thread_id: persisted_thread)
+            if thread_id
+              manifest['codex'] = codex_metadata(thread_id)
+              write_portal_manifest(slug, manifest)
+              name_portal_thread(slug, thread_id)
+            end
+          end
+          if exclusive && run_codex && (thread_id.nil? || thread_id.empty?)
+            raise Error, "unable to create a Codex thread for #{slug}"
+          end
+
+          if creation_journal && manifest.dig('creation', 'state') == 'creating' &&
+             selected && !managed_by_workspace?(selected)
+            reconcile_creation_tmux_session!(slug, selected)
+            selected = nil
+          end
+          if run_codex && thread_id && selected && codex_provenance_configured? &&
+             !session_codex_provenance_matches?(selected, thread_id)
+            raise Error,
+                  "existing tmux session does not use the recorded Codex endpoint; " \
+                  "stop it before enabling portal interaction: #{slug}"
+          end
+          selected = if selected
+                       selected = ensure_managed_session!(slug, session: selected)
+                       run_codex ? reconcile_native_client!(slug, selected) : selected
+                     else
+                       verify_codex_client! if run_codex && thread_id
+                       create_tmux_session(slug, run_codex:, thread_id:)
+                     end
+
+          selected = sync_slug(slug, require_session: true, session: selected)
+          trusted_thread_id = thread_id
+          goal_pending = run_codex && thread_id && goal_file &&
+                         !manifest.dig('creation', 'initial_goal_sent')
+          manifest['creation']['state'] = goal_pending ? 'creating' : 'ready'
+          write_portal_manifest(slug, manifest)
+          if goal_pending
+            write_session_authority(slug, selected, state: 'creating')
+          else
+            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
+            write_session_authority(slug, selected, state: 'ready')
+          end
+          selected
+        end
+
+        if goal_pending
+          # The host session and a private creating authority now exist, and the
+          # slug lock is released. The initial turn can safely invoke workspace
+          # helpers while duplicate creation and destructive lifecycle commands
+          # remain excluded by the host-only creation lock.
+          send_portal_goal(thread_id, goal_file)
+          selected_session = with_slug_lock(slug) do
+            select_tmux_for_slug!(slug)
+            current = revalidate_session!(selected_session)
+            current_manifest = load_portal_manifest(portal_file(slug), required: true)
+            unless current_manifest.dig('codex', 'thread_id') == thread_id &&
+                   current_manifest.dig('creation', 'state') == 'creating'
+              raise Error, "session creation state changed while starting Codex: #{slug}"
+            end
+            current_manifest['creation']['initial_goal_sent'] = true
+            current_manifest['creation']['state'] = 'ready'
+            write_portal_manifest(slug, current_manifest)
+            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
+            write_session_authority(slug, current, state: 'ready')
+            current
+          end
+        end
+        selected_session
+      end
+
+      if json
+        @out.puts JSON.generate(
+          slug:,
+          url: portal_url(slug),
+          threadId: trusted_thread_id,
+          attach: session && attach_command(session.id)
+        )
+        return
       end
 
       if attach.nil?
@@ -290,70 +543,118 @@ module VpsfreeDevSession
       end
 
       if attach
+        raise Error, "tmux session not found: #{slug}" if replayed && !session
+
         attach_to_session(session)
       else
         @out.puts "session: #{slug}"
-        @out.puts "attach: #{attach_command(session.id).map(&:shellescape).join(' ')}"
+        @out.puts "attach: #{attach_command(session.id).map(&:shellescape).join(' ')}" if session
+        @out.puts "portal: #{portal_url(slug)}"
       end
     end
 
     def attach(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      session = ensure_managed_session!(slug)
+      session = with_slug_lock(slug) do
+        select_tmux_for_slug!(slug)
+        session = ensure_managed_session!(slug)
+        reconcile_native_client!(slug, session)
+      end
       attach_to_session(session)
     end
 
     def sync(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      with_slug_lock(slug) { sync_slug(slug, require_session: true) }
+      with_slug_lock(slug) do
+        select_tmux_for_slug!(slug)
+        session = sync_slug(slug, require_session: true)
+        reconcile_native_client!(slug, session)
+      end
     end
 
     def stop(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      with_slug_lock(slug) do
-        session = ensure_managed_session!(slug)
-        close_session!(slug, session)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          session = ensure_managed_session!(slug)
+          close_session!(slug, session)
+        end
+      end
+    end
+
+    def recover_stale(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          authority = load_session_authority(slug, required: true)
+          if @tmux.session_by_id(authority.fetch('tmux_session_id'))
+            raise Error, "session authority is not stale: #{slug}"
+          end
+          validate_session_closure!(slug)
+          ensure_portal_thread_idle!(slug, authority)
+          delete_session_authority(slug)
+          @out.puts "removed stale session authority: #{slug}"
+        end
       end
     end
 
     def remove(input, as_is:, force:)
       slug = lookup_slug(input, as_is:)
-      with_slug_lock(slug) do
-        plan = prepare_cleanup(slug, force:)
-        validate_session_closure!(slug)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          plan = prepare_cleanup(slug, force:)
+          validate_session_closure!(slug)
+          quiesced = quiesce_and_require_idle!(slug, plan.session)
+          snapshot_portal_repository_heads(slug, plan)
 
-        execute_cleanup(slug, plan, force:)
-        close_session!(slug, plan.session) if plan.session
+          execute_cleanup(slug, plan, force:)
+          close_session!(slug, plan.session, idle_checked: true) if plan.session
+        rescue StandardError
+          restore_native_client!(slug, quiesced) if quiesced && @tmux.session_by_id(quiesced.id)
+          raise
+        end
       end
     end
 
     def finalize(input, as_is:)
       slug = lookup_slug(input, as_is:)
-      with_slug_lock(slug) do
-        source = validate_work_directory!(slug)
-        destination = archive_dir(slug)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          source = validate_work_directory!(slug)
+          destination = archive_dir(slug)
 
-        raise Error, "archive already exists: #{destination}" if path_exists?(destination)
+          raise Error, "archive already exists: #{destination}" if path_exists?(destination)
 
-        validate_tracking_files!(slug)
-        validate_terminal_lifecycle!(slug)
-        validate_tracking_committed!(slug)
-        archive_root = ensure_archive_root!
-        unless File.stat(source).dev == File.stat(archive_root).dev
-          raise Error, 'work and archive directories must be on the same filesystem'
-        end
-        validate_archive_move_command!
+          validate_tracking_files!(slug)
+          validate_terminal_lifecycle!(slug)
+          validate_tracking_committed!(slug)
+          archive_root = ensure_archive_root!
+          unless File.stat(source).dev == File.stat(archive_root).dev
+            raise Error, 'work and archive directories must be on the same filesystem'
+          end
+          validate_archive_move_command!
 
-        plan = prepare_cleanup(slug, force: false)
-        execute_cleanup(slug, plan, force: false)
-        source = validate_work_directory!(slug)
-        ensure_archive_root!
-        atomic_archive_move!(source, destination)
+          plan = prepare_cleanup(slug, force: false)
+          quiesced = quiesce_and_require_idle!(slug, plan.session)
+          finalize_portal_manifest(slug, plan)
+          execute_cleanup(slug, plan, force: false)
+          source = validate_work_directory!(slug)
+          ensure_archive_root!
+          atomic_archive_move!(source, destination)
 
-        @out.puts "archived: #{destination}"
-        @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
-        if plan.session
-          @out.puts "stop after committing: bin/dev-session stop #{slug} --as-is"
+          @out.puts "archived: #{destination}"
+          @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
+          if plan.session
+            helper = @require_runtime ? 'workspace-dev-session' : 'bin/dev-session'
+            @out.puts "stop after committing: #{helper} stop #{slug} --as-is"
+          end
+        rescue StandardError
+          restore_native_client!(slug, quiesced) if quiesced && @tmux.session_by_id(quiesced.id)
+          raise
         end
       end
     end
@@ -366,6 +667,7 @@ module VpsfreeDevSession
               end
 
       rows = slugs.sort.map do |slug|
+        select_tmux_for_slug!(slug)
         identity = @tmux.session(slug)
         session = if identity.nil?
                     'none'
@@ -389,10 +691,69 @@ module VpsfreeDevSession
       print_rows(rows)
     end
 
+    def validate
+      count = 0
+      seen = {}
+      %w[work archive].each do |root_name|
+        root_path = File.join(workspace, root_name)
+        next unless File.directory?(root_path)
+
+        Dir.children(root_path).sort.each do |slug|
+          next unless valid_part?(slug)
+
+          path = File.join(root_path, slug, PORTAL_MANIFEST)
+          next unless path_exists?(path)
+
+          if seen.key?(slug)
+            raise Error, "duplicate session #{slug.inspect} in #{seen.fetch(slug)} and #{root_name}"
+          end
+          manifest = load_portal_manifest(path, required: true)
+          plan = File.join(root_path, slug, 'plan.md')
+          state = File.join(root_path, slug, 'state.md')
+          [plan, state].each do |tracking|
+            raise Error, "tracking file is a symlink: #{tracking}" if File.symlink?(tracking)
+            raise Error, "missing tracking file: #{tracking}" unless File.file?(tracking)
+          end
+          read_bounded_file(plan, 'plan.md')
+          lifecycle = lifecycle_state(read_bounded_file(state, 'state.md'))
+          terminal = %w[complete abandoned].include?(lifecycle)
+          if root_name == 'archive' && (!terminal || manifest['finalized_at'].to_s.empty?)
+            raise Error, "archived session lacks terminal lifecycle or finalization metadata: #{path}"
+          end
+          if root_name == 'work' && lifecycle == 'active' && !manifest['finalized_at'].to_s.empty?
+            raise Error, "active session contains finalization metadata: #{path}"
+          end
+          seen[slug] = root_name
+          count += 1
+        end
+      end
+      @out.puts "validated #{count} portal manifest#{count == 1 ? '' : 's'}"
+    end
+
     def current
       slug = current_slug
       @out.puts slug
       slug
+    end
+
+    def url(input = nil, as_is: false)
+      slug = if input
+               if as_is
+                 validate_part!(input, 'slug')
+                 input
+               else
+                 lookup_slug(input, as_is: false)
+               end
+             else
+               current_slug
+             end
+      unless path_exists?(work_dir(slug)) || path_exists?(archive_dir(slug))
+        raise Error, "session tracking is missing for #{slug}"
+      end
+
+      value = portal_url(slug)
+      @out.puts value
+      value
     end
 
     def worktree_add(input, project, as_is:, name:, branch:, base:, fetch:)
@@ -401,38 +762,98 @@ module VpsfreeDevSession
       validate_part!(name, 'worktree name') if name
 
       with_slug_lock(slug) do
+        select_tmux_for_slug!(slug)
         branch ||= slug
         validate_git_branch!(branch)
+        name ||= project
+        if project == 'workspace' && name != 'workspace'
+          raise Error, 'the workspace repository must use worktree name "workspace"'
+        end
+        if project != 'workspace' && name == 'workspace'
+          raise Error, 'worktree name "workspace" is reserved for the workspace repository'
+        end
 
         ensure_tracking_files(slug)
 
-        repo_path = repo_dir(project)
-        raise Error, "repository not found: #{repo_path}" unless File.directory?(repo_path)
-        repo = validate_canonical_repository!(repo_path, repo_path)
+        repo = repository_common_dir(project)
 
         @command_runner.run(['git', "--git-dir=#{repo}", 'fetch', 'origin']) if fetch
 
-        base ||= origin_head(repo)
-        name ||= project
+        default_branch = origin_head(repo)
+        base ||= default_branch
         path = File.join(worktrees_dir(slug), name)
-
-        raise Error, "worktree path already exists: #{path}" if path_exists?(path)
-
         ensure_worktree_group!(slug, create: true)
 
-        if branch_exists?(repo, branch)
-          @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
+        manifest = ensure_portal_manifest(slug)
+        registered = manifest.fetch('repositories', []).find do |item|
+          item.is_a?(Hash) && item['name'] == name
+        end
+        remote = git_capture(['git', "--git-dir=#{repo}", 'remote', 'get-url', 'origin']).strip
+        github = github_repository(remote)
+        if registered
+          unless registered['project'] == project && registered['branch'] == branch &&
+                 (registered['github'].nil? || github.nil? || registered['github'] == github)
+            raise Error, "portal repository registration conflicts with worktree #{name}"
+          end
+          base_sha = registered['initial_base_sha']
+          unless base_sha&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
+            raise Error, "portal repository has no initial base commit: #{name}"
+          end
+          default_branch = registered.fetch('default_branch', default_branch.delete_prefix('origin/'))
         else
-          @command_runner.run([
-            'git',
-            "--git-dir=#{repo}",
-            'worktree',
-            'add',
-            '-b',
-            branch,
-            path,
-            base
-          ])
+          base_sha = git_capture(['git', "--git-dir=#{repo}", 'rev-parse', base]).strip
+        end
+
+        if path_exists?(path)
+          common_dir = validate_worktree_path!(slug, { name:, path: })
+          unless File.realpath(common_dir) == File.realpath(repo)
+            raise Error, "worktree belongs to a different repository: #{path}"
+          end
+          current_branch = git_capture([
+            'git', '-C', path, 'symbolic-ref', '--quiet', '--short', 'HEAD'
+          ]).strip
+          raise Error, "worktree uses unexpected branch #{current_branch.inspect}: #{path}" unless current_branch == branch
+
+          unless registered
+            head_sha = git_capture(['git', '-C', path, 'rev-parse', 'HEAD']).strip
+            unless head_sha == base_sha
+              raise Error, "unregistered worktree has advanced from its recoverable base: #{path}"
+            end
+            update_portal_repository(
+              slug,
+              name:,
+              project:,
+              github:,
+              branch:,
+              base_sha:,
+              default_branch:
+            )
+          end
+        else
+          update_portal_repository(
+            slug,
+            name:,
+            project:,
+            github:,
+            branch:,
+            base_sha:,
+            default_branch:
+          ) unless registered
+
+          if branch_exists?(repo, branch)
+            @command_runner.run(['git', "--git-dir=#{repo}", 'worktree', 'add', path, branch])
+          else
+            @command_runner.run([
+              'git',
+              "--git-dir=#{repo}",
+              'worktree',
+              'add',
+              '-b',
+              branch,
+              path,
+              base_sha
+            ])
+          end
         end
 
         sync_slug(slug, require_session: false)
@@ -445,6 +866,7 @@ module VpsfreeDevSession
       validate_part!(name, 'worktree name')
 
       with_slug_lock(slug) do
+        select_tmux_for_slug!(slug)
         path = File.join(worktrees_dir(slug), name)
         raise Error, "worktree not found: #{path}" unless File.directory?(path)
 
@@ -456,6 +878,7 @@ module VpsfreeDevSession
           raise Error, "worktree has uncommitted changes: #{path}"
         end
 
+        record_portal_repository_head(slug, name, path, common_dir)
         remove_worktree_path(slug, entry, common_dir:, force:)
         sync_slug(slug, require_session: false)
       end
@@ -564,17 +987,812 @@ module VpsfreeDevSession
       return false unless path_exists?(File.join(workspace, '.git'))
 
       relative = File.join('archive', slug)
-      indexed = git_capture(['git', '-C', workspace, 'ls-files', '-z', '--', relative])
+      indexed = safe_workspace_git_capture('ls-files', '-z', '--', relative)
       return true unless indexed.empty?
 
-      history = git_capture([
-        'git', '-C', workspace, 'log', '--all',
-        '--format=%H', '--', relative
-      ])
+      history = safe_workspace_git_capture(
+        'log', '--all', '--max-count=1', '--format=%H', '--', relative
+      )
       !history.empty?
     end
 
     private
+
+    def safe_workspace_git_capture(*args)
+      git_capture([
+        'git',
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.hooksPath=/dev/null',
+        '-C', workspace,
+        *args
+      ])
+    end
+
+    def select_tmux_for_slug!(slug)
+      @tmux = @default_tmux
+      @selected_authority = load_session_authority(slug, required: false)
+      return if @selected_authority.nil?
+
+      socket = @selected_authority.fetch('tmux_socket')
+      if @tmux_socket_explicit && @configured_tmux_socket != socket
+        raise Error,
+              "configured tmux socket does not match trusted session authority for #{slug}"
+      end
+      return if @tmux_injected
+
+      @tmux = Tmux.new(runner: @command_runner, socket: socket)
+    end
+
+    def ensure_authority_directory!
+      return nil unless @authority_dir
+
+      reject_symlink_components!(@authority_dir, 'session authority directory')
+      if path_exists?(@authority_dir)
+        raise Error, "session authority path is not a directory: #{@authority_dir}" unless File.directory?(@authority_dir)
+      else
+        FileUtils.mkdir_p(@authority_dir, mode: 0o700)
+      end
+      stat = File.stat(@authority_dir)
+      unless stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
+        raise Error,
+              "session authority directory must be owned by uid #{Process.euid} with mode 0700: #{@authority_dir}"
+      end
+      @authority_dir
+    end
+
+    def authority_file(slug)
+      File.join(@authority_dir, "#{slug}.json")
+    end
+
+    def load_session_authority(slug, required:)
+      unless @authority_dir
+        raise Error, 'session authority directory is not configured' if required
+
+        return nil
+      end
+      ensure_authority_directory!
+      path = authority_file(slug)
+      unless path_exists?(path)
+        raise Error, "session authority not found: #{path}" if required
+
+        return nil
+      end
+      raise Error, "session authority is a symlink: #{path}" if File.symlink?(path)
+      stat = File.stat(path)
+      unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o600
+        raise Error,
+              "session authority must be a uid #{Process.euid} mode-0600 file: #{path}"
+      end
+      data = File.binread(path, AUTHORITY_MAX_SIZE + 1)
+      raise Error, "session authority exceeds 64 KiB: #{path}" if data.bytesize > AUTHORITY_MAX_SIZE
+
+      record = JSON.parse(data)
+      validate_session_authority!(record, slug, path)
+      record
+    rescue JSON::ParserError => e
+      raise Error, "invalid session authority #{path}: #{e.message}"
+    end
+
+    def validate_session_authority!(record, slug, path)
+      keys = %w[
+        schema state slug workspace tmux_socket tmux_session_id codex_thread_id
+        codex_socket_path codex_client_version
+      ]
+      validate_mapping_keys!(record, keys, 'session authority', path)
+      unless record['schema'].is_a?(Integer) && record['schema'] == 1 &&
+             %w[creating ready].include?(record['state']) &&
+             record['slug'] == slug && record['workspace'] == workspace &&
+             valid_socket_path?(record['tmux_socket']) &&
+             record['tmux_session_id'].is_a?(String) &&
+             record['tmux_session_id'].match?(/\A\$[0-9]+\z/)
+        raise Error, "invalid session authority: #{path}"
+      end
+      codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
+      present = codex_keys.count { |key| record.key?(key) }
+      return if present.zero?
+
+      unless present == codex_keys.length &&
+             record['codex_thread_id'].is_a?(String) && !record['codex_thread_id'].empty? &&
+             valid_socket_path?(record['codex_socket_path']) &&
+             valid_client_version?(record['codex_client_version'])
+        raise Error, "invalid Codex session authority: #{path}"
+      end
+    end
+
+    def write_session_authority(slug, session, state:)
+      return unless @authority_dir
+
+      ensure_authority_directory!
+      record = {
+        'schema' => 1,
+        'state' => state,
+        'slug' => slug,
+        'workspace' => workspace,
+        'tmux_socket' => session.socket_path,
+        'tmux_session_id' => session.id
+      }
+      if session.codex_thread_id && !session.codex_thread_id.empty?
+        record.merge!(
+          'codex_thread_id' => session.codex_thread_id,
+          'codex_socket_path' => session.codex_socket_path,
+          'codex_client_version' => session.codex_client_version
+        )
+      end
+      path = authority_file(slug)
+      validate_session_authority!(record, slug, path)
+      if path_exists?(path) && File.symlink?(path)
+        raise Error, "session authority is a symlink: #{path}"
+      end
+      temporary = File.join(@authority_dir, ".#{slug}.#{$$}.tmp")
+      raise Error, "temporary session authority already exists: #{temporary}" if path_exists?(temporary)
+
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write(JSON.generate(record))
+          file.write("\n")
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, path)
+        fsync_directory(@authority_dir)
+      ensure
+        File.unlink(temporary) if path_exists?(temporary)
+      end
+      @selected_authority = record
+    end
+
+    def delete_session_authority(slug)
+      return unless @authority_dir
+
+      ensure_authority_directory!
+      path = authority_file(slug)
+      return unless path_exists?(path)
+
+      load_session_authority(slug, required: true)
+      File.unlink(path)
+      fsync_directory(@authority_dir)
+      @selected_authority = nil
+    end
+
+    def reject_symlink_components!(path, label)
+      current = Pathname.new(File::SEPARATOR)
+      Pathname.new(File.expand_path(path)).each_filename do |component|
+        current = current.join(component)
+        begin
+          stat = File.lstat(current)
+        rescue Errno::ENOENT
+          break
+        end
+        raise Error, "#{label} has a symlink component: #{current}" if stat.symlink?
+      end
+    end
+
+    def executable_in_path(name, path)
+      return nil if path.nil? || path.empty?
+
+      path.split(File::PATH_SEPARATOR).each do |directory|
+        candidate = File.join(directory, name)
+        return candidate if File.file?(candidate) && File.executable?(candidate)
+      end
+      nil
+    end
+
+    def slug_state_exists?(slug)
+      path_exists?(work_dir(slug)) ||
+        path_exists?(archive_dir(slug)) ||
+        path_exists?(worktrees_dir(slug)) ||
+        !@tmux.session(slug).nil?
+    end
+
+    def prepare_creation_journal(slug, goal_file, exclusive:, run_codex:)
+      path = creation_journal_file(slug)
+      if exclusive && !goal_file
+        if !path_exists?(path) && slug_state_exists?(slug)
+          raise Error, "dev session already exists: #{slug}"
+        end
+        raise Error, '--exclusive requires --goal-file'
+      end
+
+      goal = read_goal(goal_file) if goal_file
+      expected = {
+        'schema' => 1,
+        'slug' => slug,
+        'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
+        'run_codex' => run_codex
+      }
+      if path_exists?(path)
+        raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
+        raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
+
+        actual = JSON.parse(File.read(path))
+        state = actual['state']
+        unless %w[creating ready].include?(state) && actual.keys.sort == [
+          'goal_sha256', 'run_codex', 'schema', 'slug', 'state'
+        ]
+          raise Error, "invalid creation journal #{path}"
+        end
+        manifest = load_portal_manifest(portal_file(slug), required: false)
+        if path_exists?(archive_dir(slug))
+          raise Error, "dev session already exists: #{slug}"
+        end
+        recorded_request = actual.reject { |key, _value| key == 'state' }
+        unless recorded_request == expected
+          if recorded_request.merge('goal_sha256' => expected['goal_sha256']) == expected
+            raise Error, "creation request does not match the recorded goal for #{slug}"
+          end
+          raise Error, "creation request does not match the recorded request for #{slug}"
+        end
+        if manifest && !%w[creating ready].include?(manifest.dig('creation', 'state'))
+          raise Error, "invalid creation state for #{slug}"
+        end
+        return nil if state == 'ready' && manifest&.dig('creation', 'state') == 'ready' && !exclusive
+        return actual
+      end
+
+      if slug_state_exists?(slug)
+        raise Error, "dev session already exists: #{slug}" if exclusive
+
+        manifest = load_portal_manifest(portal_file(slug), required: false)
+        if manifest && manifest.dig('creation', 'state') != 'ready'
+          raise Error, "dev session creation is incomplete: #{slug}"
+        end
+        return nil
+      end
+
+      journal = expected.merge('state' => 'creating')
+      write_creation_journal(path, journal, create: true)
+      journal
+    rescue JSON::ParserError => e
+      raise Error, "invalid creation journal #{path}: #{e.message}"
+    end
+
+    def mark_creation_journal_ready(slug, journal)
+      path = creation_journal_file(slug)
+      raise Error, "creation journal disappeared: #{path}" unless path_exists?(path)
+      raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
+
+      actual = JSON.parse(File.read(path))
+      unless actual == journal
+        raise Error, "creation journal changed during creation: #{path}"
+      end
+      completed = actual.merge('state' => 'ready')
+      write_creation_journal(path, completed, create: false)
+      journal.replace(completed)
+    rescue JSON::ParserError => e
+      raise Error, "invalid creation journal #{path}: #{e.message}"
+    end
+
+    def write_creation_journal(path, journal, create:)
+      temporary = "#{path}.#{$$}.tmp"
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write(JSON.generate(journal))
+          file.write("\n")
+          file.flush
+          file.fsync
+        end
+        if create && path_exists?(path)
+          raise Error, "creation journal already exists: #{path}"
+        end
+        File.rename(temporary, path)
+        fsync_directory(File.dirname(path))
+      ensure
+        File.unlink(temporary) if path_exists?(temporary)
+      end
+    end
+
+    def creation_journal_file(slug)
+      root = File.join(workspace, 'worktrees')
+      ensure_directory!(root, 'worktrees root', create: true)
+      lock_root = File.join(root, '.locks')
+      ensure_directory!(lock_root, 'dev-session lock directory', create: true)
+      File.join(lock_root, "#{slug}.creation.json")
+    end
+
+    def fsync_directory(path)
+      File.open(path, File::RDONLY) { |directory| directory.fsync }
+    end
+
+    def portal_url(slug)
+      "#{@portal_url}/#{slug}/"
+    end
+
+    def ensure_portal_manifest(slug, creation_journal: nil)
+      path = portal_file(slug)
+      manifest = load_portal_manifest(path, required: false)
+      return manifest if manifest
+
+      manifest = {
+        'schema' => 1,
+        'slug' => slug,
+        'codex' => {},
+        'creation' => if creation_journal
+                        {
+                          'state' => 'creating',
+                          'initial_goal_sent' => false,
+                          'goal_sha256' => creation_journal['goal_sha256']
+                        }.compact
+                      else
+                        {
+                          'state' => 'ready',
+                          'initial_goal_sent' => false
+                        }
+                      end,
+        'repositories' => [],
+        'artifacts' => []
+      }
+      write_portal_manifest(slug, manifest)
+      manifest
+    end
+
+    def load_portal_manifest(path, required:)
+      unless path_exists?(path)
+        raise Error, "portal manifest not found: #{path}" if required
+
+        return nil
+      end
+      raise Error, "portal manifest is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "portal manifest is not a file: #{path}" unless File.file?(path)
+      data = read_bounded_file(path, 'portal manifest')
+      stream = Psych.parse_stream(data)
+      unless stream.children.length == 1 && stream.children.first.root
+        raise Error, "portal manifest must contain one YAML document: #{path}"
+      end
+      validate_yaml_structure!(stream.children.first.root, path)
+      manifest = YAML.safe_load(
+        data,
+        permitted_classes: [],
+        permitted_symbols: [],
+        aliases: false
+      )
+      validate_portal_manifest!(manifest, File.basename(File.dirname(path)), path)
+
+      manifest
+    rescue Psych::Exception => e
+      raise Error, "invalid portal manifest #{path}: #{e.message}"
+    end
+
+    def read_bounded_file(path, label)
+      data = File.binread(path, TRACKING_MAX_SIZE + 1)
+      if data.bytesize > TRACKING_MAX_SIZE
+        raise Error, "#{label} exceeds 1 MiB: #{path}"
+      end
+      data
+    end
+
+    def write_portal_manifest(slug, manifest)
+      path = portal_file(slug)
+      validate_work_directory!(slug)
+      validate_portal_manifest!(manifest, slug, path)
+      raise Error, "portal manifest is a symlink: #{path}" if File.symlink?(path)
+      if path_exists?(path) && !File.file?(path)
+        raise Error, "portal manifest is not a file: #{path}"
+      end
+
+      temporary = File.join(File.dirname(path), ".portal.yml.#{$$}.tmp")
+      raise Error, "temporary portal manifest already exists: #{temporary}" if path_exists?(temporary)
+
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+          file.write(YAML.dump(manifest))
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, path)
+        fsync_directory(File.dirname(path))
+      ensure
+        File.unlink(temporary) if path_exists?(temporary)
+      end
+    end
+
+    def validate_portal_manifest!(manifest, expected_slug, path)
+      unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
+             manifest['schema'] == 1
+        raise Error, "unsupported portal manifest: #{path}"
+      end
+      validate_mapping_keys!(
+        manifest,
+        %w[schema slug codex creation repositories artifacts finalized_at],
+        'portal manifest',
+        path
+      )
+      unless valid_part?(manifest['slug']) && manifest['slug'] == expected_slug
+        raise Error, "portal manifest slug does not match its directory: #{path}"
+      end
+      repositories = manifest.fetch('repositories', [])
+      artifacts = manifest.fetch('artifacts', [])
+      creation = manifest.fetch('creation', {})
+      unless repositories.is_a?(Array) && artifacts.is_a?(Array) &&
+             manifest.fetch('codex', {}).is_a?(Hash) && creation.is_a?(Hash)
+        raise Error, "invalid portal manifest structure: #{path}"
+      end
+      codex = manifest.fetch('codex', {})
+      validate_mapping_keys!(
+        codex,
+        %w[thread_id socket_path client_version],
+        'portal codex metadata',
+        path
+      )
+      if codex.key?('thread_id') && !codex['thread_id'].is_a?(String)
+        raise Error, "invalid portal Codex thread ID in #{path}"
+      end
+      if codex.key?('socket_path') && !valid_socket_path?(codex['socket_path'])
+        raise Error, "invalid portal Codex socket path in #{path}"
+      end
+      if codex.key?('client_version') && !valid_client_version?(codex['client_version'])
+        raise Error, "invalid portal Codex client version in #{path}"
+      end
+      codex_provenance = %w[socket_path client_version]
+      if codex_provenance.any? { |key| codex.key?(key) } &&
+         (!codex_provenance.all? { |key| codex.key?(key) } || codex['thread_id'].to_s.empty?)
+        raise Error, "incomplete portal Codex provenance in #{path}"
+      end
+      validate_mapping_keys!(
+        creation,
+        %w[state initial_goal_sent goal_sha256],
+        'portal creation metadata',
+        path
+      )
+      state = creation['state']
+      if creation.key?('state') && (!state.is_a?(String) || !%w[creating ready].include?(state))
+        raise Error, "invalid portal creation state in #{path}"
+      end
+      if creation.key?('initial_goal_sent') &&
+         ![true, false].include?(creation['initial_goal_sent'])
+        raise Error, "invalid portal initial-goal state in #{path}"
+      end
+      goal_sha256 = creation['goal_sha256']
+      if creation.key?('goal_sha256') &&
+         (!goal_sha256.is_a?(String) || !goal_sha256.match?(/\A[0-9a-f]{64}\z/))
+        raise Error, "invalid portal goal digest in #{path}"
+      end
+
+      repository_names = repositories.map do |repository|
+        unless repository.is_a?(Hash) && valid_part?(repository['name']) &&
+               valid_part?(repository['project'])
+          raise Error, "invalid portal repository in #{path}"
+        end
+        validate_mapping_keys!(
+          repository,
+          %w[name project github branch default_branch initial_base_sha final_head_sha],
+          'portal repository',
+          path
+        )
+        %w[project github branch default_branch initial_base_sha final_head_sha].each do |key|
+          if repository.key?(key) && !repository[key].is_a?(String)
+            raise Error, "invalid portal repository #{key} in #{path}"
+          end
+        end
+        if repository['github'] && !repository['github'].match?(
+          %r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
+        )
+          raise Error, "invalid portal GitHub repository in #{path}"
+        end
+        %w[initial_base_sha final_head_sha].each do |key|
+          value = repository[key]
+          next if value.nil? || value.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
+
+          raise Error, "invalid portal repository #{key} in #{path}"
+        end
+        repository['name']
+      end
+      if repository_names.uniq.length != repository_names.length
+        raise Error, "duplicate portal repository in #{path}"
+      end
+
+      artifact_paths = artifacts.map do |artifact|
+        unless artifact.is_a?(Hash) && artifact['label'].is_a?(String) &&
+               !artifact['label'].strip.empty? && artifact['path'].is_a?(String)
+          raise Error, "invalid portal artifact in #{path}"
+        end
+        validate_mapping_keys!(artifact, %w[label path], 'portal artifact', path)
+        artifact_path = artifact['path']
+        pathname = Pathname.new(artifact_path)
+        clean = pathname.cleanpath.to_s
+        if artifact_path.empty? || pathname.absolute? ||
+           %w[. ..].include?(clean) || clean.start_with?("..#{File::SEPARATOR}")
+          raise Error, "portal artifact escapes tracking directory in #{path}"
+        end
+        clean
+      end
+      if artifact_paths.uniq.length != artifact_paths.length
+        raise Error, "duplicate portal artifact in #{path}"
+      end
+
+      finalized_at = manifest['finalized_at']
+      if manifest.key?('finalized_at')
+        unless finalized_at.is_a?(String) && valid_rfc3339_timestamp?(finalized_at)
+          raise ArgumentError, 'expected an RFC3339 timestamp'
+        end
+        Time.iso8601(finalized_at)
+
+        manifest.fetch('repositories', []).each do |repository|
+          unless %w[initial_base_sha final_head_sha].all? do |key|
+                   repository[key]&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
+                 end
+            raise Error,
+                  "finalized portal repository has no immutable comparison in #{path}"
+          end
+        end
+      end
+    rescue ArgumentError => e
+      raise Error, "invalid portal finalized_at in #{path}: #{e.message}"
+    end
+
+    def validate_mapping_keys!(mapping, allowed, label, path)
+      unless mapping.keys.all? { |key| key.is_a?(String) } &&
+             (mapping.keys - allowed).empty?
+        raise Error, "invalid #{label} fields in #{path}"
+      end
+    end
+
+    def valid_socket_path?(value)
+      return false unless value.is_a?(String) && value.bytesize <= 4096
+      return false unless value.match?(%r{\A/[A-Za-z0-9._/-]+\z})
+
+      Pathname.new(value).cleanpath.to_s == value
+    end
+
+    def valid_client_version?(value)
+      value.is_a?(String) && value.match?(/\A[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\z/)
+    end
+
+    def validate_yaml_structure!(node, path)
+      if node.is_a?(Psych::Nodes::Alias)
+        raise Error, "YAML aliases are not supported in #{path}"
+      end
+      if node.respond_to?(:tag) && node.tag
+        raise Error, "explicit YAML tags are not supported in #{path}"
+      end
+      if node.is_a?(Psych::Nodes::Mapping)
+        keys = node.children.each_slice(2).map do |key, _value|
+          unless key.is_a?(Psych::Nodes::Scalar)
+            raise Error, "YAML mapping keys must be strings in #{path}"
+          end
+          key.value
+        end
+        if keys.uniq.length != keys.length
+          raise Error, "duplicate YAML mapping key in #{path}"
+        end
+      end
+      Array(node.children).each { |child| validate_yaml_structure!(child, path) }
+    end
+
+    def valid_rfc3339_timestamp?(value)
+      match = value.match(
+        /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))\z/
+      )
+      return false unless match
+
+      year, month, day, hour, minute, second = match.captures[0, 6].map(&:to_i)
+      offset_hour = match[8]&.to_i
+      offset_minute = match[9]&.to_i
+      Date.valid_date?(year, month, day, Date::GREGORIAN) &&
+        hour < 24 && minute < 60 && second < 60 &&
+        (offset_hour.nil? || (offset_hour < 24 && offset_minute < 60))
+    end
+
+    def create_portal_thread(slug, persisted_thread_id: nil)
+      unless @portal_command && !@portal_command.empty?
+        @err.puts 'warning: workspace-portal is unavailable; starting an unshared Codex session'
+        return nil
+      end
+
+      environment = session_environment(slug)
+      command = [*@portal_command, 'thread', 'create']
+      THREAD_ENV_ARGUMENTS.each do |name, argument|
+        command += [argument, environment.fetch(name)] if environment.key?(name)
+      end
+      command << '--require-runtime' if environment[ENV_REQUIRE_RUNTIME] == '1'
+      command += ['--thread-id', persisted_thread_id] if persisted_thread_id
+      stdout, _stderr, _status = @command_runner.capture(command)
+      result = JSON.parse(stdout)
+      thread_id = result['threadId']
+      unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, 'workspace-portal returned an invalid Codex thread id'
+      end
+
+      thread_id
+    rescue JSON::ParserError => e
+      raise Error, "workspace-portal returned invalid JSON: #{e.message}"
+    end
+
+    def name_portal_thread(slug, thread_id)
+      command = [
+        *@portal_command,
+        'thread',
+        'set-name',
+        '--thread-id',
+        thread_id,
+        '--name',
+        slug
+      ]
+      command += ['--socket', @codex_socket] if @codex_socket
+      @command_runner.capture(command)
+    rescue CommandError => e
+      @err.puts "warning: unable to name shared Codex thread: #{e.message}"
+    end
+
+    def send_portal_goal(thread_id, goal_file)
+      command = [
+        *@portal_command,
+        'thread',
+        'ensure-initial',
+        '--thread-id',
+        thread_id,
+        '--input-file',
+        File.expand_path(goal_file)
+      ]
+      command += ['--socket', @codex_socket] if @codex_socket
+      @command_runner.capture(command)
+    end
+
+    def codex_metadata(thread_id)
+      metadata = { 'thread_id' => thread_id }
+      if @codex_socket && !@codex_socket.empty? && @codex_version && !@codex_version.empty?
+        metadata['socket_path'] = @codex_socket
+        metadata['client_version'] = @codex_version
+      end
+      metadata
+    end
+
+    def session_codex_provenance_matches?(session, thread_id)
+      session.codex_thread_id == thread_id &&
+        session.codex_socket_path == @codex_socket
+    end
+
+    def codex_provenance_configured?
+      @codex_socket && !@codex_socket.empty? && @codex_version && !@codex_version.empty?
+    end
+
+    def seed_goal(slug, goal_file)
+      goal = read_goal(goal_file)
+
+      plan_path = plan_file(slug)
+      plan = File.read(plan_path)
+      empty_plan = plan_skeleton(slug)
+      seeded_plan = empty_plan.sub("## Goal\n\n", "## Goal\n\n#{goal}\n\n")
+      if plan == empty_plan
+        atomic_replace(plan_path, seeded_plan)
+      elsif plan != seeded_plan
+        raise Error, "plan cannot be reconciled with the creation journal: #{plan_path}"
+      end
+
+      state_path = state_file(slug)
+      state = File.read(state_path)
+      empty_state = state_skeleton(slug)
+      seeded_state = empty_state.sub(
+        "## Status\n\n",
+        "## Status\n\n- Session created with an initial browser request.\n\n"
+      )
+      if state == empty_state
+        atomic_replace(state_path, seeded_state)
+      elsif state != seeded_state
+        raise Error, "state cannot be reconciled with the creation journal: #{state_path}"
+      end
+    end
+
+    def read_goal(goal_file)
+      path = File.expand_path(goal_file)
+      raise Error, "goal file is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "goal file is not a regular file: #{path}" unless File.file?(path)
+      if File.size(path) > MAX_MESSAGE_BYTES
+        raise Error, "goal file exceeds #{MAX_MESSAGE_BYTES.to_s.reverse.scan(/.{1,3}/).join(',').reverse} bytes"
+      end
+
+      goal = File.read(path, encoding: Encoding::UTF_8).strip
+      raise Error, 'goal file is empty' if goal.empty?
+
+      goal
+    rescue ArgumentError => e
+      raise Error, "goal file is not valid UTF-8: #{e.message}"
+    end
+
+    def update_portal_repository(
+      slug,
+      name:,
+      project:,
+      github:,
+      branch:,
+      base_sha:,
+      default_branch:
+    )
+      manifest = ensure_portal_manifest(slug)
+      repository = {
+        'name' => name,
+        'project' => project,
+        'github' => github,
+        'branch' => branch,
+        'default_branch' => default_branch.delete_prefix('origin/'),
+        'initial_base_sha' => base_sha
+      }.reject { |_key, value| value.nil? || value.empty? }
+
+      repositories = manifest.fetch('repositories', [])
+      index = repositories.index { |item| item.is_a?(Hash) && item['name'] == name }
+      index ? repositories[index] = repository : repositories << repository
+      manifest['repositories'] = repositories.sort_by { |item| item.fetch('name', '') }
+      write_portal_manifest(slug, manifest)
+    end
+
+    def github_repository(remote)
+      match = remote.match(
+        %r{\A(?:git@github\.com:|ssh://git@github\.com/|https?://github\.com/)([^/]+/[^/]+?)(?:\.git)?\z}
+      )
+      match && match[1]
+    end
+
+    def finalize_portal_manifest(slug, plan)
+      path = portal_file(slug)
+      manifest = load_portal_manifest(path, required: false)
+      return unless manifest
+
+      snapshot_portal_repository_heads(slug, plan)
+      manifest = load_portal_manifest(path, required: true)
+      repositories = manifest.fetch('repositories', [])
+      repositories.each do |repository|
+        if repository['final_head_sha'].nil?
+          raise Error,
+                "portal repository has no worktree or recorded final head: #{repository['name']}"
+        end
+
+        unless repository['initial_base_sha'] && repository['final_head_sha']
+          raise Error, "portal repository has incomplete comparison metadata: #{repository['name']}"
+        end
+      end
+      manifest['finalized_at'] = Time.now.utc.iso8601
+      write_portal_manifest(slug, manifest)
+    end
+
+    def snapshot_portal_repository_heads(slug, plan)
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      return unless manifest
+
+      entries = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
+      repositories = manifest.fetch('repositories', [])
+      registered_names = repositories.map { |repository| repository.fetch('name') }
+      unregistered = entries.keys - registered_names
+      unless unregistered.empty?
+        raise Error, "worktrees are missing from the portal manifest: #{unregistered.sort.join(', ')}"
+      end
+
+      repositories.each do |repository|
+        entry = entries[repository['name']]
+        next unless entry
+
+        validate_portal_repository_identity!(repository, entry.fetch(:common_dir), entry.fetch(:path))
+        repository['final_head_sha'] = git_capture([
+          'git', '-C', entry.fetch(:path), 'rev-parse', 'HEAD'
+        ]).strip
+      end
+      write_portal_manifest(slug, manifest)
+    end
+
+    def record_portal_repository_head(slug, name, worktree, common_dir)
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      return unless manifest
+
+      repository = manifest.fetch('repositories', []).find do |item|
+        item['name'] == name
+      end
+      unless repository
+        raise Error, "worktree is missing from the portal manifest: #{name}"
+      end
+
+      validate_portal_repository_identity!(repository, common_dir, worktree)
+
+      repository['final_head_sha'] = git_capture([
+        'git', '-C', worktree, 'rev-parse', 'HEAD'
+      ]).strip
+      write_portal_manifest(slug, manifest)
+    end
+
+    def validate_portal_repository_identity!(repository, common_dir, worktree)
+      expected = repository_common_dir(repository.fetch('project'))
+      return if File.realpath(common_dir) == File.realpath(expected)
+
+      raise Error, "portal repository identity does not match worktree: #{worktree}"
+    end
 
     def print_rows(rows)
       return if rows.empty?
@@ -708,7 +1926,11 @@ module VpsfreeDevSession
 
       common_dir = git_capture(['git', '-C', path, 'rev-parse', '--git-common-dir']).strip
       common_dir = File.realpath(File.expand_path(common_dir, path))
-      common_dir = validate_canonical_repository!(common_dir, path)
+      common_dir = if entry.fetch(:name) == 'workspace'
+                     validate_workspace_repository!(path, expected_common_dir: common_dir)
+                   else
+                     validate_canonical_repository!(common_dir, path)
+                   end
       listing = git_capture([
         'git',
         "--git-dir=#{common_dir}",
@@ -744,6 +1966,34 @@ module VpsfreeDevSession
       raise Error, "repository is not a canonical bare clone: #{source}"
     rescue Errno::ENOENT, Errno::EACCES => e
       raise Error, "cannot validate repository #{source}: #{e.message}"
+    end
+
+    def validate_workspace_repository!(source, expected_common_dir: nil)
+      top = git_capture(['git', '-C', source, 'rev-parse', '--show-toplevel']).strip
+      expected_top = source == workspace ? workspace : File.realpath(source)
+      unless File.realpath(top) == expected_top
+        raise Error, "workspace repository root does not match: #{source}"
+      end
+
+      common = git_capture(['git', '-C', source, 'rev-parse', '--git-common-dir']).strip
+      common = File.realpath(File.expand_path(common, source))
+      workspace_common = git_capture([
+        'git', '-C', workspace, 'rev-parse', '--git-common-dir'
+      ]).strip
+      workspace_common = File.realpath(File.expand_path(workspace_common, workspace))
+      unless common == workspace_common &&
+             (expected_common_dir.nil? || common == expected_common_dir)
+        raise Error, "worktree does not belong to the workspace repository: #{source}"
+      end
+
+      bare = git_capture([
+        'git', "--git-dir=#{common}", 'rev-parse', '--is-bare-repository'
+      ]).strip
+      return common if bare == 'false'
+
+      raise Error, "workspace repository unexpectedly is bare: #{source}"
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot validate workspace repository #{source}: #{e.message}"
     end
 
     def validate_worktree_head!(path)
@@ -823,23 +2073,63 @@ module VpsfreeDevSession
       ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
-    def with_slug_lock(slug)
-      root = File.join(workspace, 'worktrees')
-      ensure_directory!(root, 'worktrees root', create: true)
-      lock_root = File.join(root, '.locks')
-      ensure_directory!(lock_root, 'dev-session lock directory', create: true)
-      path = File.join(lock_root, "#{slug}.lock")
-      raise Error, "dev-session lock is a symlink: #{path}" if File.symlink?(path)
-
-      File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
-        unless file.flock(File::LOCK_EX | File::LOCK_NB)
-          raise Error, "another dev-session command is changing #{slug}"
+    def with_host_lock(path, description, wait: false, busy_message: nil)
+      reject_symlink_components!(path, description)
+      File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |file|
+        stat = file.stat
+        current = File.lstat(path)
+        unless stat.file? && !current.symlink? && stat.dev == current.dev &&
+               stat.ino == current.ino && stat.uid == Process.euid &&
+               (stat.mode & 0o777) == 0o600
+          raise Error, "#{description} must be a uid #{Process.euid} mode-0600 file: #{path}"
+        end
+        locked = file.flock(File::LOCK_EX | File::LOCK_NB)
+        locked = file.flock(File::LOCK_EX) if !locked && wait
+        unless locked
+          raise Error, busy_message || "cannot lock #{description}: #{path}"
         end
 
         yield
       ensure
         file.flock(File::LOCK_UN)
       end
+    rescue Errno::ELOOP => e
+      raise Error, "#{description} is unsafe: #{e.message}"
+    end
+
+    def session_lock_file(slug, kind: 'session')
+      if @authority_dir
+        ensure_authority_directory!
+        suffix = kind == 'session' ? '.lock' : ".#{kind}.lock"
+        File.join(@authority_dir, "#{slug}#{suffix}")
+      else
+        root = File.join(workspace, 'worktrees')
+        ensure_directory!(root, 'worktrees root', create: true)
+        lock_root = File.join(root, '.locks')
+        ensure_directory!(lock_root, 'dev-session lock directory', create: true)
+        suffix = kind == 'session' ? '.lock' : ".#{kind}.lock"
+        File.join(lock_root, "#{slug}#{suffix}")
+      end
+    end
+
+    def with_creation_lock(slug, &block)
+      with_host_lock(
+        session_lock_file(slug, kind: 'creation'),
+        "development session creation lock for #{slug}",
+        busy_message: "another dev-session command is creating or closing #{slug}",
+        &block
+      )
+    end
+
+    def with_slug_lock(slug, &block)
+      authority = load_session_authority(slug, required: false) if @authority_dir
+      with_host_lock(
+        session_lock_file(slug),
+        "development session lock for #{slug}",
+        wait: authority&.fetch('state', nil) == 'creating',
+        busy_message: "another dev-session command is changing #{slug}",
+        &block
+      )
     end
 
     def path_exists?(path)
@@ -849,7 +2139,7 @@ module VpsfreeDevSession
       false
     end
 
-    def create_tmux_session(slug, run_codex:)
+    def create_tmux_session(slug, run_codex:, thread_id: nil)
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
       command = [
@@ -864,7 +2154,8 @@ module VpsfreeDevSession
         'dev',
         '-c',
         workspace,
-        *tmux_environment_args(slug)
+        *tmux_environment_args(slug),
+        @shell_command
       ]
 
       created_id = @tmux.capture(*command).first.strip
@@ -898,7 +2189,8 @@ module VpsfreeDevSession
           '-t',
           dev_target,
           '-c',
-          work_path
+          work_path,
+          @shell_command
         ).first.strip
 
         @tmux.capture(
@@ -911,14 +2203,39 @@ module VpsfreeDevSession
           '-t',
           right,
           '-c',
-          worktrees_path
+          worktrees_path,
+          @shell_command
         )
 
         @tmux.run('select-pane', '-t', left)
 
         if run_codex
-          @tmux.run('send-keys', '-t', left, '-l', @codex_command)
+          command = if codex_provenance_configured?
+                      @codex_command_argv.map(&:shellescape).join(' ')
+                    else
+                      @codex_command.dup
+                    end
+          if thread_id
+            remote = @codex_socket ? "unix://#{@codex_socket}" : 'unix://'
+            command = "#{command} --remote #{remote.shellescape} resume #{thread_id.shellescape}"
+          end
+          @tmux.run('send-keys', '-t', left, '-l', command)
           @tmux.run('send-keys', '-t', left, 'Enter')
+          if thread_id && @codex_socket && !@codex_socket.empty? &&
+             @codex_version && !@codex_version.empty?
+            @tmux.run(
+              'set-option', '-t', session_target, SESSION_CODEX_THREAD, thread_id
+            )
+            @tmux.run(
+              'set-option', '-t', session_target, SESSION_CODEX_SOCKET, @codex_socket
+            )
+            @tmux.run(
+              'set-option', '-t', session_target, SESSION_CODEX_VERSION, @codex_version
+            )
+            @tmux.run(
+              'set-option', '-t', session_target, SESSION_CODEX_PANE, left
+            )
+          end
         end
 
         @tmux.run('set-option', '-t', session_target, SESSION_SLUG, slug)
@@ -928,6 +2245,16 @@ module VpsfreeDevSession
         cleanup_partial_tmux_session(created_id, slug)
         raise
       end
+    end
+
+    def reconcile_creation_tmux_session!(slug, session)
+      unless session.name == slug && workspace_identity?(session.workspace) &&
+             session.environment_slug == slug && ['', '1'].include?(session.mark) &&
+             ['', slug].include?(session.slug)
+        raise Error, "tmux session is not recoverable creation state: #{slug}"
+      end
+
+      @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
     end
 
     def cleanup_partial_tmux_session(id, slug)
@@ -978,7 +2305,8 @@ module VpsfreeDevSession
           entry.fetch(:name),
           *tmux_environment_args(slug),
           '-c',
-          entry.fetch(:path)
+          entry.fetch(:path),
+          @shell_command
         ).first.strip
 
         @tmux.run('set-window-option', '-t', window_id, WINDOW_KIND, 'worktree')
@@ -997,9 +2325,30 @@ module VpsfreeDevSession
 
     def ensure_managed_session!(slug, session: @tmux.session(slug))
       raise Error, "tmux session not found: #{slug}" unless session
-      return session if managed_by_workspace?(session)
+      if managed_by_workspace?(session)
+        validate_authority_session!(slug, session) if @selected_authority
+        return session
+      end
 
       raise Error, "tmux session is not managed by this workspace: #{slug}"
+    end
+
+    def validate_authority_session!(slug, session)
+      record = @selected_authority
+      return unless record
+
+      unless record['slug'] == slug && record['tmux_session_id'] == session.id &&
+             record['tmux_socket'] == session.socket_path
+        raise Error, "live tmux session does not match trusted authority for #{slug}"
+      end
+      codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
+      return unless codex_keys.all? { |key| record.key?(key) }
+
+      unless session.codex_thread_id == record['codex_thread_id'] &&
+             session.codex_socket_path == record['codex_socket_path'] &&
+             session.codex_client_version == record['codex_client_version']
+        raise Error, "live Codex session does not match trusted authority for #{slug}"
+      end
     end
 
     def managed_by_workspace?(session)
@@ -1027,10 +2376,16 @@ module VpsfreeDevSession
 
     def attach_to_session(session)
       revalidate_session!(session)
-      if ENV['TMUX'] && !ENV['TMUX'].empty?
+      caller_socket = @env['TMUX'].to_s.split(',', 2).first
+      if !caller_socket.empty? && caller_socket == session.socket_path
         @tmux.run('switch-client', '-t', Tmux.session_target(session.id))
       else
-        exec(*attach_command(session.id))
+        attach_environment = {}
+        if !caller_socket.empty?
+          attach_environment['TMUX'] = nil
+          attach_environment['TMUX_PANE'] = nil
+        end
+        @process_exec.call(attach_environment, attach_command(session.id))
       end
     end
 
@@ -1039,12 +2394,67 @@ module VpsfreeDevSession
     end
 
     def session_environment(slug)
-      {
+      environment = {
         ENV_SLUG => slug,
         ENV_WORKSPACE => workspace,
         ENV_WORK_DIR => work_dir(slug),
-        ENV_WORKTREES_DIR => worktrees_dir(slug)
+        ENV_WORKTREES_DIR => worktrees_dir(slug),
+        ENV_PORTAL_BASE_URL => @portal_url,
+        ENV_PORTAL_URL => portal_url(slug)
       }
+      environment[ENV_CODEX_SOCKET] = @codex_socket if @codex_socket
+      environment[ENV_CODEX_VERSION] = @codex_version if @codex_version
+      environment[ENV_CODEX_COMMAND] = @codex_command_argv.first
+      environment[ENV_TMUX_SOCKET] = @configured_tmux_socket if @configured_tmux_socket
+      environment[ENV_AUTHORITY_DIR] = @authority_dir if @authority_dir
+      environment[ENV_PORTAL_COMMAND] = @portal_command.first if @portal_command&.first
+      environment[ENV_REQUIRE_RUNTIME] = '1' if @require_runtime
+      environment
+    end
+
+    def validate_required_runtime!
+      values = {
+        'authority directory' => @authority_dir,
+        'tmux socket' => @configured_tmux_socket,
+        'Codex socket' => @codex_socket,
+        'Codex version' => @codex_version,
+        'portal command' => @portal_command&.first
+      }
+      missing = values.select { |_label, value| value.nil? || value.empty? }.keys
+      unless missing.empty?
+        raise Error, "portal runtime configuration is incomplete: #{missing.join(', ')}"
+      end
+
+      paths = {
+        'authority directory' => @authority_dir,
+        'tmux socket' => @configured_tmux_socket,
+        'Codex command' => @codex_command_argv.first,
+        'Codex socket' => @codex_socket,
+        'portal command' => @portal_command.first
+      }
+      invalid = paths.select { |_label, value| !value.start_with?(File::SEPARATOR) }.keys
+      unless invalid.empty?
+        raise Error, "portal runtime paths must be absolute: #{invalid.join(', ')}"
+      end
+    end
+
+    def verify_codex_client!
+      return unless codex_provenance_configured?
+
+      executable = @codex_command_argv.first
+      unless executable.start_with?(File::SEPARATOR) && File.file?(executable) && File.executable?(executable)
+        raise Error,
+              'Codex provenance requires VPSFREE_DEV_SESSION_CODEX to name an absolute executable path'
+      end
+      stdout, stderr, status = @command_runner.capture(
+        [executable, '--version'],
+        allow_failure: true
+      )
+      words = "#{stdout}\n#{stderr}".scan(/[A-Za-z0-9][A-Za-z0-9._+-]*/)
+      return if status.success? && words.include?(@codex_version)
+
+      raise Error,
+            "Codex executable does not report configured version #{@codex_version}: #{executable}"
     end
 
     def tmux_environment_args(slug)
@@ -1090,7 +2500,7 @@ module VpsfreeDevSession
                       .select { |identity| managed_by_workspace?(identity) }
                       .select { |identity| valid_part?(identity.name) }
                       .map(&:name)
-      (slug_dirs('work') + slug_dirs('worktrees') + sessions).uniq.sort
+      (slug_dirs('work') + slug_dirs('archive') + slug_dirs('worktrees') + sessions).uniq.sort
     end
 
     def slug_dirs(name)
@@ -1104,6 +2514,15 @@ module VpsfreeDevSession
 
     def repo_dir(project)
       File.join(workspace, 'repos', "#{project}.git")
+    end
+
+    def repository_common_dir(project)
+      return validate_workspace_repository!(workspace) if project == 'workspace'
+
+      path = repo_dir(project)
+      raise Error, "repository not found: #{path}" unless File.directory?(path)
+
+      validate_canonical_repository!(path, path)
     end
 
     def work_dir(slug)
@@ -1124,6 +2543,10 @@ module VpsfreeDevSession
 
     def state_file(slug)
       File.join(work_dir(slug), 'state.md')
+    end
+
+    def portal_file(slug)
+      File.join(work_dir(slug), PORTAL_MANIFEST)
     end
 
     def slug_from_path(path)
@@ -1156,11 +2579,70 @@ module VpsfreeDevSession
       if path_exists?(path)
         raise Error, "tracking file is a symlink: #{path}" if File.symlink?(path)
         raise Error, "tracking path is not a file: #{path}" unless File.file?(path)
+        raise Error, "tracking file is empty or truncated: #{path}" if File.empty?(path)
 
         return
       end
 
-      File.write(path, content)
+      directory = File.dirname(path)
+      temporary = File.join(directory, ".#{File.basename(path)}.#{$$}.tmp")
+      raise Error, "temporary tracking file already exists: #{temporary}" if path_exists?(temporary)
+
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+          file.write(content)
+          file.flush
+          file.fsync
+        end
+        File.link(temporary, path)
+        fsync_directory(directory)
+      rescue Errno::EEXIST
+        raise Error, "tracking path appeared during creation: #{path}"
+      ensure
+        File.unlink(temporary) if path_exists?(temporary)
+      end
+    end
+
+    def validate_creation_tracking_files!(slug)
+      requirements = {
+        plan_file(slug) => [
+          "# #{slug}", '## Goal', '## Affected repositories', '## Approach',
+          '## Compatibility and deployment', '## Testing plan'
+        ],
+        state_file(slug) => [
+          "---\nlifecycle: active\n---", "# #{slug}", '## Repositories',
+          '## Status', '## Commands run', '## Results', '## Open questions',
+          '## Cleanup'
+        ]
+      }
+      requirements.each do |path, markers|
+        content = read_bounded_file(path, File.basename(path))
+        missing = markers.reject { |marker| content.include?(marker) }
+        next if missing.empty?
+
+        raise Error, "tracking file is incomplete and cannot be reconciled: #{path}"
+      end
+    end
+
+    def atomic_replace(path, content)
+      raise Error, "tracking file is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "tracking path is not a file: #{path}" unless File.file?(path)
+
+      directory = File.dirname(path)
+      temporary = File.join(directory, ".#{File.basename(path)}.#{$$}.tmp")
+      raise Error, "temporary tracking file already exists: #{temporary}" if path_exists?(temporary)
+
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+          file.write(content)
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, path)
+        fsync_directory(directory)
+      ensure
+        File.unlink(temporary) if path_exists?(temporary)
+      end
     end
 
     def plan_skeleton(slug)
@@ -1209,9 +2691,11 @@ module VpsfreeDevSession
       end
 
       missing = paths.reject { |path| File.file?(path) }
-      return if missing.empty?
+      unless missing.empty?
+        raise Error, "missing tracking files: #{missing.join(', ')}"
+      end
 
-      raise Error, "missing tracking files: #{missing.join(', ')}"
+      lifecycle_state(read_bounded_file(state_file(slug), 'state.md'))
     end
 
     def validate_terminal_lifecycle!(slug)
@@ -1219,7 +2703,7 @@ module VpsfreeDevSession
     end
 
     def validate_terminal_lifecycle_file!(path)
-      validate_terminal_lifecycle_content!(File.read(path))
+      validate_terminal_lifecycle_content!(read_bounded_file(path, 'state.md'))
     end
 
     def validate_terminal_lifecycle_content!(content)
@@ -1273,6 +2757,13 @@ module VpsfreeDevSession
     end
 
     def lifecycle_state(content)
+      if content.bytesize > TRACKING_MAX_SIZE
+        raise Error, 'state.md exceeds 1 MiB'
+      end
+      content = content.dup.force_encoding(Encoding::UTF_8)
+      unless content.valid_encoding?
+        raise Error, 'state.md is not valid UTF-8'
+      end
       match = content.match(LIFECYCLE_HEADER)
       return match[1] if match
 
@@ -1281,10 +2772,125 @@ module VpsfreeDevSession
             'active, complete, or abandoned'
     end
 
-    def close_session!(slug, session)
+    def close_session!(slug, session, idle_checked: false)
       validate_session_closure!(slug)
-      revalidate_session!(session)
+      quiesced = quiesce_and_require_idle!(slug, session) unless idle_checked
+      session = revalidate_session!(session)
       @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+      delete_session_authority(slug)
+    rescue StandardError
+      restore_native_client!(slug, quiesced) if quiesced && @tmux.session_by_id(quiesced.id)
+      raise
+    end
+
+    def ensure_portal_thread_idle!(slug, authority)
+      manifest_root = path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug)
+      manifest = load_portal_manifest(File.join(manifest_root, PORTAL_MANIFEST), required: false)
+      thread_id = authority&.fetch('codex_thread_id', nil) || manifest&.dig('codex', 'thread_id')
+      return unless thread_id
+      unless @portal_command && !@portal_command.empty?
+        raise Error, "workspace-portal is required to verify that Codex is idle for #{slug}"
+      end
+
+      cwd = work_dir(slug)
+      socket = authority&.fetch('codex_socket_path', nil) || manifest&.dig('codex', 'socket_path')
+      unless socket && valid_socket_path?(socket)
+        raise Error, "Codex socket provenance is missing for #{slug}"
+      end
+
+      command = [
+        *@portal_command,
+        'thread',
+        'require-idle',
+        '--thread-id',
+        thread_id,
+        '--cwd',
+        cwd
+      ]
+      command += ['--socket', socket]
+      @command_runner.capture(command)
+    end
+
+    def quiesce_and_require_idle!(slug, session)
+      quiesced = quiesce_native_client!(slug, session)
+      ensure_portal_thread_idle!(slug, @selected_authority)
+      quiesced
+    rescue StandardError
+      restore_native_client!(slug, quiesced) if quiesced
+      raise
+    end
+
+    def quiesce_native_client!(slug, session)
+      return unless session&.codex_thread_id && !session.codex_thread_id.empty?
+      unless session.codex_pane_id&.match?(/\A%[0-9]+\z/)
+        raise Error, "managed Codex pane identity is missing for #{slug}"
+      end
+
+      session = revalidate_session!(session)
+      unless @tmux.pane_session_id(session.codex_pane_id) == session.id
+        raise Error, "managed Codex pane does not belong to #{slug}"
+      end
+      @tmux.run(
+        'respawn-pane', '-k', '-t', session.codex_pane_id,
+        '-c', path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug),
+        @shell_command
+      )
+      session
+    end
+
+    def restore_native_client!(slug, session)
+      session = revalidate_session!(session)
+      send_native_client_command(session)
+      @err.puts "restored terminal Codex client after refusing lifecycle change: #{slug}"
+    rescue StandardError => e
+      raise Error, "unable to restore terminal Codex client for #{slug}: #{e.message}"
+    end
+
+    def reconcile_native_client!(slug, session)
+      return session unless codex_provenance_configured? &&
+                            session.codex_thread_id && !session.codex_thread_id.empty?
+      unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
+             @tmux.pane_session_id(session.codex_pane_id) == session.id
+        raise Error, "managed Codex pane identity is invalid for #{slug}"
+      end
+
+      current = @tmux.pane_current_command(session.codex_pane_id)
+      command_name = File.basename(@codex_command_argv.first)
+      expected = [command_name, ".#{command_name}-wrapped"]
+      return session if expected.include?(current)
+
+      shell_name = File.basename(@shell_command)
+      unless current == shell_name
+        raise Error,
+              "managed Codex pane for #{slug} is running unexpected command #{current.inspect}"
+      end
+      verify_codex_client!
+      send_native_client_command(session)
+      session = update_native_client_version!(slug, session)
+      @err.puts "restarted terminal Codex client for #{slug} after App Server disconnect"
+      session
+    rescue StandardError => e
+      raise Error, "unable to reconcile terminal Codex client for #{slug}: #{e.message}"
+    end
+
+    def send_native_client_command(session)
+      command = @codex_command_argv.map(&:shellescape).join(' ')
+      remote = "unix://#{session.codex_socket_path}"
+      command = "#{command} --remote #{remote.shellescape} resume #{session.codex_thread_id.shellescape}"
+      @tmux.run('send-keys', '-t', session.codex_pane_id, '-l', command)
+      @tmux.run('send-keys', '-t', session.codex_pane_id, 'Enter')
+    end
+
+    def update_native_client_version!(slug, session)
+      return session if session.codex_client_version == @codex_version
+
+      @tmux.run(
+        'set-option', '-t', Tmux.session_target(session.id),
+        SESSION_CODEX_VERSION, @codex_version
+      )
+      session.codex_client_version = @codex_version
+      write_session_authority(slug, session, state: 'ready') if @selected_authority
+      revalidate_session!(session)
     end
 
     def validate_session_closure!(slug)
@@ -1417,6 +3023,13 @@ module VpsfreeDevSession
       @err = err
       @workspace = File.expand_path('..', __dir__)
       @tmux_socket = nil
+      @authority_dir = nil
+      @codex_socket = nil
+      @codex_version = nil
+      @codex_command = nil
+      @portal_command = nil
+      @portal_url = nil
+      @require_runtime = nil
     end
 
     def run
@@ -1433,6 +3046,8 @@ module VpsfreeDevSession
         run_single_slug { |runner, slug, opts| runner.sync(slug, as_is: opts[:as_is]) }
       when 'stop'
         run_single_slug { |runner, slug, opts| runner.stop(slug, as_is: opts[:as_is]) }
+      when 'recover-stale'
+        run_single_slug { |runner, slug, opts| runner.recover_stale(slug, as_is: opts[:as_is]) }
       when 'remove'
         run_remove
       when 'finalize'
@@ -1441,8 +3056,12 @@ module VpsfreeDevSession
         end
       when 'list'
         run_list
+      when 'validate'
+        runner.validate
       when 'current'
         run_current
+      when 'url'
+        run_url
       when 'worktree'
         run_worktree
       else
@@ -1472,6 +3091,47 @@ module VpsfreeDevSession
         when /\A--tmux-socket=(.+)\z/
           @tmux_socket = Regexp.last_match(1)
           @argv.shift
+        when '--authority-dir'
+          @argv.shift
+          @authority_dir = File.expand_path(
+            @argv.shift || raise(Error, '--authority-dir requires DIR')
+          )
+        when /\A--authority-dir=(.+)\z/
+          @authority_dir = File.expand_path(Regexp.last_match(1))
+          @argv.shift
+        when '--codex-socket'
+          @argv.shift
+          @codex_socket = @argv.shift || raise(Error, '--codex-socket requires PATH')
+        when /\A--codex-socket=(.+)\z/
+          @codex_socket = Regexp.last_match(1)
+          @argv.shift
+        when '--codex-version'
+          @argv.shift
+          @codex_version = @argv.shift || raise(Error, '--codex-version requires VERSION')
+        when /\A--codex-version=(.+)\z/
+          @codex_version = Regexp.last_match(1)
+          @argv.shift
+        when '--codex-command'
+          @argv.shift
+          @codex_command = @argv.shift || raise(Error, '--codex-command requires PATH')
+        when /\A--codex-command=(.+)\z/
+          @codex_command = Regexp.last_match(1)
+          @argv.shift
+        when '--portal-command'
+          @argv.shift
+          @portal_command = @argv.shift || raise(Error, '--portal-command requires PATH')
+        when /\A--portal-command=(.+)\z/
+          @portal_command = Regexp.last_match(1)
+          @argv.shift
+        when '--portal-base-url'
+          @argv.shift
+          @portal_url = @argv.shift || raise(Error, '--portal-base-url requires URL')
+        when /\A--portal-base-url=(.+)\z/
+          @portal_url = Regexp.last_match(1)
+          @argv.shift
+        when '--require-runtime'
+          @require_runtime = true
+          @argv.shift
         when '-h', '--help'
           @out.puts USAGE
           exit 0
@@ -1482,17 +3142,40 @@ module VpsfreeDevSession
     end
 
     def runner
-      @runner ||= Runner.new(workspace: @workspace, tmux_socket: @tmux_socket, out: @out, err: @err)
+      @runner ||= Runner.new(
+        workspace: @workspace,
+        tmux_socket: @tmux_socket,
+        authority_dir: @authority_dir,
+        codex_socket: @codex_socket,
+        codex_version: @codex_version,
+        codex_command: @codex_command,
+        portal_command: @portal_command,
+        portal_url: @portal_url,
+        require_runtime: @require_runtime,
+        out: @out,
+        err: @err
+      )
     end
 
     def run_start
-      opts = { as_is: false, new: false, attach: nil, run_codex: true }
+      opts = {
+        as_is: false,
+        new: false,
+        attach: nil,
+        run_codex: true,
+        goal_file: nil,
+        json: false,
+        exclusive: false
+      }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--new') { opts[:new] = true }
         parser_opts.on('--attach') { opts[:attach] = true }
         parser_opts.on('--no-attach') { opts[:attach] = false }
         parser_opts.on('--no-codex') { opts[:run_codex] = false }
+        parser_opts.on('--goal-file FILE') { |value| opts[:goal_file] = value }
+        parser_opts.on('--json') { opts[:json] = true }
+        parser_opts.on('--exclusive') { opts[:exclusive] = true }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'start')
@@ -1526,6 +3209,17 @@ module VpsfreeDevSession
       require_arity!(0, @argv, 'current')
 
       runner.current
+    end
+
+    def run_url
+      opts = { as_is: false }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+      end
+      parser.parse!(@argv)
+      require_arity!(0..1, @argv, 'url')
+
+      runner.url(@argv.first, as_is: opts[:as_is])
     end
 
     def run_remove

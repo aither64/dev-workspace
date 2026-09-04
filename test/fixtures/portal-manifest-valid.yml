@@ -1,0 +1,22 @@
+schema: 1
+slug: 2026-09-03-example
+codex:
+  thread_id: 01a0678c-baae-7600-bcf6-9a0cb6c83232
+  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  client_version: 0.152.1
+creation:
+  state: ready
+  initial_goal_sent: true
+  goal_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+repositories:
+  - name: example
+    project: example
+    github: vpsfreecz/example
+    branch: 2026-09-03-example
+    default_branch: master
+    initial_base_sha: 0123456789abcdef0123456789abcdef01234567
+    final_head_sha: 89abcdef0123456789abcdef0123456789abcdef
+artifacts:
+  - label: Report
+    path: report.md
+finalized_at: "2026-09-03T12:00:00Z"

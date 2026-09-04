@@ -1,0 +1,9 @@
+schema: 1
+slug: 2026-09-03-example
+repositories:
+  - name: example
+    project: example
+    initial_base_sha: 0123456789abcdef0123456789abcdef01234567
+    final_head_sha: 89abcdef0123456789abcdef0123456789abcdef
+artifacts: []
+finalized_at: "1500-02-29T00:00:00Z"

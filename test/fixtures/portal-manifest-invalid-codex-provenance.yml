@@ -1,0 +1,9 @@
+schema: 1
+slug: 2026-09-03-example
+codex:
+  thread_id: thread-1
+  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+creation:
+  state: ready
+repositories: []
+artifacts: []

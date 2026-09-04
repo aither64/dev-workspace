@@ -1,0 +1,15 @@
+schema: 1
+slug: 2026-09-03-example
+codex:
+  thread_id: thread-1
+  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  client_version: 0.152.1
+creation:
+  state: ready
+tmux:
+  socket_path: /run/vpsfree-workspace-tmux/tmux.sock
+  codex_thread_id: other-thread
+  codex_socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  codex_client_version: 0.152.1
+repositories: []
+artifacts: []

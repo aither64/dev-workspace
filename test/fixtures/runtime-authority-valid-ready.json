@@ -1,0 +1,1 @@
+{"schema":1,"state":"ready","slug":"example","workspace":"/srv/workspace","tmux_socket":"/run/workspace/tmux.sock","tmux_session_id":"$7","codex_thread_id":"thread-1","codex_socket_path":"/run/workspace/codex.sock","codex_client_version":"0.152.1"}

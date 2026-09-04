@@ -40,16 +40,33 @@ Managed tmux panes and worktree windows receive these environment variables:
 - `VPSFREE_DEV_SESSION_SLUG`;
 - `VPSFREE_DEV_SESSION_WORKSPACE`;
 - `VPSFREE_DEV_SESSION_WORK_DIR`;
-- `VPSFREE_DEV_SESSION_WORKTREES_DIR`.
+- `VPSFREE_DEV_SESSION_WORKTREES_DIR`;
+- `VPSFREE_DEV_SESSION_PORTAL_BASE_URL`, the reusable portal origin;
+- `VPSFREE_DEV_SESSION_URL`, the resolved link for this session.
 
-`start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`, and
-`worktrees/<slug>/` when missing. Existing plan and state files are never
-overwritten. New state files begin with exact YAML front matter containing
-`lifecycle: active`; that anchored field is the only lifecycle authority. An
-exact slug that is present under `archive/`, tracked there, or found there in
-repository history cannot be reused, even if its archive is absent from the
-current working tree. Archive index or history lookup failures are refused
-rather than treated as proof that the slug is unused.
+Do not use `VPSFREE_DEV_SESSION_URL` as the input for another session. Its
+value already contains the current slug. The configuration-owned wrapper
+passes the base URL explicitly and exports both values into each managed pane.
+
+`start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`,
+`work/<slug>/portal.yml`, and `worktrees/<slug>/` when missing. When
+`workspace-portal` is installed, it also creates a Codex App Server thread,
+records its ID, assigns the session name, and opens the terminal Codex client
+on that thread. On restart, the recorded thread ID is authoritative: the
+helper resumes that exact thread while refreshing its working directory and
+runtime environment. A working-directory search is used only to recover a
+lost `thread/start` response before an ID was recorded. Existing plan and state
+files are never overwritten. New state files begin with exact YAML front
+matter containing `lifecycle: active`; that
+anchored field is the only lifecycle authority. An
+exact slug that is present under `archive/` or active workspace state cannot be
+reused. The helper also checks the top-level Git index and history, so removing
+an archive from a later checkout does not remove its slug tombstone. It disables
+repository-configured process hooks for these read-only checks and fails closed
+when the archive history cannot be read.
+If a running session was created without a shared portal thread, stop it before
+starting the same active slug with portal interaction; the helper refuses to
+attach a new browser thread to an old terminal conversation.
 
 ```yaml
 ---
@@ -82,6 +99,7 @@ bin/dev-session remove api-token-rotation
 bin/dev-session finalize api-token-rotation
 bin/dev-session list
 bin/dev-session current
+bin/dev-session url
 ```
 
 Lookup commands accept a short name when it resolves to exactly one known slug
@@ -114,6 +132,11 @@ writers are quiet, then restart the same active slug with `start --as-is` so it
 receives canonical metadata. Existing symlinked workspace paths are recognized
 and normalized automatically.
 
+`url` prints the permanent portal page for the selected initiative. It accepts
+the same short-name and `--as-is` forms as the other lookup commands. The page
+continues to work after finalization because the portal scans both `work/` and
+`archive/`.
+
 `remove` cleans up a development session:
 
 ```sh
@@ -124,7 +147,9 @@ It removes clean git worktrees whose `HEAD` is attached to a shared
 `refs/heads/*` branch under `worktrees/<slug>/`, removes the empty worktree
 group directory, and then kills the managed tmux session when one exists. This
 order makes it safe to run from inside its own managed session: the session is
-killed only after cleanup has completed. Branches are kept.
+killed only after cleanup has completed. Before removing worktrees, it records
+each final `HEAD` and verifies the worktree against the canonical project stored
+in `portal.yml`. Branches are kept.
 `work/<slug>/plan.md` and `state.md` are kept by default.
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
@@ -169,8 +194,8 @@ Before running it:
 `finalize` performs all safety checks before cleanup. It refuses missing
 tracking files, an active or ambiguous lifecycle, tracking without a prior
 commit, an existing archive destination, mismatched or replaced tmux identity,
-worktree changes reported by ordinary `git status --porcelain`, detached or
-worktrees, worktrees outside the canonical `repos/*.git` bare clones, symlinked
+worktree changes reported by ordinary `git status --porcelain`, detached
+worktrees, worktrees outside the allowed repositories, symlinked
 paths or roots, and unknown entries in the worktree group. Cleanup for one slug
 is serialized, and every worktree receives the same ordinary cleanliness and
 path checks before any is removed. It then delegates each removal to non-force
@@ -212,10 +237,31 @@ This uses:
 - base ref: `origin/HEAD`, falling back to `origin/master`;
 - `git fetch origin` before creation.
 
+The helper also records the canonical project identity, GitHub repository,
+feature branch, default branch, and starting base commit in `portal.yml`.
+Removing an individual worktree or using bulk cleanup records its last commit
+before cleanup. Finalization verifies the project identity and records the last
+commit of every remaining worktree, so archived pages retain trustworthy
+immutable comparison links.
+
 Before fetching or creating a branch, the helper resolves the repository and
 requires it to be a bare clone directly under the canonical `repos/` root.
 An in-root alias to another canonical bare clone is accepted; a symlink to an
 external repository is refused.
+
+Workspace implementation work uses the top-level repository through its
+reserved project and worktree name:
+
+```sh
+bin/dev-session worktree add api-token-rotation workspace
+```
+
+This creates `worktrees/<slug>/workspace` from the top-level repository. The
+helper verifies that the worktree belongs to that exact repository and applies
+the same cleanliness, attached-branch, final-commit, and non-force removal
+checks used for project worktrees. The name `workspace` is reserved for this
+repository, so an independent project cannot use it as a worktree alias. Other
+non-bare repositories remain refused.
 
 Useful options:
 
@@ -242,8 +288,59 @@ the worktree is intentional.
 Global options are accepted before the command:
 
 ```sh
-bin/dev-session --workspace /tmp/ws --tmux-socket dev-session-test start demo --no-attach
+bin/dev-session --workspace /tmp/ws \
+  --tmux-socket /tmp/dev-session-test.sock \
+  --authority-dir /tmp/dev-session-authority \
+  --codex-socket /tmp/codex-app-server.sock \
+  start demo --no-attach
 ```
 
+An absolute tmux socket uses `tmux -S` and is unaffected by `TMUX_TMPDIR`.
+`VPSFREE_DEV_SESSION_TMUX_SOCKET` supplies the same setting to ordinary shell
+sessions; an explicit `--tmux-socket` still takes precedence.
+When `--authority-dir` or `VPSFREE_DEV_SESSION_AUTHORITY_DIR` is configured,
+the helper writes uid-private runtime identity there, coordinates mutations
+through a shared lifecycle gate beside it, and never selects a host socket from
+the workspace-writable manifest. Run `bin/dev-session validate` to
+validate every persisted portal entry, including its plan, anchored lifecycle,
+active/archive placement, and manifest, before deployment.
+
 Set `VPSFREE_DEV_SESSION_CODEX` to override the command used for the left pane.
+Publishing Codex runtime provenance requires this value to begin with an
+absolute executable path whose `--version` output matches
+`VPSFREE_DEV_SESSION_CODEX_VERSION`. The recorded version describes how the
+session was created; an existing session remains valid after a compatible
+client upgrade when its thread, App Server socket, working directory, and live
+host authority still match.
+Set `VPSFREE_DEV_SESSION_CODEX_SOCKET` or pass `--codex-socket` to connect the
+terminal and helper operations to a supervised App Server socket.
 Use `--no-codex` to start a shell in the left pane instead.
+
+`--goal-file FILE` seeds the Goal section in a new plan. `--json` prints the
+resolved slug, portal URL, Codex thread ID, and identity-bound tmux attach
+command. `--exclusive` requires a goal file and records its digest in a workspace-local
+creation journal before creating initiative state. It may resume a manifest
+whose creation state is `creating` or `ready` only when the complete request
+identity matches. The unique `work/<slug>` directory is used to reconcile one
+matching App Server thread, but App Server does not offer an exactly-once
+creation key. An ambiguous remote timeout can leave an orphan or duplicate, and
+multiple candidates are refused. An incomplete tmux session is replaced only
+when its creation environment identifies the exact workspace and slug. The
+journal remains in
+the lock directory after the manifest reaches `ready`, allowing the
+HTTP result to be replayed without repeating a known initial turn. The portal
+passes a full dated slug with `--as-is`, preserving request identity across
+midnight. Set
+`VPSFREE_DEV_SESSION_PORTAL_COMMAND` to override the `workspace-portal`
+executable used for thread creation.
+
+The deployed portal uses `--require-runtime`, also propagated as
+`VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`. In that mode the authority directory,
+tmux socket, Codex command and socket, client version, and portal command must
+all be present, and every path must be absolute. On aitherdev, use the immutable
+`workspace-dev-session` wrapper for portal-managed sessions. Direct
+`bin/dev-session` use remains appropriate for ordinary local workspace
+coordination that is not attached to the deployed portal runtime.
+
+See [Workspace portal](workspace-portal.md) for the browser interface, manifest
+format, security model, private CA, and deployment responsibilities.

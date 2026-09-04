@@ -4,6 +4,7 @@ require 'date'
 require 'fileutils'
 require 'minitest/autorun'
 require 'open3'
+require 'rbconfig'
 require 'shellwords'
 require 'stringio'
 require 'tmpdir'
@@ -12,6 +13,10 @@ load File.expand_path('../bin/dev-session', __dir__)
 
 class DevSessionTest < Minitest::Test
   class NullTmux
+    def argv(*args)
+      ['tmux', *args]
+    end
+
     def session(_slug)
       nil
     end
@@ -25,6 +30,14 @@ class DevSessionTest < Minitest::Test
     end
 
     def current_session_identity(_pane)
+      nil
+    end
+
+    def pane_session_id(_pane)
+      nil
+    end
+
+    def pane_current_command(_pane)
       nil
     end
   end
@@ -47,14 +60,33 @@ class DevSessionTest < Minitest::Test
   end
 
   class ManagedTmux < NullTmux
-    attr_reader :killed
+    attr_reader :killed, :quiesced, :sent_commands
 
-    def initialize(slug, workspace:, on_kill: nil)
+    def initialize(
+      slug,
+      workspace:,
+      on_kill: nil,
+      socket_path: nil,
+      codex_thread_id: nil,
+      codex_socket_path: nil,
+      codex_client_version: nil,
+      codex_pane_id: nil,
+      pane_current_command: nil,
+      id: '$managed'
+    )
       @slug = slug
       @workspace = workspace
-      @id = '$managed'
+      @id = id
       @on_kill = on_kill
+      @socket_path = socket_path
+      @codex_thread_id = codex_thread_id
+      @codex_socket_path = codex_socket_path
+      @codex_client_version = codex_client_version
+      @codex_pane_id = codex_pane_id || (codex_thread_id && '%1')
+      @pane_current_command = pane_current_command || (codex_thread_id && 'codex')
       @killed = false
+      @quiesced = false
+      @sent_commands = []
     end
 
     def session(slug)
@@ -77,11 +109,36 @@ class DevSessionTest < Minitest::Test
       []
     end
 
+    def pane_session_id(pane)
+      pane == @codex_pane_id && !@killed ? @id : nil
+    end
+
+    def pane_current_command(pane)
+      pane == @codex_pane_id && !@killed ? @pane_current_command : nil
+    end
+
     def argv(*args)
       ['tmux', *args]
     end
 
     def run(*args)
+      if args.first == 'respawn-pane'
+        @quiesced = true
+        @pane_current_command = File.basename(args.last)
+        @on_kill&.call
+        return
+      end
+      if args.first == 'send-keys'
+        @quiesced = false
+        if args.include?('-l')
+          @sent_commands << args.last
+          @pane_current_command = 'codex'
+        end
+      end
+      if args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_CODEX_VERSION
+        @codex_client_version = args.last
+        return
+      end
       targets = ["#{@id}:", @slug]
       return unless args.first(2) == ['kill-session', '-t'] && targets.include?(args[2])
 
@@ -97,7 +154,12 @@ class DevSessionTest < Minitest::Test
         name: @slug,
         mark: '1',
         slug: @slug,
-        workspace: @workspace
+        workspace: @workspace,
+        socket_path: @socket_path,
+        codex_thread_id: @codex_thread_id,
+        codex_socket_path: @codex_socket_path,
+        codex_client_version: @codex_client_version,
+        codex_pane_id: @codex_pane_id
       )
     end
   end
@@ -345,8 +407,21 @@ class DevSessionTest < Minitest::Test
         name: @slug,
         mark: @mark,
         slug: @session_slug,
-        workspace: @workspace
+        workspace: @workspace,
+        environment_slug: @slug
       )
+    end
+  end
+
+  class RecordingTmux < NullTmux
+    attr_reader :mutations
+
+    def initialize
+      @mutations = []
+    end
+
+    def run(*arguments)
+      @mutations << arguments
     end
   end
 
@@ -528,6 +603,27 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_rejects_json_attach_before_creating_session_state
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: true,
+          run_codex: false,
+          json: true
+        )
+      end
+
+      assert_match(/--json cannot be combined with --attach/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
   def test_tracking_files_are_created_once
     with_workspace do |workspace|
       runner = runner_for(workspace)
@@ -544,6 +640,1016 @@ class DevSessionTest < Minitest::Test
       assert_includes(File.read(state), '## Commands run')
       assert_match(/\A---\nlifecycle: active\n---\n/, File.read(state))
       assert(File.directory?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
+  def test_start_creates_a_portal_manifest_and_prints_the_stable_url
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      socket_path = '/run/user/1000/tmux-1000/default'
+      tmux = ManagedTmux.new(slug, workspace:, socket_path:)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_url: 'https://workspace.example.test/'
+      )
+
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(1, manifest['schema'])
+      assert_equal(slug, manifest['slug'])
+      refute(manifest.key?('tmux'))
+      assert_includes(out.string, "portal: https://workspace.example.test/#{slug}/")
+    end
+  end
+
+  def test_tmux_socket_can_come_from_deployment_environment
+    with_workspace do |workspace|
+      socket = '/run/vpsfree-workspace-tmux/tmux.sock'
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'VPSFREE_DEV_SESSION_TMUX_SOCKET' => socket }
+      )
+
+      assert_equal(socket, runner.instance_variable_get(:@tmux).socket)
+    end
+  end
+
+  def test_portal_runtime_mode_fails_closed_and_propagates_to_sessions
+    with_workspace do |workspace|
+      error = assert_raises(VpsfreeDevSession::Error) do
+        VpsfreeDevSession::Runner.new(
+          workspace:,
+          tmux: NullTmux.new,
+          require_runtime: true,
+          out: StringIO.new,
+          err: StringIO.new,
+          env: {}
+        )
+      end
+      assert_includes(error.message, 'portal runtime configuration is incomplete')
+
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        authority_dir: '/run/workspace-authority',
+        tmux_socket: '/run/workspace-tmux/tmux.sock',
+        codex_socket: '/run/workspace-codex/app-server.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
+        portal_command: ['/run/current-system/sw/bin/workspace-portal'],
+        require_runtime: true,
+        out: StringIO.new,
+        err: StringIO.new,
+        env: {}
+      )
+      environment = runner.send(:session_environment, '2026-06-06-demo')
+      contract = File.readlines(
+        File.expand_path('../portal/runtime-environment-keys.txt', __dir__),
+        chomp: true
+      )
+      assert_equal(contract.sort, environment.keys.sort)
+      assert_equal(
+        (contract - [VpsfreeDevSession::ENV_REQUIRE_RUNTIME]).sort,
+        VpsfreeDevSession::THREAD_ENV_ARGUMENTS.keys.sort
+      )
+      assert_equal('1', environment.fetch(VpsfreeDevSession::ENV_REQUIRE_RUNTIME))
+      assert_equal(
+        VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL,
+        environment.fetch(VpsfreeDevSession::ENV_PORTAL_BASE_URL)
+      )
+      assert_equal(
+        "#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/2026-06-06-demo/",
+        environment.fetch(VpsfreeDevSession::ENV_PORTAL_URL)
+      )
+      assert_equal(
+        '/run/current-system/sw/bin/workspace-portal',
+        environment.fetch(VpsfreeDevSession::ENV_PORTAL_COMMAND)
+      )
+    end
+  end
+
+  def test_resolved_session_url_is_not_reused_as_the_portal_base
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+      out = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        env: {
+          VpsfreeDevSession::ENV_PORTAL_BASE_URL => 'https://workspace.example.test',
+          VpsfreeDevSession::ENV_PORTAL_URL => "https://workspace.example.test/#{slug}/"
+        }
+      )
+
+      assert_equal(
+        "https://workspace.example.test/#{slug}/",
+        runner.url(slug, as_is: true)
+      )
+      assert_equal("https://workspace.example.test/#{slug}/\n", out.string)
+    end
+  end
+
+  def test_absolute_tmux_socket_ignores_tmux_tmpdir_and_is_persisted
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      Dir.mktmpdir('dev-session-socket') do |socket_directory|
+        socket = File.join(socket_directory, 'tmux.sock')
+        authority_dir = File.join(socket_directory, 'authority')
+        former_tmpdir = ENV['TMUX_TMPDIR']
+        ENV['TMUX_TMPDIR'] = File.join(socket_directory, 'ignored')
+        begin
+          runner = VpsfreeDevSession::Runner.new(
+            workspace:,
+            tmux_socket: socket,
+            authority_dir:,
+            out: StringIO.new,
+            err: StringIO.new,
+            today: TODAY,
+            env: {}
+          )
+          runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+          authority_lock = File.join(authority_dir, "#{slug}.lock")
+          assert(File.file?(authority_lock))
+          assert_equal(0o600, File.stat(authority_lock).mode & 0o777)
+          _stdout, _stderr, status = Open3.capture3(
+            { 'TMUX_TMPDIR' => File.join(socket_directory, 'elsewhere') },
+            'tmux', '-S', socket, 'has-session', '-t', "=#{slug}:"
+          )
+          assert(status.success?, 'explicit tmux socket did not survive TMUX_TMPDIR drift')
+
+          out = StringIO.new
+          ordinary_runner = VpsfreeDevSession::Runner.new(
+            workspace:,
+            authority_dir:,
+            out:,
+            err: StringIO.new,
+            today: TODAY,
+            env: {}
+          )
+          ordinary_runner.list(slug, as_is: true)
+          assert_includes(out.string, 'managed')
+
+          mismatch = VpsfreeDevSession::Runner.new(
+            workspace:,
+            tmux_socket: File.join(socket_directory, 'other.sock'),
+            authority_dir:,
+            out: StringIO.new,
+            err: StringIO.new,
+            today: TODAY,
+            env: {}
+          )
+          error = assert_raises(VpsfreeDevSession::Error) do
+            mismatch.list(slug, as_is: true)
+          end
+          assert_includes(error.message, 'does not match trusted session authority')
+
+          ordinary_runner.stop(slug, as_is: true)
+          refute(tmux_session_exists?(socket, slug))
+          refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+        ensure
+          Open3.capture3('tmux', '-S', socket, 'kill-server')
+          former_tmpdir.nil? ? ENV.delete('TMUX_TMPDIR') : ENV['TMUX_TMPDIR'] = former_tmpdir
+        end
+      end
+    end
+  end
+
+  def test_cross_server_attach_unsets_tmux_instead_of_switching_the_other_server
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      target = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/vpsfree-workspace-tmux/tmux.sock'
+      )
+      calls = []
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: target,
+        process_exec: ->(environment, argv) { calls << [environment, argv] },
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {
+          'TMUX' => '/tmp/tmux-1000/default,123,0',
+          'TMUX_PANE' => '%1'
+        }
+      )
+      runner.ensure_tracking_files(slug)
+
+      runner.attach(slug, as_is: true)
+
+      assert_equal(1, calls.length)
+      assert_equal({'TMUX' => nil, 'TMUX_PANE' => nil}, calls[0][0])
+      assert_equal(
+        ['tmux', 'attach-session', '-t', '$managed:'],
+        calls[0][1]
+      )
+    end
+  end
+
+  def test_start_seeds_the_goal_and_returns_json_with_a_shared_thread
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Implement a useful feature.\n")
+      tmux = ManagedTmux.new(slug, workspace:)
+      portal_command = [
+        RbConfig.ruby,
+        '-e',
+        "require 'json'; puts JSON.generate(threadId: 'thread-123')"
+      ]
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$created',
+        name: slug,
+        mark: '1',
+        slug:,
+        workspace:
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |_slug, run_codex:, thread_id:|
+          raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
+
+          session
+        end
+
+        define_method(:sync_slug) do |_slug, require_session:, session:|
+          raise 'missing created session' unless require_session && session
+
+          session
+        end
+
+        define_method(:revalidate_session!) do |expected|
+          expected
+        end
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command:,
+        portal_url: 'https://workspace.example.test'
+      )
+
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true
+      )
+
+      result = JSON.parse(out.string)
+      assert_equal(slug, result['slug'])
+      assert_equal('thread-123', result['threadId'])
+      assert_equal("https://workspace.example.test/#{slug}/", result['url'])
+      assert_includes(File.read(File.join(workspace, 'work', slug, 'plan.md')), 'Implement a useful feature.')
+      assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial browser request')
+      assert_equal(
+        {
+          'state' => 'ready',
+          'initial_goal_sent' => true,
+          'goal_sha256' => Digest::SHA256.hexdigest('Implement a useful feature.')
+        },
+        YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+            .fetch('creation')
+      )
+    end
+  end
+
+  def test_start_refuses_to_retrofit_an_unshared_running_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ManagedTmux.new(slug, workspace:)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: nil
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      shared_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [
+          RbConfig.ruby,
+          '-e',
+          "require 'json'; puts JSON.generate(threadId: 'unexpected')"
+        ]
+      )
+      error = assert_raises(VpsfreeDevSession::Error) do
+        shared_runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+      end
+      assert_match(/no shared Codex thread/, error.message)
+    end
+  end
+
+  def test_goal_seeding_is_stable_when_goal_contains_template_headings
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Keep this literal text:\n\n## Goal\n\n## Affected repositories\n")
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+
+      runner.send(:seed_goal, slug, goal)
+      first_plan = File.binread(File.join(workspace, 'work', slug, 'plan.md'))
+      first_state = File.binread(File.join(workspace, 'work', slug, 'state.md'))
+      runner.send(:seed_goal, slug, goal)
+
+      assert_equal(first_plan, File.binread(File.join(workspace, 'work', slug, 'plan.md')))
+      assert_equal(first_state, File.binread(File.join(workspace, 'work', slug, 'state.md')))
+      assert_equal(1, first_plan.scan('Keep this literal text:').length)
+    end
+  end
+
+  def test_exclusive_browser_start_retries_partial_creation_without_duplicate_thread
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      log = File.join(workspace, 'portal.log')
+      failure_marker = File.join(workspace, 'send-failed')
+      portal = File.join(workspace, 'fake-portal.rb')
+      File.write(goal, "Implement a retry-safe feature.\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        case ARGV[1]
+        when 'create'
+          puts JSON.generate(threadId: 'thread-retry')
+        when 'ensure-initial'
+          unless File.exist?(#{failure_marker.dump})
+            File.write(#{failure_marker.dump}, "failed\n")
+            warn 'simulated send failure'
+            exit 1
+          end
+        end
+      RUBY
+      out = StringIO.new
+      created_session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$created', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/test/tmux.sock'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |*_arguments, **_keywords|
+          created_session
+        end
+
+        define_method(:sync_slug) do |*_arguments, **_keywords|
+          created_session
+        end
+
+        define_method(:revalidate_session!) do |_expected|
+          created_session
+        end
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      partial = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-retry', partial.dig('codex', 'thread_id'))
+      assert_equal('creating', partial.dig('creation', 'state'))
+      refute(partial.dig('creation', 'initial_goal_sent'))
+
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(slug, workspace:),
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+      commands = File.readlines(log, chomp: true)
+      creation_commands = commands.select { |line| line.start_with?('thread create ') }
+      assert_equal(2, creation_commands.length)
+      refute_includes(creation_commands.fetch(0), '--thread-id')
+      assert_includes(creation_commands.fetch(1), '--thread-id thread-retry')
+      assert_equal(2, commands.count { |line| line.start_with?('thread set-name ') })
+      assert_equal(2, commands.count { |line| line.start_with?('thread ensure-initial ') })
+      complete = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('ready', complete.dig('creation', 'state'))
+      assert(complete.dig('creation', 'initial_goal_sent'))
+
+      out.truncate(0)
+      out.rewind
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+      assert_equal('thread-retry', JSON.parse(out.string).fetch('threadId'))
+      replayed_commands = File.readlines(log, chomp: true)
+      assert_equal(2, replayed_commands.count { |line| line.start_with?('thread create ') })
+      assert_equal(2, replayed_commands.count { |line| line.start_with?('thread set-name ') })
+      assert_equal(2, replayed_commands.count { |line| line.start_with?('thread ensure-initial ') })
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      assert_equal('ready', journal.fetch('state'))
+
+      replay_out = StringIO.new
+      replay_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: replay_out,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      replay_runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+      replay = JSON.parse(replay_out.string)
+      assert_equal('thread-retry', replay.fetch('threadId'))
+      assert_nil(replay.fetch('attach'))
+      assert_equal(replayed_commands, File.readlines(log, chomp: true))
+    end
+  end
+
+  def test_initial_turn_starts_after_private_local_creation_and_without_the_slug_lock
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      authority_dir = File.join(workspace, 'runtime-authority')
+      observation = File.join(workspace, 'initial-turn-observation')
+      portal = File.join(workspace, 'fake-portal.rb')
+      codex = File.join(workspace, 'codex')
+      File.write(goal, "Implement after local setup.\n")
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.152.1'\n")
+      File.chmod(0o755, codex)
+      File.write(portal, <<~RUBY)
+        require 'json'
+        require 'yaml'
+        case ARGV[1]
+        when 'create'
+          puts JSON.generate(threadId: 'thread-123')
+        when 'ensure-initial'
+          authority = JSON.parse(File.read(#{File.join(authority_dir, "#{slug}.json").dump}))
+          manifest = YAML.safe_load(File.read(#{File.join(workspace, 'work', slug, 'portal.yml').dump}))
+          exit 2 unless authority['state'] == 'creating'
+          exit 3 unless manifest.dig('creation', 'state') == 'creating'
+          File.open(#{File.join(authority_dir, "#{slug}.lock").dump}, File::RDWR) do |lock|
+            exit 4 unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          end
+          File.write(#{observation.dump}, "ready for initial turn\n")
+        end
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$7', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-123',
+        codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| session }
+        define_method(:revalidate_session!) { |_expected| session }
+      end
+      runner = runner_class.new(
+        workspace:,
+        authority_dir:,
+        tmux_socket: '/run/test/tmux.sock',
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: codex,
+        tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      runner.start(
+        slug, as_is: true, new: false, attach: false, run_codex: true,
+        goal_file: goal, json: true, exclusive: true
+      )
+
+      assert_equal("ready for initial turn\n", File.read(observation))
+      authority = JSON.parse(File.read(File.join(authority_dir, "#{slug}.json")))
+      assert_equal('ready', authority.fetch('state'))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      assert(manifest.dig('creation', 'initial_goal_sent'))
+    end
+  end
+
+  def test_exclusive_browser_replay_repairs_authority_after_ready_journal_crash
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      authority_dir = File.join(workspace, 'runtime-authority')
+      portal = File.join(workspace, 'fake-portal.rb')
+      codex = File.join(workspace, 'codex')
+      File.write(goal, "Complete the recoverable initial turn.\n")
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.152.1'\n")
+      File.chmod(0o755, codex)
+      File.write(portal, <<~RUBY)
+        require 'json'
+        puts JSON.generate(threadId: 'thread-crash') if ARGV[1] == 'create'
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$8', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-crash',
+        codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
+      )
+      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| session }
+        define_method(:revalidate_session!) { |_expected| session }
+
+        def mark_creation_journal_ready(slug, journal)
+          super
+          raise VpsfreeDevSession::Error, 'simulated crash before authority publication'
+        end
+      end
+      runner = crashing_runner_class.new(
+        workspace:,
+        authority_dir:,
+        tmux_socket: '/run/test/tmux.sock',
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: codex,
+        tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug, as_is: true, new: false, attach: false, run_codex: true,
+          goal_file: goal, json: true, exclusive: true
+        )
+      end
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      authority_path = File.join(authority_dir, "#{slug}.json")
+      authority = JSON.parse(File.read(authority_path))
+      assert_equal('ready', journal.fetch('state'))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      assert_equal('creating', authority.fetch('state'))
+
+      out = StringIO.new
+      replay = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        tmux: ManagedTmux.new(
+          slug,
+          workspace:,
+          socket_path: '/run/test/tmux.sock',
+          codex_thread_id: 'thread-crash',
+          codex_socket_path: '/run/test/codex.sock',
+          codex_client_version: '0.152.1',
+          id: '$8'
+        ),
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      replay.start(
+        slug, as_is: true, new: false, attach: false, run_codex: true,
+        goal_file: goal, json: true, exclusive: true
+      )
+
+      assert_equal('thread-crash', JSON.parse(out.string).fetch('threadId'))
+      repaired = JSON.parse(File.read(authority_path))
+      assert_equal('ready', repaired.fetch('state'))
+    end
+  end
+
+  def test_exclusive_browser_start_recovers_a_lost_thread_result_and_rejects_goal_changes
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      changed_goal = File.join(workspace, 'changed-goal.txt')
+      thread_marker = File.join(workspace, 'thread-created')
+      invocation_log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'fake-portal.rb')
+      File.write(goal, "Implement the original request.\n")
+      File.write(changed_goal, "Implement a different request.\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{invocation_log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        case ARGV[1]
+        when 'create'
+          unless File.exist?(#{thread_marker.dump})
+            File.write(#{thread_marker.dump}, "thread-recovered\n")
+            warn 'simulated loss after App Server committed thread/start'
+            exit 1
+          end
+          puts JSON.generate(threadId: File.read(#{thread_marker.dump}).strip)
+        end
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      journal = runner.send(:creation_journal_file, slug)
+      assert(File.file?(journal))
+      partial = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('creating', partial.dig('creation', 'state'))
+      assert_nil(partial.dig('codex', 'thread_id'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: changed_goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_includes(error.message, 'does not match the recorded goal')
+
+      retry_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(slug, workspace:),
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      retry_runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+
+      complete = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-recovered', complete.dig('codex', 'thread_id'))
+      assert_equal('ready', complete.dig('creation', 'state'))
+      assert_equal('ready', JSON.parse(File.read(journal)).fetch('state'))
+      creation_commands = File.readlines(invocation_log, chomp: true)
+                              .select { |line| line.include?('thread create') }
+      assert_equal(2, creation_commands.length)
+      creation_commands.each do |command|
+        assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
+        assert_includes(command, "--workspace #{workspace}")
+        assert_includes(command, "--session-slug #{slug}")
+        assert_includes(command, "--worktrees-dir #{File.join(workspace, 'worktrees', slug)}")
+        assert_includes(command, '--portal-base-url https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz')
+        assert_includes(command, "--portal-url https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz/#{slug}/")
+      end
+      assert_equal('thread-recovered', File.read(thread_marker).strip)
+    end
+  end
+
+  def test_exclusive_browser_start_journals_before_tracking_files
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume after an early crash.\n")
+      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        def ensure_tracking_files(slug)
+          super
+          raise VpsfreeDevSession::Error, 'simulated crash after tracking creation'
+        end
+      end
+      crashing_runner = crashing_runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, '-e', "require 'json'; puts JSON.generate(threadId: 'thread-early')"]
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        crashing_runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      journal = crashing_runner.send(:creation_journal_file, slug)
+      assert(File.file?(journal))
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(slug, workspace:),
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, '-e', "require 'json'; puts JSON.generate(threadId: 'thread-early')"]
+      )
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      assert_equal('thread-early', manifest.dig('codex', 'thread_id'))
+      assert_equal('ready', JSON.parse(File.read(journal)).fetch('state'))
+    end
+  end
+
+  def test_exclusive_browser_retry_refuses_partial_tracking_content
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume after an early crash.\n")
+      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        def ensure_tracking_files(_slug)
+          raise VpsfreeDevSession::Error, 'simulated crash before tracking creation'
+        end
+      end
+      crashing_runner = crashing_runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      assert_raises(VpsfreeDevSession::Error) do
+        crashing_runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+
+      runner = runner_for(workspace)
+      tracking = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(tracking)
+      FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug))
+      File.write(File.join(tracking, 'plan.md'), "# #{slug}\n\n## Goal\n")
+      File.write(File.join(tracking, 'state.md'), runner.send(:state_skeleton, slug))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/incomplete and cannot be reconciled/, error.message)
+    end
+  end
+
+  def test_ruby_manifest_validator_accepts_shared_fixture
+    with_workspace do |workspace|
+      slug = '2026-09-03-example'
+      directory = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(directory)
+      FileUtils.cp(
+        File.expand_path('fixtures/portal-manifest-valid.yml', __dir__),
+        File.join(directory, 'portal.yml')
+      )
+
+      manifest = runner_for(workspace).send(
+        :load_portal_manifest,
+        File.join(directory, 'portal.yml'),
+        required: true
+      )
+      assert_equal(slug, manifest['slug'])
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      refute(manifest.key?('tmux'))
+      assert_equal('2026-09-03T12:00:00Z', manifest['finalized_at'])
+    end
+  end
+
+  def test_validate_checks_all_persisted_portal_manifests
+    with_workspace do |workspace|
+      valid_directory = File.join(workspace, 'work', '2026-09-03-example')
+      invalid_directory = File.join(workspace, 'archive', '2026-09-03-invalid')
+      FileUtils.mkdir_p(valid_directory)
+      FileUtils.mkdir_p(invalid_directory)
+      FileUtils.cp(
+        File.expand_path('fixtures/portal-manifest-valid.yml', __dir__),
+        File.join(valid_directory, 'portal.yml')
+      )
+      File.write(
+        File.join(invalid_directory, 'portal.yml'),
+        "schema: 1\nslug: 2026-09-03-other\n"
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).validate
+      end
+    end
+  end
+
+  def test_validate_enforces_tracking_lifecycle_and_duplicate_placement
+    with_workspace do |workspace|
+      slug = '2026-09-03-example'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      File.write(
+        File.join(workspace, 'work', slug, 'portal.yml'),
+        "schema: 1\nslug: #{slug}\nrepositories: []\nartifacts: []\n"
+      )
+      out = StringIO.new
+      validating_runner = runner_for(workspace, out:)
+      validating_runner.validate
+      assert_includes(out.string, 'validated 1 portal manifest')
+
+      archive = File.join(workspace, 'archive', slug)
+      FileUtils.mkdir_p(archive)
+      File.write(File.join(archive, 'plan.md'), "# Plan\n")
+      File.write(
+        File.join(archive, 'state.md'),
+        "---\nlifecycle: complete\n---\n"
+      )
+      File.write(
+        File.join(archive, 'portal.yml'),
+        "schema: 1\nslug: #{slug}\nfinalized_at: '2026-09-03T12:00:00Z'\nrepositories: []\nartifacts: []\n"
+      )
+      error = assert_raises(VpsfreeDevSession::Error) do
+        validating_runner.validate
+      end
+      assert_includes(error.message, 'duplicate session')
+
+      FileUtils.rm_rf(File.join(workspace, 'work', slug))
+      File.write(File.join(archive, 'state.md'), "---\nlifecycle: active\n---\n")
+      error = assert_raises(VpsfreeDevSession::Error) do
+        validating_runner.validate
+      end
+      assert_includes(error.message, 'terminal lifecycle')
+    end
+  end
+
+  def test_ruby_manifest_validator_rejects_shared_invalid_fixtures
+    fixtures = Dir[File.expand_path('fixtures/portal-manifest-invalid-*.yml', __dir__)]
+    refute_empty(fixtures)
+
+    fixtures.each do |fixture|
+      with_workspace do |workspace|
+        slug = '2026-09-03-example'
+        directory = File.join(workspace, 'work', slug)
+        FileUtils.mkdir_p(directory)
+        FileUtils.cp(fixture, File.join(directory, 'portal.yml'))
+
+        assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+          runner_for(workspace).send(
+            :load_portal_manifest,
+            File.join(directory, 'portal.yml'),
+            required: true
+          )
+        end
+      end
+    end
+  end
+
+  def test_ruby_runtime_authority_validator_uses_shared_corpus
+    runner = runner_for('/tmp')
+    Dir[File.expand_path('fixtures/runtime-authority-valid-*.json', __dir__)].each do |fixture|
+      record = JSON.parse(File.read(fixture))
+      record['workspace'] = runner.workspace
+      runner.send(:validate_session_authority!, record, 'example', fixture)
+    end
+    Dir[File.expand_path('fixtures/runtime-authority-invalid-*.json', __dir__)].each do |fixture|
+      record = JSON.parse(File.read(fixture))
+      record['workspace'] = runner.workspace
+      assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+        runner.send(:validate_session_authority!, record, 'example', fixture)
+      end
+    end
+  end
+
+  def test_exclusive_start_refuses_to_reuse_an_existing_slug
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-06-06-demo'
+      runner.ensure_tracking_files(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          exclusive: true
+        )
+      end
+
+      assert_match(/already exists/, error.message)
     end
   end
 
@@ -612,6 +1718,53 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_tracking_files_refuse_a_slug_found_only_in_the_git_index
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      archive = File.join(workspace, 'archive', slug)
+      FileUtils.mkdir_p(archive)
+      File.write(File.join(archive, 'plan.md'), "# Plan\n")
+      File.write(
+        File.join(archive, 'state.md'),
+        "---\nlifecycle: complete\n---\n\n# #{slug}\n\n## Status\n"
+      )
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      assert_git_success('git', '-C', workspace, 'add', File.join('archive', slug))
+      FileUtils.rm_r(archive)
+      refute_empty(
+        git_capture_success('git', '-C', workspace, 'ls-files', '--', File.join('archive', slug))
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
+      assert_match(/archived slug cannot be reused/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tracking_file_creation_does_not_execute_workspace_git_configuration
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      marker = File.join(workspace, 'git-hook-ran')
+      hook = File.join(workspace, 'hostile-fsmonitor')
+      File.write(hook, "#!/bin/sh\ntouch #{Shellwords.escape(marker)}\nprintf '{}\\n'\n")
+      FileUtils.chmod(0o755, hook)
+      assert_git_success('git', '-C', workspace, 'config', 'core.fsmonitor', hook)
+
+      runner_for(workspace).ensure_tracking_files(slug)
+
+      refute(File.exist?(marker))
+      assert(File.file?(File.join(workspace, 'work', slug, 'plan.md')))
+    end
+  end
+
   def test_tracking_files_fail_closed_when_archive_history_cannot_be_read
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -622,6 +1775,21 @@ class DevSessionTest < Minitest::Test
       end
 
       refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_tracking_files_refuse_an_existing_empty_partial_write
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      directory = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(directory)
+      File.write(File.join(directory, 'plan.md'), '')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).ensure_tracking_files(slug)
+      end
+
+      assert_match(/empty or truncated/, error.message)
     end
   end
 
@@ -770,7 +1938,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_current_ignores_tmux_server_current_session_outside_a_tmux_pane
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -807,7 +1975,7 @@ class DevSessionTest < Minitest::Test
       resolver = File.join(directory, 'dev-session')
       File.write(
         resolver,
-        "#!/usr/bin/env bash\n" \
+        "#!/bin/sh\n" \
         "test \"$1\" = current\n" \
         "printf 'managed-session\\n'\n"
       )
@@ -889,6 +2057,146 @@ class DevSessionTest < Minitest::Test
         '--verify',
         '--quiet',
         'refs/heads/2026-06-06-demo'
+      )
+    end
+  end
+
+  def test_worktree_add_records_github_comparison_metadata
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success(
+        'git',
+        "--git-dir=#{repository}",
+        'remote',
+        'set-url',
+        'origin',
+        'git@github.com:vpsfreecz/sample.git'
+      )
+
+      runner_for(workspace).worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'work', '2026-06-06-demo', 'portal.yml'))
+      )
+      metadata = manifest.fetch('repositories').fetch(0)
+      assert_equal('sample', metadata['name'])
+      assert_equal('sample', metadata['project'])
+      assert_equal('vpsfreecz/sample', metadata['github'])
+      assert_equal('2026-06-06-demo', metadata['branch'])
+      assert_equal('master', metadata['default_branch'])
+      assert_match(/\A[0-9a-f]{40}\z/, metadata['initial_base_sha'])
+    end
+  end
+
+  def test_worktree_add_uses_one_immutable_base_and_recovers_registration
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      slug = '2026-06-06-demo'
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      base_sha = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'worktree', 'add', '-b', slug, path, base_sha
+      )
+
+      runner.worktree_add(
+        slug,
+        'sample',
+        as_is: true,
+        name: nil,
+        branch: slug,
+        base: 'master',
+        fetch: false
+      )
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      metadata = manifest.fetch('repositories').fetch(0)
+      assert_equal(base_sha, metadata['initial_base_sha'])
+      assert_equal(slug, metadata['branch'])
+    end
+  end
+
+  def test_explicit_base_does_not_change_recorded_default_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success('git', "--git-dir=#{repository}", 'branch', 'release', 'master')
+
+      runner_for(workspace).worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'release',
+        fetch: false
+      )
+
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'work', '2026-06-06-demo', 'portal.yml'))
+      )
+      assert_equal('master', manifest.dig('repositories', 0, 'default_branch'))
+    end
+  end
+
+  def test_workspace_repository_worktree_can_be_finalized_with_stable_identity
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      File.write(File.join(workspace, 'README.md'), "# Workspace\n")
+      assert_git_success('git', '-C', workspace, 'add', 'README.md')
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'initial workspace')
+      assert_git_success(
+        'git', '-C', workspace, 'remote', 'add', 'origin',
+        'git@github.com:vpsfreecz/vpsfree-cz-workspace.git'
+      )
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug,
+        'workspace',
+        as_is: true,
+        name: nil,
+        branch: slug,
+        base: 'master',
+        fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'workspace')
+      assert(File.exist?(File.join(path, '.git')))
+
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.finalize(slug, as_is: true)
+
+      refute(File.exist?(path))
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'archive', slug, 'portal.yml'))
+      )
+      repository = manifest.fetch('repositories').fetch(0)
+      assert_equal('workspace', repository['name'])
+      assert_equal('vpsfreecz/vpsfree-cz-workspace', repository['github'])
+      assert_match(/\A[0-9a-f]{40}\z/, repository['final_head_sha'])
+      assert_git_success(
+        'git', '-C', workspace, 'show-ref', '--verify', '--quiet',
+        "refs/heads/#{slug}"
       )
     end
   end
@@ -1010,6 +2318,83 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_remove_records_heads_so_finalize_can_archive_later
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      expected_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
+
+      runner.remove('demo', as_is: false, force: false)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(expected_head, manifest.dig('repositories', 0, 'final_head_sha'))
+
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.finalize('demo', as_is: false)
+      archived = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(expected_head, archived.dig('repositories', 0, 'final_head_sha'))
+      assert(archived['finalized_at'])
+    end
+  end
+
+  def test_finalize_rejects_worktree_swapped_from_another_canonical_repository
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      create_bare_repo(workspace, 'other')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      assert_git_success(
+        'git',
+        "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+        'worktree',
+        'remove',
+        path
+      )
+      assert_git_success(
+        'git',
+        "--git-dir=#{File.join(workspace, 'repos', 'other.git')}",
+        'worktree',
+        'add',
+        '-b',
+        'replacement',
+        path,
+        'master'
+      )
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize('demo', as_is: false)
+      end
+      assert_match(/repository identity does not match/, error.message)
+      assert(File.directory?(path))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
   def test_remove_kills_session_after_worktrees_are_removed
     skip 'git is not available' unless command_available?('git')
 
@@ -1116,7 +2501,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_remove_kills_managed_tmux_session
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -1144,7 +2529,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_remove_refuses_unmanaged_tmux_session
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -1214,7 +2599,10 @@ class DevSessionTest < Minitest::Test
 
       refute(tmux.killed)
       assert_includes(out.string, File.join(workspace, 'archive', slug))
-      assert_includes(out.string, 'stop after committing')
+      assert_includes(
+        out.string,
+        "stop after committing: bin/dev-session stop #{slug} --as-is"
+      )
       assert_includes(
         File.read(File.join(workspace, 'archive', slug, 'state.md')),
         'lifecycle: complete'
@@ -1505,6 +2893,43 @@ class DevSessionTest < Minitest::Test
           runner.send(:validate_terminal_lifecycle_content!, content)
         end
         assert_match(/must start with lifecycle YAML front matter/, error.message)
+      end
+    end
+  end
+
+  def test_ruby_lifecycle_parser_accepts_shared_valid_fixtures
+    fixtures = Dir[File.expand_path('fixtures/lifecycle-valid-*.md', __dir__)]
+    refute_empty(fixtures)
+
+    fixtures.each do |fixture|
+      with_workspace do |workspace|
+        lifecycle = runner_for(workspace).send(:lifecycle_state, File.binread(fixture))
+        assert_includes(%w[active complete abandoned], lifecycle, File.basename(fixture))
+      end
+    end
+  end
+
+  def test_ruby_lifecycle_parser_rejects_shared_invalid_fixtures
+    fixtures = Dir[File.expand_path('fixtures/lifecycle-invalid-*.md', __dir__)]
+    refute_empty(fixtures)
+
+    fixtures.each do |fixture|
+      with_workspace do |workspace|
+        assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+          runner_for(workspace).send(:lifecycle_state, File.binread(fixture))
+        end
+      end
+    end
+  end
+
+  def test_lifecycle_parser_rejects_invalid_utf8_and_oversized_input
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:lifecycle_state, "---\nlifecycle: active\n---\n\xff".b)
+      end
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:lifecycle_state, "---\nlifecycle: active\n---\n" + ('x' * 1024 * 1024))
       end
     end
   end
@@ -1940,6 +3365,30 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_finalize_refuses_a_registered_git_worktree_missing_from_manifest
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      assert_git_success('git', "--git-dir=#{repository}", 'worktree', 'add', path, 'master')
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.finalize(slug, as_is: true)
+      end
+
+      assert_match(/missing from the portal manifest/, error.message)
+      assert(File.directory?(path))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
   def test_finalize_refuses_a_worktree_from_outside_canonical_repositories
     skip 'git is not available' unless command_available?('git')
 
@@ -1988,7 +3437,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_tmux_targets_do_not_prefix_match_a_longer_session
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -2029,7 +3478,7 @@ class DevSessionTest < Minitest::Test
       assert_match(/changed during creation/, error.message)
       assert_includes(tmux.new_session_args, '-P')
       assert_includes(tmux.new_session_args, '#{session_id}')
-      assert_equal(1, tmux.name_lookups)
+      assert_equal(2, tmux.name_lookups)
       assert_empty(tmux.mutations)
     end
   end
@@ -2045,7 +3494,7 @@ class DevSessionTest < Minitest::Test
       end
 
       assert_match(/session changed during operation/, error.message)
-      assert_equal(1, tmux.name_lookups)
+      assert_equal(2, tmux.name_lookups)
       refute(tmux.mutations.flatten.include?('$replacement:'))
     end
   end
@@ -2103,6 +3552,34 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_creation_recovery_kills_only_the_exact_unmarked_tmux_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = RecordingTmux.new
+      runner = runner_for(workspace, tmux:)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$partial',
+        name: slug,
+        mark: '',
+        slug: '',
+        workspace:,
+        environment_slug: slug
+      )
+
+      runner.send(:reconcile_creation_tmux_session!, slug, session)
+
+      assert_equal([['kill-session', '-t', '$partial:']], tmux.mutations)
+
+      replacement = session.dup
+      replacement.environment_slug = '2026-06-06-other'
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:reconcile_creation_tmux_session!, slug, replacement)
+      end
+      assert_includes(error.message, 'not recoverable')
+      assert_equal(1, tmux.mutations.length)
+    end
+  end
+
   def test_worktree_mutations_use_the_slug_lock
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -2150,6 +3627,140 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_stop_refuses_an_active_codex_turn_before_killing_tmux_or_authority
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.152.1',
+        id: '$7'
+      )
+      failing_portal = [RbConfig.ruby, '-e', "warn 'thread is active'; exit 1"]
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        tmux:,
+        portal_command: failing_portal,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.stop(slug, as_is: true)
+      end
+      refute(tmux.killed)
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+
+      idle_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        tmux:,
+        portal_command: ['true'],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      idle_runner.stop(slug, as_is: true)
+      assert(tmux.killed)
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_stop_quiesces_terminal_before_the_authoritative_idle_check
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      active = File.join(workspace, 'turn-active')
+      portal = File.join(workspace, 'portal')
+      File.write(portal, <<~RUBY)
+        #!/usr/bin/env ruby
+        abort 'turn became active while terminal was quiesced' if File.exist?(#{active.dump})
+      RUBY
+      File.chmod(0o755, portal)
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        on_kill: -> { File.write(active, "active\n") },
+        socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.152.1',
+        id: '$7'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
+        tmux:,
+        portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.stop(slug, as_is: true)
+      end
+      assert_includes(error.message, 'turn became active')
+      refute(tmux.killed)
+      refute(tmux.quiesced, 'terminal Codex client was not restored')
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_recover_stale_removes_only_idle_identity_validated_authority
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.152.1',
+        id: '$7'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        tmux:,
+        portal_command: ['true'],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.recover_stale(slug, as_is: true)
+      end
+
+      tmux.run('kill-session', '-t', '$7:')
+      runner.recover_stale(slug, as_is: true)
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
   def test_remove_does_not_kill_a_replacement_tmux_session
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -2167,7 +3778,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_managed_tmux_session_is_bound_to_its_workspace
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -2223,18 +3834,51 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_finalize_runtime_output_uses_deployed_helper
+    slug = '2026-06-06-demo'
+    with_workspace do |workspace|
+      runner_for(workspace).send(:ensure_tracking_files, slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      out = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(slug, workspace:),
+        tmux_socket: '/run/workspace-tmux/tmux.sock',
+        authority_dir: File.join(workspace, 'runtime-authority'),
+        codex_socket: '/run/workspace-codex/app-server.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
+        portal_command: ['/run/current-system/sw/bin/workspace-portal'],
+        require_runtime: true,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      runner.finalize(slug, as_is: true)
+
+      assert_includes(
+        out.string,
+        "stop after committing: workspace-dev-session stop #{slug} --as-is"
+      )
+    end
+  end
+
   def test_finalize_keeps_real_tmux_session_until_explicit_stop
     skip 'git is not available' unless command_available?('git')
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
 
     with_workspace do |workspace|
       out = StringIO.new
+      authority_dir = File.join(workspace, 'runtime-authority')
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
+        authority_dir:,
         codex_command: 'false',
         out:,
         err: StringIO.new,
@@ -2243,14 +3887,22 @@ class DevSessionTest < Minitest::Test
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      runner.finalize('demo', as_is: false)
+      ordinary_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      ordinary_runner.finalize('demo', as_is: false)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
       assert(tmux_session_exists?(socket, slug))
       assert_includes(out.string, 'stop after committing')
 
       commit_archive_move(workspace, slug)
-      runner.stop(slug, as_is: true)
+      ordinary_runner.stop(slug, as_is: true)
       refute(tmux_session_exists?(socket, slug))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
@@ -2258,7 +3910,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_tmux_codex_runs_from_shell_and_leaves_shell_available
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -2302,8 +3954,84 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_shared_session_records_codex_endpoint_provenance
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+    codex_socket = '/run/vpsfree-workspace-codex/app-server.sock'
+
+    with_workspace do |workspace|
+      codex_executable = File.join(workspace, 'codex')
+      File.write(codex_executable, "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'codex-cli 0.152.1'; exit 0; }\nexit 0\n")
+      File.chmod(0o755, codex_executable)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux_socket: socket,
+        codex_socket:,
+        codex_version: '0.152.1',
+        codex_command: codex_executable,
+        portal_command: [
+          RbConfig.ruby,
+          '-e',
+          "require 'json'; puts JSON.generate(threadId: 'thread-123')"
+        ],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(codex_socket, manifest.dig('codex', 'socket_path'))
+      assert_equal('0.152.1', manifest.dig('codex', 'client_version'))
+      refute(manifest.key?('tmux'))
+    ensure
+      tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
+  def test_codex_provenance_requires_the_configured_executable_version
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      codex_executable = File.join(workspace, 'codex')
+      File.write(codex_executable, "#!/bin/sh\necho 'codex-cli 0.151.0'\n")
+      File.chmod(0o755, codex_executable)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$created', name: slug, mark: '1', slug:, workspace:
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |*_arguments, **_keywords|
+          session
+        end
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: codex_executable,
+        portal_command: [
+          RbConfig.ruby,
+          '-e',
+          "require 'json'; puts JSON.generate(threadId: 'thread-123')"
+        ],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+      end
+      assert_includes(error.message, 'does not report configured version')
+    end
+  end
+
   def test_tmux_start_and_sync_manage_only_worktree_windows
-    skip 'tmux is not available' unless command_available?('tmux')
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
@@ -2337,6 +4065,14 @@ class DevSessionTest < Minitest::Test
       assert_includes(
         session_env,
         "#{VpsfreeDevSession::ENV_WORKTREES_DIR}=#{File.join(workspace, 'worktrees', slug)}\n"
+      )
+      assert_includes(
+        session_env,
+        "#{VpsfreeDevSession::ENV_PORTAL_BASE_URL}=#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}\n"
+      )
+      assert_includes(
+        session_env,
+        "#{VpsfreeDevSession::ENV_PORTAL_URL}=#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/\n"
       )
 
       panes = tmux_capture(socket, 'list-panes', '-t', "#{slug}:dev", '-F', '#{pane_current_path}')
@@ -2380,6 +4116,89 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_codex_endpoint_identity_survives_compatible_client_upgrade
+    with_workspace do |workspace|
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        out: StringIO.new,
+        err: StringIO.new,
+        env: {}
+      )
+      session = VpsfreeDevSession::Tmux::Session.new(
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.152.1'
+      )
+
+      assert(runner.send(:session_codex_provenance_matches?, session, 'thread-1'))
+      session.codex_socket_path = '/run/workspace/other.sock'
+      refute(runner.send(:session_codex_provenance_matches?, session, 'thread-1'))
+    end
+  end
+
+  def test_attach_restarts_terminal_client_after_app_server_disconnect
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/workspace/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.152.1',
+        pane_current_command: 'sh'
+      )
+      errors = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        out: StringIO.new,
+        err: errors,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+
+      session = runner.send(:reconcile_native_client!, slug, tmux.session(slug))
+
+      assert_equal('$managed', session.id)
+      assert_equal('0.153.2', session.codex_client_version)
+      assert_equal(1, tmux.sent_commands.length)
+      assert_includes(tmux.sent_commands.first, codex)
+      assert_includes(tmux.sent_commands.first, '--remote unix:///run/workspace/codex.sock')
+      assert_includes(tmux.sent_commands.first, 'resume thread-1')
+      assert_includes(errors.string, 'restarted terminal Codex client')
+
+      running = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/workspace/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.153.2',
+        pane_current_command: '.codex-wrapped'
+      )
+      running_runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: running,
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        out: StringIO.new,
+        err: StringIO.new,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+      running_runner.send(:reconcile_native_client!, slug, running.session(slug))
+      assert_empty(running.sent_commands)
+    end
+  end
+
   private
 
   def with_workspace
@@ -2407,7 +4226,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def create_bare_repo(workspace, project)
-    source = File.join(workspace, 'source')
+    source = File.join(workspace, "source-#{project}")
     bare = File.join(workspace, 'repos', "#{project}.git")
 
     assert_git_success('git', 'init', '-b', 'master', source)
@@ -2522,5 +4341,23 @@ class DevSessionTest < Minitest::Test
     ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).any? do |dir|
       File.executable?(File.join(dir, cmd))
     end
+  end
+
+  def tmux_test_available?
+    return false if ENV['VPSFREE_DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+    return @tmux_test_available unless @tmux_test_available.nil?
+    return @tmux_test_available = false unless command_available?('tmux')
+
+    socket = "dev-session-probe-#{Process.pid}-#{object_id}"
+    shell = ENV.fetch('SHELL', '/bin/sh')
+    _stdout, _stderr, status = Open3.capture3(
+      'tmux', '-L', socket, 'new-session', '-d', '-s', 'probe', shell
+    )
+    _stdout, _stderr, live_status = Open3.capture3(
+      'tmux', '-L', socket, 'has-session', '-t', '=probe:'
+    )
+    @tmux_test_available = status.success? && live_status.success?
+    Open3.capture3('tmux', '-L', socket, 'kill-server') if @tmux_test_available
+    @tmux_test_available
   end
 end
