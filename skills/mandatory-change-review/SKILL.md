@@ -13,9 +13,9 @@ review is advisory, but Blocking and Important findings must be addressed as
 described below before continuing.
 
 The coordinating agent launches an adaptive team of one to four standalone
-reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` and
-the risk-scaled reasoning effort defined below, perform its assigned review
-directly, and not launch nested reviewers or subagents.
+reviewers with fresh context. Every reviewer must use model `gpt-5.6-sol` with
+reasoning effort `xhigh`, perform its assigned review directly, and not launch
+nested reviewers or subagents.
 
 ## Invocation Mode
 
@@ -29,7 +29,8 @@ First decide which role you are in:
 ## Reasoning Effort
 
 Before launching reviewers, classify the overall change at the highest risk
-present in any affected component:
+present in any affected component. The classification informs the packet and
+lane selection; all reviewers still use reasoning effort `xhigh`:
 
 - **Low:** a simple, localized, readily reversible change with no security,
   persisted-state, public-contract, destructive-operation, deployment, or
@@ -41,11 +42,10 @@ present in any affected component:
   contracts, protocols, host/node behavior, destructive or irreversible
   operations, deployment ordering, rollback, or mixed-version operation.
 
-Use reasoning effort `xhigh` for low- and medium-risk changes. Use `max` for
-high-risk changes. Apply the selected effort to every lane so reviewers share
-one explicit risk assumption. When uncertain, choose the higher risk. If an
-`xhigh` review uncovers a high-risk characteristic, reclassify the change and
-rerun every applicable lane at `max` before continuing.
+Use reasoning effort `xhigh` for every risk classification. Do not use `max`;
+its additional latency is disproportionate for this workflow. When uncertain,
+choose the higher risk classification so the packet and specialist lanes still
+cover the relevant concerns.
 
 ## Review Lanes
 
@@ -85,8 +85,8 @@ required lane.
    Do not review a half-staged or partly uncommitted implementation.
 3. Run quick verification first, using the local project guidance. Do not start
    long integration tests yet.
-4. Classify the overall risk and select the reasoning effort, then determine
-   the applicable lanes using the triggers above. Read every applicable lane
+4. Classify the overall risk, use reasoning effort `xhigh`, then determine the
+   applicable lanes using the triggers above. Read every applicable lane
    reference before preparing the review.
 5. Prepare a review packet containing:
    - requested outcome and acceptance criteria;
@@ -105,8 +105,8 @@ required lane.
      interface, and consumers discovered from imports, dependency pins,
      wrappers, manifests, documentation, and current repository state.
 6. Launch one fresh standalone agent per applicable lane. Set
-   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort` to the
-   risk-scaled value selected above. Give each agent the review packet, its
+   `fork_turns: "none"`, `model: "gpt-5.6-sol"`, and `reasoning_effort:
+   "xhigh"`. Give each agent the review packet, its
    lane, this skill path, and instructions to read the lane reference and
    perform the review itself. Do not pass hidden conclusions or ask for a
    rubber stamp.
@@ -122,8 +122,7 @@ required lane.
 10. Rerun only the lanes affected when a remediation introduces a new design,
    expands the accepted boundary, changes a public or cross-project contract,
    or resolves a finding through behavior the completed review did not assess.
-   Do not rerun unaffected lanes. The high-risk reclassification rule above
-   remains an explicit exception.
+   Do not rerun unaffected lanes.
 11. Record the risk classification and rationale, reviewer lanes, model and
    effort, reviewed commits, findings, decisions, fixes, and any reruns in the
    initiative `state.md`.
