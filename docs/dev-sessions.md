@@ -52,12 +52,18 @@ passes the base URL explicitly and exports both values into each managed pane.
 `work/<slug>/portal.yml`, and `worktrees/<slug>/` when missing. When
 `workspace-portal` is installed, it also creates a Codex App Server thread,
 records its ID, assigns the session name, and opens the terminal Codex client
-on that thread. On restart, the recorded thread ID is authoritative: the
-helper resumes that exact thread while refreshing its working directory and
-runtime environment. A working-directory search is used only to recover a
-lost `thread/start` response before an ID was recorded. Existing plan and state
-files are never overwritten. New state files begin with exact YAML front
-matter containing `lifecycle: active`; that
+on that thread. Once the initial turn is recorded, the thread ID is
+authoritative and the helper resumes that exact thread while refreshing its
+working directory and runtime environment. While an exclusive creation journal
+is still `creating` and its initial goal is unsent, the helper reconciles the
+unique working directory instead. It resumes the sole candidate, or replaces a
+recorded memory-only thread that vanished during an App Server restart. It
+refuses multiple candidates and never replaces a ready thread. Before the one
+allowed initial `turn/start`, it records a durable attempt marker. A retry of
+the same unmaterialized thread fails closed until exact matching history appears
+or an App Server restart permits a fresh creation replacement. Existing plan
+and state files are never overwritten. New state files begin with exact YAML
+front matter containing `lifecycle: active`; that
 anchored field is the only lifecycle authority. An
 exact slug that is present under `archive/` or active workspace state cannot be
 reused. The helper also checks the top-level Git index and history, so removing
@@ -323,10 +329,12 @@ creation journal before creating initiative state. It may resume a manifest
 whose creation state is `creating` or `ready` only when the complete request
 identity matches. The unique `work/<slug>` directory is used to reconcile one
 matching App Server thread, but App Server does not offer an exactly-once
-creation key. An ambiguous remote timeout can leave an orphan or duplicate, and
-multiple candidates are refused. An incomplete tmux session is replaced only
-when its creation environment identifies the exact workspace and slug. The
-journal remains in
+creation key. A pending retry resumes the sole candidate, creates a replacement
+when an App Server restart provably left none, and refuses multiple candidates.
+It sends the initial goal directly only when metadata identifies the expected
+fresh, idle, turnless thread; accepted or ambiguous active turns fail closed.
+An incomplete tmux session is replaced only when its creation environment
+identifies the exact workspace and slug. The journal remains in
 the lock directory after the manifest reaches `ready`, allowing the
 HTTP result to be replayed without repeating a known initial turn. The portal
 passes a full dated slug with `--as-is`, preserving request identity across

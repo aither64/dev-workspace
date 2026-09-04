@@ -22,6 +22,73 @@ func TestManifestFixtureLoadsAndMatchesDirectory(t *testing.T) {
 	}
 }
 
+func TestSharedValidManifestFixturesAreAccepted(t *testing.T) {
+	fixtures, err := filepath.Glob(filepath.Join("..", "..", "..", "test", "fixtures", "portal-manifest-valid*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixtures) < 2 {
+		t.Fatal("schema 1 and schema 2 valid manifest fixtures are required")
+	}
+	for _, fixture := range fixtures {
+		t.Run(filepath.Base(fixture), func(t *testing.T) {
+			data, readErr := os.ReadFile(fixture)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			var manifest Manifest
+			if err := decodeManifest(data, &manifest); err != nil {
+				t.Fatalf("valid shared fixture failed decoding: %v", err)
+			}
+			if err := manifest.Validate(fixtureSlug); err != nil {
+				t.Fatalf("valid shared fixture failed validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitialGoalAttemptMarkerIsLimitedToInFlightSchema(t *testing.T) {
+	attempted := true
+	for _, testCase := range []struct {
+		name     string
+		manifest Manifest
+		valid    bool
+	}{
+		{
+			name: "in-flight schema",
+			manifest: Manifest{
+				Schema: 2, Slug: "example",
+				Creation: Creation{State: "creating", InitialGoalAttempted: &attempted},
+			},
+			valid: true,
+		},
+		{
+			name: "marker in stable schema",
+			manifest: Manifest{
+				Schema: 1, Slug: "example",
+				Creation: Creation{State: "creating", InitialGoalAttempted: &attempted},
+			},
+		},
+		{
+			name: "ready in-flight schema",
+			manifest: Manifest{
+				Schema: 2, Slug: "example",
+				Creation: Creation{State: "ready", InitialGoalAttempted: &attempted},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := testCase.manifest.Validate("example")
+			if testCase.valid && err != nil {
+				t.Fatalf("valid manifest rejected: %v", err)
+			}
+			if !testCase.valid && err == nil {
+				t.Fatal("invalid manifest accepted")
+			}
+		})
+	}
+}
+
 func TestArchiveChronologyUsesFinalizedTimestamp(t *testing.T) {
 	workspace := fixtureWorkspace(t, "archive")
 	summary, err := Find(workspace, fixtureSlug)
@@ -154,7 +221,7 @@ func TestWorkspaceManifestNeverGrantsRuntimeInteractivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(directory, ManifestName)
-	creating := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/codex.sock\n  client_version: 0.152.1\ncreation:\n  state: creating\n  initial_goal_sent: false\n  goal_sha256: " + strings.Repeat("a", 64) + "\nrepositories: []\nartifacts: []\n"
+	creating := "schema: 2\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/codex.sock\n  client_version: 0.152.1\ncreation:\n  state: creating\n  initial_goal_sent: false\n  initial_goal_attempted: true\n  goal_sha256: " + strings.Repeat("a", 64) + "\nrepositories: []\nartifacts: []\n"
 	if err := os.WriteFile(path, []byte(creating), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +235,8 @@ func TestWorkspaceManifestNeverGrantsRuntimeInteractivity(t *testing.T) {
 	}
 	ready := strings.Replace(creating, "state: creating", "state: ready", 1)
 	ready = strings.Replace(ready, "initial_goal_sent: false", "initial_goal_sent: true", 1)
+	ready = strings.Replace(ready, "schema: 2", "schema: 1", 1)
+	ready = strings.Replace(ready, "  initial_goal_attempted: true\n", "", 1)
 	if err := os.WriteFile(path, []byte(ready), 0o644); err != nil {
 		t.Fatal(err)
 	}

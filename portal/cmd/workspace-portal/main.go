@@ -194,6 +194,8 @@ func threadCommand(args []string) error {
 	threadID := flags.String("thread-id", "", "thread id")
 	inputFile := flags.String("input-file", "", "file containing a message")
 	requireRuntime := flags.Bool("require-runtime", false, "require complete deployed runtime provenance")
+	recoverCreating := flags.Bool("recover-creating", false, "reconcile a creating thread by working directory")
+	startUnmaterialized := flags.Bool("start-unmaterialized", false, "allow the first turn on a proven fresh thread")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -213,7 +215,13 @@ func threadCommand(args []string) error {
 		if !*requireRuntime || !runtime.complete() {
 			return errors.New("thread create requires complete workspace, lifecycle, tmux and Codex provenance")
 		}
-		id, err := client.EnsureThread(ctx, *threadID, *cwd, runtime.environment())
+		var id string
+		var err error
+		if *recoverCreating {
+			id, err = client.RecoverCreatingThread(ctx, *threadID, *cwd, runtime.environment())
+		} else {
+			id, err = client.OpenThread(ctx, *threadID, *cwd, runtime.environment())
+		}
 		if err != nil {
 			return err
 		}
@@ -224,8 +232,8 @@ func threadCommand(args []string) error {
 		}
 		return client.SetName(ctx, *threadID, *name)
 	case "ensure-initial":
-		if *threadID == "" || *inputFile == "" {
-			return errors.New("thread ensure-initial requires --thread-id and --input-file")
+		if *threadID == "" || *cwd == "" || *inputFile == "" {
+			return errors.New("thread ensure-initial requires --thread-id, --cwd and --input-file")
 		}
 		input, err := os.ReadFile(*inputFile)
 		if err != nil {
@@ -241,7 +249,7 @@ func threadCommand(args []string) error {
 		if len(message) == 0 {
 			return errors.New("thread input must not be blank")
 		}
-		return client.EnsureInitialMessage(ctx, *threadID, string(message))
+		return client.EnsureInitialMessage(ctx, *threadID, *cwd, string(message), *startUnmaterialized)
 	case "require-idle":
 		if *threadID == "" || *cwd == "" {
 			return errors.New("thread require-idle requires --thread-id and --cwd")

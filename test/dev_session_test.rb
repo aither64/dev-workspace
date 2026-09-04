@@ -156,6 +156,7 @@ class DevSessionTest < Minitest::Test
         mark: '1',
         slug: @slug,
         workspace: @workspace,
+        environment_slug: @slug,
         socket_path: @socket_path,
         codex_thread_id: @codex_thread_id,
         codex_socket_path: @codex_socket_path,
@@ -969,6 +970,51 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_stopped_ready_session_opens_only_its_recorded_thread
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'fake-portal.rb')
+      File.write(portal, <<~RUBY)
+        File.write(#{log.dump}, ARGV.join(' '))
+        warn 'recorded thread is unavailable'
+        exit 1
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = { 'thread_id' => 'thread-ready' }
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          json: true
+        )
+      end
+      assert_includes(error.message, 'recorded thread is unavailable')
+      command = File.read(log)
+      assert_includes(command, 'thread create')
+      assert_includes(command, '--thread-id thread-ready')
+      refute_includes(command, '--recover-creating')
+      unchanged = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-ready', unchanged.dig('codex', 'thread_id'))
+      assert_equal('ready', unchanged.dig('creation', 'state'))
+    end
+  end
+
   def test_start_refuses_to_retrofit_an_unshared_running_session
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -1087,8 +1133,10 @@ class DevSessionTest < Minitest::Test
       end
       partial = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('thread-retry', partial.dig('codex', 'thread_id'))
+      assert_equal(2, partial.fetch('schema'))
       assert_equal('creating', partial.dig('creation', 'state'))
       refute(partial.dig('creation', 'initial_goal_sent'))
+      assert(partial.dig('creation', 'initial_goal_attempted'))
 
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
@@ -1112,13 +1160,19 @@ class DevSessionTest < Minitest::Test
       commands = File.readlines(log, chomp: true)
       creation_commands = commands.select { |line| line.start_with?('thread create ') }
       assert_equal(2, creation_commands.length)
+      creation_commands.each { |line| assert_includes(line, '--recover-creating') }
       refute_includes(creation_commands.fetch(0), '--thread-id')
       assert_includes(creation_commands.fetch(1), '--thread-id thread-retry')
-      assert_equal(2, commands.count { |line| line.start_with?('thread set-name ') })
-      assert_equal(2, commands.count { |line| line.start_with?('thread ensure-initial ') })
+      assert_equal(1, commands.count { |line| line.start_with?('thread set-name ') })
+      initial_commands = commands.select { |line| line.start_with?('thread ensure-initial ') }
+      assert_equal(2, initial_commands.length)
+      assert_includes(initial_commands.fetch(0), '--start-unmaterialized')
+      refute_includes(initial_commands.fetch(1), '--start-unmaterialized')
       complete = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', complete.dig('creation', 'state'))
       assert(complete.dig('creation', 'initial_goal_sent'))
+      assert_equal(1, complete.fetch('schema'))
+      refute(complete.fetch('creation').key?('initial_goal_attempted'))
 
       out.truncate(0)
       out.rewind
@@ -1135,7 +1189,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('thread-retry', JSON.parse(out.string).fetch('threadId'))
       replayed_commands = File.readlines(log, chomp: true)
       assert_equal(2, replayed_commands.count { |line| line.start_with?('thread create ') })
-      assert_equal(2, replayed_commands.count { |line| line.start_with?('thread set-name ') })
+      assert_equal(1, replayed_commands.count { |line| line.start_with?('thread set-name ') })
       assert_equal(2, replayed_commands.count { |line| line.start_with?('thread ensure-initial ') })
       journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
       assert_equal('ready', journal.fetch('state'))
@@ -1231,6 +1285,101 @@ class DevSessionTest < Minitest::Test
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', manifest.dig('creation', 'state'))
       assert(manifest.dig('creation', 'initial_goal_sent'))
+    end
+  end
+
+  def test_exclusive_browser_retry_replaces_unmaterialized_thread_after_app_server_restart
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'fake-portal.rb')
+      codex = File.join(workspace, 'codex')
+      authority_dir = File.join(workspace, 'runtime-authority')
+      File.write(goal, "Recover after an App Server restart.\n")
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.0'\n")
+      File.chmod(0o755, codex)
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        case ARGV[1]
+        when 'create'
+          id = ARGV.include?('--thread-id') ? 'thread-replacement' : 'thread-vanished'
+          puts JSON.generate(threadId: id)
+        when 'ensure-initial'
+          id = ARGV.fetch(ARGV.index('--thread-id') + 1)
+          exit 1 if id == 'thread-vanished'
+        end
+      RUBY
+      original = VpsfreeDevSession::Tmux::Session.new(
+        id: '$7', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-vanished', codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.153.0', codex_pane_id: '%1'
+      )
+      first_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| original }
+        define_method(:sync_slug) { |*_arguments, **_keywords| original }
+        define_method(:revalidate_session!) { |_expected| original }
+      end
+      first = first_runner_class.new(
+        workspace:, authority_dir:, tmux_socket: '/run/test/tmux.sock',
+        codex_socket: '/run/test/codex.sock', codex_version: '0.153.0',
+        codex_command: codex, tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      assert_raises(VpsfreeDevSession::CommandError) do
+        first.start(
+          slug, as_is: true, new: false, attach: false, run_codex: true,
+          goal_file: goal, json: true, exclusive: true
+        )
+      end
+
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-vanished', codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.153.0', codex_pane_id: '%1', id: '$7'
+      )
+      replacement = original.dup
+      replacement.id = '$8'
+      replacement.codex_thread_id = 'thread-replacement'
+      second_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| replacement }
+        define_method(:sync_slug) { |*_arguments, **_keywords| replacement }
+        define_method(:revalidate_session!) { |expected| expected }
+      end
+      second = second_runner_class.new(
+        workspace:, authority_dir:, tmux_socket: '/run/test/tmux.sock',
+        codex_socket: '/run/test/codex.sock', codex_version: '0.153.0',
+        codex_command: codex, tmux:,
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      second.start(
+        slug, as_is: true, new: false, attach: false, run_codex: true,
+        goal_file: goal, json: true, exclusive: true
+      )
+
+      assert(tmux.killed)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-replacement', manifest.dig('codex', 'thread_id'))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      assert(manifest.dig('creation', 'initial_goal_sent'))
+      authority = JSON.parse(File.read(File.join(authority_dir, "#{slug}.json")))
+      assert_equal('$8', authority.fetch('tmux_session_id'))
+      assert_equal('thread-replacement', authority.fetch('codex_thread_id'))
+      assert_equal('ready', authority.fetch('state'))
+      commands = File.readlines(log, chomp: true)
+      assert_equal(2, commands.count { |line| line.start_with?('thread create ') })
+      commands.select { |line| line.start_with?('thread create ') }.each do |line|
+        assert_includes(line, '--recover-creating')
+      end
+      assert(commands.any? do |line|
+        line.start_with?('thread ensure-initial ') &&
+          line.include?('--thread-id thread-replacement') &&
+          line.include?("--cwd #{File.join(workspace, 'work', slug)}")
+      end)
     end
   end
 
@@ -1414,6 +1563,7 @@ class DevSessionTest < Minitest::Test
                               .select { |line| line.include?('thread create') }
       assert_equal(2, creation_commands.length)
       creation_commands.each do |command|
+        assert_includes(command, '--recover-creating')
         assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
         assert_includes(command, "--workspace #{workspace}")
         assert_includes(command, "--session-slug #{slug}")
@@ -1561,6 +1711,27 @@ class DevSessionTest < Minitest::Test
       assert_equal('ready', manifest.dig('creation', 'state'))
       refute(manifest.key?('tmux'))
       assert_equal('2026-09-03T12:00:00Z', manifest['finalized_at'])
+    end
+  end
+
+  def test_ruby_manifest_validator_accepts_all_shared_valid_fixtures
+    fixtures = Dir[File.expand_path('fixtures/portal-manifest-valid*.yml', __dir__)]
+    assert_operator(fixtures.length, :>=, 2)
+
+    fixtures.each do |fixture|
+      with_workspace do |workspace|
+        slug = '2026-09-03-example'
+        directory = File.join(workspace, 'work', slug)
+        FileUtils.mkdir_p(directory)
+        FileUtils.cp(fixture, File.join(directory, 'portal.yml'))
+
+        manifest = runner_for(workspace).send(
+          :load_portal_manifest,
+          File.join(directory, 'portal.yml'),
+          required: true
+        )
+        assert_equal(slug, manifest['slug'], File.basename(fixture))
+      end
     end
   end
 

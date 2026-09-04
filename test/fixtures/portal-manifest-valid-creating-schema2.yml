@@ -1,0 +1,13 @@
+schema: 2
+slug: 2026-09-03-example
+codex:
+  thread_id: thread-creating
+  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  client_version: 0.153.0
+creation:
+  state: creating
+  initial_goal_sent: false
+  initial_goal_attempted: true
+  goal_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+repositories: []
+artifacts: []

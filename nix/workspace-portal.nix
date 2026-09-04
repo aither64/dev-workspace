@@ -46,6 +46,7 @@ buildGoModule {
     export SHELL=${bash}/bin/bash
     export TMUX_TMPDIR="$TMPDIR/tmux"
     export VPSFREE_DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
+    export VPSFREE_CODEX_TEST_BINARY=${codex}/bin/codex
     mkdir -p "$HOME" "$TMUX_TMPDIR"
     schema_dir="$TMPDIR/codex-schema"
     codex app-server generate-json-schema --experimental --out "$schema_dir"

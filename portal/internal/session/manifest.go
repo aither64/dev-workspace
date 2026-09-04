@@ -41,9 +41,10 @@ type Codex struct {
 }
 
 type Creation struct {
-	State           string `yaml:"state,omitempty" json:"state,omitempty"`
-	InitialGoalSent bool   `yaml:"initial_goal_sent,omitempty" json:"initialGoalSent,omitempty"`
-	GoalSHA256      string `yaml:"goal_sha256,omitempty" json:"goalSha256,omitempty"`
+	State                string `yaml:"state,omitempty" json:"state,omitempty"`
+	InitialGoalSent      bool   `yaml:"initial_goal_sent,omitempty" json:"initialGoalSent,omitempty"`
+	InitialGoalAttempted *bool  `yaml:"initial_goal_attempted,omitempty" json:"initialGoalAttempted,omitempty"`
+	GoalSHA256           string `yaml:"goal_sha256,omitempty" json:"goalSha256,omitempty"`
 }
 
 type Tmux struct {
@@ -101,7 +102,7 @@ func validSocketPath(path string) bool {
 }
 
 func (m *Manifest) Validate(expectedSlug string) error {
-	if m.Schema != 1 {
+	if m.Schema != 1 && m.Schema != 2 {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
 	}
 	if !ValidSlug(m.Slug) {
@@ -115,6 +116,13 @@ func (m *Manifest) Validate(expectedSlug string) error {
 	}
 	if m.Creation.GoalSHA256 != "" && !sha256Pattern.MatchString(m.Creation.GoalSHA256) {
 		return errors.New("invalid creation goal digest")
+	}
+	if m.Schema == 1 && m.Creation.InitialGoalAttempted != nil {
+		return errors.New("schema 1 must not contain an initial goal attempt marker")
+	}
+	if m.Schema == 2 && (m.Creation.State != "creating" || m.Creation.InitialGoalSent ||
+		m.Creation.InitialGoalAttempted == nil) {
+		return errors.New("invalid in-flight creation state")
 	}
 	if m.Codex.SocketPath != "" && !validSocketPath(m.Codex.SocketPath) {
 		return errors.New("invalid Codex socket path")
@@ -456,7 +464,11 @@ func validateManifestNode(root *yaml.Node) error {
 		}
 	}
 	if node := fields["creation"]; node != nil {
-		items, err := strictMapping(node, []string{"state", "initial_goal_sent", "goal_sha256"}, nil)
+		items, err := strictMapping(
+			node,
+			[]string{"state", "initial_goal_sent", "initial_goal_attempted", "goal_sha256"},
+			nil,
+		)
 		if err != nil {
 			return fmt.Errorf("creation: %w", err)
 		}
@@ -468,6 +480,11 @@ func validateManifestNode(root *yaml.Node) error {
 		}
 		if value := items["initial_goal_sent"]; value != nil {
 			if err := scalarTag(value, "!!bool", "initial_goal_sent"); err != nil {
+				return fmt.Errorf("creation: %w", err)
+			}
+		}
+		if value := items["initial_goal_attempted"]; value != nil {
+			if err := scalarTag(value, "!!bool", "initial_goal_attempted"); err != nil {
 				return fmt.Errorf("creation: %w", err)
 			}
 		}

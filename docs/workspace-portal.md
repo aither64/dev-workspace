@@ -60,17 +60,34 @@ session and remove only a validated, idle stale record:
 workspace-dev-session recover-stale 2026-09-03-example --as-is
 ```
 
-The local journal is crash-safe. Codex does not accept caller-supplied
-idempotency keys for thread or turn creation, so a lost remote response can be
-ambiguous. Recovery accepts one matching candidate and refuses conflicting
-candidates.
+The local journal provides at-most-once initial-goal delivery. Codex does not
+accept caller-supplied idempotency keys for thread or turn creation, so the
+helper durably records an initial submission attempt in a temporary schema-2
+manifest before calling `turn/start`. A retry against the same unmaterialized
+thread fails closed; it does not rely on a briefly stale idle status. Once
+history materializes, the retry requires exactly one matching initial user
+message. If an App Server restart removes the recorded memory-only thread,
+creation-only reconciliation can select or create one exact fresh replacement
+and clear the attempt marker.
+A crash between recording the attempt and sending it can therefore require an
+App Server restart before retrying.
+
+A lost `thread/start` response can race the App Server's in-memory registration
+and leave an unprompted orphan. Recovery refuses multiple visible candidates;
+restarting the App Server clears such memory-only orphans. This does not resend
+the initial goal because initial-goal delivery has its own durable attempt
+marker. Completion removes the marker and writes the ordinary schema-1
+manifest, so completed sessions remain readable after a rollback. A previous
+portal version intentionally rejects an in-flight schema-2 creation; redeploy
+the current version to reconcile it.
 
 ## Portal manifest
 
 `dev-session start` creates `work/<slug>/portal.yml`. Worktree creation records
 the repository identity, branch, GitHub repository, default branch, and initial
 commit. Cleanup records final commits, and finalization preserves the same URL
-under `archive/<slug>`.
+under `archive/<slug>`. The example is the stable schema written after creation;
+schema 2 exists only while an initial goal has an unresolved delivery outcome.
 
 ```yaml
 schema: 1

@@ -1,0 +1,8 @@
+schema: 2
+slug: 2026-09-03-example
+creation:
+  state: creating
+  initial_goal_sent: true
+  initial_goal_attempted: true
+repositories: []
+artifacts: []

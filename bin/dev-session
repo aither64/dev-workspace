@@ -413,6 +413,7 @@ module VpsfreeDevSession
         manifest = nil
         thread_id = nil
         goal_pending = false
+        start_unmaterialized = false
 
         selected_session = with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
@@ -456,8 +457,37 @@ module VpsfreeDevSession
             raise Error,
                   "existing tmux session has no shared Codex thread; stop it before enabling portal interaction: #{slug}"
           end
-          if run_codex && (thread_id.nil? || thread_id.empty?)
-            persisted_thread = manifest.dig('codex', 'thread_id')
+          persisted_thread = manifest.dig('codex', 'thread_id')
+          recovering_creation = run_codex &&
+                                creation_journal&.fetch('state', nil) == 'creating' &&
+                                manifest.dig('creation', 'state') == 'creating' &&
+                                !manifest.dig('creation', 'initial_goal_sent')
+          if recovering_creation
+            if thread_id && !thread_id.empty? && thread_id != persisted_thread
+              raise Error, "creating session authority does not match the manifest for #{slug}"
+            end
+            recovered_thread = create_portal_thread(
+              slug,
+              persisted_thread_id: persisted_thread,
+              recover_creating: true
+            )
+            if recovered_thread && persisted_thread && recovered_thread != persisted_thread
+              if selected
+                ensure_managed_session!(slug, session: selected) if @selected_authority
+                reconcile_creation_tmux_session!(slug, selected)
+                selected = nil
+              end
+              delete_session_authority(slug) if @selected_authority
+            end
+            thread_id = recovered_thread
+            if thread_id && thread_id != persisted_thread
+              manifest['codex'] = codex_metadata(thread_id)
+              manifest['schema'] = 2
+              manifest['creation']['initial_goal_attempted'] = false
+              write_portal_manifest(slug, manifest)
+              name_portal_thread(slug, thread_id)
+            end
+          elsif run_codex && (thread_id.nil? || thread_id.empty?)
             thread_id = create_portal_thread(slug, persisted_thread_id: persisted_thread)
             if thread_id
               manifest['codex'] = codex_metadata(thread_id)
@@ -492,6 +522,16 @@ module VpsfreeDevSession
           trusted_thread_id = thread_id
           goal_pending = run_codex && thread_id && goal_file &&
                          !manifest.dig('creation', 'initial_goal_sent')
+          if goal_pending && !manifest.fetch('creation').key?('initial_goal_attempted')
+            manifest['schema'] = 2
+            manifest['creation']['initial_goal_attempted'] = true
+          end
+          start_unmaterialized = goal_pending &&
+                                 manifest.dig('creation', 'initial_goal_attempted') == false
+          if start_unmaterialized
+            manifest['schema'] = 2
+            manifest['creation']['initial_goal_attempted'] = true
+          end
           manifest['creation']['state'] = goal_pending ? 'creating' : 'ready'
           write_portal_manifest(slug, manifest)
           if goal_pending
@@ -508,7 +548,12 @@ module VpsfreeDevSession
           # slug lock is released. The initial turn can safely invoke workspace
           # helpers while duplicate creation and destructive lifecycle commands
           # remain excluded by the host-only creation lock.
-          send_portal_goal(thread_id, goal_file)
+          send_portal_goal(
+            slug,
+            thread_id,
+            goal_file,
+            start_unmaterialized:
+          )
           selected_session = with_slug_lock(slug) do
             select_tmux_for_slug!(slug)
             current = revalidate_session!(selected_session)
@@ -519,6 +564,8 @@ module VpsfreeDevSession
             end
             current_manifest['creation']['initial_goal_sent'] = true
             current_manifest['creation']['state'] = 'ready'
+            current_manifest['creation'].delete('initial_goal_attempted')
+            current_manifest['schema'] = 1
             write_portal_manifest(slug, current_manifest)
             mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
             write_session_authority(slug, current, state: 'ready')
@@ -1304,13 +1351,14 @@ module VpsfreeDevSession
       return manifest if manifest
 
       manifest = {
-        'schema' => 1,
+        'schema' => creation_journal ? 2 : 1,
         'slug' => slug,
         'codex' => {},
         'creation' => if creation_journal
                         {
                           'state' => 'creating',
                           'initial_goal_sent' => false,
+                          'initial_goal_attempted' => false,
                           'goal_sha256' => creation_journal['goal_sha256']
                         }.compact
                       else
@@ -1388,7 +1436,7 @@ module VpsfreeDevSession
 
     def validate_portal_manifest!(manifest, expected_slug, path)
       unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
-             manifest['schema'] == 1
+             [1, 2].include?(manifest['schema'])
         raise Error, "unsupported portal manifest: #{path}"
       end
       validate_mapping_keys!(
@@ -1428,12 +1476,9 @@ module VpsfreeDevSession
          (!codex_provenance.all? { |key| codex.key?(key) } || codex['thread_id'].to_s.empty?)
         raise Error, "incomplete portal Codex provenance in #{path}"
       end
-      validate_mapping_keys!(
-        creation,
-        %w[state initial_goal_sent goal_sha256],
-        'portal creation metadata',
-        path
-      )
+      creation_keys = %w[state initial_goal_sent goal_sha256]
+      creation_keys << 'initial_goal_attempted' if manifest['schema'] == 2
+      validate_mapping_keys!(creation, creation_keys, 'portal creation metadata', path)
       state = creation['state']
       if creation.key?('state') && (!state.is_a?(String) || !%w[creating ready].include?(state))
         raise Error, "invalid portal creation state in #{path}"
@@ -1441,6 +1486,19 @@ module VpsfreeDevSession
       if creation.key?('initial_goal_sent') &&
          ![true, false].include?(creation['initial_goal_sent'])
         raise Error, "invalid portal initial-goal state in #{path}"
+      end
+      if creation.key?('initial_goal_attempted') &&
+         ![true, false].include?(creation['initial_goal_attempted'])
+        raise Error, "invalid portal initial-goal attempt state in #{path}"
+      end
+      if creation['initial_goal_sent'] && creation.key?('initial_goal_attempted') &&
+         !creation['initial_goal_attempted']
+        raise Error, "invalid portal initial-goal delivery state in #{path}"
+      end
+      if manifest['schema'] == 2 &&
+         (state != 'creating' || creation['initial_goal_sent'] ||
+          !creation.key?('initial_goal_attempted'))
+        raise Error, "invalid in-flight portal creation state in #{path}"
       end
       goal_sha256 = creation['goal_sha256']
       if creation.key?('goal_sha256') &&
@@ -1573,7 +1631,7 @@ module VpsfreeDevSession
         (offset_hour.nil? || (offset_hour < 24 && offset_minute < 60))
     end
 
-    def create_portal_thread(slug, persisted_thread_id: nil)
+    def create_portal_thread(slug, persisted_thread_id: nil, recover_creating: false)
       unless @portal_command && !@portal_command.empty?
         @err.puts 'warning: workspace-portal is unavailable; starting an unshared Codex session'
         return nil
@@ -1586,6 +1644,7 @@ module VpsfreeDevSession
       end
       command << '--require-runtime' if environment[ENV_REQUIRE_RUNTIME] == '1'
       command += ['--thread-id', persisted_thread_id] if persisted_thread_id
+      command << '--recover-creating' if recover_creating
       stdout, _stderr, _status = @command_runner.capture(command)
       result = JSON.parse(stdout)
       thread_id = result['threadId']
@@ -1614,16 +1673,19 @@ module VpsfreeDevSession
       @err.puts "warning: unable to name shared Codex thread: #{e.message}"
     end
 
-    def send_portal_goal(thread_id, goal_file)
+    def send_portal_goal(slug, thread_id, goal_file, start_unmaterialized:)
       command = [
         *@portal_command,
         'thread',
         'ensure-initial',
         '--thread-id',
         thread_id,
+        '--cwd',
+        work_dir(slug),
         '--input-file',
         File.expand_path(goal_file)
       ]
+      command << '--start-unmaterialized' if start_unmaterialized
       command += ['--socket', @codex_socket] if @codex_socket
       @command_runner.capture(command)
     end
