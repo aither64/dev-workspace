@@ -452,6 +452,33 @@ func TestClosedSessionDoesNotRenderMutationControls(t *testing.T) {
 	}
 }
 
+func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		BaseURL: "https://workspace.example.test",
+		Session: &session.Summary{Manifest: session.Manifest{
+			Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+			Artifacts: []session.Artifact{{Label: "Report", Path: "report.md"}},
+		}},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{
+		`class="panel session-tabs"`, `data-tab="codex"`, `data-tab="handoff"`,
+		`data-tab="repositories"`, `data-tab="plan"`, `data-tab="state"`,
+		`id="codex" class="tab-panel chat-panel active"`, `>Report</a>`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("session page lacks %s", marker)
+		}
+	}
+	for _, oldLayout := range []string{"session-layout", "chat-column", "workspace-column"} {
+		if strings.Contains(body, oldLayout) {
+			t.Fatalf("session page still contains %q", oldLayout)
+		}
+	}
+}
+
 func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string

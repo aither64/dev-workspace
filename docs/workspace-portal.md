@@ -7,10 +7,10 @@ https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz/
 ```
 
 It lists active and archived initiatives that contain `portal.yml`, with the
-newest dated sessions first. An initiative page shows GitHub comparisons,
-recent workflow runs, the plan, current state, curated artifacts, and its Codex
-conversation. An active conversation can receive messages, be interrupted,
-answer Codex questions, and handle supported command or file-change approvals.
+newest dated sessions first. Each initiative uses full-width tabs for its Codex
+conversation, handoff commands, repositories, plan, state, and curated
+artifacts. An active conversation can receive messages, be interrupted, answer
+Codex questions, and handle supported command or file-change approvals.
 
 The portal is not a shell or a general file browser. It exposes `plan.md`,
 `state.md`, and files explicitly listed in `portal.yml`. Curated artifacts are

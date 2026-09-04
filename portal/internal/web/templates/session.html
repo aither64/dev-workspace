@@ -12,10 +12,35 @@
     <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
     <div class="header-actions"><span class="badge {{if .Session.Closed}}archived{{else}}active{{end}}">{{if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete{{else if eq .Session.Lifecycle "abandoned"}}Abandoned{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span></div>
   </header>
-  <main class="page session-layout">
+  <main class="page session-page">
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
-    <section class="workspace-column">
-      <section class="panel">
+    <section class="panel session-tabs">
+      <div class="tabs">
+        {{if .Session.Codex.ThreadID}}<button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="codex" data-tab="codex">Codex</button>{{end}}
+        <button class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" type="button" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-tab="handoff">Handoff</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="repositories" data-tab="repositories">Repositories</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="plan" data-tab="plan">Plan</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="state" data-tab="state">State</button>
+        {{range .Session.Artifacts}}<a class="tab" href="/artifacts/{{$.Session.Slug}}/{{.Path}}">{{.Label}}</a>{{end}}
+      </div>
+
+      {{if .Session.Codex.ThreadID}}
+      <section id="codex" class="tab-panel chat-panel active" role="tabpanel">
+        <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><span id="codex-status" class="badge">Connecting</span></div>
+        {{if .Session.Interactive}}
+        <div id="pending" class="pending"></div>
+        {{end}}
+        <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
+        {{if .Session.Interactive}}
+        <form id="message-form" class="chat-form">
+          <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
+          <div class="chat-actions"><button type="submit">Send</button><button id="interrupt" type="button" class="danger">Interrupt</button></div>
+        </form>
+        {{end}}
+      </section>
+      {{end}}
+
+      <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel">
         <div class="section-heading"><h2>Handoff</h2></div>
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
@@ -24,7 +49,7 @@
         {{end}}
       </section>
 
-      <section>
+      <section id="repositories" class="tab-panel" role="tabpanel">
         <div class="section-heading"><h2>Repositories</h2><span>{{len .Repositories}}</span></div>
         <div class="repo-grid">
         {{range .Repositories}}
@@ -43,28 +68,9 @@
         </div>
       </section>
 
-      <section class="panel documents">
-        <div class="tabs" role="tablist"><button class="tab active" data-tab="plan">Plan</button><button class="tab" data-tab="state">State</button>{{range .Session.Artifacts}}<a class="tab" href="/artifacts/{{$.Session.Slug}}/{{.Path}}">{{.Label}}</a>{{end}}</div>
-        <article id="plan" class="document active">{{.Plan}}</article>
-        <article id="state" class="document">{{.State}}</article>
-      </section>
+      <article id="plan" class="tab-panel document" role="tabpanel">{{.Plan}}</article>
+      <article id="state" class="tab-panel document" role="tabpanel">{{.State}}</article>
     </section>
-
-    <aside class="chat-column panel">
-      <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><span id="codex-status" class="badge">Connecting</span></div>
-      {{if .Session.Codex.ThreadID}}
-        {{if .Session.Interactive}}
-        <div id="pending" class="pending"></div>
-        {{end}}
-        <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
-        {{if .Session.Interactive}}
-        <form id="message-form" class="chat-form">
-          <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
-          <div class="chat-actions"><button type="submit">Send</button><button id="interrupt" type="button" class="danger">Interrupt</button></div>
-        </form>
-        {{end}}
-      {{else}}<p class="empty">This session has no connected Codex thread.</p>{{end}}
-    </aside>
   </main>
   <script src="/static/app.js" defer></script>
 </body>
