@@ -32,10 +32,13 @@ server at `/run/vpsfree-workspace-tmux/tmux.sock`. Use the immutable host
 wrapper for terminal actions:
 
 ```sh
-workspace-dev-session attach 2026-09-03-example --as-is
-workspace-dev-session stop 2026-09-03-example --as-is
-workspace-dev-session url 2026-09-03-example --as-is
+dev-session attach 2026-09-03-example
+dev-session stop 2026-09-03-example
+dev-session url 2026-09-03-example
 ```
+
+The full dated slug is accepted directly. You can also use a short name when it
+matches exactly one session.
 
 The page shows attach and conversation controls only when host-only authority
 under `/run/vpsfree-workspace-authority` is ready and matches the live tmux
@@ -57,7 +60,7 @@ an active turn. If tmux disappears before authority cleanup, inspect the
 session and remove only a validated, idle stale record:
 
 ```sh
-workspace-dev-session recover-stale 2026-09-03-example --as-is
+dev-session recover-stale 2026-09-03-example
 ```
 
 The local journal provides at-most-once initial-goal delivery. Codex does not

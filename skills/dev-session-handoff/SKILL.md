@@ -6,8 +6,8 @@ description: Prepare a handoff for a vpsFree.cz development initiative and inclu
 # Development session handoff
 
 Use the initiative tracked by the current process. When
-`VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`, use the configuration-owned
-`workspace-dev-session`; otherwise use checkout-local `bin/dev-session`. Run
+`VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`, use the NixOS-installed
+`dev-session`; otherwise use checkout-local `bin/dev-session`. Run
 the applicable helper's `current` command and accept its result only when
 `VPSFREE_DEV_SESSION_SLUG` has the same value, as required by the workspace
 `AGENTS.md`. Do not use or modify another concurrent session. If no initiative

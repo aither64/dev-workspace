@@ -895,6 +895,37 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_exact_slug_attach_from_a_normal_shell_uses_the_target_tmux_server
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      target = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/vpsfree-workspace-tmux/tmux.sock'
+      )
+      calls = []
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: target,
+        process_exec: ->(environment, argv) { calls << [environment, argv] },
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.ensure_tracking_files(slug)
+
+      runner.attach(slug, as_is: false)
+
+      assert_equal(1, calls.length)
+      assert_equal({}, calls[0][0])
+      assert_equal(
+        ['tmux', 'attach-session', '-t', '$managed:'],
+        calls[0][1]
+      )
+    end
+  end
+
   def test_start_seeds_the_goal_and_returns_json_with_a_shared_thread
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -4061,7 +4092,7 @@ class DevSessionTest < Minitest::Test
 
       assert_includes(
         out.string,
-        "stop after committing: workspace-dev-session stop #{slug} --as-is"
+        "stop after committing: dev-session stop #{slug} --as-is"
       )
     end
   end

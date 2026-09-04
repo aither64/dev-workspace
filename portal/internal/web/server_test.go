@@ -309,9 +309,12 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 			}
-			hasAttach := strings.Contains(response.Body.String(), "workspace-dev-session attach example --as-is")
+			hasAttach := strings.Contains(response.Body.String(), "dev-session attach example\"")
 			if hasAttach != testCase.wantAttach {
 				t.Fatalf("attach visibility = %t, want %t", hasAttach, testCase.wantAttach)
+			}
+			if strings.Contains(response.Body.String(), "dev-session attach example --as-is") {
+				t.Fatal("session page advertises an unnecessary --as-is option")
 			}
 		})
 	}

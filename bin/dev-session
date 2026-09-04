@@ -696,7 +696,7 @@ module VpsfreeDevSession
           @out.puts "archived: #{destination}"
           @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
           if plan.session
-            helper = @require_runtime ? 'workspace-dev-session' : 'bin/dev-session'
+            helper = @require_runtime ? 'dev-session' : 'bin/dev-session'
             @out.puts "stop after committing: #{helper} stop #{slug} --as-is"
           end
         rescue StandardError
@@ -2438,7 +2438,7 @@ module VpsfreeDevSession
 
     def attach_to_session(session)
       revalidate_session!(session)
-      caller_socket = @env['TMUX'].to_s.split(',', 2).first
+      caller_socket = @env['TMUX'].to_s.partition(',').first
       if !caller_socket.empty? && caller_socket == session.socket_path
         @tmux.run('switch-client', '-t', Tmux.session_target(session.id))
       else

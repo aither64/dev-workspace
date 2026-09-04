@@ -110,8 +110,9 @@ bin/dev-session url
 
 Lookup commands accept a short name when it resolves to exactly one known slug
 from `work/`, `worktrees/`, or managed tmux sessions. If multiple slugs match,
-the command fails and prints the candidates. Use the full slug with `--as-is`
-to avoid ambiguity.
+the command fails and prints the candidates. Use the full dated slug directly
+to avoid ambiguity. The `--as-is` option is only needed when a command must
+treat an input as a literal slug before that slug is known to the workspace.
 
 `sync` creates one managed tmux window for every git worktree under
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no
@@ -345,10 +346,10 @@ executable used for thread creation.
 The deployed portal uses `--require-runtime`, also propagated as
 `VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`. In that mode the authority directory,
 tmux socket, Codex command and socket, client version, and portal command must
-all be present, and every path must be absolute. On aitherdev, use the immutable
-`workspace-dev-session` wrapper for portal-managed sessions. Direct
-`bin/dev-session` use remains appropriate for ordinary local workspace
-coordination that is not attached to the deployed portal runtime.
+all be present, and every path must be absolute. Aitherdev installs the same CLI
+as `dev-session` with those values fixed by its NixOS configuration. The
+checkout's `bin/dev-session` consumes the exported session variables, so both
+entry points use the same commands and session model.
 
 See [Workspace portal](workspace-portal.md) for the browser interface, manifest
 format, security model, private CA, and deployment responsibilities.

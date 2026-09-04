@@ -19,8 +19,8 @@
         <div class="section-heading"><h2>Handoff</h2></div>
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
-        <label>Attach from aitherdev<div class="copy-row"><input readonly value="workspace-dev-session attach {{.Session.Slug}} --as-is"><button type="button" data-copy>Copy</button></div></label>
-        <label>Attach over SSH<div class="copy-row"><input readonly value="ssh -t aitherdev.int.vpsfree.cz &quot;workspace-dev-session attach {{.Session.Slug}} --as-is&quot;"><button type="button" data-copy>Copy</button></div></label>
+        <label>Attach from aitherdev<div class="copy-row"><input readonly value="dev-session attach {{.Session.Slug}}"><button type="button" data-copy>Copy</button></div></label>
+        <label>Attach over SSH<div class="copy-row"><input readonly value="ssh -t aitherdev.int.vpsfree.cz &quot;dev-session attach {{.Session.Slug}}&quot;"><button type="button" data-copy>Copy</button></div></label>
         {{end}}
       </section>
 
