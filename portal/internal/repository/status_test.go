@@ -10,7 +10,7 @@ import (
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
 )
 
-func TestInspectUsesOnlyManifestMetadata(t *testing.T) {
+func TestInspectUsesValidatedRepositoryMetadata(t *testing.T) {
 	gh := filepath.Join(t.TempDir(), "gh")
 	script := `#!/bin/sh
 case "$1" in
@@ -27,6 +27,17 @@ esac
 	if len(statuses) != 1 || statuses[0].DefaultBranch != "main" ||
 		statuses[0].CompareURL != "https://github.com/example/project/compare/main...feature" {
 		t.Fatalf("unexpected active status: %#v", statuses)
+	}
+}
+
+func TestInspectKeepsRecordedDefaultBranchWhenGitHubLookupFails(t *testing.T) {
+	statuses := (Runner{GH: "false"}).Inspect(context.Background(), []session.Repository{{
+		Name: "project", GitHub: "example/project", Branch: "feature", DefaultBranch: "master",
+	}}, false)
+	if len(statuses) != 1 || statuses[0].DefaultBranch != "master" ||
+		statuses[0].CompareURL != "https://github.com/example/project/compare/master...feature" ||
+		statuses[0].GitHubError == "" {
+		t.Fatalf("unexpected fallback status: %#v", statuses)
 	}
 }
 

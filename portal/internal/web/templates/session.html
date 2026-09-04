@@ -7,10 +7,15 @@
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-session="{{.Session.Slug}}" data-interactive="{{.Session.Interactive}}">
+<body data-session="{{.Session.Slug}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}">
   <header class="topbar">
     <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
-    <div class="header-actions"><span class="badge {{if .Session.Closed}}archived{{else}}active{{end}}">{{if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete{{else if eq .Session.Lifecycle "abandoned"}}Abandoned{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span></div>
+    <div class="header-actions">
+      {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet">Fork session</button>{{end}}
+      {{if and .Session.Interactive (eq .Session.Lifecycle "active")}}<button id="finish-session" type="button" class="quiet">Prepare to finish</button>{{end}}
+      {{if .ArchivePending}}<button id="archive-session" type="button">{{if .Session.Archived}}Complete archive{{else}}Archive session{{end}}</button>{{end}}
+      <span class="badge {{if .Session.Closed}}archived{{else}}active{{end}}">{{if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete{{else if eq .Session.Lifecycle "abandoned"}}Abandoned{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
+    </div>
   </header>
   <main class="page session-page">
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
@@ -19,6 +24,7 @@
         {{if .Session.Codex.ThreadID}}<button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="codex" data-tab="codex">Codex</button>{{end}}
         <button class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" type="button" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-tab="handoff">Handoff</button>
         <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="repositories" data-tab="repositories">Repositories</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="clusters" data-tab="clusters">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</button>
         <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="plan" data-tab="plan">Plan</button>
         <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="state" data-tab="state">State</button>
         {{range .Session.Artifacts}}<a class="tab" href="/artifacts/{{$.Session.Slug}}/{{.Path}}">{{.Label}}</a>{{end}}
@@ -28,6 +34,11 @@
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel">
         <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><span id="codex-status" class="badge">Connecting</span></div>
         {{if .Session.Interactive}}
+        <form id="codex-settings" class="settings-form">
+          <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
+          <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
+          <button type="submit" class="secondary">Save settings</button>
+        </form>
         <div id="pending" class="pending"></div>
         {{end}}
         <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
@@ -42,6 +53,7 @@
 
       <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel">
         <div class="section-heading"><h2>Handoff</h2></div>
+        {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
         <label>Attach from aitherdev<div class="copy-row"><input readonly value="dev-session attach {{.Session.Slug}}"><button type="button" data-copy>Copy</button></div></label>
@@ -68,10 +80,40 @@
         </div>
       </section>
 
+      <section id="clusters" class="tab-panel" role="tabpanel">
+        <div class="section-heading"><h2>Development clusters</h2><span>{{len .Clusters}}</span></div>
+        <div class="repo-grid">
+        {{range .Clusters}}
+          <article class="panel repo-card cluster-card" data-cluster="{{.Kind}}">
+            <div class="repo-title"><h3>{{.Label}}</h3><span class="badge {{if eq .State "running"}}active{{else if eq .State "stale"}}warning{{end}}">{{.State}}</span></div>
+            <dl>{{if .Topology}}<dt>Topology</dt><dd>{{.Topology}}</dd>{{end}}{{if .Network}}<dt>Network</dt><dd>{{.Network}}</dd>{{end}}<dt>Ready</dt><dd>{{if .Ready}}yes{{else}}no{{end}}</dd></dl>
+            {{if .Links}}<nav class="link-row">{{range .Links}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{.Label}}</a>{{end}}</nav>{{end}}
+            {{range .Commands}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}
+            {{if .Credentials}}<details><summary>Test credentials</summary>{{range .Credentials}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}</details>{{end}}
+            {{if $.Session.Interactive}}<button type="button" class="danger" data-release-cluster="{{.Kind}}">Release cluster</button>{{end}}
+          </article>
+        {{else}}<p class="empty">No development cluster state for this session.</p>{{end}}
+        </div>
+      </section>
+
       <article id="plan" class="tab-panel document" role="tabpanel">{{.Plan}}</article>
       <article id="state" class="tab-panel document" role="tabpanel">{{.State}}</article>
     </section>
   </main>
+  {{if .Session.Interactive}}
+  <dialog id="fork-dialog">
+    <form id="fork-form" class="stack">
+      <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Worktrees, files, and development clusters stay with this session.</p></div>
+      <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>
+      <div class="field-grid">
+        <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
+        <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
+      </div>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create fork</button></div>
+    </form>
+  </dialog>
+  {{end}}
   <script src="/static/app.js" defer></script>
 </body>
 </html>

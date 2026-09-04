@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE="$(cd -- "$CLUSTER_DIR/../.." && pwd)"
+WORKSPACE="${VPSFREE_DEVCLUSTER_WORKSPACE:-$(cd -- "$CLUSTER_DIR/../.." && pwd)}"
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadminos"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
@@ -232,19 +232,47 @@ cluster_running() {
   local slug="$1"
   local pid_path
   pid_path="$(pid_file "$slug")"
-  [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"
+  [ -f "$pid_path" ] && runner_process_matches "$slug" "$(cat "$pid_path")"
+}
+
+runner_process_matches() {
+  local slug="$1"
+  local pid="$2"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  is_running "$pid" || return 1
+  process_has_argument "$pid" "$(socket_dir "$slug")"
+}
+
+process_has_argument() {
+  local pid="$1"
+  local expected="$2"
+  local argument
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' argument; do
+    [ "$argument" = "$expected" ] && return 0
+  done < "/proc/$pid/cmdline"
+  return 1
+}
+
+socket_processes() {
+  local slug="$1"
+  local expected process pid
+  expected="$(socket_dir "$slug")"
+  for process in /proc/[0-9]*; do
+    pid="${process##*/}"
+    process_has_argument "$pid" "$expected" && printf '%s\n' "$pid"
+  done
 }
 
 kill_socket_processes() {
   local slug="$1"
-  local sock_dir pid
-  sock_dir="$(socket_dir "$slug")"
+  local pid
 
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" = "$$" ] && continue
     kill -TERM "$pid" 2>/dev/null || true
-  done < <(pgrep -f "$sock_dir" || true)
+  done < <(socket_processes "$slug")
 
   sleep 2
 
@@ -252,7 +280,7 @@ kill_socket_processes() {
     [ -n "$pid" ] || continue
     [ "$pid" = "$$" ] && continue
     kill -KILL "$pid" 2>/dev/null || true
-  done < <(pgrep -f "$sock_dir" || true)
+  done < <(socket_processes "$slug")
 }
 
 ensure_ssh_key() {
@@ -418,7 +446,7 @@ start_cluster() {
 
   local pid_path
   pid_path="$(pid_file "$slug")"
-  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+  if [ -f "$pid_path" ] && runner_process_matches "$slug" "$(cat "$pid_path")"; then
     die "cluster '$slug' is already running with PID $(cat "$pid_path")"
   fi
 
@@ -491,7 +519,7 @@ start_cluster() {
       return
     fi
 
-    if [ -f "$pid_path" ] && ! is_running "$(cat "$pid_path")"; then
+    if [ -f "$pid_path" ] && ! runner_process_matches "$slug" "$(cat "$pid_path")"; then
       die "runner exited before becoming ready; see $log"
     fi
 
@@ -521,7 +549,7 @@ stop_cluster() {
 
   pid="$(cat "$pid_path")"
 
-  if ! is_running "$pid"; then
+  if ! runner_process_matches "$slug" "$pid"; then
     rm -f "$pid_path" "$(ready_file "$slug")"
     kill_socket_processes "$slug"
     remove_result_link "$slug"
@@ -532,7 +560,7 @@ stop_cluster() {
   kill -TERM "$pid" 2>/dev/null || true
 
   for _ in $(seq 1 120); do
-    is_running "$pid" || {
+    runner_process_matches "$slug" "$pid" || {
       kill_socket_processes "$slug"
       remove_result_link "$slug"
       printf 'cluster %s stopped\n' "$slug"
@@ -555,7 +583,7 @@ status_cluster() {
   pid_path="$(pid_file "$slug")"
 
   local running=0
-  if [ -f "$pid_path" ] && is_running "$(cat "$pid_path")"; then
+  if [ -f "$pid_path" ] && runner_process_matches "$slug" "$(cat "$pid_path")"; then
     running=1
     printf 'cluster: %s\nstatus: running\npid: %s\n' "$slug" "$(cat "$pid_path")"
   else
@@ -774,7 +802,7 @@ reset_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
 
-  if [ -f "$(pid_file "$slug")" ] && is_running "$(cat "$(pid_file "$slug")")"; then
+  if [ -f "$(pid_file "$slug")" ] && runner_process_matches "$slug" "$(cat "$(pid_file "$slug")")"; then
     stop_cluster "$slug"
   fi
 
@@ -792,6 +820,11 @@ main() {
     exit 2
   }
   shift
+
+  if [ "$cmd" != "gcroots" ] && [ "$cmd" != "help" ] &&
+     [ "$cmd" != "-h" ] && [ "$cmd" != "--help" ]; then
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid or missing slug"
+  fi
 
   case "$cmd" in
     start) start_cluster "$@" ;;

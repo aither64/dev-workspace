@@ -40,9 +40,8 @@ type Runner struct {
 	GH string
 }
 
-// Inspect derives repository links only from the validated portal manifest.
-// Worktrees are writable from the development LXC, so the host portal must not
-// invoke Git or trust repository configuration while serving a page.
+// Inspect derives repository links from repository records that the session
+// package has already validated. It does not inspect writable worktrees.
 func (r Runner) Inspect(ctx context.Context, repositories []session.Repository, closed bool) []Status {
 	statuses := make([]Status, 0, len(repositories))
 	for _, item := range repositories {
@@ -114,7 +113,6 @@ func (r Runner) Enrich(ctx context.Context, status *Status) {
 			status.DefaultBranch = strings.TrimSpace(string(result.output))
 		} else {
 			status.GitHubError = conciseError(result.err, result.output)
-			status.DefaultBranch = ""
 		}
 		status.updateLinks()
 	}

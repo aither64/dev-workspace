@@ -9,6 +9,7 @@
   lib,
   makeWrapper,
   nodejs,
+  jq,
   openssl,
   python3,
   python3Packages,
@@ -70,12 +71,18 @@ buildGoModule {
       "$out/bin/workspace-portal-password-hash"
     install -Dm644 ${src}/portal/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
+    cp -R ${src}/dev-clusters/vpsadmin "$out/share/workspace-portal/vpsadmin-devcluster"
+    cp -R ${src}/dev-clusters/vpsadminos "$out/share/workspace-portal/vpsadminos-devcluster"
 
     substituteInPlace "$out/bin/dev-session" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
     substituteInPlace "$out/bin/workspace-pki" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
     substituteInPlace "$out/bin/workspace-portal-password-hash" \
+      --replace-fail '#!/usr/bin/env bash' '#!${bash}/bin/bash'
+    substituteInPlace \
+      "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
+      "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
       --replace-fail '#!/usr/bin/env bash' '#!${bash}/bin/bash'
 
     runtimePath=${
@@ -93,6 +100,11 @@ buildGoModule {
       wrapProgram "$out/bin/$program" \
         --prefix PATH : "$runtimePath"
     done
+    clusterRuntimePath=${lib.makeBinPath [ bash coreutils git gnugrep jq ]}
+    makeWrapper "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
+      "$out/bin/vpsadmin-devcluster" --prefix PATH : "$clusterRuntimePath"
+    makeWrapper "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
+      "$out/bin/vpsadminos-devcluster" --prefix PATH : "$clusterRuntimePath"
   '';
 
   postFixup = ''
@@ -102,6 +114,15 @@ buildGoModule {
         echo "wrapped helper has a non-store interpreter: $wrapped" >&2
         exit 1
       fi
+    done
+    for program in vpsadmin-devcluster vpsadminos-devcluster; do
+      if ! head -n 1 "$out/bin/$program" | grep -Eq '^#! */nix/store/'; then
+        echo "cluster helper has a non-store interpreter: $out/bin/$program" >&2
+        exit 1
+      fi
+      ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+        VPSFREE_DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
+        "$out/bin/$program" --help >/dev/null
     done
 
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \

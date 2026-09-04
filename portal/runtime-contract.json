@@ -50,6 +50,8 @@
     "--codex-command",
     "--portal-command",
     "--tmux",
-    "--tmux-socket"
+    "--tmux-socket",
+    "--vpsadmin-cluster",
+    "--vpsadminos-cluster"
   ]
 }

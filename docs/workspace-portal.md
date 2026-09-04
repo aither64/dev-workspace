@@ -8,9 +8,12 @@ https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz/
 
 It lists active and archived initiatives that contain `portal.yml`, with the
 newest dated sessions first. Each initiative uses full-width tabs for its Codex
-conversation, handoff commands, repositories, plan, state, and curated
-artifacts. An active conversation can receive messages, be interrupted, answer
-Codex questions, and handle supported command or file-change approvals.
+conversation, handoff commands, repositories, development clusters, plan,
+state, and curated artifacts. It renders Codex output as sanitized Markdown.
+An active conversation can receive messages, be interrupted, answer Codex
+questions, handle supported command or file-change approvals, and change its
+model and reasoning effort. Enter sends a message; Shift+Enter inserts a line
+break.
 
 The portal is not a shell or a general file browser. It exposes `plan.md`,
 `state.md`, and files explicitly listed in `portal.yml`. Curated artifacts are
@@ -39,6 +42,33 @@ dev-session url 2026-09-03-example
 
 The full dated slug is accepted directly. You can also use a short name when it
 matches exactly one session.
+
+Fork session copies the Codex conversation and selected model settings into a
+new session. It does not copy worktrees, tracking files, artifacts, or
+development clusters. The equivalent terminal command is:
+
+```sh
+dev-session fork 2026-09-03-example alternate-approach
+```
+
+The portal discovers attached Git worktrees directly from the workspace and
+canonical bare repositories. A worktree therefore appears even when an older
+helper did not record it in `portal.yml`. The manifest remains authoritative
+when it already contains the repository, and conflicting live metadata is
+reported instead of replacing the recorded values.
+
+The Clusters tab recognizes vpsAdmin and vpsAdminOS state owned by the session.
+It shows the verified runner state, topology, network, service links, SSH
+commands, and development credentials. Release cluster stops the matching
+runner and removes its temporary state. The index marks sessions with running
+clusters.
+
+Prepare to finish asks Codex to complete work that is already in scope and set
+the tracking lifecycle to `complete` only when no work remains. Archive session
+then releases development clusters, validates and removes clean worktrees,
+moves tracking to `archive/`, commits only that archive move on the shared
+workspace `master`, and stops the session. It never pushes `master`. Every step
+can be retried after an interruption.
 
 The page shows attach and conversation controls only when host-only authority
 under `/run/vpsfree-workspace-authority` is ready and matches the live tmux
@@ -95,6 +125,7 @@ schema 2 exists only while an initial goal has an unresolved delivery outcome.
 ```yaml
 schema: 1
 slug: 2026-09-03-example
+forked_from: 2026-09-03-original
 codex:
   thread_id: 01a00000-0000-0000-0000-000000000000
   socket_path: /run/vpsfree-workspace-codex/app-server.sock
@@ -130,10 +161,12 @@ The portal cannot read nginx's password hash, TLS key, or CA key, and the socket
 is not mounted into the development LXC.
 
 The portal rejects mutations without the exact origin, uses a restrictive
-content security policy and sanitized Markdown, never invokes Git while
-rendering a page, and does not expose general filesystem, shell, or App Server
-RPC access. Workspace manifests are display metadata; every mutation also
-checks uid-private host authority against tmux and the App Server.
+content security policy and sanitized Markdown, and does not expose general
+filesystem, shell, or App Server RPC access. Page rendering reads Git worktree
+registrations and immutable metadata only from the workspace checkout and
+canonical bare repositories; it does not run Git in writable feature
+worktrees. Workspace manifests are display metadata; Codex mutations also
+check uid-private host authority against tmux and the App Server.
 
 The Basic Auth username is `aither`. Its random plaintext password is stored at
 `/home/aither/.local/state/vpsfree-workspace-portal/password`, readable only by

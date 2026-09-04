@@ -18,6 +18,10 @@
       <form method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
+        <div class="field-grid">
+          <label>Model<select name="model" data-model-select><option value="">System default</option></select></label>
+          <label>Reasoning effort<select name="effort" data-effort-select><option value="">Model default</option></select></label>
+        </div>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         <button type="submit">Create session</button>
       </form>
@@ -32,6 +36,7 @@
             <strong>{{.Slug}}</strong>
             <span class="muted">Updated {{timeAgo .UpdatedAt}}</span>
             <span>{{len .Repositories}} repositories</span>
+            {{with index $.ClusterCounts .Slug}}{{if gt . 0}}<span class="cluster-summary">{{.}} running {{if eq . 1}}cluster{{else}}clusters{{end}}</span>{{end}}{{end}}
           </a>
         {{else}}<p class="empty">No portal-enabled work sessions.</p>{{end}}
       </div>
@@ -51,6 +56,7 @@
       </div>
     </section>
   </main>
+  <script src="/static/app.js" defer></script>
 </body>
 </html>
 {{end}}

@@ -465,7 +465,7 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 	body := response.Body.String()
 	for _, marker := range []string{
 		`class="panel session-tabs"`, `data-tab="codex"`, `data-tab="handoff"`,
-		`data-tab="repositories"`, `data-tab="plan"`, `data-tab="state"`,
+		`data-tab="repositories"`, `data-tab="clusters"`, `data-tab="plan"`, `data-tab="state"`,
 		`id="codex" class="tab-panel chat-panel active"`, `>Report</a>`,
 	} {
 		if !strings.Contains(body, marker) {
@@ -476,6 +476,113 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 		if strings.Contains(body, oldLayout) {
 			t.Fatalf("session page still contains %q", oldLayout)
 		}
+	}
+}
+
+func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
+	javascript, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		"event.key !== \"Enter\"", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
+		"entry.html", "finish-session", "archive-session", "release-cluster", "fork-dialog",
+	} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("browser client does not contain %q", marker)
+		}
+	}
+}
+
+func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
+	server := newTestServer(t)
+	directory := t.TempDir()
+	arguments := filepath.Join(directory, "arguments")
+	helper := filepath.Join(directory, "dev-session")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\nprintf '{\"slug\":\"2026-09-04-forked\"}\\n'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	server.config.DevSession = helper
+	request := httptest.NewRequest(http.MethodPost, "/api/sessions/source/fork", strings.NewReader(
+		`{"name":"forked","creationDate":"2026-09-04"}`,
+	))
+	response := httptest.NewRecorder()
+	server.forkSession(response, request, &session.Summary{Manifest: session.Manifest{Slug: "source"}})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status/body = %d %q", response.Code, response.Body.String())
+	}
+	data, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(strings.Fields(string(data)), " ")
+	if !strings.Contains(joined, "fork source 2026-09-04-forked --as-is --json") {
+		t.Fatalf("fork arguments = %q", joined)
+	}
+}
+
+func TestCommitArchivePreservesUnrelatedWorkspaceChanges(t *testing.T) {
+	server := newTestServer(t)
+	workspace := server.config.Workspace
+	git := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+		return string(output)
+	}
+	git("init", "--initial-branch=master")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	slug := "2026-09-04-complete"
+	work := filepath.Join(workspace, "work", slug)
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name := range map[string]bool{"staged.txt": true, "unstaged.txt": true} {
+		if err := os.WriteFile(filepath.Join(workspace, name), []byte("initial\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("add", ".")
+	git("commit", "-m", "initial")
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %s: %v", output, err)
+	}
+	git("remote", "add", "origin", remote)
+	git("push", "-u", "origin", "master")
+	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "staged.txt")
+	if err := os.WriteFile(filepath.Join(workspace, "unstaged.txt"), []byte("unstaged change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := server.commitArchive(slug); err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Fields(git("show", "--format=", "--name-only", "HEAD"))
+	if len(changed) != 1 || changed[0] != filepath.Join("archive", slug, "state.md") {
+		t.Fatalf("archive commit paths = %#v", changed)
+	}
+	status := git("status", "--porcelain=v1")
+	if !strings.Contains(status, "M  staged.txt") || !strings.Contains(status, " M unstaged.txt") {
+		t.Fatalf("unrelated status was not preserved: %q", status)
 	}
 }
 
@@ -510,7 +617,9 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				return nil
 			}
 			server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
-				return codex.Transcript{ThreadID: threadID, Status: "idle", Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "persisted answer"}}}, nil
+				return codex.Transcript{ThreadID: threadID, Status: "idle", Entries: []codex.TranscriptEntry{{
+					Kind: "agentMessage", Text: "# Persisted answer\n\n<script>alert(1)</script>",
+				}}}, nil
 			}
 
 			page := httptest.NewRecorder()
@@ -526,8 +635,16 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 
 			api := httptest.NewRecorder()
 			server.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil))
-			if api.Code != http.StatusOK || !strings.Contains(api.Body.String(), "persisted answer") {
+			if api.Code != http.StatusOK || !strings.Contains(api.Body.String(), "Persisted answer") {
 				t.Fatalf("thread status/body = %d %q", api.Code, api.Body.String())
+			}
+			var transcript codex.Transcript
+			if err := json.Unmarshal(api.Body.Bytes(), &transcript); err != nil {
+				t.Fatal(err)
+			}
+			if len(transcript.Entries) != 1 || !strings.Contains(transcript.Entries[0].HTML, "<h1>Persisted answer</h1>") ||
+				strings.Contains(transcript.Entries[0].HTML, "<script") {
+				t.Fatalf("sanitized transcript Markdown = %#v", transcript.Entries)
 			}
 		})
 	}
@@ -631,6 +748,23 @@ func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ 
 
 func (client *browserContractCodex) ReadThread(_ context.Context, threadID string) (codex.Transcript, error) {
 	return codex.Transcript{ThreadID: threadID}, nil
+}
+
+func (client *browserContractCodex) ListModels(_ context.Context) ([]codex.Model, error) {
+	return []codex.Model{{
+		ID: "model-1", Model: "model-1", DisplayName: "Model 1", IsDefault: true,
+		DefaultReasoningEffort:    "medium",
+		SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: "medium"}, {ReasoningEffort: "high"}},
+	}}, nil
+}
+
+func (client *browserContractCodex) UpdateThreadSettings(
+	_ context.Context, threadID, _ string, settings codex.ThreadSettings,
+) (codex.ThreadSettings, error) {
+	if threadID != "thread-1" {
+		return codex.ThreadSettings{}, errors.New("unexpected settings thread")
+	}
+	return settings, nil
 }
 
 func (client *browserContractCodex) Send(_ context.Context, threadID, message string) error {

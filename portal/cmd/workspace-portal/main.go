@@ -83,6 +83,7 @@ type serveOptions struct {
 	unixSocket, workspace, baseURL, devSession, authorityDir string
 	codexSocket, codexVersion, codexCommand, portalCommand   string
 	gh, tmux, tmuxSocket                                     string
+	vpsadminCluster, vpsadminOSCluster                       string
 }
 
 func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
@@ -100,6 +101,8 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.gh, "gh", "gh", "GitHub CLI executable")
 	flags.StringVar(&options.tmux, "tmux", "tmux", "tmux executable")
 	flags.StringVar(&options.tmuxSocket, "tmux-socket", "", "dedicated tmux socket name or path for browser-created sessions")
+	flags.StringVar(&options.vpsadminCluster, "vpsadmin-cluster", "", "absolute vpsAdmin development cluster helper")
+	flags.StringVar(&options.vpsadminOSCluster, "vpsadminos-cluster", "", "absolute vpsAdminOS development cluster helper")
 	return flags, options
 }
 
@@ -114,11 +117,12 @@ func serve(args []string) error {
 	application, err := portalweb.New(portalweb.Config{
 		Workspace: options.workspace, BaseURL: options.baseURL, DevSession: options.devSession,
 		GH: options.gh, Tmux: options.tmux, TmuxSocket: options.tmuxSocket, AuthorityDir: options.authorityDir,
-		CodexSocket:   options.codexSocket,
-		CodexVersion:  options.codexVersion,
-		CodexCommand:  options.codexCommand,
-		PortalCommand: options.portalCommand,
-		Logger:        logger, Codex: codexClient,
+		CodexSocket:     options.codexSocket,
+		CodexVersion:    options.codexVersion,
+		CodexCommand:    options.codexCommand,
+		PortalCommand:   options.portalCommand,
+		VpsadminCluster: options.vpsadminCluster, VpsadminOSCluster: options.vpsadminOSCluster,
+		Logger: logger, Codex: codexClient,
 	})
 	if err != nil {
 		return err
@@ -174,7 +178,7 @@ func portalListener(socketPath string) (net.Listener, error) {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|set-name|ensure-initial|require-idle")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|ensure-initial|require-idle")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -192,6 +196,8 @@ func threadCommand(args []string) error {
 	codexVersion := flags.String("codex-version", "", "Codex client version")
 	name := flags.String("name", "", "thread name")
 	threadID := flags.String("thread-id", "", "thread id")
+	model := flags.String("model", "", "Codex model")
+	effort := flags.String("effort", "", "Codex reasoning effort")
 	inputFile := flags.String("input-file", "", "file containing a message")
 	requireRuntime := flags.Bool("require-runtime", false, "require complete deployed runtime provenance")
 	recoverCreating := flags.Bool("recover-creating", false, "reconcile a creating thread by working directory")
@@ -217,11 +223,31 @@ func threadCommand(args []string) error {
 		}
 		var id string
 		var err error
+		settings := codex.ThreadSettings{Model: *model, ReasoningEffort: *effort}
 		if *recoverCreating {
-			id, err = client.RecoverCreatingThread(ctx, *threadID, *cwd, runtime.environment())
+			id, err = client.RecoverCreatingThreadWithSettings(ctx, *threadID, *cwd, runtime.environment(), settings)
 		} else {
-			id, err = client.OpenThread(ctx, *threadID, *cwd, runtime.environment())
+			id, err = client.OpenThreadWithSettings(ctx, *threadID, *cwd, runtime.environment(), settings)
 		}
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{"threadId": id})
+	case "fork":
+		runtime := threadRuntime{
+			Slug: *sessionSlug, Workspace: *workspace, WorkDir: *cwd,
+			WorktreesDir: *worktreesDir, PortalBaseURL: *portalBaseURL, PortalURL: *portalURL,
+			AuthorityDir: *authorityDir, TmuxSocket: *tmuxSocket,
+			CodexCommand: *codexCommand, CodexSocket: *socket, CodexVersion: *codexVersion,
+			PortalCommand: *portalCommand,
+		}
+		if !*requireRuntime || !runtime.complete() || *threadID == "" {
+			return errors.New("thread fork requires a source thread and complete runtime provenance")
+		}
+		id, err := client.RecoverForkThread(
+			ctx, *threadID, *cwd, runtime.environment(),
+			codex.ThreadSettings{Model: *model, ReasoningEffort: *effort},
+		)
 		if err != nil {
 			return err
 		}

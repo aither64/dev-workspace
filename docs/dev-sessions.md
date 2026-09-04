@@ -28,6 +28,10 @@ Use `--as-is` when the argument is already the slug:
 bin/dev-session start 2026-06-06-api-token-rotation --as-is
 ```
 
+When the workspace portal is available, `--model` and `--effort` select the
+initial Codex settings. The browser offers the same choices from the App Server
+model catalog.
+
 The first window is named `dev` and contains three panes:
 
 - left: login shell with cwd set to the workspace repository root; the helper
@@ -99,6 +103,7 @@ commits are not tracking-only checkpoints.
 
 ```sh
 bin/dev-session attach api-token-rotation
+bin/dev-session fork api-token-rotation alternate-approach
 bin/dev-session sync api-token-rotation
 bin/dev-session stop api-token-rotation
 bin/dev-session remove api-token-rotation
@@ -113,6 +118,11 @@ from `work/`, `worktrees/`, or managed tmux sessions. If multiple slugs match,
 the command fails and prints the candidates. Use the full dated slug directly
 to avoid ambiguity. The `--as-is` option is only needed when a command must
 treat an input as a literal slug before that slug is known to the workspace.
+
+`fork` creates a new dated session with a native copy of the source Codex
+conversation. It copies no worktrees, tracking content, artifacts, or
+development clusters. Use `--model` and `--effort` to override the inherited
+Codex settings.
 
 `sync` creates one managed tmux window for every git worktree under
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no

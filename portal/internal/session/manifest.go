@@ -72,6 +72,7 @@ type Artifact struct {
 type Manifest struct {
 	Schema       int          `yaml:"schema" json:"schema"`
 	Slug         string       `yaml:"slug" json:"slug"`
+	ForkedFrom   string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
 	Codex        Codex        `yaml:"codex,omitempty" json:"codex"`
 	Creation     Creation     `yaml:"creation,omitempty" json:"creation"`
 	Repositories []Repository `yaml:"repositories,omitempty" json:"repositories"`
@@ -110,6 +111,9 @@ func (m *Manifest) Validate(expectedSlug string) error {
 	}
 	if expectedSlug != "" && m.Slug != expectedSlug {
 		return fmt.Errorf("manifest slug %q does not match directory %q", m.Slug, expectedSlug)
+	}
+	if m.ForkedFrom != "" && (!ValidSlug(m.ForkedFrom) || m.ForkedFrom == m.Slug) {
+		return errors.New("invalid fork source")
 	}
 	if m.Creation.State != "" && m.Creation.State != "creating" && m.Creation.State != "ready" {
 		return fmt.Errorf("invalid creation state %q", m.Creation.State)
@@ -454,7 +458,7 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	fields, err := strictMapping(root, []string{
-		"schema", "slug", "codex", "creation", "repositories", "artifacts", "finalized_at",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at",
 	}, []string{"schema", "slug"})
 	if err != nil {
 		return err
@@ -463,6 +467,9 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	if err := scalarTag(fields["slug"], "!!str", "slug"); err != nil {
+		return err
+	}
+	if err := optionalString(fields, "forked_from"); err != nil {
 		return err
 	}
 	if node := fields["codex"]; node != nil {

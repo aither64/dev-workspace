@@ -22,6 +22,24 @@ func TestManifestFixtureLoadsAndMatchesDirectory(t *testing.T) {
 	}
 }
 
+func TestManifestAcceptsASeparateForkSource(t *testing.T) {
+	var manifest Manifest
+	data := []byte("schema: 1\nslug: 2026-09-04-fork\nforked_from: 2026-09-03-source\n")
+	if err := decodeManifest(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.Validate("2026-09-04-fork"); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.ForkedFrom != "2026-09-03-source" {
+		t.Fatalf("fork source = %q", manifest.ForkedFrom)
+	}
+	manifest.ForkedFrom = manifest.Slug
+	if err := manifest.Validate(manifest.Slug); err == nil {
+		t.Fatal("self fork was accepted")
+	}
+}
+
 func TestListSortsBySessionDateBeforeLastUpdate(t *testing.T) {
 	workspace := t.TempDir()
 	writeSession := func(root, lifecycle, slug string, updatedAt time.Time) {

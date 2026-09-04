@@ -461,6 +461,124 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_fork_creates_a_conversation_only_session
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup_runner = runner_for(workspace)
+      setup_runner.ensure_tracking_files(source_slug)
+      source_manifest = setup_runner.send(:ensure_portal_manifest, source_slug)
+      source_manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup_runner.send(:write_portal_manifest, source_slug, source_manifest)
+
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+        puts JSON.generate(threadId: 'thread-fork') if ARGV[0, 2] == ['thread', 'fork']
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
+        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_kwargs| session }
+        define_method(:sync_slug) { |*_args, **_kwargs| session }
+      end
+      out = StringIO.new
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
+        out:, err: StringIO.new, today: TODAY, env: {}
+      )
+
+      runner.fork(
+        source_slug, 'alternative', as_is: false, json: true,
+        model: 'gpt-test', effort: 'xhigh'
+      )
+
+      result = JSON.parse(out.string)
+      assert_equal(destination_slug, result.fetch('slug'))
+      assert_equal(source_slug, result.fetch('forkedFrom'))
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+      )
+      assert_equal(source_slug, manifest.fetch('forked_from'))
+      assert_equal('thread-fork', manifest.dig('codex', 'thread_id'))
+      assert_empty(manifest.fetch('repositories'))
+      assert_empty(manifest.fetch('artifacts'))
+      assert_empty(Dir.children(File.join(workspace, 'worktrees', destination_slug)))
+      command = File.readlines(log, chomp: true).find { |line| line.start_with?('thread fork ') }
+      assert_includes(command, '--thread-id thread-source')
+      assert_includes(command, '--model gpt-test')
+      assert_includes(command, '--effort xhigh')
+    end
+  end
+
+  def test_fork_refuses_an_existing_destination
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files('2026-06-05-source')
+      manifest = runner.send(:ensure_portal_manifest, '2026-06-05-source')
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      runner.send(:write_portal_manifest, '2026-06-05-source', manifest)
+      runner.ensure_tracking_files('2026-06-06-taken')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.fork('2026-06-05-source', 'taken', as_is: false, json: true)
+      end
+      assert_includes(error.message, 'already exists')
+    end
+  end
+
+  def test_fork_resumes_after_thread_creation_and_tmux_failure
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-retry'
+      setup_runner = runner_for(workspace)
+      setup_runner.ensure_tracking_files(source_slug)
+      manifest = setup_runner.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup_runner.send(:write_portal_manifest, source_slug, manifest)
+      calls = File.join(workspace, 'fork-calls')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        if ARGV[0, 2] == ['thread', 'fork']
+          File.open(#{calls.dump}, 'a') { |file| file.puts 'fork' }
+          puts JSON.generate(threadId: 'thread-fork')
+        end
+      RUBY
+      failing_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |*_args, **_kwargs|
+          raise VpsfreeDevSession::Error, 'tmux failed'
+        end
+      end
+      failing = failing_class.new(
+        workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
+      )
+      assert_raises(VpsfreeDevSession::Error) do
+        failing.fork(source_slug, 'retry', as_is: false, json: true)
+      end
+
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
+        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+      )
+      retry_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_kwargs| session }
+        define_method(:sync_slug) { |*_args, **_kwargs| session }
+      end
+      retry_runner = retry_class.new(
+        workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
+      )
+      retry_runner.fork(source_slug, 'retry', as_is: false, json: true)
+      assert_equal(["fork\n"], File.readlines(calls))
+    end
+  end
+
   def test_slug_validation_rejects_paths_and_tmux_targets
     with_workspace do |workspace|
       runner = runner_for(workspace)

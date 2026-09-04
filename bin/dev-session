@@ -78,7 +78,11 @@ module VpsfreeDevSession
         [--require-runtime]
         start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
-        [--goal-file FILE] [--json] [--exclusive]
+        [--goal-file FILE] [--json] [--exclusive] [--model MODEL]
+        [--effort EFFORT]
+      dev-session [--workspace DIR] [--tmux-socket NAME-OR-PATH]
+        fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
+        [--model MODEL] [--effort EFFORT]
       dev-session [--workspace DIR] [--tmux-socket NAME] attach <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
       dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
@@ -400,7 +404,9 @@ module VpsfreeDevSession
       run_codex:,
       goal_file: nil,
       json: false,
-      exclusive: false
+      exclusive: false,
+      model: nil,
+      effort: nil
     )
       raise Error, '--json cannot be combined with --attach' if json && attach
 
@@ -421,7 +427,9 @@ module VpsfreeDevSession
             slug,
             goal_file,
             exclusive:,
-            run_codex:
+            run_codex:,
+            model:,
+            effort:
           )
           ensure_tracking_files(slug)
           validate_creation_tracking_files!(slug) if creation_journal
@@ -469,7 +477,9 @@ module VpsfreeDevSession
             recovered_thread = create_portal_thread(
               slug,
               persisted_thread_id: persisted_thread,
-              recover_creating: true
+              recover_creating: true,
+              model:,
+              effort:
             )
             if recovered_thread && persisted_thread && recovered_thread != persisted_thread
               if selected
@@ -488,7 +498,12 @@ module VpsfreeDevSession
               name_portal_thread(slug, thread_id)
             end
           elsif run_codex && (thread_id.nil? || thread_id.empty?)
-            thread_id = create_portal_thread(slug, persisted_thread_id: persisted_thread)
+            thread_id = create_portal_thread(
+              slug,
+              persisted_thread_id: persisted_thread,
+              model:,
+              effort:
+            )
             if thread_id
               manifest['codex'] = codex_metadata(thread_id)
               write_portal_manifest(slug, manifest)
@@ -533,6 +548,10 @@ module VpsfreeDevSession
             manifest['creation']['initial_goal_attempted'] = true
           end
           manifest['creation']['state'] = goal_pending ? 'creating' : 'ready'
+          unless goal_pending
+            manifest['schema'] = 1
+            manifest['creation'].delete('initial_goal_attempted')
+          end
           write_portal_manifest(slug, manifest)
           if goal_pending
             write_session_authority(slug, selected, state: 'creating')
@@ -608,6 +627,93 @@ module VpsfreeDevSession
         reconcile_native_client!(slug, session)
       end
       attach_to_session(session)
+    end
+
+    def fork(source_input, destination_input, as_is:, json:, model: nil, effort: nil)
+      source_slug = lookup_slug(source_input, as_is: false)
+      destination_slug = build_slug(destination_input, as_is:)
+      raise Error, 'fork source and destination must be different' if source_slug == destination_slug
+
+      source_manifest = with_slug_lock(source_slug) do
+        select_tmux_for_slug!(source_slug)
+        manifest = load_portal_manifest(portal_file(source_slug), required: true)
+        thread_id = manifest.dig('codex', 'thread_id')
+        if thread_id.nil? || thread_id.empty?
+          raise Error, "source session has no Codex conversation: #{source_slug}"
+        end
+        creation = manifest.fetch('creation', {})
+        if creation['state'] != 'ready' ||
+           (creation['goal_sha256'] && !creation['initial_goal_sent'])
+          raise Error, "source session creation is incomplete: #{source_slug}"
+        end
+        manifest
+      end
+
+      destination_session = with_creation_lock(destination_slug) do
+        with_slug_lock(destination_slug) do
+          select_tmux_for_slug!(destination_slug)
+          manifest = nil
+          if slug_state_exists?(destination_slug)
+            unless path_exists?(portal_file(destination_slug))
+              raise Error, "dev session already exists: #{destination_slug}"
+            end
+            manifest = load_portal_manifest(portal_file(destination_slug), required: true)
+            unless manifest['forked_from'] == source_slug &&
+                   manifest.dig('creation', 'state') == 'ready' &&
+                   manifest.fetch('repositories', []).empty? &&
+                   manifest.fetch('artifacts', []).empty?
+              raise Error, "dev session already exists: #{destination_slug}"
+            end
+            ensure_worktree_group!(destination_slug, create: false)
+            unless Dir.children(worktrees_dir(destination_slug)).empty?
+              raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
+            end
+            selected = @tmux.session(destination_slug)
+            if selected
+              selected = ensure_managed_session!(destination_slug, session: selected)
+              selected = reconcile_native_client!(destination_slug, selected)
+              write_session_authority(destination_slug, selected, state: 'ready')
+              next selected
+            end
+          else
+            ensure_tracking_files(destination_slug)
+            manifest = ensure_portal_manifest(destination_slug)
+            manifest['forked_from'] = source_slug
+            write_portal_manifest(destination_slug, manifest)
+          end
+
+          thread_id = manifest.dig('codex', 'thread_id')
+          if thread_id.nil? || thread_id.empty?
+            thread_id = create_portal_fork(
+              destination_slug,
+              source_manifest.dig('codex', 'thread_id'),
+              model:,
+              effort:
+            )
+            manifest['codex'] = codex_metadata(thread_id)
+            write_portal_manifest(destination_slug, manifest)
+            name_portal_thread(destination_slug, thread_id)
+          end
+          selected = create_tmux_session(destination_slug, run_codex: true, thread_id:)
+          selected = sync_slug(destination_slug, require_session: true, session: selected)
+          write_session_authority(destination_slug, selected, state: 'ready')
+          selected
+        end
+      end
+
+      if json
+        @out.puts JSON.generate(
+          slug: destination_slug,
+          url: portal_url(destination_slug),
+          threadId: destination_session.codex_thread_id,
+          forkedFrom: source_slug,
+          attach: attach_command(destination_session.id)
+        )
+      else
+        @out.puts "session: #{destination_slug}"
+        @out.puts "attach: #{attach_command(destination_session.id).map(&:shellescape).join(' ')}"
+        @out.puts "portal: #{portal_url(destination_slug)}"
+      end
     end
 
     def sync(input, as_is:)
@@ -1231,7 +1337,7 @@ module VpsfreeDevSession
         !@tmux.session(slug).nil?
     end
 
-    def prepare_creation_journal(slug, goal_file, exclusive:, run_codex:)
+    def prepare_creation_journal(slug, goal_file, exclusive:, run_codex:, model:, effort:)
       path = creation_journal_file(slug)
       if exclusive && !goal_file
         if !path_exists?(path) && slug_state_exists?(slug)
@@ -1247,15 +1353,16 @@ module VpsfreeDevSession
         'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
         'run_codex' => run_codex
       }
+      expected['model'] = model unless model.nil?
+      expected['effort'] = effort unless effort.nil?
       if path_exists?(path)
         raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
         raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
 
         actual = JSON.parse(File.read(path))
         state = actual['state']
-        unless %w[creating ready].include?(state) && actual.keys.sort == [
-          'goal_sha256', 'run_codex', 'schema', 'slug', 'state'
-        ]
+        unless %w[creating ready].include?(state) &&
+               actual.keys.sort == (expected.keys + ['state']).sort
           raise Error, "invalid creation journal #{path}"
         end
         manifest = load_portal_manifest(portal_file(slug), required: false)
@@ -1441,12 +1548,16 @@ module VpsfreeDevSession
       end
       validate_mapping_keys!(
         manifest,
-        %w[schema slug codex creation repositories artifacts finalized_at],
+        %w[schema slug forked_from codex creation repositories artifacts finalized_at],
         'portal manifest',
         path
       )
       unless valid_part?(manifest['slug']) && manifest['slug'] == expected_slug
         raise Error, "portal manifest slug does not match its directory: #{path}"
+      end
+      if manifest.key?('forked_from') &&
+         (!valid_part?(manifest['forked_from']) || manifest['forked_from'] == expected_slug)
+        raise Error, "invalid portal fork source in #{path}"
       end
       repositories = manifest.fetch('repositories', [])
       artifacts = manifest.fetch('artifacts', [])
@@ -1631,7 +1742,13 @@ module VpsfreeDevSession
         (offset_hour.nil? || (offset_hour < 24 && offset_minute < 60))
     end
 
-    def create_portal_thread(slug, persisted_thread_id: nil, recover_creating: false)
+    def create_portal_thread(
+      slug,
+      persisted_thread_id: nil,
+      recover_creating: false,
+      model: nil,
+      effort: nil
+    )
       unless @portal_command && !@portal_command.empty?
         @err.puts 'warning: workspace-portal is unavailable; starting an unshared Codex session'
         return nil
@@ -1645,6 +1762,33 @@ module VpsfreeDevSession
       command << '--require-runtime' if environment[ENV_REQUIRE_RUNTIME] == '1'
       command += ['--thread-id', persisted_thread_id] if persisted_thread_id
       command << '--recover-creating' if recover_creating
+      command += ['--model', model] if model
+      command += ['--effort', effort] if effort
+      stdout, _stderr, _status = @command_runner.capture(command)
+      result = JSON.parse(stdout)
+      thread_id = result['threadId']
+      unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, 'workspace-portal returned an invalid Codex thread id'
+      end
+
+      thread_id
+    rescue JSON::ParserError => e
+      raise Error, "workspace-portal returned invalid JSON: #{e.message}"
+    end
+
+    def create_portal_fork(slug, source_thread_id, model: nil, effort: nil)
+      unless @portal_command && !@portal_command.empty?
+        raise Error, 'workspace-portal is required to fork a Codex conversation'
+      end
+
+      environment = session_environment(slug)
+      command = [*@portal_command, 'thread', 'fork', '--thread-id', source_thread_id]
+      THREAD_ENV_ARGUMENTS.each do |name, argument|
+        command += [argument, environment.fetch(name)] if environment.key?(name)
+      end
+      command << '--require-runtime' if environment[ENV_REQUIRE_RUNTIME] == '1'
+      command += ['--model', model] if model
+      command += ['--effort', effort] if effort
       stdout, _stderr, _status = @command_runner.capture(command)
       result = JSON.parse(stdout)
       thread_id = result['threadId']
@@ -3102,6 +3246,8 @@ module VpsfreeDevSession
       case command
       when 'start'
         run_start
+      when 'fork'
+        run_fork
       when 'attach'
         run_single_slug { |runner, slug, opts| runner.attach(slug, as_is: opts[:as_is]) }
       when 'sync'
@@ -3227,7 +3373,9 @@ module VpsfreeDevSession
         run_codex: true,
         goal_file: nil,
         json: false,
-        exclusive: false
+        exclusive: false,
+        model: nil,
+        effort: nil
       }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
@@ -3238,11 +3386,27 @@ module VpsfreeDevSession
         parser_opts.on('--goal-file FILE') { |value| opts[:goal_file] = value }
         parser_opts.on('--json') { opts[:json] = true }
         parser_opts.on('--exclusive') { opts[:exclusive] = true }
+        parser_opts.on('--model MODEL') { |value| opts[:model] = value }
+        parser_opts.on('--effort EFFORT') { |value| opts[:effort] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'start')
 
       runner.start(@argv.fetch(0), **opts)
+    end
+
+    def run_fork
+      opts = { as_is: false, json: false, model: nil, effort: nil }
+      parser = OptionParser.new do |parser_opts|
+        parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--json') { opts[:json] = true }
+        parser_opts.on('--model MODEL') { |value| opts[:model] = value }
+        parser_opts.on('--effort EFFORT') { |value| opts[:effort] = value }
+      end
+      parser.parse!(@argv)
+      require_arity!(2, @argv, 'fork')
+
+      runner.fork(@argv.fetch(0), @argv.fetch(1), **opts)
     end
 
     def run_single_slug
