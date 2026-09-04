@@ -22,6 +22,57 @@ func TestManifestFixtureLoadsAndMatchesDirectory(t *testing.T) {
 	}
 }
 
+func TestListSortsBySessionDateBeforeLastUpdate(t *testing.T) {
+	workspace := t.TempDir()
+	writeSession := func(root, lifecycle, slug string, updatedAt time.Time) {
+		directory := filepath.Join(workspace, root, slug)
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		paths := []string{
+			filepath.Join(directory, ManifestName),
+			filepath.Join(directory, "state.md"),
+			filepath.Join(directory, "plan.md"),
+		}
+		manifest := "schema: 1\nslug: " + slug + "\n"
+		if root == "archive" {
+			manifest += "finalized_at: \"" + updatedAt.Format(time.RFC3339) + "\"\n"
+		}
+		if err := os.WriteFile(paths[0], []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeTrackingFiles(t, directory, lifecycle)
+		for _, path := range paths {
+			if err := os.Chtimes(path, updatedAt, updatedAt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	sharedTime := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	writeSession("work", "active", "2026-09-03-edited-later", sharedTime.Add(6*time.Hour))
+	writeSession("work", "active", "2026-09-04-zulu", sharedTime)
+	writeSession("work", "active", "2026-09-04-alpha", sharedTime)
+	writeSession("archive", "complete", "2026-09-05-newest", sharedTime)
+	writeSession("archive", "complete", "2026-09-04-arch-zulu", sharedTime)
+	writeSession("archive", "complete", "2026-09-04-arch-alpha", sharedTime)
+
+	summaries, err := List(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(summaries))
+	for _, summary := range summaries {
+		got = append(got, summary.Slug)
+	}
+	want := []string{
+		"2026-09-04-alpha", "2026-09-04-zulu", "2026-09-03-edited-later",
+		"2026-09-05-newest", "2026-09-04-arch-alpha", "2026-09-04-arch-zulu",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("session order = %v, want %v", got, want)
+	}
+}
+
 func TestSharedValidManifestFixturesAreAccepted(t *testing.T) {
 	fixtures, err := filepath.Glob(filepath.Join("..", "..", "..", "test", "fixtures", "portal-manifest-valid*.yml"))
 	if err != nil {

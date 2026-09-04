@@ -263,9 +263,28 @@ func List(workspace string) ([]Summary, error) {
 		if summaries[i].Archived != summaries[j].Archived {
 			return !summaries[i].Archived
 		}
-		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+		leftDate := slugDate(summaries[i].Slug)
+		rightDate := slugDate(summaries[j].Slug)
+		if !leftDate.Equal(rightDate) {
+			return leftDate.After(rightDate)
+		}
+		if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
+			return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+		}
+		return summaries[i].Slug < summaries[j].Slug
 	})
 	return summaries, errors.Join(problems...)
+}
+
+func slugDate(slug string) time.Time {
+	if len(slug) < len(time.DateOnly)+1 || slug[len(time.DateOnly)] != '-' {
+		return time.Time{}
+	}
+	value, err := time.Parse(time.DateOnly, slug[:len(time.DateOnly)])
+	if err != nil {
+		return time.Time{}
+	}
+	return value
 }
 
 func Find(workspace, slug string) (*Summary, error) {
