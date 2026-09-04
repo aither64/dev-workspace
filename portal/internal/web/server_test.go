@@ -103,6 +103,7 @@ func TestMutationRequiresExactOrigin(t *testing.T) {
 	handler := newTestServer(t).Handler()
 	for name, origin := range map[string]string{
 		"missing": "",
+		"null":    "null",
 		"wrong":   "https://unexpected.example.test",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -132,6 +133,9 @@ func TestSecurityResponsesAreNotCached(t *testing.T) {
 	}
 	if actual := response.Header().Get("Strict-Transport-Security"); actual != "" {
 		t.Fatalf("backend must leave Strict-Transport-Security to nginx, got %q", actual)
+	}
+	if actual := response.Header().Get("Referrer-Policy"); actual != "same-origin" {
+		t.Fatalf("Referrer-Policy = %q", actual)
 	}
 }
 
