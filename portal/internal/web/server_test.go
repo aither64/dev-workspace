@@ -1,0 +1,741 @@
+package web
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
+)
+
+func TestMarkdownIsSanitized(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := "# Plan\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))\n\n" +
+		"[encoded](&#106;avascript:alert(1))\n\n<javascript:alert(document.domain)>\n\n" +
+		"![alt](javascript:alert(document.domain))\n"
+	if err := os.WriteFile(filepath.Join(directory, "plan.md"), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summary := &session.Summary{Manifest: session.Manifest{Slug: "example"}, Workspace: server.config.Workspace, Root: "work"}
+	rendered := string(server.renderMarkdown(summary, "plan.md"))
+	if strings.Contains(rendered, "<script") || strings.Contains(rendered, `href="javascript:`) ||
+		strings.Contains(rendered, `src="javascript:`) || strings.Contains(rendered, "&#106;avascript:") {
+		t.Fatalf("unsafe Markdown output: %s", rendered)
+	}
+}
+
+func TestArtifactsUseAPassiveAllowlistAndDownloadDisposition(t *testing.T) {
+	for _, extension := range []string{".shtml", ".ehtml", ".html", ".svg", ".svgz", ".js", ".xhtml", ".xml"} {
+		t.Run(extension, func(t *testing.T) {
+			server := newTestServer(t)
+			writeArtifactSession(t, server.config.Workspace, "report"+extension)
+			request := httptest.NewRequest(http.MethodGet, "/artifacts/example/report"+extension, nil)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("status = %d", response.Code)
+			}
+		})
+	}
+
+	server := newTestServer(t)
+	writeArtifactSession(t, server.config.Workspace, "report.txt")
+	request := httptest.NewRequest(http.MethodGet, "/artifacts/example/report.txt", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if !strings.HasPrefix(response.Header().Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("Content-Disposition = %q", response.Header().Get("Content-Disposition"))
+	}
+	if response.Header().Get("Content-Security-Policy") != "sandbox; default-src 'none'" {
+		t.Fatalf("artifact CSP = %q", response.Header().Get("Content-Security-Policy"))
+	}
+}
+
+func writeArtifactSession(t *testing.T, workspace, name string) {
+	t.Helper()
+	directory := filepath.Join(workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\nartifacts:\n  - label: Report\n    path: " + name + "\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	if err := os.WriteFile(filepath.Join(directory, name), []byte("artifact"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeWebTrackingFiles(t *testing.T, directory, lifecycle string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(directory, "state.md"), []byte("---\nlifecycle: "+lifecycle+"\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "plan.md"), []byte("# Plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMutationRequiresExactOrigin(t *testing.T) {
+	handler := newTestServer(t).Handler()
+	for name, origin := range map[string]string{
+		"missing": "",
+		"wrong":   "https://unexpected.example.test",
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/not-a-route", strings.NewReader("{}"))
+			request.Header.Set("Origin", origin)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d", response.Code)
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodPost, "/not-a-route", strings.NewReader("{}"))
+	request.Header.Set("Origin", "https://workspace.example.test")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("same-origin status = %d", response.Code)
+	}
+}
+
+func TestSecurityResponsesAreNotCached(t *testing.T) {
+	response := httptest.NewRecorder()
+	newTestServer(t).Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if actual := response.Header().Get("Cache-Control"); actual != "no-store" {
+		t.Fatalf("Cache-Control = %q", actual)
+	}
+	if actual := response.Header().Get("Strict-Transport-Security"); actual != "" {
+		t.Fatalf("backend must leave Strict-Transport-Security to nginx, got %q", actual)
+	}
+}
+
+func TestNewRejectsAnHTTPBaseURL(t *testing.T) {
+	_, err := New(Config{Workspace: t.TempDir(), BaseURL: "http://workspace.example.test"})
+	if err == nil || !strings.Contains(err.Error(), "requires an HTTPS") {
+		t.Fatalf("HTTP base URL result = %v", err)
+	}
+}
+
+func TestSessionCreationKeepsStandardOutputSeparateFromWarnings(t *testing.T) {
+	server := newTestServer(t)
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	script := "#!/bin/sh\nprintf 'diagnostic warning\\n' >&2\nprintf '{\"slug\":\"2026-09-03-example\",\"threadId\":\"thread-1\"}\\n'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/sessions",
+		strings.NewReader("creation_date=2026-09-03&name=example&goal=Implement+the+feature"),
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", server.config.BaseURL)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if location := response.Header().Get("Location"); location != "/2026-09-03-example/" {
+		t.Fatalf("Location = %q", location)
+	}
+}
+
+func TestSessionCreationAcceptsMaximallyEncodedMessageAtPublishedLimit(t *testing.T) {
+	server := newTestServer(t)
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	script := "#!/bin/sh\nprintf '{\"slug\":\"2026-09-03-example\",\"threadId\":\"thread-1\"}\\n'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	goal := strings.Repeat("é", session.MaxMessageBytes/len("é"))
+	form := url.Values{
+		"creation_date": {"2026-09-03"},
+		"name":          {"example"},
+		"goal":          {goal},
+	}.Encode()
+	if len([]byte(form)) <= 32*1024 || len([]byte(form)) > session.MaxFormRequestBodyBytes {
+		t.Fatalf("encoded form size = %d, ceiling = %d", len([]byte(form)), session.MaxFormRequestBodyBytes)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(form))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", server.config.BaseURL)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+}
+
+func TestJSONTransportAcceptsMaximallyEscapedMessageAtPublishedLimit(t *testing.T) {
+	server := newTestServer(t)
+	body := `{"message":"` + strings.Repeat(`\u0000`, session.MaxMessageBytes) + `"}`
+	if len([]byte(body)) <= 64*1024 || len([]byte(body)) > session.MaxJSONRequestBodyBytes {
+		t.Fatalf("encoded JSON size = %d, ceiling = %d", len([]byte(body)), session.MaxJSONRequestBodyBytes)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/sessions/example/message", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if !server.decodeJSON(response, request, &payload) {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if len([]byte(payload.Message)) != session.MaxMessageBytes {
+		t.Fatalf("decoded message size = %d", len([]byte(payload.Message)))
+	}
+}
+
+func TestSessionCreationPassesAStableDatedSlug(t *testing.T) {
+	server := newTestServer(t)
+	server.config.TmuxSocket = "/run/vpsfree-workspace-tmux/tmux.sock"
+	server.config.CodexSocket = "/run/vpsfree-workspace-codex/app-server.sock"
+	server.config.CodexVersion = "0.152.1"
+	server.config.CodexCommand = "/nix/store/codex/bin/codex"
+	server.config.PortalCommand = "/run/current-system/sw/bin/workspace-portal"
+	directory := t.TempDir()
+	arguments := filepath.Join(directory, "arguments")
+	helper := filepath.Join(directory, "dev-session")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$ARGUMENTS\"\nprintf '{\"slug\":\"2026-09-03-example\",\"threadId\":\"thread-1\"}\\n'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	server.config.DevSession = helper
+	request := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
+		"creation_date=2026-09-03&name=example&goal=Implement+the+feature",
+	))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", server.config.BaseURL)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
+		"creation_date=2026-09-03&name=example&goal=Implement+the+feature",
+	))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", server.config.BaseURL)
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("replay status = %d, body = %q", response.Code, response.Body.String())
+	}
+	data, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if count := strings.Count(string(data), "--require-runtime\n"); count != 2 {
+		t.Fatalf("creation attempts = %d, want 2", count)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "start 2026-09-03-example --as-is --exclusive") || strings.Contains(joined, "--new") {
+		t.Fatalf("dev-session arguments = %q", argv)
+	}
+	if !strings.Contains(joined, "--tmux-socket /run/vpsfree-workspace-tmux/tmux.sock") ||
+		!strings.Contains(joined, "--require-runtime") ||
+		!strings.Contains(joined, "--authority-dir "+server.config.AuthorityDir) ||
+		!strings.Contains(joined, "--codex-socket /run/vpsfree-workspace-codex/app-server.sock") ||
+		!strings.Contains(joined, "--codex-version 0.152.1") ||
+		!strings.Contains(joined, "--codex-command /nix/store/codex/bin/codex") ||
+		!strings.Contains(joined, "--portal-base-url "+server.config.BaseURL) ||
+		!strings.Contains(joined, "--portal-command /run/current-system/sw/bin/workspace-portal") {
+		t.Fatalf("dev-session socket arguments = %q", argv)
+	}
+}
+
+func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		authority    bool
+		codexVersion string
+		wantAttach   bool
+	}{
+		{"trusted-live", true, "0.152.1", true},
+		{"compatible-upgrade", true, "0.153.0", true},
+		{"manifest-only", false, "0.152.1", false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := newTestServer(t)
+			server.config.CodexVersion = testCase.codexVersion
+			directory := filepath.Join(server.config.Workspace, "work", "example")
+			if err := os.MkdirAll(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+				"creation:\n  state: ready\n  initial_goal_sent: true\n"
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, "active")
+			if testCase.authority {
+				writeWebRuntimeAuthority(t, server, "example")
+			}
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/example/", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+			}
+			hasAttach := strings.Contains(response.Body.String(), "workspace-dev-session attach example --as-is")
+			if hasAttach != testCase.wantAttach {
+				t.Fatalf("attach visibility = %t, want %t", hasAttach, testCase.wantAttach)
+			}
+		})
+	}
+}
+
+func writeWebRuntimeAuthority(t *testing.T, server *Server, slug string) {
+	t.Helper()
+	authority := session.RuntimeAuthority{
+		Schema: 1, State: "ready", Slug: slug, Workspace: server.config.Workspace,
+		TmuxSocket: "/run/vpsfree-workspace-tmux/tmux.sock", TmuxSessionID: "$1",
+		CodexThreadID: "thread-1", CodexSocketPath: server.config.CodexSocket,
+		CodexClientVersion: "0.152.1",
+	}
+	data, err := json.Marshal(authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(server.config.AuthorityDir, slug+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmux := filepath.Join(t.TempDir(), "tmux")
+	line := strings.Join([]string{
+		"$1", slug, "1", slug, server.config.Workspace, slug,
+		authority.TmuxSocket, authority.CodexThreadID, authority.CodexSocketPath,
+		authority.CodexClientVersion, "%1",
+	}, "\t")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.Tmux = tmux
+	server.config.VerifyThread = func(_ context.Context, threadID, cwd string) error {
+		if threadID != authority.CodexThreadID || cwd != filepath.Join(server.config.Workspace, "work", slug) {
+			return errors.New("unexpected thread identity")
+		}
+		return nil
+	}
+}
+
+func TestRunProcessGroupKillsDescendantsOnTimeout(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	command := exec.Command(
+		"sh", "-c",
+		`sleep 30 & pid=$!; awk '{print $1, $22, $5}' "/proc/$pid/stat" > "$1"; wait`,
+		"sh", pidFile,
+	)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	err := runProcessGroup(ctx, command)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout result = %v", err)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := strings.Fields(string(data))
+	if len(identity) != 3 {
+		t.Fatalf("invalid descendant identity %q", data)
+	}
+	pid, err := strconv.Atoi(identity[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	processGroup, err := strconv.Atoi(identity[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processGroup != command.Process.Pid {
+		t.Fatalf("descendant process group = %d, want %d", processGroup, command.Process.Pid)
+	}
+	startTime, err := strconv.ParseUint(identity[1], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for processStillExists(pid, startTime) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processStillExists(pid, startTime) {
+		t.Fatalf("descendant process %d survived the command timeout", pid)
+	}
+}
+
+func processStillExists(pid int, startTime uint64) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) < 22 || fields[2] == "Z" {
+			return false
+		}
+		currentStart, parseErr := strconv.ParseUint(fields[21], 10, 64)
+		return parseErr == nil && currentStart == startTime
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+func TestNonInteractiveSessionRejectsEventStreams(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\ncreation:\n  state: creating\nrepositories: []\nartifacts: []\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/events", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+}
+
+func TestClosedSessionDoesNotRenderMutationControls(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		BaseURL: "https://workspace.example.test",
+		Session: &session.Summary{
+			Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}},
+			Closed:   true,
+		},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{`id="pending"`, `id="message-form"`, `id="interrupt"`} {
+		if strings.Contains(body, marker) {
+			t.Fatalf("closed session rendered %s", marker)
+		}
+	}
+}
+
+func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		root      string
+		lifecycle string
+		finalized bool
+	}{{"stopped", "work", "active", false}, {"complete", "work", "complete", false}, {"archived", "archive", "complete", true}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := newTestServer(t)
+			directory := filepath.Join(server.config.Workspace, testCase.root, "example")
+			if err := os.MkdirAll(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+				"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+				"creation:\n  state: ready\n  initial_goal_sent: true\nrepositories: []\nartifacts: []\n"
+			if testCase.finalized {
+				manifest += "finalized_at: '2026-09-03T12:00:00Z'\n"
+			}
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, testCase.lifecycle)
+			expectedCwd := filepath.Join(server.config.Workspace, "work", "example")
+			server.config.VerifyThread = func(_ context.Context, threadID, cwd string) error {
+				if threadID != "thread-1" || cwd != expectedCwd {
+					return errors.New("wrong thread identity")
+				}
+				return nil
+			}
+			server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
+				return codex.Transcript{ThreadID: threadID, Status: "idle", Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "persisted answer"}}}, nil
+			}
+
+			page := httptest.NewRecorder()
+			server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/", nil))
+			if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Loading conversation") {
+				t.Fatalf("page status/body = %d %q", page.Code, page.Body.String())
+			}
+			for _, control := range []string{`id="pending"`, `id="message-form"`, `id="interrupt"`} {
+				if strings.Contains(page.Body.String(), control) {
+					t.Fatalf("read-only page contains %s", control)
+				}
+			}
+
+			api := httptest.NewRecorder()
+			server.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil))
+			if api.Code != http.StatusOK || !strings.Contains(api.Body.String(), "persisted answer") {
+				t.Fatalf("thread status/body = %d %q", api.Code, api.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreatingAuthorityNeverGrantsControls(t *testing.T) {
+	for _, authorityState := range []string{"creating", "ready"} {
+		t.Run(authorityState, func(t *testing.T) {
+			server := newTestServer(t)
+			directory := filepath.Join(server.config.Workspace, "work", "example")
+			if err := os.MkdirAll(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+				"creation:\n  state: creating\n  initial_goal_sent: false\n  goal_sha256: " + strings.Repeat("a", 64) + "\n"
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, "active")
+			writeWebRuntimeAuthority(t, server, "example")
+			authorityPath := filepath.Join(server.config.AuthorityDir, "example.json")
+			var authority session.RuntimeAuthority
+			data, _ := os.ReadFile(authorityPath)
+			if err := json.Unmarshal(data, &authority); err != nil {
+				t.Fatal(err)
+			}
+			authority.State = authorityState
+			data, _ = json.Marshal(authority)
+			if err := os.WriteFile(authorityPath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/example/", nil))
+			if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `id="message-form"`) {
+				t.Fatalf("creating page = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestPersistedThreadWithWrongCwdIsNotReadable(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\ncreation:\n  state: ready\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	server.config.VerifyThread = func(context.Context, string, string) error { return errors.New("wrong cwd") }
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+}
+
+func TestBrowserClientIncludesFreeFormOtherInput(t *testing.T) {
+	javascript, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"question.isOther", `other.value = "__other__"`, "Custom answer"} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("browser client does not contain %q", marker)
+		}
+	}
+}
+
+type browserContractCodex struct {
+	mu        sync.Mutex
+	message   string
+	interrupt bool
+	decision  string
+	answers   map[string]map[string][]string
+}
+
+func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ string) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected verification thread")
+	}
+	return nil
+}
+
+func (client *browserContractCodex) ReadThread(_ context.Context, threadID string) (codex.Transcript, error) {
+	return codex.Transcript{ThreadID: threadID}, nil
+}
+
+func (client *browserContractCodex) Send(_ context.Context, threadID, message string) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected message thread")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.message = message
+	return nil
+}
+
+func (client *browserContractCodex) Interrupt(_ context.Context, threadID string) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected interrupt thread")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.interrupt = true
+	return nil
+}
+
+func (client *browserContractCodex) Subscribe(_ context.Context, threadID string) (<-chan struct{}, func(), error) {
+	if threadID != "thread-1" {
+		return nil, nil, errors.New("unexpected event thread")
+	}
+	events := make(chan struct{})
+	close(events)
+	return events, func() {}, nil
+}
+
+func (client *browserContractCodex) PromptsWithItems(_ context.Context, threadID string) ([]codex.Prompt, error) {
+	if threadID != "thread-1" {
+		return nil, errors.New("unexpected pending thread")
+	}
+	return []codex.Prompt{{
+		ID: "approval-1", Kind: "command", ThreadID: threadID,
+		AvailableDecisions: []string{"accept", "decline"}, AuthorityAvailable: true,
+	}}, nil
+}
+
+func (client *browserContractCodex) RespondAnswers(
+	_ context.Context, id, threadID string, answers map[string]map[string][]string,
+) error {
+	if id != "question-1" || threadID != "thread-1" {
+		return errors.New("unexpected answer target")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.answers = answers
+	return nil
+}
+
+func (client *browserContractCodex) RespondDecision(_ context.Context, id, threadID, decision string) error {
+	if id != "approval-1" || threadID != "thread-1" {
+		return errors.New("unexpected decision target")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.decision = decision
+	return nil
+}
+
+func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for the shipped browser contract test")
+	}
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n" +
+		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, "example")
+	controller := &browserContractCodex{}
+	server.config.Codex = controller
+	server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
+		return codex.Transcript{
+			ThreadID: threadID, Status: "idle",
+			Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "contract response"}},
+		}, nil
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	server.config.BaseURL = httpServer.URL
+	command := exec.Command(node, "browser_contract_test.cjs", httpServer.URL)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser contract failed: %v\n%s", err, output)
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	answer := ""
+	if choice, ok := controller.answers["choice"]; ok {
+		if answers := choice["answers"]; len(answers) > 0 {
+			answer = answers[0]
+		}
+	}
+	if controller.message != "browser message" || !controller.interrupt ||
+		controller.decision != "accept" || answer != "yes" {
+		t.Fatalf("browser operations were not delivered: %#v", controller)
+	}
+}
+
+func TestRepositoryCacheDoesNotCrossClosedTransition(t *testing.T) {
+	server := newTestServer(t)
+	gh := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$1\" in repo) printf 'main\\n' ;; run) printf '[]\\n' ;; esac\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.repository.GH = gh
+	updated := time.Now()
+	repository := session.Repository{
+		Name: "example", GitHub: "vpsfreecz/example", Branch: "feature", DefaultBranch: "master",
+		InitialBaseSHA: strings.Repeat("1", 40), FinalHeadSHA: strings.Repeat("2", 40),
+	}
+	active := &session.Summary{Manifest: session.Manifest{Slug: "example", Repositories: []session.Repository{repository}}, UpdatedAt: updated}
+	activeStatus := server.repositories(context.Background(), active)
+	if len(activeStatus) != 1 || !strings.Contains(activeStatus[0].CompareURL, "main...feature") {
+		t.Fatalf("active status = %#v", activeStatus)
+	}
+	closed := *active
+	closed.Closed = true
+	closedStatus := server.repositories(context.Background(), &closed)
+	if len(closedStatus) != 1 || !strings.Contains(closedStatus[0].CompareURL, strings.Repeat("1", 40)+"..."+strings.Repeat("2", 40)) {
+		t.Fatalf("closed status reused mutable cache: %#v", closedStatus)
+	}
+}
+
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	workspace := t.TempDir()
+	authorityDir := filepath.Join(t.TempDir(), "authority")
+	if err := os.Mkdir(authorityDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{
+		Workspace:    workspace,
+		BaseURL:      "https://workspace.example.test",
+		AuthorityDir: authorityDir,
+		CodexSocket:  "/run/vpsfree-workspace-codex/app-server.sock",
+		CodexVersion: "0.152.1",
+		Logger:       log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}

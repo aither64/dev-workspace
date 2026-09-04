@@ -2,6 +2,7 @@
 
 require 'date'
 require 'fileutils'
+require 'json'
 require 'minitest/autorun'
 require 'open3'
 require 'rbconfig'
@@ -713,13 +714,17 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
       environment = runner.send(:session_environment, '2026-06-06-demo')
-      contract = File.readlines(
-        File.expand_path('../portal/runtime-environment-keys.txt', __dir__),
-        chomp: true
+      contract = JSON.parse(
+        File.read(File.expand_path('../portal/runtime-contract.json', __dir__))
       )
-      assert_equal(contract.sort, environment.keys.sort)
       assert_equal(
-        (contract - [VpsfreeDevSession::ENV_REQUIRE_RUNTIME]).sort,
+        VpsfreeDevSession::MAX_MESSAGE_BYTES,
+        contract.fetch('maxMessageBytes')
+      )
+      environment_keys = contract.fetch('threadEnvironmentKeys')
+      assert_equal(environment_keys.sort, environment.keys.sort)
+      assert_equal(
+        (environment_keys - [VpsfreeDevSession::ENV_REQUIRE_RUNTIME]).sort,
         VpsfreeDevSession::THREAD_ENV_ARGUMENTS.keys.sort
       )
       assert_equal('1', environment.fetch(VpsfreeDevSession::ENV_REQUIRE_RUNTIME))
@@ -735,6 +740,31 @@ class DevSessionTest < Minitest::Test
         '/run/current-system/sw/bin/workspace-portal',
         environment.fetch(VpsfreeDevSession::ENV_PORTAL_COMMAND)
       )
+    end
+  end
+
+  def test_deployment_runtime_flags_are_accepted
+    with_workspace do |workspace|
+      contract = JSON.parse(
+        File.read(File.expand_path('../portal/runtime-contract.json', __dir__))
+      )
+      values = {
+        '--workspace' => workspace,
+        '--authority-dir' => File.join(workspace, 'authority'),
+        '--tmux-socket' => File.join(workspace, 'tmux.sock'),
+        '--codex-command' => '/bin/true',
+        '--codex-socket' => File.join(workspace, 'codex.sock'),
+        '--codex-version' => 'test-version',
+        '--portal-command' => '/bin/true',
+        '--portal-base-url' => 'https://workspace.example.test'
+      }
+      arguments = contract.fetch('devSessionFlags').flat_map do |option|
+        option == '--require-runtime' ? [option] : [option, values.fetch(option)]
+      end
+      out = StringIO.new
+      err = StringIO.new
+      status = VpsfreeDevSession::CLI.new(arguments + ['validate'], out:, err:).run
+      assert_equal(0, status, err.string)
     end
   end
 

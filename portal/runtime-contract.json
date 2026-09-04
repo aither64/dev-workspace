@@ -1,0 +1,55 @@
+{
+  "maxMessageBytes": 20000,
+  "formEncodingExpansion": 3,
+  "jsonEncodingExpansion": 6,
+  "transportEnvelopeBytes": 1024,
+  "threadEnvironmentKeys": [
+    "VPSFREE_DEV_SESSION_SLUG",
+    "VPSFREE_DEV_SESSION_WORKSPACE",
+    "VPSFREE_DEV_SESSION_WORK_DIR",
+    "VPSFREE_DEV_SESSION_WORKTREES_DIR",
+    "VPSFREE_DEV_SESSION_PORTAL_BASE_URL",
+    "VPSFREE_DEV_SESSION_URL",
+    "VPSFREE_DEV_SESSION_AUTHORITY_DIR",
+    "VPSFREE_DEV_SESSION_TMUX_SOCKET",
+    "VPSFREE_DEV_SESSION_CODEX",
+    "VPSFREE_DEV_SESSION_CODEX_SOCKET",
+    "VPSFREE_DEV_SESSION_CODEX_VERSION",
+    "VPSFREE_DEV_SESSION_PORTAL_COMMAND",
+    "VPSFREE_DEV_SESSION_REQUIRE_RUNTIME"
+  ],
+  "staticEnvironmentKeys": [
+    "VPSFREE_DEV_SESSION_PORTAL_BASE_URL",
+    "VPSFREE_DEV_SESSION_AUTHORITY_DIR",
+    "VPSFREE_DEV_SESSION_TMUX_SOCKET",
+    "VPSFREE_DEV_SESSION_CODEX",
+    "VPSFREE_DEV_SESSION_CODEX_SOCKET",
+    "VPSFREE_DEV_SESSION_CODEX_VERSION",
+    "VPSFREE_DEV_SESSION_PORTAL_COMMAND",
+    "VPSFREE_DEV_SESSION_REQUIRE_RUNTIME"
+  ],
+  "devSessionFlags": [
+    "--require-runtime",
+    "--workspace",
+    "--authority-dir",
+    "--tmux-socket",
+    "--codex-command",
+    "--codex-socket",
+    "--codex-version",
+    "--portal-command",
+    "--portal-base-url"
+  ],
+  "portalServeFlags": [
+    "--workspace",
+    "--base-url",
+    "--unix-socket",
+    "--dev-session",
+    "--authority-dir",
+    "--codex-socket",
+    "--codex-version",
+    "--codex-command",
+    "--portal-command",
+    "--tmux",
+    "--tmux-socket"
+  ]
+}

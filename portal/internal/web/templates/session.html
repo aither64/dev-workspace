@@ -1,0 +1,72 @@
+{{define "session"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Session.Slug}} · Workspace</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-session="{{.Session.Slug}}" data-interactive="{{.Session.Interactive}}">
+  <header class="topbar">
+    <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
+    <div class="header-actions"><span class="badge {{if .Session.Closed}}archived{{else}}active{{end}}">{{if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete{{else if eq .Session.Lifecycle "abandoned"}}Abandoned{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span></div>
+  </header>
+  <main class="page session-layout">
+    {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
+    <section class="workspace-column">
+      <section class="panel">
+        <div class="section-heading"><h2>Handoff</h2></div>
+        <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
+        {{if and .Session.Interactive .Session.Tmux.SocketPath}}
+        <label>Attach from aitherdev<div class="copy-row"><input readonly value="workspace-dev-session attach {{.Session.Slug}} --as-is"><button type="button" data-copy>Copy</button></div></label>
+        <label>Attach over SSH<div class="copy-row"><input readonly value="ssh -t aitherdev.int.vpsfree.cz &quot;workspace-dev-session attach {{.Session.Slug}} --as-is&quot;"><button type="button" data-copy>Copy</button></div></label>
+        {{end}}
+      </section>
+
+      <section>
+        <div class="section-heading"><h2>Repositories</h2><span>{{len .Repositories}}</span></div>
+        <div class="repo-grid">
+        {{range .Repositories}}
+          <article class="panel repo-card">
+            <div class="repo-title"><h3>{{.Name}}</h3></div>
+            <dl><dt>Branch</dt><dd><code>{{.Branch}}</code></dd>{{if .HeadSHA}}<dt>Final HEAD</dt><dd><code>{{shortSHA .HeadSHA}}</code></dd>{{end}}</dl>
+            <nav class="link-row">
+              {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
+              {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Branch</a>{{end}}
+              {{if .ActionsURL}}<a href="{{.ActionsURL}}" target="_blank" rel="noreferrer">Actions</a>{{end}}
+            </nav>
+            {{if .GitHubError}}<p class="notice warning">GitHub: {{.GitHubError}}</p>{{end}}
+            {{if .Runs}}<div class="runs">{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{.Conclusion}}">{{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{end}}
+          </article>
+        {{else}}<p class="empty">Codex has not added any repository worktrees yet.</p>{{end}}
+        </div>
+      </section>
+
+      <section class="panel documents">
+        <div class="tabs" role="tablist"><button class="tab active" data-tab="plan">Plan</button><button class="tab" data-tab="state">State</button>{{range .Session.Artifacts}}<a class="tab" href="/artifacts/{{$.Session.Slug}}/{{.Path}}">{{.Label}}</a>{{end}}</div>
+        <article id="plan" class="document active">{{.Plan}}</article>
+        <article id="state" class="document">{{.State}}</article>
+      </section>
+    </section>
+
+    <aside class="chat-column panel">
+      <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><span id="codex-status" class="badge">Connecting</span></div>
+      {{if .Session.Codex.ThreadID}}
+        {{if .Session.Interactive}}
+        <div id="pending" class="pending"></div>
+        {{end}}
+        <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
+        {{if .Session.Interactive}}
+        <form id="message-form" class="chat-form">
+          <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
+          <div class="chat-actions"><button type="submit">Send</button><button id="interrupt" type="button" class="danger">Interrupt</button></div>
+        </form>
+        {{end}}
+      {{else}}<p class="empty">This session has no connected Codex thread.</p>{{end}}
+    </aside>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
+{{end}}

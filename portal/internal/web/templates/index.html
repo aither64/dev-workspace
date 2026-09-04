@@ -1,0 +1,56 @@
+{{define "index"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workspace</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><p class="eyebrow">vpsFree.cz development</p><h1>Workspace</h1></div>
+  </header>
+  <main class="page">
+    {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
+    <section class="panel new-session">
+      <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects.</p></div>
+      <form method="post" action="/sessions" class="stack">
+        <input type="hidden" name="creation_date" value="{{.CreationDate}}">
+        <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
+        <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
+        <button type="submit">Create session</button>
+      </form>
+    </section>
+
+    <section>
+      <div class="section-heading"><h2>Work</h2><span>{{len .Active}}</span></div>
+      <div class="session-grid">
+        {{range .Active}}
+          <a class="session-card" href="/{{.Slug}}/">
+            <span class="status-dot {{if not .Closed}}active{{end}}"></span>
+            <strong>{{.Slug}}</strong>
+            <span class="muted">Updated {{timeAgo .UpdatedAt}}</span>
+            <span>{{len .Repositories}} repositories</span>
+          </a>
+        {{else}}<p class="empty">No portal-enabled work sessions.</p>{{end}}
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading"><h2>Archive</h2><span>{{len .Archived}}</span></div>
+      <div class="session-grid">
+        {{range .Archived}}
+          <a class="session-card archived" href="/{{.Slug}}/">
+            <span class="status-dot"></span>
+            <strong>{{.Slug}}</strong>
+            <span class="muted">Finalized {{timeAgo .UpdatedAt}}</span>
+            <span>{{len .Repositories}} repositories</span>
+          </a>
+        {{else}}<p class="empty">No portal-enabled archived sessions.</p>{{end}}
+      </div>
+    </section>
+  </main>
+</body>
+</html>
+{{end}}
