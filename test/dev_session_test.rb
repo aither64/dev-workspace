@@ -1194,11 +1194,17 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       commit_tracking(workspace, slug, lifecycle: 'active')
       state = File.join(workspace, 'work', slug, 'state.md')
+      tracking_paths = [
+        File.join('work', slug),
+        File.join('archive', slug)
+      ]
       set_lifecycle(workspace, slug, 'complete')
       File.write(state, "#{File.read(state)}\nFinal result: passed\n")
       assert_equal(
         '1',
-        git_capture_success('git', '-C', workspace, 'rev-list', '--count', 'HEAD').strip
+        git_capture_success(
+          'git', '-C', workspace, 'rev-list', '--count', 'HEAD', '--', *tracking_paths
+        ).strip
       )
       out = StringIO.new
       tmux = ManagedTmux.new(slug, workspace:)
@@ -1241,7 +1247,9 @@ class DevSessionTest < Minitest::Test
       commit_archive_move(workspace, slug)
       assert_equal(
         '2',
-        git_capture_success('git', '-C', workspace, 'rev-list', '--count', 'HEAD').strip
+        git_capture_success(
+          'git', '-C', workspace, 'rev-list', '--count', 'HEAD', '--', *tracking_paths
+        ).strip
       )
       runner.stop(slug, as_is: true)
       assert(tmux.killed)
