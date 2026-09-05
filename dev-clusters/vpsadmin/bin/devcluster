@@ -9,7 +9,7 @@ CERT_DIR="$STATE_ROOT/certs/default"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
-DEV_SESSION_BIN="${VPSFREE_DEV_SESSION_COMMAND:-dev-session}"
+DEV_SESSION_BIN=dev-session
 
 usage() {
   cat <<'EOF'

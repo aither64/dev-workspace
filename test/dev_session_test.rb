@@ -887,6 +887,42 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_global_option_separator_seals_the_deployment_runtime
+    with_workspace do |workspace|
+      fixed_workspace = File.join(workspace, 'fixed')
+      FileUtils.mkdir_p(fixed_workspace)
+      arguments = [
+        '--require-runtime',
+        '--workspace', fixed_workspace,
+        '--authority-dir', File.join(workspace, 'authority'),
+        '--tmux-socket', File.join(workspace, 'tmux.sock'),
+        '--codex-command', '/bin/true',
+        '--codex-socket', File.join(workspace, 'codex.sock'),
+        '--codex-version', 'test-version',
+        '--portal-command', '/bin/true',
+        '--portal-base-url', 'https://workspace.example.test',
+        '--'
+      ]
+
+      out = StringIO.new
+      err = StringIO.new
+      status = VpsfreeDevSession::CLI.new(arguments + ['--help'], out:, err:).run
+      assert_equal(0, status, err.string)
+      assert_includes(out.string, 'Usage:')
+
+      %w[--workspace --workspace=/tmp/caller].each do |override|
+        caller_arguments = override == '--workspace' ? [override, '/tmp/caller'] : [override]
+        out = StringIO.new
+        err = StringIO.new
+        status = VpsfreeDevSession::CLI.new(
+          arguments + caller_arguments + ['validate'], out:, err:
+        ).run
+        assert_equal(1, status)
+        assert_includes(err.string, "unknown command: #{override}")
+      end
+    end
+  end
+
   def test_resolved_session_url_is_not_reused_as_the_portal_base
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

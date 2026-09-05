@@ -3232,6 +3232,8 @@ module VpsfreeDevSession
       raise Error, USAGE unless command
 
       case command
+      when '-h', '--help'
+        @out.puts USAGE
       when 'start'
         run_start
       when 'fork'
@@ -3275,6 +3277,9 @@ module VpsfreeDevSession
     def parse_global_options
       until @argv.empty?
         case @argv.first
+        when '--'
+          @argv.shift
+          break
         when '--workspace'
           @argv.shift
           @workspace = File.expand_path(@argv.shift || raise(Error, '--workspace requires DIR'))

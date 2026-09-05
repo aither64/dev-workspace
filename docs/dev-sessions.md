@@ -310,16 +310,17 @@ not require callers to repeat these host-specific arguments. Run
 plan, anchored lifecycle, active/archive placement, and manifest, before
 deployment.
 
-Set `VPSFREE_DEV_SESSION_CODEX` to override the command used for the left pane.
-Publishing Codex runtime provenance requires this value to begin with an
-absolute executable path whose `--version` output matches
-`VPSFREE_DEV_SESSION_CODEX_VERSION`. The recorded version describes how the
-session was created; an existing session remains valid after a compatible
-client upgrade when its thread, App Server socket, working directory, and live
-host authority still match.
-Set `VPSFREE_DEV_SESSION_CODEX_SOCKET` or pass `--codex-socket` to connect the
-terminal and helper operations to a supervised App Server socket.
-Use `--no-codex` to start a shell in the left pane instead.
+Host-specific runtime options are private implementation details fixed by the
+installed command. Callers cannot replace them with command-line flags or
+environment variables. The recorded Codex version describes how the session
+was created; an existing session remains valid after a compatible client
+upgrade when its thread, App Server socket, working directory, and live host
+authority still match. Use `--no-codex` to start a shell in the left pane
+instead.
+
+New conversations use the configured default model with `max` reasoning. When
+an explicitly chosen model does not support `max`, its advertised default
+reasoning effort is used. An explicit reasoning choice always takes precedence.
 
 `--goal-file FILE` seeds the Goal section in a new plan. `--json` prints the
 resolved slug, portal URL, Codex thread ID, and identity-bound tmux attach
@@ -337,9 +338,7 @@ identifies the exact workspace and slug. The journal remains in
 the lock directory after the manifest reaches `ready`, allowing the
 HTTP result to be replayed without repeating a known initial turn. The portal
 passes a full dated slug with `--as-is`, preserving request identity across
-midnight. Set
-`VPSFREE_DEV_SESSION_PORTAL_COMMAND` to override the `workspace-portal`
-executable used for thread creation.
+midnight.
 
 The private package implementation requires the authority directory, tmux
 socket, Codex command and socket, client version, and portal command to be

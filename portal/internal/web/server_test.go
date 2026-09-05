@@ -230,11 +230,8 @@ func TestJSONTransportAcceptsMaximallyEscapedMessageAtPublishedLimit(t *testing.
 
 func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testing.T) {
 	server := newTestServer(t)
-	server.config.TmuxSocket = "/run/vpsfree-workspace-tmux/tmux.sock"
 	server.config.CodexSocket = "/run/vpsfree-workspace-codex/app-server.sock"
 	server.config.CodexVersion = "0.152.1"
-	server.config.CodexCommand = "/nix/store/codex/bin/codex"
-	server.config.PortalCommand = "/run/current-system/sw/bin/workspace-portal"
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
 	helper := filepath.Join(directory, "dev-session")
@@ -526,7 +523,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	for _, marker := range []string{
 		"event.key !== \"Enter\"", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"entry.html", "finish-session", "archive-session", "release-cluster", "fork-dialog",
-		"codex-settings-dialog", "codex-settings-open", "preferredReasoningEffort",
+		"codex-settings-dialog", "codex-settings-open", "modelSelect.required",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)

@@ -51,12 +51,9 @@ type Config struct {
 	DevSession        string
 	GH                string
 	Tmux              string
-	TmuxSocket        string
 	AuthorityDir      string
 	CodexSocket       string
 	CodexVersion      string
-	CodexCommand      string
-	PortalCommand     string
 	VpsadminCluster   string
 	VpsadminOSCluster string
 	Logger            *log.Logger

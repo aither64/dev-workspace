@@ -81,8 +81,8 @@ func run(args []string) error {
 
 type serveOptions struct {
 	unixSocket, workspace, baseURL, devSession, authorityDir string
-	codexSocket, codexVersion, codexCommand, portalCommand   string
-	gh, tmux, tmuxSocket                                     string
+	codexSocket, codexVersion                                string
+	gh, tmux                                                 string
 	vpsadminCluster, vpsadminOSCluster                       string
 }
 
@@ -96,11 +96,8 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
 	flags.StringVar(&options.codexSocket, "codex-socket", codex.DefaultSocket(), "Codex App Server Unix socket")
 	flags.StringVar(&options.codexVersion, "codex-version", "", "Codex client version used by attached terminal sessions")
-	flags.StringVar(&options.codexCommand, "codex-command", "", "absolute Codex client executable used by attached terminal sessions")
-	flags.StringVar(&options.portalCommand, "portal-command", "", "stable workspace-portal executable used by sessions")
 	flags.StringVar(&options.gh, "gh", "gh", "GitHub CLI executable")
 	flags.StringVar(&options.tmux, "tmux", "tmux", "tmux executable")
-	flags.StringVar(&options.tmuxSocket, "tmux-socket", "", "dedicated tmux socket name or path for browser-created sessions")
 	flags.StringVar(&options.vpsadminCluster, "vpsadmin-cluster", "", "absolute vpsAdmin development cluster helper")
 	flags.StringVar(&options.vpsadminOSCluster, "vpsadminos-cluster", "", "absolute vpsAdminOS development cluster helper")
 	return flags, options
@@ -116,11 +113,9 @@ func serve(args []string) error {
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		Workspace: options.workspace, BaseURL: options.baseURL, DevSession: options.devSession,
-		GH: options.gh, Tmux: options.tmux, TmuxSocket: options.tmuxSocket, AuthorityDir: options.authorityDir,
+		GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		CodexSocket:     options.codexSocket,
 		CodexVersion:    options.codexVersion,
-		CodexCommand:    options.codexCommand,
-		PortalCommand:   options.portalCommand,
 		VpsadminCluster: options.vpsadminCluster, VpsadminOSCluster: options.vpsadminOSCluster,
 		Logger: logger, Codex: codexClient,
 	})
