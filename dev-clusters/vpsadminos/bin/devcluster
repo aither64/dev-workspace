@@ -9,6 +9,7 @@ SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
 DEV_SESSION_BIN=dev-session
+source "$SCRIPT_DIR/../../lib/runtime.sh"
 
 usage() {
   cat <<'EOF'
@@ -221,66 +222,6 @@ node_ssh_port() {
   port="$(jq -r --arg node "$node" '.nodes[$node].sshPort // empty' "$(config_json_for_slug "$slug")")"
   [ -n "$port" ] || die "node '$node' has no sshPort"
   printf '%s\n' "$port"
-}
-
-is_running() {
-  local pid="$1"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
-cluster_running() {
-  local slug="$1"
-  local pid_path
-  pid_path="$(pid_file "$slug")"
-  [ -f "$pid_path" ] && runner_process_matches "$slug" "$(cat "$pid_path")"
-}
-
-runner_process_matches() {
-  local slug="$1"
-  local pid="$2"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  is_running "$pid" || return 1
-  process_has_argument "$pid" "$(socket_dir "$slug")"
-}
-
-process_has_argument() {
-  local pid="$1"
-  local expected="$2"
-  local argument
-  [ -r "/proc/$pid/cmdline" ] || return 1
-  while IFS= read -r -d '' argument; do
-    [ "$argument" = "$expected" ] && return 0
-  done < "/proc/$pid/cmdline"
-  return 1
-}
-
-socket_processes() {
-  local slug="$1"
-  local expected process pid
-  expected="$(socket_dir "$slug")"
-  for process in /proc/[0-9]*; do
-    pid="${process##*/}"
-    process_has_argument "$pid" "$expected" && printf '%s\n' "$pid"
-  done
-}
-
-kill_socket_processes() {
-  local slug="$1"
-  local pid
-
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
-    kill -TERM "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
-
-  sleep 2
-
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
-    kill -KILL "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
 }
 
 ensure_ssh_key() {
@@ -578,6 +519,11 @@ stop_cluster() {
 status_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
+
+  if [ "${2:-}" = "--json" ]; then
+    devcluster_status_json vpsadminos vpsAdminOS "$slug" vpsadminos-devcluster false
+    return
+  fi
 
   local pid_path
   pid_path="$(pid_file "$slug")"

@@ -32,6 +32,7 @@ buildGoModule {
     codex
     coreutils
     git
+    jq
     nodejs
     openssl
     python3
@@ -58,6 +59,7 @@ buildGoModule {
     (
       cd ..
       ruby test/dev_session_test.rb
+      ruby test/devcluster_status_test.rb
       ruby test/workspace_pki_test.rb
       ruby test/workspace_portal_password_test.rb
     )
@@ -74,6 +76,7 @@ buildGoModule {
       "$out/share/workspace-portal/runtime-contract.json"
     cp -R ${src}/dev-clusters/vpsadmin "$out/share/workspace-portal/vpsadmin-devcluster"
     cp -R ${src}/dev-clusters/vpsadminos "$out/share/workspace-portal/vpsadminos-devcluster"
+    cp -R ${src}/dev-clusters/lib "$out/share/workspace-portal/lib"
 
     substituteInPlace "$out/libexec/workspace-portal/dev-session" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'

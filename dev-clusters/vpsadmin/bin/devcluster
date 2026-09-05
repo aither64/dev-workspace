@@ -10,6 +10,7 @@ SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
 DEV_SESSION_BIN=dev-session
+source "$SCRIPT_DIR/../../lib/runtime.sh"
 
 usage() {
   cat <<'EOF'
@@ -234,66 +235,6 @@ machine_known() {
   jq -e --arg machine "$machine" '
     (.nodes | has($machine)) or ((.dns.servers // {}) | has($machine))
   ' "$(config_json_for_slug "$slug")" >/dev/null
-}
-
-is_running() {
-  local pid="$1"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
-
-cluster_running() {
-  local slug="$1"
-  local pid_path
-  pid_path="$(pid_file "$slug")"
-  [ -f "$pid_path" ] && runner_process_matches "$slug" "$(cat "$pid_path")"
-}
-
-runner_process_matches() {
-  local slug="$1"
-  local pid="$2"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  is_running "$pid" || return 1
-  process_has_argument "$pid" "$(socket_dir "$slug")"
-}
-
-process_has_argument() {
-  local pid="$1"
-  local expected="$2"
-  local argument
-  [ -r "/proc/$pid/cmdline" ] || return 1
-  while IFS= read -r -d '' argument; do
-    [ "$argument" = "$expected" ] && return 0
-  done < "/proc/$pid/cmdline"
-  return 1
-}
-
-socket_processes() {
-  local slug="$1"
-  local expected process pid
-  expected="$(socket_dir "$slug")"
-  for process in /proc/[0-9]*; do
-    pid="${process##*/}"
-    process_has_argument "$pid" "$expected" && printf '%s\n' "$pid"
-  done
-}
-
-kill_socket_processes() {
-  local slug="$1"
-  local pid
-
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
-    kill -TERM "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
-
-  sleep 2
-
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
-    kill -KILL "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
 }
 
 ensure_ssh_key() {
@@ -1046,6 +987,11 @@ status_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
 
+  if [ "${2:-}" = "--json" ]; then
+    devcluster_status_json vpsadmin vpsAdmin "$slug" vpsadmin-devcluster true
+    return
+  fi
+
   local pid_path
   pid_path="$(pid_file "$slug")"
 
@@ -1070,6 +1016,25 @@ status_cluster() {
   if [ -L "$(result_link "$slug")" ]; then
     printf 'gcroot: %s\n' "$(result_link "$slug")"
   fi
+}
+
+devcluster_credentials_json() {
+  local slug="$1"
+  jq -c '
+    (.seed.users // [] | if type == "array" then . else [] end) as $users |
+    ([
+      {label: "Admin login", value: "test-admin"},
+      {label: "Admin password", value: "testAdminPassword"}
+    ] + (($users | map([
+      {label: "User login", value: .login},
+      {label: "User password", value: .password}
+    ]) | add) // []) + [
+      {label: "Adminer login", value: .adminer.webAuth.username},
+      {label: "Adminer password", value: .adminer.webAuth.password},
+      {label: "Mailpit login", value: .mail.capture.webAuth.username},
+      {label: "Mailpit password", value: .mail.capture.webAuth.password}
+    ]) | map(select(.value | type == "string" and length > 0))
+  ' "$(config_json_for_slug "$slug")"
 }
 
 gcroots_cluster() {
@@ -1130,7 +1095,6 @@ urls_cluster() {
   [ -n "$slug" ] || die "missing slug"
   ensure_cluster_config "$slug"
   local api_domain adminer_domain auth_domain console_domain webui_domain web_cs_domain web_en_domain mailpit_domain status_domain
-  local adminer_user adminer_password mailpit_user mailpit_password
   api_domain="$(config_get "$slug" '.domains.api')"
   adminer_domain="$(config_get "$slug" '.domains.adminer')"
   auth_domain="$(config_get "$slug" '.domains.auth')"
@@ -1140,10 +1104,6 @@ urls_cluster() {
   web_en_domain="$(config_get "$slug" '.domains.webEn')"
   mailpit_domain="$(config_get "$slug" '.domains.mailpit')"
   status_domain="$(config_get "$slug" '.domains.status')"
-  adminer_user="$(config_get "$slug" '.adminer.webAuth.username')"
-  adminer_password="$(config_get "$slug" '.adminer.webAuth.password')"
-  mailpit_user="$(config_get "$slug" '.mail.capture.webAuth.username')"
-  mailpit_password="$(config_get "$slug" '.mail.capture.webAuth.password')"
 
   cat <<EOF
 Cluster: $slug
@@ -1157,23 +1117,14 @@ Console: https://$console_domain/
 Mailpit: https://$mailpit_domain/
 Status:  https://$status_domain/
 Adminer: https://$adminer_domain/
-
-Admin login: test-admin
-Admin password: testAdminPassword
-User login: test-user1
-User password: testUser1Password
-User login: test-user2
-User password: testUser2Password
-Adminer login: $adminer_user
-Adminer password: $adminer_password
 Adminer DB system: MySQL
 Adminer DB server: 127.0.0.1
 Adminer DB user: vpsadmin
 Adminer DB password: testMariadbApiPassword
-Mailpit login: $mailpit_user
-Mailpit password: $mailpit_password
 CA: $CERT_DIR/vpsadmin-ca.crt
 EOF
+
+  devcluster_credentials_json "$slug" | jq -r '.[] | "\(.label): \(.value)"'
 
   if [ "$(cluster_network "$slug")" = "local" ]; then
     cat <<EOF
