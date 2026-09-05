@@ -18,11 +18,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/cluster"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/processgroup"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/repository"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
 	"github.com/microcosm-cc/bluemonday"
@@ -440,12 +440,11 @@ func (s *Server) runDevSession(timeout time.Duration, args ...string) (string, s
 	commandCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	command := exec.Command(s.config.DevSession, args...)
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	err := runProcessGroup(commandCtx, command)
+	err := processgroup.Run(commandCtx, command)
 	return stdout.String(), stderr.String(), err
 }
 
@@ -498,22 +497,6 @@ func (s *Server) validateModelSettings(ctx context.Context, settings codex.Threa
 		return fmt.Errorf("reasoning effort %q is not available for %s", settings.ReasoningEffort, model.DisplayName)
 	}
 	return fmt.Errorf("Codex model %q is not available", settings.Model)
-}
-
-func runProcessGroup(ctx context.Context, command *exec.Cmd) error {
-	if err := command.Start(); err != nil {
-		return err
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		<-done
-		return ctx.Err()
-	}
 }
 
 func (s *Server) artifact(w http.ResponseWriter, r *http.Request) {
