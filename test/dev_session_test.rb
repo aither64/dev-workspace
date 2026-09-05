@@ -477,7 +477,7 @@ class DevSessionTest < Minitest::Test
 
     assert_equal(0, cli.run)
     assert_equal('demo', captured.fetch(:input))
-    assert_equal("Investigate the API failure.\n", captured.fetch(:goal))
+    assert_equal('Investigate the API failure.', captured.fetch(:goal))
     assert_equal(0o600, captured.fetch(:mode))
     assert_includes(err.string, 'Initial request: ')
     refute(File.exist?(captured.dig(:options, :goal_file)))
@@ -500,6 +500,29 @@ class DevSessionTest < Minitest::Test
 
     assert_equal(1, cli.run)
     assert_includes(err.string, 'requires --goal-file when input is not interactive')
+  end
+
+  def test_cli_accepts_an_exactly_maximum_size_interactive_request
+    captured = nil
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:start_requires_initial_goal?) do |_input, **_options|
+      true
+    end
+    fake_runner.define_singleton_method(:start) do |_input, **options|
+      captured = File.binread(options.fetch(:goal_file))
+    end
+    request = 'x' * VpsfreeDevSession::MAX_MESSAGE_BYTES
+    cli = VpsfreeDevSession::CLI.new(
+      ['start', 'demo', '--no-attach'],
+      input: TTYInput.new("#{request}\n"),
+      out: StringIO.new,
+      err: StringIO.new
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(0, cli.run)
+    assert_equal(VpsfreeDevSession::MAX_MESSAGE_BYTES, captured.bytesize)
+    assert_equal(request, captured)
   end
 
   def test_new_shared_session_requires_an_initial_request_before_writes
@@ -1180,8 +1203,9 @@ class DevSessionTest < Minitest::Test
         workspace:
       )
       runner_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) do |_slug, run_codex:, thread_id:|
+        define_method(:create_tmux_session) do |_slug, run_codex:, thread_id:, launch_codex:|
           raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
+          raise 'Codex launched before the initial request persisted' if launch_codex
 
           session
         end
@@ -1193,6 +1217,10 @@ class DevSessionTest < Minitest::Test
         end
 
         define_method(:revalidate_session!) do |expected|
+          expected
+        end
+
+        define_method(:reconcile_native_client!) do |_slug, expected|
           expected
         end
       end
@@ -1235,7 +1263,74 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_stopped_ready_session_opens_only_its_recorded_thread
+  def test_start_uses_one_private_snapshot_when_the_caller_goal_file_changes
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      original_request = 'Implement the original request.'
+      goal = File.join(workspace, 'goal.txt')
+      delivered = File.join(workspace, 'delivered.txt')
+      portal = File.join(workspace, 'fake-portal.rb')
+      File.write(goal, "#{original_request}\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        case ARGV[1]
+        when 'create'
+          puts JSON.generate(threadId: 'thread-snapshot')
+        when 'ensure-initial'
+          input = ARGV.fetch(ARGV.index('--input-file') + 1)
+          File.binwrite(#{delivered.dump}, File.binread(input))
+        end
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$created', name: slug, mark: '1', slug:, workspace:
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:prepare_creation_journal) do |*arguments, **keywords|
+          journal = super(*arguments, **keywords)
+          File.write(goal, "A replacement request that must be ignored.\n")
+          journal
+        end
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| session }
+        define_method(:revalidate_session!) { |_expected| session }
+        define_method(:reconcile_native_client!) { |_slug, expected| expected }
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+
+      assert_equal(original_request, File.binread(delivered))
+      assert_includes(
+        File.read(File.join(workspace, 'work', slug, 'plan.md')),
+        original_request
+      )
+      refute_includes(
+        File.read(File.join(workspace, 'work', slug, 'plan.md')),
+        'replacement request'
+      )
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      assert_equal(Digest::SHA256.hexdigest(original_request), journal.fetch('goal_sha256'))
+    end
+  end
+
+  def test_stopped_ready_session_rejects_a_recorded_thread_without_persisted_history
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       log = File.join(workspace, 'portal.log')
@@ -1248,6 +1343,9 @@ class DevSessionTest < Minitest::Test
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
@@ -1271,11 +1369,80 @@ class DevSessionTest < Minitest::Test
       end
       assert_includes(error.message, 'recorded thread is unavailable')
       command = File.read(log)
-      assert_includes(command, 'thread create')
+      assert_includes(command, 'thread require-materialized')
       assert_includes(command, '--thread-id thread-ready')
-      refute_includes(command, '--recover-creating')
+      assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
+      refute_includes(command, 'thread create')
       unchanged = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('thread-ready', unchanged.dig('codex', 'thread_id'))
+      assert_equal('ready', unchanged.dig('creation', 'state'))
+    end
+  end
+
+  def test_ready_creation_replay_rejects_a_thread_without_persisted_history
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'fake-portal.rb')
+      File.write(goal, "Implement a persistent conversation.\n")
+      File.write(portal, <<~RUBY)
+        File.write(#{log.dump}, ARGV.join(' '))
+        warn 'recorded thread has no rollout'
+        exit 1
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      journal = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      runner.ensure_tracking_files(slug)
+      runner.send(:seed_goal, slug, goal)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: journal)
+      manifest['codex'] = {
+        'thread_id' => 'thread-ready',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      manifest['creation']['state'] = 'ready'
+      manifest['creation']['initial_goal_sent'] = true
+      manifest['creation'].delete('initial_goal_attempted')
+      manifest['schema'] = 1
+      runner.send(:write_portal_manifest, slug, manifest)
+      runner.send(:mark_creation_journal_ready, slug, journal)
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+
+      assert_includes(error.message, 'recorded thread has no rollout')
+      assert_includes(File.read(log), 'thread require-materialized')
+      unchanged = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', unchanged.dig('creation', 'state'))
     end
   end
@@ -1483,6 +1650,37 @@ class DevSessionTest < Minitest::Test
       assert_equal('thread-retry', replay.fetch('threadId'))
       assert_nil(replay.fetch('attach'))
       assert_equal(replayed_commands, File.readlines(log, chomp: true))
+
+      stopped_session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$restarted', name: slug, mark: '1', slug:, workspace:
+      )
+      restart_runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| stopped_session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| stopped_session }
+        define_method(:revalidate_session!) { |_expected| stopped_session }
+      end
+      restart_out = StringIO.new
+      restart_runner = restart_runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: restart_out,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command: [RbConfig.ruby, portal]
+      )
+      restart_runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        json: true
+      )
+      assert_equal('thread-retry', JSON.parse(restart_out.string).fetch('threadId'))
+      restarted_commands = File.readlines(log, chomp: true)
+      assert_equal(3, restarted_commands.count { |line| line.start_with?('thread create ') })
+      assert_equal(2, restarted_commands.count { |line| line.start_with?('thread ensure-initial ') })
     end
   end
 
@@ -1523,6 +1721,11 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
+        define_method(:reconcile_native_client!) do |_slug, expected|
+          raise 'initial request was not persisted before Codex launch' unless File.file?(observation)
+
+          expected
+        end
       end
       runner = runner_class.new(
         workspace:,
@@ -1613,6 +1816,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| replacement }
         define_method(:sync_slug) { |*_arguments, **_keywords| replacement }
         define_method(:revalidate_session!) { |expected| expected }
+        define_method(:reconcile_native_client!) { |_slug, expected| expected }
       end
       second = second_runner_class.new(
         workspace:, authority_dir:, tmux_socket: '/run/test/tmux.sock',
@@ -1671,6 +1875,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
+        define_method(:reconcile_native_client!) { |_slug, expected| expected }
 
         def mark_creation_journal_ready(slug, journal)
           super

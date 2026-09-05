@@ -13,6 +13,17 @@ Pass a short name by default:
 dev-session start api-token-rotation
 ```
 
+For a new Codex session, the command asks for the first request before it
+creates tracking files or tmux panes. In a script or another noninteractive
+shell, put that request in a file:
+
+```sh
+dev-session start api-token-rotation --goal-file request.txt --no-attach
+```
+
+The request file is required only while creating a shared conversation. An
+existing session resumes without asking for the request again.
+
 If a unique existing slug already matches that name, `start` resumes it. If no
 existing slug matches, it creates today's slug. On June 6, 2026, a new
 `api-token-rotation` session resolves to `2026-06-06-api-token-rotation`.
@@ -56,10 +67,12 @@ passes the base URL explicitly and exports both values into each managed pane.
 `start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`,
 `work/<slug>/portal.yml`, and `worktrees/<slug>/` when missing. When
 `workspace-portal` is installed, it also creates a Codex App Server thread,
-records its ID, assigns the session name, and opens the terminal Codex client
-on that thread. Once the initial turn is recorded, the thread ID is
-authoritative and the helper resumes that exact thread while refreshing its
-working directory and runtime environment. While an exclusive creation journal
+records its ID, assigns the session name, and sends the initial request. It
+waits until the App Server has persisted the rollout and verifies the exact
+first user message before it opens the terminal Codex client. Once that check
+passes, the thread ID is authoritative and the helper resumes that exact
+thread while refreshing its working directory and runtime environment. While
+an exclusive creation journal
 is still `creating` and its initial goal is unsent, the helper reconciles the
 unique working directory instead. It resumes the sole candidate, or replaces a
 recorded memory-only thread that vanished during an App Server restart. It
@@ -322,10 +335,12 @@ New conversations use the configured default model with `max` reasoning. When
 an explicitly chosen model does not support `max`, its advertised default
 reasoning effort is used. An explicit reasoning choice always takes precedence.
 
-`--goal-file FILE` seeds the Goal section in a new plan. `--json` prints the
-resolved slug, portal URL, Codex thread ID, and identity-bound tmux attach
-command. `--exclusive` requires a goal file and records its digest in a workspace-local
-creation journal before creating initiative state. It may resume a manifest
+`--goal-file FILE` provides the initial Codex request and seeds the Goal
+section in a new plan. It is required when a noninteractive caller creates a
+shared conversation. `--json` prints the resolved slug, portal URL, Codex
+thread ID, and identity-bound tmux attach command. `--exclusive` requires a
+goal file and records its digest in a workspace-local creation journal before
+creating initiative state. It may resume a manifest
 whose creation state is `creating` or `ready` only when the complete request
 identity matches. The unique `work/<slug>` directory is used to reconcile one
 matching App Server thread, but App Server does not offer an exactly-once

@@ -398,6 +398,17 @@ module VpsfreeDevSession
       model: nil,
       effort: nil
     )
+      goal_snapshot = nil
+      if goal_file
+        goal = read_goal(goal_file)
+        goal_snapshot = Tempfile.new(['dev-session-goal-', '.txt'])
+        goal_snapshot.chmod(0o600)
+        goal_snapshot.binmode
+        goal_snapshot.write(goal)
+        goal_snapshot.flush
+        goal_snapshot.fsync
+        goal_file = goal_snapshot.path
+      end
       raise Error, '--json cannot be combined with --attach' if json && attach
 
       slug = resolve_start_slug(input, as_is:, new:)
@@ -436,6 +447,10 @@ module VpsfreeDevSession
           if exclusive && creation_journal&.fetch('state', nil) == 'ready' &&
              manifest.dig('creation', 'state') == 'ready'
             trusted_thread_id = manifest.dig('codex', 'thread_id')
+            if run_codex && trusted_thread_id && @portal_command &&
+               codex_provenance_configured?
+              require_portal_thread_materialized(slug, trusted_thread_id)
+            end
             replayed = true
             selected = @tmux.session(slug)
             if selected && managed_by_workspace?(selected)
@@ -461,6 +476,10 @@ module VpsfreeDevSession
                   "existing tmux session has no shared Codex thread; stop it before enabling portal interaction: #{slug}"
           end
           persisted_thread = manifest.dig('codex', 'thread_id')
+          if run_codex && goal_file.nil? && persisted_thread &&
+             @portal_command && codex_provenance_configured?
+            require_portal_thread_materialized(slug, persisted_thread)
+          end
           recovering_creation = run_codex &&
                                 creation_journal&.fetch('state', nil) == 'creating' &&
                                 manifest.dig('creation', 'state') == 'creating' &&
@@ -512,6 +531,8 @@ module VpsfreeDevSession
           if exclusive && run_codex && (thread_id.nil? || thread_id.empty?)
             raise Error, "unable to create a Codex thread for #{slug}"
           end
+          goal_pending = run_codex && thread_id && goal_file &&
+                         !manifest.dig('creation', 'initial_goal_sent')
 
           if creation_journal && manifest.dig('creation', 'state') == 'creating' &&
              selected && !managed_by_workspace?(selected)
@@ -526,16 +547,24 @@ module VpsfreeDevSession
           end
           selected = if selected
                        selected = ensure_managed_session!(slug, session: selected)
-                       run_codex ? reconcile_native_client!(slug, selected) : selected
+                       if run_codex
+                         goal_pending ? quiesce_native_client!(slug, selected) :
+                           reconcile_native_client!(slug, selected)
+                       else
+                         selected
+                       end
                      else
                        verify_codex_client! if run_codex && thread_id
-                       create_tmux_session(slug, run_codex:, thread_id:)
+                       create_tmux_session(
+                         slug,
+                         run_codex:,
+                         thread_id:,
+                         launch_codex: run_codex && !goal_pending
+                       )
                      end
 
           selected = sync_slug(slug, require_session: true, session: selected)
           trusted_thread_id = thread_id
-          goal_pending = run_codex && thread_id && goal_file &&
-                         !manifest.dig('creation', 'initial_goal_sent')
           if goal_pending && !manifest.fetch('creation').key?('initial_goal_attempted')
             manifest['schema'] = 2
             manifest['creation']['initial_goal_attempted'] = true
@@ -580,6 +609,7 @@ module VpsfreeDevSession
                    current_manifest.dig('creation', 'state') == 'creating'
               raise Error, "session creation state changed while starting Codex: #{slug}"
             end
+            current = reconcile_native_client!(slug, current)
             current_manifest['creation']['initial_goal_sent'] = true
             current_manifest['creation']['state'] = 'ready'
             current_manifest['creation'].delete('initial_goal_attempted')
@@ -616,6 +646,8 @@ module VpsfreeDevSession
         @out.puts "attach: #{attach_command(session.id).map(&:shellescape).join(' ')}" if session
         @out.puts "portal: #{portal_url(slug)}"
       end
+    ensure
+      goal_snapshot&.close!
     end
 
     def attach(input, as_is:)
@@ -1372,12 +1404,22 @@ module VpsfreeDevSession
         raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
 
         actual = JSON.parse(File.read(path))
+        unless actual.is_a?(Hash)
+          raise Error, "invalid creation journal #{path}"
+        end
         state = actual['state']
+        manifest = load_portal_manifest(portal_file(slug), required: false)
+        if goal_file.nil? && !exclusive && state == 'ready' &&
+           manifest&.dig('creation', 'state') == 'ready'
+          unless valid_stored_creation_journal?(actual, slug, manifest)
+            raise Error, "invalid creation journal #{path}"
+          end
+          return nil
+        end
         unless %w[creating ready].include?(state) &&
                actual.keys.sort == (expected.keys + ['state']).sort
           raise Error, "invalid creation journal #{path}"
         end
-        manifest = load_portal_manifest(portal_file(slug), required: false)
         if path_exists?(archive_dir(slug))
           raise Error, "dev session already exists: #{slug}"
         end
@@ -1410,6 +1452,25 @@ module VpsfreeDevSession
       journal
     rescue JSON::ParserError => e
       raise Error, "invalid creation journal #{path}: #{e.message}"
+    end
+
+    def valid_stored_creation_journal?(journal, slug, manifest)
+      required = %w[schema slug goal_sha256 run_codex state]
+      allowed = required + %w[model effort]
+      return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
+      return false unless journal['schema'] == 1 && journal['slug'] == slug &&
+                          journal['state'] == 'ready' &&
+                          [true, false].include?(journal['run_codex'])
+
+      goal_sha256 = journal['goal_sha256']
+      return false unless goal_sha256.nil? ||
+                          (goal_sha256.is_a?(String) && goal_sha256.match?(/\A[0-9a-f]{64}\z/))
+      return false unless manifest.dig('creation', 'goal_sha256') == goal_sha256
+
+      %w[model effort].all? do |key|
+        !journal.key?(key) ||
+          (journal[key].is_a?(String) && !journal[key].empty? && journal[key].bytesize <= 1024)
+      end
     end
 
     def mark_creation_journal_ready(slug, journal)
@@ -1842,6 +1903,20 @@ module VpsfreeDevSession
         File.expand_path(goal_file)
       ]
       command << '--start-unmaterialized' if start_unmaterialized
+      command += ['--socket', @codex_socket] if @codex_socket
+      @command_runner.capture(command)
+    end
+
+    def require_portal_thread_materialized(slug, thread_id)
+      command = [
+        *@portal_command,
+        'thread',
+        'require-materialized',
+        '--thread-id',
+        thread_id,
+        '--cwd',
+        work_dir(slug)
+      ]
       command += ['--socket', @codex_socket] if @codex_socket
       @command_runner.capture(command)
     end
@@ -2357,7 +2432,10 @@ module VpsfreeDevSession
       false
     end
 
-    def create_tmux_session(slug, run_codex:, thread_id: nil)
+    def create_tmux_session(slug, run_codex:, thread_id: nil, launch_codex: run_codex)
+      if launch_codex && !run_codex
+        raise Error, 'cannot launch Codex for a session configured without Codex'
+      end
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
       command = [
@@ -2427,7 +2505,7 @@ module VpsfreeDevSession
 
         @tmux.run('select-pane', '-t', left)
 
-        if run_codex
+        if launch_codex
           command = if codex_provenance_configured?
                       @codex_command_argv.map(&:shellescape).join(' ')
                     else
@@ -2439,21 +2517,21 @@ module VpsfreeDevSession
           end
           @tmux.run('send-keys', '-t', left, '-l', command)
           @tmux.run('send-keys', '-t', left, 'Enter')
-          if thread_id && @codex_socket && !@codex_socket.empty? &&
-             @codex_version && !@codex_version.empty?
-            @tmux.run(
-              'set-option', '-t', session_target, SESSION_CODEX_THREAD, thread_id
-            )
-            @tmux.run(
-              'set-option', '-t', session_target, SESSION_CODEX_SOCKET, @codex_socket
-            )
-            @tmux.run(
-              'set-option', '-t', session_target, SESSION_CODEX_VERSION, @codex_version
-            )
-            @tmux.run(
-              'set-option', '-t', session_target, SESSION_CODEX_PANE, left
-            )
-          end
+        end
+        if run_codex && thread_id && @codex_socket && !@codex_socket.empty? &&
+           @codex_version && !@codex_version.empty?
+          @tmux.run(
+            'set-option', '-t', session_target, SESSION_CODEX_THREAD, thread_id
+          )
+          @tmux.run(
+            'set-option', '-t', session_target, SESSION_CODEX_SOCKET, @codex_socket
+          )
+          @tmux.run(
+            'set-option', '-t', session_target, SESSION_CODEX_VERSION, @codex_version
+          )
+          @tmux.run(
+            'set-option', '-t', session_target, SESSION_CODEX_PANE, left
+          )
         end
 
         @tmux.run('set-option', '-t', session_target, SESSION_SLUG, slug)
@@ -3426,7 +3504,6 @@ module VpsfreeDevSession
         Tempfile.create(['dev-session-goal-', '.txt']) do |file|
           file.chmod(0o600)
           file.write(request)
-          file.write("\n")
           file.flush
           opts[:goal_file] = file.path
           return runner.start(input, **opts)

@@ -176,7 +176,7 @@ func portalListener(socketPath string) (net.Listener, error) {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|ensure-initial|require-idle")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|ensure-initial|require-materialized|require-idle")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -289,6 +289,11 @@ func threadCommand(args []string) error {
 			return errors.New("thread require-idle requires --thread-id and --cwd")
 		}
 		return client.RequireThreadIdle(ctx, *threadID, *cwd)
+	case "require-materialized":
+		if *threadID == "" || *cwd == "" {
+			return errors.New("thread require-materialized requires --thread-id and --cwd")
+		}
+		return client.RequireThreadMaterialized(ctx, *threadID, *cwd)
 	default:
 		return fmt.Errorf("unknown thread command %q", command)
 	}

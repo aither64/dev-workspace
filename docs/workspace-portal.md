@@ -27,7 +27,9 @@ packaged `dev-session`, journals creation before changing initiative state,
 creates a persisted Codex thread, and sends the request as the first turn. A
 retry uses the same dated slug and must contain the same request. Completed
 requests replay their existing result instead of creating another session or
-turn.
+turn. Creation reports success only after the rollout exists and its first user
+message exactly matches the submitted request. The terminal client starts
+after that verification, so it cannot race an empty thread.
 
 The terminal command asks for the same initial request before it creates a new
 Codex session, then attaches to the persisted thread:
@@ -132,6 +134,10 @@ manifest, so completed sessions remain readable after a rollback. A previous
 portal version intentionally rejects an in-flight schema-2 creation; redeploy
 the current version to reconcile it.
 
+A ready manifest written by the earlier empty-thread implementation is not
+silently adopted when its rollout is still missing. Archive that incomplete
+session and start a new one with an initial request.
+
 ## Portal manifest
 
 `dev-session start` creates `work/<slug>/portal.yml`. Worktree creation records
@@ -230,10 +236,12 @@ the App Server, and the package's protocol contract test together.
 
 Deploy aitherdev first, then deploy both internal DNS servers through normal
 confctl generations. Host activation creates or reuses credentials and starts
-the portal; no portal-specific rollout helper, NAR attestation, manual rollback
-capture, or exclusive deployment procedure is needed. Ordinary NixOS
-generation rollback removes the service while leaving reusable credentials on
-disk.
+the portal. Before an aitherdev switch or rollback that changes session
+creation, stop the portal and confirm that no `dev-session start` process is
+running. This prevents a request handled by the old generation from crossing
+the mutable `/run/current-system` boundary. No NAR attestation or manual
+rollback capture is needed. Ordinary NixOS generation rollback removes the
+service while leaving reusable credentials on disk.
 
 The portal continues serving initiative status when GitHub or the App Server is
 temporarily unavailable. Only the affected integration reports an error. The
