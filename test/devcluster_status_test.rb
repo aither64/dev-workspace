@@ -365,6 +365,7 @@ class DevclusterStatusTest < Minitest::Test
     end
     runtime = File.read(File.join(ROOT, 'dev-clusters/lib/runtime.sh'))
     assert_equal(1, runtime.scan(/^runner_process_matches\(\)/).length)
+    assert_equal(1, runtime.scan(/^signal_cluster_runner\(\)/).length)
     assert_equal(1, runtime.scan(/^kill_socket_processes\(\)/).length)
     %w[list_cluster_slugs remove_result_link gcroots_cluster gcroot_cluster].each do |function|
       HELPERS.each_value do |helper|
@@ -454,7 +455,6 @@ class DevclusterStatusTest < Minitest::Test
     script = <<~BASH
       set -euo pipefail
       source "$1"
-      EXPECTED_SOCKET_DIR="$2"
       socket_dir() { printf '%s\n' "$EXPECTED_SOCKET_DIR"; }
       die() { printf 'error: %s\n' "$*" >&2; return 1; }
       kill() { return 1; }
@@ -463,10 +463,70 @@ class DevclusterStatusTest < Minitest::Test
     BASH
 
     begin
-      _stdout, stderr, result = Open3.capture3('bash', '-c', script, 'bash', runtime, marker)
+      _stdout, stderr, result = Open3.capture3(
+        { 'EXPECTED_SOCKET_DIR' => marker }, 'bash', '-c', script, 'bash', runtime
+      )
       refute(result.success?)
       assert_includes(stderr, 'unable to stop cluster processes')
       assert(Process.kill(0, child), 'failed cleanup did not leave the test process running')
+    ensure
+      stop_process(child)
+    end
+  end
+
+  def test_runner_signal_rechecks_a_process_that_exits
+    runtime = File.join(ROOT, 'dev-clusters/lib/runtime.sh')
+    marker = "/tmp/vpsfree-devcluster-#{Digest::SHA256.hexdigest('runner-race')[0, 12]}"
+    child = spawn_marker_process(marker)
+    script = <<~BASH
+      set -euo pipefail
+      source "$1"
+      socket_dir() { printf '%s\n' "$EXPECTED_SOCKET_DIR"; }
+      die() { printf 'error: %s\n' "$*" >&2; return 1; }
+      kill() { builtin kill "$@"; command sleep 0.05; return 1; }
+      signal_cluster_runner runner-race "$CHILD_PID" TERM stop
+    BASH
+
+    begin
+      _stdout, stderr, result = Open3.capture3(
+        { 'EXPECTED_SOCKET_DIR' => marker, 'CHILD_PID' => child.to_s },
+        'bash', '-c', script, 'bash', runtime
+      )
+      assert(result.success?, stderr)
+      assert_process_exited(child, 'runner did not exit after the simulated signal race')
+    ensure
+      stop_process(child)
+    end
+  end
+
+  def test_socket_cleanup_rechecks_after_the_final_wait
+    runtime = File.join(ROOT, 'dev-clusters/lib/runtime.sh')
+    marker = "/tmp/vpsfree-devcluster-#{Digest::SHA256.hexdigest('final-wait')[0, 12]}"
+    child = spawn_marker_process("--socket-path=#{marker}/machine.sock")
+    script = <<~BASH
+      set -euo pipefail
+      source "$1"
+      WAIT_COUNT=0
+      socket_dir() { printf '%s\n' "$EXPECTED_SOCKET_DIR"; }
+      die() { printf 'error: %s\n' "$*" >&2; return 1; }
+      kill() { return 1; }
+      sleep() {
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+        if [ "$WAIT_COUNT" -eq 21 ]; then
+          builtin kill -KILL "$CHILD_PID"
+          command sleep 0.2
+        fi
+      }
+      kill_socket_processes final-wait
+    BASH
+
+    begin
+      _stdout, stderr, result = Open3.capture3(
+        { 'EXPECTED_SOCKET_DIR' => marker, 'CHILD_PID' => child.to_s },
+        'bash', '-c', script, 'bash', runtime
+      )
+      assert(result.success?, stderr)
+      assert_process_exited(child, 'socket child did not exit during the final wait')
     ensure
       stop_process(child)
     end
@@ -547,7 +607,7 @@ class DevclusterStatusTest < Minitest::Test
 
   def spawn_marker_process(marker)
     pid = Process.spawn(
-      RbConfig.ruby, '-e', 'sleep 30', marker,
+      RbConfig.ruby, '-e', 'sleep 30', '--', marker,
       out: File::NULL, err: File::NULL
     )
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2

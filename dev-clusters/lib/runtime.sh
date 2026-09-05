@@ -20,6 +20,18 @@ runner_process_matches() {
   process_has_argument "$pid" "$(socket_dir "$slug")"
 }
 
+signal_cluster_runner() {
+  local slug="$1"
+  local pid="$2"
+  local signal="$3"
+  local action="$4"
+
+  runner_process_matches "$slug" "$pid" || return 0
+  if ! kill "-$signal" "$pid" 2>/dev/null && runner_process_matches "$slug" "$pid"; then
+    die "unable to $action cluster runner PID $pid"
+  fi
+}
+
 process_has_argument() {
   local pid="$1"
   local expected="$2"
@@ -84,6 +96,8 @@ kill_socket_processes() {
     sleep 0.1
   done
 
+  mapfile -t processes < <(socket_processes "$slug")
+  [ "${#processes[@]}" -gt 0 ] || return 0
   die "unable to stop cluster processes: ${processes[*]}"
 }
 

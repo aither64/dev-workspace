@@ -480,9 +480,7 @@ stop_cluster() {
     return
   fi
 
-  if runner_process_matches "$slug" "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || die "unable to stop cluster runner PID $pid"
-  fi
+  signal_cluster_runner "$slug" "$pid" TERM stop
 
   for _ in $(seq 1 120); do
     runner_process_matches "$slug" "$pid" || {
@@ -494,9 +492,7 @@ stop_cluster() {
     sleep 1
   done
 
-  if runner_process_matches "$slug" "$pid"; then
-    kill -KILL "$pid" 2>/dev/null || die "unable to kill cluster runner PID $pid"
-  fi
+  signal_cluster_runner "$slug" "$pid" KILL kill
   kill_socket_processes "$slug"
   remove_result_link "$slug"
   printf 'cluster %s killed after timeout\n' "$slug"
