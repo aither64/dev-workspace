@@ -480,7 +480,8 @@ module VpsfreeDevSession
                   "existing tmux session has no shared Codex thread; stop it before enabling portal interaction: #{slug}"
           end
           persisted_thread = manifest.dig('codex', 'thread_id')
-          if run_codex && goal_file.nil? && persisted_thread &&
+          if run_codex && persisted_thread &&
+             manifest.dig('creation', 'state') == 'ready' &&
              @portal_command && codex_provenance_configured?
             require_portal_thread_materialized(slug, persisted_thread)
           end
@@ -3166,6 +3167,12 @@ module VpsfreeDevSession
       unless @tmux.pane_session_id(session.codex_pane_id) == session.id
         raise Error, "managed Codex pane does not belong to #{slug}"
       end
+      current = @tmux.pane_current_command(session.codex_pane_id)
+      return if current == File.basename(@shell_command)
+      unless native_client_process_names.include?(current)
+        raise Error,
+              "managed Codex pane for #{slug} is running unexpected command #{current.inspect}"
+      end
       @tmux.run(
         'respawn-pane', '-k', '-t', session.codex_pane_id,
         '-c', path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug),
@@ -3176,7 +3183,7 @@ module VpsfreeDevSession
 
     def restore_native_client!(slug, session)
       session = revalidate_session!(session)
-      send_native_client_command(session)
+      reconcile_native_client!(slug, session)
       @err.puts "restored terminal Codex client after refusing lifecycle change: #{slug}"
     rescue StandardError => e
       raise Error, "unable to restore terminal Codex client for #{slug}: #{e.message}"
@@ -3192,9 +3199,7 @@ module VpsfreeDevSession
       end
 
       current = @tmux.pane_current_command(session.codex_pane_id)
-      command_name = File.basename(@codex_command_argv.first)
-      expected = [command_name, ".#{command_name}-wrapped"]
-      return session if expected.include?(current)
+      return session if native_client_process_names.include?(current)
 
       shell_name = File.basename(@shell_command)
       unless current == shell_name
@@ -3208,6 +3213,11 @@ module VpsfreeDevSession
       session
     rescue StandardError => e
       raise Error, "unable to reconcile terminal Codex client for #{slug}: #{e.message}"
+    end
+
+    def native_client_process_names
+      command_name = File.basename(@codex_command_argv.first)
+      [command_name, ".#{command_name}-wrapped"]
     end
 
     def require_reconcilable_portal_thread!(slug, session, allow_creating:)

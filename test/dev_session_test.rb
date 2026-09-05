@@ -1461,6 +1461,22 @@ class DevSessionTest < Minitest::Test
       assert_includes(File.read(log), 'thread require-materialized')
       unchanged = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', unchanged.dig('creation', 'state'))
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: false
+        )
+      end
+
+      assert_includes(error.message, 'recorded thread has no rollout')
+      assert_includes(File.read(log), 'thread require-materialized')
     end
   end
 
@@ -4342,11 +4358,21 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(VpsfreeDevSession::Error) do
         runner.stop(slug, as_is: true)
       end
+      assert_includes(error.message, 'unable to restore terminal Codex client')
       refute(tmux.killed)
+      assert(tmux.quiesced)
+      assert_empty(tmux.sent_commands)
       assert(File.file?(File.join(authority_dir, "#{slug}.json")))
 
       idle_runner = VpsfreeDevSession::Runner.new(
@@ -4372,9 +4398,14 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       active = File.join(workspace, 'turn-active')
       portal = File.join(workspace, 'portal')
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.152.1'\n")
+      File.chmod(0o755, codex)
       File.write(portal, <<~RUBY)
         #!/usr/bin/env ruby
-        abort 'turn became active while terminal was quiesced' if File.exist?(#{active.dump})
+        if ARGV.include?('require-idle') && File.exist?(#{active.dump})
+          abort 'turn became active while terminal was quiesced'
+        end
       RUBY
       File.chmod(0o755, portal)
       authority_dir = File.join(workspace, 'runtime-authority')
@@ -4393,7 +4424,7 @@ class DevSessionTest < Minitest::Test
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
         codex_version: '0.152.1',
-        codex_command: '/bin/true',
+        codex_command: codex,
         tmux:,
         portal_command: [RbConfig.ruby, portal],
         out: StringIO.new,
@@ -4402,6 +4433,13 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
 
       error = assert_raises(VpsfreeDevSession::CommandError) do
         runner.stop(slug, as_is: true)
@@ -4410,6 +4448,24 @@ class DevSessionTest < Minitest::Test
       refute(tmux.killed)
       refute(tmux.quiesced, 'terminal Codex client was not restored')
       assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_quiesce_does_not_restore_a_client_that_was_already_stopped
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        codex_thread_id: 'thread-1',
+        codex_pane_id: '%1',
+        pane_current_command: File.basename(ENV.fetch('SHELL', '/bin/sh'))
+      )
+      runner = runner_for(workspace, tmux:)
+
+      assert_nil(runner.send(:quiesce_native_client!, slug, tmux.session(slug)))
+      refute(tmux.quiesced)
+      assert_empty(tmux.sent_commands)
     end
   end
 
