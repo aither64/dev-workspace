@@ -29,6 +29,24 @@ retry uses the same dated slug and must contain the same request. Completed
 requests replay their existing result instead of creating another session or
 turn.
 
+The terminal command asks for the same initial request before it creates a new
+Codex session, then attaches to the persisted thread:
+
+```text
+$ dev-session start example
+Initial request: Investigate the reported API failure.
+```
+
+For scripts or redirected input, place the request in a file:
+
+```sh
+dev-session start example --goal-file request.txt --no-attach
+```
+
+Without an interactive terminal, a new Codex session requires `--goal-file`.
+An existing session that already has a persisted thread can be attached without
+another request.
+
 Codex receives the workspace instructions and selects affected repositories.
 The terminal and browser share one App Server thread and a dedicated tmux
 server at `/run/vpsfree-workspace-tmux/tmux.sock`. Use the immutable host

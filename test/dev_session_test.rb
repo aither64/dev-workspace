@@ -13,6 +13,12 @@ require 'tmpdir'
 load File.expand_path('../libexec/dev-session', __dir__)
 
 class DevSessionTest < Minitest::Test
+  class TTYInput < StringIO
+    def tty?
+      true
+    end
+  end
+
   class NullTmux
     def argv(*args)
       ['tmux', *args]
@@ -445,6 +451,80 @@ class DevSessionTest < Minitest::Test
   end
 
   TODAY = Date.new(2026, 6, 6)
+
+  def test_cli_prompts_for_a_new_session_initial_request
+    captured = nil
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:start_requires_initial_goal?) do |_input, **_options|
+      true
+    end
+    fake_runner.define_singleton_method(:start) do |input, **options|
+      captured = {
+        input:,
+        options: options.dup,
+        goal: File.read(options.fetch(:goal_file)),
+        mode: File.stat(options.fetch(:goal_file)).mode & 0o777
+      }
+    end
+    err = StringIO.new
+    cli = VpsfreeDevSession::CLI.new(
+      ['start', 'demo', '--no-attach'],
+      input: TTYInput.new("Investigate the API failure.\n"),
+      out: StringIO.new,
+      err:
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(0, cli.run)
+    assert_equal('demo', captured.fetch(:input))
+    assert_equal("Investigate the API failure.\n", captured.fetch(:goal))
+    assert_equal(0o600, captured.fetch(:mode))
+    assert_includes(err.string, 'Initial request: ')
+    refute(File.exist?(captured.dig(:options, :goal_file)))
+  end
+
+  def test_cli_requires_a_goal_file_for_noninteractive_new_session
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:start_requires_initial_goal?) do |_input, **_options|
+      true
+    end
+    fake_runner.define_singleton_method(:start) { raise 'must not start' }
+    err = StringIO.new
+    cli = VpsfreeDevSession::CLI.new(
+      ['start', 'demo', '--no-attach'],
+      input: StringIO.new("ignored\n"),
+      out: StringIO.new,
+      err:
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(1, cli.run)
+    assert_includes(err.string, 'requires --goal-file when input is not interactive')
+  end
+
+  def test_new_shared_session_requires_an_initial_request_before_writes
+    with_workspace do |workspace|
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/codex.sock',
+        codex_version: '0.152.1',
+        codex_command: '/bin/true',
+        portal_command: ['/bin/true'],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start('demo', as_is: false, new: false, attach: false, run_codex: true)
+      end
+      assert_includes(error.message, 'requires an initial request')
+      refute(File.exist?(File.join(workspace, 'work', '2026-06-06-demo')))
+      refute(File.exist?(File.join(workspace, 'worktrees', '2026-06-06-demo')))
+    end
+  end
 
   def test_build_slug_prefixes_current_date
     with_workspace do |workspace|
@@ -1142,7 +1222,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('thread-123', result['threadId'])
       assert_equal("https://workspace.example.test/#{slug}/", result['url'])
       assert_includes(File.read(File.join(workspace, 'work', slug, 'plan.md')), 'Implement a useful feature.')
-      assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial browser request')
+      assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial request')
       assert_equal(
         {
           'state' => 'ready',
@@ -4350,30 +4430,60 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       codex_executable = File.join(workspace, 'codex')
-      File.write(codex_executable, "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'codex-cli 0.152.1'; exit 0; }\nexit 0\n")
+      codex_log = File.join(workspace, 'codex.log')
+      File.write(codex_executable, <<~SH)
+        #!/bin/sh
+        [ "$1" = --version ] && { echo 'codex-cli 0.152.1'; exit 0; }
+        printf '%s\n' "$@" > #{codex_log.dump}
+        sleep 2
+      SH
       File.chmod(0o755, codex_executable)
+      portal_log = File.join(workspace, 'portal.log')
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Investigate the reported issue.\n")
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{portal_log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+        if ARGV[0, 2] == ['thread', 'create']
+          puts JSON.generate(threadId: 'thread-123')
+        end
+      RUBY
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_socket:,
         codex_version: '0.152.1',
         codex_command: codex_executable,
-        portal_command: [
-          RbConfig.ruby,
-          '-e',
-          "require 'json'; puts JSON.generate(threadId: 'thread-123')"
-        ],
+        portal_command: [RbConfig.ruby, portal],
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
         env: {}
       )
-      runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal
+      )
 
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-123', manifest.dig('codex', 'thread_id'))
       assert_equal(codex_socket, manifest.dig('codex', 'socket_path'))
       assert_equal('0.152.1', manifest.dig('codex', 'client_version'))
       refute(manifest.key?('tmux'))
+      codex_arguments = File.readlines(codex_log, chomp: true)
+      assert_includes(codex_arguments, '--remote')
+      assert_includes(codex_arguments, "unix://#{codex_socket}")
+      assert_includes(codex_arguments, 'resume')
+      assert_includes(codex_arguments, 'thread-123')
+      portal_commands = File.readlines(portal_log, chomp: true)
+      assert(portal_commands[0].start_with?('thread create '))
+      assert(portal_commands[1].start_with?('thread set-name '))
+      assert(portal_commands[2].start_with?('thread ensure-initial '))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
     end
@@ -4382,6 +4492,8 @@ class DevSessionTest < Minitest::Test
   def test_codex_provenance_requires_the_configured_executable_version
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Investigate the reported issue.\n")
       codex_executable = File.join(workspace, 'codex')
       File.write(codex_executable, "#!/bin/sh\necho 'codex-cli 0.151.0'\n")
       File.chmod(0o755, codex_executable)
@@ -4411,7 +4523,14 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal
+        )
       end
       assert_includes(error.message, 'does not report configured version')
     end

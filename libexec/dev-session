@@ -9,6 +9,7 @@ require 'open3'
 require 'optparse'
 require 'pathname'
 require 'shellwords'
+require 'tempfile'
 require 'time'
 require 'yaml'
 
@@ -400,6 +401,11 @@ module VpsfreeDevSession
       raise Error, '--json cannot be combined with --attach' if json && attach
 
       slug = resolve_start_slug(input, as_is:, new:)
+      if run_codex && goal_file.nil? && @portal_command &&
+         codex_provenance_configured? &&
+         start_requires_initial_goal?(input, as_is:, new:)
+        raise Error, 'a new shared Codex session requires an initial request'
+      end
       trusted_thread_id = nil
       replayed = false
 
@@ -487,6 +493,10 @@ module VpsfreeDevSession
               name_portal_thread(slug, thread_id)
             end
           elsif run_codex && (thread_id.nil? || thread_id.empty?)
+            if persisted_thread.nil? && goal_file.nil? &&
+               @portal_command && codex_provenance_configured?
+              raise Error, 'a new shared Codex session requires an initial request'
+            end
             thread_id = create_portal_thread(
               slug,
               persisted_thread_id: persisted_thread,
@@ -1048,6 +1058,20 @@ module VpsfreeDevSession
       raise unless e.message.start_with?('no slug found for ')
 
       build_slug(input, as_is: false)
+    end
+
+    def start_requires_initial_goal?(input, as_is:, new:)
+      slug = resolve_start_slug(input, as_is:, new:)
+      root = if path_exists?(work_dir(slug))
+               work_dir(slug)
+             elsif path_exists?(archive_dir(slug))
+               archive_dir(slug)
+             end
+      return true unless root
+
+      manifest = load_portal_manifest(File.join(root, PORTAL_MANIFEST), required: false)
+      manifest&.dig('codex', 'thread_id').to_s.empty? ||
+        manifest.dig('creation', 'state') == 'creating'
     end
 
     def lookup_slug(input, as_is:)
@@ -1858,7 +1882,7 @@ module VpsfreeDevSession
       empty_state = state_skeleton(slug)
       seeded_state = empty_state.sub(
         "## Status\n\n",
-        "## Status\n\n- Session created with an initial browser request.\n\n"
+        "## Status\n\n- Session created with an initial request.\n\n"
       )
       if state == empty_state
         atomic_replace(state_path, seeded_state)
@@ -3211,8 +3235,9 @@ module VpsfreeDevSession
   end
 
   class CLI
-    def initialize(argv, out: $stdout, err: $stderr)
+    def initialize(argv, input: $stdin, out: $stdout, err: $stderr)
       @argv = argv.dup
+      @input = input
       @out = out
       @err = err
       @workspace = File.expand_path('..', __dir__)
@@ -3385,7 +3410,30 @@ module VpsfreeDevSession
       parser.parse!(@argv)
       require_arity!(1, @argv, 'start')
 
-      runner.start(@argv.fetch(0), **opts)
+      input = @argv.fetch(0)
+      if opts[:run_codex] && opts[:goal_file].nil? &&
+         runner.start_requires_initial_goal?(input, as_is: opts[:as_is], new: opts[:new])
+        unless !opts[:json] && @input.respond_to?(:tty?) && @input.tty?
+          raise Error, 'a new Codex session requires --goal-file when input is not interactive'
+        end
+
+        @err.print 'Initial request: '
+        request = @input.gets&.chomp
+        if request.nil? || request.strip.empty?
+          raise Error, 'the initial request cannot be empty'
+        end
+
+        Tempfile.create(['dev-session-goal-', '.txt']) do |file|
+          file.chmod(0o600)
+          file.write(request)
+          file.write("\n")
+          file.flush
+          opts[:goal_file] = file.path
+          return runner.start(input, **opts)
+        end
+      end
+
+      runner.start(input, **opts)
     end
 
     def run_fork
