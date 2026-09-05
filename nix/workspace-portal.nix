@@ -56,6 +56,9 @@ buildGoModule {
     codex app-server generate-json-schema --experimental --out "$schema_dir"
     export VPSFREE_CODEX_SCHEMA_DIR="$schema_dir"
     python3 ../test/codex_protocol_contract.py "$schema_dir"
+    patchShebangs \
+      ../dev-clusters/vpsadmin/bin/devcluster \
+      ../dev-clusters/vpsadminos/bin/devcluster
     go test ./...
     node --check internal/web/static/app.js
     (
@@ -116,6 +119,7 @@ buildGoModule {
   '';
 
   postFixup = ''
+    mkdir -p "$TMPDIR/workspace"
     if test -e "$out/bin/dev-session"; then
       echo "private dev-session helper was exposed in bin" >&2
       exit 1
