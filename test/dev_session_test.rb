@@ -4465,6 +4465,35 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_idle_check_uses_host_socket_for_a_legacy_manifest
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal')
+      File.write(portal, <<~RUBY)
+        File.write(#{log.dump}, ARGV.join(' '))
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new,
+        codex_socket: '/run/test/codex.sock', codex_version: '0.152.1',
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = { 'thread_id' => 'thread-legacy' }
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      runner.send(:ensure_portal_thread_idle!, slug, nil)
+
+      command = File.read(log)
+      assert_includes(command, 'thread require-idle')
+      assert_includes(command, '--thread-id thread-legacy')
+      assert_includes(command, '--socket /run/test/codex.sock')
+      assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
+    end
+  end
+
   def test_stop_quiesces_terminal_before_the_authoritative_idle_check
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

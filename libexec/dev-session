@@ -3131,7 +3131,9 @@ module VpsfreeDevSession
       end
 
       cwd = work_dir(slug)
-      socket = authority&.fetch('codex_socket_path', nil) || manifest&.dig('codex', 'socket_path')
+      socket = authority&.fetch('codex_socket_path', nil) ||
+               manifest&.dig('codex', 'socket_path') ||
+               @codex_socket
       unless socket && valid_socket_path?(socket)
         raise Error, "Codex socket provenance is missing for #{slug}"
       end
