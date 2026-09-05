@@ -14,12 +14,12 @@
   <main class="page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
     <section class="panel new-session">
-      <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects.</p></div>
+      <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From aitherdev, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
         <div class="field-grid">
-          <label>Model<select name="model" data-model-select><option value="">System default</option></select></label>
+          <label>Model<select name="model" data-model-select data-new-session-default><option value="">System default</option></select></label>
           <label>Reasoning effort<select name="effort" data-effort-select><option value="">Model default</option></select></label>
         </div>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>

@@ -32,13 +32,8 @@
 
       {{if .Session.Codex.ThreadID}}
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel">
-        <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><span id="codex-status" class="badge">Connecting</span></div>
+        <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><div class="chat-heading-actions">{{if .Session.Interactive}}<button id="codex-settings-open" type="button" class="quiet">Settings</button>{{end}}<span id="codex-status" class="badge">Connecting</span></div></div>
         {{if .Session.Interactive}}
-        <form id="codex-settings" class="settings-form">
-          <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
-          <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
-          <button type="submit" class="secondary">Save settings</button>
-        </form>
         <div id="pending" class="pending"></div>
         {{end}}
         <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
@@ -112,6 +107,16 @@
         <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
       </div>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create fork</button></div>
+    </form>
+  </dialog>
+  <dialog id="codex-settings-dialog">
+    <form id="codex-settings" class="stack">
+      <div><p class="eyebrow">Codex</p><h2>Session settings</h2></div>
+      <div class="field-grid">
+        <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
+        <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
+      </div>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button id="codex-settings-save" type="submit">Save settings</button></div>
     </form>
   </dialog>
   {{end}}

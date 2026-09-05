@@ -323,7 +323,39 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 			if strings.Contains(response.Body.String(), "dev-session attach example --as-is") {
 				t.Fatal("session page advertises an unnecessary --as-is option")
 			}
+			if testCase.authority {
+				body := response.Body.String()
+				codexEnd := strings.Index(body, `<section id="handoff"`)
+				if codexEnd < 0 || strings.Contains(body[:codexEnd], `id="codex-settings"`) {
+					t.Fatal("Codex settings form is still visible above the transcript")
+				}
+				for _, marker := range []string{`id="codex-settings-open"`, `id="codex-settings-dialog"`} {
+					if !strings.Contains(body, marker) {
+						t.Fatalf("session page is missing %s", marker)
+					}
+				}
+			}
 		})
+	}
+}
+
+func TestSessionWithoutAThreadExplainsHowToStartSharedSessions(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "legacy")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 2\nslug: legacy\ncodex: {}\ncreation:\n  state: creating\n  initial_goal_sent: false\n  initial_goal_attempted: false\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/legacy/", nil))
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), "This session has no shared Codex conversation") ||
+		!strings.Contains(response.Body.String(), "dev-session start &lt;short-name&gt;") {
+		t.Fatalf("legacy page = %d %q", response.Code, response.Body.String())
 	}
 }
 
@@ -494,6 +526,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	for _, marker := range []string{
 		"event.key !== \"Enter\"", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"entry.html", "finish-session", "archive-session", "release-cluster", "fork-dialog",
+		"codex-settings-dialog", "codex-settings-open", "preferredReasoningEffort",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)

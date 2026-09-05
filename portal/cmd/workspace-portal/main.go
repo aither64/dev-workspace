@@ -224,6 +224,16 @@ func threadCommand(args []string) error {
 		var id string
 		var err error
 		settings := codex.ThreadSettings{Model: *model, ReasoningEffort: *effort}
+		if *threadID == "" || *recoverCreating {
+			models, listErr := client.ListModels(ctx)
+			if listErr != nil {
+				return fmt.Errorf("load Codex models: %w", listErr)
+			}
+			settings, listErr = codex.ResolveNewThreadSettings(models, settings)
+			if listErr != nil {
+				return listErr
+			}
+		}
 		if *recoverCreating {
 			id, err = client.RecoverCreatingThreadWithSettings(ctx, *threadID, *cwd, runtime.environment(), settings)
 		} else {
