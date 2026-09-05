@@ -122,6 +122,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer application.Close()
 	listener, err := portalListener(options.unixSocket)
 	if err != nil {
 		return err
@@ -133,10 +134,12 @@ func serve(args []string) error {
 	shutdownDone := make(chan error, 1)
 	go func() {
 		<-stopContext.Done()
-		application.Close()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 130*time.Second)
 		defer cancel()
-		shutdownDone <- httpServer.Shutdown(shutdownContext)
+		httpShutdown := make(chan error, 1)
+		go func() { httpShutdown <- httpServer.Shutdown(shutdownContext) }()
+		application.Close()
+		shutdownDone <- <-httpShutdown
 	}()
 	logger.Printf("listening on %s for %s", listener.Addr(), options.baseURL)
 	err = httpServer.Serve(listener)

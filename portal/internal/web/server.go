@@ -89,6 +89,10 @@ type Server struct {
 	operationMu     sync.Mutex
 	operations      map[string]archiveOperation
 	workspaceGitMu  sync.Mutex
+	archiveContext  context.Context
+	cancelArchives  context.CancelFunc
+	archiveWG       sync.WaitGroup
+	closing         bool
 	stopOnce        sync.Once
 	stopping        chan struct{}
 }
@@ -156,6 +160,7 @@ func New(config Config) (*Server, error) {
 	policy := bluemonday.UGCPolicy()
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
+	archiveContext, cancelArchives := context.WithCancel(context.Background())
 	return &Server{
 		config: config, templates: templates,
 		markdown: goldmark.New(), sanitizer: policy,
@@ -164,12 +169,21 @@ func New(config Config) (*Server, error) {
 		repositoryCache: make(map[string]cachedRepositories),
 		messageLocks:    make(map[string]*sync.Mutex),
 		operations:      make(map[string]archiveOperation),
+		archiveContext:  archiveContext,
+		cancelArchives:  cancelArchives,
 		stopping:        make(chan struct{}),
 	}, nil
 }
 
 func (s *Server) Close() {
-	s.stopOnce.Do(func() { close(s.stopping) })
+	s.stopOnce.Do(func() {
+		s.operationMu.Lock()
+		s.closing = true
+		close(s.stopping)
+		s.cancelArchives()
+		s.operationMu.Unlock()
+		s.archiveWG.Wait()
+	})
 }
 
 func (s *Server) Handler() http.Handler {
@@ -437,7 +451,11 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runDevSession(timeout time.Duration, args ...string) (string, string, error) {
-	commandCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	return s.runDevSessionContext(context.Background(), timeout, args...)
+}
+
+func (s *Server) runDevSessionContext(parent context.Context, timeout time.Duration, args ...string) (string, string, error) {
+	commandCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	command := exec.Command(s.config.DevSession, args...)
 	var stdout bytes.Buffer
@@ -714,6 +732,11 @@ func (s *Server) startArchive(w http.ResponseWriter, summary *session.Summary) {
 		return
 	}
 	s.operationMu.Lock()
+	if s.closing {
+		s.operationMu.Unlock()
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
+		return
+	}
 	operation, exists := s.operations[summary.Slug]
 	if exists && operation.State == "running" {
 		s.operationMu.Unlock()
@@ -721,9 +744,11 @@ func (s *Server) startArchive(w http.ResponseWriter, summary *session.Summary) {
 		return
 	}
 	s.operations[summary.Slug] = archiveOperation{State: "running"}
+	s.archiveWG.Add(1)
 	s.operationMu.Unlock()
 	go func(slug string) {
-		err := s.archiveSession(slug)
+		defer s.archiveWG.Done()
+		err := s.archiveSession(s.archiveContext, slug)
 		operation := archiveOperation{State: "complete"}
 		if err != nil {
 			operation.State = "failed"
@@ -746,8 +771,8 @@ func (s *Server) archiveStatus(w http.ResponseWriter, slug string) {
 	s.writeJSON(w, http.StatusOK, operation)
 }
 
-func (s *Server) archiveSession(slug string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+func (s *Server) archiveSession(parent context.Context, slug string) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	err := s.clusters.ReleaseAll(ctx, slug)
 	cancel()
 	if err != nil {
@@ -759,15 +784,26 @@ func (s *Server) archiveSession(slug string) error {
 	}
 	if !summary.Archived {
 		args := []string{"finalize", slug, "--as-is"}
-		if stdout, stderr, err := s.runDevSession(5*time.Minute, args...); err != nil {
+		if stdout, stderr, err := s.runDevSessionContext(parent, 5*time.Minute, args...); err != nil {
 			return commandFailure("finalize session", stdout, stderr, err)
 		}
 	}
-	if err := s.commitArchive(slug); err != nil {
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	// Once Git begins committing, give its isolated, bounded transaction time to
+	// finish even when service shutdown has canceled the surrounding workflow.
+	commitContext, cancelCommit := context.WithTimeout(context.Background(), 120*time.Second)
+	err = s.commitArchive(commitContext, slug)
+	cancelCommit()
+	if err != nil {
+		return err
+	}
+	if err := parent.Err(); err != nil {
 		return err
 	}
 	args := []string{"stop", slug, "--as-is"}
-	if stdout, stderr, err := s.runDevSession(3*time.Minute, args...); err != nil {
+	if stdout, stderr, err := s.runDevSessionContext(parent, 3*time.Minute, args...); err != nil {
 		message := stderr + stdout
 		if !strings.Contains(message, "tmux session not found") &&
 			!strings.Contains(message, "session authority not found") {
@@ -777,19 +813,25 @@ func (s *Server) archiveSession(slug string) error {
 	return nil
 }
 
-func (s *Server) commitArchive(slug string) error {
+func (s *Server) commitArchive(parent context.Context, slug string) error {
 	s.workspaceGitMu.Lock()
 	defer s.workspaceGitMu.Unlock()
 
-	git := func(timeout time.Duration, args ...string) (string, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	runGit := func(base context.Context, timeout time.Duration, args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(base, timeout)
 		defer cancel()
-		command := exec.CommandContext(ctx, "git", append([]string{"-C", s.config.Workspace}, args...)...)
-		output, err := command.CombinedOutput()
+		command := exec.Command("git", args...)
+		output, err := processgroup.CombinedOutputGraceful(ctx, command, 3*time.Second)
 		if err != nil {
 			return string(output), err
 		}
 		return string(output), nil
+	}
+	git := func(timeout time.Duration, args ...string) (string, error) {
+		return runGit(parent, timeout, append([]string{"-C", s.config.Workspace}, args...)...)
+	}
+	gitUncancelled := func(timeout time.Duration, args ...string) (string, error) {
+		return runGit(context.Background(), timeout, append([]string{"-C", s.config.Workspace}, args...)...)
 	}
 	branch, err := git(10*time.Second, "symbolic-ref", "--short", "HEAD")
 	if err != nil || strings.TrimSpace(branch) != "master" {
@@ -809,8 +851,15 @@ func (s *Server) commitArchive(slug string) error {
 	if strings.TrimSpace(status) == "" {
 		return nil
 	}
-	if output, err := git(20*time.Second, append([]string{"add", "-A", "--"}, paths...)...); err != nil {
-		return fmt.Errorf("stage archive change: %s: %w", strings.TrimSpace(output), err)
+	cachedOutput, cachedErr := git(10*time.Second, append(
+		[]string{"diff", "--cached", "--quiet", "--"}, paths...,
+	)...)
+	if cachedErr != nil {
+		var cachedExit *exec.ExitError
+		if !errors.As(cachedErr, &cachedExit) || cachedExit.ExitCode() != 1 {
+			return fmt.Errorf("inspect staged archive paths: %s: %w", strings.TrimSpace(cachedOutput), cachedErr)
+		}
+		return errors.New("archive paths already contain staged changes; unstage them and retry")
 	}
 	messageFile, err := os.CreateTemp("", "workspace-archive-commit-*.txt")
 	if err != nil {
@@ -829,9 +878,31 @@ func (s *Server) commitArchive(slug string) error {
 	if err := messageFile.Close(); err != nil {
 		return err
 	}
-	args := []string{"commit", "--only", "-F", messagePath, "--"}
-	args = append(args, paths...)
+	archivePath := filepath.Join(s.config.Workspace, "archive", slug)
+	if _, err := os.Lstat(archivePath); err != nil {
+		return fmt.Errorf("inspect finalized archive: %w", err)
+	}
+	cleanup := func() error {
+		output, cleanupErr := gitUncancelled(
+			10*time.Second,
+			append([]string{"reset", "--quiet", "HEAD", "--"}, paths...)...,
+		)
+		if cleanupErr != nil {
+			return fmt.Errorf("restore archive paths in shared index: %s: %w", strings.TrimSpace(output), cleanupErr)
+		}
+		return nil
+	}
+	if output, err := git(10*time.Second, "add", "--intent-to-add", "--", paths[1]); err != nil {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			return fmt.Errorf("prepare archive path for commit: %s: %w; %v", strings.TrimSpace(output), err, cleanupErr)
+		}
+		return fmt.Errorf("prepare archive path for commit: %s: %w", strings.TrimSpace(output), err)
+	}
+	args := append([]string{"commit", "--only", "-F", messagePath, "--"}, paths...)
 	if output, err := git(2*time.Minute, args...); err != nil {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			return fmt.Errorf("commit archive change: %s: %w; %v", strings.TrimSpace(output), err, cleanupErr)
+		}
 		return fmt.Errorf("commit archive change: %s: %w", strings.TrimSpace(output), err)
 	}
 	return nil

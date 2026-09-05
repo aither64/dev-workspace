@@ -574,7 +574,7 @@ func TestCommitArchivePreservesUnrelatedWorkspaceChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := server.commitArchive(slug); err != nil {
+	if err := server.commitArchive(context.Background(), slug); err != nil {
 		t.Fatal(err)
 	}
 	changed := strings.Fields(git("show", "--format=", "--name-only", "HEAD"))
@@ -584,6 +584,292 @@ func TestCommitArchivePreservesUnrelatedWorkspaceChanges(t *testing.T) {
 	status := git("status", "--porcelain=v1")
 	if !strings.Contains(status, "M  staged.txt") || !strings.Contains(status, " M unstaged.txt") {
 		t.Fatalf("unrelated status was not preserved: %q", status)
+	}
+}
+
+func TestCommitArchiveHookFailureLeavesTheSharedIndexUntouchedAndCanRetry(t *testing.T) {
+	server := newTestServer(t)
+	workspace := server.config.Workspace
+	git := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+		return string(output)
+	}
+	git("init", "--initial-branch=master")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	slug := "2026-09-05-hook-failure"
+	work := filepath.Join(workspace, "work", slug)
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".")
+	git("commit", "-m", "initial")
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %s: %v", output, err)
+	}
+	git("remote", "add", "origin", remote)
+	git("push", "-u", "origin", "master")
+	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "staged.txt")
+	before := git("status", "--porcelain=v1")
+	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.commitArchive(context.Background(), slug); err == nil {
+		t.Fatal("archive commit unexpectedly passed its failing hook")
+	}
+	if after := git("status", "--porcelain=v1"); after != before {
+		t.Fatalf("hook failure changed shared index/status:\n before: %q\n after:  %q", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".git", "index.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hook failure left index lock: %v", err)
+	}
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.commitArchive(context.Background(), slug); err != nil {
+		t.Fatalf("retry archive commit: %v", err)
+	}
+	if changed := strings.Fields(git("show", "--format=", "--name-only", "HEAD")); len(changed) != 1 || changed[0] != filepath.Join("archive", slug, "state.md") {
+		t.Fatalf("retry archive paths = %#v", changed)
+	}
+}
+
+func TestCommitArchiveRejectsAConcurrentMasterAdvanceWithoutRevertingIt(t *testing.T) {
+	server := newTestServer(t)
+	workspace := server.config.Workspace
+	git := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+		return string(output)
+	}
+	git("init", "--initial-branch=master")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	slug := "2026-09-05-concurrent"
+	work := filepath.Join(workspace, "work", slug)
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "unrelated.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".")
+	git("commit", "-m", "initial")
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %s: %v", output, err)
+	}
+	git("remote", "add", "origin", remote)
+	git("push", "-u", "origin", "master")
+	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WORKSPACE", workspace)
+	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
+	script := "#!/bin/sh\n" +
+		"unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n" +
+		"parent=$(git -C \"$WORKSPACE\" rev-parse refs/heads/master)\n" +
+		"tree=$(git -C \"$WORKSPACE\" rev-parse \"$parent^{tree}\")\n" +
+		"concurrent=$(printf 'concurrent\\n' | git -C \"$WORKSPACE\" commit-tree \"$tree\" -p \"$parent\")\n" +
+		"git -C \"$WORKSPACE\" update-ref refs/heads/master \"$concurrent\" \"$parent\"\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := server.commitArchive(context.Background(), slug)
+	if err == nil {
+		t.Fatalf("archive result after concurrent commit = %v", err)
+	}
+	if subject := strings.TrimSpace(git("log", "-1", "--format=%s")); subject != "concurrent" {
+		t.Fatalf("concurrent master head = %q", subject)
+	}
+	if content := git("show", "HEAD:unrelated.txt"); content != "initial\n" {
+		t.Fatalf("concurrent content was reverted: %q", content)
+	}
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.commitArchive(context.Background(), slug); err != nil {
+		t.Fatalf("retry archive commit: %v", err)
+	}
+	if content := git("show", "HEAD:unrelated.txt"); content != "initial\n" {
+		t.Fatalf("retry reverted concurrent content: %q", content)
+	}
+}
+
+func TestCommitArchiveCancellationCleansTheIndexAndCanRetry(t *testing.T) {
+	server := newTestServer(t)
+	workspace := server.config.Workspace
+	git := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+		return string(output)
+	}
+	git("init", "--initial-branch=master")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	slug := "2026-09-05-canceled-commit"
+	work := filepath.Join(workspace, "work", slug)
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".")
+	git("commit", "-m", "initial")
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init remote: %s: %v", output, err)
+	}
+	git("remote", "add", "origin", remote)
+	git("push", "-u", "origin", "master")
+	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "staged.txt")
+	before := git("status", "--porcelain=v1")
+	started := filepath.Join(t.TempDir(), "hook-started")
+	t.Setenv("STARTED", started)
+	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf started > \"$STARTED\"\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- server.commitArchive(ctx, slug) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pre-commit hook did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-result; err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("canceled archive commit result = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".git", "index.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled Git left its index lock: %v", err)
+	}
+	if after := git("status", "--porcelain=v1"); after != before {
+		t.Fatalf("canceled archive changed shared status:\n before: %q\n after:  %q", before, after)
+	}
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.commitArchive(context.Background(), slug); err != nil {
+		t.Fatalf("retry canceled archive commit: %v", err)
+	}
+	status := git("status", "--porcelain=v1")
+	if strings.Contains(status, slug) || !strings.Contains(status, "M  staged.txt") {
+		t.Fatalf("retry did not preserve unrelated staged work: %q", status)
+	}
+}
+
+func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
+	server := newTestServer(t)
+	started := filepath.Join(t.TempDir(), "started")
+	helper := filepath.Join(t.TempDir(), "cluster-helper")
+	script := "#!/bin/sh\nprintf started > \"$STARTED\"\nsleep 30\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STARTED", started)
+	server.clusters.Vpsadmin = helper
+	server.clusters.VpsadminOS = helper
+	response := httptest.NewRecorder()
+	server.startArchive(response, &session.Summary{
+		Manifest:  session.Manifest{Slug: "2026-09-05-shutdown"},
+		Lifecycle: "complete",
+	})
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("archive start status/body = %d %q", response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("archive helper did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() {
+		server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server shutdown did not drain the canceled archive operation")
+	}
+	server.operationMu.Lock()
+	operation := server.operations["2026-09-05-shutdown"]
+	server.operationMu.Unlock()
+	if operation.State != "failed" || !strings.Contains(operation.Error, context.Canceled.Error()) {
+		t.Fatalf("archive operation after shutdown = %#v", operation)
+	}
+	retry := httptest.NewRecorder()
+	server.startArchive(retry, &session.Summary{
+		Manifest:  session.Manifest{Slug: "2026-09-05-shutdown"},
+		Lifecycle: "complete",
+	})
+	if retry.Code != http.StatusServiceUnavailable {
+		t.Fatalf("archive start during shutdown status/body = %d %q", retry.Code, retry.Body.String())
 	}
 }
 
