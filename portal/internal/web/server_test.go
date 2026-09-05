@@ -531,6 +531,34 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	}
 }
 
+func TestAutomaticReasoningIsValidInSettingsAndForkForms(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, "example")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/example/", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if count := strings.Count(body, `name="effort" data-effort-select>`); count != 2 {
+		t.Fatalf("automatic effort selects = %d", count)
+	}
+	if strings.Contains(body, `name="effort" data-effort-select required`) {
+		t.Fatal("automatic reasoning is blocked by native required validation")
+	}
+}
+
 func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 	server := newTestServer(t)
 	directory := t.TempDir()
