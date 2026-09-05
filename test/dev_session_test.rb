@@ -1717,6 +1717,78 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_discards_a_stale_authority_thread_before_recreating_tmux
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      portal_log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal')
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.152.1'\n")
+      File.chmod(0o755, codex)
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{portal_log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        puts JSON.generate(threadId: 'thread-manifest') if ARGV[1] == 'create'
+      RUBY
+
+      setup = VpsfreeDevSession::Runner.new(
+        workspace:, authority_dir:, tmux: NullTmux.new,
+        out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
+      )
+      setup.ensure_tracking_files(slug)
+      manifest = setup.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {
+        'thread_id' => 'thread-manifest',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      setup.send(:write_portal_manifest, slug, manifest)
+      stale = VpsfreeDevSession::Tmux::Session.new(
+        id: '$7', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-stale',
+        codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
+      )
+      setup.send(:write_session_authority, slug, stale, state: 'ready')
+
+      created_threads = []
+      created = stale.dup
+      created.id = '$8'
+      created.codex_thread_id = 'thread-manifest'
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |_slug, thread_id:, **_keywords|
+          created_threads << thread_id
+          created
+        end
+        define_method(:sync_slug) { |*_arguments, **_keywords| created }
+        define_method(:revalidate_session!) { |_expected| created }
+      end
+      out = StringIO.new
+      runner = runner_class.new(
+        workspace:, authority_dir:, tmux_socket: '/run/test/tmux.sock',
+        codex_socket: '/run/test/codex.sock', codex_version: '0.152.1',
+        codex_command: codex, tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal], out:, err: StringIO.new,
+        today: TODAY, env: {}
+      )
+
+      runner.start(
+        slug, as_is: true, new: false, attach: false, run_codex: true, json: true
+      )
+
+      assert_equal(['thread-manifest'], created_threads)
+      assert_equal('thread-manifest', JSON.parse(out.string).fetch('threadId'))
+      commands = File.readlines(portal_log, chomp: true)
+      assert(commands.any? { |line| line.start_with?('thread require-materialized ') })
+      create = commands.find { |line| line.start_with?('thread create ') }
+      assert_includes(create, '--thread-id thread-manifest')
+      refute_includes(create, 'thread-stale')
+      authority = JSON.parse(File.read(File.join(authority_dir, "#{slug}.json")))
+      assert_equal('thread-manifest', authority.fetch('codex_thread_id'))
+      assert_equal('$8', authority.fetch('tmux_session_id'))
+    end
+  end
+
   def test_initial_turn_starts_after_private_local_creation_and_without_the_slug_lock
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

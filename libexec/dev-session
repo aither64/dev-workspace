@@ -472,6 +472,7 @@ module VpsfreeDevSession
           if @selected_authority && selected.nil?
             delete_session_authority(slug)
             @selected_authority = nil
+            thread_id = nil
           end
           if run_codex && (thread_id.nil? || thread_id.empty?) &&
              manifest.dig('creation', 'state') == 'ready' && selected &&
