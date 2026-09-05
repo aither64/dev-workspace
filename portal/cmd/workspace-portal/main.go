@@ -92,7 +92,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.unixSocket, "unix-socket", "", "required HTTP Unix socket")
 	flags.StringVar(&options.workspace, "workspace", "/home/aither/workspace/ai/vpsfree.cz", "workspace root")
 	flags.StringVar(&options.baseURL, "base-url", "https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz", "external base URL")
-	flags.StringVar(&options.devSession, "dev-session", "", "path to bin/dev-session")
+	flags.StringVar(&options.devSession, "dev-session", "", "absolute installed dev-session command")
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
 	flags.StringVar(&options.codexSocket, "codex-socket", codex.DefaultSocket(), "Codex App Server Unix socket")
 	flags.StringVar(&options.codexVersion, "codex-version", "", "Codex client version used by attached terminal sessions")

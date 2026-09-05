@@ -5,10 +5,8 @@ description: Prepare a handoff for a vpsFree.cz development initiative and inclu
 
 # Development session handoff
 
-Use the initiative tracked by the current process. When
-`VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`, use the NixOS-installed
-`dev-session`; otherwise use checkout-local `bin/dev-session`. Run
-the applicable helper's `current` command and accept its result only when
+Use the initiative tracked by the current process through the NixOS-installed
+`dev-session` command. Run `dev-session current` and accept its result only when
 `VPSFREE_DEV_SESSION_SLUG` has the same value, as required by the workspace
 `AGENTS.md`. Do not use or modify another concurrent session. If no initiative
 belongs to the process, create one before making changes or ask for the
@@ -21,10 +19,9 @@ Before handing off material work:
    rules require it.
 2. Keep `portal.yml` free of secrets and transient files. Add only useful
    artifacts stored beneath the initiative tracking directory. Repository
-   worktrees created with the applicable helper's `worktree add` command
+   worktrees created with `dev-session worktree add`
    register themselves.
-3. Get the stable link from the applicable helper's `url <slug> --as-is`
-   command.
+3. Get the stable link from `dev-session url <slug> --as-is`.
 4. Put that link in the final handoff after the outcome and any action the user
    still owns. If the portal is not deployed or reachable yet, label the link as
    the post-deployment URL instead of omitting it.

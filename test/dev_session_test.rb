@@ -10,7 +10,7 @@ require 'shellwords'
 require 'stringio'
 require 'tmpdir'
 
-load File.expand_path('../bin/dev-session', __dir__)
+load File.expand_path('../libexec/dev-session', __dir__)
 
 class DevSessionTest < Minitest::Test
   class NullTmux
@@ -2951,7 +2951,7 @@ class DevSessionTest < Minitest::Test
       assert_includes(out.string, File.join(workspace, 'archive', slug))
       assert_includes(
         out.string,
-        "stop after committing: bin/dev-session stop #{slug} --as-is"
+        "stop after committing: dev-session stop #{slug} --as-is"
       )
       assert_includes(
         File.read(File.join(workspace, 'archive', slug, 'state.md')),
@@ -4273,6 +4273,7 @@ class DevSessionTest < Minitest::Test
         workspace:,
         tmux_socket: socket,
         codex_command:,
+        portal_command: [],
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY

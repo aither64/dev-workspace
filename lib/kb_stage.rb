@@ -54,7 +54,7 @@ module KbStage
     slug = ENV['VPSFREE_DEV_SESSION_SLUG']
     raise Error, 'VPSFREE_DEV_SESSION_SLUG is not set' if slug.nil? || slug.empty?
 
-    output, status = Open3.capture2(File.join(ROOT, 'bin/dev-session'), 'current')
+    output, status = Open3.capture2('dev-session', 'current')
     unless status.success? && output.strip == slug
       raise Error, 'the active dev-session does not match VPSFREE_DEV_SESSION_SLUG'
     end

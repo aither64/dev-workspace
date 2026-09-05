@@ -72,37 +72,26 @@ module VpsfreeDevSession
 
   USAGE = <<~USAGE
     Usage:
-      dev-session [--workspace DIR] [--tmux-socket NAME-OR-PATH]
-        [--authority-dir DIR] [--codex-socket PATH] [--codex-version VERSION]
-        [--codex-command PATH] [--portal-command PATH] [--portal-base-url URL]
-        [--require-runtime]
-        start <name-or-slug>
+      dev-session start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
         [--goal-file FILE] [--json] [--exclusive] [--model MODEL]
         [--effort EFFORT]
-      dev-session [--workspace DIR] [--tmux-socket NAME-OR-PATH]
-        fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
+      dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
         [--model MODEL] [--effort EFFORT]
-      dev-session [--workspace DIR] [--tmux-socket NAME] attach <name-or-slug> [--as-is]
-      dev-session [--workspace DIR] [--tmux-socket NAME] sync <name-or-slug> [--as-is]
-      dev-session [--workspace DIR] [--tmux-socket NAME] stop <name-or-slug> [--as-is]
-      dev-session [--workspace DIR] [--authority-dir DIR] recover-stale
-        <name-or-slug> [--as-is]
-      dev-session [--workspace DIR] [--tmux-socket NAME] remove <name-or-slug>
-        [--as-is] [--force]
-      dev-session [--workspace DIR] [--tmux-socket NAME] finalize <name-or-slug>
-        [--as-is]
-      dev-session [--workspace DIR] [--tmux-socket NAME] list [<name-or-slug>] [--as-is]
-      dev-session [--workspace DIR] validate
-      dev-session [--workspace DIR] [--tmux-socket NAME] current
-      dev-session [--workspace DIR] [--tmux-socket NAME] url
-        [<name-or-slug>] [--as-is]
-
-      dev-session [--workspace DIR] [--tmux-socket NAME] worktree add
+      dev-session attach <name-or-slug> [--as-is]
+      dev-session sync <name-or-slug> [--as-is]
+      dev-session stop <name-or-slug> [--as-is]
+      dev-session recover-stale <name-or-slug> [--as-is]
+      dev-session remove <name-or-slug> [--as-is] [--force]
+      dev-session finalize <name-or-slug> [--as-is]
+      dev-session list [<name-or-slug>] [--as-is]
+      dev-session validate
+      dev-session current
+      dev-session url [<name-or-slug>] [--as-is]
+      dev-session worktree add
         <name-or-slug> <project> [--as-is] [--name NAME] [--branch BRANCH]
         [--base REF] [--no-fetch]
-      dev-session [--workspace DIR] [--tmux-socket NAME] worktree remove
-        <name-or-slug> <name> [--as-is] [--force]
+      dev-session worktree remove <name-or-slug> <name> [--as-is] [--force]
   USAGE
 
   class Error < StandardError; end
@@ -802,8 +791,7 @@ module VpsfreeDevSession
           @out.puts "archived: #{destination}"
           @out.puts "review and commit: work/#{slug} -> archive/#{slug}"
           if plan.session
-            helper = @require_runtime ? 'dev-session' : 'bin/dev-session'
-            @out.puts "stop after committing: #{helper} stop #{slug} --as-is"
+            @out.puts "stop after committing: dev-session stop #{slug} --as-is"
           end
         rescue StandardError
           restore_native_client!(slug, quiesced) if quiesced && @tmux.session_by_id(quiesced.id)

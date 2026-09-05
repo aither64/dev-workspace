@@ -1,6 +1,7 @@
 # Development Tmux Sessions
 
-`bin/dev-session` manages one tmux session per development initiative. The
+The NixOS-installed `dev-session` command manages one tmux session per
+development initiative. The
 session name is the resolved slug, and the tool follows the workspace layout
 from `AGENTS.md`.
 
@@ -9,7 +10,7 @@ from `AGENTS.md`.
 Pass a short name by default:
 
 ```sh
-bin/dev-session start api-token-rotation
+dev-session start api-token-rotation
 ```
 
 If a unique existing slug already matches that name, `start` resumes it. If no
@@ -19,13 +20,13 @@ existing slug matches, it creates today's slug. On June 6, 2026, a new
 Use `--new` to force today's slug even when older matching sessions exist:
 
 ```sh
-bin/dev-session start api-token-rotation --new
+dev-session start api-token-rotation --new
 ```
 
 Use `--as-is` when the argument is already the slug:
 
 ```sh
-bin/dev-session start 2026-06-06-api-token-rotation --as-is
+dev-session start 2026-06-06-api-token-rotation --as-is
 ```
 
 When the workspace portal is available, `--model` and `--effort` select the
@@ -102,15 +103,15 @@ commits are not tracking-only checkpoints.
 ## Attaching and syncing
 
 ```sh
-bin/dev-session attach api-token-rotation
-bin/dev-session fork api-token-rotation alternate-approach
-bin/dev-session sync api-token-rotation
-bin/dev-session stop api-token-rotation
-bin/dev-session remove api-token-rotation
-bin/dev-session finalize api-token-rotation
-bin/dev-session list
-bin/dev-session current
-bin/dev-session url
+dev-session attach api-token-rotation
+dev-session fork api-token-rotation alternate-approach
+dev-session sync api-token-rotation
+dev-session stop api-token-rotation
+dev-session remove api-token-rotation
+dev-session finalize api-token-rotation
+dev-session list
+dev-session current
+dev-session url
 ```
 
 Lookup commands accept a short name when it resolves to exactly one known slug
@@ -157,7 +158,7 @@ continues to work after finalization because the portal scans both `work/` and
 `remove` cleans up a development session:
 
 ```sh
-bin/dev-session remove api-token-rotation
+dev-session remove api-token-rotation
 ```
 
 It removes clean git worktrees whose `HEAD` is attached to a shared
@@ -176,7 +177,7 @@ exact initiative group are always refused. Cleanup then delegates removal to
 Branches are retained:
 
 ```sh
-bin/dev-session remove api-token-rotation --force
+dev-session remove api-token-rotation --force
 ```
 
 `remove` is for stopping or cleaning up an active session. It never deletes the
@@ -190,7 +191,7 @@ Use `finalize` only after the initiative is fully complete or explicitly
 abandoned:
 
 ```sh
-bin/dev-session finalize api-token-rotation
+dev-session finalize api-token-rotation
 ```
 
 Before running it:
@@ -234,7 +235,7 @@ does not stage or commit. Inspect the reported move and commit only the exact
 `work/<slug>/` and `archive/<slug>/` paths in the shared top-level repository,
 including the final tracking content, as one archive commit. The managed tmux
 session remains available for that commit. After the commit,
-`bin/dev-session stop <slug> --as-is` verifies the terminal archive and clean
+`dev-session stop <slug> --as-is` verifies the terminal archive and clean
 task paths before closing the exact workspace-owned tmux identity it resolves
 at stop time.
 
@@ -243,7 +244,7 @@ at stop time.
 Create a project worktree through the canonical bare repository:
 
 ```sh
-bin/dev-session worktree add api-token-rotation vpsadmin
+dev-session worktree add api-token-rotation vpsadmin
 ```
 
 This uses:
@@ -270,7 +271,7 @@ Workspace implementation work uses the top-level repository through its
 reserved project and worktree name:
 
 ```sh
-bin/dev-session worktree add api-token-rotation workspace
+dev-session worktree add api-token-rotation workspace
 ```
 
 This creates `worktrees/<slug>/workspace` from the top-level repository. The
@@ -283,15 +284,15 @@ non-bare repositories remain refused.
 Useful options:
 
 ```sh
-bin/dev-session worktree add api-token-rotation vpsadmin --base origin/main
-bin/dev-session worktree add api-token-rotation vpsadmin --name vpsadmin-master --branch master
-bin/dev-session worktree add api-token-rotation vpsadmin --no-fetch
+dev-session worktree add api-token-rotation vpsadmin --base origin/main
+dev-session worktree add api-token-rotation vpsadmin --name vpsadmin-master --branch master
+dev-session worktree add api-token-rotation vpsadmin --no-fetch
 ```
 
 Remove a worktree without deleting its branch:
 
 ```sh
-bin/dev-session worktree remove api-token-rotation vpsadmin
+dev-session worktree remove api-token-rotation vpsadmin
 ```
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
@@ -300,27 +301,14 @@ remains the authority for whether its non-force worktree removal can proceed;
 resolve any refusal and retry, or use the explicit force option when discarding
 the worktree is intentional.
 
-## Test and automation options
+## Runtime ownership
 
-Global options are accepted before the command:
-
-```sh
-bin/dev-session --workspace /tmp/ws \
-  --tmux-socket /tmp/dev-session-test.sock \
-  --authority-dir /tmp/dev-session-authority \
-  --codex-socket /tmp/codex-app-server.sock \
-  start demo --no-attach
-```
-
-An absolute tmux socket uses `tmux -S` and is unaffected by `TMUX_TMPDIR`.
-`VPSFREE_DEV_SESSION_TMUX_SOCKET` supplies the same setting to ordinary shell
-sessions; an explicit `--tmux-socket` still takes precedence.
-When `--authority-dir` or `VPSFREE_DEV_SESSION_AUTHORITY_DIR` is configured,
-the helper writes uid-private runtime identity there, coordinates mutations
-through a shared lifecycle gate beside it, and never selects a host socket from
-the workspace-writable manifest. Run `bin/dev-session validate` to
-validate every persisted portal entry, including its plan, anchored lifecycle,
-active/archive placement, and manifest, before deployment.
+The NixOS configuration owns the workspace path, tmux socket, host authority,
+Codex executable and App Server socket, and portal URL. The public command does
+not require callers to repeat these host-specific arguments. Run
+`dev-session validate` to validate every persisted portal entry, including its
+plan, anchored lifecycle, active/archive placement, and manifest, before
+deployment.
 
 Set `VPSFREE_DEV_SESSION_CODEX` to override the command used for the left pane.
 Publishing Codex runtime provenance requires this value to begin with an
@@ -353,13 +341,11 @@ midnight. Set
 `VPSFREE_DEV_SESSION_PORTAL_COMMAND` to override the `workspace-portal`
 executable used for thread creation.
 
-The deployed portal uses `--require-runtime`, also propagated as
-`VPSFREE_DEV_SESSION_REQUIRE_RUNTIME=1`. In that mode the authority directory,
-tmux socket, Codex command and socket, client version, and portal command must
-all be present, and every path must be absolute. Aitherdev installs the same CLI
-as `dev-session` with those values fixed by its NixOS configuration. The
-checkout's `bin/dev-session` consumes the exported session variables, so both
-entry points use the same commands and session model.
+The private package implementation requires the authority directory, tmux
+socket, Codex command and socket, client version, and portal command to be
+present as absolute paths. Aitherdev exposes it only through the configured
+`dev-session` wrapper, so terminal users and the portal share one command and
+one session model.
 
 See [Workspace portal](workspace-portal.md) for the browser interface, manifest
 format, security model, private CA, and deployment responsibilities.

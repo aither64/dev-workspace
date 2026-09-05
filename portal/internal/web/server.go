@@ -141,6 +141,9 @@ func New(config Config) (*Server, error) {
 	if baseURL.Scheme != "https" {
 		return nil, fmt.Errorf("portal requires an HTTPS base URL")
 	}
+	if config.DevSession == "" || !filepath.IsAbs(config.DevSession) {
+		return nil, errors.New("portal requires an absolute dev-session command")
+	}
 	templates, err := template.New("pages").Funcs(template.FuncMap{
 		"shortSHA": func(value string) string {
 			if len(value) > 10 {
@@ -400,8 +403,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	args := s.devSessionRuntimeArgs()
-	args = append(args, "start", slug, "--as-is", "--exclusive", "--no-attach", "--goal-file", goalPath, "--json")
+	args := []string{"start", slug, "--as-is", "--exclusive", "--no-attach", "--goal-file", goalPath, "--json"}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -437,32 +439,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/"+result.Slug+"/", http.StatusSeeOther)
 }
 
-func (s *Server) devSessionRuntimeArgs() []string {
-	args := []string{
-		"--require-runtime", "--workspace", s.config.Workspace,
-		"--portal-base-url", s.config.BaseURL,
-	}
-	values := []struct{ flag, value string }{
-		{"--authority-dir", s.config.AuthorityDir}, {"--tmux-socket", s.config.TmuxSocket},
-		{"--codex-socket", s.config.CodexSocket}, {"--codex-version", s.config.CodexVersion},
-		{"--codex-command", s.config.CodexCommand}, {"--portal-command", s.config.PortalCommand},
-	}
-	for _, value := range values {
-		if value.value != "" {
-			args = append(args, value.flag, value.value)
-		}
-	}
-	return args
-}
-
 func (s *Server) runDevSession(timeout time.Duration, args ...string) (string, string, error) {
-	devSession := s.config.DevSession
-	if devSession == "" {
-		devSession = filepath.Join(s.config.Workspace, "bin", "dev-session")
-	}
 	commandCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	command := exec.Command(devSession, args...)
+	command := exec.Command(s.config.DevSession, args...)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -804,7 +784,7 @@ func (s *Server) archiveSession(slug string) error {
 		return err
 	}
 	if !summary.Archived {
-		args := append(s.devSessionRuntimeArgs(), "finalize", slug, "--as-is")
+		args := []string{"finalize", slug, "--as-is"}
 		if stdout, stderr, err := s.runDevSession(5*time.Minute, args...); err != nil {
 			return commandFailure("finalize session", stdout, stderr, err)
 		}
@@ -812,7 +792,7 @@ func (s *Server) archiveSession(slug string) error {
 	if err := s.commitArchive(slug); err != nil {
 		return err
 	}
-	args := append(s.devSessionRuntimeArgs(), "stop", slug, "--as-is")
+	args := []string{"stop", slug, "--as-is"}
 	if stdout, stderr, err := s.runDevSession(3*time.Minute, args...); err != nil {
 		message := stderr + stdout
 		if !strings.Contains(message, "tmux session not found") &&
@@ -926,7 +906,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		}
 	}
 	destination := body.CreationDate + "-" + body.Name
-	args := append(s.devSessionRuntimeArgs(), "fork", source.Slug, destination, "--as-is", "--json")
+	args := []string{"fork", source.Slug, destination, "--as-is", "--json"}
 	if settings.Model != "" {
 		args = append(args, "--model", settings.Model)
 	}

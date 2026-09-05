@@ -146,6 +146,17 @@ func TestNewRejectsAnHTTPBaseURL(t *testing.T) {
 	}
 }
 
+func TestNewRequiresAnAbsoluteInstalledDevSessionCommand(t *testing.T) {
+	for _, command := range []string{"", "dev-session"} {
+		_, err := New(Config{
+			Workspace: t.TempDir(), BaseURL: "https://workspace.example.test", DevSession: command,
+		})
+		if err == nil || !strings.Contains(err.Error(), "absolute dev-session") {
+			t.Fatalf("dev-session %q result = %v", command, err)
+		}
+	}
+}
+
 func TestSessionCreationKeepsStandardOutputSeparateFromWarnings(t *testing.T) {
 	server := newTestServer(t)
 	helper := filepath.Join(t.TempDir(), "dev-session")
@@ -217,7 +228,7 @@ func TestJSONTransportAcceptsMaximallyEscapedMessageAtPublishedLimit(t *testing.
 	}
 }
 
-func TestSessionCreationPassesAStableDatedSlug(t *testing.T) {
+func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testing.T) {
 	server := newTestServer(t)
 	server.config.TmuxSocket = "/run/vpsfree-workspace-tmux/tmux.sock"
 	server.config.CodexSocket = "/run/vpsfree-workspace-codex/app-server.sock"
@@ -258,22 +269,18 @@ func TestSessionCreationPassesAStableDatedSlug(t *testing.T) {
 		t.Fatal(err)
 	}
 	argv := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if count := strings.Count(string(data), "--require-runtime\n"); count != 2 {
-		t.Fatalf("creation attempts = %d, want 2", count)
-	}
 	joined := strings.Join(argv, " ")
 	if !strings.Contains(joined, "start 2026-09-03-example --as-is --exclusive") || strings.Contains(joined, "--new") {
 		t.Fatalf("dev-session arguments = %q", argv)
 	}
-	if !strings.Contains(joined, "--tmux-socket /run/vpsfree-workspace-tmux/tmux.sock") ||
-		!strings.Contains(joined, "--require-runtime") ||
-		!strings.Contains(joined, "--authority-dir "+server.config.AuthorityDir) ||
-		!strings.Contains(joined, "--codex-socket /run/vpsfree-workspace-codex/app-server.sock") ||
-		!strings.Contains(joined, "--codex-version 0.152.1") ||
-		!strings.Contains(joined, "--codex-command /nix/store/codex/bin/codex") ||
-		!strings.Contains(joined, "--portal-base-url "+server.config.BaseURL) ||
-		!strings.Contains(joined, "--portal-command /run/current-system/sw/bin/workspace-portal") {
-		t.Fatalf("dev-session socket arguments = %q", argv)
+	for _, privateFlag := range []string{
+		"--require-runtime", "--workspace", "--tmux-socket", "--authority-dir",
+		"--codex-socket", "--codex-version", "--codex-command",
+		"--portal-base-url", "--portal-command",
+	} {
+		if strings.Contains(joined, privateFlag) {
+			t.Fatalf("portal passed private flag %q in %q", privateFlag, argv)
+		}
 	}
 }
 
@@ -914,6 +921,7 @@ func newTestServer(t *testing.T) *Server {
 	server, err := New(Config{
 		Workspace:    workspace,
 		BaseURL:      "https://workspace.example.test",
+		DevSession:   "/run/current-system/sw/bin/dev-session",
 		AuthorityDir: authorityDir,
 		CodexSocket:  "/run/vpsfree-workspace-codex/app-server.sock",
 		CodexVersion: "0.152.1",

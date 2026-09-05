@@ -65,7 +65,8 @@ buildGoModule {
   '';
 
   postInstall = ''
-    install -Dm755 ${src}/bin/dev-session "$out/bin/dev-session"
+    install -Dm755 ${src}/libexec/dev-session \
+      "$out/libexec/workspace-portal/dev-session"
     install -Dm755 ${src}/bin/workspace-pki "$out/bin/workspace-pki"
     install -Dm755 ${src}/bin/workspace-portal-password-hash \
       "$out/bin/workspace-portal-password-hash"
@@ -74,7 +75,7 @@ buildGoModule {
     cp -R ${src}/dev-clusters/vpsadmin "$out/share/workspace-portal/vpsadmin-devcluster"
     cp -R ${src}/dev-clusters/vpsadminos "$out/share/workspace-portal/vpsadminos-devcluster"
 
-    substituteInPlace "$out/bin/dev-session" \
+    substituteInPlace "$out/libexec/workspace-portal/dev-session" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
     substituteInPlace "$out/bin/workspace-pki" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
@@ -96,7 +97,9 @@ buildGoModule {
         tmux
       ]
     }
-    for program in dev-session workspace-pki workspace-portal-password-hash; do
+    wrapProgram "$out/libexec/workspace-portal/dev-session" \
+      --prefix PATH : "$runtimePath"
+    for program in workspace-pki workspace-portal-password-hash; do
       wrapProgram "$out/bin/$program" \
         --prefix PATH : "$runtimePath"
     done
@@ -108,13 +111,22 @@ buildGoModule {
   '';
 
   postFixup = ''
-    for program in dev-session workspace-pki workspace-portal-password-hash; do
+    if test -e "$out/bin/dev-session"; then
+      echo "private dev-session helper was exposed in bin" >&2
+      exit 1
+    fi
+    for program in workspace-pki workspace-portal-password-hash; do
       wrapped="$out/bin/.$program-wrapped"
       if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
         echo "wrapped helper has a non-store interpreter: $wrapped" >&2
         exit 1
       fi
     done
+    wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
+    if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+      echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+      exit 1
+    fi
     for program in vpsadmin-devcluster vpsadminos-devcluster; do
       if ! head -n 1 "$out/bin/$program" | grep -Eq '^#! */nix/store/'; then
         echo "cluster helper has a non-store interpreter: $out/bin/$program" >&2
@@ -126,7 +138,7 @@ buildGoModule {
     done
 
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
-      "$out/bin/dev-session" --help >/dev/null
+      "$out/libexec/workspace-portal/dev-session" --help >/dev/null
 
     set +e
     pki_usage="$(${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \

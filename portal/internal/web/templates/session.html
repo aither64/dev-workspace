@@ -53,6 +53,7 @@
 
       <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel">
         <div class="section-heading"><h2>Handoff</h2></div>
+        {{if not .Session.Codex.ThreadID}}<p class="notice warning">This session has no shared Codex conversation. Start new sessions with <code>dev-session start &lt;short-name&gt;</code>.</p>{{end}}
         {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
