@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE="${VPSFREE_DEVCLUSTER_WORKSPACE:-$(cd -- "$CLUSTER_DIR/../.." && pwd)}"
+WORKSPACE_INPUT="${VPSFREE_DEVCLUSTER_WORKSPACE:-$CLUSTER_DIR/../..}"
+WORKSPACE="$(cd -- "$WORKSPACE_INPUT" && pwd -P)"
+DEVCLUSTER_KIND=vpsadmin
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadmin"
 CERT_DIR="$STATE_ROOT/certs/default"
 SSH_DIR="$STATE_ROOT/ssh"
@@ -119,8 +121,9 @@ ensure_cluster_config() {
   cfg="$(cluster_config_file "$slug")"
 
   need_cmd jq
-  mkdir -p "$(cluster_dir "$slug")"
+  devcluster_validate_cluster_directory "$slug" true
 
+  [ ! -L "$cfg" ] || die "unsafe cluster config symlink: $cfg"
   if [ ! -f "$cfg" ]; then
     cp "$DEFAULT_CONFIG_FILE" "$cfg"
   fi
@@ -139,27 +142,6 @@ result_link() {
 
 config_path() {
   readlink -f "$(result_link "$1")"
-}
-
-list_cluster_slugs() {
-  local dir
-  [ -d "$STATE_ROOT/clusters" ] || return 0
-
-  for dir in "$STATE_ROOT"/clusters/*; do
-    [ -d "$dir" ] || continue
-    basename "$dir"
-  done | sort
-}
-
-remove_result_link() {
-  local slug="$1"
-  local link
-  link="$(result_link "$slug")"
-
-  if [ -L "$link" ] || [ -e "$link" ]; then
-    rm -f -- "$link"
-    printf 'removed GC root: %s\n' "$link"
-  fi
 }
 
 machine_ip() {
@@ -912,7 +894,7 @@ start_cluster() {
 
   (
     cd "$WORKSPACE"
-    exec nohup setsid "${command[@]}"
+    devcluster_exec_without_lifecycle_lock nohup setsid "${command[@]}"
   ) >>"$log" 2>&1 &
 
   local launcher_pid=$!
@@ -965,7 +947,7 @@ stop_cluster() {
     return
   fi
 
-  kill -TERM "$pid" 2>/dev/null || true
+  runner_process_matches "$slug" "$pid" && kill -TERM "$pid" 2>/dev/null || true
 
   for _ in $(seq 1 120); do
     runner_process_matches "$slug" "$pid" || {
@@ -977,7 +959,7 @@ stop_cluster() {
     sleep 1
   done
 
-  kill -KILL "$pid" 2>/dev/null || true
+  runner_process_matches "$slug" "$pid" && kill -KILL "$pid" 2>/dev/null || true
   kill_socket_processes "$slug"
   remove_result_link "$slug"
   printf 'cluster %s killed after timeout\n' "$slug"
@@ -1035,59 +1017,6 @@ devcluster_credentials_json() {
       {label: "Mailpit password", value: .mail.capture.webAuth.password}
     ]) | map(select(.value | type == "string" and length > 0))
   ' "$(config_json_for_slug "$slug")"
-}
-
-gcroots_cluster() {
-  local cleanup=0
-  local -a slugs=()
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --cleanup)
-        cleanup=1
-        ;;
-      --*)
-        usage
-        exit 2
-        ;;
-      *)
-        slugs+=("$1")
-        ;;
-    esac
-    shift
-  done
-
-  if [ "${#slugs[@]}" -eq 0 ]; then
-    mapfile -t slugs < <(list_cluster_slugs)
-  fi
-
-  local slug link target state
-  for slug in "${slugs[@]}"; do
-    link="$(result_link "$slug")"
-
-    if cluster_running "$slug"; then
-      state="running"
-    elif [ -f "$(ready_file "$slug")" ]; then
-      state="stopped-stale-ready"
-    else
-      state="stopped"
-    fi
-
-    if [ ! -L "$link" ] && [ ! -e "$link" ]; then
-      printf '%s %s no-gcroot\n' "$slug" "$state"
-      continue
-    fi
-
-    target="$(readlink -f "$link" 2>/dev/null || true)"
-
-    if [ "$cleanup" = "1" ] && [ "$state" != "running" ]; then
-      remove_result_link "$slug"
-    else
-      printf '%s %s %s' "$slug" "$state" "$link"
-      [ -n "$target" ] && printf ' -> %s' "$target"
-      printf '\n'
-    fi
-  done
 }
 
 urls_cluster() {
@@ -1260,14 +1189,16 @@ reset_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
 
+  devcluster_validate_cluster_directory "$slug" false || true
+
   if [ -f "$(pid_file "$slug")" ] && runner_process_matches "$slug" "$(cat "$(pid_file "$slug")")"; then
     stop_cluster "$slug"
   fi
 
   kill_socket_processes "$slug"
   remove_result_link "$slug"
-  rm -rf "$(cluster_dir "$slug")"
-  rm -rf "$(socket_dir "$slug")"
+  rm -rf -- "$(cluster_dir "$slug")"
+  rm -rf -- "$(socket_dir "$slug")"
   printf 'cluster %s state removed\n' "$slug"
 }
 
@@ -1284,18 +1215,23 @@ main() {
     [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid or missing slug"
   fi
 
+  if [ "$cmd" != "cert" ] && [ "$cmd" != "gcroots" ] &&
+     [ "$cmd" != "help" ] && [ "$cmd" != "-h" ] && [ "$cmd" != "--help" ]; then
+    devcluster_validate_state_ancestors false || true
+  fi
+
   case "$cmd" in
-    start) start_cluster "$@" ;;
-    stop) stop_cluster "$@" ;;
-    status) status_cluster "$@" ;;
+    start) devcluster_with_lifecycle_lock "$1" true start_cluster "${@:2}" ;;
+    stop) devcluster_with_lifecycle_lock "$1" false stop_cluster "${@:2}" ;;
+    status) devcluster_with_lifecycle_lock "$1" false status_cluster "${@:2}" ;;
     gcroots) gcroots_cluster "$@" ;;
-    urls) urls_cluster "$@" ;;
-    config) config_cluster "$@" ;;
+    urls) devcluster_with_lifecycle_lock "$1" true urls_cluster "${@:2}" ;;
+    config) devcluster_with_lifecycle_lock "$1" true config_cluster "${@:2}" ;;
     refresh) refresh_nodes_after_seed "$@" ;;
-    update) update_cluster "$@" ;;
+    update) devcluster_with_lifecycle_lock "$1" true update_cluster "${@:2}" ;;
     restart) restart_service "$@" ;;
     ssh) ssh_cluster "$@" ;;
-    reset) reset_cluster "$@" ;;
+    reset) devcluster_with_lifecycle_lock "$1" false reset_cluster "${@:2}" ;;
     cert)
       local sub="${1:-}"
       [ -n "$sub" ] || {

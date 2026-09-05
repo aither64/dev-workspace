@@ -15,6 +15,7 @@
   python3Packages,
   ruby,
   tmux,
+  util-linux,
   src,
 }:
 buildGoModule {
@@ -39,6 +40,7 @@ buildGoModule {
     python3Packages.jsonschema
     ruby
     tmux
+    util-linux
     apacheHttpd
   ];
 
@@ -106,7 +108,7 @@ buildGoModule {
       wrapProgram "$out/bin/$program" \
         --prefix PATH : "$runtimePath"
     done
-    clusterRuntimePath=${lib.makeBinPath [ bash coreutils git gnugrep jq ]}
+    clusterRuntimePath=${lib.makeBinPath [ bash coreutils git gnugrep jq util-linux ]}
     makeWrapper "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
       "$out/bin/vpsadmin-devcluster" --prefix PATH : "$clusterRuntimePath"
     makeWrapper "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
