@@ -44,6 +44,9 @@ class DevclusterStatusTest < Minitest::Test
         HELPERS.fetch('vpsadmin'), 'urls', slug
       )
       assert(result.success?, stderr)
+      status.fetch('links').each do |link|
+        assert_includes(stdout, "#{link.fetch('label')}: #{link.fetch('url')}")
+      end
       assert_includes(stdout, 'User login: custom-user1')
       assert_includes(stdout, 'User password: custom-password2')
       refute_includes(stdout, 'test-user1')

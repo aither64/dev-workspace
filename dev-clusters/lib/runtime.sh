@@ -74,7 +74,7 @@ devcluster_status_json() {
   local slug="$3"
   local ssh_command="$4"
   local include_services="$5"
-  local directory topology network ready running state pid_text config_path credentials
+  local directory topology network ready running state pid_text config_path credentials links
 
   directory="$(cluster_dir "$slug")"
   if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
@@ -115,6 +115,10 @@ devcluster_status_json() {
     jq -e 'type == "array"' <<<"$credentials" >/dev/null \
       || die "invalid development cluster credential catalog"
   fi
+  links='[]'
+  if [ "$kind" = vpsadmin ] && [ "$config_path" != /dev/null ]; then
+    links="$(devcluster_vpsadmin_links_json "$config_path" "$network")"
+  fi
 
   jq -n \
     --arg kind "$kind" \
@@ -127,6 +131,7 @@ devcluster_status_json() {
     --argjson ready "$ready" \
     --argjson includeServices "$include_services" \
     --argjson credentials "$credentials" \
+    --argjson links "$links" \
     --slurpfile config "$config_path" '
       ($config[0] // {}) as $cfg |
       ($cfg.topologies[$topology] // [] |
@@ -143,31 +148,39 @@ devcluster_status_json() {
         ready: $ready,
         topology: $topology,
         network: $network,
-        links: (if $kind == "vpsadmin" then
-          ([
-            {key: "webui", label: "Web UI"},
-            {key: "webCs", label: "Czech website"},
-            {key: "webEn", label: "English website"},
-            {key: "api", label: "API"},
-            {key: "auth", label: "Authentication"},
-            {key: "console", label: "Console"},
-            {key: "mailpit", label: "Mailpit"},
-            {key: "adminer", label: "Adminer"},
-            {key: "status", label: "Status"}
-          ] | map(
-            . as $item |
-            ($cfg.domains[$item.key] // "") as $domain |
-            select($domain | type == "string" and length > 0) |
-            {label: $item.label, url: (
-              "https://" + $domain +
-              (if $network == "local" then ":10443" else "" end) + "/"
-            )}
-          ))
-        else [] end),
+        links: $links,
         commands: ($targets | map({
           label: ., value: ($sshCommand + " ssh " + $slug + " " + .)
         })),
         credentials: $credentials
       }
     '
+}
+
+devcluster_vpsadmin_links_json() {
+  local config="$1"
+  local network="$2"
+
+  jq -c --arg network "$network" '
+    . as $cfg |
+    [
+      {key: "webui", label: "Web UI"},
+      {key: "webCs", label: "Czech website"},
+      {key: "webEn", label: "English website"},
+      {key: "api", label: "API"},
+      {key: "auth", label: "Authentication"},
+      {key: "console", label: "Console"},
+      {key: "mailpit", label: "Mailpit"},
+      {key: "adminer", label: "Adminer"},
+      {key: "status", label: "Status"}
+    ] | map(
+      . as $item |
+      ($cfg.domains[$item.key] // "") as $domain |
+      select($domain | type == "string" and length > 0) |
+      {label: $item.label, url: (
+        "https://" + $domain +
+        (if $network == "local" then ":10443" else "" end) + "/"
+      )}
+    )
+  ' "$config"
 }

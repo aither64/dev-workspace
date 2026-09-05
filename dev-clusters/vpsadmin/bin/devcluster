@@ -1094,29 +1094,13 @@ urls_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
   ensure_cluster_config "$slug"
-  local api_domain adminer_domain auth_domain console_domain webui_domain web_cs_domain web_en_domain mailpit_domain status_domain
-  api_domain="$(config_get "$slug" '.domains.api')"
-  adminer_domain="$(config_get "$slug" '.domains.adminer')"
-  auth_domain="$(config_get "$slug" '.domains.auth')"
-  console_domain="$(config_get "$slug" '.domains.console')"
-  webui_domain="$(config_get "$slug" '.domains.webui')"
-  web_cs_domain="$(config_get "$slug" '.domains.webCs')"
-  web_en_domain="$(config_get "$slug" '.domains.webEn')"
-  mailpit_domain="$(config_get "$slug" '.domains.mailpit')"
-  status_domain="$(config_get "$slug" '.domains.status')"
+  local links network
+  network="$(cluster_network "$slug")"
+  links="$(devcluster_vpsadmin_links_json "$(config_json_for_slug "$slug")" "$network")"
 
   cat <<EOF
 Cluster: $slug
 Config:  $(cluster_config_file "$slug")
-Web UI:  https://$webui_domain/
-Web CS:  https://$web_cs_domain/
-Web EN:  https://$web_en_domain/
-API:     https://$api_domain/
-Auth:    https://$auth_domain/
-Console: https://$console_domain/
-Mailpit: https://$mailpit_domain/
-Status:  https://$status_domain/
-Adminer: https://$adminer_domain/
 Adminer DB system: MySQL
 Adminer DB server: 127.0.0.1
 Adminer DB user: vpsadmin
@@ -1124,9 +1108,11 @@ Adminer DB password: testMariadbApiPassword
 CA: $CERT_DIR/vpsadmin-ca.crt
 EOF
 
+  jq -r '.[] | "\(.label): \(.url)"' <<<"$links"
+
   devcluster_credentials_json "$slug" | jq -r '.[] | "\(.label): \(.value)"'
 
-  if [ "$(cluster_network "$slug")" = "local" ]; then
+  if [ "$network" = "local" ]; then
     cat <<EOF
 
 Local network forwards:
@@ -1136,20 +1122,6 @@ EOF
       printf '  SSH %-10s 127.0.0.1:%s\n' "$machine:" "$(machine_ssh_port "$slug" "$machine")"
     done < <(topology_machines "$slug" "$(cluster_topology "$slug")")
 
-    cat <<EOF
-
-Local browser URLs require these hostnames to resolve to 127.0.0.1 and use
-port 10443:
-  https://$webui_domain:10443/
-  https://$web_cs_domain:10443/
-  https://$web_en_domain:10443/
-  https://$api_domain:10443/
-  https://$auth_domain:10443/
-  https://$console_domain:10443/
-  https://$mailpit_domain:10443/
-  https://$status_domain:10443/
-  https://$adminer_domain:10443/
-EOF
   fi
 }
 
