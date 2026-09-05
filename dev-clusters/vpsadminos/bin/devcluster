@@ -207,12 +207,21 @@ node_ssh_port() {
 }
 
 ensure_ssh_key() {
-  mkdir -p "$SSH_DIR"
+  devcluster_validate_ssh_directory true
 
   if [ ! -f "$SSH_KEY" ]; then
     need_cmd ssh-keygen
     ssh-keygen -t ed25519 -N '' -C 'vpsadminos-devcluster' -f "$SSH_KEY" >/dev/null
   fi
+}
+
+build_config_with_credentials() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+
+  ensure_ssh_key
+  build_config "$slug" "$topology" "$network"
 }
 
 slug_optional_path() {
@@ -384,8 +393,8 @@ start_cluster() {
   fi
 
   kill_socket_processes "$slug"
-  ensure_ssh_key
-  build_config "$slug" "$topology" "$network"
+  devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
+    build_config_with_credentials "$slug" "$topology" "$network"
   printf '%s\n' "$topology" > "$(topology_file "$slug")"
   printf '%s\n' "$network" > "$(network_file "$slug")"
 
@@ -579,8 +588,8 @@ update_cluster() {
   topology="$(cluster_topology "$slug")"
   network="$(cluster_network "$slug")"
 
-  ensure_ssh_key
-  build_config "$slug" "$topology" "$network"
+  devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
+    build_config_with_credentials "$slug" "$topology" "$network"
 
   need_cmd jq
 

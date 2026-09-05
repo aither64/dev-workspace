@@ -125,6 +125,114 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
+  def test_vpsadmin_certificate_state_is_locked_and_rejects_symlinks
+    Dir.mktmpdir('devcluster-cert-lock') do |workspace|
+      external = Dir.mktmpdir('devcluster-cert-target')
+      certs = File.join(workspace, '.dev-clusters', 'vpsadmin', 'certs')
+      lock_root = File.join(workspace, '.dev-clusters', '.locks')
+      FileUtils.mkdir_p(File.dirname(certs))
+      FileUtils.mkdir_p(lock_root)
+      FileUtils.mkdir_p(File.join(external, 'default'))
+      sentinel = File.join(external, 'default', 'vpsadmin-ca.keep')
+      File.write(sentinel, 'keep')
+      File.symlink(external, certs)
+
+      lock_path = File.join(lock_root, 'vpsadmin-credentials.lock')
+      File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+        lock.flock(File::LOCK_EX)
+        stdin, stdout, stderr, waiter = Open3.popen3(
+          { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+          HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
+        )
+        stdin.close
+        sleep 0.1
+        assert(waiter.alive?, 'certificate initialization did not wait for the provider lock')
+        lock.flock(File::LOCK_UN)
+        output = stdout.read
+        error = stderr.read
+        refute(waiter.value.success?, "certificate initialization unexpectedly succeeded: #{output}")
+        assert_includes(error, 'unsafe vpsadmin certificate state directory')
+      end
+      assert_equal('keep', File.read(sentinel))
+    ensure
+      FileUtils.remove_entry(external) if external && File.exist?(external)
+    end
+  end
+
+  def test_vpsadmin_certificate_files_cannot_redirect_writes
+    Dir.mktmpdir('devcluster-cert-file') do |workspace|
+      cert_dir = File.join(workspace, '.dev-clusters', 'vpsadmin', 'certs', 'default')
+      external = File.join(workspace, 'external-key')
+      FileUtils.mkdir_p(cert_dir)
+      File.write(external, 'keep')
+      File.symlink(external, File.join(cert_dir, 'vpsadmin-ca.key'))
+
+      _stdout, stderr, result = Open3.capture3(
+        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
+      )
+      refute(result.success?)
+      assert_includes(stderr, 'unsafe vpsadmin certificate state file')
+      assert_equal('keep', File.read(external))
+    end
+  end
+
+  def test_vpsadmin_certificate_leaf_cannot_redirect_writes
+    Dir.mktmpdir('devcluster-cert-leaf') do |workspace|
+      certs = File.join(workspace, '.dev-clusters', 'vpsadmin', 'certs')
+      external = Dir.mktmpdir('devcluster-cert-leaf-target')
+      FileUtils.mkdir_p(certs)
+      sentinel = File.join(external, 'vpsadmin-ca.keep')
+      File.write(sentinel, 'keep')
+      File.symlink(external, File.join(certs, 'default'))
+
+      _stdout, stderr, result = Open3.capture3(
+        { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+        HELPERS.fetch('vpsadmin'), 'cert', 'init', '--force'
+      )
+      refute(result.success?)
+      assert_includes(stderr, 'unsafe vpsadmin certificate set directory')
+      assert_equal('keep', File.read(sentinel))
+    ensure
+      FileUtils.remove_entry(external) if external && File.exist?(external)
+    end
+  end
+
+  def test_shared_ssh_directory_is_locked_and_cannot_redirect_key_generation
+    HELPERS.each do |kind, helper|
+      Dir.mktmpdir("devcluster-#{kind}-ssh-leaf") do |workspace|
+        slug = '2026-09-05-ssh-symlink-test'
+        provider_root = File.join(workspace, '.dev-clusters', kind)
+        lock_root = File.join(workspace, '.dev-clusters', '.locks')
+        external = Dir.mktmpdir("devcluster-#{kind}-ssh-leaf-target")
+        FileUtils.mkdir_p(provider_root)
+        FileUtils.mkdir_p(lock_root)
+        File.symlink(external, File.join(provider_root, 'ssh'))
+        write_lifecycle(workspace, slug, 'active')
+
+        lock_path = File.join(lock_root, "#{kind}-credentials.lock")
+        File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+          lock.flock(File::LOCK_EX)
+          stdin, stdout, stderr, waiter = Open3.popen3(
+            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            helper, 'start', slug, '--network', 'local'
+          )
+          stdin.close
+          sleep 2.5
+          assert(waiter.alive?, "#{kind} key generation did not wait for the provider lock")
+          lock.flock(File::LOCK_UN)
+          output = stdout.read
+          error = stderr.read
+          refute(waiter.value.success?, "#{kind} start unexpectedly succeeded: #{output}")
+          assert_includes(error, "unsafe #{kind} SSH state directory")
+        end
+        assert_empty(Dir.children(external))
+      ensure
+        FileUtils.remove_entry(external) if external && File.exist?(external)
+      end
+    end
+  end
+
   def test_queued_start_rechecks_session_lifecycle_after_taking_the_lock
     HELPERS.each do |kind, helper|
       Dir.mktmpdir('devcluster-lock') do |workspace|

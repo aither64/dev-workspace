@@ -14,6 +14,26 @@ DEFAULT_CONFIG_FILE="$CLUSTER_DIR/default-config.json"
 DEV_SESSION_BIN=dev-session
 source "$SCRIPT_DIR/../../lib/runtime.sh"
 
+devcluster_validate_cert_directory() {
+  local create="${1:-false}"
+  local path
+
+  if ! devcluster_validate_provider_root "$create"; then
+    return 1
+  fi
+  if ! devcluster_check_directory "$STATE_ROOT/certs" \
+    "vpsadmin certificate state directory" "$create"; then
+    return 1
+  fi
+  if ! devcluster_check_directory "$CERT_DIR" \
+    "vpsadmin certificate set directory" "$create"; then
+    return 1
+  fi
+  for path in "$CERT_DIR"/vpsadmin-ca.* "$CERT_DIR"/vpsadmin-cert.*; do
+    devcluster_check_regular_file "$path" "vpsadmin certificate state file" || true
+  done
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -220,7 +240,7 @@ machine_known() {
 }
 
 ensure_ssh_key() {
-  mkdir -p "$SSH_DIR"
+  devcluster_validate_ssh_directory true
 
   if [ ! -f "$SSH_KEY" ]; then
     need_cmd ssh-keygen
@@ -299,6 +319,8 @@ cert_reissue_server() {
   fi
 
   need_cmd openssl
+  devcluster_validate_cert_directory false \
+    || die "CA certificate not found; run 'devcluster cert init'"
   [ -f "$CERT_DIR/vpsadmin-ca.crt" ] || die "CA certificate not found; run 'devcluster cert init'"
   [ -f "$CERT_DIR/vpsadmin-ca.key" ] || die "CA key not found; cannot reissue server certificate"
 
@@ -368,7 +390,7 @@ cert_init() {
   done
 
   need_cmd openssl
-  mkdir -p "$CERT_DIR"
+  devcluster_validate_cert_directory true
 
   if [ "$force" -ne 1 ] && [ -f "$CERT_DIR/vpsadmin-cert.crt" ]; then
     die "certificate already exists in $CERT_DIR; use --force to replace it"
@@ -435,7 +457,7 @@ cert_import() {
     [ -f "$src/$required" ] || die "$src/$required not found"
   done
 
-  mkdir -p "$CERT_DIR"
+  devcluster_validate_cert_directory true
 
   if [ "$force" -ne 1 ] && [ -f "$CERT_DIR/vpsadmin-cert.crt" ]; then
     die "certificate already exists in $CERT_DIR; use --force to replace it"
@@ -458,6 +480,8 @@ cert_import() {
 }
 
 cert_show_ca() {
+  devcluster_validate_cert_directory false \
+    || die "CA certificate not found; run 'devcluster cert init'"
   [ -f "$CERT_DIR/vpsadmin-ca.crt" ] || die "CA certificate not found; run 'devcluster cert init'"
 
   printf 'CA certificate: %s\n' "$CERT_DIR/vpsadmin-ca.crt"
@@ -470,6 +494,7 @@ ensure_certs() {
   local slug="${1:-}"
   local cert_cfg
   cert_cfg="$(cert_config_for_slug "$slug")"
+  devcluster_validate_cert_directory true
 
   if [ -f "$CERT_DIR/vpsadmin-cert.crt" ] && [ -f "$CERT_DIR/vpsadmin-cert.key" ]; then
     ensure_cert_domains "$cert_cfg"
@@ -483,6 +508,22 @@ ensure_certs() {
   fi
 
   ensure_cert_domains "$cert_cfg"
+}
+
+ensure_shared_credentials() {
+  local slug="$1"
+
+  ensure_ssh_key
+  ensure_certs "$slug"
+}
+
+build_config_with_credentials() {
+  local slug="$1"
+  local topology="$2"
+  local network="$3"
+
+  ensure_shared_credentials "$slug"
+  build_config "$slug" "$topology" "$network"
 }
 
 slug_vpsadmin_path() {
@@ -847,10 +888,8 @@ start_cluster() {
   fi
 
   kill_socket_processes "$slug"
-  ensure_ssh_key
-  ensure_certs "$slug"
-
-  build_config "$slug" "$topology" "$network"
+  devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
+    build_config_with_credentials "$slug" "$topology" "$network"
   printf '%s\n' "$topology" > "$(topology_file "$slug")"
   printf '%s\n' "$network" > "$(network_file "$slug")"
 
@@ -1072,9 +1111,8 @@ update_cluster() {
   local network
   network="$(cluster_network "$slug")"
 
-  ensure_ssh_key
-  ensure_certs "$slug"
-  build_config "$slug" "$topology" "$network"
+  devcluster_with_lock "$DEVCLUSTER_KIND-credentials" \
+    build_config_with_credentials "$slug" "$topology" "$network"
 
   need_cmd jq
 
@@ -1240,9 +1278,9 @@ main() {
       }
       shift
       case "$sub" in
-        init) cert_init "$@" ;;
-        import) cert_import "$@" ;;
-        show-ca) cert_show_ca "$@" ;;
+        init) devcluster_with_lock "$DEVCLUSTER_KIND-credentials" cert_init "$@" ;;
+        import) devcluster_with_lock "$DEVCLUSTER_KIND-credentials" cert_import "$@" ;;
+        show-ca) devcluster_with_lock "$DEVCLUSTER_KIND-credentials" cert_show_ca "$@" ;;
         *) usage; exit 2 ;;
       esac
       ;;
