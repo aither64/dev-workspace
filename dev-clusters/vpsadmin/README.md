@@ -43,10 +43,10 @@ access tests.
 Network modes:
 
 - `bridge` is the default. It attaches VMs to `br0` and uses the predictable
-  `172.16.106.*` dev addresses. This needs a usable `qemu-bridge-helper` or
-  root privileges. On `aitherdev`, deploy the host configuration that provides
-  `/run/wrappers/bin/qemu-bridge-helper` and keeps `/etc/qemu/bridge.conf`
-  restricted to the allowed bridges.
+  `172.16.106.*` dev addresses. The current user needs access to `/dev/kvm` and
+  a usable `qemu-bridge-helper`. On `aitherdev`, deploy the host configuration
+  that provides `/run/wrappers/bin/qemu-bridge-helper` and keeps
+  `/etc/qemu/bridge.conf` restricted to the allowed bridges.
 - `local` runs without bridge privileges. VMs talk to each other on a QEMU
   socket network and expose host forwards on localhost:
   `10443` for HTTPS, `10022` for services SSH, `10122` for node1 SSH, `10222`

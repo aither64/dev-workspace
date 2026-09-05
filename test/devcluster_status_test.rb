@@ -374,6 +374,15 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
+  def test_privileged_start_is_not_part_of_the_managed_contract
+    HELPERS.each_value do |helper|
+      source = File.read(helper)
+      refute_includes(source, '--sudo')
+      refute_includes(source, 'DEVCLUSTER_USE_SUDO')
+      refute_includes(source, 'sudo -E')
+    end
+  end
+
   def test_status_and_reset_match_the_exact_runner_socket_argument
     with_cluster('vpsadmin') do |workspace, directory, slug|
       marker = File.join('/tmp', "vpsfree-devcluster-#{Digest::SHA256.hexdigest(slug)[0, 12]}")
@@ -435,6 +444,31 @@ class DevclusterStatusTest < Minitest::Test
           stop_process(unrelated)
         end
       end
+    end
+  end
+
+  def test_socket_cleanup_fails_if_a_matching_process_survives
+    runtime = File.join(ROOT, 'dev-clusters/lib/runtime.sh')
+    marker = "/tmp/vpsfree-devcluster-#{Digest::SHA256.hexdigest('signal-test')[0, 12]}"
+    child = spawn_marker_process("--socket-path=#{marker}/machine.sock")
+    script = <<~BASH
+      set -euo pipefail
+      source "$1"
+      EXPECTED_SOCKET_DIR="$2"
+      socket_dir() { printf '%s\n' "$EXPECTED_SOCKET_DIR"; }
+      die() { printf 'error: %s\n' "$*" >&2; return 1; }
+      kill() { return 1; }
+      sleep() { :; }
+      kill_socket_processes signal-test
+    BASH
+
+    begin
+      _stdout, stderr, result = Open3.capture3('bash', '-c', script, 'bash', runtime, marker)
+      refute(result.success?)
+      assert_includes(stderr, 'unable to stop cluster processes')
+      assert(Process.kill(0, child), 'failed cleanup did not leave the test process running')
+    ensure
+      stop_process(child)
     end
   end
 

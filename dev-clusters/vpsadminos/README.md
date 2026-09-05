@@ -64,8 +64,8 @@ Some vpsAdminOS boots can spend several minutes without console output after
 SeaBIOS. Use `--timeout seconds` when testing slower boots.
 
 `bridge` attaches `eth1` to `br0`, assigns the configured `172.16.106.*`
-addresses, and routes the VM through the bridge gateway. This needs a usable
-QEMU bridge helper or root privileges. The helper path defaults to
+addresses, and routes the VM through the bridge gateway. The current user needs
+access to `/dev/kvm` and a usable QEMU bridge helper. The helper path defaults to
 `/run/wrappers/bin/qemu-bridge-helper`; override it with:
 
 ```sh

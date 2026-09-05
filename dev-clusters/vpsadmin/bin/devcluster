@@ -37,7 +37,7 @@ devcluster_validate_cert_directory() {
 usage() {
   cat <<'EOF'
 Usage:
-  devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force] [--sudo]
+  devcluster start <slug> [--topology single|dual|storage] [--network bridge|local] [--force]
   devcluster stop <slug>
   devcluster status <slug>
   devcluster gcroots [--cleanup] [<slug>...]
@@ -839,7 +839,6 @@ start_cluster() {
   local topology="single"
   local network="${VPSADMIN_DEVCLUSTER_NETWORK:-bridge}"
   local force=0
-  local use_sudo="${VPSADMIN_DEVCLUSTER_USE_SUDO:-0}"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -855,10 +854,6 @@ start_cluster() {
         ;;
       --force)
         force=1
-        shift
-        ;;
-      --sudo)
-        use_sudo=1
         shift
         ;;
       *)
@@ -927,10 +922,6 @@ start_cluster() {
     --ready-file "$ready"
   )
 
-  if [ "$use_sudo" = "1" ]; then
-    command=(sudo -E "${command[@]}")
-  fi
-
   (
     cd "$WORKSPACE"
     devcluster_exec_without_lifecycle_lock nohup setsid "${command[@]}"
@@ -986,7 +977,9 @@ stop_cluster() {
     return
   fi
 
-  runner_process_matches "$slug" "$pid" && kill -TERM "$pid" 2>/dev/null || true
+  if runner_process_matches "$slug" "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || die "unable to stop cluster runner PID $pid"
+  fi
 
   for _ in $(seq 1 120); do
     runner_process_matches "$slug" "$pid" || {
@@ -998,7 +991,9 @@ stop_cluster() {
     sleep 1
   done
 
-  runner_process_matches "$slug" "$pid" && kill -KILL "$pid" 2>/dev/null || true
+  if runner_process_matches "$slug" "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || die "unable to kill cluster runner PID $pid"
+  fi
   kill_socket_processes "$slug"
   remove_result_link "$slug"
   printf 'cluster %s killed after timeout\n' "$slug"

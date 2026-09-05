@@ -2,7 +2,7 @@
 
 is_running() {
   local pid="$1"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  [ -n "$pid" ] && [ -d "/proc/$pid" ]
 }
 
 cluster_running() {
@@ -52,6 +52,7 @@ socket_processes() {
   expected="$(socket_dir "$slug")"
   for process in /proc/[0-9]*; do
     pid="${process##*/}"
+    [ "$pid" = "$$" ] && continue
     process_references_path "$pid" "$expected" && printf '%s\n' "$pid"
   done
 }
@@ -59,23 +60,31 @@ socket_processes() {
 kill_socket_processes() {
   local slug="$1"
   local expected pid
+  local -a processes=()
   expected="$(socket_dir "$slug")"
 
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
+  mapfile -t processes < <(socket_processes "$slug")
+  [ "${#processes[@]}" -gt 0 ] || return 0
+  for pid in "${processes[@]}"; do
     process_references_path "$pid" "$expected" || continue
     kill -TERM "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
+  done
 
   sleep 2
 
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    [ "$pid" = "$$" ] && continue
+  mapfile -t processes < <(socket_processes "$slug")
+  for pid in "${processes[@]}"; do
     process_references_path "$pid" "$expected" || continue
     kill -KILL "$pid" 2>/dev/null || true
-  done < <(socket_processes "$slug")
+  done
+
+  for _ in $(seq 1 20); do
+    mapfile -t processes < <(socket_processes "$slug")
+    [ "${#processes[@]}" -gt 0 ] || return 0
+    sleep 0.1
+  done
+
+  die "unable to stop cluster processes: ${processes[*]}"
 }
 
 devcluster_check_directory() {
