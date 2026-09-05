@@ -462,8 +462,7 @@ class DevSessionTest < Minitest::Test
       captured = {
         input:,
         options: options.dup,
-        goal: File.read(options.fetch(:goal_file)),
-        mode: File.stat(options.fetch(:goal_file)).mode & 0o777
+        goal: options.fetch(:goal_text)
       }
     end
     err = StringIO.new
@@ -478,9 +477,8 @@ class DevSessionTest < Minitest::Test
     assert_equal(0, cli.run)
     assert_equal('demo', captured.fetch(:input))
     assert_equal('Investigate the API failure.', captured.fetch(:goal))
-    assert_equal(0o600, captured.fetch(:mode))
     assert_includes(err.string, 'Initial request: ')
-    refute(File.exist?(captured.dig(:options, :goal_file)))
+    assert_nil(captured.dig(:options, :goal_file))
   end
 
   def test_cli_requires_a_goal_file_for_noninteractive_new_session
@@ -509,7 +507,7 @@ class DevSessionTest < Minitest::Test
       true
     end
     fake_runner.define_singleton_method(:start) do |_input, **options|
-      captured = File.binread(options.fetch(:goal_file))
+      captured = options.fetch(:goal_text)
     end
     request = 'x' * VpsfreeDevSession::MAX_MESSAGE_BYTES
     cli = VpsfreeDevSession::CLI.new(
@@ -546,6 +544,20 @@ class DevSessionTest < Minitest::Test
       assert_includes(error.message, 'requires an initial request')
       refute(File.exist?(File.join(workspace, 'work', '2026-06-06-demo')))
       refute(File.exist?(File.join(workspace, 'worktrees', '2026-06-06-demo')))
+    end
+  end
+
+  def test_goal_file_must_not_be_a_symlink
+    with_workspace do |workspace|
+      target = File.join(workspace, 'goal-target.txt')
+      link = File.join(workspace, 'goal-link.txt')
+      File.write(target, "Do the work.\n")
+      File.symlink(target, link)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace).send(:read_goal, link)
+      end
+      assert_includes(error.message, 'goal file is a symlink')
     end
   end
 
@@ -1220,7 +1232,7 @@ class DevSessionTest < Minitest::Test
           expected
         end
 
-        define_method(:reconcile_native_client!) do |_slug, expected|
+        define_method(:reconcile_native_client!) do |_slug, expected, **_keywords|
           expected
         end
       end
@@ -1269,6 +1281,7 @@ class DevSessionTest < Minitest::Test
       original_request = 'Implement the original request.'
       goal = File.join(workspace, 'goal.txt')
       delivered = File.join(workspace, 'delivered.txt')
+      snapshot_record = File.join(workspace, 'snapshot-record.txt')
       portal = File.join(workspace, 'fake-portal.rb')
       File.write(goal, "#{original_request}\n")
       File.write(portal, <<~RUBY)
@@ -1279,6 +1292,7 @@ class DevSessionTest < Minitest::Test
         when 'ensure-initial'
           input = ARGV.fetch(ARGV.index('--input-file') + 1)
           File.binwrite(#{delivered.dump}, File.binread(input))
+          File.write(#{snapshot_record.dump}, "\#{input}\n\#{File.stat(input).mode & 0o777}\n")
         end
       RUBY
       session = VpsfreeDevSession::Tmux::Session.new(
@@ -1293,7 +1307,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
-        define_method(:reconcile_native_client!) { |_slug, expected| expected }
+        define_method(:reconcile_native_client!) { |_slug, expected, **_keywords| expected }
       end
       runner = runner_class.new(
         workspace:,
@@ -1317,6 +1331,9 @@ class DevSessionTest < Minitest::Test
       )
 
       assert_equal(original_request, File.binread(delivered))
+      snapshot_path, snapshot_mode = File.readlines(snapshot_record, chomp: true)
+      assert_equal(0o600, Integer(snapshot_mode))
+      refute(File.exist?(snapshot_path))
       assert_includes(
         File.read(File.join(workspace, 'work', slug, 'plan.md')),
         original_request
@@ -1721,7 +1738,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
-        define_method(:reconcile_native_client!) do |_slug, expected|
+        define_method(:reconcile_native_client!) do |_slug, expected, **_keywords|
           raise 'initial request was not persisted before Codex launch' unless File.file?(observation)
 
           expected
@@ -1816,7 +1833,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| replacement }
         define_method(:sync_slug) { |*_arguments, **_keywords| replacement }
         define_method(:revalidate_session!) { |expected| expected }
-        define_method(:reconcile_native_client!) { |_slug, expected| expected }
+        define_method(:reconcile_native_client!) { |_slug, expected, **_keywords| expected }
       end
       second = second_runner_class.new(
         workspace:, authority_dir:, tmux_socket: '/run/test/tmux.sock',
@@ -1875,7 +1892,7 @@ class DevSessionTest < Minitest::Test
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
-        define_method(:reconcile_native_client!) { |_slug, expected| expected }
+        define_method(:reconcile_native_client!) { |_slug, expected, **_keywords| expected }
 
         def mark_creation_journal_ready(slug, journal)
           super
@@ -4907,6 +4924,155 @@ class DevSessionTest < Minitest::Test
       )
       running_runner.send(:reconcile_native_client!, slug, running.session(slug))
       assert_empty(running.sent_commands)
+    end
+  end
+
+  def test_terminal_reconciliation_refuses_an_incomplete_creation
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      portal_log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal.rb')
+      codex = File.join(workspace, 'codex')
+      File.write(portal, <<~RUBY)
+        File.write(#{portal_log.dump}, ARGV.join(' '))
+      RUBY
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/workspace/tmux.sock',
+        codex_thread_id: 'thread-creating',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.153.2',
+        pane_current_command: 'sh'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new,
+        err: StringIO.new,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['schema'] = 2
+      manifest['codex'] = {
+        'thread_id' => 'thread-creating',
+        'socket_path' => '/run/workspace/codex.sock',
+        'client_version' => '0.153.2'
+      }
+      manifest['creation'] = {
+        'state' => 'creating',
+        'initial_goal_sent' => false,
+        'initial_goal_attempted' => true,
+        'goal_sha256' => Digest::SHA256.hexdigest('initial request')
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:reconcile_native_client!, slug, tmux.session(slug))
+      end
+
+      assert_includes(error.message, 'session creation is incomplete')
+      assert_empty(tmux.sent_commands)
+      refute(File.exist?(portal_log))
+    end
+  end
+
+  def test_concurrent_attach_cannot_launch_codex_during_initial_delivery
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      goal = File.join(workspace, 'goal.txt')
+      portal = File.join(workspace, 'portal.rb')
+      codex = File.join(workspace, 'codex')
+      File.write(goal, "Deliver the initial request.\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        puts JSON.generate(threadId: 'thread-concurrent') if ARGV[1] == 'create'
+      RUBY
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      entered_delivery = Queue.new
+      release_delivery = Queue.new
+      created_session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$9', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/workspace/tmux.sock',
+        codex_thread_id: 'thread-concurrent',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.153.2', codex_pane_id: '%1'
+      )
+      creator_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| created_session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| created_session }
+        define_method(:revalidate_session!) { |_expected| created_session }
+        define_method(:send_portal_goal) do |*_arguments, **_keywords|
+          entered_delivery << true
+          release_delivery.pop
+        end
+        define_method(:reconcile_native_client!) do |_slug, session, **_keywords|
+          session
+        end
+      end
+      creator = creator_class.new(
+        workspace:,
+        authority_dir:,
+        tmux_socket: '/run/workspace/tmux.sock',
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        portal_command: [RbConfig.ruby, portal],
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+      creator_thread = Thread.new do
+        creator.start(
+          slug, as_is: true, new: false, attach: false, run_codex: true,
+          goal_file: goal, json: true, exclusive: true
+        )
+      end
+      entered_delivery.pop
+
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/workspace/tmux.sock',
+        codex_thread_id: 'thread-concurrent',
+        codex_socket_path: '/run/workspace/codex.sock',
+        codex_client_version: '0.153.2',
+        pane_current_command: 'sh',
+        id: '$9'
+      )
+      attacher = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        tmux_socket: '/run/workspace/tmux.sock',
+        codex_socket: '/run/workspace/codex.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        portal_command: [RbConfig.ruby, portal],
+        tmux:,
+        process_exec: ->(*_arguments) { raise 'attach unexpectedly replaced the process' },
+        out: StringIO.new,
+        err: StringIO.new,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        attacher.attach(slug, as_is: true)
+      end
+      assert_includes(error.message, 'session creation is incomplete')
+      assert_empty(tmux.sent_commands)
+    ensure
+      release_delivery << true if release_delivery
+      creator_thread&.value
     end
   end
 

@@ -393,14 +393,18 @@ module VpsfreeDevSession
       attach:,
       run_codex:,
       goal_file: nil,
+      goal_text: nil,
       json: false,
       exclusive: false,
       model: nil,
       effort: nil
     )
+      if goal_file && goal_text
+        raise Error, 'initial request cannot use both a goal file and direct text'
+      end
       goal_snapshot = nil
-      if goal_file
-        goal = read_goal(goal_file)
+      if goal_file || goal_text
+        goal = goal_text ? normalize_goal_text(goal_text) : read_goal(goal_file)
         goal_snapshot = Tempfile.new(['dev-session-goal-', '.txt'])
         goal_snapshot.chmod(0o600)
         goal_snapshot.binmode
@@ -609,7 +613,7 @@ module VpsfreeDevSession
                    current_manifest.dig('creation', 'state') == 'creating'
               raise Error, "session creation state changed while starting Codex: #{slug}"
             end
-            current = reconcile_native_client!(slug, current)
+            current = reconcile_native_client!(slug, current, allow_creating: true)
             current_manifest['creation']['initial_goal_sent'] = true
             current_manifest['creation']['state'] = 'ready'
             current_manifest['creation'].delete('initial_goal_attempted')
@@ -623,6 +627,8 @@ module VpsfreeDevSession
         selected_session
       end
 
+      goal_snapshot&.close!
+      goal_snapshot = nil
       if json
         @out.puts JSON.generate(
           slug:,
@@ -677,6 +683,9 @@ module VpsfreeDevSession
            (creation['goal_sha256'] && !creation['initial_goal_sent'])
           raise Error, "source session creation is incomplete: #{source_slug}"
         end
+        if @portal_command && codex_provenance_configured?
+          require_portal_thread_materialized(source_slug, thread_id)
+        end
         manifest
       end
 
@@ -724,6 +733,9 @@ module VpsfreeDevSession
             manifest['codex'] = codex_metadata(thread_id)
             write_portal_manifest(destination_slug, manifest)
             name_portal_thread(destination_slug, thread_id)
+          end
+          if @portal_command && codex_provenance_configured?
+            require_portal_thread_materialized(destination_slug, thread_id)
           end
           selected = create_tmux_session(destination_slug, run_codex: true, thread_id:)
           selected = sync_slug(destination_slug, require_session: true, session: selected)
@@ -1968,18 +1980,46 @@ module VpsfreeDevSession
 
     def read_goal(goal_file)
       path = File.expand_path(goal_file)
-      raise Error, "goal file is a symlink: #{path}" if File.symlink?(path)
-      raise Error, "goal file is not a regular file: #{path}" unless File.file?(path)
-      if File.size(path) > MAX_MESSAGE_BYTES
+      data = File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+        stat = file.stat
+        current = File.lstat(path)
+        unless stat.file? && !current.symlink? && stat.dev == current.dev &&
+               stat.ino == current.ino
+          raise Error, "goal file is not a stable regular file: #{path}"
+        end
+        file.read(MAX_MESSAGE_BYTES + 1)
+      end
+      if data.bytesize > MAX_MESSAGE_BYTES
         raise Error, "goal file exceeds #{MAX_MESSAGE_BYTES.to_s.reverse.scan(/.{1,3}/).join(',').reverse} bytes"
       end
 
-      goal = File.read(path, encoding: Encoding::UTF_8).strip
+      goal = data.force_encoding(Encoding::UTF_8)
+      raise Error, 'goal file is not valid UTF-8' unless goal.valid_encoding?
+
+      goal = goal.strip
       raise Error, 'goal file is empty' if goal.empty?
 
       goal
-    rescue ArgumentError => e
-      raise Error, "goal file is not valid UTF-8: #{e.message}"
+    rescue Errno::ELOOP
+      raise Error, "goal file is a symlink: #{path}"
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot read goal file #{path}: #{e.message}"
+    end
+
+    def normalize_goal_text(value)
+      raise Error, 'initial request is not text' unless value.is_a?(String)
+      if value.bytesize > MAX_MESSAGE_BYTES
+        raise Error,
+              "initial request exceeds #{MAX_MESSAGE_BYTES.to_s.reverse.scan(/.{1,3}/).join(',').reverse} bytes"
+      end
+
+      goal = value.dup.force_encoding(Encoding::UTF_8)
+      raise Error, 'initial request is not valid UTF-8' unless goal.valid_encoding?
+
+      goal = goal.strip
+      raise Error, 'the initial request cannot be empty' if goal.empty?
+
+      goal
     end
 
     def update_portal_repository(
@@ -3142,9 +3182,10 @@ module VpsfreeDevSession
       raise Error, "unable to restore terminal Codex client for #{slug}: #{e.message}"
     end
 
-    def reconcile_native_client!(slug, session)
+    def reconcile_native_client!(slug, session, allow_creating: false)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
+      require_reconcilable_portal_thread!(slug, session, allow_creating:)
       unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
              @tmux.pane_session_id(session.codex_pane_id) == session.id
         raise Error, "managed Codex pane identity is invalid for #{slug}"
@@ -3167,6 +3208,25 @@ module VpsfreeDevSession
       session
     rescue StandardError => e
       raise Error, "unable to reconcile terminal Codex client for #{slug}: #{e.message}"
+    end
+
+    def require_reconcilable_portal_thread!(slug, session, allow_creating:)
+      return unless @portal_command && !@portal_command.empty?
+
+      manifest = load_portal_manifest(portal_file(slug), required: true)
+      unless manifest.dig('codex', 'thread_id') == session.codex_thread_id
+        raise Error, "session Codex thread does not match the portal manifest for #{slug}"
+      end
+      creation = manifest.fetch('creation', {})
+      ready = creation['state'] == 'ready' &&
+              (!creation['goal_sha256'] || creation['initial_goal_sent'])
+      creating = allow_creating && creation['state'] == 'creating' &&
+                 creation['initial_goal_attempted']
+      unless ready || creating
+        raise Error, "session creation is incomplete; wait before attaching: #{slug}"
+      end
+
+      require_portal_thread_materialized(slug, session.codex_thread_id)
     end
 
     def send_native_client_command(session)
@@ -3471,7 +3531,8 @@ module VpsfreeDevSession
         json: false,
         exclusive: false,
         model: nil,
-        effort: nil
+        effort: nil,
+        goal_text: nil
       }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
@@ -3501,13 +3562,7 @@ module VpsfreeDevSession
           raise Error, 'the initial request cannot be empty'
         end
 
-        Tempfile.create(['dev-session-goal-', '.txt']) do |file|
-          file.chmod(0o600)
-          file.write(request)
-          file.flush
-          opts[:goal_file] = file.path
-          return runner.start(input, **opts)
-        end
+        opts[:goal_text] = request
       end
 
       runner.start(input, **opts)

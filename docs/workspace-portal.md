@@ -237,11 +237,11 @@ the App Server, and the package's protocol contract test together.
 Deploy aitherdev first, then deploy both internal DNS servers through normal
 confctl generations. Host activation creates or reuses credentials and starts
 the portal. Before an aitherdev switch or rollback that changes session
-creation, stop the portal and confirm that no `dev-session start` process is
-running. This prevents a request handled by the old generation from crossing
-the mutable `/run/current-system` boundary. No NAR attestation or manual
-rollback capture is needed. Ordinary NixOS generation rollback removes the
-service while leaving reusable credentials on disk.
+creation, stop the portal and confirm that no `dev-session start` or
+`dev-session fork` process is running. This prevents a request handled by the
+old generation from crossing the mutable `/run/current-system` boundary. No
+NAR attestation or manual rollback capture is needed. Ordinary NixOS generation
+rollback removes the service while leaving reusable credentials on disk.
 
 The portal continues serving initiative status when GitHub or the App Server is
 temporarily unavailable. Only the affected integration reports an error. The
