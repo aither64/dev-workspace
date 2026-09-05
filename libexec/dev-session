@@ -3149,6 +3149,18 @@ module VpsfreeDevSession
       ]
       command += ['--socket', socket]
       @command_runner.capture(command)
+    rescue CommandError => e
+      legacy_root_thread = authority.nil? &&
+                           manifest&.dig('codex', 'socket_path').nil? &&
+                           socket == @codex_socket &&
+                           @tmux.session(slug).nil?
+      cwd_mismatch = e.stderr.strip ==
+                     'workspace-portal: Codex thread does not match the development session directory'
+      raise unless legacy_root_thread && cwd_mismatch
+
+      root_command = command.dup
+      root_command[root_command.index('--cwd') + 1] = workspace
+      @command_runner.capture(root_command)
     end
 
     def quiesce_and_require_idle!(slug, session)

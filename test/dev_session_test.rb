@@ -4494,6 +4494,45 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_idle_check_retries_the_workspace_root_for_a_stopped_legacy_thread
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal')
+      work = File.join(workspace, 'work', slug)
+      File.write(portal, <<~RUBY)
+        File.open(#{log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
+        if cwd == #{work.dump}
+          warn 'workspace-portal: Codex thread does not match the development session directory'
+          exit 1
+        end
+        exit(cwd == #{workspace.dump} ? 0 : 2)
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new,
+        codex_socket: '/run/test/codex.sock', codex_version: '0.152.1',
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = { 'thread_id' => 'thread-legacy' }
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      runner.send(:ensure_portal_thread_idle!, slug, nil)
+
+      commands = File.readlines(log, chomp: true)
+      assert_equal(2, commands.length)
+      assert_includes(commands.fetch(0), "--cwd #{work}")
+      assert_includes(commands.fetch(1), "--cwd #{workspace}")
+      commands.each do |command|
+        assert_includes(command, '--thread-id thread-legacy')
+        assert_includes(command, '--socket /run/test/codex.sock')
+      end
+    end
+  end
+
   def test_stop_quiesces_terminal_before_the_authoritative_idle_check
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
