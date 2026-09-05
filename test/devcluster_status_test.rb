@@ -405,6 +405,39 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
+  def test_reset_kills_children_that_reference_socket_files
+    HELPERS.each_key do |kind|
+      with_cluster(kind) do |workspace, _directory, slug|
+        socket_prefix = kind == 'vpsadmin' ? 'vpsfree' : 'vpsadminos'
+        socket_directory = File.join(
+          '/tmp',
+          "#{socket_prefix}-devcluster-#{Digest::SHA256.hexdigest(slug)[0, 12]}"
+        )
+        arguments = [
+          "socket,id=char0,path=#{socket_directory}/machine.sock,server=on",
+          "--socket-path=#{socket_directory}/virtiofs.sock"
+        ]
+        children = arguments.map { |argument| spawn_marker_process(argument) }
+        unrelated = spawn_marker_process("--socket-path=#{socket_directory}-other/virtiofs.sock")
+
+        begin
+          _stdout, stderr, result = Open3.capture3(
+            { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
+            HELPERS.fetch(kind), 'reset', slug
+          )
+          assert(result.success?, stderr)
+          children.each do |pid|
+            assert_process_exited(pid, "#{kind} left socket child #{pid} running")
+          end
+          assert(Process.kill(0, unrelated), "#{kind} killed a prefix-matching process")
+        ensure
+          children.each { |pid| stop_process(pid) }
+          stop_process(unrelated)
+        end
+      end
+    end
+  end
+
   private
 
   def with_cluster(kind)
@@ -515,6 +548,18 @@ class DevclusterStatusTest < Minitest::Test
     Process.kill('TERM', pid)
     Process.wait(pid)
   rescue Errno::ESRCH, Errno::ECHILD
+    nil
+  end
+
+  def assert_process_exited(pid, message)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    loop do
+      return if Process.wait(pid, Process::WNOHANG)
+      raise message if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.01
+    end
+  rescue Errno::ECHILD
     nil
   end
 end

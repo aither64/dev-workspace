@@ -31,13 +31,28 @@ process_has_argument() {
   return 1
 }
 
+process_references_path() {
+  local pid="$1"
+  local expected="$2"
+  local argument
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' argument; do
+    case "$argument" in
+      "$expected"|"$expected"/*|*="$expected"|*="$expected"/*|*,"$expected"|*,"$expected"/*)
+        return 0
+        ;;
+    esac
+  done < "/proc/$pid/cmdline"
+  return 1
+}
+
 socket_processes() {
   local slug="$1"
   local expected process pid
   expected="$(socket_dir "$slug")"
   for process in /proc/[0-9]*; do
     pid="${process##*/}"
-    process_has_argument "$pid" "$expected" && printf '%s\n' "$pid"
+    process_references_path "$pid" "$expected" && printf '%s\n' "$pid"
   done
 }
 
@@ -49,7 +64,7 @@ kill_socket_processes() {
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" = "$$" ] && continue
-    process_has_argument "$pid" "$expected" || continue
+    process_references_path "$pid" "$expected" || continue
     kill -TERM "$pid" 2>/dev/null || true
   done < <(socket_processes "$slug")
 
@@ -58,7 +73,7 @@ kill_socket_processes() {
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" = "$$" ] && continue
-    process_has_argument "$pid" "$expected" || continue
+    process_references_path "$pid" "$expected" || continue
     kill -KILL "$pid" 2>/dev/null || true
   done < <(socket_processes "$slug")
 }
