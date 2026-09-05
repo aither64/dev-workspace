@@ -175,7 +175,9 @@ func TestReleaseDeadlineKillsAHelperBlockedOnFlock(t *testing.T) {
 
 	pidFile := filepath.Join(t.TempDir(), "flock.pid")
 	helper := filepath.Join(t.TempDir(), "helper")
-	script := "#!/bin/sh\nflock \"$LOCK_PATH\" sh -c 'sleep 30' &\nprintf '%s\\n' \"$!\" > \"$PID_FILE\"\nwait\n"
+	script := "#!/bin/sh\nflock \"$LOCK_PATH\" sh -c 'sleep 30' &\n" +
+		"printf '%s\\n' \"$!\" > \"$PID_FILE.tmp\"\n" +
+		"mv \"$PID_FILE.tmp\" \"$PID_FILE\"\nwait\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
