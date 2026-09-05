@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
@@ -51,13 +55,13 @@ func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
 func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	workspace := t.TempDir()
 	vpsadmin := statusHelper(t, `{
-		"schema":1,"found":true,"kind":"vpsadmin","label":"vpsAdmin",
+		"schema":1,"found":true,"kind":"vpsadmin",
 		"state":"stale","ready":true,"topology":"single","network":"local",
 		"links":[{"label":"Web UI","url":"https://webui.example.test:10443/"}],
 		"commands":[{"label":"services","value":"vpsadmin-devcluster ssh example services"}],
 		"credentials":[{"label":"Admin login","value":"test-admin"}]
 	}`)
-	vpsadminOS := statusHelper(t, `{"schema":1,"found":false,"kind":"vpsadminos","label":"vpsAdminOS"}`)
+	vpsadminOS := statusHelper(t, `{"schema":1,"found":false,"kind":"vpsadminos"}`)
 
 	statuses, err := (Runner{Workspace: workspace, Vpsadmin: vpsadmin, VpsadminOS: vpsadminOS}).Inspect("example")
 	if err != nil {
@@ -65,6 +69,9 @@ func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	}
 	if len(statuses) != 1 || statuses[0].Kind != "vpsadmin" || statuses[0].State != "stale" {
 		t.Fatalf("statuses = %#v", statuses)
+	}
+	if statuses[0].Label != "vpsAdmin" {
+		t.Fatalf("status label = %q", statuses[0].Label)
 	}
 	if len(statuses[0].Links) != 1 || statuses[0].Links[0].URL != "https://webui.example.test:10443/" {
 		t.Fatalf("links = %#v", statuses[0].Links)
@@ -97,7 +104,9 @@ func TestInspectRejectsIncompatibleOrInvalidHelperStatus(t *testing.T) {
 	}{
 		{"schema", `{"schema":2,"found":true,"kind":"vpsadmin"}`, "incompatible"},
 		{"kind", `{"schema":1,"found":true,"kind":"vpsadminos"}`, "incompatible"},
-		{"state", `{"schema":1,"found":true,"kind":"vpsadmin","label":"vpsAdmin","state":"broken"}`, "invalid status"},
+		{"state", `{"schema":1,"found":true,"kind":"vpsadmin","state":"broken"}`, "invalid status"},
+		{"label", `{"schema":1,"found":true,"kind":"vpsadmin","label":"helper label","state":"stopped"}`, "invalid status"},
+		{"not-found-label", `{"schema":1,"found":false,"kind":"vpsadmin","label":"helper label"}`, "invalid status"},
 		{"unknown-field", `{"schema":1,"found":false,"kind":"vpsadmin","extra":true}`, "unknown field"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -130,6 +139,105 @@ func TestReleaseUsesConfiguredHelperAndWorkspace(t *testing.T) {
 	if string(data) != "reset\n2026-09-04-test\n"+workspace+"\n" {
 		t.Fatalf("release invocation = %q", data)
 	}
+}
+
+func TestReleaseAllInvokesEveryProviderWithoutAStatusSnapshot(t *testing.T) {
+	workspace := t.TempDir()
+	output := t.TempDir()
+	vpsadmin := releaseHelper(t, filepath.Join(output, "vpsadmin"))
+	vpsadminOS := releaseHelper(t, filepath.Join(output, "vpsadminos"))
+	runner := Runner{Workspace: workspace, Vpsadmin: vpsadmin, VpsadminOS: vpsadminOS}
+	if err := runner.ReleaseAll(context.Background(), "2026-09-05-archive"); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"vpsadmin", "vpsadminos"} {
+		data, err := os.ReadFile(filepath.Join(output, kind))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "reset\n2026-09-05-archive\n"+workspace+"\n" {
+			t.Fatalf("%s release invocation = %q", kind, data)
+		}
+	}
+}
+
+func TestReleaseDeadlineKillsAHelperBlockedOnFlock(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "held.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	pidFile := filepath.Join(t.TempDir(), "flock.pid")
+	helper := filepath.Join(t.TempDir(), "helper")
+	script := "#!/bin/sh\nflock \"$LOCK_PATH\" sh -c 'sleep 30' &\nprintf '%s\\n' \"$!\" > \"$PID_FILE\"\nwait\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOCK_PATH", lockPath)
+	t.Setenv("PID_FILE", pidFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workspace := t.TempDir()
+	result := make(chan error, 1)
+	go func() {
+		result <- (Runner{Workspace: workspace, Vpsadmin: helper}).Release(ctx, "vpsadmin", "example")
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(pidFile); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not publish its flock PID")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("release did not return after cancellation")
+	}
+	if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("release result = %v, want cancellation", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("release exceeded its bounded cancellation window: %s", elapsed)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exitDeadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(pid, 0) == nil && time.Now().Before(exitDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if syscall.Kill(pid, 0) == nil {
+		t.Fatalf("flock descendant %d survived cancellation", pid)
+	}
+}
+
+func releaseHelper(t *testing.T, output string) string {
+	t.Helper()
+	helper := filepath.Join(t.TempDir(), "helper")
+	script := "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$VPSFREE_DEVCLUSTER_WORKSPACE\" > \"" + output + "\"\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return helper
 }
 
 func statusHelper(t *testing.T, payload string) string {

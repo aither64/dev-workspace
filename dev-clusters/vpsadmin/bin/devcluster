@@ -1009,7 +1009,7 @@ status_cluster() {
   [ -n "$slug" ] || die "missing slug"
 
   if [ "${2:-}" = "--json" ]; then
-    devcluster_status_json vpsadmin vpsAdmin "$slug" vpsadmin-devcluster true
+    devcluster_status_json vpsadmin "$slug" vpsadmin-devcluster true
     return
   fi
 

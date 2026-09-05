@@ -747,17 +747,11 @@ func (s *Server) archiveStatus(w http.ResponseWriter, slug string) {
 }
 
 func (s *Server) archiveSession(slug string) error {
-	clusters, err := s.clusters.Inspect(slug)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	err := s.clusters.ReleaseAll(ctx, slug)
+	cancel()
 	if err != nil {
 		return err
-	}
-	for _, developmentCluster := range clusters {
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-		err := s.clusters.Release(ctx, developmentCluster.Kind, slug)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("release %s cluster: %w", developmentCluster.Label, err)
-		}
 	}
 	summary, err := session.Find(s.config.Workspace, slug)
 	if err != nil {

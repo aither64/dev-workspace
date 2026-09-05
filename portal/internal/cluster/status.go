@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/processgroup"
 )
 
 type Link struct {
@@ -47,16 +49,29 @@ type Runner struct {
 	VpsadminOS string
 }
 
+type provider struct {
+	name   string
+	label  string
+	helper string
+}
+
+func (r Runner) providers() []provider {
+	return []provider{
+		{name: "vpsadmin", label: "vpsAdmin", helper: r.Vpsadmin},
+		{name: "vpsadminos", label: "vpsAdminOS", helper: r.VpsadminOS},
+	}
+}
+
 func (r Runner) Inspect(slug string) ([]Status, error) {
 	if !validSlug(slug) {
 		return nil, errors.New("invalid session slug")
 	}
 	var statuses []Status
 	var problems []error
-	for _, kind := range []string{"vpsadmin", "vpsadminos"} {
-		status, found, err := r.inspectKind(kind, slug)
+	for _, provider := range r.providers() {
+		status, found, err := r.inspectProvider(provider, slug)
 		if err != nil {
-			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", kind, err))
+			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.name, err))
 			continue
 		}
 		if found {
@@ -66,25 +81,38 @@ func (r Runner) Inspect(slug string) ([]Status, error) {
 	return statuses, errors.Join(problems...)
 }
 
+// ReleaseAll invokes every provider unconditionally. Each helper serializes
+// reset with starts for the same session, so this is also the archive barrier:
+// a cluster cannot appear between a one-time status snapshot and finalization.
+func (r Runner) ReleaseAll(ctx context.Context, slug string) error {
+	var problems []error
+	for _, provider := range r.providers() {
+		if err := r.releaseProvider(ctx, provider, slug); err != nil {
+			problems = append(problems, fmt.Errorf("release %s cluster: %w", provider.label, err))
+		}
+	}
+	return errors.Join(problems...)
+}
+
 func (r Runner) Release(ctx context.Context, kind, slug string) error {
 	if !validSlug(slug) {
 		return errors.New("invalid session slug")
 	}
-	var helper string
-	switch kind {
-	case "vpsadmin":
-		helper = r.Vpsadmin
-	case "vpsadminos":
-		helper = r.VpsadminOS
-	default:
-		return errors.New("unknown development cluster")
+	for _, provider := range r.providers() {
+		if provider.name == kind {
+			return r.releaseProvider(ctx, provider, slug)
+		}
 	}
-	if helper == "" || !filepath.IsAbs(helper) {
+	return errors.New("unknown development cluster")
+}
+
+func (r Runner) releaseProvider(ctx context.Context, provider provider, slug string) error {
+	if provider.helper == "" || !filepath.IsAbs(provider.helper) {
 		return errors.New("development cluster helper is unavailable")
 	}
-	command := exec.CommandContext(ctx, helper, "reset", slug)
+	command := exec.Command(provider.helper, "reset", slug)
 	command.Env = append(os.Environ(), "VPSFREE_DEVCLUSTER_WORKSPACE="+r.Workspace)
-	output, err := command.CombinedOutput()
+	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message == "" {
@@ -95,22 +123,18 @@ func (r Runner) Release(ctx context.Context, kind, slug string) error {
 	return nil
 }
 
-func (r Runner) inspectKind(kind, slug string) (Status, bool, error) {
-	helper := r.Vpsadmin
-	if kind == "vpsadminos" {
-		helper = r.VpsadminOS
-	}
-	if helper == "" {
+func (r Runner) inspectProvider(provider provider, slug string) (Status, bool, error) {
+	if provider.helper == "" {
 		return Status{}, false, nil
 	}
-	if !filepath.IsAbs(helper) {
+	if !filepath.IsAbs(provider.helper) {
 		return Status{}, false, errors.New("development cluster helper is not absolute")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, helper, "status", slug, "--json")
+	command := exec.Command(provider.helper, "status", slug, "--json")
 	command.Env = append(os.Environ(), "VPSFREE_DEVCLUSTER_WORKSPACE="+r.Workspace)
-	output, err := command.CombinedOutput()
+	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message == "" {
@@ -131,15 +155,19 @@ func (r Runner) inspectKind(kind, slug string) (Status, bool, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Status{}, false, errors.New("development cluster helper returned trailing output")
 	}
-	if response.Schema != 1 || response.Kind != kind {
+	if response.Schema != 1 || response.Kind != provider.name {
 		return Status{}, false, errors.New("development cluster helper returned an incompatible status")
+	}
+	if response.Label != "" {
+		return Status{}, false, errors.New("development cluster helper returned an invalid status")
 	}
 	if !response.Found {
 		return Status{}, false, nil
 	}
-	if response.Label == "" || (response.State != "running" && response.State != "stopped" && response.State != "stale") {
+	if response.State != "running" && response.State != "stopped" && response.State != "stale" {
 		return Status{}, false, errors.New("development cluster helper returned an invalid status")
 	}
+	response.Label = provider.label
 	return response.Status, true, nil
 }
 

@@ -364,17 +364,15 @@ devcluster_read_small_file() {
 
 devcluster_status_json() {
   local kind="$1"
-  local label="$2"
-  local slug="$3"
-  local ssh_command="$4"
-  local include_services="$5"
+  local slug="$2"
+  local ssh_command="$3"
+  local include_services="$4"
   local directory topology network ready running state pid_text config_path credentials links
 
   devcluster_validate_state_ancestors false || true
   directory="$(cluster_dir "$slug")"
   if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
-    jq -n --arg kind "$kind" --arg label "$label" \
-      '{schema: 1, found: false, kind: $kind, label: $label}'
+    jq -n --arg kind "$kind" '{schema: 1, found: false, kind: $kind}'
     return
   fi
   [ ! -L "$directory" ] && [ -d "$directory" ] || die "unsafe cluster state directory"
@@ -417,7 +415,6 @@ devcluster_status_json() {
 
   jq -n \
     --arg kind "$kind" \
-    --arg label "$label" \
     --arg slug "$slug" \
     --arg state "$state" \
     --arg topology "$topology" \
@@ -438,7 +435,6 @@ devcluster_status_json() {
         schema: 1,
         found: true,
         kind: $kind,
-        label: $label,
         state: $state,
         ready: $ready,
         topology: $topology,
