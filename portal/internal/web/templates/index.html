@@ -19,7 +19,7 @@
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
         <div class="field-grid">
-          <label>Model<select name="model" data-model-select><option value="">System default</option></select></label>
+          <label>Model<select name="model" data-model-select><option value="">GPT-6 Astra (default)</option></select></label>
           <label>Reasoning effort<select name="effort" data-effort-select><option value="">Automatic</option></select></label>
         </div>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
@@ -32,7 +32,7 @@
       <div class="session-grid">
         {{range .Active}}
           <a class="session-card" href="/{{.Slug}}/">
-            <span class="status-dot {{if not .Closed}}active{{end}}"></span>
+            <span class="status-dot active"></span>
             <strong>{{.Slug}}</strong>
             <span class="muted">Updated {{timeAgo .UpdatedAt}}</span>
             <span>{{len .Repositories}} repositories</span>

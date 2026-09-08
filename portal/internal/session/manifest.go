@@ -22,6 +22,7 @@ import (
 const (
 	ManifestName    = "portal.yml"
 	manifestMaxSize = 1024 * 1024
+	TrackingMaxSize = 8 * 1024 * 1024
 )
 
 var slugPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -45,6 +46,9 @@ type Creation struct {
 	InitialGoalSent      bool   `yaml:"initial_goal_sent,omitempty" json:"initialGoalSent,omitempty"`
 	InitialGoalAttempted *bool  `yaml:"initial_goal_attempted,omitempty" json:"initialGoalAttempted,omitempty"`
 	GoalSHA256           string `yaml:"goal_sha256,omitempty" json:"goalSha256,omitempty"`
+	TrackingOrigin       string `yaml:"tracking_origin,omitempty" json:"-"`
+	TrackingPlanSHA256   string `yaml:"tracking_plan_sha256,omitempty" json:"-"`
+	TrackingStateSHA256  string `yaml:"tracking_state_sha256,omitempty" json:"-"`
 }
 
 type Tmux struct {
@@ -69,6 +73,18 @@ type Artifact struct {
 	Path  string `yaml:"path" json:"path"`
 }
 
+var builtInArtifacts = []Artifact{
+	{Label: "Plan", Path: "plan.md"},
+	{Label: "State", Path: "state.md"},
+}
+
+// AvailableArtifacts returns the complete portal artifact catalog. Plan and
+// state are built in; the manifest only declares additional curated files.
+func AvailableArtifacts(summary *Summary) []Artifact {
+	artifacts := append([]Artifact(nil), builtInArtifacts...)
+	return append(artifacts, summary.Artifacts...)
+}
+
 type Manifest struct {
 	Schema       int          `yaml:"schema" json:"schema"`
 	Slug         string       `yaml:"slug" json:"slug"`
@@ -84,7 +100,7 @@ type Summary struct {
 	Manifest
 	Tmux              Tmux      `json:"tmux"`
 	Archived          bool      `json:"archived"`
-	Closed            bool      `json:"closed"`
+	Terminal          bool      `json:"terminal"`
 	Interactive       bool      `json:"interactive"`
 	PersistedThread   bool      `json:"-"`
 	Lifecycle         string    `json:"lifecycle"`
@@ -120,6 +136,23 @@ func (m *Manifest) Validate(expectedSlug string) error {
 	}
 	if m.Creation.GoalSHA256 != "" && !sha256Pattern.MatchString(m.Creation.GoalSHA256) {
 		return errors.New("invalid creation goal digest")
+	}
+	trackingFields := []string{
+		m.Creation.TrackingOrigin,
+		m.Creation.TrackingPlanSHA256,
+		m.Creation.TrackingStateSHA256,
+	}
+	trackingPresent := 0
+	for _, value := range trackingFields {
+		if value != "" {
+			trackingPresent++
+		}
+	}
+	if trackingPresent != 0 && (trackingPresent != len(trackingFields) ||
+		(m.Creation.TrackingOrigin != "revived" && m.Creation.TrackingOrigin != "retained") ||
+		!sha256Pattern.MatchString(m.Creation.TrackingPlanSHA256) ||
+		!sha256Pattern.MatchString(m.Creation.TrackingStateSHA256)) {
+		return errors.New("invalid preserved tracking provenance")
 	}
 	if m.Schema == 1 && m.Creation.InitialGoalAttempted != nil {
 		return errors.New("schema 1 must not contain an initial goal attempt marker")
@@ -173,6 +206,11 @@ func (m *Manifest) Validate(expectedSlug string) error {
 		}
 		if _, ok := seenArtifacts[clean]; ok {
 			return fmt.Errorf("duplicate artifact path %q", clean)
+		}
+		for _, builtIn := range builtInArtifacts {
+			if clean == builtIn.Path {
+				return fmt.Errorf("artifact path %q is built in", clean)
+			}
 		}
 		seenArtifacts[clean] = struct{}{}
 	}
@@ -267,28 +305,12 @@ func List(workspace string) ([]Summary, error) {
 		if summaries[i].Archived != summaries[j].Archived {
 			return !summaries[i].Archived
 		}
-		leftDate := slugDate(summaries[i].Slug)
-		rightDate := slugDate(summaries[j].Slug)
-		if !leftDate.Equal(rightDate) {
-			return leftDate.After(rightDate)
-		}
 		if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
 			return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
 		}
 		return summaries[i].Slug < summaries[j].Slug
 	})
 	return summaries, errors.Join(problems...)
-}
-
-func slugDate(slug string) time.Time {
-	if len(slug) < len(time.DateOnly)+1 || slug[len(time.DateOnly)] != '-' {
-		return time.Time{}
-	}
-	value, err := time.Parse(time.DateOnly, slug[:len(time.DateOnly)])
-	if err != nil {
-		return time.Time{}
-	}
-	return value
 }
 
 func Find(workspace, slug string) (*Summary, error) {
@@ -361,7 +383,6 @@ func loadSummary(workspace, root, slug string, archived bool) (*Summary, error) 
 	if !archived && lifecycle == "active" && manifest.FinalizedAt != "" {
 		return nil, fmt.Errorf("validate %s: active session contains finalization metadata", relative)
 	}
-	closed := terminal
 	updatedAt := info.ModTime()
 	if stateUpdatedAt.After(updatedAt) {
 		updatedAt = stateUpdatedAt
@@ -370,10 +391,13 @@ func loadSummary(workspace, root, slug string, archived bool) (*Summary, error) 
 		updatedAt = planUpdatedAt
 	}
 	if manifest.FinalizedAt != "" {
-		updatedAt, _ = time.Parse(time.RFC3339, manifest.FinalizedAt)
+		finalizedAt, _ := time.Parse(time.RFC3339, manifest.FinalizedAt)
+		if archived || finalizedAt.After(updatedAt) {
+			updatedAt = finalizedAt
+		}
 	}
 	return &Summary{
-		Manifest: manifest, Archived: archived, Closed: closed, Interactive: false,
+		Manifest: manifest, Archived: archived, Terminal: terminal, Interactive: false,
 		PersistedThread: manifest.Codex.ThreadID != "",
 		Lifecycle:       lifecycle, UpdatedAt: updatedAt, ManifestUpdatedAt: info.ModTime(),
 		Workspace: workspace, Root: root,
@@ -391,15 +415,15 @@ func loadLifecycle(workspace, root, slug string) (string, time.Time, error) {
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > manifestMaxSize {
-		return "", time.Time{}, errors.New("state file is not a regular file of at most 1 MiB")
+	if !info.Mode().IsRegular() || info.Size() > TrackingMaxSize {
+		return "", time.Time{}, errors.New("state file is not a regular file of at most 8 MiB")
 	}
-	data, err := io.ReadAll(io.LimitReader(file, manifestMaxSize+1))
+	data, err := io.ReadAll(io.LimitReader(file, TrackingMaxSize+1))
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	if len(data) > manifestMaxSize {
-		return "", time.Time{}, errors.New("state file exceeds 1 MiB")
+	if len(data) > TrackingMaxSize {
+		return "", time.Time{}, errors.New("state file exceeds 8 MiB")
 	}
 	if !utf8.Valid(data) {
 		return "", time.Time{}, errors.New("state file is not valid UTF-8")
@@ -421,8 +445,8 @@ func trackingModTime(workspace, root, slug, name string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > manifestMaxSize {
-		return time.Time{}, fmt.Errorf("%s is not a regular file of at most 1 MiB", name)
+	if !info.Mode().IsRegular() || info.Size() > TrackingMaxSize {
+		return time.Time{}, fmt.Errorf("%s is not a regular file of at most 8 MiB", name)
 	}
 	return info.ModTime(), nil
 }
@@ -492,7 +516,10 @@ func validateManifestNode(root *yaml.Node) error {
 	if node := fields["creation"]; node != nil {
 		items, err := strictMapping(
 			node,
-			[]string{"state", "initial_goal_sent", "initial_goal_attempted", "goal_sha256"},
+			[]string{
+				"state", "initial_goal_sent", "initial_goal_attempted", "goal_sha256",
+				"tracking_origin", "tracking_plan_sha256", "tracking_state_sha256",
+			},
 			nil,
 		)
 		if err != nil {
@@ -514,11 +541,15 @@ func validateManifestNode(root *yaml.Node) error {
 				return fmt.Errorf("creation: %w", err)
 			}
 		}
-		if err := optionalString(items, "goal_sha256"); err != nil {
-			return fmt.Errorf("creation: %w", err)
-		}
-		if value := items["goal_sha256"]; value != nil && value.Value == "" {
-			return errors.New("creation: goal_sha256 must not be empty")
+		for _, key := range []string{
+			"goal_sha256", "tracking_origin", "tracking_plan_sha256", "tracking_state_sha256",
+		} {
+			if err := optionalString(items, key); err != nil {
+				return fmt.Errorf("creation: %w", err)
+			}
+			if value := items[key]; value != nil && value.Value == "" {
+				return fmt.Errorf("creation: %s must not be empty", key)
+			}
 		}
 	}
 	if node := fields["repositories"]; node != nil {
@@ -639,13 +670,11 @@ func scalarTag(node *yaml.Node, tag, name string) error {
 }
 
 func OpenArtifact(summary *Summary, artifactPath string, maxSize int64) (*os.File, os.FileInfo, error) {
-	allowed := artifactPath == "plan.md" || artifactPath == "state.md"
-	if !allowed {
-		for _, artifact := range summary.Artifacts {
-			if filepath.Clean(artifact.Path) == filepath.Clean(artifactPath) {
-				allowed = true
-				break
-			}
+	allowed := false
+	for _, artifact := range AvailableArtifacts(summary) {
+		if filepath.Clean(artifact.Path) == filepath.Clean(artifactPath) {
+			allowed = true
+			break
 		}
 	}
 	if !allowed {

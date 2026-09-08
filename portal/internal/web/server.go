@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,21 +30,36 @@ import (
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed templates/*.html static/*
 var assets embed.FS
 
+var queueClientMessageIDPattern = regexp.MustCompile(
+	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
+)
+
 type codexController interface {
 	VerifyThread(context.Context, string, string) error
 	ReadThread(context.Context, string) (codex.Transcript, error)
+	ListThreadActivity(context.Context) ([]codex.ThreadActivity, error)
 	ListModels(context.Context) ([]codex.Model, error)
-	UpdateThreadSettings(context.Context, string, string, codex.ThreadSettings) (codex.ThreadSettings, error)
-	Send(context.Context, string, string) error
+	ListCollaborationModes(context.Context) ([]codex.CollaborationMode, error)
+	UpdateThreadSettings(context.Context, string, codex.ThreadSettingsUpdate) (codex.ThreadSettings, error)
+	Send(context.Context, string, string, string, string) (codex.SendReceipt, error)
+	PrepareSend(string, string, string, string, bool) error
+	SendAttempted(context.Context, string, string, string, string) (bool, error)
+	ListQueue(context.Context, string) ([]codex.QueueEntry, error)
+	Queue(context.Context, string, string, string) (codex.QueueEntry, error)
+	DeleteQueueEntry(context.Context, string, string) error
+	StartQueue(context.Context, string, string) error
 	Interrupt(context.Context, string) error
 	Subscribe(context.Context, string) (<-chan struct{}, func(), error)
 	PromptsWithItems(context.Context, string) ([]codex.Prompt, error)
 	RespondAnswers(context.Context, string, string, map[string]map[string][]string) error
+	SnoozeUserInput(string, string) error
 	RespondDecision(context.Context, string, string, string) error
 }
 
@@ -52,6 +70,7 @@ type Config struct {
 	GH                string
 	Tmux              string
 	AuthorityDir      string
+	TransitionLock    string
 	CodexSocket       string
 	CodexVersion      string
 	VpsadminCluster   string
@@ -66,51 +85,51 @@ type cachedRepositories struct {
 	statuses []repository.Status
 	created  time.Time
 	updated  time.Time
-	closed   bool
+	terminal bool
 	archived bool
 }
 
-type archiveOperation struct {
-	State string `json:"state"`
-	Error string `json:"error,omitempty"`
+type lifecycleOperation struct {
+	Kind     string `json:"kind,omitempty"`
+	State    string `json:"state"`
+	Error    string `json:"error,omitempty"`
+	Redirect string `json:"redirect,omitempty"`
 }
 
 type Server struct {
-	config          Config
-	templates       *template.Template
-	markdown        goldmark.Markdown
-	sanitizer       *bluemonday.Policy
-	repository      repository.Runner
-	repositoryMu    sync.Mutex
-	repositoryCache map[string]cachedRepositories
-	messageMu       sync.Mutex
-	messageLocks    map[string]*sync.Mutex
-	clusters        cluster.Runner
-	operationMu     sync.Mutex
-	operations      map[string]archiveOperation
-	workspaceGitMu  sync.Mutex
-	archiveContext  context.Context
-	cancelArchives  context.CancelFunc
-	archiveWG       sync.WaitGroup
-	closing         bool
-	stopOnce        sync.Once
-	stopping        chan struct{}
+	config           Config
+	templates        *template.Template
+	markdown         goldmark.Markdown
+	sanitizer        *bluemonday.Policy
+	repository       repository.Runner
+	repositoryMu     sync.Mutex
+	repositoryCache  map[string]cachedRepositories
+	messageMu        sync.Mutex
+	messageLocks     map[string]*sync.Mutex
+	clusters         cluster.Runner
+	operationMu      sync.Mutex
+	operations       map[string]lifecycleOperation
+	operationContext context.Context
+	cancelOperations context.CancelFunc
+	operationWG      sync.WaitGroup
+	closing          bool
+	stopOnce         sync.Once
+	stopping         chan struct{}
 }
 
 type pageData struct {
-	BaseURL         string
-	CreationDate    string
-	MaxMessageBytes int
-	Error           string
-	Active          []session.Summary
-	Archived        []session.Summary
-	Session         *session.Summary
-	Repositories    []repository.Status
-	Clusters        []cluster.Status
-	ClusterCounts   map[string]int
-	ArchivePending  bool
-	Plan            template.HTML
-	State           template.HTML
+	BaseURL          string
+	CreationDate     string
+	MaxMessageBytes  int
+	Error            string
+	Active           []session.Summary
+	Archived         []session.Summary
+	Session          *session.Summary
+	Repositories     []repository.Status
+	Clusters         []cluster.Status
+	ClusterCounts    map[string]int
+	Artifacts        []session.Artifact
+	PendingLifecycle string
 }
 
 func New(config Config) (*Server, error) {
@@ -160,18 +179,18 @@ func New(config Config) (*Server, error) {
 	policy := bluemonday.UGCPolicy()
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
-	archiveContext, cancelArchives := context.WithCancel(context.Background())
+	operationContext, cancelOperations := context.WithCancel(context.Background())
 	return &Server{
 		config: config, templates: templates,
-		markdown: goldmark.New(), sanitizer: policy,
-		repository:      repository.Runner{GH: config.GH},
-		clusters:        cluster.Runner{Workspace: workspace, Vpsadmin: config.VpsadminCluster, VpsadminOS: config.VpsadminOSCluster},
-		repositoryCache: make(map[string]cachedRepositories),
-		messageLocks:    make(map[string]*sync.Mutex),
-		operations:      make(map[string]archiveOperation),
-		archiveContext:  archiveContext,
-		cancelArchives:  cancelArchives,
-		stopping:        make(chan struct{}),
+		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
+		repository:       repository.Runner{GH: config.GH},
+		clusters:         cluster.Runner{Workspace: workspace, Vpsadmin: config.VpsadminCluster, VpsadminOS: config.VpsadminOSCluster},
+		repositoryCache:  make(map[string]cachedRepositories),
+		messageLocks:     make(map[string]*sync.Mutex),
+		operations:       make(map[string]lifecycleOperation),
+		operationContext: operationContext,
+		cancelOperations: cancelOperations,
+		stopping:         make(chan struct{}),
 	}, nil
 }
 
@@ -180,9 +199,9 @@ func (s *Server) Close() {
 		s.operationMu.Lock()
 		s.closing = true
 		close(s.stopping)
-		s.cancelArchives()
+		s.cancelOperations()
 		s.operationMu.Unlock()
-		s.archiveWG.Wait()
+		s.operationWG.Wait()
 	})
 }
 
@@ -196,10 +215,18 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
 		if !s.validMutation(r) {
 			s.writeError(w, r, http.StatusForbidden, "request origin is invalid")
 			return
+		}
+		if !lifecycleMutationRequest(r) {
+			unlock, err := s.lockTransition()
+			if err != nil {
+				s.writeError(w, r, http.StatusServiceUnavailable, "workspace runtime is changing; retry shortly")
+				return
+			}
+			defer unlock()
 		}
 	}
 	switch {
@@ -209,8 +236,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.createSession(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/models":
 		s.models(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
+		s.collaborationModes(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifacts/"):
 		s.artifact(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifact-previews/"):
+		s.artifactImage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/sessions/"):
 		s.sessionAPI(w, r)
 	case r.Method == http.MethodGet && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 0:
@@ -218,6 +249,42 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func lifecycleMutationRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/sessions/") {
+		return false
+	}
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	return strings.HasSuffix(path, "/archive") || strings.HasSuffix(path, "/delete") ||
+		strings.HasSuffix(path, "/revive")
+}
+
+func (s *Server) lockTransition() (func(), error) {
+	return s.lockTransitionMode(unix.LOCK_SH)
+}
+
+func (s *Server) lockTransitionMode(mode int) (func(), error) {
+	_, unlock, err := s.acquireTransition(mode)
+	return unlock, err
+}
+
+func (s *Server) acquireTransition(mode int) (*os.File, func(), error) {
+	if s.config.TransitionLock == "" {
+		return nil, func() {}, nil
+	}
+	file, err := os.OpenFile(s.config.TransitionLock, os.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := unix.Flock(int(file.Fd()), mode); err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	return file, func() {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		_ = file.Close()
+	}, nil
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -277,6 +344,33 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 			data.Active = append(data.Active, summary)
 		}
 	}
+	if s.config.Codex != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		activities, activityErr := s.config.Codex.ListThreadActivity(ctx)
+		cancel()
+		if activityErr != nil {
+			s.config.Logger.Printf("load Codex session activity: %v", activityErr)
+		} else {
+			activityByIdentity := make(map[string]time.Time, len(activities))
+			for _, activity := range activities {
+				activityByIdentity[activity.ID+"\x00"+activity.Cwd] = activity.UpdatedAt
+			}
+			for index := range data.Active {
+				summary := &data.Active[index]
+				expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
+				updated := activityByIdentity[summary.Codex.ThreadID+"\x00"+expectedCwd]
+				if updated.After(summary.UpdatedAt) {
+					summary.UpdatedAt = updated
+				}
+			}
+		}
+	}
+	sort.SliceStable(data.Active, func(i, j int) bool {
+		if !data.Active[i].UpdatedAt.Equal(data.Active[j].UpdatedAt) {
+			return data.Active[i].UpdatedAt.After(data.Active[j].UpdatedAt)
+		}
+		return data.Active[i].Slug < data.Active[j].Slug
+	})
 	s.render(w, "index", data)
 }
 
@@ -306,8 +400,15 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		BaseURL: s.config.BaseURL, Session: summary,
 		CreationDate: time.Now().Format(time.DateOnly), MaxMessageBytes: session.MaxMessageBytes,
 	}
+	data.PendingLifecycle, err = session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if err != nil {
+		data.Error = "Session lifecycle state is unsafe: " + err.Error()
+	}
 	if discoveryErr != nil {
-		data.Error = "Some live worktrees could not be verified: " + discoveryErr.Error()
+		if data.Error != "" {
+			data.Error += "; "
+		}
+		data.Error += "Some live worktrees could not be verified: " + discoveryErr.Error()
 	}
 	data.Repositories = s.repositories(r.Context(), summary)
 	data.Clusters, err = s.clusters.Inspect(summary.Slug)
@@ -317,34 +418,14 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		}
 		data.Error += "Some development cluster details are unavailable: " + err.Error()
 	}
-	data.ArchivePending = !summary.Archived && summary.Closed
-	if summary.Archived {
-		data.ArchivePending = s.archiveIncomplete(summary.Slug)
-	}
-	data.Plan = s.renderMarkdown(summary, "plan.md")
-	data.State = s.renderMarkdown(summary, "state.md")
+	data.Artifacts = session.AvailableArtifacts(summary)
 	s.render(w, "session", data)
-}
-
-func (s *Server) archiveIncomplete(slug string) bool {
-	if s.config.AuthorityDir != "" {
-		if info, err := os.Lstat(filepath.Join(s.config.AuthorityDir, slug+".json")); err == nil &&
-			info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
-			return true
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	paths := []string{filepath.Join("work", slug), filepath.Join("archive", slug)}
-	args := append([]string{"-C", s.config.Workspace, "status", "--porcelain=v1", "--"}, paths...)
-	output, err := exec.CommandContext(ctx, "git", args...).Output()
-	return err == nil && len(bytes.TrimSpace(output)) > 0
 }
 
 func (s *Server) repositories(ctx context.Context, summary *session.Summary) []repository.Status {
 	s.repositoryMu.Lock()
 	if cached, ok := s.repositoryCache[summary.Slug]; summary.Archived && ok && time.Since(cached.created) < time.Minute &&
-		cached.updated.Equal(summary.ManifestUpdatedAt) && cached.closed == summary.Closed && cached.archived == summary.Archived {
+		cached.updated.Equal(summary.ManifestUpdatedAt) && cached.terminal == summary.Terminal && cached.archived == summary.Archived {
 		result := append([]repository.Status(nil), cached.statuses...)
 		s.repositoryMu.Unlock()
 		return result
@@ -352,11 +433,11 @@ func (s *Server) repositories(ctx context.Context, summary *session.Summary) []r
 	s.repositoryMu.Unlock()
 	inspectionContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	statuses := s.repository.Inspect(inspectionContext, summary.Repositories, summary.Closed)
+	statuses := s.repository.Inspect(inspectionContext, summary.Repositories, summary.Archived)
 	s.repositoryMu.Lock()
 	s.repositoryCache[summary.Slug] = cachedRepositories{
 		statuses: append([]repository.Status(nil), statuses...), created: time.Now(),
-		updated: summary.ManifestUpdatedAt, closed: summary.Closed, archived: summary.Archived,
+		updated: summary.ManifestUpdatedAt, terminal: summary.Terminal, archived: summary.Archived,
 	}
 	s.repositoryMu.Unlock()
 	return statuses
@@ -423,7 +504,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// Creation is journaled by dev-session and must be allowed to finish even if
 	// the browser disconnects while waiting for the response.
-	stdout, stderr, err := s.runDevSession(2*time.Minute, args...)
+	stdout, stderr, err := s.runDevSession(context.Background(), 2*time.Minute, args...)
 	if err != nil {
 		message := strings.TrimSpace(stderr)
 		if message == "" {
@@ -450,14 +531,27 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/"+result.Slug+"/", http.StatusSeeOther)
 }
 
-func (s *Server) runDevSession(timeout time.Duration, args ...string) (string, string, error) {
-	return s.runDevSessionContext(context.Background(), timeout, args...)
-}
-
-func (s *Server) runDevSessionContext(parent context.Context, timeout time.Duration, args ...string) (string, string, error) {
+func (s *Server) runDevSession(parent context.Context, timeout time.Duration, args ...string) (string, string, error) {
 	commandCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	command := exec.Command(s.config.DevSession, args...)
+	return runDevSessionCommand(commandCtx, command)
+}
+
+func (s *Server) runDevSessionWithTransition(
+	parent context.Context, timeout time.Duration, transition *os.File, args ...string,
+) (string, string, error) {
+	commandCtx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	command := exec.Command(s.config.DevSession, args...)
+	if transition != nil {
+		command.ExtraFiles = []*os.File{transition}
+		command.Env = append(os.Environ(), "VPSFREE_WORKSPACE_TRANSITION_LOCK_FD=3")
+	}
+	return runDevSessionCommand(commandCtx, command)
+}
+
+func runDevSessionCommand(commandCtx context.Context, command *exec.Cmd) (string, string, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -481,7 +575,51 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if models == nil {
 		models = []codex.Model{}
 	}
+	for index := range models {
+		models[index].IsDefault = models[index].Model == codex.DefaultNewThreadModel
+	}
 	s.writeJSON(w, http.StatusOK, models)
+}
+
+func (s *Server) collaborationModes(w http.ResponseWriter, r *http.Request) {
+	if s.config.Codex == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "Codex collaboration modes are unavailable",
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	modes, err := s.config.Codex.ListCollaborationModes(ctx)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if modes == nil {
+		modes = []codex.CollaborationMode{}
+	}
+	s.writeJSON(w, http.StatusOK, modes)
+}
+
+func (s *Server) validateCollaborationMode(ctx context.Context, requested string) error {
+	if requested == "" {
+		return nil
+	}
+	if s.config.Codex == nil {
+		return errors.New("Codex collaboration modes are unavailable")
+	}
+	lookupContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	modes, err := s.config.Codex.ListCollaborationModes(lookupContext)
+	if err != nil {
+		return fmt.Errorf("load Codex collaboration modes: %w", err)
+	}
+	for _, mode := range modes {
+		if mode.Mode == requested {
+			return nil
+		}
+	}
+	return fmt.Errorf("Codex collaboration mode %q is not available", requested)
 }
 
 func (s *Server) validateModelSettings(ctx context.Context, settings codex.ThreadSettings, allowDefault bool) error {
@@ -519,6 +657,33 @@ func (s *Server) validateModelSettings(ctx context.Context, settings codex.Threa
 
 func (s *Server) artifact(w http.ResponseWriter, r *http.Request) {
 	remainder := strings.TrimPrefix(r.URL.Path, "/artifacts/")
+	s.serveArtifactFile(w, r, remainder, false)
+}
+
+func (s *Server) artifactImage(w http.ResponseWriter, r *http.Request) {
+	remainder := strings.TrimPrefix(r.URL.Path, "/artifact-previews/")
+	s.serveArtifactFile(w, r, remainder, true)
+}
+
+func artifactContentType(path string) (string, string, bool) {
+	extension := strings.ToLower(filepath.Ext(path))
+	types := map[string]struct {
+		kind        string
+		contentType string
+	}{
+		".gif": {"image", "image/gif"}, ".jpeg": {"image", "image/jpeg"},
+		".jpg": {"image", "image/jpeg"}, ".png": {"image", "image/png"},
+		".webp": {"image", "image/webp"}, ".json": {"text", "application/json"},
+		".log":  {"text", "text/plain; charset=utf-8"},
+		".md":   {"markdown", "text/markdown; charset=utf-8"},
+		".txt":  {"text", "text/plain; charset=utf-8"},
+		".yaml": {"text", "application/yaml"}, ".yml": {"text", "application/yaml"},
+	}
+	presentation, ok := types[extension]
+	return presentation.kind, presentation.contentType, ok
+}
+
+func (s *Server) serveArtifactFile(w http.ResponseWriter, r *http.Request, remainder string, imageOnly bool) {
 	parts := strings.SplitN(remainder, "/", 2)
 	if len(parts) != 2 {
 		http.NotFound(w, r)
@@ -535,30 +700,69 @@ func (s *Server) artifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	extension := strings.ToLower(filepath.Ext(parts[1]))
-	contentTypes := map[string]string{
-		".gif": "image/gif", ".jpeg": "image/jpeg", ".jpg": "image/jpeg",
-		".json": "application/json", ".log": "text/plain; charset=utf-8",
-		".md": "text/markdown; charset=utf-8", ".png": "image/png",
-		".txt": "text/plain; charset=utf-8", ".webp": "image/webp",
-		".yaml": "application/yaml", ".yml": "application/yaml",
-	}
-	contentType, allowed := contentTypes[extension]
-	if !allowed {
+	kind, contentType, allowed := artifactContentType(parts[1])
+	if !allowed || (imageOnly && kind != "image") {
 		http.Error(w, "artifact type is not available", http.StatusUnsupportedMediaType)
 		return
 	}
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", info.Name()))
+	disposition := "attachment"
+	if imageOnly {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disposition, info.Name()))
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
+func (s *Server) artifactPreview(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	kind, _, allowed := artifactContentType(path)
+	if !allowed {
+		s.writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "artifact type is not available"})
+		return
+	}
+	file, _, err := session.OpenArtifact(summary, path, 10*1024*1024)
+	if err != nil {
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "artifact is not available"})
+		return
+	}
+	defer file.Close()
+	if kind == "image" {
+		s.writeJSON(w, http.StatusOK, map[string]string{
+			"kind": "image", "url": "/artifact-previews/" +
+				url.PathEscape(summary.Slug) + "/" + strings.ReplaceAll(url.PathEscape(path), "%2F", "/"),
+		})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 10*1024*1024+1))
+	if err != nil || len(data) > 10*1024*1024 {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to read artifact"})
+		return
+	}
+	text := strings.ToValidUTF8(string(data), "�")
+	if kind == "markdown" {
+		s.writeJSON(w, http.StatusOK, map[string]string{
+			"kind": "markdown", "html": string(s.renderTextMarkdown(text)),
+		})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"kind": "text", "text": text})
 }
 
 func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	remainder := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	parts := strings.Split(strings.Trim(remainder, "/"), "/")
-	if len(parts) != 2 {
+	if len(parts) < 2 || len(parts) > 3 {
 		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "delete" {
+		if !session.ValidSlug(parts[0]) {
+			http.NotFound(w, r)
+			return
+		}
+		s.deleteSession(w, r, parts[0])
 		return
 	}
 	summary, err := session.Find(s.config.Workspace, parts[0])
@@ -566,16 +770,24 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.Method == http.MethodPost && parts[1] == "release-cluster" {
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
 		s.releaseCluster(w, r, summary)
 		return
 	}
-	if r.Method == http.MethodPost && parts[1] == "archive" {
-		s.startArchive(w, summary)
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "archive" {
+		s.startArchive(w, r, summary)
 		return
 	}
-	if r.Method == http.MethodGet && parts[1] == "operation" {
-		s.archiveStatus(w, summary.Slug)
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "revive" {
+		s.startRevive(w, r, summary)
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "operation" {
+		s.lifecycleStatus(w, summary.Slug)
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "artifact-preview" {
+		s.artifactPreview(w, r, summary)
 		return
 	}
 	s.normalizeInteractivity(r.Context(), summary)
@@ -583,7 +795,7 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session has no Codex thread"})
 		return
 	}
-	if r.Method == http.MethodPost && parts[1] == "fork" {
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "fork" {
 		if !summary.Interactive {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready to fork"})
 			return
@@ -591,13 +803,24 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		s.forkSession(w, r, summary)
 		return
 	}
-	if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
 		lock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		defer lock.Close()
+		owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+		if journalErr != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+			return
+		}
+		if owner != "" {
+			s.writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "session " + owner + " is unfinished; retry that operation first",
+			})
+			return
+		}
 		summary, err = session.Find(s.config.Workspace, parts[0])
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session state changed"})
@@ -611,7 +834,7 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	threadID := summary.Codex.ThreadID
 	switch {
-	case r.Method == http.MethodGet && parts[1] == "thread":
+	case len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "thread":
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
 		if s.config.ReadThread == nil {
@@ -630,67 +853,190 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.writeJSON(w, http.StatusOK, result)
-	case r.Method == http.MethodGet && parts[1] == "events":
+	case len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "events":
 		if !summary.Interactive {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not interactive"})
 			return
 		}
 		s.events(w, r, threadID)
-	case r.Method == http.MethodGet && parts[1] == "pending":
+	case len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "pending":
 		if !summary.Interactive {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not interactive"})
 			return
 		}
 		s.pending(w, r, threadID)
-	case r.Method == http.MethodPost && parts[1] == "message":
+	case len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "queue":
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		entries, err := s.config.Codex.ListQueue(ctx, threadID)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		if entries == nil {
+			entries = []codex.QueueEntry{}
+		}
+		s.writeJSON(w, http.StatusOK, entries)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "message":
 		var body struct {
-			Message string `json:"message"`
+			Message             string `json:"message"`
+			ClientUserMessageID string `json:"clientUserMessageId"`
 		}
 		if !s.decodeJSON(w, r, &body) {
 			return
 		}
-		body.Message = strings.TrimSpace(body.Message)
-		if body.Message == "" || len([]byte(body.Message)) > session.MaxMessageBytes {
+		message, err := normalizeSessionMessage(body.Message)
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
+		if !queueClientMessageIDPattern.MatchString(body.ClientUserMessageID) {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": fmt.Sprintf(
-					"message must contain between 1 and %s bytes",
-					session.FormattedMaxMessageBytes(),
-				),
+				"error": "message has an invalid client identity",
 			})
 			return
 		}
-		messageLock := s.messageLock(threadID)
+		messageLock := s.messageLock(summary.Slug)
 		messageLock.Lock()
 		defer messageLock.Unlock()
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
-		if err := s.config.Codex.Send(ctx, threadID, body.Message); err != nil {
+		receipt, err := s.config.Codex.Send(
+			ctx, threadID, message, body.ClientUserMessageID, "",
+		)
+		if err != nil {
 			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		s.writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
-	case r.Method == http.MethodPost && parts[1] == "settings":
-		var body codex.ThreadSettings
+		s.writeJSON(w, http.StatusAccepted, receipt)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "queue":
+		var body struct {
+			Message             string `json:"message"`
+			ClientUserMessageID string `json:"clientUserMessageId"`
+		}
 		if !s.decodeJSON(w, r, &body) {
 			return
 		}
-		body.Model = strings.TrimSpace(body.Model)
-		body.ReasoningEffort = strings.TrimSpace(body.ReasoningEffort)
-		if err := s.validateModelSettings(r.Context(), body, false); err != nil {
+		body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
+		if !queueClientMessageIDPattern.MatchString(body.ClientUserMessageID) {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "queued message has an invalid client identity",
+			})
+			return
+		}
+		message, err := normalizeSessionMessage(body.Message)
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		messageLock := s.messageLock(summary.Slug)
+		messageLock.Lock()
+		defer messageLock.Unlock()
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		entry, err := s.config.Codex.Queue(
+			ctx, threadID, message, body.ClientUserMessageID,
+		)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, entry)
+	case len(parts) == 3 && r.Method == http.MethodDelete && parts[1] == "queue":
+		if parts[2] == "" || len(parts[2]) > 256 {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid queued message id"})
+			return
+		}
+		messageLock := s.messageLock(summary.Slug)
+		messageLock.Lock()
+		defer messageLock.Unlock()
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		if err := s.config.Codex.DeleteQueueEntry(ctx, threadID, parts[2]); err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case len(parts) == 3 && r.Method == http.MethodPost && parts[1] == "queue" && parts[2] == "start":
+		var body struct {
+			QueuedSubmissionID string `json:"queuedSubmissionId"`
+		}
+		if !s.decodeJSON(w, r, &body) {
+			return
+		}
+		body.QueuedSubmissionID = strings.TrimSpace(body.QueuedSubmissionID)
+		if body.QueuedSubmissionID == "" || len(body.QueuedSubmissionID) > 256 {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid queued message id"})
+			return
+		}
+		messageLock := s.messageLock(summary.Slug)
+		messageLock.Lock()
+		defer messageLock.Unlock()
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := s.config.Codex.StartQueue(ctx, threadID, body.QueuedSubmissionID); err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "settings":
+		var body codex.ThreadSettingsUpdate
+		if !s.decodeJSON(w, r, &body) {
+			return
+		}
+		for _, value := range []**string{&body.Model, &body.ReasoningEffort, &body.CollaborationMode} {
+			if *value != nil {
+				trimmed := strings.TrimSpace(**value)
+				*value = &trimmed
+			}
+		}
+		if body.Model == nil && body.ReasoningEffort == nil && body.CollaborationMode == nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no Codex setting was selected"})
+			return
+		}
+		messageLock := s.messageLock(summary.Slug)
+		messageLock.Lock()
+		defer messageLock.Unlock()
+		if body.Model != nil {
+			if *body.Model == "" || body.ReasoningEffort == nil || *body.ReasoningEffort == "" {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "select a Codex model and an explicit reasoning setting",
+				})
+				return
+			}
+			settings := codex.ThreadSettings{
+				Model: *body.Model, ReasoningEffort: *body.ReasoningEffort,
+			}
+			if err := s.validateModelSettings(r.Context(), settings, false); err != nil {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+		} else if body.ReasoningEffort != nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "select a Codex model before changing its reasoning setting",
+			})
+			return
+		}
+		mode := ""
+		if body.CollaborationMode != nil {
+			mode = *body.CollaborationMode
+		}
+		if err := s.validateCollaborationMode(r.Context(), mode); err != nil {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 		settings, err := s.config.Codex.UpdateThreadSettings(
-			ctx, threadID, filepath.Join(s.config.Workspace, "work", summary.Slug), body,
+			ctx, threadID, body,
 		)
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		s.writeJSON(w, http.StatusOK, settings)
-	case r.Method == http.MethodPost && parts[1] == "interrupt":
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "interrupt":
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
 		if err := s.config.Codex.Interrupt(ctx, threadID); err != nil {
@@ -698,16 +1044,253 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
-	case r.Method == http.MethodPost && parts[1] == "respond":
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "implement-plan":
+		s.implementPlan(w, r, summary)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "respond":
 		s.respond(w, r, threadID)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var body struct {
+		Confirmation string `json:"confirmation"`
+		Force        bool   `json:"force"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Confirmation != slug {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "type the full session slug to confirm deletion",
+		})
+		return
+	}
+	owner, journalErr := session.PendingLifecycle(s.config.Workspace, slug)
+	if journalErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+		return
+	}
+	if owner != "" && owner != "delete" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "session " + owner + " is unfinished; retry that operation first",
+		})
+		return
+	}
+	args := []string{"delete", slug, "--as-is", "--portal-authorized"}
+	if body.Force {
+		args = append(args, "--force")
+	}
+	if err := s.executeLifecycleOperation(
+		context.Background(), 7*time.Minute, slug, "delete", args,
+	); err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"redirect": "/"})
+}
+
+func completedPlan(transcript codex.Transcript) (codex.TranscriptEntry, bool) {
+	for index := len(transcript.Entries) - 1; index >= 0; index-- {
+		entry := transcript.Entries[index]
+		if entry.Kind == "plan" && entry.TurnStatus == "completed" && strings.TrimSpace(entry.Text) != "" {
+			return entry, true
+		}
+	}
+	return codex.TranscriptEntry{}, false
+}
+
+func planDigest(text string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
+}
+
+func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var body struct {
+		Action              string `json:"action"`
+		PlanTurnID          string `json:"planTurnId"`
+		PlanSHA256          string `json:"planSha256"`
+		ClientUserMessageID string `json:"clientUserMessageId"`
+		Name                string `json:"name"`
+		CreationDate        string `json:"creationDate"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	messageLock := s.messageLock(summary.Slug)
+	messageLock.Lock()
+	defer messageLock.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	transcript, err := s.config.Codex.ReadThread(ctx, summary.Codex.ThreadID)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	plan, ok := completedPlan(transcript)
+	digest := planDigest(plan.Text)
+	if !ok || plan.TurnID != strings.TrimSpace(body.PlanTurnID) ||
+		digest != strings.TrimSpace(body.PlanSHA256) {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "the displayed plan is stale; review the latest plan before implementing it",
+		})
+		return
+	}
+	if transcript.Status == "active" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Codex is still working on this plan"})
+		return
+	}
+	if transcript.CollaborationMode != "plan" && strings.TrimSpace(body.Action) != "same" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "the conversation is no longer in Plan mode",
+		})
+		return
+	}
+
+	switch strings.TrimSpace(body.Action) {
+	case "same":
+		const implementationMessage = "Implement the plan."
+		body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
+		if !queueClientMessageIDPattern.MatchString(body.ClientUserMessageID) {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message has an invalid client identity"})
+			return
+		}
+		actionContext := "plan:" + digest
+		if transcript.CollaborationMode == "plan" {
+			if err := s.config.Codex.PrepareSend(
+				summary.Codex.ThreadID, implementationMessage,
+				body.ClientUserMessageID, actionContext, false,
+			); err != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
+			mode := "default"
+			if _, err := s.config.Codex.UpdateThreadSettings(
+				ctx, summary.Codex.ThreadID,
+				codex.ThreadSettingsUpdate{CollaborationMode: &mode},
+			); err != nil {
+				s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+		} else if transcript.CollaborationMode == "default" {
+			attempted, attemptErr := s.config.Codex.SendAttempted(
+				ctx, summary.Codex.ThreadID, implementationMessage,
+				body.ClientUserMessageID, actionContext,
+			)
+			if attemptErr != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": attemptErr.Error()})
+				return
+			}
+			if !attempted {
+				s.writeJSON(w, http.StatusConflict, map[string]string{
+					"error": "the conversation is no longer in Plan mode",
+				})
+				return
+			}
+		} else {
+			s.writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "the conversation is no longer in Plan mode",
+			})
+			return
+		}
+		receipt, err := s.config.Codex.Send(
+			ctx, summary.Codex.ThreadID, implementationMessage,
+			body.ClientUserMessageID, actionContext,
+		)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, receipt)
+	case "new":
+		body.Name = strings.TrimSpace(body.Name)
+		body.CreationDate = strings.TrimSpace(body.CreationDate)
+		if !session.ValidSlug(body.Name) || len(body.Name) > 48 {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session name is invalid"})
+			return
+		}
+		if parsed, parseErr := time.Parse(time.DateOnly, body.CreationDate); parseErr != nil ||
+			parsed.Format(time.DateOnly) != body.CreationDate {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session creation date is invalid"})
+			return
+		}
+		goal := "Implement the following approved plan from session " + summary.Slug + ".\n\n" + plan.Text
+		if len([]byte(goal)) > session.MaxMessageBytes {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "the approved plan is too large for a new session"})
+			return
+		}
+		goalFile, createErr := os.CreateTemp("", "workspace-portal-plan-*.txt")
+		if createErr != nil {
+			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": createErr.Error()})
+			return
+		}
+		goalPath := goalFile.Name()
+		defer os.Remove(goalPath)
+		if createErr = goalFile.Chmod(0o600); createErr == nil {
+			_, createErr = goalFile.WriteString(goal)
+		}
+		if closeErr := goalFile.Close(); createErr == nil {
+			createErr = closeErr
+		}
+		if createErr != nil {
+			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": createErr.Error()})
+			return
+		}
+		destination := body.CreationDate + "-" + body.Name
+		args := []string{
+			"start", destination, "--as-is", "--exclusive", "--no-attach",
+			"--goal-file", goalPath, "--json",
+		}
+		if transcript.Model != "" {
+			args = append(args, "--model", transcript.Model)
+		}
+		if transcript.ReasoningEffort != "" {
+			args = append(args, "--effort", transcript.ReasoningEffort)
+		}
+		stdout, stderr, runErr := s.runDevSession(context.Background(), 2*time.Minute, args...)
+		if runErr != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{
+				"error": commandFailure("create plan session", stdout, stderr, runErr).Error(),
+			})
+			return
+		}
+		var result struct {
+			Slug string `json:"slug"`
+		}
+		if json.Unmarshal([]byte(stdout), &result) != nil || result.Slug != destination {
+			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "dev-session returned invalid plan session metadata"})
+			return
+		}
+		s.writeJSON(w, http.StatusCreated, map[string]string{"slug": destination, "url": "/" + destination + "/"})
+	default:
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select how to implement the plan"})
+	}
+}
+
 func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	if summary.Archived {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "archived sessions cannot have live development clusters"})
+		return
+	}
+	lock, lockErr := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+	if lockErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": lockErr.Error()})
+		return
+	}
+	defer lock.Close()
+	owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if journalErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+		return
+	}
+	if owner != "" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "session " + owner + " is unfinished; retry that operation first",
+		})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
@@ -726,9 +1309,84 @@ func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary 
 	s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) startArchive(w http.ResponseWriter, summary *session.Summary) {
-	if summary.Lifecycle != "complete" && summary.Lifecycle != "abandoned" {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "finish the session before archiving it"})
+func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if journalErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+		return
+	}
+	if owner != "" && owner != "archive" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "session " + owner + " is unfinished; retry that operation first",
+		})
+		return
+	}
+	if summary.Archived && owner != "archive" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already archived"})
+		return
+	}
+	if body.Mode != "complete" && body.Mode != "abandoned" {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select completed or abandoned archival"})
+		return
+	}
+	args := []string{"archive", summary.Slug, "--as-is", "--portal-authorized"}
+	if body.Mode == "abandoned" {
+		args = append(args, "--abandoned")
+	}
+	s.startLifecycleOperation(w, summary.Slug, "archive", "/", args)
+}
+
+func (s *Server) startRevive(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var body struct {
+		AllowAbandoned bool `json:"allowAbandoned"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if journalErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+		return
+	}
+	if owner != "" && owner != "revive" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "session " + owner + " is unfinished; retry that operation first",
+		})
+		return
+	}
+	if !summary.Archived && owner != "revive" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already active"})
+		return
+	}
+	if summary.Lifecycle == "abandoned" && owner != "revive" && !body.AllowAbandoned {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirm that the abandoned session should be revived"})
+		return
+	}
+	args := []string{"revive", summary.Slug, "--as-is", "--portal-authorized"}
+	if summary.Lifecycle == "abandoned" {
+		args = append(args, "--allow-abandoned")
+	}
+	s.startLifecycleOperation(w, summary.Slug, "revive", "/"+summary.Slug+"/", args)
+}
+
+func (s *Server) startLifecycleOperation(w http.ResponseWriter, slug, kind, redirect string, args []string) {
+	owner, err := session.PendingLifecycle(s.config.Workspace, slug)
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if owner != "" && owner != kind {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "session " + owner + " is unfinished; retry that operation first",
+		})
 		return
 	}
 	s.operationMu.Lock()
@@ -737,19 +1395,24 @@ func (s *Server) startArchive(w http.ResponseWriter, summary *session.Summary) {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
 		return
 	}
-	operation, exists := s.operations[summary.Slug]
+	operation, exists := s.operations[slug]
 	if exists && operation.State == "running" {
 		s.operationMu.Unlock()
+		if operation.Kind != kind {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "another session operation is already running"})
+			return
+		}
 		s.writeJSON(w, http.StatusAccepted, operation)
 		return
 	}
-	s.operations[summary.Slug] = archiveOperation{State: "running"}
-	s.archiveWG.Add(1)
+	operation = lifecycleOperation{Kind: kind, State: "running", Redirect: redirect}
+	s.operations[slug] = operation
+	s.operationWG.Add(1)
 	s.operationMu.Unlock()
-	go func(slug string) {
-		defer s.archiveWG.Done()
-		err := s.archiveSession(s.archiveContext, slug)
-		operation := archiveOperation{State: "complete"}
+	go func() {
+		defer s.operationWG.Done()
+		err := s.runLifecycleOperation(s.operationContext, slug, kind, args)
+		operation := lifecycleOperation{Kind: kind, State: "complete", Redirect: redirect}
 		if err != nil {
 			operation.State = "failed"
 			operation.Error = err.Error()
@@ -757,155 +1420,43 @@ func (s *Server) startArchive(w http.ResponseWriter, summary *session.Summary) {
 		s.operationMu.Lock()
 		s.operations[slug] = operation
 		s.operationMu.Unlock()
-	}(summary.Slug)
-	s.writeJSON(w, http.StatusAccepted, archiveOperation{State: "running"})
+	}()
+	s.writeJSON(w, http.StatusAccepted, operation)
 }
 
-func (s *Server) archiveStatus(w http.ResponseWriter, slug string) {
+func (s *Server) runLifecycleOperation(parent context.Context, slug, kind string, args []string) error {
+	return s.executeLifecycleOperation(parent, 12*time.Minute, slug, kind, args)
+}
+
+func (s *Server) executeLifecycleOperation(
+	parent context.Context, timeout time.Duration, slug, kind string, args []string,
+) error {
+	transition, unlockTransition, err := s.acquireTransition(unix.LOCK_EX)
+	if err != nil {
+		return fmt.Errorf("lock workspace runtime for %s: %w", kind, err)
+	}
+	defer unlockTransition()
+	mutationLock := s.messageLock(slug)
+	mutationLock.Lock()
+	defer mutationLock.Unlock()
+	stdout, stderr, err := s.runDevSessionWithTransition(parent, timeout, transition, args...)
+	if err != nil {
+		return commandFailure(kind+" session", stdout, stderr, err)
+	}
+	s.repositoryMu.Lock()
+	delete(s.repositoryCache, slug)
+	s.repositoryMu.Unlock()
+	return nil
+}
+
+func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
 	s.operationMu.Lock()
 	operation, ok := s.operations[slug]
 	s.operationMu.Unlock()
 	if !ok {
-		operation = archiveOperation{State: "idle"}
+		operation = lifecycleOperation{State: "idle"}
 	}
 	s.writeJSON(w, http.StatusOK, operation)
-}
-
-func (s *Server) archiveSession(parent context.Context, slug string) error {
-	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
-	err := s.clusters.ReleaseAll(ctx, slug)
-	cancel()
-	if err != nil {
-		return err
-	}
-	summary, err := session.Find(s.config.Workspace, slug)
-	if err != nil {
-		return err
-	}
-	if !summary.Archived {
-		args := []string{"finalize", slug, "--as-is"}
-		if stdout, stderr, err := s.runDevSessionContext(parent, 5*time.Minute, args...); err != nil {
-			return commandFailure("finalize session", stdout, stderr, err)
-		}
-	}
-	if err := parent.Err(); err != nil {
-		return err
-	}
-	// Once Git begins committing, give its isolated, bounded transaction time to
-	// finish even when service shutdown has canceled the surrounding workflow.
-	commitContext, cancelCommit := context.WithTimeout(context.Background(), 120*time.Second)
-	err = s.commitArchive(commitContext, slug)
-	cancelCommit()
-	if err != nil {
-		return err
-	}
-	if err := parent.Err(); err != nil {
-		return err
-	}
-	args := []string{"stop", slug, "--as-is"}
-	if stdout, stderr, err := s.runDevSessionContext(parent, 3*time.Minute, args...); err != nil {
-		message := stderr + stdout
-		if !strings.Contains(message, "tmux session not found") &&
-			!strings.Contains(message, "session authority not found") {
-			return commandFailure("stop session", stdout, stderr, err)
-		}
-	}
-	return nil
-}
-
-func (s *Server) commitArchive(parent context.Context, slug string) error {
-	s.workspaceGitMu.Lock()
-	defer s.workspaceGitMu.Unlock()
-
-	runGit := func(base context.Context, timeout time.Duration, args ...string) (string, error) {
-		ctx, cancel := context.WithTimeout(base, timeout)
-		defer cancel()
-		command := exec.Command("git", args...)
-		output, err := processgroup.CombinedOutputGraceful(ctx, command, 3*time.Second)
-		if err != nil {
-			return string(output), err
-		}
-		return string(output), nil
-	}
-	git := func(timeout time.Duration, args ...string) (string, error) {
-		return runGit(parent, timeout, append([]string{"-C", s.config.Workspace}, args...)...)
-	}
-	gitUncancelled := func(timeout time.Duration, args ...string) (string, error) {
-		return runGit(context.Background(), timeout, append([]string{"-C", s.config.Workspace}, args...)...)
-	}
-	branch, err := git(10*time.Second, "symbolic-ref", "--short", "HEAD")
-	if err != nil || strings.TrimSpace(branch) != "master" {
-		return errors.New("workspace checkout must be on master before archiving")
-	}
-	if output, err := git(time.Minute, "fetch", "origin", "master"); err != nil {
-		return fmt.Errorf("fetch workspace master: %s: %w", strings.TrimSpace(output), err)
-	}
-	if _, err := git(10*time.Second, "merge-base", "--is-ancestor", "origin/master", "HEAD"); err != nil {
-		return errors.New("workspace master advanced; update the shared checkout and retry archiving")
-	}
-	paths := []string{filepath.Join("work", slug), filepath.Join("archive", slug)}
-	status, err := git(10*time.Second, append([]string{"status", "--porcelain=v1", "--"}, paths...)...)
-	if err != nil {
-		return fmt.Errorf("inspect archive change: %w", err)
-	}
-	if strings.TrimSpace(status) == "" {
-		return nil
-	}
-	cachedOutput, cachedErr := git(10*time.Second, append(
-		[]string{"diff", "--cached", "--quiet", "--"}, paths...,
-	)...)
-	if cachedErr != nil {
-		var cachedExit *exec.ExitError
-		if !errors.As(cachedErr, &cachedExit) || cachedExit.ExitCode() != 1 {
-			return fmt.Errorf("inspect staged archive paths: %s: %w", strings.TrimSpace(cachedOutput), cachedErr)
-		}
-		return errors.New("archive paths already contain staged changes; unstage them and retry")
-	}
-	messageFile, err := os.CreateTemp("", "workspace-archive-commit-*.txt")
-	if err != nil {
-		return err
-	}
-	messagePath := messageFile.Name()
-	defer os.Remove(messagePath)
-	if err := messageFile.Chmod(0o600); err != nil {
-		messageFile.Close()
-		return err
-	}
-	if _, err := fmt.Fprintf(messageFile, "workspace: archive %s\n\nRecord the completed development session and remove its active tracking\nlocation.\n", slug); err != nil {
-		messageFile.Close()
-		return err
-	}
-	if err := messageFile.Close(); err != nil {
-		return err
-	}
-	archivePath := filepath.Join(s.config.Workspace, "archive", slug)
-	if _, err := os.Lstat(archivePath); err != nil {
-		return fmt.Errorf("inspect finalized archive: %w", err)
-	}
-	cleanup := func() error {
-		output, cleanupErr := gitUncancelled(
-			10*time.Second,
-			append([]string{"reset", "--quiet", "HEAD", "--"}, paths...)...,
-		)
-		if cleanupErr != nil {
-			return fmt.Errorf("restore archive paths in shared index: %s: %w", strings.TrimSpace(output), cleanupErr)
-		}
-		return nil
-	}
-	if output, err := git(10*time.Second, "add", "--intent-to-add", "--", paths[1]); err != nil {
-		if cleanupErr := cleanup(); cleanupErr != nil {
-			return fmt.Errorf("prepare archive path for commit: %s: %w; %v", strings.TrimSpace(output), err, cleanupErr)
-		}
-		return fmt.Errorf("prepare archive path for commit: %s: %w", strings.TrimSpace(output), err)
-	}
-	args := append([]string{"commit", "--only", "-F", messagePath, "--"}, paths...)
-	if output, err := git(2*time.Minute, args...); err != nil {
-		if cleanupErr := cleanup(); cleanupErr != nil {
-			return fmt.Errorf("commit archive change: %s: %w; %v", strings.TrimSpace(output), err, cleanupErr)
-		}
-		return fmt.Errorf("commit archive change: %s: %w", strings.TrimSpace(output), err)
-	}
-	return nil
 }
 
 func commandFailure(action, stdout, stderr string, err error) error {
@@ -958,7 +1509,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 	if settings.ReasoningEffort != "" {
 		args = append(args, "--effort", settings.ReasoningEffort)
 	}
-	stdout, stderr, err := s.runDevSession(2*time.Minute, args...)
+	stdout, stderr, err := s.runDevSession(context.Background(), 2*time.Minute, args...)
 	if err != nil {
 		message := strings.TrimSpace(stderr)
 		if message == "" {
@@ -1001,7 +1552,7 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	summary.Codex = persisted
 	creationReady := summary.Creation.State == "ready" &&
 		(summary.Creation.GoalSHA256 == "" || summary.Creation.InitialGoalSent)
-	if summary.Closed || !creationReady || s.config.AuthorityDir == "" {
+	if summary.Archived || !creationReady || s.config.AuthorityDir == "" {
 		return
 	}
 	authority, err := session.LoadRuntimeAuthority(
@@ -1097,6 +1648,7 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, threadID string
 		ID       string                         `json:"id"`
 		Decision string                         `json:"decision"`
 		Answers  map[string]map[string][]string `json:"answers"`
+		Snooze   bool                           `json:"snooze"`
 	}
 	if !s.decodeJSON(w, r, &body) {
 		return
@@ -1104,7 +1656,9 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, threadID string
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	var err error
-	if len(body.Answers) > 0 {
+	if body.Snooze {
+		err = s.config.Codex.SnoozeUserInput(body.ID, threadID)
+	} else if len(body.Answers) > 0 {
 		err = s.config.Codex.RespondAnswers(ctx, body.ID, threadID, body.Answers)
 	} else {
 		err = s.config.Codex.RespondDecision(ctx, body.ID, threadID, body.Decision)
@@ -1114,19 +1668,6 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, threadID string
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) renderMarkdown(summary *session.Summary, path string) template.HTML {
-	file, _, err := session.OpenArtifact(summary, path, 1024*1024)
-	if err != nil {
-		return template.HTML("<p class=\"empty\">Not available.</p>")
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 1024*1024+1))
-	if err != nil || len(data) > 1024*1024 {
-		return template.HTML("<p class=\"notice error\">Unable to read document.</p>")
-	}
-	return s.renderTextMarkdown(string(data))
 }
 
 func (s *Server) renderTextMarkdown(text string) template.HTML {
@@ -1173,6 +1714,18 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, destination 
 	}
 	return true
 }
+
+func normalizeSessionMessage(message string) (string, error) {
+	message = strings.TrimSpace(message)
+	if message == "" || len([]byte(message)) > session.MaxMessageBytes {
+		return "", fmt.Errorf(
+			"message must contain between 1 and %s bytes",
+			session.FormattedMaxMessageBytes(),
+		)
+	}
+	return message, nil
+}
+
 func timeAgo(value time.Time) string {
 	duration := time.Since(value)
 	if duration < time.Minute {

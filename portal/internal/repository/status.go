@@ -42,13 +42,13 @@ type Runner struct {
 
 // Inspect derives repository links from repository records that the session
 // package has already validated. It does not inspect writable worktrees.
-func (r Runner) Inspect(ctx context.Context, repositories []session.Repository, closed bool) []Status {
+func (r Runner) Inspect(ctx context.Context, repositories []session.Repository, immutable bool) []Status {
 	statuses := make([]Status, 0, len(repositories))
 	for _, item := range repositories {
 		status := Status{
 			Name: item.Name, GitHub: item.GitHub, Branch: item.Branch,
 			DefaultBranch: item.DefaultBranch, HeadSHA: item.FinalHeadSHA,
-			baseSHA: item.InitialBaseSHA, immutable: closed,
+			baseSHA: item.InitialBaseSHA, immutable: immutable,
 		}
 		status.updateLinks()
 		statuses = append(statuses, status)

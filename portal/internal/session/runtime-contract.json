@@ -1,8 +1,15 @@
 {
+  "developmentClusterStateSchema": 1,
+  "trackingMaxBytes": 8388608,
   "maxMessageBytes": 20000,
   "formEncodingExpansion": 3,
   "jsonEncodingExpansion": 6,
   "transportEnvelopeBytes": 1024,
+  "lifecycleJournals": [
+    { "name": "archive", "command": "archive" },
+    { "name": "removal", "command": "delete" },
+    { "name": "revive", "command": "revive" }
+  ],
   "threadEnvironmentKeys": [
     "VPSFREE_DEV_SESSION_SLUG",
     "VPSFREE_DEV_SESSION_WORKSPACE",
@@ -21,13 +28,19 @@
   "devSessionFlags": [
     "--require-runtime",
     "--workspace",
+    "--host-profile",
+    "--expected-host-generation",
+    "--expected-host-profile-token",
     "--authority-dir",
     "--tmux-socket",
     "--codex-command",
     "--codex-socket",
     "--codex-version",
     "--portal-command",
-    "--portal-base-url"
+    "--portal-base-url",
+    "--vpsadmin-cluster",
+    "--vpsadminos-cluster",
+    "--transition-lock"
   ],
   "portalServeFlags": [
     "--workspace",
@@ -35,6 +48,7 @@
     "--unix-socket",
     "--dev-session",
     "--authority-dir",
+    "--transition-lock",
     "--codex-socket",
     "--codex-version",
     "--tmux",

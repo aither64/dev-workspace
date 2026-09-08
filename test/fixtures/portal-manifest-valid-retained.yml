@@ -1,0 +1,13 @@
+schema: 2
+slug: 2026-09-03-example
+codex: {}
+creation:
+  state: creating
+  initial_goal_sent: false
+  initial_goal_attempted: false
+  goal_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  tracking_origin: retained
+  tracking_plan_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  tracking_state_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+repositories: []
+artifacts: []

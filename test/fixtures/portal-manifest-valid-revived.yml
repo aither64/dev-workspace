@@ -1,0 +1,11 @@
+schema: 1
+slug: 2026-09-03-example
+codex: {}
+creation:
+  state: ready
+  initial_goal_sent: false
+  tracking_origin: revived
+  tracking_plan_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  tracking_state_sha256: 89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
+repositories: []
+artifacts: []

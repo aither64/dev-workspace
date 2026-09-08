@@ -7,14 +7,14 @@
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-session="{{.Session.Slug}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}">
+<body data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <header class="topbar">
     <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
     <div class="header-actions">
       {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet">Fork session</button>{{end}}
-      {{if and .Session.Interactive (eq .Session.Lifecycle "active")}}<button id="finish-session" type="button" class="quiet">Prepare to finish</button>{{end}}
-      {{if .ArchivePending}}<button id="archive-session" type="button">{{if .Session.Archived}}Complete archive{{else}}Archive session{{end}}</button>{{end}}
-      <span class="badge {{if .Session.Closed}}archived{{else}}active{{end}}">{{if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete{{else if eq .Session.Lifecycle "abandoned"}}Abandoned{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
+      {{if eq .PendingLifecycle "archive"}}<button id="archive-session-open" type="button">Retry archive</button>{{else if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button">Retry revive</button>{{else if not .PendingLifecycle}}{{if .Session.Archived}}<button id="revive-session-open" type="button">Revive session</button>{{else}}<button id="archive-session-open" type="button">Archive session</button>{{end}}{{end}}
+      <button id="delete-session-open" type="button" class="danger">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</button>
+      <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .Session.Interactive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
     </div>
   </header>
   <main class="page session-page">
@@ -25,9 +25,7 @@
         <button class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" type="button" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-tab="handoff">Handoff</button>
         <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="repositories" data-tab="repositories">Repositories</button>
         <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="clusters" data-tab="clusters">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="plan" data-tab="plan">Plan</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="state" data-tab="state">State</button>
-        {{range .Session.Artifacts}}<a class="tab" href="/artifacts/{{$.Session.Slug}}/{{.Path}}">{{.Label}}</a>{{end}}
+        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="artifacts" data-tab="artifacts">Artifacts ({{len .Artifacts}})</button>
       </div>
 
       {{if .Session.Codex.ThreadID}}
@@ -35,12 +33,24 @@
         <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><div class="chat-heading-actions">{{if .Session.Interactive}}<button id="codex-settings-open" type="button" class="quiet">Settings</button>{{end}}<span id="codex-status" class="badge">Connecting</span></div></div>
         {{if .Session.Interactive}}
         <div id="pending" class="pending"></div>
+        <div id="message-receipts" class="message-receipts" hidden></div>
+        <section id="queue-panel" class="queue-panel" hidden>
+          <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
+          <ol id="queue-list"></ol>
+        </section>
         {{end}}
         <div id="transcript" class="transcript"><p class="empty">Loading conversation…</p></div>
+        <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
+        {{if .Session.Interactive}}
+        <section id="plan-actions" class="plan-actions" hidden>
+          <div><strong>Ready to implement this plan?</strong><p>Continue here or start a clean session with the exact plan.</p></div>
+          <div class="approval-actions"><button id="plan-implement-same" type="button">Implement here</button><button id="plan-implement-new" type="button" class="quiet">New session…</button><button id="plan-keep-planning" type="button" class="quiet">Keep planning</button></div>
+        </section>
+        {{end}}
         {{if .Session.Interactive}}
         <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
-          <div class="chat-actions"><button type="submit">Send</button><button id="interrupt" type="button" class="danger">Interrupt</button></div>
+          <div class="chat-actions"><div><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button></div><div class="composer-controls"><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden><button type="button" class="quiet" data-codex-mode="default">Default</button><button type="button" class="quiet plan-mode" data-codex-mode="plan">Plan</button></div><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
         </form>
         {{end}}
       </section>
@@ -92,8 +102,15 @@
         </div>
       </section>
 
-      <article id="plan" class="tab-panel document" role="tabpanel">{{.Plan}}</article>
-      <article id="state" class="tab-panel document" role="tabpanel">{{.State}}</article>
+      <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel">
+        <div class="artifact-list" role="list" aria-label="Session artifacts">
+          {{range .Artifacts}}<button type="button" class="artifact-select quiet" data-artifact-path="{{.Path}}" data-artifact-label="{{.Label}}">{{.Label}}</button>{{end}}
+        </div>
+        <div class="artifact-view">
+          <div class="section-heading"><h2 id="artifact-title">Artifacts</h2><a id="artifact-download" class="button-link" href="#" hidden>Download</a></div>
+          <div id="artifact-preview" class="document"><p class="empty">Choose an artifact to preview it.</p></div>
+        </div>
+      </section>
     </section>
   </main>
   {{if .Session.Interactive}}
@@ -119,7 +136,40 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button id="codex-settings-save" type="submit">Save settings</button></div>
     </form>
   </dialog>
+  <dialog id="plan-session-dialog">
+    <form id="plan-session-form" class="stack">
+      <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan and uses this session's model and reasoning setting.</p></div>
+      <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create session</button></div>
+    </form>
+  </dialog>
   {{end}}
+  {{if or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived))}}
+  <dialog id="archive-session-dialog">
+    <form id="archive-session-form" class="stack">
+      <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>This checks that Codex has no pending work, removes clean worktrees, releases development clusters, records the archive on workspace <code>master</code>, and stops the session runtime.</p></div>
+      <p class="notice warning">Completed work can be archived only when every registered feature head is merged into its configured default branch.</p>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" name="mode" value="abandoned" class="danger">Archive as abandoned</button><button type="submit" name="mode" value="complete">Archive completed session</button></div>
+    </form>
+  </dialog>
+  {{else if and (not .PendingLifecycle) .Session.Archived}}
+  <dialog id="revive-session-dialog">
+    <form id="revive-session-form" class="stack">
+      <div><p class="eyebrow">Continue work</p><h2>Revive session</h2><p>This restores active tracking and the retained Codex conversation. Repository worktrees stay removed until you add them again.</p></div>
+      {{if eq .Session.Lifecycle "abandoned"}}<p class="notice warning">This session was explicitly abandoned. Reviving it reopens discarded work as an active initiative.</p>{{end}}
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Revive session</button></div>
+    </form>
+  </dialog>
+  {{end}}
+  <dialog id="delete-session-dialog">
+    <form id="delete-session-form" class="stack">
+      <div><p class="eyebrow danger-text">Destructive action</p><h2>Delete session</h2><p>This removes the session, worktrees, cluster state, and browser and terminal runtime. Git branches are retained. Tracking is moved to private recovery storage.</p></div>
+      <label>Type <code>{{.Session.Slug}}</code> to confirm<input name="confirmation" required autocomplete="off"></label>
+      <label class="checkbox"><input name="force" type="checkbox"> Force deletion of dirty worktrees or an active Codex turn</label>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
+    </form>
+  </dialog>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

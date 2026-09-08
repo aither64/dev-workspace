@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,25 +20,110 @@ import (
 
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
+	"golang.org/x/sys/unix"
 )
 
-func TestMarkdownIsSanitized(t *testing.T) {
+func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
 	server := newTestServer(t)
-	directory := filepath.Join(server.config.Workspace, "work", "example")
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	server.config.TransitionLock = path
+	acquired := make(chan func(), 1)
+	failed := make(chan error, 1)
+	go func() {
+		unlock, err := server.lockTransition()
+		if err != nil {
+			failed <- err
+			return
+		}
+		acquired <- unlock
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("shared transition lock ignored the host's exclusive lock")
+	case err := <-failed:
+		t.Fatal(err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
-	payload := "# Plan\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))\n\n" +
-		"[encoded](&#106;avascript:alert(1))\n\n<javascript:alert(document.domain)>\n\n" +
-		"![alt](javascript:alert(document.domain))\n"
-	if err := os.WriteFile(filepath.Join(directory, "plan.md"), []byte(payload), 0o644); err != nil {
+	select {
+	case unlock := <-acquired:
+		unlock()
+	case err := <-failed:
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("portal did not acquire the released transition lock")
+	}
+}
+
+func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
 		t.Fatal(err)
 	}
-	summary := &session.Summary{Manifest: session.Manifest{Slug: "example"}, Workspace: server.config.Workspace, Root: "work"}
-	rendered := string(server.renderMarkdown(summary, "plan.md"))
-	if strings.Contains(rendered, "<script") || strings.Contains(rendered, `href="javascript:`) ||
-		strings.Contains(rendered, `src="javascript:`) || strings.Contains(rendered, "&#106;avascript:") {
-		t.Fatalf("unsafe Markdown output: %s", rendered)
+	owner.Close()
+	server := newTestServer(t)
+	server.config.TransitionLock = path
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte(
+		"#!/bin/sh\n"+
+			"[ \"$VPSFREE_WORKSPACE_TRANSITION_LOCK_FD\" = 3 ] || exit 23\n"+
+			"[ -e /proc/$$/fd/3 ] || exit 24\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	slug := "2026-09-06-lock-order"
+	mutationLock := server.messageLock(slug)
+	mutationLock.Lock()
+	result := make(chan error, 1)
+	go func() {
+		result <- server.runLifecycleOperation(
+			context.Background(), slug, "archive", []string{"archive", slug, "--as-is"},
+		)
+	}()
+
+	probe, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err = unix.Flock(int(probe.Fd()), unix.LOCK_SH|unix.LOCK_NB)
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Flock(int(probe.Fd()), unix.LOCK_UN); err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lifecycle operation waited for the session lock before excluding portal mutations")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mutationLock.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle operation did not release its locks")
 	}
 }
 
@@ -71,6 +157,89 @@ func TestArtifactsUseAPassiveAllowlistAndDownloadDisposition(t *testing.T) {
 	}
 }
 
+func TestArtifactPreviewRendersSanitizedMarkdownAndEscapedText(t *testing.T) {
+	server := newTestServer(t)
+	writeArtifactSession(t, server.config.Workspace, "report.md")
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.WriteFile(
+		filepath.Join(directory, "report.md"),
+		[]byte("# Report\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))\n\n"+
+			"[encoded](&#106;avascript:alert(1))\n\n<javascript:alert(document.domain)>\n\n"+
+			"![alt](javascript:alert(document.domain))\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/sessions/example/artifact-preview?path=report.md", nil,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("Markdown preview = %d %q", response.Code, response.Body.String())
+	}
+	var markdown map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &markdown); err != nil {
+		t.Fatal(err)
+	}
+	if markdown["kind"] != "markdown" || strings.Contains(markdown["html"], "<script") ||
+		strings.Contains(markdown["html"], `href="javascript:`) ||
+		strings.Contains(markdown["html"], `src="javascript:`) ||
+		strings.Contains(markdown["html"], "&#106;avascript:") {
+		t.Fatalf("Markdown preview = %#v", markdown)
+	}
+	for _, element := range []string{"<table>", "<thead>", "<tbody>", "<th>", "<td>"} {
+		if !strings.Contains(markdown["html"], element) {
+			t.Fatalf("Markdown table is missing %s: %#v", element, markdown)
+		}
+	}
+
+	writeArtifactSession(t, server.config.Workspace, "report.txt")
+	if err := os.WriteFile(filepath.Join(directory, "report.txt"), []byte("<script>plain</script>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/sessions/example/artifact-preview?path=report.txt", nil,
+	))
+	var textPreview map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &textPreview); err != nil {
+		t.Fatal(err)
+	}
+	if textPreview["kind"] != "text" || textPreview["text"] != "<script>plain</script>" {
+		t.Fatalf("text preview = %#v", textPreview)
+	}
+}
+
+func TestArtifactImagePreviewIsInlineAndStillConfined(t *testing.T) {
+	server := newTestServer(t)
+	writeArtifactSession(t, server.config.Workspace, "image.png")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/sessions/example/artifact-preview?path=image.png", nil,
+	))
+	var preview map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview["kind"] != "image" || preview["url"] != "/artifact-previews/example/image.png" {
+		t.Fatalf("image preview = %#v", preview)
+	}
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, preview["url"], nil))
+	if response.Code != http.StatusOK ||
+		!strings.HasPrefix(response.Header().Get("Content-Disposition"), "inline;") {
+		t.Fatalf("inline image = %d %#v", response.Code, response.Header())
+	}
+
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/sessions/example/artifact-preview?path=../image.png", nil,
+	))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("escaping preview status = %d", response.Code)
+	}
+}
+
 func writeArtifactSession(t *testing.T, workspace, name string) {
 	t.Helper()
 	directory := filepath.Join(workspace, "work", "example")
@@ -94,6 +263,49 @@ func writeWebTrackingFiles(t *testing.T, directory, lifecycle string) {
 	}
 	if err := os.WriteFile(filepath.Join(directory, "plan.md"), []byte("# Plan\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIndexUsesCodexActivityAndFallsBackToTrackingTimes(t *testing.T) {
+	server := newTestServer(t)
+	base := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	writeSession := func(slug, threadID string, updated time.Time) {
+		directory := filepath.Join(server.config.Workspace, "work", slug)
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := "schema: 1\nslug: " + slug + "\ncodex:\n  thread_id: " + threadID +
+			"\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+		if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeWebTrackingFiles(t, directory, "active")
+		for _, name := range []string{"portal.yml", "plan.md", "state.md"} {
+			if err := os.Chtimes(filepath.Join(directory, name), updated, updated); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeSession("2026-09-07-recent-files", "thread-1", base.Add(time.Hour))
+	writeSession("2026-09-06-recent-codex", "thread-2", base)
+	controller := &browserContractCodex{activities: []codex.ThreadActivity{{
+		ID: "thread-2", Cwd: filepath.Join(server.config.Workspace, "work", "2026-09-06-recent-codex"),
+		UpdatedAt: base.Add(2 * time.Hour),
+	}}}
+	server.config.Codex = controller
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if strings.Index(body, "2026-09-06-recent-codex") > strings.Index(body, "2026-09-07-recent-files") {
+		t.Fatalf("Codex activity did not sort first: %s", body)
+	}
+
+	controller.activityErr = errors.New("App Server unavailable")
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body = response.Body.String()
+	if strings.Index(body, "2026-09-07-recent-files") > strings.Index(body, "2026-09-06-recent-codex") {
+		t.Fatalf("filesystem fallback did not sort first: %s", body)
 	}
 }
 
@@ -239,6 +451,10 @@ func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testin
 	}
 	t.Setenv("ARGUMENTS", arguments)
 	server.config.DevSession = helper
+	server.config.TransitionLock = filepath.Join(directory, "transition.lock")
+	if err := os.WriteFile(server.config.TransitionLock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	request := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
 		"creation_date=2026-09-03&name=example&goal=Implement+the+feature",
 	))
@@ -349,7 +565,8 @@ func TestSessionWithoutAThreadExplainsHowToStartSharedSessions(t *testing.T) {
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/legacy/", nil))
 	if response.Code != http.StatusOK ||
 		!strings.Contains(response.Body.String(), "This session has no shared Codex conversation") ||
-		!strings.Contains(response.Body.String(), "dev-session start &lt;short-name&gt;") {
+		!strings.Contains(response.Body.String(), "dev-session start &lt;short-name&gt;") ||
+		!strings.Contains(response.Body.String(), `id="delete-session-open"`) {
 		t.Fatalf("legacy page = %d %q", response.Code, response.Body.String())
 	}
 }
@@ -406,20 +623,20 @@ func TestNonInteractiveSessionRejectsEventStreams(t *testing.T) {
 	}
 }
 
-func TestClosedSessionDoesNotRenderMutationControls(t *testing.T) {
+func TestTerminalSessionWithoutRuntimeDoesNotRenderMutationControls(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
 		BaseURL: "https://workspace.example.test",
 		Session: &session.Summary{
 			Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}},
-			Closed:   true,
+			Terminal: true,
 		},
 	})
 	body := response.Body.String()
 	for _, marker := range []string{`id="pending"`, `id="message-form"`, `id="interrupt"`} {
 		if strings.Contains(body, marker) {
-			t.Fatalf("closed session rendered %s", marker)
+			t.Fatalf("noninteractive terminal session rendered %s", marker)
 		}
 	}
 }
@@ -433,16 +650,44 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 			Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
 			Artifacts: []session.Artifact{{Label: "Report", Path: "report.md"}},
 		}},
+		Artifacts: []session.Artifact{
+			{Label: "Plan", Path: "plan.md"},
+			{Label: "State", Path: "state.md"},
+			{Label: "Report", Path: "report.md"},
+		},
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
 		`class="panel session-tabs"`, `data-tab="codex"`, `data-tab="handoff"`,
-		`data-tab="repositories"`, `data-tab="clusters"`, `data-tab="plan"`, `data-tab="state"`,
-		`id="codex" class="tab-panel chat-panel active"`, `>Report</a>`,
+		`data-tab="repositories"`, `data-tab="clusters"`,
+		`id="codex" class="tab-panel chat-panel active"`, `data-tab="artifacts"`,
+		`data-artifact-path="plan.md"`, `data-artifact-path="state.md"`,
+		`data-artifact-path="report.md"`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("session page lacks %s", marker)
 		}
+	}
+	for _, marker := range []string{`data-tab="plan"`, `data-tab="state"`, `id="plan"`, `id="state"`} {
+		if strings.Contains(body, marker) {
+			t.Fatalf("session page retained separate tracking tab %s", marker)
+		}
+	}
+	stylesheet, err := assets.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		"grid-template-columns: minmax(0, 1fr)", ".message { min-width: 0; max-width: 100%",
+		".table-scroll { max-width: 100%; overflow-x: auto; }", ".message.markdown table",
+		".document table", ".message details > summary",
+	} {
+		if !strings.Contains(string(stylesheet), marker) {
+			t.Fatalf("transcript styling does not contain %q", marker)
+		}
+	}
+	if strings.Contains(string(stylesheet), ".message.markdown { white-space: normal; overflow") {
+		t.Fatal("Markdown messages still create overflow containers")
 	}
 	for _, oldLayout := range []string{"session-layout", "chat-column", "workspace-column"} {
 		if strings.Contains(body, oldLayout) {
@@ -457,9 +702,11 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, marker := range []string{
-		"event.key !== \"Enter\"", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
-		"entry.html", "finish-session", "archive-session", "release-cluster", "fork-dialog",
+		"shouldSubmitMessage(event)", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
+		"await beforeRequestInputAction(snoozeAutoResolution)",
+		"entry.html", "archive-session", "revive-session", "artifactPreview", "release-cluster", "fork-dialog",
 		"codex-settings-dialog", "codex-settings-open", "modelSelect.required",
+		"const nextSignature = JSON.stringify(entries)",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)
@@ -467,7 +714,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	}
 }
 
-func TestAutomaticReasoningIsValidInSettingsAndForkForms(t *testing.T) {
+func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.T) {
 	server := newTestServer(t)
 	directory := filepath.Join(server.config.Workspace, "work", "example")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
@@ -491,7 +738,16 @@ func TestAutomaticReasoningIsValidInSettingsAndForkForms(t *testing.T) {
 		t.Fatalf("automatic effort selects = %d", count)
 	}
 	if strings.Contains(body, `name="effort" data-effort-select required`) {
-		t.Fatal("automatic reasoning is blocked by native required validation")
+		t.Fatal("fork reasoning is blocked by native required validation")
+	}
+	javascript, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(javascript),
+		`const existingSettings = Boolean(modelSelect.closest("#codex-settings"))`) ||
+		!strings.Contains(string(javascript), `if (!existingSettings)`) {
+		t.Fatal("existing-thread settings still offer unsupported automatic reasoning")
 	}
 }
 
@@ -524,312 +780,34 @@ func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 	}
 }
 
-func TestCommitArchivePreservesUnrelatedWorkspaceChanges(t *testing.T) {
-	server := newTestServer(t)
-	workspace := server.config.Workspace
-	git := func(args ...string) string {
-		t.Helper()
-		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
-		output, err := command.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %s: %v", args, output, err)
-		}
-		return string(output)
-	}
-	git("init", "--initial-branch=master")
-	git("config", "user.email", "test@example.invalid")
-	git("config", "user.name", "Test")
-	slug := "2026-09-04-complete"
-	work := filepath.Join(workspace, "work", slug)
-	if err := os.MkdirAll(work, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for name := range map[string]bool{"staged.txt": true, "unstaged.txt": true} {
-		if err := os.WriteFile(filepath.Join(workspace, name), []byte("initial\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	git("add", ".")
-	git("commit", "-m", "initial")
-	remote := filepath.Join(t.TempDir(), "origin.git")
-	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
-		t.Fatalf("init remote: %s: %v", output, err)
-	}
-	git("remote", "add", "origin", remote)
-	git("push", "-u", "origin", "master")
-	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged change\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", "staged.txt")
-	if err := os.WriteFile(filepath.Join(workspace, "unstaged.txt"), []byte("unstaged change\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := server.commitArchive(context.Background(), slug); err != nil {
-		t.Fatal(err)
-	}
-	changed := strings.Fields(git("show", "--format=", "--name-only", "HEAD"))
-	if len(changed) != 1 || changed[0] != filepath.Join("archive", slug, "state.md") {
-		t.Fatalf("archive commit paths = %#v", changed)
-	}
-	status := git("status", "--porcelain=v1")
-	if !strings.Contains(status, "M  staged.txt") || !strings.Contains(status, " M unstaged.txt") {
-		t.Fatalf("unrelated status was not preserved: %q", status)
-	}
-}
-
-func TestCommitArchiveHookFailureLeavesTheSharedIndexUntouchedAndCanRetry(t *testing.T) {
-	server := newTestServer(t)
-	workspace := server.config.Workspace
-	git := func(args ...string) string {
-		t.Helper()
-		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
-		output, err := command.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %s: %v", args, output, err)
-		}
-		return string(output)
-	}
-	git("init", "--initial-branch=master")
-	git("config", "user.email", "test@example.invalid")
-	git("config", "user.name", "Test")
-	slug := "2026-09-05-hook-failure"
-	work := filepath.Join(workspace, "work", slug)
-	if err := os.MkdirAll(work, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("initial\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", ".")
-	git("commit", "-m", "initial")
-	remote := filepath.Join(t.TempDir(), "origin.git")
-	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
-		t.Fatalf("init remote: %s: %v", output, err)
-	}
-	git("remote", "add", "origin", remote)
-	git("push", "-u", "origin", "master")
-	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", "staged.txt")
-	before := git("status", "--porcelain=v1")
-	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.commitArchive(context.Background(), slug); err == nil {
-		t.Fatal("archive commit unexpectedly passed its failing hook")
-	}
-	if after := git("status", "--porcelain=v1"); after != before {
-		t.Fatalf("hook failure changed shared index/status:\n before: %q\n after:  %q", before, after)
-	}
-	if _, err := os.Stat(filepath.Join(workspace, ".git", "index.lock")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("hook failure left index lock: %v", err)
-	}
-	if err := os.Remove(hook); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.commitArchive(context.Background(), slug); err != nil {
-		t.Fatalf("retry archive commit: %v", err)
-	}
-	if changed := strings.Fields(git("show", "--format=", "--name-only", "HEAD")); len(changed) != 1 || changed[0] != filepath.Join("archive", slug, "state.md") {
-		t.Fatalf("retry archive paths = %#v", changed)
-	}
-}
-
-func TestCommitArchiveRejectsAConcurrentMasterAdvanceWithoutRevertingIt(t *testing.T) {
-	server := newTestServer(t)
-	workspace := server.config.Workspace
-	git := func(args ...string) string {
-		t.Helper()
-		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
-		output, err := command.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %s: %v", args, output, err)
-		}
-		return string(output)
-	}
-	git("init", "--initial-branch=master")
-	git("config", "user.email", "test@example.invalid")
-	git("config", "user.name", "Test")
-	slug := "2026-09-05-concurrent"
-	work := filepath.Join(workspace, "work", slug)
-	if err := os.MkdirAll(work, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "unrelated.txt"), []byte("initial\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", ".")
-	git("commit", "-m", "initial")
-	remote := filepath.Join(t.TempDir(), "origin.git")
-	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
-		t.Fatalf("init remote: %s: %v", output, err)
-	}
-	git("remote", "add", "origin", remote)
-	git("push", "-u", "origin", "master")
-	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("WORKSPACE", workspace)
-	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
-	script := "#!/bin/sh\n" +
-		"unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n" +
-		"parent=$(git -C \"$WORKSPACE\" rev-parse refs/heads/master)\n" +
-		"tree=$(git -C \"$WORKSPACE\" rev-parse \"$parent^{tree}\")\n" +
-		"concurrent=$(printf 'concurrent\\n' | git -C \"$WORKSPACE\" commit-tree \"$tree\" -p \"$parent\")\n" +
-		"git -C \"$WORKSPACE\" update-ref refs/heads/master \"$concurrent\" \"$parent\"\n"
-	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	err := server.commitArchive(context.Background(), slug)
-	if err == nil {
-		t.Fatalf("archive result after concurrent commit = %v", err)
-	}
-	if subject := strings.TrimSpace(git("log", "-1", "--format=%s")); subject != "concurrent" {
-		t.Fatalf("concurrent master head = %q", subject)
-	}
-	if content := git("show", "HEAD:unrelated.txt"); content != "initial\n" {
-		t.Fatalf("concurrent content was reverted: %q", content)
-	}
-	if err := os.Remove(hook); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.commitArchive(context.Background(), slug); err != nil {
-		t.Fatalf("retry archive commit: %v", err)
-	}
-	if content := git("show", "HEAD:unrelated.txt"); content != "initial\n" {
-		t.Fatalf("retry reverted concurrent content: %q", content)
-	}
-}
-
-func TestCommitArchiveCancellationCleansTheIndexAndCanRetry(t *testing.T) {
-	server := newTestServer(t)
-	workspace := server.config.Workspace
-	git := func(args ...string) string {
-		t.Helper()
-		command := exec.Command("git", append([]string{"-C", workspace}, args...)...)
-		output, err := command.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %s: %v", args, output, err)
-		}
-		return string(output)
-	}
-	git("init", "--initial-branch=master")
-	git("config", "user.email", "test@example.invalid")
-	git("config", "user.name", "Test")
-	slug := "2026-09-05-canceled-commit"
-	work := filepath.Join(workspace, "work", slug)
-	if err := os.MkdirAll(work, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "state.md"), []byte("complete\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("initial\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", ".")
-	git("commit", "-m", "initial")
-	remote := filepath.Join(t.TempDir(), "origin.git")
-	if output, err := exec.Command("git", "init", "--bare", "--initial-branch=master", remote).CombinedOutput(); err != nil {
-		t.Fatalf("init remote: %s: %v", output, err)
-	}
-	git("remote", "add", "origin", remote)
-	git("push", "-u", "origin", "master")
-	if err := os.MkdirAll(filepath.Join(workspace, "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(work, filepath.Join(workspace, "archive", slug)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(workspace, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", "staged.txt")
-	before := git("status", "--porcelain=v1")
-	started := filepath.Join(t.TempDir(), "hook-started")
-	t.Setenv("STARTED", started)
-	hook := filepath.Join(workspace, ".git", "hooks", "pre-commit")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf started > \"$STARTED\"\nsleep 30\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- server.commitArchive(ctx, slug) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("pre-commit hook did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-	if err := <-result; err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
-		t.Fatalf("canceled archive commit result = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(workspace, ".git", "index.lock")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("canceled Git left its index lock: %v", err)
-	}
-	if after := git("status", "--porcelain=v1"); after != before {
-		t.Fatalf("canceled archive changed shared status:\n before: %q\n after:  %q", before, after)
-	}
-	if err := os.Remove(hook); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.commitArchive(context.Background(), slug); err != nil {
-		t.Fatalf("retry canceled archive commit: %v", err)
-	}
-	status := git("status", "--porcelain=v1")
-	if strings.Contains(status, slug) || !strings.Contains(status, "M  staged.txt") {
-		t.Fatalf("retry did not preserve unrelated staged work: %q", status)
-	}
-}
-
 func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 	server := newTestServer(t)
+	slug := "2026-09-05-shutdown"
+	tracking := filepath.Join(server.config.Workspace, "work", slug)
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "complete")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: "+slug+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	devSession := filepath.Join(t.TempDir(), "dev-session")
 	started := filepath.Join(t.TempDir(), "started")
-	helper := filepath.Join(t.TempDir(), "cluster-helper")
 	script := "#!/bin/sh\nprintf started > \"$STARTED\"\nsleep 30\n"
-	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(devSession, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("STARTED", started)
-	server.clusters.Vpsadmin = helper
-	server.clusters.VpsadminOS = helper
+	server.config.DevSession = devSession
 	response := httptest.NewRecorder()
-	server.startArchive(response, &session.Summary{
-		Manifest:  session.Manifest{Slug: "2026-09-05-shutdown"},
+	server.startArchive(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"mode":"complete"}`),
+	), &session.Summary{
+		Manifest:  session.Manifest{Slug: slug},
 		Lifecycle: "complete",
 	})
 	if response.Code != http.StatusAccepted {
@@ -843,7 +821,10 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("archive helper did not start")
+			server.operationMu.Lock()
+			operation := server.operations[slug]
+			server.operationMu.Unlock()
+			t.Fatalf("archive helper did not start: %#v", operation)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -864,8 +845,10 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 		t.Fatalf("archive operation after shutdown = %#v", operation)
 	}
 	retry := httptest.NewRecorder()
-	server.startArchive(retry, &session.Summary{
-		Manifest:  session.Manifest{Slug: "2026-09-05-shutdown"},
+	server.startArchive(retry, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"mode":"complete"}`),
+	), &session.Summary{
+		Manifest:  session.Manifest{Slug: slug},
 		Lifecycle: "complete",
 	})
 	if retry.Code != http.StatusServiceUnavailable {
@@ -905,7 +888,7 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 			}
 			server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
 				return codex.Transcript{ThreadID: threadID, Status: "idle", Entries: []codex.TranscriptEntry{{
-					Kind: "agentMessage", Text: "# Persisted answer\n\n<script>alert(1)</script>",
+					Kind: "agentMessage", Text: "# Persisted answer\n\n| Item | State |\n| --- | --- |\n| Portal | Ready |\n\n<script>alert(1)</script>",
 				}}}, nil
 			}
 
@@ -930,10 +913,59 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				t.Fatal(err)
 			}
 			if len(transcript.Entries) != 1 || !strings.Contains(transcript.Entries[0].HTML, "<h1>Persisted answer</h1>") ||
+				!strings.Contains(transcript.Entries[0].HTML, "<table>") ||
 				strings.Contains(transcript.Entries[0].HTML, "<script") {
 				t.Fatalf("sanitized transcript Markdown = %#v", transcript.Entries)
 			}
 		})
+	}
+}
+
+func TestTerminalUnarchivedSessionRemainsInteractive(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\nrepositories: []\nartifacts: []\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "complete")
+	writeWebRuntimeAuthority(t, server, "example")
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/example/", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status/body = %d %q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, control := range []string{`id="message-form"`, `id="fork-open"`, "Complete · open"} {
+		if !strings.Contains(body, control) {
+			t.Fatalf("terminal open session is missing %s", control)
+		}
+	}
+}
+
+func TestArchiveRequiresAnExplicitMode(t *testing.T) {
+	server := newTestServer(t)
+	summary := &session.Summary{
+		Manifest:  session.Manifest{Slug: "2026-09-07-example"},
+		Lifecycle: "complete",
+	}
+	for _, body := range []string{`{}`, `{"confirmation":"example"}`} {
+		response := httptest.NewRecorder()
+		server.startArchive(response, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)), summary)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("confirmation %s returned %d %q", body, response.Code, response.Body.String())
+		}
+	}
+	server.operationMu.Lock()
+	defer server.operationMu.Unlock()
+	if len(server.operations) != 0 {
+		t.Fatalf("archive without a valid mode started operations: %#v", server.operations)
 	}
 }
 
@@ -997,10 +1029,27 @@ func TestBrowserClientIncludesFreeFormOtherInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"question.isOther", `other.value = "__other__"`, "Custom answer"} {
+	for _, marker := range []string{"question.isOther", `input.value = "__other__"`, "None of the above"} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)
 		}
+	}
+}
+
+func TestSessionDeletionCanClearBrowserStateBeforeTranscriptLoads(t *testing.T) {
+	javascript, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := assets.ReadFile("templates/session.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(javascript), `let currentThreadId = body.dataset.threadId || "";`) {
+		t.Fatal("browser client does not initialize deletion identity from the rendered session")
+	}
+	if !strings.Contains(string(template), `data-thread-id="{{.Session.Codex.ThreadID}}"`) {
+		t.Fatal("session page does not render the persisted thread identity")
 	}
 }
 
@@ -1018,12 +1067,29 @@ func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
 }
 
 type browserContractCodex struct {
-	mu           sync.Mutex
-	message      string
-	interrupt    bool
-	decision     string
-	answers      map[string]map[string][]string
-	emptyPrompts bool
+	mu            sync.Mutex
+	message       string
+	messageID     string
+	actionContext string
+	sendCount     int
+	sendErr       error
+	queued        string
+	queueDeleted  string
+	queueStarted  string
+	settings      codex.ThreadSettings
+	settingsErr   error
+	interrupt     bool
+	decision      string
+	answers       map[string]map[string][]string
+	snoozed       string
+	emptyPrompts  bool
+	transcript    codex.Transcript
+	activities    []codex.ThreadActivity
+	activityErr   error
+}
+
+func (client *browserContractCodex) ListThreadActivity(_ context.Context) ([]codex.ThreadActivity, error) {
+	return client.activities, client.activityErr
 }
 
 func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ string) error {
@@ -1034,6 +1100,9 @@ func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ 
 }
 
 func (client *browserContractCodex) ReadThread(_ context.Context, threadID string) (codex.Transcript, error) {
+	if client.transcript.ThreadID != "" {
+		return client.transcript, nil
+	}
 	return codex.Transcript{ThreadID: threadID}, nil
 }
 
@@ -1045,22 +1114,119 @@ func (client *browserContractCodex) ListModels(_ context.Context) ([]codex.Model
 	}}, nil
 }
 
+func (client *browserContractCodex) ListCollaborationModes(_ context.Context) ([]codex.CollaborationMode, error) {
+	return []codex.CollaborationMode{
+		{Name: "Default", Mode: "default"}, {Name: "Plan", Mode: "plan"},
+	}, nil
+}
+
 func (client *browserContractCodex) UpdateThreadSettings(
-	_ context.Context, threadID, _ string, settings codex.ThreadSettings,
+	_ context.Context, threadID string, update codex.ThreadSettingsUpdate,
 ) (codex.ThreadSettings, error) {
 	if threadID != "thread-1" {
 		return codex.ThreadSettings{}, errors.New("unexpected settings thread")
 	}
-	return settings, nil
+	client.mu.Lock()
+	if update.Model != nil {
+		client.settings.Model = *update.Model
+	}
+	if update.ReasoningEffort != nil {
+		client.settings.ReasoningEffort = *update.ReasoningEffort
+	}
+	if update.CollaborationMode != nil {
+		client.settings.CollaborationMode = *update.CollaborationMode
+	}
+	client.mu.Unlock()
+	return client.settings, client.settingsErr
 }
 
-func (client *browserContractCodex) Send(_ context.Context, threadID, message string) error {
+func (client *browserContractCodex) Send(
+	_ context.Context, threadID, message, clientID, actionContext string,
+) (codex.SendReceipt, error) {
 	if threadID != "thread-1" {
-		return errors.New("unexpected message thread")
+		return codex.SendReceipt{}, errors.New("unexpected message thread")
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.message = message
+	client.messageID = clientID
+	client.actionContext = actionContext
+	client.sendCount++
+	if client.sendErr != nil {
+		return codex.SendReceipt{}, client.sendErr
+	}
+	return codex.SendReceipt{
+		TurnID: "turn-1", ClientUserMessageID: clientID, Steered: true,
+	}, nil
+}
+
+func (client *browserContractCodex) PrepareSend(
+	threadID, message, clientID, actionContext string, _ bool,
+) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected message thread")
+	}
+	client.mu.Lock()
+	client.message = message
+	client.messageID = clientID
+	client.actionContext = actionContext
+	client.mu.Unlock()
+	return nil
+}
+
+func (client *browserContractCodex) SendAttempted(
+	_ context.Context, threadID, message, clientID, _ string,
+) (bool, error) {
+	if threadID != "thread-1" {
+		return false, errors.New("unexpected message thread")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.messageID == "" {
+		return false, nil
+	}
+	if client.messageID != clientID || client.message != message {
+		return false, errors.New("message identity was reused with different text")
+	}
+	return true, nil
+}
+
+func (client *browserContractCodex) ListQueue(_ context.Context, threadID string) ([]codex.QueueEntry, error) {
+	if threadID != "thread-1" {
+		return nil, errors.New("unexpected queue thread")
+	}
+	return []codex.QueueEntry{{ID: "queued-1", Text: "queued item", ClientUserMessageID: "client-1"}}, nil
+}
+
+func (client *browserContractCodex) Queue(
+	_ context.Context, threadID, message, clientID string,
+) (codex.QueueEntry, error) {
+	if threadID != "thread-1" {
+		return codex.QueueEntry{}, errors.New("unexpected queue thread")
+	}
+	client.mu.Lock()
+	client.queued = message
+	client.mu.Unlock()
+	return codex.QueueEntry{ID: "queued-2", Text: message, ClientUserMessageID: clientID}, nil
+}
+
+func (client *browserContractCodex) DeleteQueueEntry(_ context.Context, threadID, id string) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected queue thread")
+	}
+	client.mu.Lock()
+	client.queueDeleted = id
+	client.mu.Unlock()
+	return nil
+}
+
+func (client *browserContractCodex) StartQueue(_ context.Context, threadID, queuedSubmissionID string) error {
+	if threadID != "thread-1" {
+		return errors.New("unexpected queue thread")
+	}
+	client.mu.Lock()
+	client.queueStarted = queuedSubmissionID
+	client.mu.Unlock()
 	return nil
 }
 
@@ -1108,6 +1274,16 @@ func (client *browserContractCodex) RespondAnswers(
 	return nil
 }
 
+func (client *browserContractCodex) SnoozeUserInput(id, threadID string) error {
+	if id == "" || threadID != "thread-1" {
+		return errors.New("unexpected snooze target")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.snoozed = id
+	return nil
+}
+
 func (client *browserContractCodex) RespondDecision(_ context.Context, id, threadID, decision string) error {
 	if id != "approval-1" || threadID != "thread-1" {
 		return errors.New("unexpected decision target")
@@ -1116,6 +1292,513 @@ func (client *browserContractCodex) RespondDecision(_ context.Context, id, threa
 	defer client.mu.Unlock()
 	client.decision = decision
 	return nil
+}
+
+func TestImplementPlanRejectsAStalePlan(t *testing.T) {
+	server := newTestServer(t)
+	controller := &browserContractCodex{transcript: codex.Transcript{
+		ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+		Entries: []codex.TranscriptEntry{{
+			TurnID: "turn-new", TurnStatus: "completed", Kind: "plan", Text: "Current plan",
+		}},
+	}}
+	server.config.Codex = controller
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(
+		`{"action":"same","planTurnId":"turn-old","planSha256":"bad","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+	))
+	response := httptest.NewRecorder()
+
+	server.implementPlan(response, request, &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}})
+
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "stale") {
+		t.Fatalf("stale plan response = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestImplementPlanContinuesInTheSameThread(t *testing.T) {
+	server := newTestServer(t)
+	plan := "1. Make the change.\n2. Test it."
+	controller := &browserContractCodex{
+		settings: codex.ThreadSettings{
+			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
+		},
+		transcript: codex.Transcript{
+			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+			Entries: []codex.TranscriptEntry{{
+				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+			}},
+		},
+	}
+	server.config.Codex = controller
+	body := fmt.Sprintf(
+		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		planDigest(plan),
+	)
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	response := httptest.NewRecorder()
+
+	server.implementPlan(response, request, &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}})
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("same-thread plan response = %d %q", response.Code, response.Body.String())
+	}
+	if controller.message != "Implement the plan." ||
+		controller.actionContext != "plan:"+planDigest(plan) ||
+		controller.settings.CollaborationMode != "default" {
+		t.Fatalf("plan implementation state = %#v", controller)
+	}
+}
+
+func TestImplementPlanKeepsItsDurableAttemptWhenTheMessageFails(t *testing.T) {
+	server := newTestServer(t)
+	plan := "Make the change."
+	controller := &browserContractCodex{
+		sendErr: errors.New("send failed"),
+		settings: codex.ThreadSettings{
+			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
+		},
+		transcript: codex.Transcript{
+			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+			Entries: []codex.TranscriptEntry{{
+				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+			}},
+		},
+	}
+	server.config.Codex = controller
+	body := fmt.Sprintf(
+		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		planDigest(plan),
+	)
+	response := httptest.NewRecorder()
+	server.implementPlan(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}})
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed plan response = %d %q", response.Code, response.Body.String())
+	}
+	if controller.settings.CollaborationMode != "default" {
+		t.Fatalf("collaboration mode = %q", controller.settings.CollaborationMode)
+	}
+}
+
+func TestImplementPlanKeepsDefaultModeAndReconcilesAnUnknownSend(t *testing.T) {
+	server := newTestServer(t)
+	plan := "Make the change."
+	controller := &browserContractCodex{
+		sendErr: &codex.UnknownSendOutcomeError{Err: errors.New("connection changed")},
+		settings: codex.ThreadSettings{
+			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
+		},
+		transcript: codex.Transcript{
+			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+			Entries: []codex.TranscriptEntry{{
+				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+			}},
+		},
+	}
+	server.config.Codex = controller
+	body := fmt.Sprintf(
+		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		planDigest(plan),
+	)
+	summary := &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}}
+	first := httptest.NewRecorder()
+	server.implementPlan(first, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), summary)
+	if first.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unknown plan response = %d %q", first.Code, first.Body.String())
+	}
+	if controller.settings.CollaborationMode != "default" {
+		t.Fatalf("unknown send restored collaboration mode = %q", controller.settings.CollaborationMode)
+	}
+
+	controller.sendErr = nil
+	controller.transcript.CollaborationMode = "default"
+	retry := httptest.NewRecorder()
+	server.implementPlan(retry, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), summary)
+	if retry.Code != http.StatusAccepted {
+		t.Fatalf("reconciled plan response = %d %q", retry.Code, retry.Body.String())
+	}
+}
+
+func TestImplementPlanRetriesAfterTheModeChangeResponseIsLost(t *testing.T) {
+	server := newTestServer(t)
+	plan := "Make the change."
+	controller := &browserContractCodex{
+		settingsErr: errors.New("settings response was lost"),
+		settings: codex.ThreadSettings{
+			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
+		},
+		transcript: codex.Transcript{
+			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+			Entries: []codex.TranscriptEntry{{
+				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+			}},
+		},
+	}
+	server.config.Codex = controller
+	body := fmt.Sprintf(
+		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		planDigest(plan),
+	)
+	summary := &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}}
+	first := httptest.NewRecorder()
+	server.implementPlan(first, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), summary)
+	if first.Code != http.StatusConflict || controller.settings.CollaborationMode != "default" {
+		t.Fatalf(
+			"lost settings response = %d %q, mode %q",
+			first.Code, first.Body.String(), controller.settings.CollaborationMode,
+		)
+	}
+
+	controller.settingsErr = nil
+	controller.transcript.CollaborationMode = "default"
+	retry := httptest.NewRecorder()
+	server.implementPlan(retry, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), summary)
+	if retry.Code != http.StatusAccepted || controller.message != "Implement the plan." || controller.sendCount != 1 {
+		t.Fatalf(
+			"settings retry = %d %q, message %q, sends %d",
+			retry.Code, retry.Body.String(), controller.message, controller.sendCount,
+		)
+	}
+}
+
+func TestImplementPlanStartsANewSessionWithTheExactPlan(t *testing.T) {
+	server := newTestServer(t)
+	directory := t.TempDir()
+	arguments := filepath.Join(directory, "arguments")
+	goalCopy := filepath.Join(directory, "goal")
+	helper := filepath.Join(directory, "dev-session")
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$ARGUMENTS"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--goal-file" ]; then
+    cp "$2" "$GOAL_COPY"
+    break
+  fi
+  shift
+done
+printf '{"slug":"2026-09-07-implement-feature"}\n'
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	t.Setenv("GOAL_COPY", goalCopy)
+	server.config.DevSession = helper
+	plan := "1. Make the change.\n2. Test it."
+	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{
+		ThreadID: "thread-1", Status: "idle", Model: "model-1", ReasoningEffort: "high",
+		CollaborationMode: "plan", Entries: []codex.TranscriptEntry{{
+			TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+		}},
+	}}
+	body := fmt.Sprintf(
+		`{"action":"new","planTurnId":"turn-plan","planSha256":"%s","name":"implement-feature","creationDate":"2026-09-07"}`,
+		planDigest(plan),
+	)
+	response := httptest.NewRecorder()
+	server.implementPlan(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(body),
+	), &session.Summary{Manifest: session.Manifest{
+		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+	}})
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("new-session plan response = %d %q", response.Code, response.Body.String())
+	}
+	goal, err := os.ReadFile(goalCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGoal := "Implement the following approved plan from session example.\n\n" + plan
+	if string(goal) != wantGoal {
+		t.Fatalf("new session goal = %q, want %q", goal, wantGoal)
+	}
+	argv, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
+	if len(lines) != 12 || lines[0] != "start" || lines[1] != "2026-09-07-implement-feature" ||
+		lines[2] != "--as-is" || lines[3] != "--exclusive" || lines[4] != "--no-attach" ||
+		lines[5] != "--goal-file" || lines[7] != "--json" ||
+		lines[8] != "--model" || lines[9] != "model-1" ||
+		lines[10] != "--effort" || lines[11] != "high" {
+		t.Fatalf("new session arguments = %#v", lines)
+	}
+}
+
+func TestDeleteSessionRequiresExactConfirmationAndUsesDestructiveCLI(t *testing.T) {
+	server := newTestServer(t)
+	directory := t.TempDir()
+	arguments := filepath.Join(directory, "arguments")
+	helper := filepath.Join(directory, "dev-session")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	server.config.DevSession = helper
+	bad := httptest.NewRecorder()
+	server.deleteSession(bad, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"confirmation":"wrong"}`),
+	), "example")
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("bad confirmation status = %d", bad.Code)
+	}
+
+	response := httptest.NewRecorder()
+	server.deleteSession(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"confirmation":"example","force":true}`),
+	), "example")
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+	}
+	data, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n" {
+		t.Fatalf("delete arguments = %q", data)
+	}
+}
+
+func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		start     func(*Server, http.ResponseWriter, *http.Request, *session.Summary)
+		body      string
+		summary   *session.Summary
+		expected  string
+		operation string
+		journal   string
+	}{
+		{
+			name: "complete archive", start: (*Server).startArchive,
+			body:     `{"mode":"complete"}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
+			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
+		},
+		{
+			name: "abandoned archive", start: (*Server).startArchive,
+			body:     `{"mode":"abandoned"}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
+			expected: "archive\nexample\n--as-is\n--portal-authorized\n--abandoned\n", operation: "archive",
+		},
+		{
+			name: "revive", start: (*Server).startRevive,
+			body:     `{"allowAbandoned":false}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "complete"},
+			expected: "revive\nexample\n--as-is\n--portal-authorized\n", operation: "revive",
+		},
+		{
+			name: "retry archive after tracking moved", start: (*Server).startArchive,
+			body:     `{"mode":"complete"}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "complete"},
+			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
+			journal: ".archive.json",
+		},
+		{
+			name: "retry revive after tracking moved", start: (*Server).startRevive,
+			body:     `{"allowAbandoned":false}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
+			expected: "revive\nexample\n--as-is\n--portal-authorized\n", operation: "revive",
+			journal: ".revive.json",
+		},
+		{
+			name: "retry abandoned revive without another confirmation", start: (*Server).startRevive,
+			body: `{"allowAbandoned":false}`,
+			summary: &session.Summary{
+				Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "abandoned",
+			},
+			expected:  "revive\nexample\n--as-is\n--portal-authorized\n--allow-abandoned\n",
+			operation: "revive", journal: ".revive.json",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := newTestServer(t)
+			arguments := filepath.Join(t.TempDir(), "arguments")
+			helper := filepath.Join(t.TempDir(), "dev-session")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"
+			if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("ARGUMENTS", arguments)
+			server.config.DevSession = helper
+			if testCase.journal != "" {
+				root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+				if err := os.MkdirAll(root, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "example"+testCase.journal), []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := httptest.NewRecorder()
+			testCase.start(server, response, httptest.NewRequest(
+				http.MethodPost, "/", strings.NewReader(testCase.body),
+			), testCase.summary)
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("start = %d %q", response.Code, response.Body.String())
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				server.operationMu.Lock()
+				operation := server.operations["example"]
+				server.operationMu.Unlock()
+				if operation.State == "complete" {
+					if operation.Kind != testCase.operation {
+						t.Fatalf("operation = %#v", operation)
+					}
+					break
+				}
+				if operation.State == "failed" {
+					t.Fatalf("operation = %#v", operation)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("operation did not complete")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			data, err := os.ReadFile(arguments)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != testCase.expected {
+				t.Fatalf("arguments = %q", data)
+			}
+		})
+	}
+}
+
+func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	if err := os.WriteFile(
+		filepath.Join(directory, "portal.yml"), []byte("schema: 1\nslug: example\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	lockPath := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = lockPath
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(
+			http.MethodPost, "/api/sessions/example/delete",
+			strings.NewReader(`{"confirmation":"example"}`),
+		)
+		request.Header.Set("Origin", "https://workspace.example.test")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		done <- response
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("session deletion did not wait for an exclusive transition")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case response := <-done:
+		if response.Code != http.StatusOK {
+			t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session deletion did not continue after the transition was released")
+	}
+}
+
+func TestDeleteSessionRetryReachesTheRemovalJournalAfterTrackingMoved(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	if err := os.WriteFile(
+		filepath.Join(directory, "portal.yml"), []byte("schema: 1\nslug: example\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "first-attempt")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	script := `#!/bin/sh
+if [ ! -e "$DELETE_MARKER" ]; then
+  : > "$DELETE_MARKER"
+  rm -rf -- "$DELETE_TRACKING"
+  exit 19
+fi
+exit 0
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DELETE_MARKER", marker)
+	t.Setenv("DELETE_TRACKING", directory)
+	server.config.DevSession = helper
+	handler := server.Handler()
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(
+			http.MethodPost, "/api/sessions/example/delete",
+			strings.NewReader(`{"confirmation":"example"}`),
+		)
+		r.Header.Set("Origin", "https://workspace.example.test")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+		return response
+	}
+
+	first := request()
+	if first.Code != http.StatusConflict || !strings.Contains(first.Body.String(), "exit status 19") {
+		t.Fatalf("first deletion = %d %q", first.Code, first.Body.String())
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tracking still exists after simulated move: %v", err)
+	}
+	second := request()
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry deletion = %d %q", second.Code, second.Body.String())
+	}
 }
 
 func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
@@ -1140,7 +1823,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 	server.config.Codex = controller
 	server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
 		return codex.Transcript{
-			ThreadID: threadID, Status: "idle",
+			ThreadID: threadID, Status: "idle", CollaborationMode: "default",
 			Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "contract response"}},
 		}, nil
 	}
@@ -1160,13 +1843,18 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 			answer = answers[0]
 		}
 	}
-	if controller.message != "browser message" || !controller.interrupt ||
-		controller.decision != "accept" || answer != "yes" {
+	if controller.message != "browser message" ||
+		controller.messageID != "00000000-0000-4000-8000-000000000004" ||
+		controller.actionContext != "" ||
+		controller.queued != "queue message" ||
+		controller.queueDeleted != "queued-1" || controller.queueStarted != "queued-1" ||
+		controller.settings.CollaborationMode != "plan" || !controller.interrupt ||
+		controller.decision != "accept" || controller.snoozed != "question-1" || answer != "yes" {
 		t.Fatalf("browser operations were not delivered: %#v", controller)
 	}
 }
 
-func TestRepositoryCacheDoesNotCrossClosedTransition(t *testing.T) {
+func TestRepositoryCacheDoesNotCrossArchiveTransition(t *testing.T) {
 	server := newTestServer(t)
 	gh := filepath.Join(t.TempDir(), "gh")
 	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$1\" in repo) printf 'main\\n' ;; run) printf '[]\\n' ;; esac\n"), 0o755); err != nil {
@@ -1183,11 +1871,12 @@ func TestRepositoryCacheDoesNotCrossClosedTransition(t *testing.T) {
 	if len(activeStatus) != 1 || !strings.Contains(activeStatus[0].CompareURL, "main...feature") {
 		t.Fatalf("active status = %#v", activeStatus)
 	}
-	closed := *active
-	closed.Closed = true
-	closedStatus := server.repositories(context.Background(), &closed)
-	if len(closedStatus) != 1 || !strings.Contains(closedStatus[0].CompareURL, strings.Repeat("1", 40)+"..."+strings.Repeat("2", 40)) {
-		t.Fatalf("closed status reused mutable cache: %#v", closedStatus)
+	archived := *active
+	archived.Terminal = true
+	archived.Archived = true
+	archivedStatus := server.repositories(context.Background(), &archived)
+	if len(archivedStatus) != 1 || !strings.Contains(archivedStatus[0].CompareURL, strings.Repeat("1", 40)+"..."+strings.Repeat("2", 40)) {
+		t.Fatalf("archived status reused mutable cache: %#v", archivedStatus)
 	}
 }
 

@@ -17,7 +17,7 @@ func TestManifestFixtureLoadsAndMatchesDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Slug != fixtureSlug || len(summary.Artifacts) != 1 || !summary.Closed {
+	if summary.Slug != fixtureSlug || len(summary.Artifacts) != 1 || !summary.Terminal {
 		t.Fatalf("unexpected summary: %#v", summary)
 	}
 }
@@ -40,7 +40,7 @@ func TestManifestAcceptsASeparateForkSource(t *testing.T) {
 	}
 }
 
-func TestListSortsBySessionDateBeforeLastUpdate(t *testing.T) {
+func TestListSortsActiveAndArchivedSessionsByActivity(t *testing.T) {
 	workspace := t.TempDir()
 	writeSession := func(root, lifecycle, slug string, updatedAt time.Time) {
 		directory := filepath.Join(workspace, root, slug)
@@ -70,9 +70,9 @@ func TestListSortsBySessionDateBeforeLastUpdate(t *testing.T) {
 	writeSession("work", "active", "2026-09-03-edited-later", sharedTime.Add(6*time.Hour))
 	writeSession("work", "active", "2026-09-04-zulu", sharedTime)
 	writeSession("work", "active", "2026-09-04-alpha", sharedTime)
-	writeSession("archive", "complete", "2026-09-05-newest", sharedTime)
+	writeSession("archive", "complete", "2026-09-05-newest", sharedTime.Add(time.Hour))
 	writeSession("archive", "complete", "2026-09-04-arch-zulu", sharedTime)
-	writeSession("archive", "complete", "2026-09-04-arch-alpha", sharedTime)
+	writeSession("archive", "complete", "2026-09-04-arch-alpha", sharedTime.Add(3*time.Hour))
 
 	summaries, err := List(workspace)
 	if err != nil {
@@ -83,8 +83,8 @@ func TestListSortsBySessionDateBeforeLastUpdate(t *testing.T) {
 		got = append(got, summary.Slug)
 	}
 	want := []string{
-		"2026-09-04-alpha", "2026-09-04-zulu", "2026-09-03-edited-later",
-		"2026-09-05-newest", "2026-09-04-arch-alpha", "2026-09-04-arch-zulu",
+		"2026-09-03-edited-later", "2026-09-04-alpha", "2026-09-04-zulu",
+		"2026-09-04-arch-alpha", "2026-09-05-newest", "2026-09-04-arch-zulu",
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("session order = %v, want %v", got, want)
@@ -249,7 +249,7 @@ func TestLifecycleRejectsInvalidUTF8AndOversizedInput(t *testing.T) {
 		data []byte
 	}{
 		{"invalid-utf8", append([]byte("---\nlifecycle: active\n---\n"), 0xff)},
-		{"oversized", []byte(strings.Repeat("x", manifestMaxSize+1))},
+		{"oversized", []byte(strings.Repeat("x", TrackingMaxSize+1))},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			workspace := t.TempDir()
@@ -264,6 +264,21 @@ func TestLifecycleRejectsInvalidUTF8AndOversizedInput(t *testing.T) {
 				t.Fatal("invalid lifecycle input accepted")
 			}
 		})
+	}
+}
+
+func TestLifecycleAcceptsLargeTrackingFile(t *testing.T) {
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "work", fixtureSlug)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("---\nlifecycle: active\n---\n" + strings.Repeat("x", 1_100_000))
+	if err := os.WriteFile(filepath.Join(directory, "state.md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if lifecycle, _, err := loadLifecycle(workspace, "work", fixtureSlug); err != nil || lifecycle != "active" {
+		t.Fatalf("large tracking lifecycle = %q, %v", lifecycle, err)
 	}
 }
 
@@ -318,7 +333,7 @@ func TestWorkspaceManifestNeverGrantsRuntimeInteractivity(t *testing.T) {
 	}
 }
 
-func TestTerminalLifecycleMakesWorkSessionReadOnly(t *testing.T) {
+func TestTerminalLifecycleMarksWorkSessionArchiveEligible(t *testing.T) {
 	workspace := t.TempDir()
 	directory := filepath.Join(workspace, "work", "example")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
@@ -333,7 +348,7 @@ func TestTerminalLifecycleMakesWorkSessionReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !summary.Closed || summary.Interactive || summary.Lifecycle != "complete" {
+	if !summary.Terminal || summary.Interactive || summary.Lifecycle != "complete" {
 		t.Fatalf("terminal session phase = %#v", summary)
 	}
 }
@@ -503,6 +518,21 @@ func TestOversizedArtifactIsRejectedBeforeReading(t *testing.T) {
 	}
 	if _, _, err := OpenArtifact(summary, "report.md", 1024); err == nil {
 		t.Fatal("expected oversized artifact rejection")
+	}
+}
+
+func TestManifestCannotRedeclareBuiltInArtifacts(t *testing.T) {
+	workspace := fixtureWorkspace(t, "work")
+	summary, err := Find(workspace, fixtureSlug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"plan.md", "state.md"} {
+		manifest := summary.Manifest
+		manifest.Artifacts = []Artifact{{Label: "Duplicate", Path: path}}
+		if err := manifest.Validate(fixtureSlug); err == nil || !strings.Contains(err.Error(), "is built in") {
+			t.Fatalf("Validate(%q) = %v, want built-in artifact rejection", path, err)
+		}
 	}
 }
 
