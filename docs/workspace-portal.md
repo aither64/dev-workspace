@@ -418,6 +418,13 @@ known password-reset cluster may retain its recorded legacy socket, and its
 complete owner record must prove the known runner tuple. Other legacy state
 fails closed. Older target generations that could orphan workspace-scoped
 socket identities are refused.
+New cluster creation records the workspace-scoped socket identity in the same
+per-cluster locked transaction that creates the state directory. Every later
+operation rejects an existing directory without that record. An explicit reset
+can recover late pre-contract state only when the runner's complete socket,
+state, PID-file, and ready-file arguments prove ownership. It stops that runner
+and accepts only its process tree; ambiguous legacy state is left in place for
+manual inspection.
 Reset unsupported cluster state before switching or rolling back. Candidate
 activation repeats this check, so invoking `workspace-host switch` from a
 pre-contract installed generation cannot bypass it; a refusal uses normal

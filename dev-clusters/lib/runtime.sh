@@ -78,6 +78,20 @@ signal_cluster_runner() {
   fi
 }
 
+signal_cluster_runner_socket() {
+  local slug="$1"
+  local pid="$2"
+  local runner_socket="$3"
+  local signal="$4"
+  local action="$5"
+
+  runner_process_matches_socket "$slug" "$pid" "$runner_socket" || return 0
+  if ! kill "-$signal" "$pid" 2>/dev/null &&
+    runner_process_matches_socket "$slug" "$pid" "$runner_socket"; then
+    die "unable to $action cluster runner PID $pid"
+  fi
+}
+
 process_has_argument() {
   local pid="$1"
   local expected="$2"
@@ -104,18 +118,42 @@ process_has_argument_pair() {
   return 1
 }
 
-legacy_runner_process_matches() {
+process_is_descendant_of() {
+  local pid="$1"
+  local ancestor="$2"
+  local key value
+  local depth=0
+  [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$ancestor" =~ ^[0-9]+$ ]] || return 1
+
+  while [ "$depth" -lt 64 ] && [ "$pid" -gt 1 ]; do
+    [ "$pid" = "$ancestor" ] && return 0
+    value=""
+    while read -r key value; do
+      [ "$key" = "PPid:" ] && break
+    done < "/proc/$pid/status" 2>/dev/null || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    pid="$value"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+runner_process_matches_socket() {
   local slug="$1"
   local pid="$2"
-  local legacy_socket="$3"
+  local runner_socket="$3"
   local directory
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   is_running "$pid" || return 1
   directory="$(cluster_dir "$slug")"
-  process_has_argument_pair "$pid" --sock-dir "$legacy_socket" &&
+  process_has_argument_pair "$pid" --sock-dir "$runner_socket" &&
     process_has_argument_pair "$pid" --state-dir "$directory/state" &&
     process_has_argument_pair "$pid" --pid-file "$(pid_file "$slug")" &&
     process_has_argument_pair "$pid" --ready-file "$(ready_file "$slug")"
+}
+
+legacy_runner_process_matches() {
+  runner_process_matches_socket "$@"
 }
 
 legacy_socket_transition_allowed() {
@@ -178,6 +216,14 @@ devcluster_workspace_socket_dir() {
   printf '/tmp/%s-%s\n' "$prefix" "$digest"
 }
 
+devcluster_legacy_socket_dir() {
+  local slug="$1"
+  local prefix="$2"
+  local digest
+  digest="$(printf '%s' "$slug" | sha256sum | cut -c1-12)"
+  printf '/tmp/%s-%s\n' "$prefix" "$digest"
+}
+
 record_cluster_socket_dir() {
   local slug="$1"
   local selected="$2"
@@ -198,6 +244,28 @@ record_cluster_socket_dir() {
   mv -- "$temporary" "$state_file"
 }
 
+devcluster_initialize_cluster_socket_identity() {
+  local slug="$1"
+  local prefix="$2"
+  local directory selected
+  directory="$(cluster_dir "$slug")"
+
+  if [ -e "$directory" ] || [ -L "$directory" ]; then
+    devcluster_validate_cluster_directory "$slug" false \
+      || die "development cluster state disappeared while initializing: $slug"
+    devcluster_socket_dir "$slug" "$prefix" >/dev/null
+    return
+  fi
+
+  # This is the only transaction that turns an absent cluster into new state.
+  # It runs under the per-cluster lifecycle lock, so a stale packaged helper
+  # that creates pre-contract state first makes the existing-state branch above
+  # fail closed instead of being silently relabeled.
+  devcluster_validate_cluster_directory "$slug" true
+  selected="$(devcluster_workspace_socket_dir "$slug" "$prefix")"
+  record_cluster_socket_dir "$slug" "$selected"
+}
+
 devcluster_adopt_package_transition() {
   local slug="$1"
   local prefix="$2"
@@ -209,7 +277,7 @@ devcluster_adopt_package_transition() {
     || die "unsafe development cluster state during package transition: $directory"
 
   canonical="$(devcluster_workspace_socket_dir "$slug" "$prefix")"
-  legacy="/tmp/$prefix-$(printf '%s' "$slug" | sha256sum | cut -c1-12)"
+  legacy="$(devcluster_legacy_socket_dir "$slug" "$prefix")"
   state_file="$directory/socket-dir"
   if [ -e "$state_file" ] || [ -L "$state_file" ]; then
     [ ! -L "$state_file" ] && [ -f "$state_file" ] \
@@ -267,7 +335,7 @@ devcluster_cleanup_paths_json() {
   state_path="$(cluster_dir "$slug")"
   socket_path="$(devcluster_workspace_socket_dir "$slug" "$prefix")"
   if legacy_socket_transition_allowed "$slug" "$prefix"; then
-    legacy_path="/tmp/$prefix-$(printf '%s' "$slug" | sha256sum | cut -c1-12)"
+    legacy_path="$(devcluster_legacy_socket_dir "$slug" "$prefix")"
   fi
   jq -cn \
     --arg state "$state_path" \
@@ -279,8 +347,8 @@ devcluster_cleanup_paths_json() {
 devcluster_socket_dir() {
   local slug="$1"
   local prefix="$2"
-  local legacy_digest selected state_file pid recorded
-  legacy_digest="$(printf '%s' "$slug" | sha256sum | cut -c1-12)"
+  local legacy selected state_file pid recorded
+  legacy="$(devcluster_legacy_socket_dir "$slug" "$prefix")"
   selected="$(devcluster_workspace_socket_dir "$slug" "$prefix")"
   state_file="$(cluster_dir "$slug")/socket-dir"
 
@@ -289,8 +357,11 @@ devcluster_socket_dir() {
       || die "unsafe cluster socket state: $state_file"
     recorded="$(cat "$state_file")"
     case "$recorded" in
-      "$selected") ;;
-      "/tmp/$prefix-$legacy_digest")
+      "$selected")
+        printf '%s\n' "$selected"
+        return
+        ;;
+      "$legacy")
         if legacy_socket_transition_allowed "$slug" "$prefix"; then
           if [ -f "$(pid_file "$slug")" ]; then
             pid="$(cat "$(pid_file "$slug")")"
@@ -309,27 +380,119 @@ devcluster_socket_dir() {
             return
           fi
         fi
+        die "legacy cluster ownership cannot be proven: $slug; reset this cluster first"
         ;;
       *) die "invalid cluster socket state: $state_file" ;;
     esac
-  elif legacy_socket_transition_allowed "$slug" "$prefix"; then
-    recorded="/tmp/$prefix-$legacy_digest"
-    if legacy_socket_owner_matches "$slug" "$recorded" &&
-      { [ -e "$recorded" ] || [ -L "$recorded" ]; }; then
-      [ ! -L "$recorded" ] && [ -d "$recorded" ] \
-        || die "unsafe legacy cluster socket directory: $recorded"
-      selected="$recorded"
-    elif [ -f "$(pid_file "$slug")" ]; then
-      pid="$(cat "$(pid_file "$slug")")"
-      if legacy_runner_process_matches "$slug" "$pid" "$recorded"; then
-        selected="$recorded"
-        record_legacy_socket_owner "$slug" "$selected"
+  fi
+
+  die "cluster socket identity is missing: $slug; reset this cluster first"
+}
+
+devcluster_reset_socket_dir() {
+  local slug="$1"
+  local prefix="$2"
+  local directory state_file canonical legacy recorded pid candidate process
+  local -a referenced=()
+  directory="$(cluster_dir "$slug")"
+  canonical="$(devcluster_workspace_socket_dir "$slug" "$prefix")"
+  legacy="$(devcluster_legacy_socket_dir "$slug" "$prefix")"
+  state_file="$directory/socket-dir"
+
+  recorded=""
+  if [ -e "$state_file" ] || [ -L "$state_file" ]; then
+    [ ! -L "$state_file" ] && [ -f "$state_file" ] \
+      || die "unsafe cluster socket state: $state_file"
+    recorded="$(cat "$state_file")"
+    case "$recorded" in
+      "$canonical") printf '%s\n' "$recorded"; return ;;
+      "$legacy")
+        if legacy_socket_transition_allowed "$slug" "$prefix" &&
+          legacy_socket_owner_matches "$slug" "$legacy"; then
+          printf '%s\n' "$legacy"
+          return
+        fi
+        ;;
+      *) die "invalid cluster socket state: $state_file" ;;
+    esac
+  elif legacy_socket_transition_allowed "$slug" "$prefix" &&
+    legacy_socket_owner_matches "$slug" "$legacy"; then
+    [ -e "$legacy" ] || [ -L "$legacy" ] \
+      || die "recorded legacy cluster socket is missing: $legacy"
+    [ ! -L "$legacy" ] && [ -d "$legacy" ] \
+      || die "unsafe legacy cluster socket directory: $legacy"
+    printf '%s\n' "$legacy"
+    return
+  fi
+
+  pid=""
+  if [ -f "$(pid_file "$slug")" ]; then
+    pid="$(cat "$(pid_file "$slug")")"
+  fi
+  for candidate in "$canonical" "$legacy" "$directory"; do
+    while IFS= read -r process; do
+      [ -n "$process" ] || continue
+      [[ " ${referenced[*]-} " = *" $process "* ]] || referenced+=("$process")
+    done < <(socket_processes "$slug" "$candidate")
+  done
+
+  if [ -z "$recorded" ] && [ -n "$pid" ] &&
+    runner_process_matches_socket "$slug" "$pid" "$canonical"; then
+    candidate="$canonical"
+  elif [ -n "$pid" ] && runner_process_matches_socket "$slug" "$pid" "$legacy"; then
+    candidate="$legacy"
+  else
+    candidate="$canonical"
+    if [ "${#referenced[@]}" -gt 0 ]; then
+      die "cluster socket identity is missing and process ownership cannot be proven: $slug"
+    fi
+    if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      die "cluster socket identity is missing and the legacy socket is ambiguous: $slug"
+    fi
+    [ -z "$recorded" ] || candidate="$recorded"
+  fi
+
+  for process in "${referenced[@]}"; do
+    { [ "$process" = "$pid" ] || process_is_descendant_of "$process" "$pid"; } \
+      || die "cluster socket identity is missing and process ownership cannot be proven: $slug"
+  done
+  printf '%s\n' "$candidate"
+}
+
+devcluster_reset_cluster_runtime() {
+  local slug="$1"
+  local prefix="$2"
+  local sock_dir legacy pid
+  local -a processes=()
+
+  if ! sock_dir="$(devcluster_reset_socket_dir "$slug" "$prefix")"; then
+    return 1
+  fi
+  legacy="$(devcluster_legacy_socket_dir "$slug" "$prefix")"
+
+  if [ -f "$(pid_file "$slug")" ]; then
+    pid="$(cat "$(pid_file "$slug")")"
+    if runner_process_matches_socket "$slug" "$pid" "$sock_dir"; then
+      signal_cluster_runner_socket "$slug" "$pid" "$sock_dir" TERM stop
+      for _ in $(seq 1 120); do
+        runner_process_matches_socket "$slug" "$pid" "$sock_dir" || break
+        sleep 1
+      done
+      if runner_process_matches_socket "$slug" "$pid" "$sock_dir"; then
+        signal_cluster_runner_socket "$slug" "$pid" "$sock_dir" KILL kill
       fi
     fi
   fi
 
-  record_cluster_socket_dir "$slug" "$selected"
-  printf '%s\n' "$selected"
+  if [ "$sock_dir" = "$legacy" ]; then
+    mapfile -t processes < <(socket_processes "$slug" "$sock_dir")
+    [ "${#processes[@]}" -eq 0 ] \
+      || die "legacy cluster processes remain after stopping the proven runner: ${processes[*]}"
+  else
+    kill_socket_processes "$slug" "$sock_dir"
+  fi
+  remove_result_link "$slug"
+  remove_cluster_runtime_state "$slug" "$sock_dir"
 }
 
 process_references_path() {
@@ -578,7 +741,7 @@ devcluster_require_lifecycle_lock_owner() {
 
 devcluster_require_lifecycle_mutation_allowed() {
   local slug="$1"
-  local callback="$2"
+  local operation_name="$2"
   local owner="${VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION:-}"
   local entry operation _command journal
 
@@ -594,7 +757,7 @@ devcluster_require_lifecycle_mutation_allowed() {
         || die "development session '$slug' lifecycle journal must be an owned mode-0600 file"
       [ "$owner" = "$operation" ] \
         || die "development session '$slug' has an unfinished lifecycle operation"
-      [ "$callback" = reset_cluster ] \
+      [ "$operation_name" = reset ] \
         || die "only lifecycle-owned cluster reset is allowed for '$slug'"
       devcluster_require_lifecycle_lock_owner "$slug" "$owner"
     fi
@@ -673,15 +836,24 @@ devcluster_lifecycle_callback() {
   local slug="$1"
   local require_active="$2"
   local mutation="$3"
-  local callback="$4"
-  shift 4
+  local operation_name="$4"
+  local callback="$5"
+  shift 5
 
-  devcluster_validate_cluster_directory "$slug" false || true
+  local cluster_exists=false
+  if devcluster_validate_cluster_directory "$slug" false; then
+    cluster_exists=true
+  fi
   if [ "$mutation" = true ]; then
-    devcluster_require_lifecycle_mutation_allowed "$slug" "$callback"
+    devcluster_require_lifecycle_mutation_allowed "$slug" "$operation_name"
   fi
   if [ "$require_active" = true ]; then
     devcluster_require_active_session "$slug"
+  fi
+  if [ "$cluster_exists" = true ] &&
+    [ "$operation_name" != reset ] &&
+    [ "$operation_name" != transition-adopt ]; then
+    devcluster_socket_dir "$slug" "$DEVCLUSTER_SOCKET_PREFIX" >/dev/null
   fi
   "$callback" "$slug" "$@"
 }
@@ -690,11 +862,13 @@ devcluster_with_lifecycle_lock() {
   local slug="$1"
   local require_active="$2"
   local mutation="$3"
-  local callback="$4"
-  shift 4
+  local operation_name="$4"
+  local callback="$5"
+  shift 5
 
   devcluster_with_lock "$DEVCLUSTER_KIND-$slug" \
-    devcluster_lifecycle_callback "$slug" "$require_active" "$mutation" "$callback" "$@"
+    devcluster_lifecycle_callback \
+    "$slug" "$require_active" "$mutation" "$operation_name" "$callback" "$@"
 }
 
 list_cluster_slugs() {
@@ -750,7 +924,8 @@ gcroots_cluster() {
   for slug in "${slugs[@]}"; do
     [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid cluster slug '$slug'"
     if [ "$cleanup" = 1 ]; then
-      devcluster_with_lifecycle_lock "$slug" false true gcroot_cluster "$cleanup"
+      devcluster_with_lifecycle_lock \
+        "$slug" false true gcroots-cleanup gcroot_cluster "$cleanup"
     else
       gcroot_cluster "$slug" "$cleanup"
     fi
@@ -763,6 +938,7 @@ gcroot_cluster() {
   local link target state
 
   devcluster_validate_cluster_directory "$slug" false || return 0
+  devcluster_socket_dir "$slug" "$DEVCLUSTER_SOCKET_PREFIX" >/dev/null
   link="$(result_link "$slug")"
 
   if cluster_running "$slug"; then

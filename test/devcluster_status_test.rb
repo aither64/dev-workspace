@@ -538,7 +538,7 @@ class DevclusterStatusTest < Minitest::Test
             printf '%s\\n' "$!" > "$CHILD_PID_FILE"
             wait
           }
-          devcluster_with_lifecycle_lock "$SESSION_SLUG" false true callback
+          devcluster_with_lifecycle_lock "$SESSION_SLUG" false true test-detach callback
         BASH
         parent = Process.spawn(
           'bash', '-c', script, 'bash', workspace, kind, runtime, child_pid_file, slug,
@@ -566,7 +566,10 @@ class DevclusterStatusTest < Minitest::Test
       refute_match(/^runner_process_matches\(\)/, File.read(helper))
       refute_match(/^devcluster_socket_dir\(\)/, File.read(helper))
       assert_includes(File.read(helper), 'source "$SCRIPT_DIR/../../lib/runtime.sh"')
-      assert_includes(File.read(helper), 'remove_cluster_runtime_state "$slug" "$sock_dir"')
+      assert_includes(
+        File.read(helper),
+        'devcluster_reset_cluster_runtime "$slug" "$DEVCLUSTER_SOCKET_PREFIX"'
+      )
     end
     runtime = File.read(File.join(ROOT, 'dev-clusters/lib/runtime.sh'))
     assert_equal(1, runtime.scan(/^runner_process_matches\(\)/).length)
@@ -575,6 +578,7 @@ class DevclusterStatusTest < Minitest::Test
     assert_equal(1, runtime.scan(/^kill_socket_processes\(\)/).length)
     %w[
       list_cluster_slugs remove_cluster_runtime_state remove_result_link
+      devcluster_reset_cluster_runtime
       gcroots_cluster gcroot_cluster
     ].each do |function|
       HELPERS.each_value do |helper|
@@ -759,7 +763,73 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
-  def test_package_transition_refuses_stale_precontract_state_even_with_legacy_opt_in
+  def test_new_cluster_creation_records_workspace_socket_identity
+    HELPERS.each do |kind, helper|
+      Dir.mktmpdir('devcluster-new-socket-identity') do |workspace|
+        slug = "new-#{kind}-#{Process.pid}"
+        write_lifecycle(workspace, slug, 'active')
+
+        _stdout, stderr, result = Open3.capture3(
+          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+          helper, 'config', slug
+        )
+
+        assert(result.success?, stderr)
+        state_file = File.join(
+          workspace, '.dev-clusters', kind, 'clusters', slug, 'socket-dir'
+        )
+        assert_equal(
+          workspace_socket_directory(kind, workspace, slug),
+          File.read(state_file).strip
+        )
+      end
+    end
+  end
+
+  def test_ordinary_access_refuses_late_precontract_state_and_reset_cleans_it
+    HELPERS.each do |kind, helper|
+      Dir.mktmpdir('devcluster-late-precontract') do |workspace|
+        slug = "late-precontract-#{kind}-#{Process.pid}"
+        directory = File.join(workspace, '.dev-clusters', kind, 'clusters', slug)
+        prefix = kind == 'vpsadmin' ? 'vpsfree-devcluster' : 'vpsadminos-devcluster'
+        legacy = "/tmp/#{prefix}-#{Digest::SHA256.hexdigest(slug)[0, 12]}"
+        FileUtils.mkdir_p(directory)
+        FileUtils.mkdir_p(legacy)
+        write_lifecycle(workspace, slug, 'active')
+        child = spawn_marker_process(
+          '--sock-dir', legacy,
+          '--state-dir', File.join(directory, 'state'),
+          '--pid-file', File.join(directory, 'runner.pid'),
+          '--ready-file', File.join(directory, 'ready')
+        )
+        File.write(File.join(directory, 'runner.pid'), "#{child}\n")
+        begin
+          _stdout, stderr, result = Open3.capture3(
+            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            helper, 'status', slug, '--json'
+          )
+          refute(result.success?)
+          assert_includes(stderr, 'cluster socket identity is missing')
+          refute(File.exist?(File.join(directory, 'socket-dir')))
+          assert(Process.kill(0, child))
+
+          _stdout, stderr, result = Open3.capture3(
+            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
+            helper, 'reset', slug
+          )
+          assert(result.success?, stderr)
+          assert_process_exited(child, "#{kind} reset left the proven legacy runner alive")
+          refute(File.exist?(directory))
+          refute(File.exist?(legacy))
+        ensure
+          stop_process(child)
+          FileUtils.rm_rf(legacy)
+        end
+      end
+    end
+  end
+
+  def test_package_transition_refuses_stale_precontract_state
     HELPERS.each do |kind, helper|
       Dir.mktmpdir('devcluster-transition-stale') do |workspace|
         slug = "stale-#{kind}-#{Process.pid}"
@@ -769,10 +839,7 @@ class DevclusterStatusTest < Minitest::Test
         FileUtils.mkdir_p(directory)
 
         _stdout, stderr, result = Open3.capture3(
-          {
-            'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-            'VPSFREE_DEVCLUSTER_ALLOW_PRECONTRACT_ADOPTION' => '1'
-          },
+          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -801,10 +868,7 @@ class DevclusterStatusTest < Minitest::Test
         held = File.open(File.join(legacy, 'held'), File::WRONLY | File::CREAT, 0o600)
 
         _stdout, stderr, result = Open3.capture3(
-          {
-            'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-            'VPSFREE_DEVCLUSTER_ALLOW_PRECONTRACT_ADOPTION' => '1'
-          },
+          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -831,10 +895,7 @@ class DevclusterStatusTest < Minitest::Test
         child = spawn_marker_process('--sock-dir', legacy)
         begin
           _stdout, stderr, result = Open3.capture3(
-            {
-              'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-              'VPSFREE_DEVCLUSTER_ALLOW_PRECONTRACT_ADOPTION' => '1'
-            },
+            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'transition-adopt', slug
           )
 
@@ -869,10 +930,7 @@ class DevclusterStatusTest < Minitest::Test
         File.write(File.join(directory, 'runner.pid'), "#{child}\n")
         begin
           _stdout, stderr, result = Open3.capture3(
-            {
-              'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-              'VPSFREE_DEVCLUSTER_ALLOW_PRECONTRACT_ADOPTION' => '1'
-            },
+            {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
             helper, 'transition-adopt', slug
           )
 
@@ -902,10 +960,7 @@ class DevclusterStatusTest < Minitest::Test
         File.write(File.join(directory, 'legacy-socket-owner'), "#{owner}\n")
 
         _stdout, stderr, result = Open3.capture3(
-          {
-            'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-            'VPSFREE_DEVCLUSTER_ALLOW_PRECONTRACT_ADOPTION' => '1'
-          },
+          {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace},
           helper, 'transition-adopt', slug
         )
 
@@ -1012,6 +1067,7 @@ class DevclusterStatusTest < Minitest::Test
         BASH
         begin
           File.write(File.join(directory_a, 'runner.pid'), "#{child}\n")
+          File.write(File.join(directory_a, 'socket-dir'), "#{legacy}\n")
           stdout, stderr, result = Open3.capture3(
             {
               'CLUSTER_DIR' => directory_a,
@@ -1037,7 +1093,7 @@ class DevclusterStatusTest < Minitest::Test
             'bash', '-c', script, 'bash', runtime
           )
           refute(result.success?, stdout)
-          assert_includes(stderr, 'refusing to replace different cluster socket state')
+          assert_includes(stderr, 'legacy cluster ownership cannot be proven')
           assert_equal(legacy, File.read(File.join(directory_b, 'socket-dir')).strip)
           assert_equal(
             File.read(File.join(directory_a, 'legacy-socket-owner')),
@@ -1076,9 +1132,11 @@ class DevclusterStatusTest < Minitest::Test
             _stdout, stderr, result = Open3.capture3(
               {'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace_b}, helper, 'reset', slug
             )
-            assert(result.success?, stderr)
+            refute(result.success?)
+            assert_includes(stderr, 'process ownership cannot be proven')
             assert(Process.kill(0, child), "#{kind} reset killed a foreign legacy cluster")
             assert(File.directory?(directory_a))
+            assert(File.directory?(directory_b))
           ensure
             stop_process(child)
           end
@@ -1292,6 +1350,10 @@ class DevclusterStatusTest < Minitest::Test
       slug = '2026-09-05-test'
       directory = File.join(workspace, '.dev-clusters', kind, 'clusters', slug)
       FileUtils.mkdir_p(directory)
+      File.write(
+        File.join(directory, 'socket-dir'),
+        "#{workspace_socket_directory(kind, workspace, slug)}\n"
+      )
       write_lifecycle(workspace, slug, 'active')
       yield workspace, directory, slug
     end

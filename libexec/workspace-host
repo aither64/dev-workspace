@@ -33,6 +33,8 @@ module VpsfreeWorkspaceHost
   ].freeze
   unless RUNTIME_CONTRACT.fetch('developmentClusterStateSchema').is_a?(Integer) &&
          RUNTIME_CONTRACT.fetch('developmentClusterStateSchema').positive? &&
+         RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy').is_a?(Integer) &&
+         RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy').positive? &&
          RUNTIME_CONTRACT.fetch('trackingMaxBytes').is_a?(Integer) &&
          RUNTIME_CONTRACT.fetch('trackingMaxBytes').positive?
     raise 'workspace runtime contract has an invalid development cluster contract'
@@ -922,9 +924,14 @@ module VpsfreeWorkspaceHost
       return false if payload.bytesize > 64 * 1024
 
       data = JSON.parse(payload)
-      data.is_a?(Hash) && DEVELOPMENT_CLUSTER_IDENTITY_FIELDS.all? do |field|
+      return false unless data.is_a?(Hash)
+      return false unless DEVELOPMENT_CLUSTER_IDENTITY_FIELDS.all? do |field|
         data[field] == RUNTIME_CONTRACT.fetch(field)
       end
+
+      policy = data['developmentClusterTransitionPolicy']
+      policy.is_a?(Integer) &&
+        policy >= RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy')
     rescue Errno::ENOENT, Errno::EACCES, JSON::ParserError
       false
     end

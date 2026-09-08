@@ -6,6 +6,7 @@ CLUSTER_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_INPUT="${VPSFREE_DEVCLUSTER_WORKSPACE:-$CLUSTER_DIR/../..}"
 WORKSPACE="$(cd -- "$WORKSPACE_INPUT" && pwd -P)"
 DEVCLUSTER_KIND=vpsadminos
+DEVCLUSTER_SOCKET_PREFIX=vpsadminos-devcluster
 STATE_ROOT="$WORKSPACE/.dev-clusters/vpsadminos"
 SSH_DIR="$STATE_ROOT/ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
@@ -53,7 +54,7 @@ ready_file() {
 }
 
 socket_dir() {
-  devcluster_socket_dir "$1" vpsadminos-devcluster
+  devcluster_socket_dir "$1" "$DEVCLUSTER_SOCKET_PREFIX"
 }
 
 topology_file() {
@@ -106,7 +107,7 @@ ensure_cluster_config() {
   cfg="$(cluster_config_file "$slug")"
 
   need_cmd jq
-  devcluster_validate_cluster_directory "$slug" true
+  devcluster_initialize_cluster_socket_identity "$slug" "$DEVCLUSTER_SOCKET_PREFIX"
 
   [ ! -L "$cfg" ] || die "unsafe cluster config symlink: $cfg"
   if [ ! -f "$cfg" ]; then
@@ -679,16 +680,7 @@ reset_cluster() {
   [ -n "$slug" ] || die "missing slug"
 
   devcluster_validate_cluster_directory "$slug" false || true
-  local sock_dir
-  sock_dir="$(socket_dir "$slug")"
-
-  if [ -f "$(pid_file "$slug")" ] && runner_process_matches "$slug" "$(cat "$(pid_file "$slug")")"; then
-    stop_cluster "$slug"
-  fi
-
-  kill_socket_processes "$slug" "$sock_dir"
-  remove_result_link "$slug"
-  remove_cluster_runtime_state "$slug" "$sock_dir"
+  devcluster_reset_cluster_runtime "$slug" "$DEVCLUSTER_SOCKET_PREFIX" || return
   printf 'cluster %s state removed\n' "$slug"
 }
 
@@ -711,18 +703,19 @@ main() {
   fi
 
   case "$cmd" in
-    start) devcluster_with_lifecycle_lock "$1" true true start_cluster "${@:2}" ;;
-    stop) devcluster_with_lifecycle_lock "$1" false true stop_cluster "${@:2}" ;;
-    status) devcluster_with_lifecycle_lock "$1" false false status_cluster "${@:2}" ;;
+    start) devcluster_with_lifecycle_lock "$1" true true start start_cluster "${@:2}" ;;
+    stop) devcluster_with_lifecycle_lock "$1" false true stop stop_cluster "${@:2}" ;;
+    status) devcluster_with_lifecycle_lock "$1" false false status status_cluster "${@:2}" ;;
     gcroots) gcroots_cluster "$@" ;;
-    info) devcluster_with_lifecycle_lock "$1" false false info_cluster "${@:2}" ;;
-    config) devcluster_with_lifecycle_lock "$1" true true config_cluster "${@:2}" ;;
-    update) devcluster_with_lifecycle_lock "$1" true true update_cluster "${@:2}" ;;
-    restart) devcluster_with_lifecycle_lock "$1" true true restart_service "${@:2}" ;;
-    ssh) devcluster_with_lifecycle_lock "$1" true true ssh_cluster "${@:2}" ;;
-    reset) devcluster_with_lifecycle_lock "$1" false true reset_cluster "${@:2}" ;;
+    info) devcluster_with_lifecycle_lock "$1" false false info info_cluster "${@:2}" ;;
+    config) devcluster_with_lifecycle_lock "$1" true true config config_cluster "${@:2}" ;;
+    update) devcluster_with_lifecycle_lock "$1" true true update update_cluster "${@:2}" ;;
+    restart) devcluster_with_lifecycle_lock "$1" true true restart restart_service "${@:2}" ;;
+    ssh) devcluster_with_lifecycle_lock "$1" true true ssh ssh_cluster "${@:2}" ;;
+    reset) devcluster_with_lifecycle_lock "$1" false true reset reset_cluster "${@:2}" ;;
     cleanup-paths) need_cmd jq; devcluster_cleanup_paths_json "$1" vpsadminos-devcluster ;;
-    transition-adopt) devcluster_with_lifecycle_lock "$1" false true \
+    transition-adopt) devcluster_with_lifecycle_lock \
+      "$1" false true transition-adopt \
       devcluster_adopt_package_transition vpsadminos-devcluster ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;

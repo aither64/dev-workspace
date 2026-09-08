@@ -236,24 +236,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusForbidden, "request origin is invalid")
 			return
 		}
-		if !lifecycleMutationRequest(r) {
-			unlock, err := s.lockTransition()
-			if err != nil {
-				s.writeError(w, r, http.StatusServiceUnavailable, "workspace runtime is changing; retry shortly")
-				return
-			}
-			defer unlock()
-			if err := s.requireCurrentHostProfile(); err != nil {
-				s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
-				return
-			}
-		}
 	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		s.index(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/sessions":
-		s.createSession(w, r)
+		s.withPortalMutation(w, r, func() { s.createSession(w, r) })
 	case r.Method == http.MethodGet && r.URL.Path == "/api/models":
 		s.models(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
@@ -271,13 +259,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func lifecycleMutationRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/sessions/") {
-		return false
+func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, mutate func()) {
+	unlock, err := s.lockTransition()
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "workspace runtime is changing; retry shortly")
+		return
 	}
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	return strings.HasSuffix(path, "/archive") || strings.HasSuffix(path, "/delete") ||
-		strings.HasSuffix(path, "/revive")
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	mutate()
 }
 
 func (s *Server) lockTransition() (func(), error) {
@@ -813,21 +806,45 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		s.deleteSession(w, r, parts[0])
 		return
 	}
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "archive" {
+		summary, err := session.Find(s.config.Workspace, parts[0])
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.startArchive(w, r, summary)
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "revive" {
+		summary, err := session.Find(s.config.Workspace, parts[0])
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.startRevive(w, r, summary)
+		return
+	}
+	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		s.withPortalMutation(w, r, func() { s.sessionAPIResolved(w, r, parts) })
+		return
+	}
+	s.sessionAPIResolved(w, r, parts)
+}
+
+func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, parts []string) {
 	summary, err := session.Find(s.config.Workspace, parts[0])
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	s.sessionAPIForSummary(w, r, parts, summary)
+}
+
+func (s *Server) sessionAPIForSummary(
+	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
+) {
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
 		s.releaseCluster(w, r, summary)
-		return
-	}
-	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "archive" {
-		s.startArchive(w, r, summary)
-		return
-	}
-	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "revive" {
-		s.startRevive(w, r, summary)
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "operation" {

@@ -826,6 +826,10 @@ class WorkspaceHostTest < Minitest::Test
       )
       File.write(old_contract, JSON.generate(
         'developmentClusterStateSchema' => 1,
+        'developmentClusterTransitionPolicy' =>
+          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+            'developmentClusterTransitionPolicy'
+          ),
         'trackingMaxBytes' => 1024 * 1024
       ))
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
@@ -833,6 +837,65 @@ class WorkspaceHostTest < Minitest::Test
         workspace, '.dev-clusters', 'vpsadminos', 'clusters',
         '2026-09-07-active-cluster'
       ))
+
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(2, host.send(:profile_generation))
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'target package has no compatible cluster-state contract'
+      )
+    end
+  end
+
+  def test_switch_accepts_a_stricter_cluster_transition_policy
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      cluster = File.join(
+        workspace, '.dev-clusters', 'vpsadminos', 'clusters',
+        '2026-09-07-active-cluster'
+      )
+      FileUtils.mkdir_p(cluster)
+      File.write(File.join(cluster, 'socket-dir'), "/tmp/workspace-scoped-socket\n")
+      host.candidate = make_package(
+        paths.fetch(:root),
+        'package-stricter-policy',
+        transition_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+          'developmentClusterTransitionPolicy'
+        ) + 1
+      )
+
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(1, host.send(:profile_generation))
+    end
+  end
+
+  def test_rollback_refuses_the_permissive_cluster_transition_policy
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      old_contract = File.join(
+        host.send(:profile_generation_path, 1),
+        'share/workspace-portal/runtime-contract.json'
+      )
+      File.write(old_contract, JSON.generate(
+        'developmentClusterStateSchema' =>
+          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('developmentClusterStateSchema'),
+        'developmentClusterTransitionPolicy' => 1,
+        'trackingMaxBytes' =>
+          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes')
+      ))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      cluster = File.join(
+        workspace, '.dev-clusters', 'vpsadmin', 'clusters',
+        '2026-09-07-active-cluster'
+      )
+      FileUtils.mkdir_p(cluster)
+      File.write(File.join(cluster, 'socket-dir'), "/tmp/workspace-scoped-socket\n")
 
       assert_equal(1, host.run('workspace-host', ['rollback']))
       assert_equal(2, host.send(:profile_generation))
@@ -1512,7 +1575,10 @@ class WorkspaceHostTest < Minitest::Test
     parent,
     name,
     cluster_contract: true,
-    tracking_max: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes')
+    tracking_max: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes'),
+    transition_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+      'developmentClusterTransitionPolicy'
+    )
   )
     package = File.join(parent, name)
     command = File.join(package, 'bin', 'workspace-host')
@@ -1526,6 +1592,7 @@ class WorkspaceHostTest < Minitest::Test
         'developmentClusterStateSchema' => VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
           'developmentClusterStateSchema'
         ),
+        'developmentClusterTransitionPolicy' => transition_policy,
         'trackingMaxBytes' => tracking_max
       ))
       %w[vpsadmin vpsadminos].each do |kind|

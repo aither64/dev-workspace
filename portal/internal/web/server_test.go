@@ -65,6 +65,72 @@ func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
 	}
 }
 
+func TestPortalMutationRejectsProfileSwitchWhileWaiting(t *testing.T) {
+	for _, scenario := range []string{"successful", "compensated"} {
+		t.Run(scenario, func(t *testing.T) {
+			server := newTestServer(t)
+			path := filepath.Join(t.TempDir(), "transition.lock")
+			owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+				t.Fatal(err)
+			}
+			server.config.TransitionLock = path
+
+			request := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(""))
+			request.Header.Set("Origin", server.config.BaseURL)
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				server.Handler().ServeHTTP(response, request)
+				close(done)
+			}()
+			select {
+			case <-done:
+				t.Fatal("portal mutation did not wait for the transition")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			oldTarget, err := os.Readlink(server.config.HostProfile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(server.config.HostProfile); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), server.config.HostProfile); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "compensated" {
+				if err := os.Remove(server.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(oldTarget, server.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("portal mutation did not continue after the transition")
+			}
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), "superseded workspace package") {
+				t.Fatalf("body = %q", response.Body.String())
+			}
+		})
+	}
+}
+
 func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "transition.lock")
 	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)

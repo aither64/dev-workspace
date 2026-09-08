@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,20 +17,33 @@ import (
 func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
 	workspace := t.TempDir()
 	slug := "2026-09-05-contract"
-	for kind, config := range map[string]string{
-		"vpsadmin":   `{"topologies":{"single":["node1"]},"seed":{"users":[{"login":"custom","password":"custom-password"}]}}`,
-		"vpsadminos": `{"topologies":{"single":["node1"]}}`,
+	for kind, fixture := range map[string]struct {
+		config, socketPrefix string
+	}{
+		"vpsadmin": {
+			config:       `{"topologies":{"single":["node1"]},"seed":{"users":[{"login":"custom","password":"custom-password"}]}}`,
+			socketPrefix: "vpsfree-devcluster",
+		},
+		"vpsadminos": {
+			config:       `{"topologies":{"single":["node1"]}}`,
+			socketPrefix: "vpsadminos-devcluster",
+		},
 	} {
 		directory := filepath.Join(workspace, ".dev-clusters", kind, "clusters", slug)
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		for name, value := range map[string]string{
-			"topology": "single\n", "network": "bridge\n", "config.json": config,
+			"topology": "single\n", "network": "bridge\n", "config.json": fixture.config,
 		} {
 			if err := os.WriteFile(filepath.Join(directory, name), []byte(value), 0o600); err != nil {
 				t.Fatal(err)
 			}
+		}
+		digest := fmt.Sprintf("%x", sha256.Sum256([]byte(workspace+"\x00"+slug)))[:12]
+		socketDirectory := "/tmp/" + fixture.socketPrefix + "-" + digest + "\n"
+		if err := os.WriteFile(filepath.Join(directory, "socket-dir"), []byte(socketDirectory), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
 	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
