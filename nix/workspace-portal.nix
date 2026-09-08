@@ -74,6 +74,8 @@ buildGoModule {
   postInstall = ''
     install -Dm755 ${src}/libexec/dev-session \
       "$out/libexec/workspace-portal/dev-session"
+    install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
+      "$out/libexec/workspace-portal/workspace-profile-identity.rb"
     install -Dm755 ${src}/bin/workspace-pki "$out/bin/workspace-pki"
     install -Dm755 ${src}/bin/workspace-portal-password-hash \
       "$out/bin/workspace-portal-password-hash"

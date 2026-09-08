@@ -5,6 +5,7 @@ require 'fileutils'
 require 'json'
 require 'minitest/autorun'
 require 'open3'
+require 'pty'
 require 'rbconfig'
 require 'shellwords'
 require 'stringio'
@@ -16,6 +17,209 @@ class DevSessionTest < Minitest::Test
   class TTYInput < StringIO
     def tty?
       true
+    end
+  end
+
+  class SignalingTTYInput < TTYInput
+    def initialize(value, read:)
+      super(value)
+      @read = read
+    end
+
+    def gets(*arguments)
+      value = super
+      @read << true
+      value
+    end
+  end
+
+  class LockingCLI < VpsfreeDevSession::CLI
+    def initialize(*args, entered:, release:, **options)
+      super(*args, **options)
+      @entered = entered
+      @release = release
+    end
+
+    private
+
+    def run_command(_command)
+      @entered << true
+      @release.pop
+    end
+  end
+
+  def test_cli_holds_the_shared_host_transition_lock_while_mutating_state
+    Dir.mktmpdir('dev-session-transition-lock-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      entered = Queue.new
+      release = Queue.new
+      cli = LockingCLI.new(
+        ['--transition-lock', path, 'probe'],
+        entered:,
+        release:,
+        out: StringIO.new,
+        err: StringIO.new
+      )
+      result = nil
+      thread = Thread.new { result = cli.run }
+      entered.pop
+
+      File.open(path, File::RDWR) do |file|
+        refute(file.flock(File::LOCK_EX | File::LOCK_NB))
+        release << true
+        thread.join
+        assert(file.flock(File::LOCK_EX | File::LOCK_NB))
+      end
+      assert_equal(0, result)
+    ensure
+      release << true if thread&.alive?
+      thread&.join
+    end
+  end
+
+  def test_cli_confirms_lifecycle_action_before_waiting_for_the_transition_lock
+    Dir.mktmpdir('dev-session-lifecycle-lock-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      owner = File.open(path, File::RDWR | File::CREAT, 0o600)
+      owner.flock(File::LOCK_EX)
+      prompt_read = Queue.new
+      calls = []
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:|
+        calls << [input, as_is, force]
+      end
+      cli = VpsfreeDevSession::CLI.new(
+        [
+          '--transition-lock', path, '--', 'delete',
+          '2026-06-06-demo', '--as-is'
+        ],
+        input: SignalingTTYInput.new("2026-06-06-demo\n", read: prompt_read),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+      cli.define_singleton_method(:runner) { fake_runner }
+
+      thread = Thread.new { cli.run }
+      prompt_read.pop
+      sleep 0.05
+      assert_empty(calls)
+      owner.flock(File::LOCK_UN)
+
+      assert_equal(0, thread.value)
+      assert_equal([['2026-06-06-demo', true, false]], calls)
+    ensure
+      owner&.flock(File::LOCK_UN)
+      owner&.close
+      thread&.join
+    end
+  end
+
+  def test_lifecycle_confirmation_uses_a_real_terminal_before_taking_the_lock
+    Dir.mktmpdir('dev-session-lifecycle-pty-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      marker = File.join(directory, 'deleted')
+      owner = File.open(path, File::RDWR | File::CREAT, 0o600)
+      owner.flock(File::LOCK_EX)
+      master, slave = PTY.open
+      pid = fork do
+        master.close
+        $stdin.reopen(slave)
+        $stdout.reopen(slave)
+        $stderr.reopen(slave)
+        slave.close
+        fake_runner = Object.new
+        fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+        fake_runner.define_singleton_method(:delete) do |_input, as_is:, force:|
+          File.write(marker, "#{as_is}:#{force}\n")
+        end
+        cli = VpsfreeDevSession::CLI.new([
+          '--transition-lock', path, '--', 'delete',
+          '2026-06-06-demo', '--as-is'
+        ])
+        cli.define_singleton_method(:runner) { fake_runner }
+        exit!(cli.run)
+      end
+      slave.close
+
+      prompt = +''
+      until prompt.include?('Type 2026-06-06-demo to delete this session:')
+        ready = IO.select([master], nil, nil, 2)
+        flunk('timed out waiting for lifecycle confirmation prompt') unless ready
+        prompt << master.read_nonblock(4096)
+      end
+      master.write("2026-06-06-demo\n")
+      sleep 0.05
+      refute(File.exist?(marker))
+      assert(Process.kill(0, pid))
+      owner.flock(File::LOCK_UN)
+
+      _waited, status = Process.wait2(pid)
+      pid = nil
+      assert(status.success?)
+      assert_equal("true:false\n", File.read(marker))
+    ensure
+      if pid
+        Process.kill('TERM', pid) rescue nil
+        Process.wait(pid) rescue nil
+      end
+      master&.close unless master&.closed?
+      slave&.close unless slave&.closed?
+      owner&.flock(File::LOCK_UN)
+      owner&.close
+    end
+  end
+
+  def test_waiting_lifecycle_cli_rejects_a_generation_changed_after_confirmation
+    %w[successful-switch compensated-switch].each do |scenario|
+      Dir.mktmpdir("dev-session-#{scenario}") do |directory|
+        path = File.join(directory, 'transition.lock')
+        expected = File.join(directory, 'old')
+        selected = File.join(directory, 'new')
+        profile = File.join(directory, 'profile')
+        FileUtils.mkdir_p(expected)
+        FileUtils.mkdir_p(selected)
+        File.symlink(expected, profile)
+        owner = File.open(path, File::RDWR | File::CREAT, 0o600)
+        owner.flock(File::LOCK_EX)
+        prompt_read = Queue.new
+        calls = []
+        error_output = StringIO.new
+        fake_runner = Object.new
+        fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+        fake_runner.define_singleton_method(:delete) { |*arguments, **options| calls << [arguments, options] }
+        cli = VpsfreeDevSession::CLI.new(
+          [
+            '--transition-lock', path,
+            '--host-profile', profile,
+            '--expected-host-generation', expected,
+            '--expected-host-profile-token', profile_link_token(profile),
+            '--', 'delete', '2026-06-06-demo', '--as-is'
+          ],
+          input: SignalingTTYInput.new("2026-06-06-demo\n", read: prompt_read),
+          out: StringIO.new,
+          err: error_output
+        )
+        cli.define_singleton_method(:runner) { fake_runner }
+
+        thread = Thread.new { cli.run }
+        prompt_read.pop
+        File.unlink(profile)
+        File.symlink(selected, profile)
+        if scenario == 'compensated-switch'
+          File.unlink(profile)
+          File.symlink(expected, profile)
+        end
+        owner.flock(File::LOCK_UN)
+
+        assert_equal(1, thread.value)
+        assert_empty(calls)
+        assert_includes(error_output.string, 'superseded package generation')
+      ensure
+        owner&.flock(File::LOCK_UN)
+        owner&.close
+        thread&.join
+      end
     end
   end
 
@@ -169,6 +373,31 @@ class DevSessionTest < Minitest::Test
         codex_client_version: @codex_client_version,
         codex_pane_id: @codex_pane_id
       )
+    end
+  end
+
+  class WindowRecordingTmux < ManagedTmux
+    attr_reader :captures
+
+    def initialize(*args, **options)
+      super
+      @captures = []
+    end
+
+    def capture(*args)
+      @captures << args
+      ['%new']
+    end
+  end
+
+  class KillThenFailOnceTmux < ManagedTmux
+    def run(*args)
+      killing = args.first(2) == ['kill-session', '-t']
+      super
+      return unless killing && !@reported_failure
+
+      @reported_failure = true
+      raise VpsfreeDevSession::Error, 'simulated failure after tmux removal'
     end
   end
 
@@ -439,14 +668,14 @@ class DevSessionTest < Minitest::Test
       @callback = callback
     end
 
-    def capture(argv, allow_failure: false)
+    def capture(argv, allow_failure: false, **options)
       @callback.call(argv)
-      @delegate.capture(argv, allow_failure:)
+      @delegate.capture(argv, allow_failure:, **options)
     end
 
-    def run(argv)
+    def run(argv, **options)
       @callback.call(argv)
-      @delegate.run(argv)
+      @delegate.run(argv, **options)
     end
   end
 
@@ -498,6 +727,217 @@ class DevSessionTest < Minitest::Test
 
     assert_equal(1, cli.run)
     assert_includes(err.string, 'requires --goal-file when input is not interactive')
+  end
+
+  def test_retired_lifecycle_commands_are_not_public
+    %w[finalize remove reopen _finalize-url].each do |command|
+      err = StringIO.new
+      cli = VpsfreeDevSession::CLI.new(
+        [command, '2026-06-06-demo', '--as-is'],
+        input: StringIO.new,
+        out: StringIO.new,
+        err:
+      )
+      assert_equal(1, cli.run)
+      assert_includes(err.string, "unknown command: #{command}")
+    end
+  end
+
+  def test_archive_requires_a_simple_interactive_confirmation
+    calls = []
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+    fake_runner.define_singleton_method(:archive) { |input, **options| calls << [input, options] }
+    err = StringIO.new
+    cli = VpsfreeDevSession::CLI.new(
+      ['archive', '2026-06-06-demo', '--as-is'],
+      input: StringIO.new,
+      out: StringIO.new,
+      err:
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(1, cli.run)
+    assert_empty(calls)
+    assert_includes(err.string, 'requires an interactive terminal')
+
+    err = StringIO.new
+    cli = VpsfreeDevSession::CLI.new(
+      ['archive', '2026-06-06-demo', '--as-is'],
+      input: TTYInput.new("no\n"),
+      out: StringIO.new,
+      err:
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+    assert_equal(1, cli.run)
+    assert_empty(calls)
+    assert_includes(err.string, 'was not confirmed')
+
+    cli = VpsfreeDevSession::CLI.new(
+      ['archive', '2026-06-06-demo', '--as-is'],
+      input: TTYInput.new("yes\n"),
+      out: StringIO.new,
+      err: StringIO.new
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+    assert_equal(0, cli.run)
+    assert_equal(
+      [['2026-06-06-demo', { as_is: true, abandoned: false }]],
+      calls
+    )
+  end
+
+  def test_revive_confirmation_uses_the_archived_lifecycle
+    calls = []
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+    fake_runner.define_singleton_method(:revive_confirmation) do |_input, as_is:|
+      { lifecycle: 'abandoned', pending: false } if as_is
+    end
+    fake_runner.define_singleton_method(:revive) do |input, **options|
+      calls << [input, options]
+    end
+    err = StringIO.new
+    cli = VpsfreeDevSession::CLI.new(
+      ['revive', '2026-06-06-demo', '--as-is'],
+      input: TTYInput.new("yes\n"), out: StringIO.new, err:
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(0, cli.run)
+    assert_includes(err.string, 'explicitly abandoned')
+    assert_equal(
+      [['2026-06-06-demo', { as_is: true, allow_abandoned: true }]],
+      calls
+    )
+  end
+
+  def test_revive_retry_uses_the_journaled_confirmation_without_another_prompt
+    calls = []
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+    fake_runner.define_singleton_method(:revive_confirmation) do |_input, as_is:|
+      { lifecycle: 'abandoned', pending: true } if as_is
+    end
+    fake_runner.define_singleton_method(:revive) do |input, **options|
+      calls << [input, options]
+    end
+    cli = VpsfreeDevSession::CLI.new(
+      ['revive', '2026-06-06-demo', '--as-is'],
+      input: StringIO.new, out: StringIO.new, err: StringIO.new
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(0, cli.run)
+    assert_equal(
+      [['2026-06-06-demo', { as_is: true, allow_abandoned: true }]],
+      calls
+    )
+  end
+
+  def test_stop_requires_an_interactive_exact_slug_confirmation
+    stopped = []
+    fake_runner = Object.new
+    fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+    fake_runner.define_singleton_method(:stop) { |input, as_is:| stopped << [input, as_is] }
+    err = StringIO.new
+    rejected = VpsfreeDevSession::CLI.new(
+      ['stop', '2026-06-06-demo', '--as-is'],
+      input: StringIO.new,
+      out: StringIO.new,
+      err:
+    )
+    rejected.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(1, rejected.run)
+    assert_empty(stopped)
+    assert_includes(err.string, 'requires an interactive terminal')
+
+    cli = VpsfreeDevSession::CLI.new(
+      ['stop', '2026-06-06-demo', '--as-is'],
+      input: TTYInput.new("2026-06-06-demo\n"),
+      out: StringIO.new,
+      err: StringIO.new
+    )
+    cli.define_singleton_method(:runner) { fake_runner }
+
+    assert_equal(0, cli.run)
+    assert_equal([['2026-06-06-demo', true]], stopped)
+  end
+
+  def test_portal_lifecycle_authorization_is_bound_to_its_service_cgroup
+    Dir.mktmpdir('dev-session-cgroup-test') do |directory|
+      cgroup = File.join(directory, 'cgroup')
+      File.write(
+        cgroup,
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/" \
+        "workspace-portal@vpsfree-cz.service\n"
+      )
+      calls = []
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+      fake_runner.define_singleton_method(:archive) { |input, **options| calls << [input, options] }
+      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:|
+        calls << [input, { as_is:, force: }]
+      end
+      arguments = [
+        '--require-runtime',
+        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--portal-command', '/nix/store/portal/bin/workspace-portal',
+        '--', 'archive', '2026-06-06-demo', '--as-is', '--portal-authorized'
+      ]
+      cli = VpsfreeDevSession::CLI.new(
+        arguments,
+        input: StringIO.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        cgroup_file: cgroup,
+        env: {}
+      )
+      cli.define_singleton_method(:runner) { fake_runner }
+
+      assert_equal(0, cli.run)
+      assert_equal(
+        [['2026-06-06-demo', { as_is: true, abandoned: false }]],
+        calls
+      )
+
+      remove_arguments = [
+        '--require-runtime',
+        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--portal-command', '/nix/store/portal/bin/workspace-portal',
+        '--', 'delete', '2026-06-06-demo', '--as-is', '--portal-authorized', '--force'
+      ]
+      remove = VpsfreeDevSession::CLI.new(
+        remove_arguments,
+        input: StringIO.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        cgroup_file: cgroup,
+        env: {}
+      )
+      remove.define_singleton_method(:runner) { fake_runner }
+      assert_equal(0, remove.run)
+      assert_equal(
+        ['2026-06-06-demo', { as_is: true, force: true }],
+        calls.last
+      )
+
+      File.write(cgroup, "0::/user.slice/workspace-tmux@vpsfree-cz.service\n")
+      err = StringIO.new
+      rejected = VpsfreeDevSession::CLI.new(
+        arguments,
+        input: StringIO.new,
+        out: StringIO.new,
+        err:,
+        cgroup_file: cgroup,
+        env: {}
+      )
+      rejected.define_singleton_method(:runner) { fake_runner }
+      assert_equal(1, rejected.run)
+      assert_includes(err.string, 'not available to this process')
+      assert_equal(2, calls.length)
+    end
   end
 
   def test_cli_accepts_an_exactly_maximum_size_interactive_request
@@ -643,6 +1083,44 @@ class DevSessionTest < Minitest::Test
         runner.fork('2026-06-05-source', 'taken', as_is: false, json: true)
       end
       assert_includes(error.message, 'already exists')
+    end
+  end
+
+  def test_fork_rejects_a_source_conversation_from_another_runtime_without_mutation
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-old-runtime'
+      destination_slug = '2026-06-06-fork'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      manifest = setup.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = {
+        'thread_id' => 'thread-old',
+        'socket_path' => '/run/old/app-server.sock',
+        'client_version' => '0.151.0'
+      }
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      called = File.join(workspace, 'portal-called')
+      portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: portal,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.fork(source_slug, 'fork', as_is: false, json: true)
+      end
+
+      assert_includes(error.message, 'belongs to another runtime')
+      refute(File.exist?(called))
+      refute(File.exist?(File.join(workspace, 'work', destination_slug)))
+      refute(File.exist?(File.join(workspace, 'worktrees', destination_slug)))
     end
   end
 
@@ -942,6 +1420,8 @@ class DevSessionTest < Minitest::Test
         codex_version: '0.152.1',
         codex_command: '/bin/true',
         portal_command: ['/run/current-system/sw/bin/workspace-portal'],
+        vpsadmin_cluster: RbConfig.ruby,
+        vpsadminos_cluster: RbConfig.ruby,
         require_runtime: true,
         out: StringIO.new,
         err: StringIO.new,
@@ -949,12 +1429,32 @@ class DevSessionTest < Minitest::Test
       )
       environment = runner.send(:session_environment, '2026-06-06-demo')
       contract = JSON.parse(
-        File.read(File.expand_path('../portal/runtime-contract.json', __dir__))
+        File.read(File.expand_path('../portal/internal/session/runtime-contract.json', __dir__))
       )
       assert_equal(
         VpsfreeDevSession::MAX_MESSAGE_BYTES,
         contract.fetch('maxMessageBytes')
       )
+      assert_equal(
+        VpsfreeDevSession::TRACKING_MAX_SIZE,
+        contract.fetch('trackingMaxBytes')
+      )
+      assert_equal(
+        VpsfreeDevSession::LIFECYCLE_JOURNALS,
+        contract.fetch('lifecycleJournals')
+      )
+      expected_journals = contract.fetch('lifecycleJournals').to_h do |journal|
+        [journal.fetch('command'), journal.fetch('name')]
+      end
+      assert_equal(expected_journals, VpsfreeDevSession::LIFECYCLE_JOURNAL_NAMES)
+      assert_equal(%w[archive delete revive], expected_journals.keys.sort)
+      assert_equal(expected_journals.length, expected_journals.values.uniq.length)
+      expected_journals.each do |command, name|
+        assert_equal(
+          File.join(workspace, 'worktrees', '.locks', "2026-06-06-demo.#{name}.json"),
+          runner.send(:lifecycle_journal_file, '2026-06-06-demo', command)
+        )
+      end
       environment_keys = contract.fetch('threadEnvironmentKeys')
       assert_equal(environment_keys.sort, environment.keys.sort)
       assert_equal(
@@ -980,18 +1480,30 @@ class DevSessionTest < Minitest::Test
   def test_deployment_runtime_flags_are_accepted
     with_workspace do |workspace|
       contract = JSON.parse(
-        File.read(File.expand_path('../portal/runtime-contract.json', __dir__))
+        File.read(File.expand_path('../portal/internal/session/runtime-contract.json', __dir__))
       )
       values = {
         '--workspace' => workspace,
+        '--host-profile' => File.join(workspace, 'profile'),
+        '--expected-host-generation' => File.join(workspace, 'generation'),
         '--authority-dir' => File.join(workspace, 'authority'),
         '--tmux-socket' => File.join(workspace, 'tmux.sock'),
         '--codex-command' => '/bin/true',
         '--codex-socket' => File.join(workspace, 'codex.sock'),
         '--codex-version' => 'test-version',
         '--portal-command' => '/bin/true',
-        '--portal-base-url' => 'https://workspace.example.test'
+        '--portal-base-url' => 'https://workspace.example.test',
+        '--vpsadmin-cluster' => RbConfig.ruby,
+        '--vpsadminos-cluster' => RbConfig.ruby,
+        '--transition-lock' => File.join(workspace, 'transition.lock')
       }
+      FileUtils.mkdir_p(values.fetch('--expected-host-generation'))
+      File.symlink(
+        values.fetch('--expected-host-generation'), values.fetch('--host-profile')
+      )
+      values['--expected-host-profile-token'] = profile_link_token(
+        values.fetch('--host-profile')
+      )
       arguments = contract.fetch('devSessionFlags').flat_map do |option|
         option == '--require-runtime' ? [option] : [option, values.fetch(option)]
       end
@@ -1371,7 +1883,11 @@ class DevSessionTest < Minitest::Test
       )
       runner.ensure_tracking_files(slug)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
-      manifest['codex'] = { 'thread_id' => 'thread-ready' }
+      manifest['codex'] = {
+        'thread_id' => 'thread-ready',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
       runner.send(:write_portal_manifest, slug, manifest)
 
       error = assert_raises(VpsfreeDevSession::CommandError) do
@@ -2143,8 +2659,8 @@ class DevSessionTest < Minitest::Test
         assert_includes(command, "--workspace #{workspace}")
         assert_includes(command, "--session-slug #{slug}")
         assert_includes(command, "--worktrees-dir #{File.join(workspace, 'worktrees', slug)}")
-        assert_includes(command, '--portal-base-url https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz')
-        assert_includes(command, "--portal-url https://vpsfree-cz-workspace.aitherdev.int.vpsfree.cz/#{slug}/")
+        assert_includes(command, '--portal-base-url https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz')
+        assert_includes(command, "--portal-url https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz/#{slug}/")
       end
       assert_equal('thread-recovered', File.read(thread_marker).strip)
     end
@@ -2156,7 +2672,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume after an early crash.\n")
       crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
-        def ensure_tracking_files(slug)
+        def ensure_tracking_files(slug, **)
           super
           raise VpsfreeDevSession::Error, 'simulated crash after tracking creation'
         end
@@ -2219,7 +2735,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume after an early crash.\n")
       crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
-        def ensure_tracking_files(_slug)
+        def ensure_tracking_files(_slug, **)
           raise VpsfreeDevSession::Error, 'simulated crash before tracking creation'
         end
       end
@@ -2941,10 +3457,17 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(workspace, 'README.md'), "# Workspace\n")
       assert_git_success('git', '-C', workspace, 'add', 'README.md')
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'initial workspace')
+      remote = File.join(workspace, 'workspace-origin.git')
+      assert_git_success('git', 'init', '--bare', remote)
       assert_git_success(
         'git', '-C', workspace, 'remote', 'add', 'origin',
         'git@github.com:vpsfreecz/vpsfree-cz-workspace.git'
       )
+      assert_git_success(
+        'git', '-C', workspace, 'config',
+        "url.#{remote}.insteadOf", 'git@github.com:vpsfreecz/vpsfree-cz-workspace.git'
+      )
+      assert_git_success('git', '-C', workspace, 'push', 'origin', 'master')
       slug = '2026-06-06-demo'
       runner = runner_for(workspace)
       runner.worktree_add(
@@ -2959,8 +3482,9 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', slug, 'workspace')
       assert(File.exist?(File.join(path, '.git')))
 
+      merge_registered_branches(workspace, slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.finalize(slug, as_is: true)
+      runner.send(:finalize_tracking, slug, as_is: true)
 
       refute(File.exist?(path))
       manifest = YAML.safe_load(
@@ -3061,7 +3585,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_remove_cleans_worktrees_but_keeps_notes_and_branch
+  def test_remove_discards_session_to_private_recovery_and_keeps_branch
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -3079,10 +3603,13 @@ class DevSessionTest < Minitest::Test
       )
 
       slug = '2026-06-06-demo'
-      runner.remove('demo', as_is: false, force: false)
+      runner.delete('demo', as_is: false, force: false)
 
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
-      assert(File.exist?(File.join(workspace, 'work', slug, 'plan.md')))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      recovery = removal_recovery(workspace, slug)
+      assert(File.exist?(File.join(recovery, 'work', 'plan.md')))
+      assert_equal('removed', JSON.parse(File.read(File.join(recovery, 'recovery.json')))['state'])
       assert_git_success(
         'git',
         "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
@@ -3094,7 +3621,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_remove_records_heads_so_finalize_can_archive_later
+  def test_remove_records_heads_in_recovered_tracking
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -3113,15 +3640,10 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', slug, 'sample')
       expected_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
 
-      runner.remove('demo', as_is: false, force: false)
-      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      runner.delete('demo', as_is: false, force: false)
+      recovery = removal_recovery(workspace, slug)
+      manifest = YAML.safe_load(File.read(File.join(recovery, 'work', 'portal.yml')))
       assert_equal(expected_head, manifest.dig('repositories', 0, 'final_head_sha'))
-
-      commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.finalize('demo', as_is: false)
-      archived = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
-      assert_equal(expected_head, archived.dig('repositories', 0, 'final_head_sha'))
-      assert(archived['finalized_at'])
     end
   end
 
@@ -3163,7 +3685,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
       assert_match(/repository identity does not match/, error.message)
       assert(File.directory?(path))
@@ -3193,29 +3715,820 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(
         slug,
         workspace:,
-        on_kill: -> { refute(File.exist?(path)) }
+        on_kill: lambda {
+          refute(File.exist?(path))
+          assert(File.exist?(File.join(workspace, 'work', slug)))
+        }
       )
       remove_runner = runner_for(workspace, tmux:)
 
-      remove_runner.remove('demo', as_is: false, force: false)
+      remove_runner.delete('demo', as_is: false, force: false)
 
       assert(tmux.killed)
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
-      assert(File.exist?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      assert(File.directory?(removal_recovery(workspace, slug)))
     end
   end
 
-  def test_remove_all_is_rejected
+  def test_delete_all_is_rejected
     with_workspace do |workspace|
       err = StringIO.new
       status = VpsfreeDevSession::CLI.new(
-        ['--workspace', workspace, 'remove', 'demo', '--all'],
+        ['--workspace', workspace, 'delete', 'demo', '--all'],
         out: StringIO.new,
         err:
       ).run
 
       assert_equal(1, status)
       assert_match(/invalid option: --all/, err.string)
+    end
+  end
+
+  def test_delete_yes_bypass_is_rejected
+    with_workspace do |workspace|
+      runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
+      err = StringIO.new
+      status = VpsfreeDevSession::CLI.new(
+        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is', '--yes'],
+        input: StringIO.new,
+        out: StringIO.new,
+        err:
+      ).run
+
+      assert_equal(1, status)
+      assert_match(/invalid option: --yes/, err.string)
+      assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
+    end
+  end
+
+  def test_delete_requires_confirmation_in_noninteractive_cli
+    with_workspace do |workspace|
+      runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
+      err = StringIO.new
+
+      status = VpsfreeDevSession::CLI.new(
+        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
+        input: StringIO.new,
+        out: StringIO.new,
+        err:
+      ).run
+
+      assert_equal(1, status)
+      assert_includes(err.string, 'requires an interactive terminal')
+      assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
+    end
+  end
+
+  def test_delete_requires_the_full_slug_in_interactive_cli
+    with_workspace do |workspace|
+      runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
+      err = StringIO.new
+
+      status = VpsfreeDevSession::CLI.new(
+        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
+        input: TTYInput.new("demo\n"),
+        out: StringIO.new,
+        err:
+      ).run
+
+      assert_equal(1, status)
+      assert_includes(err.string, 'was not confirmed')
+      assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
+    end
+  end
+
+  def test_remove_discards_an_archived_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      FileUtils.mkdir_p(File.join(workspace, 'archive'))
+      File.rename(File.join(workspace, 'work', slug), File.join(workspace, 'archive', slug))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+      assert(File.directory?(File.join(removal_recovery(workspace, slug), 'archive')))
+    end
+  end
+
+  def test_remove_preserves_the_creation_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Fix the session.\n")
+      runner = runner_for(workspace)
+      runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      runner.ensure_tracking_files(slug)
+
+      runner.delete(slug, as_is: true, force: false)
+
+      recovery = removal_recovery(workspace, slug)
+      assert(File.file?(File.join(recovery, 'creation.json')))
+      refute(File.exist?(File.join(workspace, 'worktrees', '.locks', "#{slug}.creation.json")))
+    end
+  end
+
+  def test_remove_force_preserves_unmanaged_worktree_entries
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      File.write(File.join(workspace, 'worktrees', slug, 'unmanaged.txt'), "keep me\n")
+
+      runner.delete(slug, as_is: true, force: true)
+
+      recovery = removal_recovery(workspace, slug)
+      assert_equal(
+        "keep me\n",
+        File.read(File.join(recovery, 'unmanaged-worktrees', 'unmanaged.txt'))
+      )
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
+  def test_remove_releases_both_development_cluster_types
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      helpers = File.join(workspace, 'helpers')
+      log = File.join(workspace, 'cluster.log')
+      FileUtils.mkdir_p(helpers)
+      %w[vpsadmin-devcluster vpsadminos-devcluster].each do |name|
+        path = File.join(helpers, name)
+        script = <<~'SH'
+          #!/bin/sh
+          if [ "$1" = cleanup-paths ]; then
+            printf '%s\n' '{"schema":1,"paths":[]}'
+            exit 0
+          fi
+          name=${0##*/}
+          printf '%s:%s:%s\n' "$VPSFREE_DEVCLUSTER_WORKSPACE" "$name" "$*" >> "$CLUSTER_LOG"
+        SH
+        File.write(path, script)
+        File.chmod(0o755, path)
+      end
+      runner = runner_for(
+        workspace,
+        env: {'PATH' => helpers, 'CLUSTER_LOG' => log}
+      )
+      runner.ensure_tracking_files(slug)
+
+      runner.delete(slug, as_is: true, force: false)
+
+      assert_equal(
+        [
+          "#{workspace}:vpsadmin-devcluster:reset #{slug}",
+          "#{workspace}:vpsadminos-devcluster:reset #{slug}"
+        ],
+        File.readlines(log, chomp: true)
+      )
+    end
+  end
+
+  def test_remove_retains_recovery_without_touching_worktrees_when_thread_retirement_fails
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      portal = File.join(workspace, 'portal')
+      File.write(portal, "#!/bin/sh\nexit 19\n")
+      File.chmod(0o755, portal)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        portal_command: [portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      runner.worktree_add(
+        'demo',
+        'sample',
+        as_is: false,
+        name: nil,
+        branch: nil,
+        base: 'master',
+        fetch: false
+      )
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.153.4'
+      }
+      File.write(manifest_path, YAML.dump(manifest))
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert(File.directory?(File.join(workspace, 'worktrees', slug, 'sample')))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      recovery = removal_recovery(workspace, slug)
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('thread_retiring', journal.fetch('phase'))
+      assert(File.file?(File.join(recovery, 'recovery.json')))
+    end
+  end
+
+  def test_remove_discovers_a_thread_whose_start_result_was_lost
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      log = File.join(workspace, 'portal.log')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(goal, "Create the session.\n")
+      File.write(portal, <<~RUBY)
+        case ARGV[1]
+        when 'create'
+          warn 'simulated loss after App Server committed thread/start'
+          exit 19
+        when 'retire'
+          File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+          abort 'cwd discovery unexpectedly supplied a thread ID' if ARGV.include?('--thread-id')
+        else
+          abort "unexpected portal action: \#{ARGV.join(' ')}"
+        end
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.start(
+          slug, as_is: true, new: false, attach: false, run_codex: true,
+          goal_file: goal, json: true, exclusive: true
+        )
+      end
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_nil(manifest.dig('codex', 'thread_id'))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      call = File.read(log)
+      assert_includes(call, "thread retire --cwd #{File.join(workspace, 'work', slug)}")
+      assert_includes(call, '--socket /run/test/codex.sock')
+      refute_includes(call, '--thread-id')
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_remove_can_upgrade_a_non_force_retirement_retry_to_force
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      calls = File.join(workspace, 'retire-calls')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        File.open(#{calls.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+        unless ARGV.include?('--force')
+          warn 'Codex thread still has an active turn'
+          exit 19
+        end
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(
+          slug,
+          workspace:,
+          codex_thread_id: 'thread-1',
+          codex_socket_path: '/run/test/codex.sock'
+        ),
+        portal_command: [RbConfig.ruby, portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      runner.ensure_tracking_files(slug)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal(false, journal.fetch('force'))
+      assert_equal('thread_retiring', journal.fetch('phase'))
+
+      runner.delete(slug, as_is: true, force: true)
+
+      lines = File.readlines(calls, chomp: true)
+      refute_includes(lines.fetch(0), '--force')
+      assert_includes(lines.fetch(1), '--force')
+      recovery = JSON.parse(File.read(File.join(removal_recovery(workspace, slug), 'recovery.json')))
+      assert_equal(true, recovery.fetch('force'))
+    end
+  end
+
+  def test_remove_rejects_recovery_storage_nested_in_tracking
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      state_home = File.join(workspace, 'work', slug, 'private-state')
+      runner = runner_for(workspace, env: {'XDG_STATE_HOME' => state_home})
+      runner.ensure_tracking_files(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'recovery root is inside session state')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(state_home))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_rejects_recovery_storage_nested_in_the_creation_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Create the session.\n")
+      creator = runner_for(workspace)
+      creator.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      creator.ensure_tracking_files(slug)
+      journal = creator.send(:creation_journal_file, slug)
+      runner = runner_for(workspace, env: {'XDG_STATE_HOME' => journal})
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'recovery root is inside session state')
+      assert(File.file?(journal))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_force_rejects_recovery_storage_nested_in_a_worktree
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      creator = runner_for(workspace)
+      creator.worktree_add(
+        'demo', 'sample', as_is: false, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      worktree = File.join(workspace, 'worktrees', slug, 'sample')
+      state_home = File.join(worktree, 'private-state')
+      runner = runner_for(workspace, env: {'XDG_STATE_HOME' => state_home})
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert_includes(error.message, 'recovery root is inside session state')
+      assert(File.directory?(worktree))
+      refute(File.exist?(state_home))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_rejects_recovery_storage_nested_in_absent_cluster_state
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      cluster = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
+      state_home = File.join(cluster, 'private-state')
+      helper = cleanup_contract_helper(workspace, 'vpsadmin', [cluster])
+      runner = runner_for(
+        workspace,
+        env: {'XDG_STATE_HOME' => state_home},
+        vpsadmin_cluster: helper
+      )
+      runner.ensure_tracking_files(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'recovery root is inside session state')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(state_home))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_rejects_recovery_storage_nested_in_cluster_socket
+    with_workspace do |workspace|
+      {
+        'vpsadmin' => 'vpsfree-devcluster',
+        'vpsadminos' => 'vpsadminos-devcluster'
+      }.each do |kind, prefix|
+        slug = "2026-06-06-demo-#{kind}"
+        digest = Digest::SHA256.hexdigest("#{workspace}\0#{slug}")[0, 12]
+        socket = File.join('/tmp', "#{prefix}-#{digest}")
+        state_home = File.join(socket, 'private-state')
+        helper = cleanup_contract_helper(workspace, kind, [socket])
+        runner = runner_for(
+          workspace,
+          env: {'XDG_STATE_HOME' => state_home},
+          vpsadmin_cluster: kind == 'vpsadmin' ? helper : nil,
+          vpsadminos_cluster: kind == 'vpsadminos' ? helper : nil
+        )
+        runner.ensure_tracking_files(slug)
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.delete(slug, as_is: true, force: false)
+        end
+
+        assert_includes(error.message, 'recovery root is inside session state')
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      end
+    end
+  end
+
+  def test_remove_rejects_recovery_storage_nested_in_legacy_cluster_socket
+    with_workspace do |workspace|
+      slug = '2026-08-18-vpsadmin-password-reset'
+      digest = Digest::SHA256.hexdigest(slug)[0, 12]
+      socket = File.join('/tmp', "vpsfree-devcluster-#{digest}")
+      state_home = File.join(socket, 'private-removal-state')
+      helper = cleanup_contract_helper(workspace, 'vpsadmin', [socket])
+      runner = runner_for(
+        workspace,
+        env: {'XDG_STATE_HOME' => state_home},
+        vpsadmin_cluster: helper
+      )
+      runner.ensure_tracking_files(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'recovery root is inside session state')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_reconciles_an_archive_before_its_phase_update
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      calls = File.join(workspace, 'retire-calls')
+      portal = File.join(workspace, 'portal')
+      File.write(portal, <<~RUBY)
+        File.open(#{calls.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+        abort 'retirement lost its thread identity' unless ARGV.include?('--thread-id')
+      RUBY
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        portal_command: [RbConfig.ruby, portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      runner.ensure_tracking_files(slug)
+      advance = runner.method(:advance_removal!)
+      interrupted = false
+      runner.define_singleton_method(:advance_removal!) do |current_slug, removal, phase|
+        if phase == 'thread_retired' && !interrupted
+          interrupted = true
+          raise VpsfreeDevSession::Error, 'simulated interruption after thread archive'
+        end
+        advance.call(current_slug, removal, phase)
+      end
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('thread_retiring', journal.fetch('phase'))
+      assert(tmux.quiesced)
+
+      runner.delete(slug, as_is: true, force: false)
+
+      assert_equal(2, File.readlines(calls).length)
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_remove_refuses_to_orphan_a_known_thread_when_runtime_is_unavailable
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest['codex'] = {'thread_id' => 'thread-1'}
+      File.write(manifest_path, YAML.dump(manifest))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'workspace-portal is required')
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('thread_retiring', journal.fetch('phase'))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_remove_retries_after_cluster_release_failure
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      helper = File.join(workspace, 'vpsadmin-devcluster')
+      marker = File.join(workspace, 'cluster-retried')
+      File.write(helper, <<~SH)
+        #!/bin/sh
+        if [ "$1" = cleanup-paths ]; then
+          printf '%s\n' '{"schema":1,"paths":[]}'
+          exit 0
+        fi
+        if [ ! -e #{Shellwords.escape(marker)} ]; then
+          : > #{Shellwords.escape(marker)}
+          exit 19
+        fi
+      SH
+      File.chmod(0o755, helper)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: ManagedTmux.new(slug, workspace:),
+        vpsadmin_cluster: helper,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      runner.ensure_tracking_files(slug)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('thread_retired', journal.fetch('phase'))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_remove_passes_its_exclusive_session_lock_to_cluster_reset
+    with_workspace do |workspace|
+      slug = '2026-06-06-cluster-lock-owner'
+      runner = runner_for(
+        workspace,
+        vpsadmin_cluster: File.expand_path(
+          '../dev-clusters/vpsadmin/bin/devcluster', __dir__
+        )
+      )
+      runner.ensure_tracking_files(slug)
+      cluster = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
+      FileUtils.mkdir_p(cluster)
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(cluster))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_retries_after_tmux_was_killed
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = KillThenFailOnceTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+      runner.ensure_tracking_files(slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      assert_includes(error.message, 'after tmux removal')
+      assert(tmux.killed)
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('worktrees_removed', journal.fetch('phase'))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_remove_recovers_a_tracking_move_before_its_phase_update
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      advance = runner.method(:advance_removal!)
+      interrupted = false
+      runner.define_singleton_method(:advance_removal!) do |current_slug, removal, phase|
+        if phase == 'tracking_preserved' && !interrupted
+          interrupted = true
+          raise VpsfreeDevSession::Error, 'simulated interruption after tracking move'
+        end
+        advance.call(current_slug, removal, phase)
+      end
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      recovery = removal_recovery(workspace, slug)
+      assert(File.directory?(File.join(recovery, 'work')))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('removed', JSON.parse(File.read(File.join(recovery, 'recovery.json'))).fetch('state'))
+    end
+  end
+
+  def test_remove_commits_tracked_active_and_archived_sessions
+    %w[work archive].each do |tracking_kind|
+      with_workspace do |workspace|
+        slug = "2026-06-06-#{tracking_kind}"
+        runner = runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        commit_tracking(workspace, slug, lifecycle: 'active')
+        if tracking_kind == 'archive'
+          FileUtils.mkdir_p(File.join(workspace, 'archive'))
+          File.rename(File.join(workspace, 'work', slug), File.join(workspace, 'archive', slug))
+          commit_archive_move(workspace, slug)
+        end
+        configure_workspace_origin(workspace)
+        unrelated = File.join(workspace, 'unrelated.txt')
+        File.write(unrelated, "keep staged\n")
+        assert_git_success('git', '-C', workspace, 'add', 'unrelated.txt')
+
+        runner.delete(slug, as_is: true, force: false)
+
+        relative = File.join(tracking_kind, slug)
+        assert_equal('', git_capture_success('git', '-C', workspace, 'ls-files', '--', relative))
+        assert_equal("workspace: delete #{slug}", git_capture_success(
+          'git', '-C', workspace, 'log', '-1', '--format=%s'
+        ).strip)
+        assert_equal('A  unrelated.txt', git_capture_success(
+          'git', '-C', workspace, 'status', '--short', '--', 'unrelated.txt'
+        ).strip)
+      end
+    end
+  end
+
+  def test_remove_retries_a_failed_tracking_deletion_commit
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      marker = File.join(workspace, '.git', 'remove-hook-retried')
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      File.write(hook, <<~SH)
+        #!/bin/sh
+        if [ ! -e #{Shellwords.escape(marker)} ]; then
+          : > #{Shellwords.escape(marker)}
+          exit 1
+        fi
+      SH
+      File.chmod(0o755, hook)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('tracking_preserved', journal.fetch('phase'))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+
+      [
+        -> { runner.start(slug, as_is: true, new: false, attach: false, run_codex: false) },
+        -> { runner.revive(slug, as_is: true) },
+        -> {
+          runner.worktree_add(
+            slug, 'sample', as_is: true, name: nil, branch: nil,
+            base: nil, fetch: false
+          )
+        }
+      ].each do |operation|
+        error = assert_raises(VpsfreeDevSession::Error, &operation)
+      assert_includes(error.message, 'deletion is unfinished')
+      end
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('', git_capture_success(
+        'git', '-C', workspace, 'ls-files', '--', File.join('work', slug)
+      ))
+    end
+  end
+
+  def test_remove_keeps_its_journal_when_a_successful_hook_recreates_tracking
+    with_workspace do |workspace|
+      slug = '2026-06-06-hook-recreates-tracking'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      recreated = File.join(workspace, 'work', slug)
+      File.write(hook, <<~SH)
+        #!/bin/sh
+        mkdir -p #{Shellwords.escape(recreated)}
+        printf 'recreated by hook\n' > #{Shellwords.escape(File.join(recreated, 'unexpected.txt'))}
+      SH
+      File.chmod(0o755, hook)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'tracking reappeared')
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('tracking_preserved', journal.fetch('phase'))
+      assert(File.file?(File.join(recreated, 'unexpected.txt')))
+      assert_equal('', git_capture_success(
+        'git', '-C', workspace, 'ls-files', '--', File.join('work', slug)
+      ))
+
+      retry_error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      assert_includes(retry_error.message, 'tracking reappeared')
+      retry_journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('tracking_preserved', retry_journal.fetch('phase'))
+    end
+  end
+
+  def test_remove_rechecks_remote_master_immediately_before_deletion_commit
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      remote = File.join(workspace, '.git', 'test-origin.git')
+      commit = runner.method(:commit_removed_tracking!)
+      advanced = false
+      runner.define_singleton_method(:commit_removed_tracking!) do |current_slug, removal|
+        unless advanced
+          advanced = true
+          Dir.mktmpdir('dev-session-remote-advance') do |checkout|
+            system('git', 'clone', remote, checkout, out: File::NULL, err: File::NULL) || raise('clone failed')
+            system('git', '-C', checkout, 'config', 'user.email', 'test@example.invalid') || raise('config failed')
+            system('git', '-C', checkout, 'config', 'user.name', 'Test User') || raise('config failed')
+            File.write(File.join(checkout, 'remote.txt'), "advanced\n")
+            system('git', '-C', checkout, 'add', 'remote.txt') || raise('add failed')
+            system('git', '-C', checkout, 'commit', '-m', 'advance remote', out: File::NULL) || raise('commit failed')
+            system('git', '-C', checkout, 'push', 'origin', 'master', out: File::NULL) || raise('push failed')
+          end
+        end
+        commit.call(current_slug, removal)
+      end
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'workspace master advanced')
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal('tracking_preserved', journal.fetch('phase'))
+      assert_equal('start initiative', git_capture_success(
+        'git', '-C', workspace, 'log', '-1', '--format=%s'
+      ).strip)
     end
   end
 
@@ -3240,7 +4553,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.remove('demo', as_is: false, force: false)
+        runner.delete('demo', as_is: false, force: false)
       end
 
       assert_match(/uncommitted changes/, error.message)
@@ -3269,10 +4582,11 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', slug, 'sample')
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
 
-      runner.remove('demo', as_is: false, force: true)
+      runner.delete('demo', as_is: false, force: true)
 
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
-      assert(File.exist?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      assert(File.directory?(removal_recovery(workspace, slug)))
     end
   end
 
@@ -3289,16 +4603,17 @@ class DevSessionTest < Minitest::Test
         codex_command: 'false',
         out: StringIO.new,
         err: StringIO.new,
-        today: TODAY
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
       )
 
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       assert(tmux_session_exists?(socket, slug))
 
-      runner.remove('demo', as_is: false, force: false)
+      runner.delete('demo', as_is: false, force: false)
 
       refute(tmux_session_exists?(socket, slug))
-      assert(File.exist?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
     end
@@ -3313,18 +4628,21 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       FileUtils.mkdir_p(File.join(workspace, 'work', slug))
       tmux_run(socket, 'new-session', '-d', '-s', slug, '-c', workspace)
+      cluster_helper = cleanup_contract_helper(workspace, 'empty-cluster', [])
 
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
+        vpsadmin_cluster: cluster_helper,
+        vpsadminos_cluster: cluster_helper,
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.remove('demo', as_is: false, force: false)
+        runner.delete('demo', as_is: false, force: false)
       end
 
       assert_match(/not managed/, error.message)
@@ -3371,7 +4689,8 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, workspace:)
 
       runner = runner_for(workspace, tmux:, out:)
-      runner.finalize('demo', as_is: false)
+      merge_registered_branches(workspace, slug)
+      runner.send(:finalize_tracking, 'demo', as_is: false)
 
       refute(tmux.killed)
       assert_includes(out.string, File.join(workspace, 'archive', slug))
@@ -3402,12 +4721,6 @@ class DevSessionTest < Minitest::Test
       assert_match(/must be committed before stopping/, error.message)
       refute(tmux.killed)
 
-      remove_error = assert_raises(VpsfreeDevSession::Error) do
-        runner.remove(slug, as_is: true, force: false)
-      end
-      assert_match(/must be committed before stopping/, remove_error.message)
-      refute(tmux.killed)
-
       commit_archive_move(workspace, slug)
       assert_equal(
         '2',
@@ -3431,14 +4744,14 @@ class DevSessionTest < Minitest::Test
         commit_tracking(workspace, slug, lifecycle: 'complete')
         tmux = ManagedTmux.new(slug, workspace:)
         runner = runner_for(workspace, tmux:)
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
         FileUtils.mkdir_p(File.join(workspace, 'work', slug))
 
         error = assert_raises(VpsfreeDevSession::Error) do
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
-            runner.remove(slug, as_is: true, force: false)
+            runner.delete(slug, as_is: true, force: false)
           end
         end
 
@@ -3455,7 +4768,7 @@ class DevSessionTest < Minitest::Test
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
-            runner.remove(slug, as_is: true, force: false)
+            runner.delete(slug, as_is: true, force: false)
           end
         end
 
@@ -3466,7 +4779,9 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_session_closing_rejects_invalid_active_tracking
-    %i[stop remove].product(%i[symlink file empty_directory]).each do |operation, kind|
+    cases = %i[symlink file empty_directory].map { |kind| [:stop, kind] }
+    cases += %i[symlink file].map { |kind| [:remove, kind] }
+    cases.each do |operation, kind|
       with_workspace do |workspace|
         slug = '2026-06-06-demo'
         path = File.join(workspace, 'work', slug)
@@ -3485,13 +4800,27 @@ class DevSessionTest < Minitest::Test
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
-            runner.remove(slug, as_is: true, force: false)
+            runner.delete(slug, as_is: true, force: false)
           end
         end
 
-        assert_match(/work directory|missing tracking files/, error.message)
+        assert_match(/work directory|session tracking|missing tracking files/, error.message)
         refute(tmux.killed)
       end
+    end
+  end
+
+  def test_remove_accepts_incomplete_empty_tracking
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+      tmux = ManagedTmux.new(slug, workspace:)
+
+      runner_for(workspace, tmux:).delete(slug, as_is: true, force: false)
+
+      assert(tmux.killed)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      assert(File.directory?(File.join(removal_recovery(workspace, slug), 'work')))
     end
   end
 
@@ -3531,7 +4860,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
 
-      runner.finalize('demo', as_is: false)
+      runner.send(:finalize_tracking, 'demo', as_is: false)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
     end
@@ -3547,7 +4876,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/lifecycle is not terminal/, error.message)
@@ -3563,7 +4892,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.rm(File.join(workspace, 'work', slug, 'plan.md'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/missing tracking files/, error.message)
@@ -3579,7 +4908,7 @@ class DevSessionTest < Minitest::Test
       set_lifecycle(workspace, slug, 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/tracking files have no prior commit/, error.message)
@@ -3597,7 +4926,7 @@ class DevSessionTest < Minitest::Test
       commit_terminal_tracking_only(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/no committed active lifecycle/, error.message)
@@ -3620,7 +4949,7 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
       end
 
       assert_match(/not terminal: active/, error.message)
@@ -3640,7 +4969,7 @@ class DevSessionTest < Minitest::Test
       File.write(state, "#{content}\n- Lifecycle: complete\n")
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
       end
 
       assert_match(/must start with lifecycle YAML front matter/, error.message)
@@ -3705,7 +5034,10 @@ class DevSessionTest < Minitest::Test
         runner.send(:lifecycle_state, "---\nlifecycle: active\n---\n\xff".b)
       end
       assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:lifecycle_state, "---\nlifecycle: active\n---\n" + ('x' * 1024 * 1024))
+        runner.send(
+          :lifecycle_state,
+          "---\nlifecycle: active\n---\n" + ('x' * VpsfreeDevSession::TRACKING_MAX_SIZE)
+        )
       end
     end
   end
@@ -3729,7 +5061,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'pseudo active state')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
       end
 
       assert_match(/no committed active lifecycle/, error.message)
@@ -3747,7 +5079,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
       tmux = ManagedTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:)
-      runner.finalize(slug, as_is: true)
+      runner.send(:finalize_tracking, slug, as_is: true)
       state = File.join(workspace, 'archive', slug, 'state.md')
       content = File.read(state).sub('lifecycle: complete', 'lifecycle: active')
       File.write(state, state_with_body_lifecycle(content, 'complete'))
@@ -3770,7 +5102,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/archive already exists/, error.message)
@@ -3793,7 +5125,7 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/archive already exists/, error.message)
@@ -3824,7 +5156,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, workspace:)
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner_for(workspace, tmux:).finalize('demo', as_is: false)
+        runner_for(workspace, tmux:).send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/uncommitted changes/, error.message)
@@ -3861,7 +5193,7 @@ class DevSessionTest < Minitest::Test
       detached_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/detached HEAD/, error.message)
@@ -3929,7 +5261,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'sample'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/unmanaged entries/, error.message)
@@ -3953,7 +5285,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.ln_s(outside_root, work_root)
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/work root is a symlink/, error.message)
@@ -3997,7 +5329,7 @@ class DevSessionTest < Minitest::Test
         )
 
         assert_raises(VpsfreeDevSession::Error) do
-          runner.finalize('demo', as_is: false)
+          runner.send(:finalize_tracking, 'demo', as_is: false)
         end
 
         assert(File.directory?(source), "#{collision} collision moved the source")
@@ -4008,6 +5340,27 @@ class DevSessionTest < Minitest::Test
           assert_equal([], Dir.children(destination))
         end
       end
+    end
+  end
+
+  def test_atomic_archive_move_syncs_both_parent_directories
+    with_workspace do |workspace|
+      source = File.join(workspace, 'work', '2026-06-06-demo')
+      destination = File.join(workspace, 'archive', '2026-06-06-demo')
+      FileUtils.mkdir_p(source)
+      FileUtils.mkdir_p(File.dirname(destination))
+      runner = runner_for(workspace)
+      synced = []
+      runner.define_singleton_method(:fsync_directory) { |path| synced << path }
+
+      runner.send(:atomic_archive_move!, source, destination)
+
+      assert_equal(
+        [File.join(workspace, 'work'), File.join(workspace, 'archive')],
+        synced
+      )
+      refute(File.exist?(source))
+      assert(File.directory?(destination))
     end
   end
 
@@ -4048,7 +5401,7 @@ class DevSessionTest < Minitest::Test
       )
 
       assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
       end
 
       assert(File.directory?(path))
@@ -4080,7 +5433,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
-      runner.finalize(slug, as_is: true)
+      runner.send(:finalize_tracking, slug, as_is: true)
 
       assert_equal(2, move_commands.length)
       move_commands.each do |argv|
@@ -4109,15 +5462,15 @@ class DevSessionTest < Minitest::Test
         assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
 
         error = assert_raises(VpsfreeDevSession::Error) do
-          runner.remove(slug, as_is: true, force: false)
+          runner.delete(slug, as_is: true, force: false)
         end
         assert_match(/another dev-session command/, error.message)
 
-        runner.remove(other_slug, as_is: true, force: false)
+        runner.delete(other_slug, as_is: true, force: false)
         refute(File.exist?(File.join(workspace, 'worktrees', other_slug)))
       end
 
-      runner.remove(slug, as_is: true, force: false)
+      runner.delete(slug, as_is: true, force: false)
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
     end
   end
@@ -4133,7 +5486,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'cache'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize('demo', as_is: false)
+        runner.send(:finalize_tracking, 'demo', as_is: false)
       end
 
       assert_match(/contains unmanaged entries/, error.message)
@@ -4156,7 +5509,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.finalize(slug, as_is: true)
+        runner.send(:finalize_tracking, slug, as_is: true)
       end
 
       assert_match(/missing from the portal manifest/, error.message)
@@ -4182,7 +5535,7 @@ class DevSessionTest < Minitest::Test
         assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
 
         error = assert_raises(VpsfreeDevSession::Error) do
-          runner.finalize(slug, as_is: true)
+          runner.send(:finalize_tracking, slug, as_is: true)
         end
 
         assert_match(/outside the canonical repository root/, error.message)
@@ -4201,7 +5554,8 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner_for(workspace, tmux: UnmanagedTmux.new(slug)).finalize(
+        runner_for(workspace, tmux: UnmanagedTmux.new(slug)).send(
+          :finalize_tracking,
           'demo',
           as_is: false
         )
@@ -4465,7 +5819,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_idle_check_uses_host_socket_for_a_legacy_manifest
+  def test_idle_check_ignores_a_manifest_without_current_socket_provenance
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       log = File.join(workspace, 'portal.log')
@@ -4486,28 +5840,17 @@ class DevSessionTest < Minitest::Test
 
       runner.send(:ensure_portal_thread_idle!, slug, nil)
 
-      command = File.read(log)
-      assert_includes(command, 'thread require-idle')
-      assert_includes(command, '--thread-id thread-legacy')
-      assert_includes(command, '--socket /run/test/codex.sock')
-      assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
+      refute(File.exist?(log))
     end
   end
 
-  def test_idle_check_retries_the_workspace_root_for_a_stopped_legacy_thread
+  def test_idle_check_ignores_a_manifest_from_another_runtime
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       log = File.join(workspace, 'portal.log')
       portal = File.join(workspace, 'portal')
-      work = File.join(workspace, 'work', slug)
       File.write(portal, <<~RUBY)
-        File.open(#{log.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
-        cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
-        if cwd == #{work.dump}
-          warn 'workspace-portal: Codex thread does not match the development session directory'
-          exit 1
-        end
-        exit(cwd == #{workspace.dump} ? 0 : 2)
+        File.write(#{log.dump}, ARGV.join(' '))
       RUBY
       runner = VpsfreeDevSession::Runner.new(
         workspace:, tmux: NullTmux.new,
@@ -4517,19 +5860,16 @@ class DevSessionTest < Minitest::Test
       )
       runner.ensure_tracking_files(slug)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
-      manifest['codex'] = { 'thread_id' => 'thread-legacy' }
+      manifest['codex'] = {
+        'thread_id' => 'thread-old',
+        'socket_path' => '/run/old/app-server.sock',
+        'client_version' => '0.151.0'
+      }
       runner.send(:write_portal_manifest, slug, manifest)
 
       runner.send(:ensure_portal_thread_idle!, slug, nil)
 
-      commands = File.readlines(log, chomp: true)
-      assert_equal(2, commands.length)
-      assert_includes(commands.fetch(0), "--cwd #{work}")
-      assert_includes(commands.fetch(1), "--cwd #{workspace}")
-      commands.each do |command|
-        assert_includes(command, '--thread-id thread-legacy')
-        assert_includes(command, '--socket /run/test/codex.sock')
-      end
+      refute(File.exist?(log))
     end
   end
 
@@ -4652,7 +5992,7 @@ class DevSessionTest < Minitest::Test
       tmux = ReplacedTmux.new(slug, workspace:)
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner_for(workspace, tmux:).remove(slug, as_is: true, force: false)
+        runner_for(workspace, tmux:).delete(slug, as_is: true, force: false)
       end
 
       assert_match(/session changed during operation/, error.message)
@@ -4733,6 +6073,8 @@ class DevSessionTest < Minitest::Test
         codex_version: '0.152.1',
         codex_command: '/bin/true',
         portal_command: ['/run/current-system/sw/bin/workspace-portal'],
+        vpsadmin_cluster: RbConfig.ruby,
+        vpsadminos_cluster: RbConfig.ruby,
         require_runtime: true,
         out:,
         err: StringIO.new,
@@ -4740,7 +6082,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      runner.finalize(slug, as_is: true)
+      runner.send(:finalize_tracking, slug, as_is: true)
 
       assert_includes(
         out.string,
@@ -4779,7 +6121,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
-      ordinary_runner.finalize('demo', as_is: false)
+      ordinary_runner.send(:finalize_tracking, 'demo', as_is: false)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
       assert(tmux_session_exists?(socket, slug))
@@ -4852,7 +6194,8 @@ class DevSessionTest < Minitest::Test
       File.write(codex_executable, <<~SH)
         #!/bin/sh
         [ "$1" = --version ] && { echo 'codex-cli 0.152.1'; exit 0; }
-        printf '%s\n' "$@" > #{codex_log.dump}
+        printf '%s\n' "$@" > #{(codex_log + '.tmp').dump}
+        mv #{(codex_log + '.tmp').dump} #{codex_log.dump}
         sleep 2
       SH
       File.chmod(0o755, codex_executable)
@@ -4893,6 +6236,7 @@ class DevSessionTest < Minitest::Test
       assert_equal(codex_socket, manifest.dig('codex', 'socket_path'))
       assert_equal('0.152.1', manifest.dig('codex', 'client_version'))
       refute(manifest.key?('tmux'))
+      wait_for_file(codex_log)
       codex_arguments = File.readlines(codex_log, chomp: true)
       assert_includes(codex_arguments, '--remote')
       assert_includes(codex_arguments, "unix://#{codex_socket}")
@@ -4961,9 +6305,23 @@ class DevSessionTest < Minitest::Test
     slug = '2026-06-06-demo'
 
     with_workspace do |workspace|
+      create_bare_repo(workspace, 'alpha')
+      repository = File.join(workspace, 'repos', 'alpha.git')
+      master = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success('git', "--git-dir=#{repository}", 'branch', slug, 'master')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'update-ref',
+        'refs/remotes/origin/master', master
+      )
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'symbolic-ref',
+        'refs/remotes/origin/HEAD', 'refs/remotes/origin/master'
+      )
       worktree = File.join(workspace, 'worktrees', slug, 'alpha')
-      FileUtils.mkdir_p(worktree)
-      File.write(File.join(worktree, '.git'), "gitdir: /tmp/nonexistent\n")
+      FileUtils.mkdir_p(File.dirname(worktree))
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'worktree', 'add', worktree, slug
+      )
 
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
@@ -5059,6 +6417,121 @@ class DevSessionTest < Minitest::Test
       assert(runner.send(:session_codex_provenance_matches?, session, 'thread-1'))
       session.codex_socket_path = '/run/workspace/other.sock'
       refute(runner.send(:session_codex_provenance_matches?, session, 'thread-1'))
+    end
+  end
+
+  def test_start_rejects_a_ready_thread_from_another_app_server_runtime
+    with_workspace do |workspace|
+      slug = '2026-06-06-migrated'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(slug)
+      manifest = setup.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/old/app-server.sock',
+        'client_version' => '0.151.0'
+      }
+      setup.send(:write_portal_manifest, slug, manifest)
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$migrated', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/new/tmux.sock', codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/new/app-server.sock',
+        codex_client_version: '0.153.2', codex_pane_id: '%1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_options| session }
+        define_method(:sync_slug) { |*_args, **_options| session }
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/new/app-server.sock',
+        codex_version: '0.153.2',
+        codex_command: codex,
+        portal_command: [
+          RbConfig.ruby,
+          '-e',
+          "require 'json'; puts JSON.generate(threadId: 'thread-1') if ARGV[0, 2] == ['thread', 'create']"
+        ],
+        out: StringIO.new,
+        err: StringIO.new,
+        env: { 'SHELL' => '/bin/sh' }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
+      end
+
+      assert_includes(error.message, 'belongs to another runtime')
+      retained = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-1', retained.dig('codex', 'thread_id'))
+      assert_equal('/run/old/app-server.sock', retained.dig('codex', 'socket_path'))
+      assert_equal('0.151.0', retained.dig('codex', 'client_version'))
+    end
+  end
+
+  def test_exclusive_replay_rejects_a_ready_thread_from_another_runtime
+    with_workspace do |workspace|
+      slug = '2026-06-06-old-runtime'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue the original request.\n")
+      setup = runner_for(workspace)
+      journal = setup.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      setup.ensure_tracking_files(slug)
+      manifest = setup.send(:ensure_portal_manifest, slug, creation_journal: journal)
+      manifest['schema'] = 1
+      manifest['creation']['state'] = 'ready'
+      manifest['creation']['initial_goal_sent'] = true
+      manifest['creation'].delete('initial_goal_attempted')
+      manifest['codex'] = {
+        'thread_id' => 'thread-old',
+        'socket_path' => '/run/old/app-server.sock',
+        'client_version' => '0.151.0'
+      }
+      setup.send(:write_portal_manifest, slug, manifest)
+      setup.send(:mark_creation_journal_ready, slug, journal)
+      called = File.join(workspace, 'portal-called')
+      portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: portal,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+
+      assert_includes(error.message, 'belongs to another runtime')
+      refute(File.exist?(called))
+      retained = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('/run/old/app-server.sock', retained.dig('codex', 'socket_path'))
     end
   end
 
@@ -5272,7 +6745,2016 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_archive_rejects_an_unmerged_registered_branch_before_mutating_state
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "unmerged\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'unmerged feature')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'push', 'origin',
+        "refs/heads/#{slug}:refs/heads/#{slug}"
+      )
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'feature head is not merged')
+      assert_includes(error.message, "#{slug} -> origin/master")
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      assert(File.directory?(File.join(workspace, 'worktrees', slug, 'sample')))
+      assert_match(
+        /\A---\nlifecycle: active\n---/,
+        File.read(File.join(workspace, 'work', slug, 'state.md'))
+      )
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_closes_and_commits_a_coordination_only_session
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-coordination'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      File.write(File.join(workspace, 'staged.txt'), "staged\n")
+      File.write(File.join(workspace, 'unstaged.txt'), "unstaged\n")
+      assert_git_success('git', '-C', workspace, 'add', 'staged.txt')
+
+      runner.archive(slug, as_is: true)
+
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      assert_match(
+        /\A---\nlifecycle: complete\n---/,
+        File.read(File.join(workspace, 'archive', slug, 'state.md'))
+      )
+      assert_equal(
+        "workspace: archive #{slug}",
+        git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
+      )
+      changed = git_capture_success(
+        'git', '-C', workspace, 'show', '--format=', '--name-only', 'HEAD'
+      ).lines.map(&:strip).reject(&:empty?)
+      refute_includes(changed, 'staged.txt')
+      refute_includes(changed, 'unstaged.txt')
+      assert_equal('A  staged.txt', git_capture_success(
+        'git', '-C', workspace, 'status', '--short', '--', 'staged.txt'
+      ).strip)
+      assert_equal('?? unstaged.txt', git_capture_success(
+        'git', '-C', workspace, 'status', '--short', '--', 'unstaged.txt'
+      ).strip)
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_retries_a_failed_exact_tracking_commit
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-retry'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      File.write(hook, "#!/bin/sh\nexit 1\n")
+      File.chmod(0o755, hook)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.archive(slug, as_is: true)
+      end
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_equal('tracking_archived', journal.fetch('phase'))
+
+      File.unlink(hook)
+      runner.archive(slug, as_is: true)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_equal(
+        "workspace: archive #{slug}",
+        git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
+      )
+    end
+  end
+
+  def test_archive_retry_rejects_mutated_tracking_before_the_commit_phase
+    skip 'git is not available' unless command_available?('git')
+
+    %i[state thread].each do |mutation|
+      with_workspace do |workspace|
+        slug = "2026-06-06-archive-#{mutation}"
+        base = runner_for(workspace)
+        base.ensure_tracking_files(slug)
+        base.send(:ensure_portal_manifest, slug)
+        commit_tracking(workspace, slug, lifecycle: 'active')
+        configure_workspace_origin(workspace)
+        fail_once = true
+        runner_class = Class.new(VpsfreeDevSession::Runner) do
+          define_method(:advance_archive!) do |current_slug, journal, phase|
+            if phase == 'tracking_archived' && fail_once
+              fail_once = false
+              raise VpsfreeDevSession::Error, 'injected post-move failure'
+            end
+
+            super(current_slug, journal, phase)
+          end
+        end
+        runner = runner_class.new(
+          workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+          today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+        )
+
+        assert_raises(VpsfreeDevSession::Error) do
+          runner.archive(slug, as_is: true)
+        end
+        assert(File.directory?(File.join(workspace, 'archive', slug)))
+        journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        assert_equal('clusters_released', journal.fetch('phase'))
+
+        if mutation == :state
+          state = File.join(workspace, 'archive', slug, 'state.md')
+          File.write(state, File.read(state).sub('lifecycle: complete', 'lifecycle: active'))
+        else
+          portal = File.join(workspace, 'archive', slug, 'portal.yml')
+          manifest = YAML.safe_load(File.read(portal))
+          manifest['codex']['thread_id'] = 'replacement-thread'
+          File.write(portal, YAML.dump(manifest))
+        end
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.archive(slug, as_is: true)
+        end
+        assert_includes(error.message, 'archived tracking changed during recovery')
+        assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      end
+    end
+  end
+
+  def test_unfinished_archive_reserves_the_slug_until_its_matching_retry
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-owned'
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      fail_retirement = true
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:retire_portal_thread!) do |*arguments, **options|
+          raise VpsfreeDevSession::Error, 'injected retirement failure' if fail_retirement
+
+          super(*arguments, **options)
+        end
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_equal('tracking_committed', journal.fetch('phase'))
+
+      conflicts = [
+        -> { runner.delete(slug, as_is: true, force: false) },
+        -> { runner.revive(slug, as_is: true) },
+        -> do
+          runner.start(
+            slug, as_is: true, new: false, attach: false, run_codex: false
+          )
+        end,
+        -> do
+          runner.worktree_add(
+            slug, 'sample', as_is: true, name: nil, branch: nil,
+            base: 'master', fetch: false
+          )
+        end
+      ]
+      conflicts.each do |operation|
+        error = assert_raises(VpsfreeDevSession::Error, &operation)
+        assert_includes(error.message, 'session archive is unfinished')
+      end
+
+      fail_retirement = false
+      runner.archive(slug, as_is: true)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_archive_retry_rejects_dirty_tracking_after_the_commit_phase
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-dirty-commit'
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:retire_portal_thread!) do |*_arguments, **_options|
+          raise VpsfreeDevSession::Error, 'injected retirement failure'
+        end
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_equal('tracking_committed', journal.fetch('phase'))
+      File.open(File.join(workspace, 'archive', slug, 'plan.md'), 'a') do |file|
+        file.write("\nUncommitted change.\n")
+      end
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'committed archive tracking differs')
+      assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_retry_reproves_the_retained_feature_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-reprove'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "merged\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      merge_registered_branches(workspace, slug)
+      configure_workspace_origin(workspace)
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      File.write(hook, "#!/bin/sh\nexit 1\n")
+      File.chmod(0o755, hook)
+
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.archive(slug, as_is: true)
+      end
+      File.unlink(hook)
+      repository = File.join(workspace, 'repos', 'sample.git')
+      temporary = File.join(workspace, 'advanced-feature')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'worktree', 'add', temporary, slug
+      )
+      configure_git_identity(temporary)
+      File.write(File.join(temporary, 'later.txt'), "not merged\n")
+      assert_git_success('git', '-C', temporary, 'add', 'later.txt')
+      assert_git_success('git', '-C', temporary, 'commit', '-m', 'later feature')
+      assert_git_success('git', '-C', temporary, 'push', 'origin', slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'feature branch changed after merge proof')
+      assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_archive_reproves_exact_heads_before_each_destructive_retry_phase
+    skip 'git is not available' unless command_available?('git')
+
+    %w[quiesced clusters_released].each do |phase|
+      with_workspace do |workspace|
+        create_bare_repo(workspace, 'sample')
+        slug = "2026-06-06-reprove-#{phase.tr('_', '-')}"
+        runner = runner_for(workspace)
+        runner.worktree_add(
+          slug, 'sample', as_is: true, name: nil, branch: nil,
+          base: 'master', fetch: false
+        )
+        path = File.join(workspace, 'worktrees', slug, 'sample')
+        configure_git_identity(path)
+        File.write(File.join(path, 'feature.txt'), "first merged head\n")
+        assert_git_success('git', '-C', path, 'add', 'feature.txt')
+        assert_git_success('git', '-C', path, 'commit', '-m', 'first merged feature')
+        commit_tracking(workspace, slug, lifecycle: 'active')
+        merge_registered_branches(workspace, slug)
+        configure_workspace_origin(workspace)
+
+        plan = runner.send(:prepare_cleanup, slug, force: false)
+        heads = runner.send(:prove_registered_branches_merged!, slug, plan)
+        journal = runner.send(:prepare_archive_journal!, slug, 'complete', heads, plan)
+        runner.send(:advance_archive!, slug, journal, 'quiesced')
+        if phase == 'clusters_released'
+          runner.send(:advance_archive!, slug, journal, 'clusters_released')
+        end
+
+        File.write(File.join(path, 'later.txt'), "second merged head\n")
+        assert_git_success('git', '-C', path, 'add', 'later.txt')
+        assert_git_success('git', '-C', path, 'commit', '-m', 'second merged feature')
+        assert_git_success('git', '-C', path, 'push', 'origin', slug)
+        assert_git_success('git', '-C', path, 'push', 'origin', "#{slug}:master")
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.archive(slug, as_is: true)
+        end
+        assert_includes(error.message, 'feature heads changed during archival')
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+        assert(File.directory?(path))
+        persisted = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        assert_equal(phase, persisted.fetch('phase'))
+      end
+    end
+  end
+
+  def test_archive_accepts_the_exact_feature_head_after_it_is_merged
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-merged'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "merged\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      merge_registered_branches(workspace, slug)
+      configure_workspace_origin(workspace)
+
+      runner.archive(slug, as_is: true)
+
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'archive', slug, 'portal.yml'))
+      )
+      repository = manifest.fetch('repositories').fetch(0)
+      assert_equal(
+        git_capture_success(
+          'git', "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+          'rev-parse', "refs/heads/#{slug}"
+        ).strip,
+        repository.fetch('final_head_sha')
+      )
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
+  def test_archive_abandoned_skips_the_merge_requirement
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-discarded'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'discarded.txt'), "discarded\n")
+      assert_git_success('git', '-C', path, 'add', 'discarded.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'discarded')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      runner.archive(slug, as_is: true, abandoned: true)
+
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      assert_match(
+        /\A---\nlifecycle: abandoned\n---/,
+        File.read(File.join(workspace, 'archive', slug, 'state.md'))
+      )
+    end
+  end
+
+  def test_revive_commits_tracking_before_starting_the_runtime
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      starts = []
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:start) do |input, **options|
+          starts << [input, options]
+        end
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      runner.revive(slug, as_is: true)
+
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+      assert_match(
+        /\A---\nlifecycle: active\n---/,
+        File.read(File.join(workspace, 'work', slug, 'state.md'))
+      )
+      assert_equal(1, starts.length)
+      assert_equal(true, starts.fetch(0).fetch(1).fetch(:allow_empty_thread))
+      assert_equal(false, starts.fetch(0).fetch(1).fetch(:exclusive))
+      assert_equal(
+        "workspace: revive #{slug}",
+        git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
+      )
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_revive_does_not_create_a_blank_thread_for_a_current_manifest
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-current-no-thread'
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      base.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+      starts = []
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:start) { |input, **options| starts << [input, options] }
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      runner.revive(slug, as_is: true)
+
+      assert_empty(starts)
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'work', slug, 'portal.yml'))
+      )
+      assert_nil(manifest.dig('codex', 'thread_id'))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_revive_resumes_an_interrupted_archive_to_work_transition
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-interrupted'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:start) { |_input, **_options| nil }
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+      runner.send(:prepare_revive_journal!, slug, 'complete')
+      File.rename(
+        File.join(workspace, 'archive', slug),
+        File.join(workspace, 'work', slug)
+      )
+
+      runner.revive(slug, as_is: true)
+
+      assert_match(
+        /\A---\nlifecycle: active\n---/,
+        File.read(File.join(workspace, 'work', slug, 'state.md'))
+      )
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+      assert_equal(
+        "workspace: revive #{slug}",
+        git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
+      )
+    end
+  end
+
+  def test_revive_retry_uses_durable_abandoned_confirmation_after_tracking_move
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-abandoned-retry'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'abandoned')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+
+      journal = runner.send(
+        :prepare_revive_journal!, slug, 'abandoned', abandoned_confirmed: true
+      )
+      runner.send(:finish_revive_tracking!, slug, journal)
+
+      assert_equal(
+        { lifecycle: 'abandoned', pending: true },
+        runner.revive_confirmation(slug, as_is: true)
+      )
+      runner.revive(slug, as_is: true, allow_abandoned: false)
+
+      assert_match(
+        /\A---\nlifecycle: active\n---/,
+        File.read(File.join(workspace, 'work', slug, 'state.md'))
+      )
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_revive_rejects_tracking_edits_after_the_restore_move
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-tree-change'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runner = runner_for(workspace)
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.write(File.join(workspace, 'work', slug, 'unexpected.txt'), "changed\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.revive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'revived tracking changed during recovery')
+      assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_revive_recovery_rejects_dirty_tracking_after_commit
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-dirty-commit'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runner = runner_for(workspace)
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      runner.send(
+        :commit_tracking_transition!, slug, direction: 'revive', mode: 'complete'
+      )
+      runner.send(:advance_revive!, slug, journal, 'tracking_committed')
+      File.open(File.join(workspace, 'work', slug, 'plan.md'), 'a') do |file|
+        file.write("\nUncommitted change.\n")
+      end
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.revive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'committed revive tracking differs')
+      assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_finalize_rejects_an_unmerged_legacy_worktree_without_a_manifest
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-legacy'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      File.unlink(File.join(workspace, 'work', slug, 'portal.yml'))
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "unmerged legacy feature\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'unmerged legacy feature')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'push', 'origin',
+        "refs/heads/#{slug}:refs/heads/#{slug}"
+      )
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:finalize_tracking, slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'feature head is not merged')
+      assert_includes(error.message, "#{slug} -> origin/master")
+    end
+  end
+
+  def test_finalize_check_is_non_mutating_after_exact_head_is_merged
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      runner = runner_for(workspace, out:)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "merged feature\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
+      merge_registered_branches(workspace, slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      runner.send(:finalize_tracking, slug, as_is: true, check: true)
+
+      assert_includes(out.string, "finalizable: #{slug}")
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(manifest.key?('finalized_at'))
+      refute(manifest.dig('repositories', 0).key?('final_head_sha'))
+    end
+  end
+
+  def test_finalize_check_does_not_query_a_conversation_from_another_runtime
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-old-runtime'
+      called = File.join(workspace, 'portal-called')
+      portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
+      out = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: portal,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['creation']['state'] = 'ready'
+      manifest['codex'] = {
+        'thread_id' => 'thread-old',
+        'socket_path' => '/run/old/app-server.sock',
+        'client_version' => '0.151.0'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      runner.send(:finalize_tracking, slug, as_is: true, check: true)
+
+      assert_includes(out.string, "finalizable: #{slug}")
+      refute(File.exist?(called))
+    end
+  end
+
+  def test_finalize_check_refuses_an_active_codex_turn_without_quiescing
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-active-turn'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.152.1',
+        id: '$7'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        tmux:,
+        portal_command: [RbConfig.ruby, '-e', "warn 'thread is active'; exit 1"],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.send(:finalize_tracking, slug, as_is: true, check: true)
+      end
+
+      assert_includes(error.message, 'thread is active')
+      refute(tmux.quiesced)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_finalize_prepare_quiesces_the_terminal_and_preserves_tracking
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-prepare'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      out = StringIO.new
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test/tmux.sock',
+        codex_thread_id: 'thread-1',
+        codex_socket_path: '/run/test/codex.sock',
+        codex_client_version: '0.152.1',
+        id: '$8'
+      )
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        authority_dir:,
+        codex_socket: '/run/test/codex.sock',
+        codex_version: '0.152.1',
+        tmux:,
+        portal_command: [RbConfig.ruby, '-e', 'exit 0'],
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {
+        'thread_id' => 'thread-1',
+        'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.152.1'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+
+      runner.send(:finalize_tracking, slug, as_is: true, prepare: true)
+
+      assert(tmux.quiesced)
+      assert_includes(out.string, "prepared for finalization: #{slug}")
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_finalize_accepts_an_unmerged_abandoned_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'discarded.txt'), "discarded feature\n")
+      assert_git_success('git', '-C', path, 'add', 'discarded.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'discarded feature')
+      commit_tracking(workspace, slug, lifecycle: 'abandoned')
+
+      runner.send(:finalize_tracking, slug, as_is: true)
+
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_revive_current_archive_clears_terminal_metadata
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      merge_registered_branches(workspace, slug)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
+
+      state = File.read(File.join(workspace, 'work', slug, 'state.md'))
+      assert_match(/\A---\nlifecycle: active\n---\n/, state)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(manifest.key?('finalized_at'))
+      refute(manifest.dig('repositories', 0).key?('final_head_sha'))
+      assert_equal('revived', manifest.dig('creation', 'tracking_origin'))
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: nil, fetch: false
+      )
+      assert(File.directory?(File.join(workspace, 'worktrees', slug, 'sample')))
+    end
+  end
+
+  def test_revive_journal_repeats_parent_sync_after_an_interrupted_move
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-interrupted'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runtime = File.join(workspace, 'runtime-authority')
+      runner = runner_for(workspace, authority_dir: runtime)
+      runner.send(:prepare_revive_journal!, slug, 'complete')
+      File.rename(
+        File.join(workspace, 'archive', slug),
+        File.join(workspace, 'work', slug)
+      )
+
+      FileUtils.rm_rf(runtime)
+      synced = []
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:fsync_directory) do |path|
+          synced << path
+          super(path)
+        end
+      end
+      retry_runner = runner_class.new(
+        workspace:,
+        authority_dir: runtime,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+      journal = retry_runner.send(:load_revive_journal, slug)
+      retry_runner.send(:finish_revive_tracking!, slug, journal)
+
+      state = File.read(File.join(workspace, 'work', slug, 'state.md'))
+      assert_match(/\A---\nlifecycle: active\n---\n/, state)
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+      assert(File.exist?(File.join(workspace, 'worktrees', '.locks', "#{slug}.revive.json")))
+      assert_includes(synced, File.join(workspace, 'archive'))
+      assert_includes(synced, File.join(workspace, 'work'))
+    end
+  end
+
+  def test_revive_journal_rejects_a_changed_plan_after_an_interrupted_move
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-interrupted-plan'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runner = runner_for(workspace)
+      runner.send(:prepare_revive_journal!, slug, 'complete')
+      File.rename(
+        File.join(workspace, 'archive', slug),
+        File.join(workspace, 'work', slug)
+      )
+      File.write(File.join(workspace, 'work', slug, 'plan.md'), "truncated\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        journal = runner.send(:load_revive_journal, slug)
+        runner.send(:finish_revive_tracking!, slug, journal)
+      end
+      assert_match(/revived plan changed after revive was prepared/, error.message)
+      assert(File.exist?(File.join(workspace, 'worktrees', '.locks', "#{slug}.revive.json")))
+    end
+  end
+
+  def test_revive_with_an_existing_thread_records_exact_recovery_provenance
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-existing-thread'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex']['thread_id'] = 'thread-existing'
+      manifest['creation']['initial_goal_sent'] = true
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+
+      revived = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-existing', revived.dig('codex', 'thread_id'))
+      assert_equal('revived', revived.dig('creation', 'tracking_origin'))
+      assert_match(/\A[0-9a-f]{64}\z/, revived.dig('creation', 'tracking_plan_sha256'))
+      assert_match(/\A[0-9a-f]{64}\z/, revived.dig('creation', 'tracking_state_sha256'))
+    end
+  end
+
+  def test_start_revived_existing_thread_uses_exact_archived_recovery_without_a_goal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-existing-thread-recovery'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {
+        'thread_id' => 'thread-existing',
+        'socket_path' => '/run/current/app-server.sock',
+        'client_version' => '0.152.1'
+      }
+      manifest['creation']['initial_goal_sent'] = true
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
+
+      calls = File.join(workspace, 'portal-calls')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{calls.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        puts JSON.generate(threadId: 'thread-existing') if ARGV[0, 2] == ['thread', 'create']
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$revived', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-existing',
+        codex_socket_path: '/run/current/app-server.sock',
+        codex_client_version: '0.152.1', codex_pane_id: '%1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_options| session }
+        define_method(:sync_slug) { |*_args, **_options| session }
+        define_method(:revalidate_session!) { |_selected| session }
+        define_method(:reconcile_native_client!) { |_slug, selected, **_options| selected }
+        define_method(:verify_codex_client!) {}
+      end
+      out = StringIO.new
+      starter = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: [RbConfig.ruby, portal],
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      starter.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        json: true,
+        exclusive: false
+      )
+
+      assert_equal('thread-existing', JSON.parse(out.string).fetch('threadId'))
+      recorded = File.read(calls)
+      assert_includes(recorded, 'thread create')
+      assert_includes(recorded, '--thread-id thread-existing')
+      assert_includes(recorded, '--recover-archived')
+      refute_includes(recorded, 'ensure-initial')
+      updated = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-existing', updated.dig('codex', 'thread_id'))
+      refute(updated.dig('creation').key?('tracking_origin'))
+      refute(updated.dig('creation').key?('tracking_plan_sha256'))
+      refute(updated.dig('creation').key?('tracking_state_sha256'))
+    end
+  end
+
+  def test_revived_thread_recovery_defers_version_refresh_until_authority_is_ready
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-existing-thread-retry'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {
+        'thread_id' => 'thread-existing',
+        'socket_path' => '/run/current/app-server.sock',
+        'client_version' => '0.152.1'
+      }
+      manifest['creation']['initial_goal_sent'] = true
+      runner.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
+
+      calls = File.join(workspace, 'portal-calls')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{calls.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
+        puts JSON.generate(threadId: 'thread-existing') if ARGV[0, 2] == ['thread', 'create']
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$revived', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-existing',
+        codex_socket_path: '/run/current/app-server.sock',
+        codex_client_version: '0.153.4', codex_pane_id: '%1'
+      )
+      authority_attempts = 0
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_options| session }
+        define_method(:write_session_authority) do |*_args, **_options|
+          authority_attempts += 1
+          if authority_attempts == 1
+            raise VpsfreeDevSession::Error, 'simulated authority publication failure'
+          end
+        end
+        define_method(:sync_slug) { |*_args, **_options| session }
+        define_method(:revalidate_session!) { |_selected| session }
+        define_method(:reconcile_native_client!) { |_slug, selected, **_options| selected }
+        define_method(:verify_codex_client!) {}
+      end
+      out = StringIO.new
+      starter = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.153.4',
+        portal_command: [RbConfig.ruby, portal],
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        starter.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          json: true,
+          exclusive: false
+        )
+      end
+      assert_match(/simulated authority publication failure/, error.message)
+      interrupted = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('0.152.1', interrupted.dig('codex', 'client_version'))
+      assert_equal('revived', interrupted.dig('creation', 'tracking_origin'))
+
+      starter.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        json: true,
+        exclusive: false
+      )
+
+      assert_equal('thread-existing', JSON.parse(out.string).fetch('threadId'))
+      assert_equal(2, authority_attempts)
+      assert_equal(2, File.readlines(calls).count { |line| line.start_with?('thread create ') })
+      recovered = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('0.153.4', recovered.dig('codex', 'client_version'))
+      refute(recovered.dig('creation').key?('tracking_origin'))
+      refute(recovered.dig('creation').key?('tracking_plan_sha256'))
+      refute(recovered.dig('creation').key?('tracking_state_sha256'))
+    end
+  end
+
+  def test_revive_legacy_archive_reuses_retained_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      slug = '2026-06-06-demo'
+      assert_git_success('git', "--git-dir=#{repository}", 'branch', slug, 'master')
+      master = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'update-ref',
+        'refs/remotes/origin/master', master
+      )
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'symbolic-ref',
+        'refs/remotes/origin/HEAD', 'refs/remotes/origin/master'
+      )
+      tracking = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(tracking)
+      runner = runner_for(workspace)
+      File.write(
+        File.join(tracking, 'plan.md'),
+        <<~PLAN
+          # Retained legacy plan
+
+          This substantive plan predates the current tracking template.
+        PLAN
+      )
+      File.write(
+        File.join(tracking, 'state.md'),
+        <<~STATE
+          ---
+          lifecycle: active
+          ---
+
+          # Retained legacy state
+
+          This substantive state predates the current tracking template.
+        STATE
+      )
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
+      revived = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('revived', revived.dig('creation', 'tracking_origin'))
+      assert_equal(
+        Digest::SHA256.hexdigest(File.read(File.join(workspace, 'work', slug, 'plan.md'))),
+        revived.dig('creation', 'tracking_plan_sha256')
+      )
+      assert_equal(
+        Digest::SHA256.hexdigest(File.read(File.join(workspace, 'work', slug, 'state.md'))),
+        revived.dig('creation', 'tracking_state_sha256')
+      )
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: nil, fetch: false
+      )
+
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      assert_equal(slug, git_capture_success('git', '-C', path, 'branch', '--show-current').strip)
+      assert_equal(master, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(master, manifest.dig('repositories', 0, 'initial_base_sha'))
+
+      plan_before = File.read(File.join(workspace, 'work', slug, 'plan.md'))
+      state_before = File.read(File.join(workspace, 'work', slug, 'state.md'))
+      goal = File.join(workspace, 'goal.txt')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(goal, "Continue the retained initiative.\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        puts JSON.generate(threadId: 'thread-fresh') if ARGV[0, 2] == ['thread', 'create']
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$fresh', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-fresh',
+        codex_socket_path: '/run/current/app-server.sock',
+        codex_client_version: '0.152.1', codex_pane_id: '%1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_options| session }
+        define_method(:sync_slug) { |*_args, **_options| session }
+        define_method(:revalidate_session!) { |_selected| session }
+        define_method(:reconcile_native_client!) { |_slug, selected, **_options| selected }
+        define_method(:verify_codex_client!) {}
+      end
+      out = StringIO.new
+      starter = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: [RbConfig.ruby, portal],
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      starter.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+
+      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
+      assert_equal(plan_before, File.read(File.join(workspace, 'work', slug, 'plan.md')))
+      assert_equal(state_before, File.read(File.join(workspace, 'work', slug, 'state.md')))
+      updated = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(master, updated.dig('repositories', 0, 'initial_base_sha'))
+      assert_equal('thread-fresh', updated.dig('codex', 'thread_id'))
+      assert_equal('ready', updated.dig('creation', 'state'))
+      refute(updated.dig('creation').key?('tracking_origin'))
+      refute(updated.dig('creation').key?('tracking_plan_sha256'))
+      refute(updated.dig('creation').key?('tracking_state_sha256'))
+
+      out.truncate(0)
+      out.rewind
+      starter.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
+
+      journal_path = starter.send(:creation_journal_file, slug)
+      interrupted = JSON.parse(File.read(journal_path)).merge('state' => 'creating')
+      File.write(journal_path, JSON.generate(interrupted))
+      File.write(
+        File.join(workspace, 'work', slug, 'plan.md'),
+        "#{plan_before}\nFollow-up recorded after the initial turn.\n"
+      )
+      out.truncate(0)
+      out.rewind
+      starter.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: nil,
+        json: true,
+        exclusive: false
+      )
+      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
+      assert_equal('ready', JSON.parse(File.read(journal_path)).fetch('state'))
+    end
+  end
+
+  def test_start_adopts_committed_active_tracking_and_registers_existing_worktrees
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      slug = '2026-06-06-retained'
+      master = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success('git', "--git-dir=#{repository}", 'branch', slug, 'master')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'update-ref',
+        'refs/remotes/origin/master', master
+      )
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'symbolic-ref',
+        'refs/remotes/origin/HEAD', 'refs/remotes/origin/master'
+      )
+      worktree = File.join(workspace, 'worktrees', slug, 'sample')
+      FileUtils.mkdir_p(File.dirname(worktree))
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'worktree', 'add', worktree, slug
+      )
+
+      tracking = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(tracking)
+      plan = "# Retained plan\n\nPokračovat v existující implementaci.\n"
+      state = "---\nlifecycle: active\n---\n\n# Retained state\n\nPřipraveno.\n" + ('x' * 1_100_000)
+      File.write(File.join(tracking, 'plan.md'), plan)
+      File.write(File.join(tracking, 'state.md'), state)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+
+      goal = File.join(workspace, 'goal.txt')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(goal, "Read plan.md and state.md, then continue the retained initiative.\n")
+      File.write(portal, <<~RUBY)
+        require 'json'
+        puts JSON.generate(threadId: 'thread-retained') if ARGV[0, 2] == ['thread', 'create']
+      RUBY
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$retained', name: slug, mark: '1', slug:, workspace:,
+        socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-retained',
+        codex_socket_path: '/run/current/app-server.sock',
+        codex_client_version: '0.152.1', codex_pane_id: '%1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_args, **_options| session }
+        define_method(:sync_slug) do |selected_slug, **_options|
+          sync_portal_repositories(selected_slug, worktree_entries(selected_slug))
+          session
+        end
+        define_method(:revalidate_session!) { |_selected| session }
+        define_method(:reconcile_native_client!) { |_slug, selected, **_options| selected }
+        define_method(:verify_codex_client!) {}
+      end
+      out = StringIO.new
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        codex_socket: '/run/current/app-server.sock',
+        codex_version: '0.152.1',
+        portal_command: [RbConfig.ruby, portal],
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      interrupted = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      assert_equal('retained', interrupted.fetch('tracking_origin'))
+      refute(File.exist?(File.join(tracking, 'portal.yml')))
+
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true,
+        exclusive: true
+      )
+
+      assert_equal('thread-retained', JSON.parse(out.string).fetch('threadId'))
+      assert_equal(plan.b, File.binread(File.join(tracking, 'plan.md')))
+      assert_equal(state.b, File.binread(File.join(tracking, 'state.md')))
+      manifest = YAML.safe_load(File.read(File.join(tracking, 'portal.yml')))
+      assert_equal('thread-retained', manifest.dig('codex', 'thread_id'))
+      assert_equal('sample', manifest.dig('repositories', 0, 'project'))
+      assert_equal(slug, manifest.dig('repositories', 0, 'branch'))
+      assert_equal('master', manifest.dig('repositories', 0, 'default_branch'))
+      assert_equal(master, manifest.dig('repositories', 0, 'initial_base_sha'))
+      refute(manifest.fetch('creation').key?('tracking_origin'))
+
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      assert_equal('ready', journal.fetch('state'))
+      assert_equal('retained', journal.fetch('tracking_origin'))
+      assert_equal(Digest::SHA256.hexdigest(plan), journal.fetch('tracking_plan_sha256'))
+      assert_equal(Digest::SHA256.hexdigest(state), journal.fetch('tracking_state_sha256'))
+      refute(journal.key?('tracking_portal_sha256'))
+    end
+  end
+
+  def test_start_refuses_uncommitted_retained_plan_or_state
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-dirty'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      File.write(File.join(workspace, 'work', slug, 'plan.md'), "uncommitted replacement\n")
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/retained plan, state, and portal absence must match/, error.message)
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+    end
+  end
+
+  def test_start_refuses_a_deleted_committed_retained_portal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-deleted-portal'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      File.unlink(File.join(workspace, 'work', slug, 'portal.yml'))
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/retained plan, state, and portal absence must match/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+    end
+  end
+
+  def test_start_refuses_retained_tracking_without_codex_before_mutation
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-no-codex'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/restarting retained tracking requires a Codex conversation/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+    end
+  end
+
+  def test_start_without_goal_refuses_retained_tracking_without_codex_before_mutation
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-no-goal-no-codex'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/restarting retained tracking requires a Codex conversation/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(runner.instance_variable_get(:@tmux).session(slug))
+    end
+  end
+
+  def test_start_without_goal_refuses_deleted_committed_portal_without_codex_before_mutation
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-deleted-portal-no-codex'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      File.unlink(File.join(workspace, 'work', slug, 'portal.yml'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/restarting retained tracking requires a Codex conversation/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(runner.instance_variable_get(:@tmux).session(slug))
+    end
+  end
+
+  def test_start_without_goal_allows_a_stopped_ready_session_without_codex
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-ready-no-codex'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(slug)
+      setup.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$restarted', name: slug, mark: '1', slug:, workspace:
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
+        define_method(:sync_slug) { |*_arguments, **_keywords| session }
+        define_method(:revalidate_session!) { |expected| expected }
+      end
+      out = StringIO.new
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {}
+      )
+
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: false,
+        json: true,
+        exclusive: false
+      )
+
+      result = JSON.parse(out.string)
+      assert_equal(slug, result.fetch('slug'))
+      assert_nil(result.fetch('threadId'))
+      assert_equal(['tmux', 'attach-session', '-t', '$restarted:'], result.fetch('attach'))
+    end
+  end
+
+  def test_start_refuses_committed_empty_portal_as_retained_tracking
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-empty-portal'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/retained active tracking with a portal manifest cannot be adopted/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+    end
+  end
+
+  def test_start_refuses_manifestless_tracking_with_archive_history
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-manually-restored-archive'
+      runner = archived_runner(workspace, slug)
+      FileUtils.mv(
+        File.join(workspace, 'archive', slug),
+        File.join(workspace, 'work', slug)
+      )
+      FileUtils.rm_f(File.join(workspace, 'work', slug, 'portal.yml'))
+      set_lifecycle(workspace, slug, 'active')
+      assert_git_success(
+        'git', '-C', workspace, 'add', '-A', '--',
+        File.join('work', slug), File.join('archive', slug)
+      )
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'manually restore archive')
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/archived slug must be restored with dev-session revive/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+    end
+  end
+
+  def test_retained_conversation_replay_rejects_changed_manifest_provenance
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained-manifest-replay'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Continue this initiative.\n")
+      journal = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: journal)
+      manifest['creation']['tracking_state_sha256'] = '0' * 64
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/preserved tracking provenance changed during creation/, error.message)
+    end
+  end
+
+  def test_portal_sync_leaves_an_unproven_unregistered_worktree_untouched
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-unproven'
+      path = File.join(workspace, 'worktrees', slug, 'legacy-clone')
+      assert_git_success('git', 'init', '-b', slug, path)
+      marker = File.join(path, 'uncommitted.txt')
+      File.write(marker, "keep this work\n")
+      plain_path = File.join(workspace, 'worktrees', slug, 'plain-directory')
+      FileUtils.mkdir_p(plain_path)
+      plain_marker = File.join(plain_path, 'keep.txt')
+      File.write(plain_marker, "keep this too\n")
+      err = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err:, today: TODAY
+      )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+
+      runner.send(
+        :sync_portal_repositories,
+        slug,
+        runner.send(:worktree_entries, slug)
+      )
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_empty(manifest.fetch('repositories'))
+      assert_equal("keep this work\n", File.read(marker))
+      assert_equal("keep this too\n", File.read(plain_marker))
+      assert_match(/did not register unproven worktree/, err.string)
+      assert_match(/outside the canonical repository root/, err.string)
+      assert_match(/not a canonical attached Git worktree/, err.string)
+    end
+  end
+
+  def test_portal_sync_leaves_a_canonical_worktree_with_an_unsafe_name_unregistered
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      slug = '2026-06-06-unsafe-worktree-name'
+      master = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success('git', "--git-dir=#{repository}", 'branch', slug, 'master')
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'update-ref',
+        'refs/remotes/origin/master', master
+      )
+      assert_git_success(
+        'git', "--git-dir=#{repository}", 'symbolic-ref',
+        'refs/remotes/origin/HEAD', 'refs/remotes/origin/master'
+      )
+      path = File.join(workspace, 'worktrees', slug, 'legacy checkout')
+      FileUtils.mkdir_p(File.dirname(path))
+      assert_git_success('git', "--git-dir=#{repository}", 'worktree', 'add', path, slug)
+      err = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err:, today: TODAY
+      )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+
+      proven = runner.send(
+        :sync_portal_repositories,
+        slug,
+        runner.send(:worktree_entries, slug)
+      )
+
+      assert_empty(proven)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_empty(manifest.fetch('repositories'))
+      assert_match(/worktree name is unsafe for a portal manifest/, err.string)
+      assert(File.directory?(path))
+    end
+  end
+
+  def test_portal_sync_rejects_a_registered_non_worktree_path
+    with_workspace do |workspace|
+      slug = '2026-06-06-registered-non-worktree'
+      path = File.join(workspace, 'worktrees', slug, 'broken')
+      FileUtils.mkdir_p(path)
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['repositories'] = [{
+        'name' => 'broken',
+        'project' => 'sample',
+        'branch' => slug,
+        'default_branch' => 'master'
+      }]
+      runner.send(:write_portal_manifest, slug, manifest)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:sync_portal_repositories, slug, [])
+      end
+      assert_match(/registered portal worktree is not a canonical attached worktree/, error.message)
+      assert(File.directory?(path))
+    end
+  end
+
+  def test_sync_does_not_open_a_window_for_an_unproven_git_directory
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-unproven-window'
+      path = File.join(workspace, 'worktrees', slug, 'standalone')
+      assert_git_success('git', 'init', '-b', slug, path)
+      tmux = WindowRecordingTmux.new(slug, workspace:)
+      err = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux:, out: StringIO.new, err:, today: TODAY, env: {}
+      )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+
+      runner.send(:sync_slug, slug, require_session: true)
+
+      assert_empty(tmux.captures)
+      assert_match(/did not register unproven worktree/, err.string)
+      assert(File.directory?(path))
+    end
+  end
+
+  def test_fresh_conversation_rejects_terminal_revived_tracking
+    %w[complete abandoned].each do |lifecycle|
+      with_workspace do |workspace|
+        slug = "2026-06-06-#{lifecycle}"
+        tracking = File.join(workspace, 'work', slug)
+        FileUtils.mkdir_p(tracking)
+        FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug))
+        plan = "# Retained plan\n\nContinue this work.\n"
+        state = "---\nlifecycle: #{lifecycle}\n---\n\n# Retained state\n"
+        File.write(File.join(tracking, 'plan.md'), plan)
+        File.write(File.join(tracking, 'state.md'), state)
+        runner = runner_for(workspace)
+        manifest = runner.send(
+          :revived_portal_manifest,
+          slug,
+          plan_sha256: Digest::SHA256.hexdigest(plan),
+          state_sha256: Digest::SHA256.hexdigest(state)
+        )
+        File.write(File.join(tracking, 'portal.yml'), YAML.dump(manifest))
+        goal = File.join(workspace, 'goal.txt')
+        File.write(goal, "Resume retained work.\n")
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.start(
+            slug,
+            as_is: true,
+            new: false,
+            attach: false,
+            run_codex: false,
+            goal_file: goal,
+            json: true,
+            exclusive: true
+          )
+        end
+        assert_match(/cannot create a conversation for a #{lifecycle} initiative/, error.message)
+        refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      end
+    end
+  end
+
+  def test_revived_conversation_replay_rejects_changed_tracking
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revived-replay'
+      runner = archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      journal = runner.send(:prepare_revive_journal!, slug, 'complete')
+      runner.send(:finish_revive_tracking!, slug, journal)
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume retained work.\n")
+      journal = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      assert(journal.fetch('preserve_tracking'))
+      File.write(File.join(workspace, 'work', slug, 'plan.md'), "x")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/preserved tracking changed before conversation creation/, error.message)
+    end
+  end
+
+  def test_revived_conversation_rejects_self_asserted_uncommitted_provenance
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-self-asserted-revive'
+      runner = archived_runner(workspace, slug)
+      File.rename(
+        File.join(workspace, 'archive', slug),
+        File.join(workspace, 'work', slug)
+      )
+      FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug))
+      plan = "# Replacement plan\n\nThis did not come from the archive.\n"
+      state_path = File.join(workspace, 'work', slug, 'state.md')
+      state = runner.send(:revived_state_content, File.read(state_path))
+      File.write(File.join(workspace, 'work', slug, 'plan.md'), plan)
+      File.write(state_path, state)
+      manifest = runner.send(
+        :revived_portal_manifest,
+        slug,
+        plan_sha256: Digest::SHA256.hexdigest(plan),
+        state_sha256: Digest::SHA256.hexdigest(state)
+      )
+      File.write(File.join(workspace, 'work', slug, 'portal.yml'), YAML.dump(manifest))
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume retained work.\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: false,
+          goal_file: goal,
+          json: true,
+          exclusive: true
+        )
+      end
+      assert_match(/revived tracking provenance cannot be proven/, error.message)
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
+    end
+  end
+
+  def test_revive_refuses_abandoned_dirty_duplicate_and_live_states
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-abandoned'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_tracking(workspace, slug, lifecycle: 'abandoned')
+      runner.send(:finalize_tracking, slug, as_is: true)
+      commit_archive_move(workspace, slug)
+      configure_workspace_origin(workspace)
+      error = assert_raises(VpsfreeDevSession::Error) { runner.revive(slug, as_is: true) }
+      assert_includes(error.message, 'without confirmation')
+      runner.send(:prepare_revive_journal!, slug, 'abandoned', abandoned_confirmed: true)
+      runner.send(:finish_revive_tracking!, slug, runner.send(:load_revive_journal, slug))
+      assert_match(/lifecycle: active/, File.read(File.join(workspace, 'work', slug, 'state.md')))
+    end
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-dirty'
+      runner = archived_runner(workspace, slug)
+      File.write(File.join(workspace, 'archive', slug, 'state.md'), "\nchanged\n", mode: 'a')
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:prepare_revive_journal!, slug, 'complete')
+      end
+      assert_includes(error.message, 'archive move must be committed')
+    end
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-duplicate'
+      runner = archived_runner(workspace, slug)
+      FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:prepare_revive_journal!, slug, 'complete')
+      end
+      assert_includes(error.message, 'active tracking already exists')
+    end
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-live'
+      archived_runner(workspace, slug)
+      tmux = ManagedTmux.new(slug, workspace:)
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner_for(workspace, tmux:).send(:prepare_revive_journal!, slug, 'complete')
+      end
+      assert_includes(error.message, 'live tmux session')
+    end
+  end
+
   private
+
+  def removal_recovery(workspace, slug)
+    matches = Dir.glob(
+      File.join(workspace, '.xdg-state', 'vpsfree-workspaces', 'removed', '*', "*-#{slug}-*")
+    )
+    assert_equal(1, matches.length, "expected one recovery directory for #{slug}")
+    matches.fetch(0)
+  end
 
   def with_workspace
     Dir.mktmpdir('dev-session-test') do |workspace|
@@ -5283,19 +8765,59 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def runner_for(workspace, env: {}, cwd: nil, tmux: nil, out: nil)
+  def profile_link_token(path)
+    VpsfreeWorkspaceProfileIdentity.token(path)
+  end
+
+  def cleanup_contract_helper(workspace, name, paths)
+    helper = File.join(workspace, "#{name}-cleanup-contract")
+    payload = JSON.generate('schema' => 1, 'paths' => paths)
+    File.write(helper, <<~SH)
+      #!/bin/sh
+      [ "$1" = cleanup-paths ] || exit 0
+      printf '%s\n' #{Shellwords.escape(payload)}
+    SH
+    File.chmod(0o755, helper)
+    helper
+  end
+
+  def runner_for(
+    workspace,
+    env: {},
+    cwd: nil,
+    tmux: nil,
+    out: nil,
+    authority_dir: nil,
+    vpsadmin_cluster: nil,
+    vpsadminos_cluster: nil
+  )
     out ||= StringIO.new
     tmux ||= NullTmux.new
+    resolved_env = {
+      'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')
+    }.merge(env)
 
     VpsfreeDevSession::Runner.new(
       workspace:,
+      authority_dir:,
       tmux:,
       out:,
       err: StringIO.new,
       today: TODAY,
-      env:,
-      cwd: cwd || workspace
+      env: resolved_env,
+      cwd: cwd || workspace,
+      vpsadmin_cluster:,
+      vpsadminos_cluster:
     )
+  end
+
+  def archived_runner(workspace, slug)
+    runner = runner_for(workspace)
+    runner.ensure_tracking_files(slug)
+    commit_tracking(workspace, slug, lifecycle: 'complete')
+    runner.send(:finalize_tracking, slug, as_is: true)
+    commit_archive_move(workspace, slug)
+    runner
   end
 
   def create_bare_repo(workspace, project)
@@ -5305,6 +8827,7 @@ class DevSessionTest < Minitest::Test
     assert_git_success('git', 'init', '-b', 'master', source)
     assert_git_success('git', '-C', source, 'config', 'user.email', 'test@example.invalid')
     assert_git_success('git', '-C', source, 'config', 'user.name', 'Test User')
+    assert_git_success('git', '-C', source, 'config', 'receive.denyCurrentBranch', 'updateInstead')
     File.write(File.join(source, 'README.md'), "# Test\n")
     assert_git_success('git', '-C', source, 'add', 'README.md')
     assert_git_success('git', '-C', source, 'commit', '-m', 'initial')
@@ -5322,6 +8845,37 @@ class DevSessionTest < Minitest::Test
     set_lifecycle(workspace, slug, lifecycle)
     assert_git_success('git', '-C', workspace, 'add', File.join('work', slug, 'state.md'))
     assert_git_success('git', '-C', workspace, 'commit', '-m', 'close initiative')
+  end
+
+  def configure_workspace_origin(workspace)
+    remote = File.join(workspace, '.git', 'test-origin.git')
+    assert_git_success('git', 'init', '--bare', remote)
+    assert_git_success('git', '-C', workspace, 'remote', 'add', 'origin', remote)
+    assert_git_success('git', '-C', workspace, 'push', '-u', 'origin', 'master')
+  end
+
+  def merge_registered_branches(workspace, slug)
+    path = File.join(workspace, 'work', slug, 'portal.yml')
+    return unless File.file?(path)
+
+    manifest = YAML.safe_load(File.read(path))
+    manifest.fetch('repositories', []).each do |repository|
+      common = if repository.fetch('project') == 'workspace'
+                 File.join(workspace, '.git')
+               else
+                 File.join(workspace, 'repos', "#{repository.fetch('project')}.git")
+               end
+      branch = repository.fetch('branch')
+      default = repository.fetch('default_branch')
+      assert_git_success(
+        'git', "--git-dir=#{common}", 'push', 'origin',
+        "refs/heads/#{branch}:refs/heads/#{branch}"
+      )
+      assert_git_success(
+        'git', "--git-dir=#{common}", 'push', 'origin',
+        "refs/heads/#{branch}:refs/heads/#{default}"
+      )
+    end
   end
 
   def commit_terminal_tracking_only(workspace, slug, lifecycle:)

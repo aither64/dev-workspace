@@ -26,6 +26,8 @@ Usage:
   devcluster restart <slug> <node> <service>
   devcluster ssh [<slug>] <node> [ssh-options...] [-- <remote-command>...]
   devcluster reset <slug>
+  devcluster cleanup-paths <slug>
+  devcluster transition-adopt <slug>
 EOF
 }
 
@@ -51,9 +53,7 @@ ready_file() {
 }
 
 socket_dir() {
-  local digest
-  digest="$(printf '%s' "$1" | sha256sum | cut -c1-12)"
-  printf '/tmp/vpsadminos-devcluster-%s\n' "$digest"
+  devcluster_socket_dir "$1" vpsadminos-devcluster
 }
 
 topology_file() {
@@ -460,11 +460,12 @@ stop_cluster() {
   local slug="${1:-}"
   [ -n "$slug" ] || die "missing slug"
 
-  local pid_path pid
+  local pid_path pid sock_dir
   pid_path="$(pid_file "$slug")"
+  sock_dir="$(socket_dir "$slug")"
   if [ ! -f "$pid_path" ]; then
     rm -f "$(ready_file "$slug")"
-    kill_socket_processes "$slug"
+    kill_socket_processes "$slug" "$sock_dir"
     remove_result_link "$slug"
     printf 'cluster %s was not running\n' "$slug"
     return
@@ -474,7 +475,7 @@ stop_cluster() {
 
   if ! runner_process_matches "$slug" "$pid"; then
     rm -f "$pid_path" "$(ready_file "$slug")"
-    kill_socket_processes "$slug"
+    kill_socket_processes "$slug" "$sock_dir"
     remove_result_link "$slug"
     printf 'cluster %s was not running\n' "$slug"
     return
@@ -484,7 +485,7 @@ stop_cluster() {
 
   for _ in $(seq 1 120); do
     runner_process_matches "$slug" "$pid" || {
-      kill_socket_processes "$slug"
+      kill_socket_processes "$slug" "$sock_dir"
       remove_result_link "$slug"
       printf 'cluster %s stopped\n' "$slug"
       return
@@ -493,7 +494,7 @@ stop_cluster() {
   done
 
   signal_cluster_runner "$slug" "$pid" KILL kill
-  kill_socket_processes "$slug"
+  kill_socket_processes "$slug" "$sock_dir"
   remove_result_link "$slug"
   printf 'cluster %s killed after timeout\n' "$slug"
 }
@@ -678,15 +679,16 @@ reset_cluster() {
   [ -n "$slug" ] || die "missing slug"
 
   devcluster_validate_cluster_directory "$slug" false || true
+  local sock_dir
+  sock_dir="$(socket_dir "$slug")"
 
   if [ -f "$(pid_file "$slug")" ] && runner_process_matches "$slug" "$(cat "$(pid_file "$slug")")"; then
     stop_cluster "$slug"
   fi
 
-  kill_socket_processes "$slug"
+  kill_socket_processes "$slug" "$sock_dir"
   remove_result_link "$slug"
-  rm -rf -- "$(cluster_dir "$slug")"
-  rm -rf -- "$(socket_dir "$slug")"
+  remove_cluster_runtime_state "$slug" "$sock_dir"
   printf 'cluster %s state removed\n' "$slug"
 }
 
@@ -709,16 +711,19 @@ main() {
   fi
 
   case "$cmd" in
-    start) devcluster_with_lifecycle_lock "$1" true start_cluster "${@:2}" ;;
-    stop) devcluster_with_lifecycle_lock "$1" false stop_cluster "${@:2}" ;;
-    status) devcluster_with_lifecycle_lock "$1" false status_cluster "${@:2}" ;;
+    start) devcluster_with_lifecycle_lock "$1" true true start_cluster "${@:2}" ;;
+    stop) devcluster_with_lifecycle_lock "$1" false true stop_cluster "${@:2}" ;;
+    status) devcluster_with_lifecycle_lock "$1" false false status_cluster "${@:2}" ;;
     gcroots) gcroots_cluster "$@" ;;
-    info) info_cluster "$@" ;;
-    config) devcluster_with_lifecycle_lock "$1" true config_cluster "${@:2}" ;;
-    update) devcluster_with_lifecycle_lock "$1" true update_cluster "${@:2}" ;;
-    restart) restart_service "$@" ;;
-    ssh) ssh_cluster "$@" ;;
-    reset) devcluster_with_lifecycle_lock "$1" false reset_cluster "${@:2}" ;;
+    info) devcluster_with_lifecycle_lock "$1" false false info_cluster "${@:2}" ;;
+    config) devcluster_with_lifecycle_lock "$1" true true config_cluster "${@:2}" ;;
+    update) devcluster_with_lifecycle_lock "$1" true true update_cluster "${@:2}" ;;
+    restart) devcluster_with_lifecycle_lock "$1" true true restart_service "${@:2}" ;;
+    ssh) devcluster_with_lifecycle_lock "$1" true true ssh_cluster "${@:2}" ;;
+    reset) devcluster_with_lifecycle_lock "$1" false true reset_cluster "${@:2}" ;;
+    cleanup-paths) need_cmd jq; devcluster_cleanup_paths_json "$1" vpsadminos-devcluster ;;
+    transition-adopt) devcluster_with_lifecycle_lock "$1" false true \
+      devcluster_adopt_package_transition vpsadminos-devcluster ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
   esac
