@@ -54,6 +54,8 @@ buildGoModule {
     patchShebangs \
       ../dev-clusters/vpsadmin/bin/devcluster \
       ../dev-clusters/vpsadminos/bin/devcluster
+    ${contractPython}/bin/python3 ../test/codex_protocol_contract.py \
+      --coverage-only internal/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
     (
