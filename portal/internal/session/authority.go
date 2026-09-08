@@ -23,6 +23,7 @@ type RuntimeAuthority struct {
 	Workspace          string `json:"workspace"`
 	TmuxSocket         string `json:"tmux_socket"`
 	TmuxSessionID      string `json:"tmux_session_id"`
+	TmuxIdentity       string `json:"tmux_identity,omitempty"`
 	CodexThreadID      string `json:"codex_thread_id,omitempty"`
 	CodexSocketPath    string `json:"codex_socket_path,omitempty"`
 	CodexClientVersion string `json:"codex_client_version,omitempty"`
@@ -164,6 +165,12 @@ func LoadRuntimeAuthority(directory, slug, workspace string) (RuntimeAuthority, 
 	if present != 0 && present != len(codexKeys) {
 		return RuntimeAuthority{}, errors.New("invalid runtime Codex authority")
 	}
+	if value, ok := raw["tmux_identity"]; ok {
+		var identity string
+		if err := json.Unmarshal(value, &identity); err != nil || !isLowerHex(identity, 64) {
+			return RuntimeAuthority{}, errors.New("invalid runtime tmux identity")
+		}
+	}
 	if err := authority.Validate(slug, workspace); err != nil {
 		return RuntimeAuthority{}, err
 	}
@@ -174,7 +181,8 @@ func (a RuntimeAuthority) Validate(slug, workspace string) error {
 	if a.Schema != 1 || (a.State != "creating" && a.State != "ready") ||
 		a.Slug != slug || a.Workspace != workspace ||
 		!validSocketPath(a.TmuxSocket) || len(a.TmuxSessionID) < 2 ||
-		a.TmuxSessionID[0] != '$' || strings.Trim(a.TmuxSessionID[1:], "0123456789") != "" {
+		a.TmuxSessionID[0] != '$' || strings.Trim(a.TmuxSessionID[1:], "0123456789") != "" ||
+		(a.TmuxIdentity != "" && !isLowerHex(a.TmuxIdentity, 64)) {
 		return errors.New("invalid runtime authority identity")
 	}
 	codexCount := 0
@@ -202,6 +210,7 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 		"#{@vpsfree_dev_session_codex_socket}",
 		"#{@vpsfree_dev_session_codex_version}",
 		"#{@vpsfree_dev_session_codex_pane}",
+		"#{E:VPSFREE_DEV_SESSION_TMUX_IDENTITY}",
 	}, "\t")
 	command := exec.CommandContext(
 		ctx, tmux, "-S", a.TmuxSocket, "display-message", "-p",
@@ -212,13 +221,22 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 		return fmt.Errorf("inspect live tmux session: %w", err)
 	}
 	fields := strings.Split(strings.TrimSuffix(string(output), "\n"), "\t")
-	if len(fields) != 11 || fields[0] != a.TmuxSessionID || fields[1] != a.Slug ||
+	if len(fields) != 12 || fields[0] != a.TmuxSessionID || fields[1] != a.Slug ||
 		fields[2] != "1" || fields[3] != a.Slug || fields[4] != a.Workspace ||
 		fields[5] != a.Slug || fields[6] != a.TmuxSocket ||
 		fields[7] != a.CodexThreadID || fields[8] != a.CodexSocketPath ||
 		fields[9] != a.CodexClientVersion ||
-		(a.CodexThreadID != "" && (len(fields[10]) < 2 || fields[10][0] != '%' || strings.Trim(fields[10][1:], "0123456789") != "")) {
+		(a.CodexThreadID != "" && (len(fields[10]) < 2 || fields[10][0] != '%' || strings.Trim(fields[10][1:], "0123456789") != "")) ||
+		(fields[11] != "" && !isLowerHex(fields[11], 64)) ||
+		(a.TmuxIdentity != "" && fields[11] != a.TmuxIdentity) {
 		return errors.New("live tmux session does not match runtime authority")
 	}
 	return nil
+}
+
+func isLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	return strings.Trim(value, "0123456789abcdef") == ""
 }

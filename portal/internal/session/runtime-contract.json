@@ -1,6 +1,7 @@
 {
   "developmentClusterStateSchema": 1,
   "developmentClusterTransitionPolicy": 2,
+  "runtimeAuthorityIdentityPolicy": 1,
   "trackingMaxBytes": 8388608,
   "maxMessageBytes": 20000,
   "formEncodingExpansion": 3,

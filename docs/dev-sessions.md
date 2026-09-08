@@ -457,11 +457,29 @@ when an App Server restart provably left none, and refuses multiple candidates.
 It sends the initial goal directly only when metadata identifies the expected
 fresh, idle, turnless thread; accepted or ambiguous active turns fail closed.
 An incomplete tmux session is replaced only when its creation environment
-identifies the exact workspace and slug. The journal remains in
+identifies the exact workspace and slug and its creation identity matches the
+nonce durably recorded before tmux was started. The nonce is removed from the
+journal after the managed runtime authority is published and creation becomes
+ready. The journal remains in
 the lock directory after the manifest reaches `ready`, allowing the
 HTTP result to be replayed without repeating a known initial turn. The portal
 passes a full dated slug with `--as-is`, preserving request identity across
 midnight.
+
+Fork creation uses the same identity rule through a short-lived fork journal.
+It records the validated source thread before creating destination tracking, so
+an interrupted fork can resume without source tracking and can adopt or remove
+only the tmux session carrying the recorded identity. Explicit overrides are
+resolved against the source thread's inherited settings before the journal is
+published; both the request and its complete resolved model/reasoning pair are
+recorded. Retrying a short destination name reuses the journaled dated slug even
+after midnight, and package transitions wait until the fork finishes.
+Journal-owned destination tracking and writer temporary files are reconciled
+idempotently after an interruption, but retry refuses modified tracking or
+unexpected files.
+Starting tmux for an existing session uses a corresponding short-lived start
+journal. This makes stopped-session restarts retryable without authorizing a
+same-name tmux session created by another process.
 
 The private package implementation requires the authority directory, tmux
 socket, Codex command and socket, client version, and portal command to be

@@ -395,8 +395,13 @@ it later. A failed first installation has no preceding generation to restore;
 it leaves the validated candidate installed so the same `switch` can be
 retried. `workspace-host rollback` selects the preceding application and Codex
 pair and refuses while a thread is active. Both switch and rollback also refuse
-while any archive, delete, or revive journal exists, because changing helpers
+while any archive, delete, or revive journal exists, or while a current
+identity-bound session creation journal is still `creating`, or while a fork
+or stopped-session start journal exists, because changing helpers
 mid-transaction would make its retry semantics version-dependent.
+Legacy journal-only creation attempts are admitted: on retry the new helper
+first proves that no corresponding tmux session survives, then records a fresh
+creation identity before starting tmux.
 Every stable command records the package generation that dispatched it and
 checks both that generation and the profile-link identity again after acquiring
 the shared transition lock. A command that waited across a successful or
@@ -418,6 +423,9 @@ known password-reset cluster may retain its recorded legacy socket, and its
 complete owner record must prove the known runner tuple. Other legacy state
 fails closed. Older target generations that could orphan workspace-scoped
 socket identities are refused.
+An identity-bound tmux authority similarly requires the target package to
+publish the runtime-authority identity policy. Rollback to an older package that
+cannot parse and verify that identity is refused while such an authority exists.
 New cluster creation records the workspace-scoped socket identity in the same
 per-cluster locked transaction that creates the state directory. Every later
 operation rejects an existing directory without that record. An explicit reset
@@ -431,9 +439,12 @@ pre-contract installed generation cannot bypass it; a refusal uses normal
 switch compensation.
 
 Do not switch or roll back the workspace package during an unfinished lifecycle
-operation. The host command detects all lifecycle journals and refuses the
-transition until the matching `archive`, `delete`, or `revive` command has been
-retried successfully.
+or session-creation operation. The host command detects lifecycle journals and
+identity-bound `creating` session journals and refuses the transition until the
+matching command has been retried successfully. Fork and stopped-session start
+journals have the same transition guard. A legacy tokenless journal is safe to
+carry forward because retry refuses any surviving unbound tmux session before
+upgrading the journal.
 
 Before rolling back the NixOS substrate, stop the user layer so two portal
 runtimes cannot run at once:

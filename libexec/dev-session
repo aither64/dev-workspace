@@ -8,6 +8,7 @@ require 'json'
 require 'open3'
 require 'optparse'
 require 'pathname'
+require 'securerandom'
 require 'shellwords'
 require 'tempfile'
 require 'time'
@@ -68,6 +69,7 @@ module VpsfreeDevSession
   ENV_CODEX_SOCKET = 'VPSFREE_DEV_SESSION_CODEX_SOCKET'
   ENV_CODEX_VERSION = 'VPSFREE_DEV_SESSION_CODEX_VERSION'
   ENV_REQUIRE_RUNTIME = 'VPSFREE_DEV_SESSION_REQUIRE_RUNTIME'
+  ENV_TMUX_IDENTITY = 'VPSFREE_DEV_SESSION_TMUX_IDENTITY'
 
   THREAD_ENV_ARGUMENTS = {
     ENV_SLUG => '--session-slug',
@@ -219,6 +221,7 @@ module VpsfreeDevSession
       :codex_socket_path,
       :codex_client_version,
       :codex_pane_id,
+      :identity_token,
       keyword_init: true
     ) do
       def managed?
@@ -237,7 +240,8 @@ module VpsfreeDevSession
       "\#{#{SESSION_CODEX_THREAD}}",
       "\#{#{SESSION_CODEX_SOCKET}}",
       "\#{#{SESSION_CODEX_VERSION}}",
-      "\#{#{SESSION_CODEX_PANE}}"
+      "\#{#{SESSION_CODEX_PANE}}",
+      "\#{E:#{ENV_TMUX_IDENTITY}}"
     ].join("\t")
 
     def self.session_target(session)
@@ -279,7 +283,11 @@ module VpsfreeDevSession
     end
 
     def session_by_id(id)
-      session_for_target(Tmux.session_target(id))
+      unless id.is_a?(String) && id.match?(/\A\$[0-9]+\z/)
+        raise Error, "invalid tmux session id: #{id.inspect}"
+      end
+
+      session_for_target(Tmux.session_target(id), expected_id: id)
     end
 
     def managed_session_identities
@@ -293,7 +301,7 @@ module VpsfreeDevSession
 
       stdout.lines.filter_map do |line|
         identity = parse_session(line)
-        identity if identity.managed?
+        identity if identity&.managed?
       end
     end
 
@@ -309,7 +317,7 @@ module VpsfreeDevSession
       return nil unless status.success?
 
       identity = parse_session(stdout)
-      identity if identity.managed?
+      identity if identity&.managed?
     end
 
     def pane_session_id(pane)
@@ -353,7 +361,7 @@ module VpsfreeDevSession
 
     private
 
-    def session_for_target(target, expected_name: nil)
+    def session_for_target(target, expected_name: nil, expected_id: nil)
       stdout, _stderr, status = capture(
         'display-message',
         '-p',
@@ -363,21 +371,99 @@ module VpsfreeDevSession
         allow_failure: true
       )
       return nil unless status.success?
+      return nil if stdout.strip.empty?
 
       identity = parse_session(stdout)
+      return nil unless identity
       return nil if expected_name && identity.name != expected_name
+      if expected_id && identity.id != expected_id
+        raise Error,
+              "tmux returned session #{identity.id.inspect} for exact target #{expected_id}"
+      end
 
       identity
     end
 
     def parse_session(line)
+      fields = line.chomp.split("\t", -1)
+      raise Error, 'tmux returned an invalid session identity' unless fields.length == 12
+
+      if fields.fetch(0).empty? || fields.fetch(1).empty?
+        # tmux 3.6a can return success for a missing exact target and expand
+        # environment fields from the server's global environment. An empty
+        # session id and name are therefore the only reliable absence marker;
+        # the remaining fields are not target-bound in this response.
+        return nil if fields.fetch(0).empty? && fields.fetch(1).empty?
+
+        raise Error, 'tmux returned an invalid session identity'
+      end
+
+      unless fields.fetch(0).match?(/\A\$[0-9]+\z/) && !fields.fetch(1).empty?
+        raise Error, 'tmux returned an invalid session identity'
+      end
       id, name, mark, slug, workspace, environment_slug, socket_path,
-        codex_thread_id, codex_socket_path, codex_client_version, codex_pane_id =
-        line.chomp.split("\t", -1)
+        codex_thread_id, codex_socket_path, codex_client_version, codex_pane_id,
+        identity_token = fields
+      unless identity_token.empty? || identity_token.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'tmux returned an invalid session identity'
+      end
       Session.new(
         id:, name:, mark:, slug:, workspace:, environment_slug:, socket_path:,
-        codex_thread_id:, codex_socket_path:, codex_client_version:, codex_pane_id:
+        codex_thread_id:, codex_socket_path:, codex_client_version:, codex_pane_id:,
+        identity_token:
       )
+    end
+
+    public
+
+    def kill_session_if_identity(id, identity_token)
+      unless id.is_a?(String) && id.match?(/\A\$[0-9]+\z/) &&
+             identity_token.is_a?(String) && identity_token.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid tmux session retirement identity'
+      end
+
+      mismatch = 'vpsfree-dev-session-identity-mismatch'
+      condition = "\#{==:\#{E:#{ENV_TMUX_IDENTITY}},#{identity_token}}"
+      stdout, stderr, status = capture(
+        'if-shell', '-F', '-t', Tmux.session_target(id), condition,
+        "kill-session -t #{Tmux.session_target(id)}",
+        "display-message -p #{mismatch}",
+        allow_failure: true
+      )
+      unless status.success?
+        detail = stderr.to_s.strip
+        raise Error, "unable to retire tmux session #{id}: #{detail}"
+      end
+      return false if stdout.to_s.strip == mismatch
+      return true if stdout.to_s.strip.empty?
+
+      raise Error, 'tmux returned an invalid conditional retirement response'
+    end
+
+    def initialize_session_identity(id, identity_token)
+      unless id.is_a?(String) && id.match?(/\A\$[0-9]+\z/) &&
+             identity_token.is_a?(String) && identity_token.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid tmux session identity initialization'
+      end
+
+      mismatch = 'vpsfree-dev-session-identity-mismatch'
+      condition =
+        "\#{&&:\#{==:\#{E:#{ENV_TMUX_IDENTITY}},}," \
+        "\#{==:\#{#{SESSION_MARK}},1}}"
+      stdout, stderr, status = capture(
+        'if-shell', '-F', '-t', Tmux.session_target(id), condition,
+        "set-environment -t #{Tmux.session_target(id)} #{ENV_TMUX_IDENTITY} #{identity_token}",
+        "display-message -p #{mismatch}",
+        allow_failure: true
+      )
+      unless status.success?
+        detail = stderr.to_s.strip
+        raise Error, "unable to initialize tmux session identity #{id}: #{detail}"
+      end
+      return false if stdout.to_s.strip == mismatch
+      return true if stdout.to_s.strip.empty?
+
+      raise Error, 'tmux returned an invalid identity initialization response'
     end
   end
 
@@ -503,6 +589,7 @@ module VpsfreeDevSession
         thread_id = nil
         goal_pending = false
         start_unmaterialized = false
+        runtime_journal = nil
 
         selected_session = with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
@@ -516,6 +603,11 @@ module VpsfreeDevSession
             effort:,
             lifecycle_operation:
           )
+          runtime_journal = load_start_journal(slug)
+          if runtime_journal && creation_journal&.fetch('state', nil) == 'creating' &&
+             runtime_journal.fetch('tmux_identity') != creation_journal.fetch('tmux_identity')
+            raise Error, "start journal does not match creation identity for #{slug}"
+          end
           preserve_tracking = creation_journal&.fetch('preserve_tracking', false)
           ensure_tracking_files(slug, allow_uncommitted_revive: preserve_tracking)
           if creation_journal&.fetch('preserve_tracking', false)
@@ -568,11 +660,20 @@ module VpsfreeDevSession
               end
             end
             replayed = true
-            selected = @tmux.session(slug)
+            selected = cleanup_session(slug)
+            if runtime_journal
+              unless selected && managed_by_workspace?(selected) &&
+                     selected.identity_token == runtime_journal.fetch('tmux_identity')
+                raise Error, "session start is unfinished: #{slug}; retry without --exclusive"
+              end
+            end
             if selected && managed_by_workspace?(selected)
               selected = ensure_managed_session!(slug, session: selected)
               selected = reconcile_native_client!(slug, selected) if run_codex
-              write_session_authority(slug, selected, state: 'ready') if @selected_authority
+              if runtime_journal || @selected_authority
+                write_session_authority(slug, selected, state: 'ready')
+              end
+              delete_start_journal(slug) if runtime_journal
               next selected
             end
             next nil
@@ -583,7 +684,16 @@ module VpsfreeDevSession
           end
 
           thread_id = @selected_authority&.fetch('codex_thread_id', nil)
-          selected = @tmux.session(slug)
+          selected = cleanup_session(slug)
+          expected_creation_identity = if runtime_journal
+                                         runtime_journal.fetch('tmux_identity')
+                                       elsif creation_journal&.fetch('state', nil) == 'creating'
+                                         creation_journal.fetch('tmux_identity')
+                                       end
+          if selected && expected_creation_identity &&
+             selected.identity_token != expected_creation_identity
+            raise Error, "live tmux session does not match start identity for #{slug}"
+          end
           if @selected_authority && selected.nil?
             delete_session_authority(slug)
             @selected_authority = nil
@@ -626,7 +736,11 @@ module VpsfreeDevSession
             if recovered_thread && persisted_thread && recovered_thread != persisted_thread
               if selected
                 ensure_managed_session!(slug, session: selected) if @selected_authority
-                reconcile_creation_tmux_session!(slug, selected)
+                reconcile_creation_tmux_session!(
+                  slug,
+                  selected,
+                  creation_journal&.fetch('tmux_identity', nil)
+                )
                 selected = nil
               end
               delete_session_authority(slug) if @selected_authority
@@ -666,9 +780,13 @@ module VpsfreeDevSession
           goal_pending = run_codex && thread_id && goal_file &&
                          !manifest.dig('creation', 'initial_goal_sent')
 
-          if creation_journal && manifest.dig('creation', 'state') == 'creating' &&
-             selected && !managed_by_workspace?(selected)
-            reconcile_creation_tmux_session!(slug, selected)
+          if (creation_journal || runtime_journal) && selected &&
+             !managed_by_workspace?(selected)
+            reconcile_creation_tmux_session!(
+              slug,
+              selected,
+              expected_creation_identity
+            )
             selected = nil
           end
           if run_codex && thread_id && selected && codex_provenance_configured? &&
@@ -687,11 +805,16 @@ module VpsfreeDevSession
                        end
                      else
                        verify_codex_client! if run_codex && thread_id
+                       runtime_journal ||= prepare_start_journal!(
+                         slug,
+                         preferred_identity: creation_journal&.fetch('tmux_identity', nil)
+                       )
                        create_tmux_session(
                          slug,
                          run_codex:,
                          thread_id:,
-                         launch_codex: run_codex && !goal_pending
+                         launch_codex: run_codex && !goal_pending,
+                         identity_token: runtime_journal.fetch('tmux_identity')
                        )
                      end
 
@@ -722,9 +845,10 @@ module VpsfreeDevSession
           if goal_pending
             write_session_authority(slug, selected, state: 'creating')
           else
-            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
             write_session_authority(slug, selected, state: 'ready') unless recover_archived_thread
+            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
           end
+          delete_start_journal(slug) if runtime_journal
           selected
         end
 
@@ -803,62 +927,133 @@ module VpsfreeDevSession
     end
 
     def fork(source_input, destination_input, as_is:, json:, model: nil, effort: nil)
-      source_slug = lookup_slug(source_input, as_is: false)
-      destination_slug = build_slug(destination_input, as_is:)
+      destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
+      journal = load_fork_journal(destination_slug)
+      require_fork_journal_options!(journal, destination_slug, model:, effort:) if journal
+      source_slug = if journal
+        recorded = journal.fetch('source_slug')
+        unless source_input == recorded ||
+               valid_part?(source_input) && recorded.end_with?("-#{source_input}")
+          raise Error,
+                "unfinished fork source does not match #{destination_slug}: #{recorded}"
+        end
+        recorded
+      else
+        lookup_slug(source_input, as_is: false)
+      end
       raise Error, 'fork source and destination must be different' if source_slug == destination_slug
 
-      source_manifest = with_slug_lock(source_slug) do
-        select_tmux_for_slug!(source_slug)
-        reject_conflicting_lifecycle_journal!(source_slug)
-        manifest = load_portal_manifest(portal_file(source_slug), required: true)
-        thread_id = manifest.dig('codex', 'thread_id')
-        if thread_id.nil? || thread_id.empty?
-          raise Error, "source session has no Codex conversation: #{source_slug}"
-        end
-        creation = manifest.fetch('creation', {})
-        if creation['state'] != 'ready' ||
-           (creation['goal_sha256'] && !creation['initial_goal_sent'])
-          raise Error, "source session creation is incomplete: #{source_slug}"
-        end
-        require_current_codex_provenance!(source_slug, manifest, thread_id)
-        if @portal_command && codex_provenance_configured?
-          require_portal_thread_materialized(source_slug, thread_id)
-        end
-        manifest
+      if (recovered = recover_completed_fork(
+        destination_slug,
+        source_slug,
+        model:,
+        effort:
+      ))
+        write_fork_result(recovered, destination_slug, source_slug, json:)
+        return
       end
+
+      source_manifest = if journal
+                          { 'codex' => { 'thread_id' => journal.fetch('source_thread_id') } }
+                        else
+                          with_slug_lock(source_slug) do
+                            select_tmux_for_slug!(source_slug)
+                            reject_conflicting_lifecycle_journal!(source_slug)
+                            manifest = load_portal_manifest(portal_file(source_slug), required: true)
+                            thread_id = manifest.dig('codex', 'thread_id')
+                            if thread_id.nil? || thread_id.empty?
+                              raise Error,
+                                    "source session has no Codex conversation: #{source_slug}"
+                            end
+                            creation = manifest.fetch('creation', {})
+                            if creation['state'] != 'ready' ||
+                               (creation['goal_sha256'] && !creation['initial_goal_sent'])
+                              raise Error,
+                                    "source session creation is incomplete: #{source_slug}"
+                            end
+                            require_current_codex_provenance!(source_slug, manifest, thread_id)
+                            if @portal_command && codex_provenance_configured?
+                              require_portal_thread_materialized(source_slug, thread_id)
+                            end
+                            manifest
+                          end
+                        end
+      resolved_model, resolved_effort = if journal
+                                          [journal.fetch('model'), journal.fetch('effort')]
+                                        else
+                                          resolve_portal_fork_settings(
+                                            source_manifest.dig('codex', 'thread_id'),
+                                            model:,
+                                            effort:
+                                          )
+                                        end
 
       destination_session = with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           select_tmux_for_slug!(destination_slug)
-          reject_conflicting_lifecycle_journal!(destination_slug)
-          manifest = nil
-          if slug_state_exists?(destination_slug)
-            unless path_exists?(portal_file(destination_slug))
+          reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
+          fork_journal = load_fork_journal(destination_slug, source_slug)
+          if fork_journal
+            require_fork_journal_options!(
+              fork_journal,
+              destination_slug,
+              model:,
+              effort:
+            )
+            resolved_model = fork_journal.fetch('model')
+            resolved_effort = fork_journal.fetch('effort')
+          end
+          unless fork_journal
+            if archived_slug_known?(destination_slug)
+              raise Error,
+                    "archived slug cannot be reused: #{archive_dir(destination_slug)}"
+            end
+            if slug_state_exists?(destination_slug)
               raise Error, "dev session already exists: #{destination_slug}"
             end
-            manifest = load_portal_manifest(portal_file(destination_slug), required: true)
-            unless manifest['forked_from'] == source_slug &&
-                   manifest.dig('creation', 'state') == 'ready' &&
-                   manifest.fetch('repositories', []).empty? &&
-                   manifest.fetch('artifacts', []).empty?
-              raise Error, "dev session already exists: #{destination_slug}"
+            fork_journal = prepare_fork_journal!(
+              destination_slug,
+              source_slug,
+              source_manifest.dig('codex', 'thread_id'),
+              model: resolved_model,
+              effort: resolved_effort,
+              requested_model: model,
+              requested_effort: effort
+            )
+          end
+          ensure_fork_tracking_files(destination_slug)
+          manifest = ensure_fork_portal_manifest(destination_slug, source_slug)
+          unless manifest['forked_from'] == source_slug &&
+                 manifest.dig('creation', 'state') == 'ready' &&
+                 manifest.fetch('repositories', []).empty? &&
+                 manifest.fetch('artifacts', []).empty?
+            raise Error, "dev session already exists: #{destination_slug}"
+          end
+          unless Dir.children(worktrees_dir(destination_slug)).empty?
+            raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
+          end
+          selected = cleanup_session(destination_slug)
+          delete_session_authority(destination_slug) if @selected_authority && selected.nil?
+          if selected
+            if selected.identity_token != fork_journal.fetch('tmux_identity')
+              raise Error,
+                    "live tmux session does not match fork identity for #{destination_slug}"
             end
-            ensure_worktree_group!(destination_slug, create: false)
-            unless Dir.children(worktrees_dir(destination_slug)).empty?
-              raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
+            unless managed_by_workspace?(selected)
+              reconcile_creation_tmux_session!(
+                destination_slug,
+                selected,
+                fork_journal.fetch('tmux_identity')
+              )
+              selected = nil
             end
-            selected = @tmux.session(destination_slug)
-            if selected
-              selected = ensure_managed_session!(destination_slug, session: selected)
-              selected = reconcile_native_client!(destination_slug, selected)
-              write_session_authority(destination_slug, selected, state: 'ready')
-              next selected
-            end
-          else
-            ensure_tracking_files(destination_slug)
-            manifest = ensure_portal_manifest(destination_slug)
-            manifest['forked_from'] = source_slug
-            write_portal_manifest(destination_slug, manifest)
+          end
+          if selected
+            selected = ensure_managed_session!(destination_slug, session: selected)
+            selected = reconcile_native_client!(destination_slug, selected)
+            write_session_authority(destination_slug, selected, state: 'ready')
+            delete_fork_journal(destination_slug)
+            next selected
           end
 
           thread_id = manifest.dig('codex', 'thread_id')
@@ -867,8 +1062,8 @@ module VpsfreeDevSession
             thread_id = create_portal_fork(
               destination_slug,
               source_manifest.dig('codex', 'thread_id'),
-              model:,
-              effort:
+              model: fork_journal.fetch('model'),
+              effort: fork_journal.fetch('effort')
             )
             manifest['codex'] = codex_metadata(thread_id)
             write_portal_manifest(destination_slug, manifest)
@@ -877,13 +1072,26 @@ module VpsfreeDevSession
           if @portal_command && codex_provenance_configured?
             require_portal_thread_materialized(destination_slug, thread_id)
           end
-          selected = create_tmux_session(destination_slug, run_codex: true, thread_id:)
+          selected = create_tmux_session(
+            destination_slug,
+            run_codex: true,
+            thread_id:,
+            identity_token: fork_journal.fetch('tmux_identity')
+          )
           selected = sync_slug(destination_slug, require_session: true, session: selected)
+          unless selected.identity_token == fork_journal.fetch('tmux_identity')
+            raise Error, "created tmux session does not match fork identity for #{destination_slug}"
+          end
           write_session_authority(destination_slug, selected, state: 'ready')
+          delete_fork_journal(destination_slug)
           selected
         end
       end
 
+      write_fork_result(destination_session, destination_slug, source_slug, json:)
+    end
+
+    def write_fork_result(destination_session, destination_slug, source_slug, json:)
       if json
         @out.puts JSON.generate(
           slug: destination_slug,
@@ -896,6 +1104,73 @@ module VpsfreeDevSession
         @out.puts "session: #{destination_slug}"
         @out.puts "attach: #{attach_command(destination_session.id).map(&:shellescape).join(' ')}"
         @out.puts "portal: #{portal_url(destination_slug)}"
+      end
+    end
+
+    def recover_completed_fork(destination_slug, source_slug, model:, effort:)
+      return nil unless path_exists?(fork_journal_file(destination_slug))
+
+      with_creation_lock(destination_slug) do
+        with_slug_lock(destination_slug) do
+          return nil unless path_exists?(fork_journal_file(destination_slug))
+
+          select_tmux_for_slug!(destination_slug)
+          reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
+          journal = load_fork_journal(destination_slug, source_slug)
+          require_fork_journal_options!(journal, destination_slug, model:, effort:)
+          return nil unless path_exists?(portal_file(destination_slug))
+
+          manifest = load_portal_manifest(portal_file(destination_slug), required: true)
+          return nil if manifest == new_portal_manifest(destination_slug)
+
+          unless manifest['forked_from'] == source_slug &&
+                 manifest.dig('creation', 'state') == 'ready' &&
+                 manifest.fetch('repositories', []).empty? &&
+                 manifest.fetch('artifacts', []).empty?
+            raise Error, "invalid incomplete fork state: #{destination_slug}"
+          end
+          thread_id = manifest.dig('codex', 'thread_id')
+          return nil if thread_id.nil? || thread_id.empty?
+
+          ensure_fork_tracking_files(destination_slug)
+          unless Dir.children(worktrees_dir(destination_slug)).empty?
+            raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
+          end
+          require_current_codex_provenance!(destination_slug, manifest, thread_id)
+          if @portal_command && codex_provenance_configured?
+            require_portal_thread_materialized(destination_slug, thread_id)
+          end
+          selected = cleanup_session(destination_slug)
+          delete_session_authority(destination_slug) if @selected_authority && selected.nil?
+          if selected
+            unless selected.identity_token == journal.fetch('tmux_identity')
+              raise Error,
+                    "live tmux session does not match fork identity for #{destination_slug}"
+            end
+            unless managed_by_workspace?(selected)
+              reconcile_creation_tmux_session!(
+                destination_slug,
+                selected,
+                journal.fetch('tmux_identity')
+              )
+              selected = nil
+            end
+          end
+          unless selected
+            selected = create_tmux_session(
+              destination_slug,
+              run_codex: true,
+              thread_id:,
+              identity_token: journal.fetch('tmux_identity')
+            )
+          end
+          selected = ensure_managed_session!(destination_slug, session: selected)
+          selected = reconcile_native_client!(destination_slug, selected)
+          selected = sync_slug(destination_slug, require_session: true, session: selected)
+          write_session_authority(destination_slug, selected, state: 'ready')
+          delete_fork_journal(destination_slug)
+          selected
+        end
       end
     end
 
@@ -942,7 +1217,9 @@ module VpsfreeDevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug)
           authority = load_session_authority(slug, required: true)
-          if @tmux.session_by_id(authority.fetch('tmux_session_id'))
+          current = @tmux.session_by_id(authority.fetch('tmux_session_id'))
+          if current && (authority['tmux_identity'].nil? ||
+                         current.identity_token == authority['tmux_identity'])
             raise Error, "session authority is not stale: #{slug}"
           end
           validate_session_closure!(slug)
@@ -965,6 +1242,7 @@ module VpsfreeDevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
           journal = load_archive_journal(slug)
+          ensure_retirement_identity!(slug, cleanup_session(slug))
           unless journal
             source = validate_work_directory!(slug)
             destination = archive_dir(slug)
@@ -1158,6 +1436,7 @@ module VpsfreeDevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'delete')
+          ensure_retirement_identity!(slug, cleanup_session(slug))
           removal = prepare_removal!(slug, force:)
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')
@@ -1528,6 +1807,28 @@ module VpsfreeDevSession
       build_slug(input, as_is: false)
     end
 
+    def resolve_fork_destination_slug(input, as_is:)
+      return build_slug(input, as_is: true) if as_is
+
+      validate_part!(input, 'name')
+      today_slug = build_slug(input, as_is: false)
+      lock_root = File.dirname(creation_journal_file(today_slug))
+      matches = Dir.children(lock_root).filter_map do |name|
+        match = name.match(/\A(.+)\.fork\.json\z/)
+        slug = match && match[1]
+        slug if slug && valid_part?(slug) && slug.end_with?("-#{input}")
+      end.uniq.sort
+      case matches.length
+      when 0
+        today_slug
+      when 1
+        matches.first
+      else
+        raise Error,
+              "unfinished fork destination #{input.inspect} is ambiguous: #{matches.join(', ')}"
+      end
+    end
+
     def start_requires_initial_goal?(input, as_is:, new:)
       slug = resolve_start_slug(input, as_is:, new:)
       root = if path_exists?(work_dir(slug))
@@ -1583,6 +1884,81 @@ module VpsfreeDevSession
       ensure_worktree_group!(slug, create: true)
       write_once(plan_file(slug), plan_skeleton(slug))
       write_once(state_file(slug), state_skeleton(slug))
+    end
+
+    def ensure_fork_tracking_files(slug)
+      if archived_slug_known?(slug)
+        raise Error, "archived slug cannot be reused: #{archive_dir(slug)}"
+      end
+
+      ensure_directory!(File.join(workspace, 'work'), 'work root', create: true)
+      ensure_directory!(work_dir(slug), 'work directory', create: true)
+      validate_work_directory!(slug)
+      cleanup_fork_writer_temporaries!(slug)
+      ensure_worktree_group!(slug, create: true)
+      ensure_fork_tracking_file!(plan_file(slug), plan_skeleton(slug), 'plan.md')
+      ensure_fork_tracking_file!(state_file(slug), state_skeleton(slug), 'state.md')
+      allowed = %w[plan.md portal.yml state.md]
+      unexpected = Dir.children(work_dir(slug)).sort - allowed
+      unless unexpected.empty?
+        raise Error,
+              "incomplete fork has unexpected tracking files: #{unexpected.join(', ')}"
+      end
+    end
+
+    def cleanup_fork_writer_temporaries!(slug)
+      directory = work_dir(slug)
+      removed = false
+      Dir.children(directory).sort.each do |name|
+        match = name.match(/\A\.(plan\.md|state\.md|portal\.yml)\.[0-9]+\.tmp\z/)
+        next unless match
+
+        path = File.join(directory, name)
+        stat = File.lstat(path)
+        permissions = stat.mode & 0o777
+        unless stat.file? && stat.uid == Process.euid &&
+               permissions == (permissions & 0o644)
+          raise Error, "unsafe fork writer temporary: #{path}"
+        end
+        if stat.nlink > 1
+          final = File.join(directory, match[1])
+          unless stat.nlink == 2 && path_exists?(final) && !File.symlink?(final) &&
+                 File.file?(final) && File.identical?(path, final)
+            raise Error, "unsafe linked fork writer temporary: #{path}"
+          end
+        end
+        File.unlink(path)
+        removed = true
+      end
+      fsync_directory(directory) if removed
+    end
+
+    def ensure_fork_tracking_file!(path, expected, label)
+      unless path_exists?(path)
+        write_once(path, expected)
+        return
+      end
+      raise Error, "#{label} is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "#{label} is not a file: #{path}" unless File.file?(path)
+      return if read_bounded_file(path, label) == expected
+
+      raise Error, "incomplete fork has modified #{label}: #{path}"
+    end
+
+    def ensure_fork_portal_manifest(slug, source_slug)
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      expected = new_portal_manifest(slug)
+      expected['forked_from'] = source_slug
+      unless manifest
+        write_portal_manifest(slug, expected)
+        return expected
+      end
+      if manifest == new_portal_manifest(slug)
+        write_portal_manifest(slug, expected)
+        return expected
+      end
+
+      manifest
     end
 
     def valid_uncommitted_revive?(slug)
@@ -1765,7 +2141,7 @@ module VpsfreeDevSession
     def validate_session_authority!(record, slug, path)
       keys = %w[
         schema state slug workspace tmux_socket tmux_session_id codex_thread_id
-        codex_socket_path codex_client_version
+        codex_socket_path codex_client_version tmux_identity
       ]
       validate_mapping_keys!(record, keys, 'session authority', path)
       unless record['schema'].is_a?(Integer) && record['schema'] == 1 &&
@@ -1773,7 +2149,10 @@ module VpsfreeDevSession
              record['slug'] == slug && record['workspace'] == workspace &&
              valid_socket_path?(record['tmux_socket']) &&
              record['tmux_session_id'].is_a?(String) &&
-             record['tmux_session_id'].match?(/\A\$[0-9]+\z/)
+             record['tmux_session_id'].match?(/\A\$[0-9]+\z/) &&
+             (!record.key?('tmux_identity') ||
+               record['tmux_identity'].is_a?(String) &&
+               record['tmux_identity'].match?(/\A[0-9a-f]{64}\z/))
         raise Error, "invalid session authority: #{path}"
       end
       codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
@@ -1800,6 +2179,9 @@ module VpsfreeDevSession
         'tmux_socket' => session.socket_path,
         'tmux_session_id' => session.id
       }
+      unless session.identity_token.nil? || session.identity_token.empty?
+        record['tmux_identity'] = session.identity_token
+      end
       if session.codex_thread_id && !session.codex_thread_id.empty?
         record.merge!(
           'codex_thread_id' => session.codex_thread_id,
@@ -1887,7 +2269,10 @@ module VpsfreeDevSession
       lifecycle_operation: nil
     )
       path = creation_journal_file(slug)
-      reject_conflicting_lifecycle_journal!(slug, operation: lifecycle_operation)
+      reject_conflicting_lifecycle_journal!(
+        slug,
+        operation: lifecycle_operation || 'start'
+      )
       if exclusive && !goal_file
         if !path_exists?(path) && slug_state_exists?(slug)
           raise Error, "dev session already exists: #{slug}"
@@ -1913,6 +2298,14 @@ module VpsfreeDevSession
           raise Error, "invalid creation journal #{path}"
         end
         state = actual['state']
+        if state == 'creating' && !actual.key?('tmux_identity')
+          if cleanup_session(slug)
+            raise Error,
+                  "legacy creation has a live tmux session without a trusted identity: #{slug}"
+          end
+          actual = actual.merge('tmux_identity' => SecureRandom.hex(32))
+          write_creation_journal(path, actual, create: false)
+        end
         manifest = load_portal_manifest(portal_file(slug), required: false)
         if goal_file.nil? && !exclusive && state == 'ready' &&
            manifest&.dig('creation', 'state') == 'ready'
@@ -1941,7 +2334,7 @@ module VpsfreeDevSession
           completed = completed_preserved_creation?(actual, manifest)
           completion_pending = state == 'creating' && manifest_ready
           if completion_pending && goal_file.nil? && !exclusive
-            reconciled = actual.merge('state' => 'ready')
+            reconciled = ready_creation_journal(actual)
             unless reconciled['run_codex'] == true &&
                    valid_stored_creation_journal?(reconciled, slug, manifest)
               raise Error, "invalid creation journal #{path}"
@@ -1962,15 +2355,22 @@ module VpsfreeDevSession
             end
           end
         end
+        expected_keys = expected.keys + ['state']
+        expected_keys << 'tmux_identity' if state == 'creating'
         unless [nil, true].include?(actual['preserve_tracking']) &&
                %w[creating ready].include?(state) &&
-               actual.keys.sort == (expected.keys + ['state']).sort
+               actual.keys.sort == expected_keys.sort &&
+               (state != 'creating' ||
+                 actual['tmux_identity'].is_a?(String) &&
+                   actual['tmux_identity'].match?(/\A[0-9a-f]{64}\z/))
           raise Error, "invalid creation journal #{path}"
         end
         if path_exists?(archive_dir(slug))
           raise Error, "dev session already exists: #{slug}"
         end
-        recorded_request = actual.reject { |key, _value| key == 'state' }
+        recorded_request = actual.reject do |key, _value|
+          %w[state tmux_identity].include?(key)
+        end
         unless recorded_request == expected
           if recorded_request.merge('goal_sha256' => expected['goal_sha256']) == expected
             raise Error, "creation request does not match the recorded goal for #{slug}"
@@ -1978,7 +2378,7 @@ module VpsfreeDevSession
           raise Error, "creation request does not match the recorded request for #{slug}"
         end
         if completion_pending
-          actual = actual.merge('state' => 'ready')
+          actual = ready_creation_journal(actual)
           write_creation_journal(path, actual, create: false)
           state = 'ready'
         end
@@ -2017,6 +2417,7 @@ module VpsfreeDevSession
         end
         journal = expected.merge(
           'state' => 'creating',
+          'tmux_identity' => SecureRandom.hex(32),
           'preserve_tracking' => true,
           'tracking_origin' => origin,
           'tracking_plan_sha256' => plan_sha256,
@@ -2036,7 +2437,10 @@ module VpsfreeDevSession
         return nil
       end
 
-      journal = expected.merge('state' => 'creating')
+      journal = expected.merge(
+        'state' => 'creating',
+        'tmux_identity' => SecureRandom.hex(32)
+      )
       write_creation_journal(path, journal, create: true)
       journal
     rescue JSON::ParserError => e
@@ -2046,7 +2450,7 @@ module VpsfreeDevSession
     def valid_stored_creation_journal?(journal, slug, manifest)
       required = %w[schema slug goal_sha256 run_codex state]
       tracking = PRESERVED_JOURNAL_TRACKING_KEYS
-      allowed = required + %w[model effort preserve_tracking] + tracking
+      allowed = required + %w[model effort preserve_tracking tmux_identity] + tracking
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
       return false unless journal['schema'] == 1 && journal['slug'] == slug &&
                           journal['state'] == 'ready' &&
@@ -2057,6 +2461,7 @@ module VpsfreeDevSession
                           (goal_sha256.is_a?(String) && goal_sha256.match?(/\A[0-9a-f]{64}\z/))
       return false unless manifest.dig('creation', 'goal_sha256') == goal_sha256
       return false unless [nil, true].include?(journal['preserve_tracking'])
+      return false if journal.key?('tmux_identity')
 
       tracking_present = tracking.count { |key| journal.key?(key) }
       return false unless if journal['preserve_tracking']
@@ -2080,7 +2485,7 @@ module VpsfreeDevSession
         schema slug goal_sha256 run_codex state preserve_tracking
         tracking_origin tracking_plan_sha256 tracking_state_sha256
       ]
-      allowed = required + %w[model effort]
+      allowed = required + %w[model effort tmux_identity]
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
       return false unless journal['schema'] == 1 && journal['slug'] == slug &&
                           %w[creating ready].include?(journal['state']) &&
@@ -2089,6 +2494,12 @@ module VpsfreeDevSession
                           %w[revived retained].include?(journal['tracking_origin'])
       return false unless journal['goal_sha256'].is_a?(String) &&
                           journal['goal_sha256'].match?(/\A[0-9a-f]{64}\z/)
+      return false unless if journal['state'] == 'creating'
+                            journal['tmux_identity'].is_a?(String) &&
+                              journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/)
+                          else
+                            !journal.key?('tmux_identity')
+                          end
       return false unless %w[tracking_plan_sha256 tracking_state_sha256].all? do |key|
         journal[key].is_a?(String) && journal[key].match?(/\A[0-9a-f]{64}\z/)
       end
@@ -2225,11 +2636,17 @@ module VpsfreeDevSession
       unless actual == journal
         raise Error, "creation journal changed during creation: #{path}"
       end
-      completed = actual.merge('state' => 'ready')
+      completed = ready_creation_journal(actual)
       write_creation_journal(path, completed, create: false)
       journal.replace(completed)
     rescue JSON::ParserError => e
       raise Error, "invalid creation journal #{path}: #{e.message}"
+    end
+
+    def ready_creation_journal(journal)
+      journal.merge('state' => 'ready').reject do |key, _value|
+        key == 'tmux_identity'
+      end
     end
 
     def write_creation_journal(path, journal, create:)
@@ -2257,6 +2674,147 @@ module VpsfreeDevSession
       lock_root = File.join(root, '.locks')
       ensure_directory!(lock_root, 'dev-session lock directory', create: true)
       File.join(lock_root, "#{slug}.creation.json")
+    end
+
+    def fork_journal_file(slug)
+      File.join(File.dirname(creation_journal_file(slug)), "#{slug}.fork.json")
+    end
+
+    def start_journal_file(slug)
+      File.join(File.dirname(creation_journal_file(slug)), "#{slug}.start.json")
+    end
+
+    def load_start_journal(slug)
+      path = start_journal_file(slug)
+      return nil unless path_exists?(path)
+      raise Error, "start journal is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "start journal is not a file: #{path}" unless File.file?(path)
+
+      journal = JSON.parse(File.read(path))
+      unless journal.is_a?(Hash) && journal.keys.sort ==
+             %w[schema slug state tmux_identity].sort &&
+             journal['schema'] == 1 && journal['slug'] == slug &&
+             journal['state'] == 'creating' &&
+             journal['tmux_identity'].is_a?(String) &&
+             journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid start journal #{path}"
+      end
+      journal
+    rescue JSON::ParserError => e
+      raise Error, "invalid start journal #{path}: #{e.message}"
+    end
+
+    def prepare_start_journal!(slug, preferred_identity: nil)
+      if (journal = load_start_journal(slug))
+        if preferred_identity && journal.fetch('tmux_identity') != preferred_identity
+          raise Error, "start journal does not match creation identity for #{slug}"
+        end
+        return journal
+      end
+      identity = preferred_identity || SecureRandom.hex(32)
+      unless identity.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid tmux creation identity for #{slug}"
+      end
+      journal = {
+        'schema' => 1,
+        'slug' => slug,
+        'state' => 'creating',
+        'tmux_identity' => identity
+      }
+      write_creation_journal(start_journal_file(slug), journal, create: true)
+      journal
+    end
+
+    def delete_start_journal(slug)
+      path = start_journal_file(slug)
+      raise Error, "start journal disappeared: #{path}" unless path_exists?(path)
+      load_start_journal(slug)
+      File.unlink(path)
+      fsync_directory(File.dirname(path))
+    end
+
+    def load_fork_journal(slug, source_slug = nil)
+      path = fork_journal_file(slug)
+      return nil unless path_exists?(path)
+      raise Error, "fork journal is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "fork journal is not a file: #{path}" unless File.file?(path)
+
+      journal = JSON.parse(File.read(path))
+      unless journal.is_a?(Hash) && journal.keys.sort == %w[
+        effort model requested_effort requested_model schema slug source_slug
+        source_thread_id state tmux_identity
+      ].sort &&
+             journal['schema'] == 1 && journal['slug'] == slug &&
+             valid_part?(journal['source_slug']) &&
+             (source_slug.nil? || journal['source_slug'] == source_slug) &&
+             journal['source_thread_id'].is_a?(String) &&
+             journal['source_thread_id'].match?(/\A[0-9A-Za-z-]+\z/) &&
+             valid_fork_setting?(journal['model']) &&
+             valid_fork_setting?(journal['effort']) &&
+             valid_fork_setting?(journal['requested_model']) &&
+             valid_fork_setting?(journal['requested_effort']) &&
+             journal['state'] == 'creating' &&
+             journal['tmux_identity'].is_a?(String) &&
+             journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid fork journal #{path}"
+      end
+      journal
+    rescue JSON::ParserError => e
+      raise Error, "invalid fork journal #{path}: #{e.message}"
+    end
+
+    def prepare_fork_journal!(
+      slug,
+      source_slug,
+      source_thread_id,
+      model:,
+      effort:,
+      requested_model: model,
+      requested_effort: effort
+    )
+      unless source_thread_id.is_a?(String) &&
+             source_thread_id.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, "invalid fork source thread for #{slug}"
+      end
+      unless valid_fork_setting?(model) && valid_fork_setting?(effort) &&
+             valid_fork_setting?(requested_model) && valid_fork_setting?(requested_effort)
+        raise Error, "invalid fork options for #{slug}"
+      end
+      journal = {
+        'schema' => 1,
+        'slug' => slug,
+        'source_slug' => source_slug,
+        'source_thread_id' => source_thread_id,
+        'model' => model,
+        'effort' => effort,
+        'requested_model' => requested_model,
+        'requested_effort' => requested_effort,
+        'state' => 'creating',
+        'tmux_identity' => SecureRandom.hex(32)
+      }
+      write_creation_journal(fork_journal_file(slug), journal, create: true)
+      journal
+    end
+
+    def valid_fork_setting?(value)
+      value.nil? || value.is_a?(String) && !value.empty? && value.bytesize <= 256
+    end
+
+    def require_fork_journal_options!(journal, slug, model:, effort:)
+      return if journal.fetch('requested_model') == model &&
+                journal.fetch('requested_effort') == effort
+
+      raise Error, "fork options do not match the recorded request for #{slug}"
+    end
+
+    def delete_fork_journal(slug)
+      path = fork_journal_file(slug)
+      raise Error, "fork journal disappeared: #{path}" unless path_exists?(path)
+      load_fork_journal(slug, JSON.parse(File.read(path)).fetch('source_slug'))
+      File.unlink(path)
+      fsync_directory(File.dirname(path))
+    rescue JSON::ParserError, KeyError => e
+      raise Error, "invalid fork journal #{path}: #{e.message}"
     end
 
     def fsync_directory(path)
@@ -2642,6 +3200,36 @@ module VpsfreeDevSession
       end
 
       thread_id
+    rescue JSON::ParserError => e
+      raise Error, "workspace-portal returned invalid JSON: #{e.message}"
+    end
+
+    def resolve_portal_fork_settings(source_thread_id, model:, effort:)
+      unless @portal_command && !@portal_command.empty?
+        return [model, effort] unless @require_runtime
+
+        raise Error, 'workspace-portal is required to validate Codex settings'
+      end
+
+      command = [
+        *@portal_command,
+        'thread',
+        'resolve-fork-settings',
+        '--thread-id',
+        source_thread_id
+      ]
+      command += ['--socket', @codex_socket] if @codex_socket
+      command += ['--model', model] if model
+      command += ['--effort', effort] if effort
+      stdout, _stderr, _status = @command_runner.capture(command)
+      settings = JSON.parse(stdout)
+      unless settings.is_a?(Hash) &&
+             settings['model'].is_a?(String) && !settings['model'].empty? &&
+             settings['reasoningEffort'].is_a?(String) &&
+             !settings['reasoningEffort'].empty?
+        raise Error, 'workspace-portal returned invalid Codex settings'
+      end
+      [settings.fetch('model'), settings.fetch('reasoningEffort')]
     rescue JSON::ParserError => e
       raise Error, "workspace-portal returned invalid JSON: #{e.message}"
     end
@@ -3225,7 +3813,7 @@ module VpsfreeDevSession
     end
 
     def prepare_cleanup(slug, force:)
-      session = @tmux.session(slug)
+      session = cleanup_session(slug)
       known_state = session ||
                     path_exists?(work_dir(slug)) ||
                     path_exists?(archive_dir(slug)) ||
@@ -3259,6 +3847,26 @@ module VpsfreeDevSession
       end
 
       CleanupPlan.new(session:, entries:, unexpected:)
+    end
+
+    def cleanup_session(slug)
+      named = @tmux.session(slug)
+      return named unless @selected_authority
+
+      expected_id = @selected_authority.fetch('tmux_session_id')
+      authoritative = @tmux.session_by_id(expected_id)
+      if authoritative
+        validate_authority_session!(slug, authoritative)
+        if named && named.id != authoritative.id
+          raise Error, "live tmux session does not match trusted authority for #{slug}"
+        end
+        return authoritative
+      end
+      if named
+        raise Error, "live tmux session does not match trusted authority for #{slug}"
+      end
+
+      nil
     end
 
     def execute_cleanup(slug, plan, force:)
@@ -3358,6 +3966,14 @@ module VpsfreeDevSession
 
     def reject_conflicting_lifecycle_journal!(slug, operation: nil)
       root = File.dirname(creation_journal_file(slug))
+      if path_exists?(start_journal_file(slug)) && !%w[start revive].include?(operation)
+        raise Error,
+              "session start is unfinished: #{slug}; retry dev-session start with the original options"
+      end
+      if path_exists?(fork_journal_file(slug)) && operation != 'fork'
+        raise Error,
+              "session fork is unfinished: #{slug}; retry dev-session fork with the original options"
+      end
       journals = LIFECYCLE_JOURNALS.to_h do |journal|
         name = journal.fetch('name')
         [name, File.join(root, "#{slug}.#{name}.json")]
@@ -3776,16 +4392,46 @@ module VpsfreeDevSession
     end
 
     def retire_session_runtime!(slug, session)
-      if session
-        session = revalidate_session!(session)
-        @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
-      end
       if @selected_authority
         session_id = @selected_authority.fetch('tmux_session_id')
-        if @tmux.session_by_id(session_id)
+        if session && session.id != session_id
+          raise Error, "live tmux session does not match trusted authority for #{slug}"
+        end
+
+        session = @tmux.session_by_id(session_id)
+        if session
+          validate_authority_session!(slug, session, require_creation_identity: true)
+          unless @tmux.kill_session_if_identity(
+            session.id,
+            @selected_authority.fetch('tmux_identity')
+          )
+            raise Error, "live tmux session does not match trusted authority for #{slug}"
+          end
+        end
+        remaining = @tmux.session_by_id(session_id)
+        if remaining && remaining.id != session_id
+          raise Error,
+                "tmux returned session #{remaining.id.inspect} while verifying removal of #{session_id}"
+        end
+        if remaining
           raise Error, "managed tmux session remains after removal: #{slug}"
         end
         delete_session_authority(slug)
+      elsif session && @authority_dir
+        raise Error,
+              "refusing to retire an untrusted same-name tmux session: #{slug}"
+      elsif session
+        session = revalidate_session!(session)
+        identity_token = session.identity_token
+        unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, "tmux session lacks a trusted creation identity: #{slug}"
+        end
+        unless @tmux.kill_session_if_identity(session.id, identity_token)
+          raise Error, "tmux session changed during removal: #{slug}"
+        end
+        if @tmux.session_by_id(session.id)
+          raise Error, "managed tmux session remains after removal: #{slug}"
+        end
       end
     end
 
@@ -4765,12 +5411,22 @@ module VpsfreeDevSession
       false
     end
 
-    def create_tmux_session(slug, run_codex:, thread_id: nil, launch_codex: run_codex)
+    def create_tmux_session(
+      slug,
+      run_codex:,
+      thread_id: nil,
+      launch_codex: run_codex,
+      identity_token: nil
+    )
       if launch_codex && !run_codex
         raise Error, 'cannot launch Codex for a session configured without Codex'
       end
       work_path = work_dir(slug)
       worktrees_path = worktrees_dir(slug)
+      identity_token ||= SecureRandom.hex(32)
+      unless identity_token.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid tmux creation identity for #{slug}"
+      end
       command = [
         'new-session',
         '-d',
@@ -4784,13 +5440,16 @@ module VpsfreeDevSession
         '-c',
         workspace,
         *tmux_environment_args(slug),
+        '-e',
+        "#{ENV_TMUX_IDENTITY}=#{identity_token}",
         @shell_command
       ]
 
       created_id = @tmux.capture(*command).first.strip
       session = @tmux.session_by_id(created_id)
       unless session && session.id == created_id && session.name == slug &&
-             workspace_identity?(session.workspace)
+             workspace_identity?(session.workspace) &&
+             session.identity_token == identity_token
         raise Error, "new tmux session changed during creation: #{slug}"
       end
 
@@ -4871,27 +5530,34 @@ module VpsfreeDevSession
         @tmux.run('set-option', '-t', session_target, SESSION_MARK, '1')
         ensure_managed_session!(slug, session: @tmux.session_by_id(created_id))
       rescue StandardError
-        cleanup_partial_tmux_session(created_id, slug)
+        cleanup_partial_tmux_session(created_id, slug, identity_token)
         raise
       end
     end
 
-    def reconcile_creation_tmux_session!(slug, session)
+    def reconcile_creation_tmux_session!(slug, session, expected_identity)
       unless session.name == slug && workspace_identity?(session.workspace) &&
              session.environment_slug == slug && ['', '1'].include?(session.mark) &&
-             ['', slug].include?(session.slug)
+             ['', slug].include?(session.slug) &&
+             expected_identity&.match?(/\A[0-9a-f]{64}\z/) &&
+             session.identity_token == expected_identity
         raise Error, "tmux session is not recoverable creation state: #{slug}"
       end
 
-      @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+      unless @tmux.kill_session_if_identity(session.id, expected_identity)
+        raise Error, "tmux session changed during creation recovery: #{slug}"
+      end
     end
 
-    def cleanup_partial_tmux_session(id, slug)
+    def cleanup_partial_tmux_session(id, slug, identity_token)
+      return unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
+
       session = @tmux.session_by_id(id)
       return unless session && session.name == slug && workspace_identity?(session.workspace)
       return unless ['', slug].include?(session.slug) && ['', '1'].include?(session.mark)
+      return unless session.identity_token == identity_token
 
-      @tmux.run('kill-session', '-t', Tmux.session_target(id))
+      @tmux.kill_session_if_identity(id, identity_token)
     rescue StandardError => e
       @err.puts "warning: unable to remove partial tmux session #{slug}: #{e.message}"
     end
@@ -5063,12 +5729,22 @@ module VpsfreeDevSession
       raise Error, "tmux session is not managed by this workspace: #{slug}"
     end
 
-    def validate_authority_session!(slug, session)
+    def validate_authority_session!(slug, session, require_creation_identity: false)
       record = @selected_authority
       return unless record
 
       unless record['slug'] == slug && record['tmux_session_id'] == session.id &&
-             record['tmux_socket'] == session.socket_path
+             record['tmux_socket'] == session.socket_path && session.name == slug &&
+             session.managed? && session.environment_slug == slug &&
+             workspace_identity?(session.workspace)
+        raise Error, "live tmux session does not match trusted authority for #{slug}"
+      end
+      identity_token = record['tmux_identity']
+      if require_creation_identity && identity_token.nil?
+        raise Error,
+              "trusted session authority lacks a tmux creation identity for #{slug}"
+      end
+      if identity_token && session.identity_token != identity_token
         raise Error, "live tmux session does not match trusted authority for #{slug}"
       end
       codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
@@ -5079,6 +5755,35 @@ module VpsfreeDevSession
              session.codex_client_version == record['codex_client_version']
         raise Error, "live Codex session does not match trusted authority for #{slug}"
       end
+    end
+
+    def ensure_retirement_identity!(slug, session)
+      return session unless session && @authority_dir
+      unless @selected_authority
+        raise Error, "refusing to retire an untrusted same-name tmux session: #{slug}"
+      end
+
+      validate_authority_session!(slug, session)
+      return session if @selected_authority['tmux_identity']
+
+      identity_token = session.identity_token
+      if identity_token.nil? || identity_token.empty?
+        identity_token = SecureRandom.hex(32)
+        unless @tmux.initialize_session_identity(session.id, identity_token)
+          raise Error, "live tmux session does not match trusted authority for #{slug}"
+        end
+      end
+      session = @tmux.session_by_id(session.id)
+      unless session&.identity_token == identity_token
+        raise Error, "live tmux session does not match trusted authority for #{slug}"
+      end
+      validate_authority_session!(slug, session)
+      write_session_authority(
+        slug,
+        session,
+        state: @selected_authority.fetch('state')
+      )
+      session
     end
 
     def managed_by_workspace?(session)
@@ -5530,9 +6235,34 @@ module VpsfreeDevSession
 
     def close_session!(slug, session, idle_checked: false)
       validate_session_closure!(slug)
+      session = ensure_retirement_identity!(slug, session)
       quiesced = quiesce_and_require_idle!(slug, session) unless idle_checked
-      session = revalidate_session!(session)
-      @tmux.run('kill-session', '-t', Tmux.session_target(session.id))
+      if @selected_authority
+        validate_authority_session!(slug, session, require_creation_identity: true)
+        unless @tmux.kill_session_if_identity(
+          session.id,
+          @selected_authority.fetch('tmux_identity')
+        )
+          raise Error, "live tmux session does not match trusted authority for #{slug}"
+        end
+        if @tmux.session_by_id(session.id)
+          raise Error, "managed tmux session remains after stop: #{slug}"
+        end
+      elsif @authority_dir
+        raise Error, "refusing to stop an untrusted tmux session: #{slug}"
+      else
+        session = revalidate_session!(session)
+        identity_token = session.identity_token
+        unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, "tmux session lacks a trusted creation identity: #{slug}"
+        end
+        unless @tmux.kill_session_if_identity(session.id, identity_token)
+          raise Error, "tmux session changed during stop: #{slug}"
+        end
+        if @tmux.session_by_id(session.id)
+          raise Error, "managed tmux session remains after stop: #{slug}"
+        end
+      end
       delete_session_authority(slug)
     rescue StandardError
       restore_native_client!(slug, quiesced) if quiesced && @tmux.session_by_id(quiesced.id)

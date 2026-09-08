@@ -718,6 +718,7 @@ func writeWebRuntimeAuthority(t *testing.T, server *Server, slug string) {
 	authority := session.RuntimeAuthority{
 		Schema: 1, State: "ready", Slug: slug, Workspace: server.config.Workspace,
 		TmuxSocket: "/run/vpsfree-workspace-tmux/tmux.sock", TmuxSessionID: "$1",
+		TmuxIdentity:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		CodexThreadID: "thread-1", CodexSocketPath: server.config.CodexSocket,
 		CodexClientVersion: "0.152.1",
 	}
@@ -732,7 +733,7 @@ func writeWebRuntimeAuthority(t *testing.T, server *Server, slug string) {
 	line := strings.Join([]string{
 		"$1", slug, "1", slug, server.config.Workspace, slug,
 		authority.TmuxSocket, authority.CodexThreadID, authority.CodexSocketPath,
-		authority.CodexClientVersion, "%1",
+		authority.CodexClientVersion, "%1", authority.TmuxIdentity,
 	}, "\t")
 	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0o755); err != nil {
 		t.Fatal(err)

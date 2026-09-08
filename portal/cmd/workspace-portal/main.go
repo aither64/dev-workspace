@@ -182,7 +182,7 @@ func portalListener(socketPath string) (net.Listener, error) {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|models|defaults|ensure-initial|require-materialized|require-idle|retire")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|models|defaults|resolve-fork-settings|ensure-initial|require-materialized|require-idle|retire")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -231,6 +231,19 @@ func threadCommand(args []string) error {
 			return err
 		}
 		return json.NewEncoder(os.Stdout).Encode(models)
+	case "resolve-fork-settings":
+		if *threadID == "" {
+			return errors.New("thread resolve-fork-settings requires --thread-id")
+		}
+		settings, err := client.ResolveForkSettings(ctx, *threadID, codex.ThreadSettings{
+			Model: *model, ReasoningEffort: *effort,
+		})
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{
+			"model": settings.Model, "reasoningEffort": settings.ReasoningEffort,
+		})
 	case "create":
 		runtime := threadRuntime{
 			Slug: *sessionSlug, Workspace: *workspace, WorkDir: *cwd,

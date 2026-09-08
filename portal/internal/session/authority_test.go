@@ -19,6 +19,7 @@ func TestRuntimeAuthorityRequiresPrivateHostStateAndLiveTmuxIdentity(t *testing.
 	record := RuntimeAuthority{
 		Schema: 1, State: "ready", Slug: "example", Workspace: "/srv/workspace",
 		TmuxSocket: "/run/workspace/tmux.sock", TmuxSessionID: "$7",
+		TmuxIdentity:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		CodexThreadID: "thread-1", CodexSocketPath: "/run/workspace/codex.sock",
 		CodexClientVersion: "0.152.1",
 	}
@@ -37,7 +38,7 @@ func TestRuntimeAuthorityRequiresPrivateHostStateAndLiveTmuxIdentity(t *testing.
 	line := strings.Join([]string{
 		"$7", "example", "1", "example", "/srv/workspace", "example",
 		"/run/workspace/tmux.sock", "thread-1", "/run/workspace/codex.sock", "0.152.1",
-		"%3",
+		"%3", record.TmuxIdentity,
 	}, "\t")
 	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -64,6 +65,52 @@ func TestRuntimeAuthorityRejectsCrossMappedAndUnknownData(t *testing.T) {
 	}
 	if _, err := LoadRuntimeAuthority(directory, "example", "/srv/workspace"); err == nil {
 		t.Fatal("cross-mapped runtime authority was accepted")
+	}
+}
+
+func TestRuntimeAuthorityRejectsMismatchedAndMalformedLiveTmuxIdentities(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "authority")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := RuntimeAuthority{
+		Schema: 1, State: "ready", Slug: "example", Workspace: "/srv/workspace",
+		TmuxSocket: "/run/workspace/tmux.sock", TmuxSessionID: "$7",
+		TmuxIdentity: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	write := func(authority RuntimeAuthority, liveIdentity string) error {
+		data, err := json.Marshal(authority)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(directory, "example.json"), data, 0o600); err != nil {
+			return err
+		}
+		loaded, err := LoadRuntimeAuthority(directory, "example", "/srv/workspace")
+		if err != nil {
+			return err
+		}
+		tmux := filepath.Join(t.TempDir(), "tmux")
+		line := strings.Join([]string{
+			"$7", "example", "1", "example", "/srv/workspace", "example",
+			"/run/workspace/tmux.sock", "", "", "", "", liveIdentity,
+		}, "\t")
+		if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0o755); err != nil {
+			return err
+		}
+		return loaded.VerifyTmux(context.Background(), tmux)
+	}
+
+	if err := write(record, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("mismatched live tmux identity was accepted")
+	}
+	legacy := record
+	legacy.TmuxIdentity = ""
+	if err := write(legacy, "malformed"); err == nil {
+		t.Fatal("malformed live tmux identity was accepted for a legacy authority")
+	}
+	if err := write(legacy, ""); err != nil {
+		t.Fatalf("legacy authority with an empty live identity was rejected: %v", err)
 	}
 }
 

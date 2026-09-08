@@ -35,6 +35,8 @@ module VpsfreeWorkspaceHost
          RUNTIME_CONTRACT.fetch('developmentClusterStateSchema').positive? &&
          RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy').is_a?(Integer) &&
          RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy').positive? &&
+         RUNTIME_CONTRACT.fetch('runtimeAuthorityIdentityPolicy').is_a?(Integer) &&
+         RUNTIME_CONTRACT.fetch('runtimeAuthorityIdentityPolicy').positive? &&
          RUNTIME_CONTRACT.fetch('trackingMaxBytes').is_a?(Integer) &&
          RUNTIME_CONTRACT.fetch('trackingMaxBytes').positive?
     raise 'workspace runtime contract has an invalid development cluster contract'
@@ -392,6 +394,7 @@ module VpsfreeWorkspaceHost
       candidate_host = File.join(candidate, 'bin/workspace-host')
       raise Error, "workspace package has no workspace-host command: #{candidate}" unless File.executable?(candidate_host)
       require_compatible_development_cluster_helpers!(candidate)
+      require_compatible_runtime_authorities!(candidate)
       current_codex = File.realpath(active_codex)
       system! candidate_host, 'check-codex', '--codex', current_codex
       if File.realpath(@system_codex) != current_codex
@@ -429,7 +432,9 @@ module VpsfreeWorkspaceHost
     def activate(argv)
       raise Error, 'workspace activation takes no arguments' unless argv.empty?
 
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
       require_compatible_development_cluster_helpers!(package_root)
+      require_compatible_runtime_authorities!(package_root)
       configure_user_services
       reconcile_codex_update(defer_busy: true)
     end
@@ -447,6 +452,7 @@ module VpsfreeWorkspaceHost
       target_generation = previous_profile_generation
       target_profile = profile_generation_path(target_generation)
       require_compatible_development_cluster_helpers!(target_profile)
+      require_compatible_runtime_authorities!(target_profile)
       target_codex = generation_codex(target_generation)
       target_host = File.join(target_profile, 'bin/workspace-host')
       unless File.executable?(target_host)
@@ -850,18 +856,53 @@ module VpsfreeWorkspaceHost
     )
       operations = entries.flat_map do |entry|
         root = File.join(entry.fetch('root'), 'worktrees', '.locks')
-        LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.flat_map do |kind|
+        lifecycle = LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.flat_map do |kind|
           Dir.glob(File.join(root, "*.#{kind}.json")).sort.map do |path|
             slug = File.basename(path, ".#{kind}.json")
             "#{entry.fetch('name')}/#{slug} (#{kind})"
           end
         end
+        creation = Dir.glob(File.join(root, '*.creation.json')).sort.filter_map do |path|
+          slug = File.basename(path, '.creation.json')
+          raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
+          stat = File.stat(path)
+          unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o600
+            raise Error, "creation journal is not a private regular file: #{path}"
+          end
+          data = File.binread(path, 64 * 1024 + 1)
+          raise Error, "creation journal exceeds 64 KiB: #{path}" if data.bytesize > 64 * 1024
+          journal = JSON.parse(data)
+          unless journal.is_a?(Hash) && journal['schema'] == 1 &&
+                 journal['slug'] == slug && %w[creating ready].include?(journal['state'])
+            raise Error, "creation journal has an invalid state: #{path}"
+          end
+          if journal['state'] == 'ready'
+            if journal.key?('tmux_identity')
+              raise Error, "completed creation journal retains a tmux identity: #{path}"
+            end
+            next
+          end
+          next unless journal.key?('tmux_identity')
+
+          "#{entry.fetch('name')}/#{slug} (creation)"
+        end
+        forks = Dir.glob(File.join(root, '*.fork.json')).sort.map do |path|
+          slug = File.basename(path, '.fork.json')
+          "#{entry.fetch('name')}/#{slug} (fork)"
+        end
+        starts = Dir.glob(File.join(root, '*.start.json')).sort.map do |path|
+          slug = File.basename(path, '.start.json')
+          "#{entry.fetch('name')}/#{slug} (start)"
+        end
+        lifecycle + creation + forks + starts
       end
       return if operations.empty?
 
       raise Error,
             "#{operation} is blocked by unfinished session operations: " \
             "#{operations.join(', ')}; retry the matching dev-session command first"
+    rescue JSON::ParserError, SystemCallError => e
+      raise Error, "cannot inspect session operation state: #{e.message}"
     end
 
     def development_cluster_state(entries = registry.entries)
@@ -932,6 +973,62 @@ module VpsfreeWorkspaceHost
       policy = data['developmentClusterTransitionPolicy']
       policy.is_a?(Integer) &&
         policy >= RUNTIME_CONTRACT.fetch('developmentClusterTransitionPolicy')
+    rescue Errno::ENOENT, Errno::EACCES, JSON::ParserError
+      false
+    end
+
+    def require_compatible_runtime_authorities!(package)
+      authorities = identity_bound_runtime_authorities
+      return if authorities.empty?
+      return if runtime_authority_identity_contract?(package)
+
+      raise Error,
+            "workspace package transition is blocked by identity-bound runtime authorities: " \
+            "#{authorities.join(', ')}; target package cannot validate their tmux identities"
+    end
+
+    def identity_bound_runtime_authorities(entries = registry.entries)
+      entries.flat_map do |entry|
+        directory = instance_runtime(entry).fetch(:authority)
+        next [] unless File.exist?(directory) || File.symlink?(directory)
+        if File.symlink?(directory) || !File.directory?(directory)
+          raise Error, "runtime authority path is not a safe directory: #{directory}"
+        end
+
+        Dir.children(directory).sort.filter_map do |name|
+          next unless name.end_with?('.json')
+
+          path = File.join(directory, name)
+          stat = File.lstat(path)
+          unless stat.file? && !stat.symlink? && stat.uid == Process.euid &&
+                 (stat.mode & 0o777) == 0o600
+            raise Error, "runtime authority is not a private regular file: #{path}"
+          end
+          data = File.binread(path, 64 * 1024 + 1)
+          raise Error, "runtime authority exceeds 64 KiB: #{path}" if data.bytesize > 64 * 1024
+
+          record = JSON.parse(data)
+          unless record.is_a?(Hash)
+            raise Error, "runtime authority is not a JSON object: #{path}"
+          end
+          next unless record.key?('tmux_identity')
+
+          "#{entry.fetch('name')}/#{File.basename(name, '.json')}"
+        end
+      end
+    rescue JSON::ParserError, SystemCallError => e
+      raise Error, "cannot inspect runtime authority state: #{e.message}"
+    end
+
+    def runtime_authority_identity_contract?(package)
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      payload = File.binread(path, 64 * 1024 + 1)
+      return false if payload.bytesize > 64 * 1024
+
+      data = JSON.parse(payload)
+      policy = data['runtimeAuthorityIdentityPolicy'] if data.is_a?(Hash)
+      policy.is_a?(Integer) &&
+        policy >= RUNTIME_CONTRACT.fetch('runtimeAuthorityIdentityPolicy')
     rescue Errno::ENOENT, Errno::EACCES, JSON::ParserError
       false
     end

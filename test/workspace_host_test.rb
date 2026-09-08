@@ -790,6 +790,121 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_switch_refuses_an_unfinished_session_creation
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-pending.creation.json')
+      File.write(
+        journal,
+        JSON.generate(
+          'schema' => 1,
+          'slug' => '2026-09-07-pending',
+          'state' => 'creating',
+          'tmux_identity' => 'a' * 64
+        ) + "\n"
+      )
+      File.chmod(0o600, journal)
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, '(creation)')
+    end
+  end
+
+  def test_switch_allows_a_completed_session_creation_journal
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-ready.creation.json')
+      File.write(
+        journal,
+        JSON.generate(
+          'schema' => 1,
+          'slug' => '2026-09-07-ready',
+          'state' => 'ready'
+        ) + "\n"
+      )
+      File.chmod(0o600, journal)
+
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(1, host.send(:profile_generation))
+    end
+  end
+
+  def test_switch_allows_a_legacy_journal_only_creation_for_safe_retry
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-legacy.creation.json')
+      File.write(
+        journal,
+        JSON.generate(
+          'schema' => 1,
+          'slug' => '2026-09-07-legacy',
+          'state' => 'creating'
+        ) + "\n"
+      )
+      File.chmod(0o600, journal)
+
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(1, host.send(:profile_generation))
+    end
+  end
+
+  def test_switch_refuses_an_unfinished_session_fork
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      File.write(File.join(locks, '2026-09-07-fork.fork.json'), "{}\n")
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, '(fork)')
+    end
+  end
+
+  def test_switch_refuses_an_unfinished_session_start
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      File.write(File.join(locks, '2026-09-07-restart.start.json'), "{}\n")
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, '(start)')
+    end
+  end
+
+  def test_switch_fails_closed_on_a_malformed_creation_journal
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-broken.creation.json')
+      File.write(journal, "{\n")
+      File.chmod(0o600, journal)
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'cannot inspect session operation state'
+      )
+    end
+  end
+
   def test_switch_refuses_incompatible_cluster_helpers_while_cluster_state_exists
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -843,6 +958,39 @@ class WorkspaceHostTest < Minitest::Test
       assert_includes(
         host.instance_variable_get(:@err).string,
         'target package has no compatible cluster-state contract'
+      )
+    end
+  end
+
+  def test_rollback_refuses_a_package_without_the_identity_authority_contract
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      old_contract = File.join(
+        host.send(:profile_generation_path, 1),
+        'share/workspace-portal/runtime-contract.json'
+      )
+      contract = JSON.parse(File.read(old_contract))
+      contract.delete('runtimeAuthorityIdentityPolicy')
+      File.write(old_contract, JSON.generate(contract))
+      runtime = host.send(:instance_runtime, host.send(:registry).entries.fetch(0))
+      FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
+      File.write(
+        File.join(runtime.fetch(:authority), '2026-09-07-active.json'),
+        JSON.generate('tmux_identity' => 'a' * 64),
+        mode: 'w'
+      )
+      File.chmod(0o600, File.join(runtime.fetch(:authority), '2026-09-07-active.json'))
+
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(2, host.send(:profile_generation))
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'target package cannot validate their tmux identities'
       )
     end
   end
@@ -1578,6 +1726,9 @@ class WorkspaceHostTest < Minitest::Test
     tracking_max: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes'),
     transition_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
       'developmentClusterTransitionPolicy'
+    ),
+    authority_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+      'runtimeAuthorityIdentityPolicy'
     )
   )
     package = File.join(parent, name)
@@ -1588,13 +1739,15 @@ class WorkspaceHostTest < Minitest::Test
     if cluster_contract
       contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
       FileUtils.mkdir_p(File.dirname(contract))
-      File.write(contract, JSON.generate(
+      contract_data = {
         'developmentClusterStateSchema' => VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
           'developmentClusterStateSchema'
         ),
         'developmentClusterTransitionPolicy' => transition_policy,
         'trackingMaxBytes' => tracking_max
-      ))
+      }
+      contract_data['runtimeAuthorityIdentityPolicy'] = authority_policy if authority_policy
+      File.write(contract, JSON.generate(contract_data))
       %w[vpsadmin vpsadminos].each do |kind|
         helper = File.join(package, 'libexec/workspace-portal', "#{kind}-devcluster")
         FileUtils.mkdir_p(File.dirname(helper))

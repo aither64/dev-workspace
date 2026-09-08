@@ -283,6 +283,7 @@ class DevSessionTest < Minitest::Test
       codex_client_version: nil,
       codex_pane_id: nil,
       pane_current_command: nil,
+      identity_token: 'a' * 64,
       id: '$managed'
     )
       @slug = slug
@@ -295,6 +296,7 @@ class DevSessionTest < Minitest::Test
       @codex_client_version = codex_client_version
       @codex_pane_id = codex_pane_id || (codex_thread_id && '%1')
       @pane_current_command = pane_current_command || (codex_thread_id && 'codex')
+      @identity_token = identity_token
       @killed = false
       @quiesced = false
       @sent_commands = []
@@ -350,11 +352,30 @@ class DevSessionTest < Minitest::Test
         @codex_client_version = args.last
         return
       end
+      if args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+        @identity_token = args.last
+        return
+      end
       targets = ["#{@id}:", @slug]
       return unless args.first(2) == ['kill-session', '-t'] && targets.include?(args[2])
 
       @on_kill&.call
       @killed = true
+    end
+
+    def kill_session_if_identity(id, identity_token)
+      return false unless id == @id && identity_token == @identity_token && !@killed
+
+      run('kill-session', '-t', "#{id}:")
+      true
+    end
+
+    def initialize_session_identity(id, identity_token)
+      return false unless id == @id && !@killed &&
+                          (@identity_token.nil? || @identity_token.empty?)
+
+      @identity_token = identity_token
+      true
     end
 
     private
@@ -371,7 +392,8 @@ class DevSessionTest < Minitest::Test
         codex_thread_id: @codex_thread_id,
         codex_socket_path: @codex_socket_path,
         codex_client_version: @codex_client_version,
-        codex_pane_id: @codex_pane_id
+        codex_pane_id: @codex_pane_id,
+        identity_token: @identity_token
       )
     end
   end
@@ -390,6 +412,29 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  class RenamedManagedTmux < ManagedTmux
+    def session(_slug)
+      nil
+    end
+
+    private
+
+    def identity
+      super.tap { |session| session.name = "#{@slug}-renamed" }
+    end
+  end
+
+  class PartialManagedTmux < ManagedTmux
+    private
+
+    def identity
+      super.tap do |session|
+        session.mark = ''
+        session.slug = ''
+      end
+    end
+  end
+
   class KillThenFailOnceTmux < ManagedTmux
     def run(*args)
       killing = args.first(2) == ['kill-session', '-t']
@@ -398,6 +443,40 @@ class DevSessionTest < Minitest::Test
 
       @reported_failure = true
       raise VpsfreeDevSession::Error, 'simulated failure after tmux removal'
+    end
+  end
+
+  class MismatchedIdentityAfterKillTmux < ManagedTmux
+    def session_by_id(id)
+      return super unless @killed && id == @id
+
+      VpsfreeDevSession::Tmux::Session.new(
+        id: '$12',
+        name: @slug,
+        mark: '1',
+        slug: @slug,
+        workspace: @workspace,
+        environment_slug: @slug,
+        socket_path: @socket_path
+      )
+    end
+  end
+
+  class ReplacedDuringConditionalKillTmux < ManagedTmux
+    attr_reader :conditional_kill_attempted
+
+    def kill_session_if_identity(_id, _identity_token)
+      @conditional_kill_attempted = true
+      false
+    end
+  end
+
+  class RefusedIdentityInitializationTmux < ManagedTmux
+    attr_reader :identity_initialization_attempted
+
+    def initialize_session_identity(_id, _identity_token)
+      @identity_initialization_attempted = true
+      false
     end
   end
 
@@ -417,6 +496,7 @@ class DevSessionTest < Minitest::Test
         super
       end
     end
+
   end
 
   class UnmanagedTmux < NullTmux
@@ -452,7 +532,7 @@ class DevSessionTest < Minitest::Test
       return unless slug == @slug
 
       VpsfreeDevSession::Tmux::Session.new(
-        id: '$original',
+        id: '$12',
         name: @slug,
         mark: '1',
         slug: @slug,
@@ -522,6 +602,7 @@ class DevSessionTest < Minitest::Test
       @mutations = []
       @name_lookups = 0
       @pane = 0
+      @identity_token = nil
     end
 
     def session(slug)
@@ -548,6 +629,10 @@ class DevSessionTest < Minitest::Test
       output = case args.first
                when 'new-session'
                  @created = true
+                 identity = args.find do |value|
+                   value.start_with?("#{VpsfreeDevSession::ENV_TMUX_IDENTITY}=")
+                 end
+                 @identity_token = identity&.partition('=')&.last
                  '$original'
                when 'display-message'
                  '%left'
@@ -562,6 +647,9 @@ class DevSessionTest < Minitest::Test
 
     def run(*args)
       @mutations << args
+      if args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+        @identity_token = args.last
+      end
     end
 
     def windows(_session)
@@ -576,7 +664,8 @@ class DevSessionTest < Minitest::Test
         name: @slug,
         mark: managed ? '1' : '',
         slug: managed ? @slug : '',
-        workspace: @workspace
+        workspace: @workspace,
+        identity_token: @identity_token
       )
     end
   end
@@ -592,6 +681,7 @@ class DevSessionTest < Minitest::Test
       @split_attempts = 0
       @mark = ''
       @session_slug = ''
+      @identity_token = nil
     end
 
     def session(slug)
@@ -614,6 +704,8 @@ class DevSessionTest < Minitest::Test
         @created = true
         @mark = ''
         @session_slug = ''
+        identity = args.find { |value| value.start_with?("#{VpsfreeDevSession::ENV_TMUX_IDENTITY}=") }
+        @identity_token = identity&.partition('=')&.last
         ["$partial\n", '', nil]
       when 'display-message'
         ["%left\n", '', nil]
@@ -630,10 +722,19 @@ class DevSessionTest < Minitest::Test
         @mark = args.last
       elsif args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_SLUG
         @session_slug = args.last
+      elsif args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+        @identity_token = args.last
       elsif args.first == 'kill-session'
         @created = false
         @kill_count += 1
       end
+    end
+
+    def kill_session_if_identity(id, identity_token)
+      return false unless id == '$partial' && identity_token == @identity_token && @created
+
+      run('kill-session', '-t', "#{id}:")
+      true
     end
 
     private
@@ -645,7 +746,8 @@ class DevSessionTest < Minitest::Test
         mark: @mark,
         slug: @session_slug,
         workspace: @workspace,
-        environment_slug: @slug
+        environment_slug: @slug,
+        identity_token: @identity_token
       )
     end
   end
@@ -659,6 +761,11 @@ class DevSessionTest < Minitest::Test
 
     def run(*arguments)
       @mutations << arguments
+    end
+
+    def kill_session_if_identity(id, identity_token)
+      @mutations << ['conditional-kill-session', id, identity_token]
+      true
     end
   end
 
@@ -1031,14 +1138,22 @@ class DevSessionTest < Minitest::Test
       File.write(portal, <<~RUBY)
         require 'json'
         File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
-        puts JSON.generate(threadId: 'thread-fork') if ARGV[0, 2] == ['thread', 'fork']
+        case ARGV[0, 2]
+        when ['thread', 'resolve-fork-settings']
+          puts JSON.generate(model: 'gpt-test', reasoningEffort: 'xhigh')
+        when ['thread', 'fork']
+          puts JSON.generate(threadId: 'thread-fork')
+        end
       RUBY
       session = VpsfreeDevSession::Tmux::Session.new(
         id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
       runner_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) { |*_args, **_kwargs| session }
+        define_method(:create_tmux_session) do |*_args, **kwargs|
+          session.identity_token = kwargs.fetch(:identity_token)
+          session
+        end
         define_method(:sync_slug) { |*_args, **_kwargs| session }
       end
       out = StringIO.new
@@ -1063,7 +1178,10 @@ class DevSessionTest < Minitest::Test
       assert_empty(manifest.fetch('repositories'))
       assert_empty(manifest.fetch('artifacts'))
       assert_empty(Dir.children(File.join(workspace, 'worktrees', destination_slug)))
-      command = File.readlines(log, chomp: true).find { |line| line.start_with?('thread fork ') }
+      commands = File.readlines(log, chomp: true)
+      preflight = commands.find { |line| line.start_with?('thread resolve-fork-settings ') }
+      assert_includes(preflight, '--thread-id thread-source')
+      command = commands.find { |line| line.start_with?('thread fork ') }
       assert_includes(command, '--thread-id thread-source')
       assert_includes(command, '--model gpt-test')
       assert_includes(command, '--effort xhigh')
@@ -1137,7 +1255,9 @@ class DevSessionTest < Minitest::Test
       portal = File.join(workspace, 'portal.rb')
       File.write(portal, <<~RUBY)
         require 'json'
-        if ARGV[0, 2] == ['thread', 'fork']
+        if ARGV[0, 2] == ['thread', 'resolve-fork-settings']
+          puts JSON.generate(model: 'source-model', reasoningEffort: 'medium')
+        elsif ARGV[0, 2] == ['thread', 'fork']
           File.open(#{calls.dump}, 'a') { |file| file.puts 'fork' }
           puts JSON.generate(threadId: 'thread-fork')
         end
@@ -1160,7 +1280,10 @@ class DevSessionTest < Minitest::Test
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
       retry_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) { |*_args, **_kwargs| session }
+        define_method(:create_tmux_session) do |*_args, **kwargs|
+          session.identity_token = kwargs.fetch(:identity_token)
+          session
+        end
         define_method(:sync_slug) { |*_args, **_kwargs| session }
       end
       retry_runner = retry_class.new(
@@ -1169,6 +1292,612 @@ class DevSessionTest < Minitest::Test
       )
       retry_runner.fork(source_slug, 'retry', as_is: false, json: true)
       assert_equal(["fork\n"], File.readlines(calls))
+    end
+  end
+
+  def test_fork_resumes_after_manifest_crash_on_the_next_day_without_source_tracking
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-retry'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_portal_fork) do |*_arguments, **_keywords|
+          raise VpsfreeDevSession::Error, 'simulated crash before forked thread creation'
+        end
+      end
+      crashing = crashing_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        crashing.fork(
+          source_slug,
+          'retry',
+          as_is: false,
+          json: true,
+          model: 'gpt-test',
+          effort: 'xhigh'
+        )
+      end
+      journal_path = setup.send(:fork_journal_file, destination_slug)
+      assert(File.file?(journal_path))
+      journal = JSON.parse(File.read(journal_path))
+      assert_equal('thread-source', journal.fetch('source_thread_id'))
+      assert_equal('gpt-test', journal.fetch('model'))
+      assert_equal('xhigh', journal.fetch('effort'))
+      partial = YAML.safe_load(
+        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+      )
+      assert_equal(source_slug, partial.fetch('forked_from'))
+      assert_nil(partial.dig('codex', 'thread_id'))
+      FileUtils.rm_r(File.join(workspace, 'work', source_slug))
+
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$12', name: destination_slug, mark: '1', slug: destination_slug,
+        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+      )
+      forked_from_thread = nil
+      retry_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_portal_fork) do |_slug, source_thread_id, **_keywords|
+          forked_from_thread = source_thread_id
+          'thread-fork'
+        end
+        define_method(:name_portal_thread) { |*_arguments| nil }
+        define_method(:create_tmux_session) do |*_arguments, **keywords|
+          session.identity_token = keywords.fetch(:identity_token)
+          session
+        end
+        define_method(:sync_slug) { |*_arguments, **_keywords| session }
+      end
+      out = StringIO.new
+      retry_runner = retry_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        today: TODAY.next_day,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        retry_runner.fork(
+          'source',
+          'retry',
+          as_is: false,
+          json: true,
+          model: 'gpt-other',
+          effort: 'xhigh'
+        )
+      end
+      assert_includes(error.message, 'options do not match')
+      assert(File.file?(journal_path))
+      retry_runner.fork(
+        'source',
+        'retry',
+        as_is: false,
+        json: true,
+        model: 'gpt-test',
+        effort: 'xhigh'
+      )
+
+      result = JSON.parse(out.string)
+      assert_equal(destination_slug, result.fetch('slug'))
+      assert_equal(source_slug, result.fetch('forkedFrom'))
+      assert_equal('thread-source', forked_from_thread)
+      refute(File.exist?(journal_path))
+      refute(File.exist?(File.join(workspace, 'work', '2026-06-07-retry')))
+    end
+  end
+
+  def test_fork_recovers_a_journal_owned_partial_tracking_skeleton
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-retry'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+        def ensure_fork_tracking_file!(path, expected, label)
+          super
+          if label == 'plan.md'
+            raise VpsfreeDevSession::Error, 'simulated crash between tracking files'
+          end
+        end
+      end
+      crashing = crashing_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        crashing.fork(source_slug, 'retry', as_is: false, json: true)
+      end
+      assert(File.file?(setup.send(:fork_journal_file, destination_slug)))
+      destination_work = File.join(workspace, 'work', destination_slug)
+      plan_path = File.join(destination_work, 'plan.md')
+      state_path = File.join(destination_work, 'state.md')
+      assert(File.file?(plan_path))
+      refute(File.exist?(state_path))
+      File.link(plan_path, File.join(destination_work, '.plan.md.123.tmp'))
+      previous_umask = File.umask(0o077)
+      begin
+        File.write(File.join(destination_work, '.state.md.123.tmp'), "partial\n")
+      ensure
+        File.umask(previous_umask)
+      end
+      assert_equal(
+        0o600,
+        File.stat(File.join(destination_work, '.state.md.123.tmp')).mode & 0o777
+      )
+      FileUtils.rm_r(File.join(workspace, 'work', source_slug))
+      retry_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_portal_fork) do |*_arguments, **_keywords|
+          raise VpsfreeDevSession::Error, 'reached thread creation'
+        end
+      end
+      retry_runner = retry_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY.next_day,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        retry_runner.fork('source', 'retry', as_is: false, json: true)
+      end
+
+      assert_equal('reached thread creation', error.message)
+      state = File.read(state_path)
+      assert_equal(setup.send(:state_skeleton, destination_slug), state)
+      refute(File.exist?(File.join(destination_work, '.plan.md.123.tmp')))
+      refute(File.exist?(File.join(destination_work, '.state.md.123.tmp')))
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+      )
+      assert_equal(source_slug, manifest.fetch('forked_from'))
+    end
+  end
+
+  def test_fork_recovers_a_journal_owned_default_manifest
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-retry'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+        def ensure_fork_portal_manifest(slug, _source_slug)
+          write_portal_manifest(slug, new_portal_manifest(slug))
+          raise VpsfreeDevSession::Error, 'simulated crash before fork provenance'
+        end
+      end
+      crashing = crashing_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        crashing.fork(source_slug, 'retry', as_is: false, json: true)
+      end
+      partial = YAML.safe_load(
+        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+      )
+      refute(partial.key?('forked_from'))
+      portal_temporary = File.join(
+        workspace, 'work', destination_slug, '.portal.yml.456.tmp'
+      )
+      File.write(portal_temporary, "partial: true\n")
+      FileUtils.rm_r(File.join(workspace, 'work', source_slug))
+      retry_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_portal_fork) do |*_arguments, **_keywords|
+          raise VpsfreeDevSession::Error, 'reached thread creation'
+        end
+      end
+      retry_runner = retry_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY.next_day,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        retry_runner.fork('source', 'retry', as_is: false, json: true)
+      end
+
+      assert_equal('reached thread creation', error.message)
+      recovered = YAML.safe_load(
+        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+      )
+      assert_equal(source_slug, recovered.fetch('forked_from'))
+      refute(File.exist?(portal_temporary))
+    end
+  end
+
+  def test_fork_revalidates_options_when_a_journal_appears_under_lock
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      load_count = 0
+      racing_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:load_fork_journal) do |slug, expected_source = nil|
+          load_count += 1
+          if load_count == 2
+            prepare_fork_journal!(
+              destination_slug,
+              source_slug,
+              'thread-source',
+              model: 'gpt-first',
+              effort: 'xhigh'
+            )
+          end
+          super(slug, expected_source)
+        end
+      end
+      runner = racing_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.fork(
+          source_slug,
+          'alternative',
+          as_is: false,
+          json: true,
+          model: 'gpt-second',
+          effort: 'xhigh'
+        )
+      end
+
+      assert_includes(error.message, 'options do not match')
+      journal = JSON.parse(File.read(setup.send(:fork_journal_file, destination_slug)))
+      assert_equal('gpt-first', journal.fetch('model'))
+      refute(File.exist?(File.join(workspace, 'work', destination_slug)))
+    end
+  end
+
+  def test_fork_rejects_archive_history_before_publishing_its_journal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      archive = File.join(workspace, 'archive', destination_slug)
+      FileUtils.mkdir_p(archive)
+      File.write(File.join(archive, 'plan.md'), "# Archived\n")
+      File.write(
+        File.join(archive, 'state.md'),
+        "---\nlifecycle: complete\n---\n\n# #{destination_slug}\n"
+      )
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'add', File.join('archive', destination_slug))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'record archived slug')
+      FileUtils.rm_r(archive)
+      assert_git_success(
+        'git', '-C', workspace, 'add', '-A', '--', File.join('archive', destination_slug)
+      )
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'remove archive checkout')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        setup.fork(source_slug, 'alternative', as_is: false, json: true)
+      end
+
+      assert_includes(error.message, 'archived slug cannot be reused')
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+      refute(File.exist?(File.join(workspace, 'work', destination_slug)))
+    end
+  end
+
+  def test_fork_rejects_invalid_settings_before_publishing_its_journal
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        warn 'Codex model is unavailable'
+        exit 1
+      RUBY
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal],
+        out: StringIO.new,
+        err: StringIO.new,
+        today: TODAY,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      error = assert_raises(VpsfreeDevSession::CommandError) do
+        runner.fork(
+          source_slug,
+          'alternative',
+          as_is: false,
+          json: true,
+          model: 'missing-model',
+          effort: 'xhigh'
+        )
+      end
+
+      assert_includes(error.message, 'Codex model is unavailable')
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+      refute(File.exist?(File.join(workspace, 'work', destination_slug)))
+    end
+  end
+
+  def test_fork_recovery_rejects_a_renamed_authority_session
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      authority_dir = File.join(workspace, 'authority')
+      setup = runner_for(workspace, authority_dir:)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      FileUtils.mkdir_p(File.join(workspace, 'worktrees', destination_slug))
+      original = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11', name: destination_slug, mark: '1', slug: destination_slug,
+        workspace:, environment_slug: destination_slug,
+        socket_path: '/run/test.sock', identity_token: 'a' * 64
+      )
+      setup.send(:write_session_authority, destination_slug, original, state: 'ready')
+      tmux = RenamedManagedTmux.new(
+        destination_slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.fork(source_slug, 'alternative', as_is: false, json: true)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(File.file?(File.join(authority_dir, "#{destination_slug}.json")))
+    end
+  end
+
+  def test_fork_recovery_replaces_only_the_journal_bound_partial_session
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      authority_dir = File.join(workspace, 'authority')
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      journal = setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      tmux = PartialManagedTmux.new(
+        destination_slug, workspace:, identity_token: journal.fetch('tmux_identity')
+      )
+      created = VpsfreeDevSession::Tmux::Session.new(
+        id: '$12', name: destination_slug, mark: '1', slug: destination_slug,
+        workspace:, environment_slug: destination_slug,
+        socket_path: '/run/test.sock', codex_thread_id: 'thread-fork',
+        codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) do |*_arguments, **keywords|
+          created.identity_token = keywords.fetch(:identity_token)
+          created
+        end
+        define_method(:sync_slug) { |*_arguments, **_keywords| created }
+      end
+      runner = runner_class.new(
+        workspace:, tmux:, authority_dir:, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      runner.fork('source', 'alternative', as_is: false, json: true)
+
+      assert(tmux.killed)
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+      authority = JSON.parse(
+        File.read(File.join(authority_dir, "#{destination_slug}.json"))
+      )
+      assert_equal(journal.fetch('tmux_identity'), authority.fetch('tmux_identity'))
+    end
+  end
+
+  def test_fork_recovery_refuses_a_partial_session_with_another_identity
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      tmux = PartialManagedTmux.new(
+        destination_slug, workspace:, identity_token: 'b' * 64
+      )
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.fork(source_slug, 'alternative', as_is: false, json: true)
+      end
+
+      assert_includes(error.message, 'does not match fork identity')
+      refute(tmux.killed)
+      assert(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+    end
+  end
+
+  def test_completed_fork_recovery_does_not_require_source_tracking
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      source = setup.send(:ensure_portal_manifest, source_slug)
+      source['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, source)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      journal = setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      tmux = ManagedTmux.new(
+        destination_slug,
+        workspace:,
+        identity_token: journal.fetch('tmux_identity'),
+        codex_thread_id: 'thread-fork'
+      )
+      FileUtils.rm_r(File.join(workspace, 'work', source_slug))
+      out = StringIO.new
+      runner = runner_for(workspace, tmux:, out:)
+
+      runner.fork('source', 'alternative', as_is: false, json: true)
+
+      refute(tmux.killed)
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+      assert_equal('thread-fork', JSON.parse(out.string).fetch('threadId'))
+    end
+  end
+
+  def test_completed_fork_recovery_uses_the_journal_source_when_suffix_is_reused
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      newer_source_slug = '2026-06-07-source'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      journal = setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      setup.ensure_tracking_files(newer_source_slug)
+      tmux = ManagedTmux.new(
+        destination_slug,
+        workspace:,
+        identity_token: journal.fetch('tmux_identity'),
+        codex_thread_id: 'thread-fork'
+      )
+      out = StringIO.new
+      runner = runner_for(workspace, tmux:, out:)
+
+      runner.fork('source', 'alternative', as_is: false, json: true)
+
+      result = JSON.parse(out.string)
+      assert_equal(source_slug, result.fetch('forkedFrom'))
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+    end
+  end
+
+  def test_completed_fork_recovery_reuses_the_journal_destination_after_midnight
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination_slug = '2026-06-06-alternative'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(destination_slug)
+      destination = setup.send(:ensure_portal_manifest, destination_slug)
+      destination['forked_from'] = source_slug
+      destination['codex'] = { 'thread_id' => 'thread-fork' }
+      setup.send(:write_portal_manifest, destination_slug, destination)
+      journal = setup.send(
+        :prepare_fork_journal!, destination_slug, source_slug, 'thread-source',
+        model: nil, effort: nil
+      )
+      tmux = ManagedTmux.new(
+        destination_slug,
+        workspace:,
+        identity_token: journal.fetch('tmux_identity'),
+        codex_thread_id: 'thread-fork'
+      )
+      out = StringIO.new
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:,
+        tmux:,
+        out:,
+        err: StringIO.new,
+        today: TODAY.next_day,
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      runner.fork(source_slug, 'alternative', as_is: false, json: true)
+
+      result = JSON.parse(out.string)
+      assert_equal(destination_slug, result.fetch('slug'))
+      refute(File.exist?(setup.send(:fork_journal_file, destination_slug)))
+      refute(File.exist?(File.join(workspace, 'work', '2026-06-07-alternative')))
     end
   end
 
@@ -1597,6 +2326,8 @@ class DevSessionTest < Minitest::Test
           runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
           authority_lock = File.join(authority_dir, "#{slug}.lock")
+          authority = JSON.parse(File.read(File.join(authority_dir, "#{slug}.json")))
+          assert_match(/\A[0-9a-f]{64}\z/, authority.fetch('tmux_identity'))
           assert(File.file?(authority_lock))
           assert_equal(0o600, File.stat(authority_lock).mode & 0o777)
           _stdout, _stderr, status = Open3.capture3(
@@ -1727,9 +2458,12 @@ class DevSessionTest < Minitest::Test
         workspace:
       )
       runner_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) do |_slug, run_codex:, thread_id:, launch_codex:|
+        define_method(:create_tmux_session) do |
+          _slug, run_codex:, thread_id:, launch_codex:, identity_token:
+        |
           raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
           raise 'Codex launched before the initial request persisted' if launch_codex
+          raise 'missing journaled tmux identity' unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
 
           session
         end
@@ -2119,9 +2853,12 @@ class DevSessionTest < Minitest::Test
       refute(partial.dig('creation', 'initial_goal_sent'))
       assert(partial.dig('creation', 'initial_goal_attempted'))
 
+      creation_identity = JSON.parse(
+        File.read(runner.send(:creation_journal_file, slug))
+      ).fetch('tmux_identity')
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
-        tmux: ManagedTmux.new(slug, workspace:),
+        tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out:,
         err: StringIO.new,
         today: TODAY,
@@ -2305,6 +3042,31 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_rejects_a_renamed_authority_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-renamed-start'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = RenamedManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test.sock',
+        identity_token: 'a' * 64
+      )
+      runner.send(:write_session_authority, slug, session, state: 'ready')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
   def test_initial_turn_starts_after_private_local_creation_and_without_the_slug_lock
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -2407,7 +3169,10 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.153.0', codex_pane_id: '%1'
       )
       first_runner_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) { |*_arguments, **_keywords| original }
+        define_method(:create_tmux_session) do |*_arguments, **keywords|
+          original.identity_token = keywords.fetch(:identity_token)
+          original
+        end
         define_method(:sync_slug) { |*_arguments, **_keywords| original }
         define_method(:revalidate_session!) { |_expected| original }
       end
@@ -2425,16 +3190,24 @@ class DevSessionTest < Minitest::Test
         )
       end
 
+      creation_identity = JSON.parse(
+        File.read(first.send(:creation_journal_file, slug))
+      ).fetch('tmux_identity')
+
       tmux = ManagedTmux.new(
         slug, workspace:, socket_path: '/run/test/tmux.sock',
         codex_thread_id: 'thread-vanished', codex_socket_path: '/run/test/codex.sock',
-        codex_client_version: '0.153.0', codex_pane_id: '%1', id: '$7'
+        codex_client_version: '0.153.0', codex_pane_id: '%1', id: '$7',
+        identity_token: creation_identity
       )
       replacement = original.dup
       replacement.id = '$8'
       replacement.codex_thread_id = 'thread-replacement'
       second_runner_class = Class.new(VpsfreeDevSession::Runner) do
-        define_method(:create_tmux_session) { |*_arguments, **_keywords| replacement }
+        define_method(:create_tmux_session) do |*_arguments, **keywords|
+          replacement.identity_token = keywords.fetch(:identity_token)
+          replacement
+        end
         define_method(:sync_slug) { |*_arguments, **_keywords| replacement }
         define_method(:revalidate_session!) { |expected| expected }
         define_method(:reconcile_native_client!) { |_slug, expected, **_keywords| expected }
@@ -2626,9 +3399,10 @@ class DevSessionTest < Minitest::Test
       end
       assert_includes(error.message, 'does not match the recorded goal')
 
+      creation_identity = JSON.parse(File.read(journal)).fetch('tmux_identity')
       retry_runner = VpsfreeDevSession::Runner.new(
         workspace:,
-        tmux: ManagedTmux.new(slug, workspace:),
+        tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
@@ -2703,9 +3477,10 @@ class DevSessionTest < Minitest::Test
       assert(File.file?(journal))
       refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
 
+      creation_identity = JSON.parse(File.read(journal)).fetch('tmux_identity')
       runner = VpsfreeDevSession::Runner.new(
         workspace:,
-        tmux: ManagedTmux.new(slug, workspace:),
+        tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
@@ -4326,12 +5101,87 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_remove_preflights_legacy_identity_before_creating_a_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-remove-legacy-identity'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = RefusedIdentityInitializationTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: nil
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(tmux.identity_initialization_attempted)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_rejects_a_renamed_authority_session_before_creating_a_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-remove-renamed-session'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = RenamedManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test.sock',
+        identity_token: 'a' * 64
+      )
+      runner.send(:write_session_authority, slug, session, state: 'ready')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_resume_upgrades_a_legacy_identity_before_continuing
+    with_workspace do |workspace|
+      slug = '2026-06-06-remove-resume-legacy'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: nil
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+      runner.send(:prepare_removal!, slug, force: false)
+
+      runner.delete(slug, as_is: true, force: false)
+
+      assert(tmux.killed)
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
   def test_remove_retries_after_tmux_was_killed
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
-      tmux = KillThenFailOnceTmux.new(slug, workspace:)
-      runner = runner_for(workspace, tmux:)
+      tmux = KillThenFailOnceTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      authority_dir = File.join(workspace, 'authority')
+      runner = runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
 
       error = assert_raises(VpsfreeDevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
@@ -5590,8 +6440,293 @@ class DevSessionTest < Minitest::Test
 
       assert_match(/session not found/, error.message)
       assert(tmux_session_exists?(socket, longer_slug))
+
+      removed_slug = '2026-06-06-removed'
+      tmux_run(socket, 'new-session', '-d', '-s', removed_slug, '-c', workspace)
+      removed = tmux.session(removed_slug)
+      tmux_run(socket, 'kill-session', '-t', "#{removed.id}:")
+      assert_nil(tmux.session_by_id(removed.id))
+      assert(tmux_session_exists?(socket, longer_slug))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
+    end
+  end
+
+  def test_tmux_conditional_retirement_kills_only_the_matching_identity
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
+
+    socket = "dev-session-test-#{Process.pid}-#{object_id}"
+    slug = '2026-06-06-demo'
+    command_runner = VpsfreeDevSession::CommandRunner.new(
+      out: StringIO.new,
+      err: StringIO.new
+    )
+    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket:)
+
+    tmux_run(socket, 'new-session', '-d', '-s', slug)
+    session = tmux.session(slug)
+    token = 'a' * 64
+    tmux_run(
+      socket, 'set-environment', '-t', "#{session.id}:",
+      VpsfreeDevSession::ENV_TMUX_IDENTITY, token
+    )
+
+    refute(tmux.kill_session_if_identity(session.id, 'b' * 64))
+    assert(tmux_session_exists?(socket, slug))
+    assert(tmux.kill_session_if_identity(session.id, token))
+    refute(tmux_session_exists?(socket, slug))
+  ensure
+    tmux_run(socket, 'kill-server', allow_failure: true) if socket
+  end
+
+  def test_tmux_lookup_treats_a_successful_blank_response_as_absent
+    status = Object.new
+    status.define_singleton_method(:success?) { true }
+    command_runner = Object.new
+    command_runner.define_singleton_method(:capture) do |_argv, allow_failure:|
+      raise 'tmux lookup must allow a missing target' unless allow_failure
+
+      [" \n", '', status]
+    end
+    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+
+    assert_nil(tmux.session('2026-06-06-missing'))
+    assert_nil(tmux.session_by_id('$11'))
+  end
+
+  def test_tmux_lookup_treats_the_missing_target_socket_record_as_absent
+    status = Object.new
+    status.define_singleton_method(:success?) { true }
+    phantom = Array.new(12, '')
+    phantom[6] = '/run/test.sock'
+    command_runner = Object.new
+    command_runner.define_singleton_method(:capture) do |_argv, allow_failure:|
+      raise 'tmux lookup must allow a missing target' unless allow_failure
+
+      [phantom.join("\t") + "\n", '', status]
+    end
+    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+
+    assert_nil(tmux.session('2026-06-06-missing'))
+    assert_nil(tmux.session_by_id('$11'))
+  end
+
+  def test_tmux_lookup_ignores_global_environment_on_a_missing_target
+    status = Object.new
+    status.define_singleton_method(:success?) { true }
+    phantom = [
+      '', '', '1', 'global-slug', '/global-workspace', 'global-slug',
+      '/run/test.sock', 'global-thread', '/run/global-codex.sock', '0.153.4',
+      '%42', 'a' * 64
+    ]
+    command_runner = Object.new
+    command_runner.define_singleton_method(:capture) do |_argv, allow_failure:|
+      raise 'tmux lookup must allow a missing target' unless allow_failure
+
+      [phantom.join("\t") + "\n", '', status]
+    end
+    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+
+    assert_nil(tmux.session('2026-06-06-missing'))
+    assert_nil(tmux.session_by_id('$11'))
+  end
+
+  def test_tmux_lookup_rejects_partial_or_truncated_missing_target_records
+    status = Object.new
+    status.define_singleton_method(:success?) { true }
+    responses = [
+      ['$11', nil, nil, 'unexpected-slug', nil, nil, '/run/test.sock', nil, nil, nil, nil, nil],
+      Array.new(11, '').tap { |fields| fields[5] = '/workspace' }
+    ]
+
+    responses.each do |fields|
+      command_runner = Object.new
+      command_runner.define_singleton_method(:capture) do |_argv, allow_failure:|
+        raise 'tmux lookup must allow a missing target' unless allow_failure
+
+        [fields.map(&:to_s).join("\t") + "\n", '', status]
+      end
+      tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+
+      error = assert_raises(VpsfreeDevSession::Error) { tmux.session_by_id('$11') }
+      assert_includes(error.message, 'invalid session identity')
+    end
+  end
+
+  def test_tmux_id_lookup_rejects_a_mismatched_identity
+    status = Object.new
+    status.define_singleton_method(:success?) { true }
+    identity = [
+      '$12', '2026-06-06-other', '1', '2026-06-06-other', '/workspace',
+      '2026-06-06-other', '/run/test.sock', '', '', '', '', 'a' * 64
+    ].join("\t") + "\n"
+    command_runner = Object.new
+    command_runner.define_singleton_method(:capture) do |_argv, allow_failure:|
+      raise 'tmux lookup must allow a missing target' unless allow_failure
+
+      [identity, '', status]
+    end
+    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+
+    error = assert_raises(VpsfreeDevSession::Error) { tmux.session_by_id('$11') }
+    assert_includes(error.message, 'session "$12" for exact target $11')
+    assert_nil(tmux.session('2026-06-06-missing'))
+  end
+
+  def test_runtime_retirement_keeps_authority_when_tmux_returns_the_wrong_id
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = MismatchedIdentityAfterKillTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test.sock',
+        id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      session = tmux.session(slug)
+      runner.send(:write_session_authority, slug, session, state: 'ready')
+      runner.send(:select_tmux_for_slug!, slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, session)
+      end
+
+      assert_includes(error.message, 'session "$12" while verifying removal of $11')
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_runtime_retirement_does_not_kill_a_same_name_replacement
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ReplacedTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      stale = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11',
+        name: slug,
+        mark: '1',
+        slug:,
+        workspace:,
+        environment_slug: slug,
+        socket_path: '/run/test.sock',
+        identity_token: 'a' * 64
+      )
+      runner.send(:write_session_authority, slug, stale, state: 'ready')
+      runner.send(:select_tmux_for_slug!, slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, tmux.session(slug))
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      refute(tmux.kill_attempted)
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_runtime_retirement_rejects_a_reused_id_with_a_new_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      original = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: 'a' * 64
+      )
+      runner = runner_for(workspace, tmux: original, authority_dir:)
+      runner.send(:write_session_authority, slug, original.session(slug), state: 'ready')
+
+      replacement = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: 'b' * 64
+      )
+      runner.instance_variable_set(:@tmux, replacement)
+      runner.instance_variable_set(:@default_tmux, replacement)
+      runner.send(:select_tmux_for_slug!, slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, replacement.session(slug))
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      refute(replacement.killed)
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_runtime_retirement_without_authority_uses_the_creation_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ReplacedDuringConditionalKillTmux.new(slug, workspace:)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, tmux.session(slug))
+      end
+
+      assert_includes(error.message, 'changed during removal')
+      assert(tmux.conditional_kill_attempted)
+      refute(tmux.killed)
+    end
+  end
+
+  def test_runtime_retirement_without_authority_rejects_a_tokenless_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      tmux = ManagedTmux.new(slug, workspace:, identity_token: nil)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, tmux.session(slug))
+      end
+
+      assert_includes(error.message, 'lacks a trusted creation identity')
+      refute(tmux.killed)
+    end
+  end
+
+  def test_runtime_retirement_refuses_a_live_legacy_authority
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+      authority_path = File.join(authority_dir, "#{slug}.json")
+      authority = JSON.parse(File.read(authority_path))
+      authority.delete('tmux_identity')
+      File.write(authority_path, JSON.generate(authority) + "\n")
+      runner.send(:select_tmux_for_slug!, slug)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, tmux.session(slug))
+      end
+
+      assert_includes(error.message, 'lacks a tmux creation identity')
+      refute(tmux.killed)
+      assert(File.file?(authority_path))
+    end
+  end
+
+  def test_runtime_retirement_does_not_kill_after_authority_was_deleted
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      replacement = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$12'
+      )
+      runner = runner_for(workspace, tmux: replacement, authority_dir:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(:retire_session_runtime!, slug, replacement.session(slug))
+      end
+
+      assert_includes(error.message, 'untrusted same-name tmux session')
+      refute(replacement.killed)
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
     end
   end
 
@@ -5646,6 +6781,26 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_start_preserves_a_parsed_legacy_authority_without_an_empty_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: ''
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      authority = JSON.parse(
+        File.read(File.join(authority_dir, "#{slug}.json"))
+      )
+      refute(authority.key?('tmux_identity'))
+      refute(tmux.killed)
+    end
+  end
+
   def test_start_normalizes_a_legacy_symlinked_workspace_identity
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -5693,20 +6848,209 @@ class DevSessionTest < Minitest::Test
         mark: '',
         slug: '',
         workspace:,
-        environment_slug: slug
+        environment_slug: slug,
+        identity_token: 'a' * 64
       )
 
-      runner.send(:reconcile_creation_tmux_session!, slug, session)
+      runner.send(:reconcile_creation_tmux_session!, slug, session, 'a' * 64)
 
-      assert_equal([['kill-session', '-t', '$partial:']], tmux.mutations)
+      assert_equal(
+        [['conditional-kill-session', '$partial', 'a' * 64]],
+        tmux.mutations
+      )
 
       replacement = session.dup
-      replacement.environment_slug = '2026-06-06-other'
+      replacement.identity_token = 'b' * 64
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:reconcile_creation_tmux_session!, slug, replacement)
+        runner.send(:reconcile_creation_tmux_session!, slug, replacement, 'a' * 64)
       end
       assert_includes(error.message, 'not recoverable')
       assert_equal(1, tmux.mutations.length)
+    end
+  end
+
+  def test_creation_retry_upgrades_a_legacy_journal_only_attempt
+    with_workspace do |workspace|
+      slug = '2026-06-06-legacy-creation'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume safely.\n")
+      runner = runner_for(workspace)
+      journal = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      journal.delete('tmux_identity')
+      runner.send(
+        :write_creation_journal,
+        runner.send(:creation_journal_file, slug),
+        journal,
+        create: false
+      )
+
+      upgraded = runner.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+
+      assert_match(/\A[0-9a-f]{64}\z/, upgraded.fetch('tmux_identity'))
+    end
+  end
+
+  def test_creation_retry_refuses_a_live_legacy_unbound_tmux_session
+    with_workspace do |workspace|
+      slug = '2026-06-06-legacy-live-creation'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume safely.\n")
+      setup = runner_for(workspace)
+      journal = setup.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: true,
+        model: nil,
+        effort: nil
+      )
+      journal.delete('tmux_identity')
+      setup.send(
+        :write_creation_journal,
+        setup.send(:creation_journal_file, slug),
+        journal,
+        create: false
+      )
+      tmux = ManagedTmux.new(slug, workspace:, identity_token: nil)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(
+          :prepare_creation_journal,
+          slug,
+          goal,
+          exclusive: true,
+          run_codex: true,
+          model: nil,
+          effort: nil
+        )
+      end
+
+      assert_includes(error.message, 'live tmux session without a trusted identity')
+      refute(tmux.killed)
+    end
+  end
+
+  def test_ready_session_restart_recovers_only_its_journal_bound_partial_tmux
+    with_workspace do |workspace|
+      slug = '2026-06-06-restart'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(slug)
+      setup.send(:ensure_portal_manifest, slug)
+      journal = setup.send(:prepare_start_journal!, slug)
+      tmux = PartialManagedTmux.new(
+        slug, workspace:, identity_token: journal.fetch('tmux_identity')
+      )
+      created = VpsfreeDevSession::Tmux::Session.new(
+        id: '$12', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, identity_token: journal.fetch('tmux_identity')
+      )
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:create_tmux_session) { |*_arguments, **_keywords| created }
+        define_method(:sync_slug) { |*_arguments, **_keywords| created }
+      end
+      runner = runner_class.new(
+        workspace:, tmux:, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+
+      assert(tmux.killed)
+      refute(File.exist?(setup.send(:start_journal_file, slug)))
+    end
+  end
+
+  def test_ready_session_restart_refuses_a_partial_tmux_with_another_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-restart'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(slug)
+      setup.send(:ensure_portal_manifest, slug)
+      setup.send(:prepare_start_journal!, slug)
+      tmux = PartialManagedTmux.new(slug, workspace:, identity_token: 'b' * 64)
+      runner = runner_for(workspace, tmux:)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      end
+
+      assert_includes(error.message, 'does not match start identity')
+      refute(tmux.killed)
+      assert(File.exist?(setup.send(:start_journal_file, slug)))
+    end
+  end
+
+  def test_exclusive_replay_publishes_authority_before_consuming_start_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-restart'
+      goal = File.join(workspace, 'goal.txt')
+      authority_dir = File.join(workspace, 'authority')
+      File.write(goal, "Replay this completed request.\n")
+      setup = runner_for(workspace, authority_dir:)
+      creation = setup.send(
+        :prepare_creation_journal,
+        slug,
+        goal,
+        exclusive: true,
+        run_codex: false,
+        model: nil,
+        effort: nil
+      )
+      setup.ensure_tracking_files(slug)
+      setup.send(:seed_goal, slug, goal)
+      manifest = setup.send(:ensure_portal_manifest, slug, creation_journal: creation)
+      manifest['creation']['state'] = 'ready'
+      manifest['creation']['initial_goal_sent'] = true
+      manifest['creation'].delete('initial_goal_attempted')
+      manifest['schema'] = 1
+      setup.send(:write_portal_manifest, slug, manifest)
+      creation_identity = creation.fetch('tmux_identity')
+      setup.send(:mark_creation_journal_ready, slug, creation)
+      runtime = setup.send(
+        :prepare_start_journal!,
+        slug,
+        preferred_identity: creation_identity
+      )
+      tmux = ManagedTmux.new(
+        slug,
+        workspace:,
+        socket_path: '/run/test/tmux.sock',
+        identity_token: runtime.fetch('tmux_identity'),
+        id: '$12'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: false,
+        goal_file: goal,
+        exclusive: true
+      )
+
+      authority = JSON.parse(File.read(runner.send(:authority_file, slug)))
+      assert_equal(runtime.fetch('tmux_identity'), authority.fetch('tmux_identity'))
+      refute(File.exist?(setup.send(:start_journal_file, slug)))
     end
   end
 
@@ -5754,6 +7098,49 @@ class DevSessionTest < Minitest::Test
 
       assert_match(/session changed during operation/, error.message)
       refute(tmux.kill_attempted)
+    end
+  end
+
+  def test_stop_keeps_authority_when_identity_changes_at_the_kill_boundary
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ReplacedDuringConditionalKillTmux.new(
+        slug, workspace:, socket_path: '/run/test/tmux.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.stop(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(tmux.conditional_kill_attempted)
+      refute(tmux.killed)
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_stop_upgrades_a_live_legacy_authority_before_retirement
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test/tmux.sock', id: '$11',
+        identity_token: nil
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+      authority_path = File.join(authority_dir, "#{slug}.json")
+      refute(JSON.parse(File.read(authority_path)).key?('tmux_identity'))
+
+      runner.stop(slug, as_is: true)
+
+      assert(tmux.killed)
+      refute(File.exist?(authority_path))
     end
   end
 
@@ -5981,6 +7368,30 @@ class DevSessionTest < Minitest::Test
 
       tmux.run('kill-session', '-t', '$7:')
       runner.recover_stale(slug, as_is: true)
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+    end
+  end
+
+  def test_recover_stale_accepts_an_id_reused_with_a_different_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-stale-reused-id'
+      authority_dir = File.join(workspace, 'runtime-authority')
+      replacement = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test/tmux.sock', id: '$7',
+        identity_token: 'b' * 64
+      )
+      runner = runner_for(workspace, tmux: replacement, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      original = VpsfreeDevSession::Tmux::Session.new(
+        id: '$7', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test/tmux.sock',
+        identity_token: 'a' * 64
+      )
+      runner.send(:write_session_authority, slug, original, state: 'ready')
+
+      runner.recover_stale(slug, as_is: true)
+
+      refute(replacement.killed)
       refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
     end
   end
@@ -6855,6 +8266,152 @@ class DevSessionTest < Minitest::Test
         "workspace: archive #{slug}",
         git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
       )
+    end
+  end
+
+  def test_archive_retry_does_not_kill_a_same_name_replacement
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-stale-runtime'
+      state_home = File.join(workspace, '.xdg-state')
+      authority_dir = File.join(workspace, 'authority')
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      interrupted = false
+      runner_class = Class.new(VpsfreeDevSession::Runner) do
+        define_method(:advance_archive!) do |current_slug, journal, phase|
+          super(current_slug, journal, phase)
+          if phase == 'thread_retired' && !interrupted
+            interrupted = true
+            raise VpsfreeDevSession::Error, 'injected pre-runtime interruption'
+          end
+        end
+      end
+      first = runner_class.new(
+        workspace:, tmux: NullTmux.new, authority_dir:,
+        out: StringIO.new, err: StringIO.new, today: TODAY,
+        env: { 'XDG_STATE_HOME' => state_home }
+      )
+
+      assert_raises(VpsfreeDevSession::Error) do
+        first.archive(slug, as_is: true)
+      end
+      journal_path = first.send(:lifecycle_journal_file, slug, 'archive')
+      assert_equal('thread_retired', JSON.parse(File.read(journal_path)).fetch('phase'))
+
+      replacement = ReplacedTmux.new(slug, workspace:)
+      second = runner_for(
+        workspace,
+        tmux: replacement,
+        authority_dir:,
+        env: { 'XDG_STATE_HOME' => state_home }
+      )
+      stale = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test.sock',
+        identity_token: 'a' * 64
+      )
+      second.send(:write_session_authority, slug, stale, state: 'ready')
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        second.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      refute(replacement.kill_attempted)
+      assert(File.file?(File.join(authority_dir, "#{slug}.json")))
+      assert(File.file?(journal_path))
+    end
+  end
+
+  def test_archive_preflights_legacy_identity_before_creating_a_journal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-legacy-identity'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = RefusedIdentityInitializationTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: nil
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(tmux.identity_initialization_attempted)
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_rejects_a_renamed_authority_session_before_creating_a_journal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-renamed-session'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = RenamedManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11'
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      session = VpsfreeDevSession::Tmux::Session.new(
+        id: '$11', name: slug, mark: '1', slug:, workspace:,
+        environment_slug: slug, socket_path: '/run/test.sock',
+        identity_token: 'a' * 64
+      )
+      runner.send(:write_session_authority, slug, session, state: 'ready')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'does not match trusted authority')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_resume_upgrades_a_legacy_identity_before_continuing
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-resume-legacy'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ManagedTmux.new(
+        slug, workspace:, socket_path: '/run/test.sock', id: '$11',
+        identity_token: nil
+      )
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      plan = runner.send(:prepare_cleanup, slug, force: false)
+      runner.send(:prepare_archive_journal!, slug, 'complete', {}, plan)
+
+      runner.archive(slug, as_is: true)
+
+      assert(tmux.killed)
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
     end
   end
 
@@ -7909,6 +9466,7 @@ class DevSessionTest < Minitest::Test
 
       journal_path = starter.send(:creation_journal_file, slug)
       interrupted = JSON.parse(File.read(journal_path)).merge('state' => 'creating')
+      interrupted['tmux_identity'] = 'a' * 64
       File.write(journal_path, JSON.generate(interrupted))
       File.write(
         File.join(workspace, 'work', slug, 'plan.md'),
@@ -7927,7 +9485,9 @@ class DevSessionTest < Minitest::Test
         exclusive: false
       )
       assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
-      assert_equal('ready', JSON.parse(File.read(journal_path)).fetch('state'))
+      completed_journal = JSON.parse(File.read(journal_path))
+      assert_equal('ready', completed_journal.fetch('state'))
+      refute(completed_journal.key?('tmux_identity'))
     end
   end
 
