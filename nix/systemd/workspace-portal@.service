@@ -1,0 +1,16 @@
+[Unit]
+Description=Workspace portal for %i
+After=network-online.target workspace-codex@%i.service workspace-tmux@%i.service
+Wants=network-online.target workspace-codex@%i.service
+Requires=workspace-tmux@%i.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-portal %i
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+TimeoutStopSec=150s
+
+[Install]
+WantedBy=default.target

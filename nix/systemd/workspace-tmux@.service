@@ -1,0 +1,12 @@
+[Unit]
+Description=Workspace tmux server for %i
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-tmux %i
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

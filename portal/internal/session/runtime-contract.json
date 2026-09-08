@@ -48,6 +48,7 @@
     "--unix-socket",
     "--dev-session",
     "--authority-dir",
+    "--host-profile",
     "--transition-lock",
     "--codex-socket",
     "--codex-version",

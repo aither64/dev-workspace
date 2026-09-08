@@ -1,0 +1,12 @@
+[Unit]
+Description=Workspace portal host router
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-router
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

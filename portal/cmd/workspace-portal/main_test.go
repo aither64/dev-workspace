@@ -14,17 +14,19 @@ import (
 )
 
 type runtimeContract struct {
-	MaxMessageBytes        int      `json:"maxMessageBytes"`
-	FormEncodingExpansion  int      `json:"formEncodingExpansion"`
-	JSONEncodingExpansion  int      `json:"jsonEncodingExpansion"`
-	TransportEnvelopeBytes int      `json:"transportEnvelopeBytes"`
-	ThreadEnvironmentKeys  []string `json:"threadEnvironmentKeys"`
-	PortalServeFlags       []string `json:"portalServeFlags"`
+	TrackingMaxBytes       int                        `json:"trackingMaxBytes"`
+	MaxMessageBytes        int                        `json:"maxMessageBytes"`
+	FormEncodingExpansion  int                        `json:"formEncodingExpansion"`
+	JSONEncodingExpansion  int                        `json:"jsonEncodingExpansion"`
+	TransportEnvelopeBytes int                        `json:"transportEnvelopeBytes"`
+	LifecycleJournals      []session.LifecycleJournal `json:"lifecycleJournals"`
+	ThreadEnvironmentKeys  []string                   `json:"threadEnvironmentKeys"`
+	PortalServeFlags       []string                   `json:"portalServeFlags"`
 }
 
 func loadRuntimeContract(t *testing.T) runtimeContract {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "runtime-contract.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "session", "runtime-contract.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +41,18 @@ func TestThreadRuntimeEnvironmentMatchesPublishedContract(t *testing.T) {
 	contract := loadRuntimeContract(t)
 	if contract.MaxMessageBytes != session.MaxMessageBytes {
 		t.Fatalf("maximum message size = %d, want %d", session.MaxMessageBytes, contract.MaxMessageBytes)
+	}
+	if contract.TrackingMaxBytes != session.TrackingMaxSize {
+		t.Fatalf("tracking size = %d, want %d", session.TrackingMaxSize, contract.TrackingMaxBytes)
+	}
+	actualJournals := session.LifecycleJournals()
+	if len(actualJournals) != len(contract.LifecycleJournals) {
+		t.Fatalf("lifecycle journals = %#v, want %#v", actualJournals, contract.LifecycleJournals)
+	}
+	for index := range actualJournals {
+		if actualJournals[index] != contract.LifecycleJournals[index] {
+			t.Fatalf("lifecycle journals = %#v, want %#v", actualJournals, contract.LifecycleJournals)
+		}
 	}
 	if contract.FormEncodingExpansion != session.FormEncodingExpansion ||
 		contract.JSONEncodingExpansion != session.JSONEncodingExpansion ||

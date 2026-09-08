@@ -67,6 +67,7 @@ type Config struct {
 	Workspace         string
 	BaseURL           string
 	DevSession        string
+	HostProfile       string
 	GH                string
 	Tmux              string
 	AuthorityDir      string
@@ -98,6 +99,7 @@ type lifecycleOperation struct {
 
 type Server struct {
 	config           Config
+	hostProfile      hostProfileIdentity
 	templates        *template.Template
 	markdown         goldmark.Markdown
 	sanitizer        *bluemonday.Policy
@@ -115,6 +117,13 @@ type Server struct {
 	closing          bool
 	stopOnce         sync.Once
 	stopping         chan struct{}
+}
+
+type hostProfileIdentity struct {
+	device, inode       uint64
+	ctimeSec, ctimeNSec int64
+	mtimeSec, mtimeNSec int64
+	target              string
 }
 
 type pageData struct {
@@ -164,6 +173,13 @@ func New(config Config) (*Server, error) {
 	if config.DevSession == "" || !filepath.IsAbs(config.DevSession) {
 		return nil, errors.New("portal requires an absolute dev-session command")
 	}
+	if config.HostProfile == "" || !filepath.IsAbs(config.HostProfile) {
+		return nil, errors.New("portal requires an absolute workspace host profile")
+	}
+	hostProfile, err := readHostProfileIdentity(config.HostProfile)
+	if err != nil {
+		return nil, fmt.Errorf("read workspace host profile: %w", err)
+	}
 	templates, err := template.New("pages").Funcs(template.FuncMap{
 		"shortSHA": func(value string) string {
 			if len(value) > 10 {
@@ -181,7 +197,7 @@ func New(config Config) (*Server, error) {
 	policy.RequireNoReferrerOnLinks(true)
 	operationContext, cancelOperations := context.WithCancel(context.Background())
 	return &Server{
-		config: config, templates: templates,
+		config: config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
 		repository:       repository.Runner{GH: config.GH},
 		clusters:         cluster.Runner{Workspace: workspace, Vpsadmin: config.VpsadminCluster, VpsadminOS: config.VpsadminOSCluster},
@@ -227,6 +243,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer unlock()
+			if err := s.requireCurrentHostProfile(); err != nil {
+				s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 		}
 	}
 	switch {
@@ -285,6 +305,34 @@ func (s *Server) acquireTransition(mode int) (*os.File, func(), error) {
 		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
 		_ = file.Close()
 	}, nil
+}
+
+func readHostProfileIdentity(path string) (hostProfileIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		return hostProfileIdentity{}, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFLNK {
+		return hostProfileIdentity{}, errors.New("workspace host profile is not a symlink")
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return hostProfileIdentity{}, err
+	}
+	return hostProfileIdentity{
+		device: uint64(stat.Dev), inode: stat.Ino,
+		ctimeSec: stat.Ctim.Sec, ctimeNSec: stat.Ctim.Nsec,
+		mtimeSec: stat.Mtim.Sec, mtimeNSec: stat.Mtim.Nsec,
+		target: target,
+	}, nil
+}
+
+func (s *Server) requireCurrentHostProfile() error {
+	current, err := readHostProfileIdentity(s.config.HostProfile)
+	if err != nil || current != s.hostProfile {
+		return errors.New("portal belongs to a superseded workspace package generation; reload it")
+	}
+	return nil
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -1436,6 +1484,9 @@ func (s *Server) executeLifecycleOperation(
 		return fmt.Errorf("lock workspace runtime for %s: %w", kind, err)
 	}
 	defer unlockTransition()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
 	mutationLock := s.messageLock(slug)
 	mutationLock.Lock()
 	defer mutationLock.Unlock()

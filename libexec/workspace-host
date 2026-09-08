@@ -1,0 +1,1297 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'json'
+require 'open3'
+require 'optparse'
+require 'pathname'
+require 'shellwords'
+require 'tmpdir'
+require 'yaml'
+require_relative 'workspace-profile-identity'
+
+module VpsfreeWorkspaceHost
+  NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
+  HOSTNAME_LABEL = /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/
+  COMMANDS = %w[workspace-host dev-session vpsadmin-devcluster vpsadminos-devcluster].freeze
+
+  def self.load_runtime_contract
+    candidates = [
+      File.expand_path('../portal/internal/session/runtime-contract.json', __dir__),
+      File.expand_path('../share/workspace-portal/runtime-contract.json', __dir__)
+    ]
+    path = candidates.find { |candidate| File.file?(candidate) }
+    raise 'workspace runtime contract is missing' unless path
+
+    JSON.parse(File.binread(path))
+  end
+
+  RUNTIME_CONTRACT = load_runtime_contract.freeze
+  DEVELOPMENT_CLUSTER_IDENTITY_FIELDS = %w[
+    developmentClusterStateSchema trackingMaxBytes
+  ].freeze
+  unless RUNTIME_CONTRACT.fetch('developmentClusterStateSchema').is_a?(Integer) &&
+         RUNTIME_CONTRACT.fetch('developmentClusterStateSchema').positive? &&
+         RUNTIME_CONTRACT.fetch('trackingMaxBytes').is_a?(Integer) &&
+         RUNTIME_CONTRACT.fetch('trackingMaxBytes').positive?
+    raise 'workspace runtime contract has an invalid development cluster contract'
+  end
+  LIFECYCLE_JOURNALS = RUNTIME_CONTRACT.fetch('lifecycleJournals').map do |journal|
+    unless journal.is_a?(Hash) && journal.keys.sort == %w[command name] &&
+           journal.fetch('name').match?(NAME) &&
+           %w[archive delete revive].include?(journal.fetch('command'))
+      raise 'workspace runtime contract has an invalid lifecycle journal'
+    end
+    journal.freeze
+  end.freeze
+  unless LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.uniq.length ==
+         LIFECYCLE_JOURNALS.length &&
+         LIFECYCLE_JOURNALS.map { |journal| journal.fetch('command') }.sort ==
+         %w[archive delete revive]
+    raise 'workspace runtime contract must map each lifecycle command to one unique journal'
+  end
+
+  class Error < StandardError; end
+
+  class Registry
+    attr_reader :path, :entries
+
+    def initialize(path)
+      @path = File.expand_path(path)
+      @entries = load_entries
+    end
+
+    def find(name)
+      entries.find { |entry| entry.fetch('name') == name }
+    end
+
+    def select(name: nil, cwd: Dir.pwd, environment_name: ENV['VPSFREE_WORKSPACE_NAME'])
+      explicit = name && find(name)
+      raise Error, "workspace is not registered: #{name}" if name && !explicit
+
+      environment = environment_name && !environment_name.empty? ? find(environment_name) : nil
+      raise Error, "session workspace is not registered: #{environment_name}" if environment_name && !environment_name.empty? && !environment
+
+      real_cwd = File.realpath(cwd)
+      matches = entries.select do |entry|
+        root = entry.fetch('root')
+        real_cwd == root || real_cwd.start_with?("#{root}/")
+      end.sort_by { |entry| -entry.fetch('root').length }
+      inferred = matches.first
+      selected = explicit || environment || inferred
+      if explicit && environment && explicit != environment
+        raise Error, "--workspace #{name} conflicts with session workspace #{environment_name}"
+      end
+      if environment && inferred && environment != inferred
+        raise Error, "session workspace #{environment_name} conflicts with the current directory"
+      end
+      return selected if selected
+      return entries.first if entries.length == 1
+
+      raise Error, 'the current directory is outside registered workspaces; use --workspace NAME'
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot resolve the current directory: #{e.message}"
+    end
+
+    def register(name:, root:, hostname:, aliases:, replace:)
+      validate_name!(name)
+      root = File.realpath(File.expand_path(root))
+      %w[repos work worktrees].each do |directory|
+        candidate = File.join(root, directory)
+        raise Error, "workspace root is missing #{directory}/: #{root}" unless File.directory?(candidate)
+      end
+      hostname = normalize_hostname(hostname)
+      aliases = aliases.map { |value| normalize_hostname(value) }.uniq
+      raise Error, 'the canonical hostname cannot also be an alias' if aliases.include?(hostname)
+
+      existing = find(name)
+      raise Error, "workspace is already registered: #{name}" if existing && !replace
+      if existing && existing.fetch('root') != root
+        raise Error,
+              "registered workspace root cannot be replaced; unregister #{name} first"
+      end
+      replacement = {
+        'name' => name,
+        'root' => root,
+        'hostname' => hostname,
+        'aliases' => aliases
+      }
+      updated = entries.reject { |entry| entry.fetch('name') == name } << replacement
+      validate_entries!(updated)
+      write(updated.sort_by { |entry| entry.fetch('name') })
+      @entries = updated.sort_by { |entry| entry.fetch('name') }
+      replacement
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot register workspace: #{e.message}"
+    end
+
+    def unregister(name)
+      validate_name!(name)
+      existing = find(name)
+      raise Error, "workspace is not registered: #{name}" unless existing
+
+      updated = entries.reject { |entry| entry.fetch('name') == name }
+      write(updated)
+      @entries = updated
+      existing
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot unregister workspace: #{e.message}"
+    end
+
+    private
+
+    def load_entries
+      raise Error, "workspace registry is a symlink: #{path}" if File.symlink?(path)
+      return [] unless File.exist?(path)
+
+      stat = File.stat(path)
+      unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o077).zero?
+        raise Error, "workspace registry must be owned by uid #{Process.euid} and use mode 0600: #{path}"
+      end
+      data = File.binread(path, 1024 * 1024 + 1)
+      raise Error, "workspace registry exceeds 1 MiB: #{path}" if data.bytesize > 1024 * 1024
+
+      data = JSON.parse(data)
+      unless data.is_a?(Hash) && data.keys.sort == %w[schema workspaces] && data['schema'] == 1 && data['workspaces'].is_a?(Array)
+        raise Error, "invalid workspace registry: #{path}"
+      end
+      validate_entries!(data['workspaces'])
+      data['workspaces']
+    rescue JSON::ParserError => e
+      raise Error, "invalid workspace registry #{path}: #{e.message}"
+    end
+
+    def validate_entries!(values)
+      names = {}
+      hosts = {}
+      roots = {}
+      values.each do |entry|
+        unless entry.is_a?(Hash) && (entry.keys - %w[name root hostname aliases]).empty? &&
+               %w[name root hostname].all? { |key| entry[key].is_a?(String) } &&
+               entry.fetch('aliases', []).is_a?(Array) &&
+               entry.fetch('aliases', []).all? { |item| item.is_a?(String) }
+          raise Error, 'workspace registry contains an invalid entry'
+        end
+        name = entry.fetch('name')
+        validate_name!(name)
+        root = entry.fetch('root')
+        unless Pathname.new(root).absolute? && Pathname.new(root).cleanpath.to_s == root
+          raise Error, "workspace #{name} has an invalid root"
+        end
+        hostname = normalize_hostname(entry.fetch('hostname'))
+        aliases = entry.fetch('aliases', []).map { |item| normalize_hostname(item) }
+        raise Error, "duplicate workspace name: #{name}" if names[name]
+        raise Error, "duplicate workspace root: #{root}" if roots[root]
+        names[name] = true
+        roots[root] = true
+        ([hostname] + aliases).each do |host|
+          raise Error, "duplicate workspace hostname: #{host}" if hosts[host]
+          hosts[host] = true
+        end
+        entry['hostname'] = hostname
+        entry['aliases'] = aliases
+      end
+    end
+
+    def validate_name!(value)
+      raise Error, "invalid workspace name: #{value.inspect}" unless value.match?(NAME)
+    end
+
+    def normalize_hostname(value)
+      value = value.downcase
+      labels = value.split('.', -1)
+      unless value.bytesize <= 253 && labels.length > 1 &&
+             labels.all? { |label| label.match?(HOSTNAME_LABEL) }
+        raise Error, "invalid workspace hostname: #{value.inspect}"
+      end
+      value
+    end
+
+    def write(values)
+      directory = File.dirname(path)
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      File.chmod(0o700, directory)
+      temporary = File.join(directory, ".#{File.basename(path)}.#{$$}.tmp")
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write(JSON.pretty_generate('schema' => 1, 'workspaces' => values))
+          file.write("\n")
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, path)
+        File.open(directory, File::RDONLY) { |handle| handle.fsync }
+      ensure
+        File.unlink(temporary) if File.exist?(temporary)
+      end
+    end
+  end
+
+  class Host
+    def initialize(env: ENV, out: $stdout, err: $stderr)
+      @env = env
+      @out = out
+      @err = err
+      @home = File.expand_path(env.fetch('HOME'))
+      @config = env.fetch('VPSFREE_WORKSPACES_CONFIG', File.join(@home, '.config/vpsfree-workspaces/registry.json'))
+      @state = env.fetch('VPSFREE_WORKSPACES_STATE', File.join(@home, '.local/state/vpsfree-workspaces'))
+      @runtime = env.fetch('VPSFREE_WORKSPACES_RUNTIME_DIR', File.join(env.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}"), 'vpsfree-workspaces'))
+      @profile = env.fetch('VPSFREE_WORKSPACES_PROFILE', File.join(@state, 'profile'))
+      @system_codex = env.fetch('VPSFREE_WORKSPACES_SYSTEM_CODEX', '/run/current-system/sw/bin/codex')
+      @router_socket = env.fetch(
+        'VPSFREE_WORKSPACES_ROUTER_SOCKET',
+        '/run/vpsfree-workspace-router/router.sock'
+      )
+    end
+
+    def run(program, argv)
+      case program
+      when 'dev-session'
+        dispatch(argv, 'dev-session')
+        0
+      when 'vpsadmin-devcluster', 'vpsadminos-devcluster'
+        dispatch_cluster(argv, program)
+        0
+      else
+        workspace_host(argv)
+      end
+    rescue Error, OptionParser::ParseError, SystemCallError, Psych::Exception => e
+      @err.puts "error: #{e.message}"
+      1
+    end
+
+    private
+
+    def workspace_host(argv)
+      command = argv.shift
+      case command
+      when 'register' then with_current_generation_lock(allow_first_install: true) { register(argv) }
+      when 'unregister' then with_current_generation_lock(allow_first_install: true) { unregister(argv) }
+      when 'switch' then with_current_generation_lock(allow_first_install: true) { switch(argv) }
+      when 'rollback' then with_current_generation_lock { rollback(argv) }
+      when 'suspend' then with_current_generation_lock { suspend(argv) }
+      when 'status' then status(argv)
+      when 'check-codex' then check_codex_command(argv)
+      when 'reconcile-codex' then with_current_generation_lock { reconcile_codex(argv) }
+      when '_activate'
+        raise Error, 'workspace activation is private' unless @env['VPSFREE_WORKSPACE_ACTIVATION'] == '1'
+        activate(argv)
+      when 'run-router' then run_router(argv)
+      when 'run-portal' then run_portal(argv)
+      when 'run-codex' then run_codex(argv)
+      when 'run-tmux' then run_tmux(argv)
+      when '-h', '--help', nil
+        @out.puts usage
+      else
+        raise Error, "unknown workspace-host command: #{command}"
+      end
+      0
+    end
+
+    def usage
+      <<~USAGE
+        Usage:
+          workspace-host register NAME ROOT --hostname HOST [--alias HOST] [--replace]
+          workspace-host unregister NAME
+          workspace-host switch --source PATH
+          workspace-host rollback
+          workspace-host suspend
+          workspace-host status
+          dev-session [--workspace NAME] COMMAND [OPTIONS]
+      USAGE
+    end
+
+    def registry
+      Registry.new(@config)
+    end
+
+    def register(argv)
+      options = { aliases: [], replace: false }
+      parser = OptionParser.new do |opts|
+        opts.on('--hostname HOST') { |value| options[:hostname] = value }
+        opts.on('--alias HOST') { |value| options[:aliases] << value }
+        opts.on('--replace') { options[:replace] = true }
+      end
+      parser.parse!(argv)
+      raise Error, 'register requires NAME, ROOT, and --hostname HOST' unless argv.length == 2 && options[:hostname]
+
+      candidate_root = File.realpath(File.expand_path(argv.fetch(1)))
+      candidate = { 'name' => argv.fetch(0), 'root' => candidate_root }
+      require_no_unfinished_lifecycle_operations!(
+        (registry.entries + [candidate]).uniq { |entry| entry.fetch('root') },
+        operation: 'workspace register'
+      )
+
+      entry = registry.register(
+        name: argv.fetch(0), root: argv.fetch(1), hostname: options.fetch(:hostname),
+        aliases: options.fetch(:aliases), replace: options.fetch(:replace)
+      )
+      if File.exist?(@profile)
+        activate_installed(File.join(@profile, 'bin/workspace-host'))
+      end
+      @out.puts "registered #{entry.fetch('name')}: https://#{entry.fetch('hostname')}/"
+    end
+
+    def unregister(argv)
+      raise Error, 'unregister requires NAME' unless argv.length == 1
+
+      name = argv.fetch(0)
+      selected_registry = registry
+      entry = selected_registry.find(name)
+      raise Error, "workspace is not registered: #{name}" unless entry
+      require_no_unfinished_lifecycle_operations!([entry], operation: 'workspace unregister')
+      require_no_development_cluster_state!([entry], operation: 'workspace unregister')
+
+      quiesced = quiesce_sessions([entry])
+      units = %w[portal codex tmux].map { |kind| "workspace-#{kind}@#{name}.service" }
+      disabled = true
+      system! 'systemctl', '--user', 'disable', '--now', *units
+      retired_runtime = quarantine_instance_runtime(entry)
+      selected_registry.unregister(name)
+      unregistered = true
+      system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
+      discard_retired_runtime(retired_runtime)
+      @out.puts "unregistered #{name}"
+    rescue StandardError
+      if unregistered
+        selected_registry.register(
+          name: entry.fetch('name'),
+          root: entry.fetch('root'),
+          hostname: entry.fetch('hostname'),
+          aliases: entry.fetch('aliases'),
+          replace: false
+        )
+      end
+      restore_instance_runtime(retired_runtime, entry) if retired_runtime
+      if selected_registry&.find(name)
+        system! 'systemctl', '--user', 'enable', '--now', *units if disabled
+        system! 'systemctl', '--user', 'try-restart', 'workspace-router.service' if unregistered
+        restore_quiesced_sessions(quiesced || [])
+      end
+      raise
+    end
+
+    def switch(argv)
+      options = {}
+      parser = OptionParser.new do |opts|
+        opts.on('--source PATH') { |value| options[:source] = value }
+      end
+      parser.parse!(argv)
+      raise Error, 'switch requires --source PATH' unless argv.empty? && options[:source]
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
+      source = File.realpath(File.expand_path(options.fetch(:source)))
+      output = capture!(
+        'nix', 'build', '--no-link', '--print-out-paths', "#{source}#workspace-portal"
+      )
+      candidates = output.lines.map(&:strip).reject(&:empty?).uniq
+      raise Error, "workspace build returned #{candidates.length} package paths" unless candidates.length == 1
+      candidate = candidates.fetch(0)
+      candidate_host = File.join(candidate, 'bin/workspace-host')
+      raise Error, "workspace package has no workspace-host command: #{candidate}" unless File.executable?(candidate_host)
+      require_compatible_development_cluster_helpers!(candidate)
+      current_codex = File.realpath(active_codex)
+      system! candidate_host, 'check-codex', '--codex', current_codex
+      if File.realpath(@system_codex) != current_codex
+        system! candidate_host, 'check-codex', '--codex', @system_codex
+      end
+
+      original_generation = profile_generation if File.symlink?(@profile)
+      original_codex = current_codex
+      begin
+        FileUtils.mkdir_p(File.dirname(@profile), mode: 0o700)
+        unless File.symlink?(@profile) && File.realpath(@profile) == candidate
+          system! 'nix-env', '--profile', @profile, '--set', candidate
+        end
+        generation = profile_generation
+        retain_codex_for_generation(generation, current_codex)
+        adopt_codex(current_codex)
+        install_links
+        activate_installed(candidate_host)
+      rescue StandardError => transition_error
+        if original_generation
+          failed_generation = profile_generation
+          failed_generation = nil if failed_generation == original_generation
+          compensate_profile_transition(
+            original_generation,
+            original_codex,
+            transition_error,
+            discard_generation: failed_generation
+          )
+        end
+        raise
+      end
+      @out.puts "workspace package: #{candidate}"
+    end
+
+    def activate(argv)
+      raise Error, 'workspace activation takes no arguments' unless argv.empty?
+
+      require_compatible_development_cluster_helpers!(package_root)
+      configure_user_services
+      reconcile_codex_update(defer_busy: true)
+    end
+
+    def activate_installed(command)
+      environment = @env.to_h.merge('VPSFREE_WORKSPACE_ACTIVATION' => '1')
+      system_env!(environment, command, '_activate')
+    end
+
+    def rollback(argv)
+      raise Error, 'rollback takes no arguments' unless argv.empty?
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package rollback')
+      original_generation = profile_generation
+      original_codex = File.realpath(active_codex)
+      target_generation = previous_profile_generation
+      target_profile = profile_generation_path(target_generation)
+      require_compatible_development_cluster_helpers!(target_profile)
+      target_codex = generation_codex(target_generation)
+      target_host = File.join(target_profile, 'bin/workspace-host')
+      unless File.executable?(target_host)
+        raise Error, "workspace profile generation has no workspace-host command: #{target_generation}"
+      end
+      raise Error, "workspace profile generation has no retained Codex: #{target_generation}" unless target_codex
+      system! target_host, 'check-codex', '--codex', target_codex
+      quiesced = quiesce_sessions
+      begin
+        system! 'nix-env', '--profile', @profile, '--rollback'
+        unless profile_generation == target_generation
+          raise Error, "nix-env selected an unexpected workspace profile generation"
+        end
+        adopt_codex(target_codex)
+        install_links
+        system! 'systemctl', '--user', 'daemon-reload'
+        system! 'systemctl', '--user', 'restart', 'workspace-router.service'
+        restart_codex_consumers
+        wait_for_codex_sockets
+      rescue StandardError => transition_error
+        compensate_profile_transition(original_generation, original_codex, transition_error)
+        restore_quiesced_sessions(quiesced)
+        raise
+      end
+      restore_quiesced_sessions(quiesced)
+      @out.puts "workspace package: #{File.realpath(@profile)}"
+    end
+
+    def compensate_profile_transition(generation, codex, transition_error, discard_generation: nil)
+      system! 'nix-env', '--profile', @profile, '--switch-generation', generation.to_s
+      adopt_codex(codex)
+      retain_codex_for_generation(generation, codex)
+      install_links
+      system! 'systemctl', '--user', 'daemon-reload'
+      system! 'systemctl', '--user', 'restart', 'workspace-router.service'
+      restart_codex_consumers
+      wait_for_codex_sockets
+      discard_profile_generation(discard_generation) if discard_generation
+    rescue StandardError => compensation_error
+      raise Error,
+            "#{transition_error.message}; failed to restore workspace generation " \
+            "#{generation}: #{compensation_error.message}"
+    end
+
+    def discard_profile_generation(generation)
+      codex_root = File.join(@state, 'codex/generations', generation.to_s)
+      if File.exist?(codex_root) && !File.symlink?(codex_root)
+        raise Error, "Codex generation root is not a symlink: #{codex_root}"
+      end
+      system! 'nix-env', '--profile', @profile, '--delete-generations', generation.to_s
+      File.unlink(codex_root) if File.symlink?(codex_root)
+    end
+
+    def suspend(argv)
+      raise Error, 'suspend takes no arguments' unless argv.empty?
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace suspension')
+      quiesced = quiesce_sessions
+      common = %w[
+        workspace-router.service
+        workspace-codex-reconcile.service
+        workspace-codex-reconcile.path
+        workspace-codex-reconcile.timer
+      ]
+      instances = registry.entries.flat_map do |entry|
+        name = entry.fetch('name')
+        [
+          "workspace-portal@#{name}.service",
+          "workspace-codex@#{name}.service",
+          "workspace-tmux@#{name}.service"
+        ]
+      end
+      system! 'systemctl', '--user', 'stop', 'workspace-codex-reconcile-pending.service'
+      system! 'systemctl', '--user', 'disable', '--now', *instances, *common
+      @out.puts 'workspace portal user services are suspended'
+    rescue StandardError
+      restore_quiesced_sessions(quiesced || [])
+      raise
+    end
+
+    def install_links
+      bin = File.join(@home, 'bin')
+      units = File.join(@home, '.config/systemd/user')
+      FileUtils.mkdir_p(bin)
+      FileUtils.mkdir_p(units)
+      COMMANDS.each do |command|
+        atomic_symlink(File.join(@profile, 'bin', command), File.join(bin, command))
+      end
+      Dir[File.join(@profile, 'share/systemd/user/workspace-*')].each do |source|
+        atomic_symlink(source, File.join(units, File.basename(source)))
+      end
+    end
+
+    def configure_user_services
+      system! 'systemctl', '--user', 'daemon-reload'
+      common = %w[workspace-router.service workspace-codex-reconcile.path workspace-codex-reconcile.timer]
+      instances = registry.entries.flat_map do |entry|
+        name = entry.fetch('name')
+        ["workspace-tmux@#{name}.service", "workspace-codex@#{name}.service", "workspace-portal@#{name}.service"]
+      end
+      # Activation performs this reconciliation while holding the transition
+      # lock. Enable the same unit for user-manager startup without starting a
+      # second lock waiter during the current switch.
+      system! 'systemctl', '--user', 'enable', 'workspace-codex-reconcile.service'
+      system! 'systemctl', '--user', 'enable', '--now', *common, *instances
+      portals = registry.entries.map do |entry|
+        "workspace-portal@#{entry.fetch('name')}.service"
+      end
+      system! 'systemctl', '--user', 'try-restart', 'workspace-router.service', *portals
+    end
+
+    def status(argv)
+      raise Error, 'status takes no arguments' unless argv.empty?
+      @out.puts "package: #{File.exist?(@profile) ? File.realpath(@profile) : 'not installed'}"
+      @out.puts "system Codex: #{@system_codex}"
+      @out.puts "active Codex: #{active_codex}"
+      registry.entries.each do |entry|
+        @out.puts "#{entry.fetch('name')}: #{entry.fetch('root')} https://#{entry.fetch('hostname')}/"
+      end
+    end
+
+    def dispatch(argv, _program)
+      if %w[-h --help].include?(argv.first)
+        exec(File.join(package_root, 'libexec/workspace-portal/dev-session'), *argv)
+      end
+
+      name = extract_workspace_option!(argv)
+      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['VPSFREE_WORKSPACE_NAME'])
+      if %w[archive delete revive].include?(argv.first)
+        if inherited_exclusive_transition_lock?
+          environment, command, arguments = dev_session_invocation(
+            entry, argv, transition_lock: false
+          )
+          system_env!(environment, command, *arguments)
+        else
+          _environment, private_command, arguments = dev_session_invocation(
+            entry, argv, transition_lock: true
+          )
+          exec_with_workspace(entry, private_command, *arguments)
+        end
+        return
+      end
+      environment, private_command, arguments = dev_session_invocation(
+        entry,
+        argv,
+        transition_lock: true
+      )
+      exec_with_workspace(entry, private_command, *arguments)
+    end
+
+    def dev_session_invocation(entry, argv, transition_lock:)
+      runtime = instance_runtime(entry)
+      FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
+      version = codex_version(active_codex)
+      private_command = File.join(package_root, 'libexec/workspace-portal/dev-session')
+      arguments = [
+        '--require-runtime', '--workspace', entry.fetch('root'),
+        '--host-profile', @profile, '--expected-host-generation', package_root,
+        '--authority-dir', runtime.fetch(:authority), '--tmux-socket', runtime.fetch(:tmux),
+        '--codex-command', active_codex, '--codex-socket', runtime.fetch(:codex),
+        '--codex-version', version, '--portal-command', File.join(package_root, 'bin/workspace-portal'),
+        '--portal-base-url', "https://#{entry.fetch('hostname')}",
+        '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster'),
+        '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster'),
+        '--', *argv
+      ]
+      if File.symlink?(@profile)
+        token = profile_link_token
+        raise Error, 'workspace profile identity cannot be verified; rerun the command' unless token
+        arguments.insert(
+          arguments.index('--'), '--expected-host-profile-token', token
+        )
+      end
+      if transition_lock
+        arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file)
+      end
+      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      [environment, private_command, arguments]
+    end
+
+    def dispatch_cluster(argv, program)
+      private_command = File.join(package_root, 'libexec/workspace-portal', program)
+      exec(private_command, *argv) if %w[-h --help].include?(argv.first)
+
+      name = extract_workspace_option!(argv)
+      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['VPSFREE_WORKSPACE_NAME'])
+      environment = @env.to_h.merge(
+        'VPSFREE_WORKSPACE_NAME' => entry.fetch('name'),
+        'VPSFREE_DEVCLUSTER_WORKSPACE' => entry.fetch('root')
+      )
+      %w[
+        VPSFREE_WORKSPACE_TRANSITION_HELD
+        VPSFREE_WORKSPACE_TRANSITION_LOCK_FD
+        VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION
+        VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_FD
+        VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_PATH
+      ].each { |name_to_remove| environment.delete(name_to_remove) }
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        system_env!(environment, private_command, *argv)
+      end
+    end
+
+    def inherited_exclusive_transition_lock?
+      descriptor = Integer(@env.fetch('VPSFREE_WORKSPACE_TRANSITION_LOCK_FD', ''), 10)
+      return false if descriptor < 3
+      return false if File.symlink?(transition_lock_file)
+
+      inherited = File.for_fd(descriptor, autoclose: false)
+      expected = File.stat(transition_lock_file)
+      actual = inherited.stat
+      return false unless expected.file? && actual.file? &&
+                          expected.dev == actual.dev && expected.ino == actual.ino &&
+                          actual.uid == Process.euid && (actual.mode & 0o777) == 0o600
+
+      probe = File.open(transition_lock_file, File::RDWR | File::NOFOLLOW)
+      acquired = probe.flock(File::LOCK_SH | File::LOCK_NB)
+      return false if acquired
+      return false unless inherited.flock(File::LOCK_EX | File::LOCK_NB)
+
+      true
+    rescue ArgumentError, Errno::EBADF, Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+      false
+    ensure
+      probe&.flock(File::LOCK_UN) if acquired
+      probe&.close
+    end
+
+    def extract_workspace_option!(argv)
+      return unless argv.first == '--workspace' || argv.first&.start_with?('--workspace=')
+      first = argv.shift
+      return first.split('=', 2).fetch(1) if first.include?('=')
+      raise Error, '--workspace requires NAME' if argv.empty?
+      argv.shift
+    end
+
+    def run_router(argv)
+      raise Error, 'run-router takes no arguments' unless argv.empty?
+      FileUtils.mkdir_p(@runtime, mode: 0o700)
+      exec(
+        File.join(package_root, 'bin/workspace-portal'), 'router',
+        '--registry', @config, '--runtime-dir', @runtime, '--unix-socket', @router_socket
+      )
+    end
+
+    def run_portal(argv)
+      entry = instance_argument(argv, 'run-portal')
+      runtime = instance_runtime(entry)
+      FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
+      FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
+      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      exec(
+        environment,
+        File.join(package_root, 'bin/workspace-portal'), 'serve',
+        '--workspace', entry.fetch('root'), '--base-url', "https://#{entry.fetch('hostname')}",
+        '--unix-socket', runtime.fetch(:portal), '--dev-session', File.join(package_root, 'bin/dev-session'),
+        '--authority-dir', runtime.fetch(:authority), '--codex-socket', runtime.fetch(:codex),
+        '--host-profile', @profile, '--transition-lock', transition_lock_file,
+        '--codex-version', codex_version(active_codex), '--tmux', find_command('tmux'),
+        '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster'),
+        '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster')
+      )
+    end
+
+    def run_codex(argv)
+      entry = instance_argument(argv, 'run-codex')
+      runtime = instance_runtime(entry)
+      FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
+      exec(active_codex, 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+    end
+
+    def run_tmux(argv)
+      entry = instance_argument(argv, 'run-tmux')
+      runtime = instance_runtime(entry)
+      FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
+      socket = runtime.fetch(:tmux)
+      raise Error, "tmux socket already exists: #{socket}" if File.exist?(socket)
+      tmux = find_command('tmux')
+      system! tmux, '-S', socket, 'new-session', '-d', '-s', '__workspace_portal_keeper'
+      stop = false
+      %w[INT TERM].each { |signal| Signal.trap(signal) { stop = true } }
+      until stop
+        sleep 2
+        _output, _error, status = Open3.capture3(tmux, '-S', socket, 'has-session', '-t', '__workspace_portal_keeper')
+        raise Error, 'workspace tmux server stopped unexpectedly' unless status.success?
+      end
+      system(tmux, '-S', socket, 'kill-server', out: File::NULL, err: File::NULL)
+    end
+
+    def reconcile_codex(argv)
+      pending_only = false
+      parser = OptionParser.new do |opts|
+        opts.on('--pending-only') { pending_only = true }
+      end
+      parser.parse!(argv)
+      raise Error, 'reconcile-codex takes only --pending-only' unless argv.empty?
+      return if pending_only && !pending_codex_update?
+
+      require_no_unfinished_lifecycle_operations!(operation: 'Codex reconciliation')
+
+      reconcile_codex_update(defer_busy: false)
+    end
+
+    def reconcile_codex_update(defer_busy:)
+      adopted = File.realpath(@system_codex)
+      previous = File.realpath(active_codex)
+      if previous == adopted
+        clear_pending_codex_update
+        return true
+      end
+
+      clear_pending_codex_update unless pending_codex_update?(adopted)
+      check_codex(adopted)
+      quiesced = []
+      begin
+        quiesced = quiesce_sessions
+      rescue Error => e
+        write_pending_codex_update(adopted)
+        message = "Codex update is waiting for idle sessions: #{e.message.lines.first.to_s.strip}"
+        if defer_busy
+          @out.puts message
+          return false
+        end
+        raise Error, message
+      end
+
+      begin
+        adopt_codex(adopted)
+        restart_codex_consumers
+        wait_for_codex_sockets
+        retain_codex_for_generation(profile_generation, adopted)
+      rescue StandardError => transition_error
+        compensation_error = nil
+        begin
+          adopt_codex(previous)
+          retain_codex_for_generation(profile_generation, previous)
+          restart_codex_consumers
+          wait_for_codex_sockets
+        rescue StandardError => error
+          compensation_error = error
+        end
+        restoration_error = nil
+        begin
+          restore_quiesced_sessions(quiesced)
+        rescue StandardError => error
+          restoration_error = error
+        end
+        details = [transition_error.message]
+        if compensation_error
+          details << "failed to restore the previous Codex: #{compensation_error.message}"
+        end
+        if restoration_error
+          details << "failed to restore terminal clients: #{restoration_error.message}"
+        end
+        raise Error, details.join('; ')
+      end
+      clear_pending_codex_update
+      begin
+        restore_quiesced_sessions(quiesced)
+      rescue StandardError => restore_error
+        # The App Server and application remain on one validated pair. A failed
+        # terminal respawn is safe to retry with dev-session sync and must not
+        # roll the services out from under clients that were already restored.
+        raise Error,
+              "Codex was adopted, but terminal clients need dev-session sync: " \
+              "#{restore_error.message}"
+      end
+      true
+    end
+
+    def quiesce_sessions(entries = registry.entries)
+      quiesced = []
+      entries.each do |entry|
+        current_socket = instance_runtime(entry).fetch(:codex)
+        Dir[File.join(entry.fetch('root'), 'work', '*', 'portal.yml')].sort.each do |manifest_path|
+          manifest = read_portal_manifest(manifest_path)
+          next unless manifest.dig('creation', 'state') == 'ready'
+          thread_id = manifest.dig('codex', 'thread_id')
+          next if thread_id.nil? || thread_id.empty?
+          next unless manifest.dig('codex', 'socket_path') == current_socket
+
+          slug = File.basename(File.dirname(manifest_path))
+          environment, command, arguments = dev_session_invocation(
+            entry,
+            ['quiesce', slug, '--as-is'],
+            transition_lock: false
+          )
+          output = capture_env!(environment, command, *arguments)
+          quiesced << [entry, slug] if output.lines.any? do |line|
+            line.strip == "quiesced terminal: #{slug}"
+          end
+        end
+      end
+      quiesced
+    rescue StandardError
+      restore_quiesced_sessions(quiesced)
+      raise
+    end
+
+    def require_no_unfinished_lifecycle_operations!(
+      entries = registry.entries,
+      operation: 'workspace operation'
+    )
+      operations = entries.flat_map do |entry|
+        root = File.join(entry.fetch('root'), 'worktrees', '.locks')
+        LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.flat_map do |kind|
+          Dir.glob(File.join(root, "*.#{kind}.json")).sort.map do |path|
+            slug = File.basename(path, ".#{kind}.json")
+            "#{entry.fetch('name')}/#{slug} (#{kind})"
+          end
+        end
+      end
+      return if operations.empty?
+
+      raise Error,
+            "#{operation} is blocked by unfinished session operations: " \
+            "#{operations.join(', ')}; retry the matching dev-session command first"
+    end
+
+    def development_cluster_state(entries = registry.entries)
+      entries.flat_map do |entry|
+        %w[vpsadmin vpsadminos].flat_map do |kind|
+          root = File.join(entry.fetch('root'), '.dev-clusters', kind, 'clusters')
+          next [] unless File.exist?(root) || File.symlink?(root)
+          unless File.directory?(root) && !File.symlink?(root)
+            next ["#{entry.fetch('name')}/#{kind}/unsafe-state-root"]
+          end
+          Dir.children(root).sort.map do |slug|
+            "#{entry.fetch('name')}/#{kind}/#{slug}"
+          end
+        end
+      end
+    rescue SystemCallError => e
+      raise Error, "cannot inspect development cluster state: #{e.message}"
+    end
+
+    def require_no_development_cluster_state!(entries = registry.entries, operation: 'workspace operation')
+      clusters = development_cluster_state(entries)
+      return if clusters.empty?
+
+      raise Error,
+            "#{operation} is blocked by development cluster state: " \
+            "#{clusters.join(', ')}; reset these clusters first"
+    end
+
+    def require_compatible_development_cluster_helpers!(package)
+      clusters = development_cluster_state
+      return if clusters.empty?
+
+      unless development_cluster_contract?(package)
+        raise Error,
+              "workspace package transition is blocked by development cluster state: " \
+              "#{clusters.join(', ')}; target package has no compatible cluster-state contract; " \
+              'reset these clusters first or select a compatible package'
+      end
+      clusters.each do |identity|
+        workspace_name, kind, slug = identity.split('/', 3)
+        if slug == 'unsafe-state-root'
+          raise Error, "workspace package transition is blocked by #{identity}"
+        end
+        entry = registry.find(workspace_name)
+        command = File.join(package, 'libexec/workspace-portal', "#{kind}-devcluster")
+        unless entry && File.executable?(command)
+          raise Error, "target package cannot validate development cluster state: #{identity}"
+        end
+        environment = @env.to_h.merge(
+          'VPSFREE_WORKSPACE_NAME' => workspace_name,
+          'VPSFREE_DEVCLUSTER_WORKSPACE' => entry.fetch('root')
+        )
+        capture_env!(environment, command, 'transition-adopt', slug)
+      end
+    end
+
+    def development_cluster_contract?(package)
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      payload = File.binread(path, 64 * 1024 + 1)
+      return false if payload.bytesize > 64 * 1024
+
+      data = JSON.parse(payload)
+      data.is_a?(Hash) && DEVELOPMENT_CLUSTER_IDENTITY_FIELDS.all? do |field|
+        data[field] == RUNTIME_CONTRACT.fetch(field)
+      end
+    rescue Errno::ENOENT, Errno::EACCES, JSON::ParserError
+      false
+    end
+
+    def restore_quiesced_sessions(sessions)
+      sessions.each do |entry, slug|
+        environment, command, arguments = dev_session_invocation(
+          entry,
+          ['sync', slug, '--as-is'],
+          transition_lock: false
+        )
+        system_env!(environment, command, *arguments)
+      end
+    end
+
+    def wait_for_codex_sockets
+      sockets = registry.entries.map { |entry| instance_runtime(entry).fetch(:codex) }
+      150.times do
+        return if sockets.all? { |path| File.socket?(path) }
+        sleep 0.1
+      end
+      missing = sockets.reject { |path| File.socket?(path) }
+      raise Error, "Codex App Server sockets did not become ready: #{missing.join(', ')}"
+    end
+
+    def read_portal_manifest(path)
+      raise Error, "portal manifest is a symlink: #{path}" if File.symlink?(path)
+      raise Error, "portal manifest is not a file: #{path}" unless File.file?(path)
+      data = File.binread(path, 1024 * 1024 + 1)
+      raise Error, "portal manifest exceeds 1 MiB: #{path}" if data.bytesize > 1024 * 1024
+      manifest = YAML.safe_load(data, permitted_classes: [], permitted_symbols: [], aliases: false)
+      unless manifest.is_a?(Hash) && manifest.fetch('codex', {}).is_a?(Hash) &&
+             manifest.fetch('creation', {}).is_a?(Hash)
+        raise Error, "invalid portal manifest: #{path}"
+      end
+      manifest
+    end
+
+    def pending_codex_file
+      File.join(@state, 'codex/pending')
+    end
+
+    def pending_codex_update?(expected = nil)
+      path = pending_codex_file
+      return false unless File.file?(path) && !File.symlink?(path)
+
+      value = File.binread(path, 4097).strip
+      return false if value.empty? || value.bytesize > 4096
+      expected.nil? || value == expected
+    end
+
+    def write_pending_codex_update(command)
+      path = pending_codex_file
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      atomic_private_file(path, "#{command}\n")
+    end
+
+    def clear_pending_codex_update
+      path = pending_codex_file
+      File.unlink(path) if File.exist?(path) && !File.symlink?(path)
+    end
+
+    def transition_lock_file
+      File.join(@state, 'transition.lock')
+    end
+
+    def with_transition_lock(mode = File::LOCK_EX)
+      path = transition_lock_file
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      raise Error, "workspace transition lock is a symlink: #{path}" if File.symlink?(path)
+      File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
+        file.flock(mode)
+        yield
+      end
+    end
+
+    def with_current_generation_lock(mode: File::LOCK_EX, allow_first_install: false)
+      observed_profile = profile_link_token
+      with_transition_lock(mode) do
+        uninstalled = !File.exist?(@profile) && !File.symlink?(@profile)
+        if observed_profile && profile_link_token != observed_profile
+          raise Error,
+                'workspace package transition completed while this command waited; rerun it'
+        end
+        require_current_package_generation! unless allow_first_install && uninstalled
+        yield
+      end
+    end
+
+    def profile_link_token
+      VpsfreeWorkspaceProfileIdentity.token(@profile)
+    end
+
+    def require_current_package_generation!
+      unless File.symlink?(@profile) && File.realpath(@profile) == File.realpath(package_root)
+        raise Error,
+              'workspace command belongs to a superseded package generation; rerun it'
+      end
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+      raise Error, 'workspace package generation cannot be verified; rerun the command'
+    end
+
+    def atomic_private_file(path, content)
+      temporary = "#{path}.#{$$}.tmp"
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write(content)
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, path)
+        File.open(File.dirname(path), File::RDONLY) { |directory| directory.fsync }
+      ensure
+        File.unlink(temporary) if File.exist?(temporary)
+      end
+    end
+
+    def restart_codex_consumers
+      names = registry.entries.map { |entry| entry.fetch('name') }
+      return if names.empty?
+
+      system!(
+        'systemctl', '--user', 'restart',
+        *names.map { |name| "workspace-codex@#{name}.service" }
+      )
+      system!(
+        'systemctl', '--user', 'restart',
+        *names.map { |name| "workspace-portal@#{name}.service" }
+      )
+    end
+
+    def check_codex_command(argv)
+      options = {}
+      parser = OptionParser.new { |opts| opts.on('--codex PATH') { |value| options[:codex] = value } }
+      parser.parse!(argv)
+      raise Error, 'check-codex requires --codex PATH' unless argv.empty? && options[:codex]
+      check_codex(options.fetch(:codex))
+      @out.puts "compatible Codex: #{codex_version(options.fetch(:codex))}"
+    end
+
+    def check_codex(command)
+      command = File.realpath(command)
+      codex_version(command)
+      Dir.mktmpdir('workspace-codex-contract-') do |directory|
+        schema = File.join(directory, 'schema')
+        FileUtils.mkdir(schema)
+        system! command, 'app-server', 'generate-json-schema', '--experimental', '--out', schema
+        system!(
+          find_command('python3'),
+          File.join(package_root, 'share/workspace-portal/codex_protocol_contract.py'),
+          schema,
+          File.join(package_root, 'share/workspace-portal/codex-client.go')
+        )
+        socket = File.join(directory, 'app-server.sock')
+        pid = Process.spawn(command, 'app-server', '--listen', "unix://#{socket}", pgroup: true, out: File::NULL, err: File::NULL)
+        begin
+          150.times do
+            break if File.socket?(socket)
+            sleep 0.1
+          end
+          raise Error, 'Codex App Server did not create its probe socket' unless File.socket?(socket)
+          output = capture!(File.join(package_root, 'bin/workspace-portal'), 'thread', 'models', '--socket', socket)
+          models = JSON.parse(output)
+          defaults = JSON.parse(
+            capture!(File.join(package_root, 'bin/workspace-portal'), 'thread', 'defaults')
+          )
+          default_model = defaults.fetch('model')
+          default_effort = defaults.fetch('reasoningEffort')
+          default = models.select { |model| model['model'] == default_model }
+          unless default.length == 1 && default.first.fetch('supportedReasoningEfforts', []).any? do |effort|
+            effort['reasoningEffort'] == default_effort
+          end
+            raise Error,
+                  "default model #{default_model} does not advertise #{default_effort} reasoning"
+          end
+        ensure
+          Process.kill('TERM', -pid) rescue nil
+          Process.wait(pid) rescue nil
+        end
+      end
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot execute Codex compatibility check: #{e.message}"
+    rescue JSON::ParserError => e
+      raise Error, "Codex model catalog is invalid: #{e.message}"
+    end
+
+    def adopt_codex(command)
+      root_codex(command, File.join(@state, 'codex/current'))
+    end
+
+    def retain_codex_for_generation(generation, command)
+      root_codex(command, File.join(@state, 'codex/generations', generation.to_s))
+    end
+
+    def root_codex(command, root)
+      command = File.realpath(command)
+      store = command.match(%r{\A(/nix/store/[^/]+)})&.captures&.first
+      raise Error, "Codex is not in the Nix store: #{command}" unless store
+      directory = File.dirname(root)
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      if File.exist?(root) && !File.symlink?(root)
+        raise Error, "Codex GC root is not a symlink: #{root}"
+      end
+      system! 'nix-store', '--realise', store, '--add-root', root, '--indirect'
+    end
+
+    def profile_generation
+      raise Error, "workspace profile is not installed: #{@profile}" unless File.symlink?(@profile)
+
+      target = File.expand_path(File.readlink(@profile), File.dirname(@profile))
+      basename = Regexp.escape(File.basename(@profile))
+      match = File.basename(target).match(/\A#{basename}-(\d+)-link\z/)
+      unless match && target == profile_generation_path(match[1].to_i)
+        raise Error, "workspace profile has an invalid generation link: #{@profile}"
+      end
+      match[1].to_i
+    end
+
+    def profile_generation_path(generation)
+      File.join(File.dirname(@profile), "#{File.basename(@profile)}-#{generation}-link")
+    end
+
+    def previous_profile_generation
+      current = profile_generation
+      candidates = Dir["#{@profile}-*-link"].filter_map do |path|
+        match = File.basename(path).match(/\A#{Regexp.escape(File.basename(@profile))}-(\d+)-link\z/)
+        match && match[1].to_i < current ? match[1].to_i : nil
+      end
+      generation = candidates.max
+      raise Error, 'the workspace profile has no previous generation' unless generation
+      generation
+    end
+
+    def generation_codex(generation)
+      candidate = File.join(@state, 'codex/generations', generation.to_s, 'bin/codex')
+      File.executable?(candidate) ? candidate : nil
+    end
+
+    def active_codex
+      root = File.join(@state, 'codex/current')
+      candidate = File.join(root, 'bin/codex')
+      File.executable?(candidate) ? candidate : @system_codex
+    end
+
+    def codex_version(command)
+      output = capture!(command, '--version')
+      value = output.scan(/[0-9]+(?:\.[0-9A-Za-z+-]+)+/).last
+      raise Error, "cannot determine Codex version from #{command}" unless value
+      value
+    end
+
+    def instance_argument(argv, command)
+      raise Error, "#{command} requires one workspace name" unless argv.length == 1
+      entry = registry.find(argv.fetch(0))
+      raise Error, "workspace is not registered: #{argv.fetch(0)}" unless entry
+      entry
+    end
+
+    def instance_runtime(entry)
+      root = File.join(@runtime, entry.fetch('name'))
+      {
+        root: root,
+        portal: File.join(root, 'portal.sock'),
+        codex: File.join(root, 'app-server.sock'),
+        tmux: File.join(root, 'tmux.sock'),
+        authority: File.join(root, 'authority')
+      }
+    end
+
+    def quarantine_instance_runtime(entry)
+      root = instance_runtime(entry).fetch(:root)
+      return nil unless File.exist?(root) || File.symlink?(root)
+
+      raise Error, "workspace runtime is a symlink: #{root}" if File.symlink?(root)
+      stat = File.stat(root)
+      unless stat.directory? && stat.uid == Process.euid
+        raise Error, "workspace runtime is not an owned directory: #{root}"
+      end
+      FileUtils.mkdir_p(@runtime, mode: 0o700)
+      retired = File.join(@runtime, ".retired-#{entry.fetch('name')}-#{Process.pid}")
+      if File.exist?(retired) || File.symlink?(retired)
+        raise Error, "retired workspace runtime already exists: #{retired}"
+      end
+      File.rename(root, retired)
+      retired
+    end
+
+    def restore_instance_runtime(retired, entry)
+      root = instance_runtime(entry).fetch(:root)
+      raise Error, "workspace runtime was recreated during rollback: #{root}" if File.exist?(root)
+
+      File.rename(retired, root)
+    end
+
+    def discard_retired_runtime(retired)
+      return unless retired
+
+      FileUtils.remove_entry_secure(retired)
+    rescue SystemCallError => e
+      @err.puts "warning: unable to remove retired workspace runtime #{retired}: #{e.message}"
+    end
+
+    def package_root
+      path = File.realpath(__FILE__)
+      File.expand_path('..', File.dirname(path))
+    end
+
+    def exec_with_workspace(entry, command, *argv)
+      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      exec(environment, command, *argv)
+    end
+
+    def find_command(name)
+      @env.fetch('PATH', '').split(File::PATH_SEPARATOR).each do |directory|
+        candidate = File.join(directory, name)
+        return candidate if File.executable?(candidate)
+      end
+      raise Error, "required command is not available: #{name}"
+    end
+
+    def atomic_symlink(source, destination)
+      if File.exist?(destination) && !File.symlink?(destination)
+        raise Error, "refusing to replace non-symlink path: #{destination}"
+      end
+      temporary = "#{destination}.#{$$}.tmp"
+      File.symlink(source, temporary)
+      File.rename(temporary, destination)
+    ensure
+      File.unlink(temporary) if temporary && File.symlink?(temporary)
+    end
+
+    def capture!(*argv)
+      stdout, stderr, status = Open3.capture3(*argv)
+      unless status.success?
+        detail = stderr.strip.empty? ? stdout.strip : stderr.strip
+        raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}#{detail.empty? ? '' : "\n#{detail}"}"
+      end
+      stdout
+    end
+
+    def system!(*argv)
+      stdout, stderr, status = Open3.capture3(*argv)
+      @out.write(stdout)
+      @err.write(stderr)
+      return if status.success?
+      raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
+    end
+
+    def system_env!(environment, *argv)
+      stdout, stderr, status = Open3.capture3(environment, *argv)
+      @out.write(stdout)
+      @err.write(stderr)
+      return if status.success?
+      raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
+    end
+
+    def capture_env!(environment, *argv)
+      stdout, stderr, status = Open3.capture3(environment, *argv)
+      @err.write(stderr)
+      return stdout if status.success?
+      detail = stderr.strip.empty? ? stdout.strip : stderr.strip
+      raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}#{detail.empty? ? '' : "\n#{detail}"}"
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__ || File.basename($PROGRAM_NAME).include?('workspace-host')
+  program = ENV.fetch('VPSFREE_WORKSPACE_HOST_MODE', File.basename($PROGRAM_NAME))
+  exit VpsfreeWorkspaceHost::Host.new.run(program, ARGV.dup)
+end

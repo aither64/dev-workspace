@@ -127,6 +127,78 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	}
 }
 
+func TestLifecycleOperationRejectsProfileSwitchWhileWaiting(t *testing.T) {
+	for _, scenario := range []string{"successful", "compensated"} {
+		t.Run(scenario, func(t *testing.T) {
+			server := newTestServer(t)
+			path := filepath.Join(t.TempDir(), "transition.lock")
+			owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+				t.Fatal(err)
+			}
+			server.config.TransitionLock = path
+			marker := filepath.Join(t.TempDir(), "called")
+			helper := filepath.Join(t.TempDir(), "dev-session")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$MARKER\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("MARKER", marker)
+			server.config.DevSession = helper
+
+			result := make(chan error, 1)
+			go func() {
+				result <- server.runLifecycleOperation(
+					context.Background(), "example", "archive", []string{"archive", "example", "--as-is"},
+				)
+			}()
+			select {
+			case err := <-result:
+				t.Fatalf("lifecycle operation did not wait for the transition: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			oldTarget, err := os.Readlink(server.config.HostProfile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newTarget := t.TempDir()
+			if err := os.Remove(server.config.HostProfile); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(newTarget, server.config.HostProfile); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "compensated" {
+				if err := os.Remove(server.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(oldTarget, server.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-result:
+				if err == nil || !strings.Contains(err.Error(), "superseded workspace package") {
+					t.Fatalf("compensated switch result = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("lifecycle operation did not reject the compensated switch")
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("superseded lifecycle helper ran: %v", err)
+			}
+		})
+	}
+}
+
 func TestArtifactsUseAPassiveAllowlistAndDownloadDisposition(t *testing.T) {
 	for _, extension := range []string{".shtml", ".ehtml", ".html", ".svg", ".svgz", ".js", ".xhtml", ".xml"} {
 		t.Run(extension, func(t *testing.T) {
@@ -1887,10 +1959,15 @@ func newTestServer(t *testing.T) *Server {
 	if err := os.Mkdir(authorityDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	profile := filepath.Join(t.TempDir(), "profile")
+	if err := os.Symlink(t.TempDir(), profile); err != nil {
+		t.Fatal(err)
+	}
 	server, err := New(Config{
 		Workspace:    workspace,
 		BaseURL:      "https://workspace.example.test",
 		DevSession:   "/run/current-system/sw/bin/dev-session",
+		HostProfile:  profile,
 		AuthorityDir: authorityDir,
 		CodexSocket:  "/run/vpsfree-workspace-codex/app-server.sock",
 		CodexVersion: "0.152.1",

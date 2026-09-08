@@ -1,0 +1,6 @@
+[Unit]
+Description=Retry a pending compatible system Codex update
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host reconcile-codex --pending-only

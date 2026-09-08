@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a new aitherdev system generation
+
+[Path]
+PathChanged=/run/current-system/sw
+Unit=workspace-codex-reconcile.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Workspace Codex App Server for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-codex %i
+Restart=on-failure
+RestartSec=2s
+KillMode=mixed
+TimeoutStopSec=150s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry pending system Codex adoption
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=workspace-codex-reconcile-pending.service
+
+[Install]
+WantedBy=timers.target
