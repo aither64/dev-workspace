@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/processgroup"
@@ -66,19 +67,52 @@ func (r Runner) Inspect(slug string) ([]Status, error) {
 	if !validSlug(slug) {
 		return nil, errors.New("invalid session slug")
 	}
+	type result struct {
+		status Status
+		found  bool
+		err    error
+	}
+	providers := r.providers()
+	results := make([]result, len(providers))
+	var wait sync.WaitGroup
+	wait.Add(len(providers))
+	for index, provider := range providers {
+		go func() {
+			defer wait.Done()
+			results[index].status, results[index].found, results[index].err =
+				r.inspectProvider(provider, slug)
+		}()
+	}
+	wait.Wait()
 	var statuses []Status
 	var problems []error
-	for _, provider := range r.providers() {
-		status, found, err := r.inspectProvider(provider, slug)
-		if err != nil {
-			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.name, err))
+	for index, provider := range providers {
+		result := results[index]
+		if result.err != nil {
+			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.name, result.err))
 			continue
 		}
-		if found {
-			statuses = append(statuses, status)
+		if result.found {
+			statuses = append(statuses, result.status)
 		}
 	}
 	return statuses, errors.Join(problems...)
+}
+
+// MayExist avoids launching provider helpers for sessions without cluster
+// state. Unexpected filesystem errors and unsafe entries still return true so
+// Inspect can validate and report them through the provider-owned contract.
+func (r Runner) MayExist(slug string) bool {
+	if !validSlug(slug) {
+		return false
+	}
+	for _, provider := range r.providers() {
+		path := filepath.Join(r.Workspace, ".dev-clusters", provider.name, "clusters", slug)
+		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 // ReleaseAll invokes every provider unconditionally. Each helper serializes

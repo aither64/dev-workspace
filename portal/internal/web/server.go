@@ -44,7 +44,7 @@ var queueClientMessageIDPattern = regexp.MustCompile(
 type codexController interface {
 	VerifyThread(context.Context, string, string) error
 	ReadThread(context.Context, string) (codex.Transcript, error)
-	ListThreadActivity(context.Context) ([]codex.ThreadActivity, error)
+	ListThreadActivity(context.Context, []codex.ThreadActivity) ([]codex.ThreadActivity, error)
 	ListModels(context.Context) ([]codex.Model, error)
 	ListCollaborationModes(context.Context) ([]codex.CollaborationMode, error)
 	UpdateThreadSettings(context.Context, string, codex.ThreadSettingsUpdate) (codex.ThreadSettings, error)
@@ -370,13 +370,15 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 			}
 			summary.Repositories = merged
 		}
-		clusters, clusterErr := s.clusters.Inspect(summary.Slug)
-		if clusterErr != nil {
-			s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, clusterErr)
-		}
-		for _, cluster := range clusters {
-			if cluster.State == "running" {
-				data.ClusterCounts[summary.Slug]++
+		if !summary.Archived && s.clusters.MayExist(summary.Slug) {
+			clusters, clusterErr := s.clusters.Inspect(summary.Slug)
+			if clusterErr != nil {
+				s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, clusterErr)
+			}
+			for _, cluster := range clusters {
+				if cluster.State == "running" {
+					data.ClusterCounts[summary.Slug]++
+				}
 			}
 		}
 		if summary.Archived {
@@ -386,8 +388,19 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.config.Codex != nil {
+		expected := make([]codex.ThreadActivity, 0, len(data.Active))
+		for index := range data.Active {
+			summary := &data.Active[index]
+			if summary.Codex.ThreadID == "" {
+				continue
+			}
+			expected = append(expected, codex.ThreadActivity{
+				ID:  summary.Codex.ThreadID,
+				Cwd: filepath.Join(s.config.Workspace, "work", summary.Slug),
+			})
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		activities, activityErr := s.config.Codex.ListThreadActivity(ctx)
+		activities, activityErr := s.config.Codex.ListThreadActivity(ctx, expected)
 		cancel()
 		if activityErr != nil {
 			s.config.Logger.Printf("load Codex session activity: %v", activityErr)

@@ -577,7 +577,7 @@ devcluster_check_directory() {
     return 0
   fi
   [ "$create" = true ] || return 1
-  mkdir -- "$path"
+  mkdir -- "$path" 2>/dev/null || true
   [ ! -L "$path" ] && [ -d "$path" ] || die "unable to create safe $label: $path"
 }
 

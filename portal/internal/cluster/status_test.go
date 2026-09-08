@@ -67,6 +67,27 @@ func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
 	}
 }
 
+func TestMayExistUsesOnlyProviderStateEntries(t *testing.T) {
+	workspace := t.TempDir()
+	runner := Runner{Workspace: workspace}
+	if runner.MayExist("example") {
+		t.Fatal("missing cluster state may exist")
+	}
+	directory := filepath.Join(workspace, ".dev-clusters", "vpsadmin", "clusters", "example")
+	if err := os.MkdirAll(filepath.Dir(directory), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing", directory); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.MayExist("example") {
+		t.Fatal("unsafe cluster state was hidden from provider validation")
+	}
+	if runner.MayExist("../example") {
+		t.Fatal("invalid cluster slug may exist")
+	}
+}
+
 func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	workspace := t.TempDir()
 	vpsadmin := statusHelper(t, `{

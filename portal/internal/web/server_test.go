@@ -434,6 +434,10 @@ func TestIndexUsesCodexActivityAndFallsBackToTrackingTimes(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
+	if len(controller.activityInputs) != 2 || controller.activityInputs[1].ID != "thread-2" ||
+		controller.activityInputs[1].Cwd != filepath.Join(server.config.Workspace, "work", "2026-09-06-recent-codex") {
+		t.Fatalf("activity identities = %#v", controller.activityInputs)
+	}
 	if strings.Index(body, "2026-09-06-recent-codex") > strings.Index(body, "2026-09-07-recent-files") {
 		t.Fatalf("Codex activity did not sort first: %s", body)
 	}
@@ -1205,28 +1209,32 @@ func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
 }
 
 type browserContractCodex struct {
-	mu            sync.Mutex
-	message       string
-	messageID     string
-	actionContext string
-	sendCount     int
-	sendErr       error
-	queued        string
-	queueDeleted  string
-	queueStarted  string
-	settings      codex.ThreadSettings
-	settingsErr   error
-	interrupt     bool
-	decision      string
-	answers       map[string]map[string][]string
-	snoozed       string
-	emptyPrompts  bool
-	transcript    codex.Transcript
-	activities    []codex.ThreadActivity
-	activityErr   error
+	mu             sync.Mutex
+	message        string
+	messageID      string
+	actionContext  string
+	sendCount      int
+	sendErr        error
+	queued         string
+	queueDeleted   string
+	queueStarted   string
+	settings       codex.ThreadSettings
+	settingsErr    error
+	interrupt      bool
+	decision       string
+	answers        map[string]map[string][]string
+	snoozed        string
+	emptyPrompts   bool
+	transcript     codex.Transcript
+	activities     []codex.ThreadActivity
+	activityInputs []codex.ThreadActivity
+	activityErr    error
 }
 
-func (client *browserContractCodex) ListThreadActivity(_ context.Context) ([]codex.ThreadActivity, error) {
+func (client *browserContractCodex) ListThreadActivity(
+	_ context.Context, expected []codex.ThreadActivity,
+) ([]codex.ThreadActivity, error) {
+	client.activityInputs = append([]codex.ThreadActivity(nil), expected...)
 	return client.activities, client.activityErr
 }
 
