@@ -1,9 +1,10 @@
 # Development Tmux Sessions
 
-The NixOS-installed `dev-session` command manages one tmux session per
-development initiative. The
-session name is the resolved slug, and the tool follows the workspace layout
-from `AGENTS.md`.
+The user-profile `dev-session` command manages one tmux session per development
+initiative. It selects a registered workspace from the current directory; use
+`--workspace NAME` before the subcommand to select one explicitly. The session
+name is the resolved slug, and the tool follows the workspace layout from
+`AGENTS.md`.
 
 ## Starting a session
 
@@ -12,6 +13,17 @@ Pass a short name by default:
 ```sh
 dev-session start api-token-rotation
 ```
+
+This works anywhere under the registered root, including `work/` and
+`worktrees/`. From another directory, or whenever you want to be explicit,
+name the workspace before the subcommand:
+
+```sh
+dev-session --workspace vpsfree-cz start api-token-rotation
+```
+
+If only one workspace is registered, it is the fallback outside its root. Once
+two or more are registered, an outside call requires `--workspace`.
 
 For a new Codex session, the command asks for the first request before it
 creates tracking files or tmux panes. In a script or another noninteractive
@@ -23,6 +35,28 @@ dev-session start api-token-rotation --goal-file request.txt --no-attach
 
 The request file is required only while creating a shared conversation. An
 existing session resumes without asking for the request again.
+
+An unfinished initiative may predate the portal or lose its old process. Stop
+the old tmux session after checking that its writers are quiet, commit the
+active `plan.md` and `state.md`, and restart the exact slug with a fresh
+request:
+
+```sh
+dev-session start 2026-06-06-api-token-rotation --as-is \
+  --goal-file request.txt --no-attach
+```
+
+The helper preserves `plan.md` and `state.md` byte for byte. It creates a new
+shared conversation and registers existing canonical worktrees in the portal
+manifest. The plan and state must match the committed workspace tree.
+`portal.yml` must be absent from both the working tree and the committed tree;
+an existing manifest is never adopted as retained tracking. Restarting always
+creates a Codex conversation; `--no-codex` is refused. A directory that cannot
+be proven as a canonical, attached worktree is left untouched, reported as a
+warning, and omitted from the manifest until it is repaired. A conflicting
+registration still stops synchronization. The helper also refuses a
+conflicting managed session. This is a restart of the same active initiative,
+not a new initiative or a recovery of the old conversation.
 
 If a unique existing slug already matches that name, `start` resumes it. If no
 existing slug matches, it creates today's slug. On June 6, 2026, a new
@@ -61,8 +95,8 @@ Managed tmux panes and worktree windows receive these environment variables:
 - `VPSFREE_DEV_SESSION_URL`, the resolved link for this session.
 
 Do not use `VPSFREE_DEV_SESSION_URL` as the input for another session. Its
-value already contains the current slug. The configuration-owned wrapper
-passes the base URL explicitly and exports both values into each managed pane.
+value already contains the current slug. The registry-backed dispatcher passes
+the base URL explicitly and exports both values into each managed pane.
 
 `start` creates `work/<slug>/plan.md`, `work/<slug>/state.md`,
 `work/<slug>/portal.yml`, and `worktrees/<slug>/` when missing. When
@@ -120,8 +154,10 @@ dev-session attach api-token-rotation
 dev-session fork api-token-rotation alternate-approach
 dev-session sync api-token-rotation
 dev-session stop api-token-rotation
-dev-session remove api-token-rotation
-dev-session finalize api-token-rotation
+dev-session archive api-token-rotation
+dev-session archive api-token-rotation --abandoned
+dev-session revive api-token-rotation
+dev-session delete api-token-rotation
 dev-session list
 dev-session current
 dev-session url
@@ -142,10 +178,10 @@ Codex settings.
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no
 longer exists, and it leaves user-created windows untouched.
 
-`stop` normally only kills the exact managed tmux session and leaves all files
-and worktrees in place. After `finalize` has moved tracking into `archive/`, it
-refuses to stop until that exact archive move and its terminal state are
-committed.
+`stop` only kills the exact managed tmux session and leaves all files and
+worktrees in place. It asks you to type the exact session slug before making
+the change. Use it when you want to pause terminal access without archiving the
+initiative.
 
 `current` prints the active slug and nothing else. It resolves the slug from the
 managed tmux session environment, the caller's exact managed tmux pane, or a
@@ -159,98 +195,165 @@ owned by other workspaces from listing and short-name lookup.
 
 Managed sessions created before workspace identity metadata was introduced are
 not adopted automatically. Inspect and stop such a session manually after its
-writers are quiet, then restart the same active slug with `start --as-is` so it
-receives canonical metadata. Existing symlinked workspace paths are recognized
-and normalized automatically.
+writers are quiet, commit its active tracking, then restart the same slug with
+`start --as-is` and a new initial request. Existing symlinked workspace paths
+are recognized and normalized automatically.
 
 `url` prints the permanent portal page for the selected initiative. It accepts
 the same short-name and `--as-is` forms as the other lookup commands. The page
-continues to work after finalization because the portal scans both `work/` and
+continues to work after archival because the portal scans both `work/` and
 `archive/`.
 
-`remove` cleans up a development session:
+`delete` discards a development session after explicit confirmation:
 
 ```sh
-dev-session remove api-token-rotation
+dev-session delete api-token-rotation
 ```
 
-It removes clean git worktrees whose `HEAD` is attached to a shared
-`refs/heads/*` branch under `worktrees/<slug>/`, removes the empty worktree
-group directory, and then kills the managed tmux session when one exists. This
-order makes it safe to run from inside its own managed session: the session is
-killed only after cleanup has completed. Before removing worktrees, it records
-each final `HEAD` and verifies the worktree against the canonical project stored
-in `portal.yml`. Branches are kept.
-`work/<slug>/plan.md` and `state.md` are kept by default.
+The command requires an interactive terminal and asks you to type the resolved
+full slug. There is no noninteractive confirmation flag. The command records
+each worktree head, retires the matching
+Codex thread, releases vpsAdmin and vpsAdminOS clusters, removes the worktrees,
+stops the managed tmux session, removes runtime authority, and moves the
+tracking directory and creation journal to private recovery storage. It records
+each completed phase in a private journal, so rerunning the same command safely
+continues an interrupted deletion instead of repeating irreversible work.
+The journal is also a slug tombstone: starting, reviving, attaching, changing
+worktrees, or starting new cluster work for that slug is refused until the
+original `delete` command finishes. Thread retirement records its intent before
+contacting Codex, durably records a unique cwd-bound thread before archiving it
+when creation lost its ID, and recognizes that exact thread when it is already
+archived. A known thread
+must remain reachable; an unavailable portal or App Server stops deletion for a
+later retry instead of orphaning the conversation. Successful retirement prunes
+that thread's durable send and queue attempts.
+Recovery state is stored under:
+
+```text
+$XDG_STATE_HOME/vpsfree-workspaces/removed/<workspace-id>/
+```
+
+The session disappears from active and archived discovery. Git branches are
+retained. The recovery directory is private to the user and contains metadata
+that identifies the original workspace and slug. It must be outside the
+tracking directory, creation journal, initiative worktrees, and cluster state
+or socket directories; deletion refuses an `XDG_STATE_HOME` that would place
+recovery data inside state it will destroy.
+If the tracking directory was
+already committed, `delete` fetches `origin/master`, requires the shared
+checkout to be a compatible `master`, rechecks the fetched remote immediately
+before the commit, and commits only the exact tracking deletion. It preserves
+unrelated staged and unstaged changes and does not push.
+This prevents a fresh checkout from rediscovering a successfully deleted
+session.
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
 refused unless `--force` is passed. Detached worktrees and paths outside the
-exact initiative group are always refused. Cleanup then delegates removal to
+exact initiative group are always refused. Cleanup delegates removal to
 `git worktree remove`; if Git refuses a worktree, resolve the reason and retry.
-Branches are retained:
+`--force` also permits dirty worktrees, preserves unmanaged entries in the
+recovery directory, and interrupts an active Codex turn. If a non-forced attempt
+stops at an active turn, rerunning it with `--force` records a one-way upgrade
+to that authorization and resumes the same journal. Forced deletion still
+requires the interactive exact-slug confirmation:
 
 ```sh
-dev-session remove api-token-rotation --force
+dev-session delete api-token-rotation --force
 ```
 
-`remove` is for stopping or cleaning up an active session. It never deletes the
-initiative tracking directory. The former `--all` option is intentionally not
-supported because completed and abandoned initiatives must retain a durable
-record.
+Use `delete` only when you mean to discard the whole session. Completed and
+abandoned initiatives normally use `archive`, which preserves their durable
+record in the portal.
 
-## Finalizing an initiative
+## Archiving and reviving an initiative
 
-Use `finalize` only after the initiative is fully complete or explicitly
-abandoned:
+Use `archive` only after the initiative is fully integrated and has no
+session-owned work, or after the user explicitly abandons it:
 
 ```sh
-dev-session finalize api-token-rotation
+dev-session archive api-token-rotation
+dev-session archive api-token-rotation --abandoned
 ```
 
-Before running it:
+Before archiving completed work:
 
-- set the lifecycle field in the exact YAML front matter at the start of
-  `state.md` to `complete` or `abandoned`; lifecycle-looking text anywhere in
-  the Markdown body has no effect;
-- make sure plan and state have an earlier commit under `work/<slug>/`;
-- make sure that history includes a commit whose front matter has
-  `lifecycle: active` before the terminal transition;
+- merge every registered feature branch's exact final head into its configured
+  remote default branch;
+- make sure plan and state have an earlier commit under `work/<slug>/` whose
+  state front matter has `lifecycle: active`;
 - resolve all review, CI, merge, approval, deployment, and cleanup work owned by
   the session;
 - stop shells, editors, builds, and background processes that can still write
   into an initiative worktree;
 - remove credentials, caches, reproducible bulk captures, and transient
-  outputs, keeping plan/state and intentionally durable evidence.
+  outputs, keeping plan, state, and intentionally durable evidence.
 
-`finalize` performs all safety checks before cleanup. It refuses missing
-tracking files, an active or ambiguous lifecycle, tracking without a prior
-commit, an existing archive destination, mismatched or replaced tmux identity,
-worktree changes reported by ordinary `git status --porcelain`, detached
-worktrees, worktrees outside the allowed repositories, symlinked
-paths or roots, and unknown entries in the worktree group. Cleanup for one slug
-is serialized, and every worktree receives the same ordinary cleanliness and
-path checks before any is removed. It then delegates each removal to non-force
-`git worktree remove`, preserves the branches, and uses a same-filesystem,
-atomic no-clobber move from `work/<slug>/` to
-`archive/<slug>/`. If Git refuses a worktree for another reason, cleanup stops;
-already removed worktrees remain available through their retained branches,
-and the command can be retried after resolving the refusal. The helper requires
-GNU `mv` with `--no-copy` and `--update=none-fail`; it verifies option support
-before removing worktrees.
+The command asks for one yes/no confirmation. It writes `lifecycle: complete`
+or `lifecycle: abandoned` itself, so no separate terminal tracking commit is
+needed. The browser offers the same two modes with one confirmation dialog.
+Agents must not treat a completed response, a handoff, "finish the work", or
+"implement the plan" as permission to archive a session.
 
-The per-slug lock serializes `dev-session` commands, not external writers. A
-process that writes after the last cleanliness check can still race worktree
-removal, so all worktree writers must be stopped before finalization.
+For completed work, `archive` fetches every registered feature branch and
+default branch. The local and remote feature tips must be identical, and that
+exact commit must be an ancestor of `origin/<default_branch>`. The command
+reports every branch whose merge status cannot be proven. A squash merge or
+partial cherry-pick does not satisfy this rule. Coordination-only initiatives
+with no registered branches remain valid. Legacy live worktrees without
+`portal.yml` are inferred from their canonical bare repository and checked as
+branches. `--abandoned` skips only this merge proof. A retry fetches and
+reproves the exact heads stored in the archive journal before every remaining
+destructive phase; another merged commit on the feature branch cannot replace
+the head originally approved for archival.
 
-The terminal lifecycle and final state do not need a separate commit before
-`finalize`; the earlier committed active snapshot is sufficient. The helper
-does not stage or commit. Inspect the reported move and commit only the exact
-`work/<slug>/` and `archive/<slug>/` paths in the shared top-level repository,
-including the final tracking content, as one archive commit. The managed tmux
-session remains available for that commit. After the commit,
-`dev-session stop <slug> --as-is` verifies the terminal archive and clean
-task paths before closing the exact workspace-owned tmux identity it resolves
-at stop time.
+Before changing state, `archive` proves the thread has no active turn, pending
+request, or queued message; verifies the tracking commit and clean attached
+worktrees; checks the atomic move; and verifies that the shared workspace can
+make an exact-path commit. It then quiesces the terminal client, releases both
+development cluster types, records immutable repository heads, removes
+worktrees without force, atomically moves tracking into `archive/`, commits
+only the tracking transition, retires the Codex thread, and removes the tmux
+session and authority. Branches are retained. The host-wide transition gate
+prevents portal mutations and cluster starts from racing this operation.
+
+Each irreversible phase is journaled in private runtime state. If a command or
+deployment interruption stops the operation, run the same `archive` command
+again with the same mode. It resumes completed phases without repeating them.
+The journal binds the exact projected archive tree and retained Codex thread;
+retry refuses changed lifecycle, manifest, artifacts, or conversation identity
+before it commits tracking or retires the runtime.
+The durable journal also blocks workspace package changes, unregister,
+suspension, Codex reconciliation, and cluster mutations outside the exact
+lifecycle-owned cleanup. The per-slug lock serializes helper commands, not
+external writers, so all worktree writers must be stopped first.
+
+If an initiative needs more work after archival, revive it:
+
+```sh
+dev-session revive 2026-06-06-api-token-rotation --as-is
+```
+
+`revive` asks for one confirmation, with a stronger warning for an abandoned
+initiative. That confirmation becomes part of the transaction, so a retry
+after tracking has moved does not ask again or consult the obsolete archive
+location. The archive move and terminal tracking must already be committed.
+Revive refuses a conflicting
+active directory, worktree group, live session, dirty tracking transition, or
+ambiguous identity. It atomically moves `archive/<slug>` back to `work/<slug>`,
+changes the lifecycle to `active`, removes `finalized_at` and stale
+`final_head_sha` values, verifies the full restored tracking tree before the
+commit, commits only that transition, and preserves branch, base, repository,
+and Codex identity.
+
+When the archive retains a Codex thread, revive restores and starts that exact
+conversation without forking it or resending the initial request. It does not
+recreate worktrees. Legacy archives without `portal.yml` get a fresh shared
+conversation through the same durable thread-creation recovery used by new
+sessions, so a lost App Server response cannot create a second thread. Adding
+retained feature branches through the normal worktree command reconstructs
+their registration. Supply `--base REF` if a retained branch's intended base
+cannot be inferred uniquely. Revive is journaled and retryable in the same way
+as archive.
 
 ## Worktree helpers
 
@@ -271,7 +374,7 @@ This uses:
 The helper also records the canonical project identity, GitHub repository,
 feature branch, default branch, and starting base commit in `portal.yml`.
 Removing an individual worktree or using bulk cleanup records its last commit
-before cleanup. Finalization verifies the project identity and records the last
+before cleanup. Archival verifies the project identity and records the last
 commit of every remaining worktree, so archived pages retain trustworthy
 immutable comparison links.
 
@@ -316,24 +419,29 @@ the worktree is intentional.
 
 ## Runtime ownership
 
-The NixOS configuration owns the workspace path, tmux socket, host authority,
-Codex executable and App Server socket, and portal URL. The public command does
-not require callers to repeat these host-specific arguments. Run
+The workspace flake installs the public commands and user systemd units in a
+dedicated user Nix profile. A private registry maps workspace names to roots
+and hostnames. Per-workspace portal, App Server, authority, and tmux state lives
+below `$XDG_RUNTIME_DIR/vpsfree-workspaces/`; the public command derives those
+paths and does not require callers to repeat them. Run
 `dev-session validate` to validate every persisted portal entry, including its
 plan, anchored lifecycle, active/archive placement, and manifest, before
 deployment.
 
 Host-specific runtime options are private implementation details fixed by the
-installed command. Callers cannot replace them with command-line flags or
-environment variables. The recorded Codex version describes how the session
-was created; an existing session remains valid after a compatible client
-upgrade when its thread, App Server socket, working directory, and live host
-authority still match. Use `--no-codex` to start a shell in the left pane
+dispatcher. Callers can select only a registered workspace, not replace its
+runtime paths. The App Server uses the Codex package from the current NixOS
+system. `workspace-host` checks its protocol and model catalog before adopting
+it and retains one tested Codex store path per application profile generation.
+Codex adoption and rollback gate new mutations, quiesce native terminal
+clients, verify all threads are idle, restart App Server and portal pairs, and
+restore the clients. A compatible system update that finds an active turn is
+retried every five minutes. Use `--no-codex` to start a shell in the left pane
 instead.
 
-New conversations use the configured default model with `max` reasoning. When
-an explicitly chosen model does not support `max`, its advertised default
-reasoning effort is used. An explicit reasoning choice always takes precedence.
+New conversations use GPT-6 Astra with `xhigh` reasoning. When an explicitly
+chosen model does not support `xhigh`, its advertised default reasoning effort
+is used. An explicit reasoning choice always takes precedence.
 
 `--goal-file FILE` provides the initial Codex request and seeds the Goal
 section in a new plan. It is required when a noninteractive caller creates a
@@ -357,9 +465,9 @@ midnight.
 
 The private package implementation requires the authority directory, tmux
 socket, Codex command and socket, client version, and portal command to be
-present as absolute paths. Aitherdev exposes it only through the configured
-`dev-session` wrapper, so terminal users and the portal share one command and
-one session model.
+present as absolute paths. The registry-backed dispatcher supplies them to
+both terminal users and the portal, so they share one command and one session
+model.
 
 See [Workspace portal](workspace-portal.md) for the browser interface, manifest
 format, security model, private CA, and deployment responsibilities.

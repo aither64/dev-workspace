@@ -5,7 +5,7 @@ description: Prepare a handoff for a vpsFree.cz development initiative and inclu
 
 # Development session handoff
 
-Use the initiative tracked by the current process through the NixOS-installed
+Use the initiative tracked by the current process through the user-profile
 `dev-session` command. Run `dev-session current` and accept its result only when
 `VPSFREE_DEV_SESSION_SLUG` has the same value, as required by the workspace
 `AGENTS.md`. Do not use or modify another concurrent session. If no initiative
@@ -26,4 +26,7 @@ Before handing off material work:
    still owns. If the portal is not deployed or reachable yet, label the link as
    the post-deployment URL instead of omitting it.
 
-Archived initiatives retain the same URL and become read-only in the portal.
+Preparing a handoff does not authorize closing the session. Run `dev-session
+archive` or `dev-session delete` only when the user explicitly requests that
+lifecycle action. Archived initiatives retain the same URL and become read-only
+until `dev-session revive` restores them.
