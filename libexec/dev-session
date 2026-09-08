@@ -1133,13 +1133,6 @@ module VpsfreeDevSession
       @out.puts "revived session: #{slug}"
     end
 
-    def archived_lifecycle(input, as_is: true)
-      slug = lookup_slug(input, as_is:)
-      lifecycle_state(
-        read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
-      )
-    end
-
     def revive_confirmation(input, as_is: true)
       slug = lookup_slug(input, as_is:)
       with_creation_lock(slug) do
@@ -1217,23 +1210,8 @@ module VpsfreeDevSession
       end
     end
 
-    def finalize_tracking(input, as_is:, check: false, prepare: false)
-      raise Error, '--check and --prepare cannot be combined' if check && prepare
-
-      slug = lookup_slug(input, as_is:)
-      with_creation_lock(slug) do
-        with_slug_lock(slug) do
-          select_tmux_for_slug!(slug)
-          reject_conflicting_lifecycle_journal!(slug)
-          finalize_locked!(slug, check:, prepare:)
-        end
-      end
-    end
-
     def finalize_locked!(
       slug,
-      check: false,
-      prepare: false,
       announce: true,
       expected_proven_heads: nil,
       finalized_at: nil
@@ -1263,17 +1241,6 @@ module VpsfreeDevSession
                      else
                        {}
                      end
-      if check
-        ensure_portal_thread_idle!(slug, @selected_authority)
-        @out.puts "finalizable: #{slug}"
-        return
-      end
-      if prepare
-        quiesced = quiesce_and_require_idle!(slug, plan.session)
-        @out.puts "prepared for finalization: #{slug}"
-        return
-      end
-
       ensure_archive_root!
       quiesced = quiesce_and_require_idle!(slug, plan.session)
       verify_proven_heads_unchanged!(slug, plan, proven_heads) if lifecycle == 'complete'
@@ -1298,7 +1265,7 @@ module VpsfreeDevSession
       raise
     end
 
-    private :archived_lifecycle, :finalize_tracking, :finalize_locked!
+    private :finalize_locked!
 
     def list(input = nil, as_is: false)
       slugs = if input

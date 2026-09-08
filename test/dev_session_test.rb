@@ -3484,7 +3484,7 @@ class DevSessionTest < Minitest::Test
 
       merge_registered_branches(workspace, slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
 
       refute(File.exist?(path))
       manifest = YAML.safe_load(
@@ -3685,7 +3685,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
       assert_match(/repository identity does not match/, error.message)
       assert(File.directory?(path))
@@ -4690,7 +4690,7 @@ class DevSessionTest < Minitest::Test
 
       runner = runner_for(workspace, tmux:, out:)
       merge_registered_branches(workspace, slug)
-      runner.send(:finalize_tracking, 'demo', as_is: false)
+      finalize_core(runner, 'demo', as_is: false)
 
       refute(tmux.killed)
       assert_includes(out.string, File.join(workspace, 'archive', slug))
@@ -4744,7 +4744,7 @@ class DevSessionTest < Minitest::Test
         commit_tracking(workspace, slug, lifecycle: 'complete')
         tmux = ManagedTmux.new(slug, workspace:)
         runner = runner_for(workspace, tmux:)
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
         FileUtils.mkdir_p(File.join(workspace, 'work', slug))
 
         error = assert_raises(VpsfreeDevSession::Error) do
@@ -4860,7 +4860,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
 
-      runner.send(:finalize_tracking, 'demo', as_is: false)
+      finalize_core(runner, 'demo', as_is: false)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
     end
@@ -4876,7 +4876,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/lifecycle is not terminal/, error.message)
@@ -4892,7 +4892,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.rm(File.join(workspace, 'work', slug, 'plan.md'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/missing tracking files/, error.message)
@@ -4908,7 +4908,7 @@ class DevSessionTest < Minitest::Test
       set_lifecycle(workspace, slug, 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/tracking files have no prior commit/, error.message)
@@ -4926,7 +4926,7 @@ class DevSessionTest < Minitest::Test
       commit_terminal_tracking_only(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/no committed active lifecycle/, error.message)
@@ -4949,7 +4949,7 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert_match(/not terminal: active/, error.message)
@@ -4969,7 +4969,7 @@ class DevSessionTest < Minitest::Test
       File.write(state, "#{content}\n- Lifecycle: complete\n")
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert_match(/must start with lifecycle YAML front matter/, error.message)
@@ -5061,7 +5061,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'pseudo active state')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert_match(/no committed active lifecycle/, error.message)
@@ -5079,7 +5079,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
       tmux = ManagedTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:)
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       state = File.join(workspace, 'archive', slug, 'state.md')
       content = File.read(state).sub('lifecycle: complete', 'lifecycle: active')
       File.write(state, state_with_body_lifecycle(content, 'complete'))
@@ -5102,7 +5102,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/archive already exists/, error.message)
@@ -5125,7 +5125,7 @@ class DevSessionTest < Minitest::Test
       )
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/archive already exists/, error.message)
@@ -5156,7 +5156,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, workspace:)
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner_for(workspace, tmux:).send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner_for(workspace, tmux:), 'demo', as_is: false)
       end
 
       assert_match(/uncommitted changes/, error.message)
@@ -5193,7 +5193,7 @@ class DevSessionTest < Minitest::Test
       detached_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/detached HEAD/, error.message)
@@ -5261,7 +5261,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'sample'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/unmanaged entries/, error.message)
@@ -5285,7 +5285,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.ln_s(outside_root, work_root)
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/work root is a symlink/, error.message)
@@ -5329,7 +5329,7 @@ class DevSessionTest < Minitest::Test
         )
 
         assert_raises(VpsfreeDevSession::Error) do
-          runner.send(:finalize_tracking, 'demo', as_is: false)
+          finalize_core(runner, 'demo', as_is: false)
         end
 
         assert(File.directory?(source), "#{collision} collision moved the source")
@@ -5401,7 +5401,7 @@ class DevSessionTest < Minitest::Test
       )
 
       assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert(File.directory?(path))
@@ -5433,7 +5433,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
 
       assert_equal(2, move_commands.length)
       move_commands.each do |argv|
@@ -5486,7 +5486,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'cache'))
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, 'demo', as_is: false)
+        finalize_core(runner, 'demo', as_is: false)
       end
 
       assert_match(/contains unmanaged entries/, error.message)
@@ -5509,7 +5509,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert_match(/missing from the portal manifest/, error.message)
@@ -5535,7 +5535,7 @@ class DevSessionTest < Minitest::Test
         assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
 
         error = assert_raises(VpsfreeDevSession::Error) do
-          runner.send(:finalize_tracking, slug, as_is: true)
+          finalize_core(runner, slug, as_is: true)
         end
 
         assert_match(/outside the canonical repository root/, error.message)
@@ -5554,8 +5554,8 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner_for(workspace, tmux: UnmanagedTmux.new(slug)).send(
-          :finalize_tracking,
+        finalize_core(
+          runner_for(workspace, tmux: UnmanagedTmux.new(slug)),
           'demo',
           as_is: false
         )
@@ -6082,7 +6082,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
 
       assert_includes(
         out.string,
@@ -6121,7 +6121,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
-      ordinary_runner.send(:finalize_tracking, 'demo', as_is: false)
+      finalize_core(ordinary_runner, 'demo', as_is: false)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
       assert(tmux_session_exists?(socket, slug))
@@ -7213,7 +7213,7 @@ class DevSessionTest < Minitest::Test
       base.ensure_tracking_files(slug)
       base.send(:ensure_portal_manifest, slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      base.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(base, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       starts = []
@@ -7279,7 +7279,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
 
@@ -7375,7 +7375,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::Error) do
-        runner.send(:finalize_tracking, slug, as_is: true)
+        finalize_core(runner, slug, as_is: true)
       end
 
       assert_includes(error.message, 'feature head is not merged')
@@ -7383,75 +7383,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_finalize_check_is_non_mutating_after_exact_head_is_merged
-    skip 'git is not available' unless command_available?('git')
-
-    with_workspace do |workspace|
-      create_bare_repo(workspace, 'sample')
-      slug = '2026-06-06-demo'
-      out = StringIO.new
-      runner = runner_for(workspace, out:)
-      runner.worktree_add(
-        slug, 'sample', as_is: true, name: nil, branch: nil,
-        base: 'master', fetch: false
-      )
-      path = File.join(workspace, 'worktrees', slug, 'sample')
-      configure_git_identity(path)
-      File.write(File.join(path, 'feature.txt'), "merged feature\n")
-      assert_git_success('git', '-C', path, 'add', 'feature.txt')
-      assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
-      merge_registered_branches(workspace, slug)
-      commit_tracking(workspace, slug, lifecycle: 'complete')
-
-      runner.send(:finalize_tracking, slug, as_is: true, check: true)
-
-      assert_includes(out.string, "finalizable: #{slug}")
-      assert(File.directory?(File.join(workspace, 'work', slug)))
-      refute(File.exist?(File.join(workspace, 'archive', slug)))
-      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
-      refute(manifest.key?('finalized_at'))
-      refute(manifest.dig('repositories', 0).key?('final_head_sha'))
-    end
-  end
-
-  def test_finalize_check_does_not_query_a_conversation_from_another_runtime
-    skip 'git is not available' unless command_available?('git')
-
-    with_workspace do |workspace|
-      slug = '2026-06-06-old-runtime'
-      called = File.join(workspace, 'portal-called')
-      portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
-      out = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
-        workspace:,
-        tmux: NullTmux.new,
-        codex_socket: '/run/current/app-server.sock',
-        codex_version: '0.152.1',
-        portal_command: portal,
-        out:,
-        err: StringIO.new,
-        today: TODAY,
-        env: {}
-      )
-      runner.ensure_tracking_files(slug)
-      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
-      manifest['creation']['state'] = 'ready'
-      manifest['codex'] = {
-        'thread_id' => 'thread-old',
-        'socket_path' => '/run/old/app-server.sock',
-        'client_version' => '0.151.0'
-      }
-      runner.send(:write_portal_manifest, slug, manifest)
-      commit_tracking(workspace, slug, lifecycle: 'complete')
-
-      runner.send(:finalize_tracking, slug, as_is: true, check: true)
-
-      assert_includes(out.string, "finalizable: #{slug}")
-      refute(File.exist?(called))
-    end
-  end
-
-  def test_finalize_check_refuses_an_active_codex_turn_without_quiescing
+  def test_archive_refuses_an_active_codex_turn_without_quiescing
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -7489,58 +7421,11 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
       error = assert_raises(VpsfreeDevSession::CommandError) do
-        runner.send(:finalize_tracking, slug, as_is: true, check: true)
+        runner.archive(slug, as_is: true)
       end
 
       assert_includes(error.message, 'thread is active')
       refute(tmux.quiesced)
-      assert(File.directory?(File.join(workspace, 'work', slug)))
-      refute(File.exist?(File.join(workspace, 'archive', slug)))
-    end
-  end
-
-  def test_finalize_prepare_quiesces_the_terminal_and_preserves_tracking
-    skip 'git is not available' unless command_available?('git')
-
-    with_workspace do |workspace|
-      slug = '2026-06-06-prepare'
-      authority_dir = File.join(workspace, 'runtime-authority')
-      out = StringIO.new
-      tmux = ManagedTmux.new(
-        slug,
-        workspace:,
-        socket_path: '/run/test/tmux.sock',
-        codex_thread_id: 'thread-1',
-        codex_socket_path: '/run/test/codex.sock',
-        codex_client_version: '0.152.1',
-        id: '$8'
-      )
-      runner = VpsfreeDevSession::Runner.new(
-        workspace:,
-        authority_dir:,
-        codex_socket: '/run/test/codex.sock',
-        codex_version: '0.152.1',
-        tmux:,
-        portal_command: [RbConfig.ruby, '-e', 'exit 0'],
-        out:,
-        err: StringIO.new,
-        today: TODAY,
-        env: {}
-      )
-      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
-      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
-      manifest['codex'] = {
-        'thread_id' => 'thread-1',
-        'socket_path' => '/run/test/codex.sock',
-        'client_version' => '0.152.1'
-      }
-      runner.send(:write_portal_manifest, slug, manifest)
-      commit_tracking(workspace, slug, lifecycle: 'complete')
-
-      runner.send(:finalize_tracking, slug, as_is: true, prepare: true)
-
-      assert(tmux.quiesced)
-      assert_includes(out.string, "prepared for finalization: #{slug}")
       assert(File.directory?(File.join(workspace, 'work', slug)))
       refute(File.exist?(File.join(workspace, 'archive', slug)))
     end
@@ -7564,7 +7449,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', path, 'commit', '-m', 'discarded feature')
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
 
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
 
       assert(File.directory?(File.join(workspace, 'archive', slug)))
     end
@@ -7583,7 +7468,7 @@ class DevSessionTest < Minitest::Test
       )
       merge_registered_branches(workspace, slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
 
@@ -7687,7 +7572,7 @@ class DevSessionTest < Minitest::Test
       manifest['creation']['initial_goal_sent'] = true
       runner.send(:write_portal_manifest, slug, manifest)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
 
@@ -7718,7 +7603,7 @@ class DevSessionTest < Minitest::Test
       manifest['creation']['initial_goal_sent'] = true
       runner.send(:write_portal_manifest, slug, manifest)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       journal = runner.send(:prepare_revive_journal!, slug, 'complete')
@@ -7798,7 +7683,7 @@ class DevSessionTest < Minitest::Test
       manifest['creation']['initial_goal_sent'] = true
       runner.send(:write_portal_manifest, slug, manifest)
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       journal = runner.send(:prepare_revive_journal!, slug, 'complete')
@@ -7923,7 +7808,7 @@ class DevSessionTest < Minitest::Test
         STATE
       )
       commit_tracking(workspace, slug, lifecycle: 'complete')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
 
@@ -8705,7 +8590,7 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
-      runner.send(:finalize_tracking, slug, as_is: true)
+      finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       error = assert_raises(VpsfreeDevSession::Error) { runner.revive(slug, as_is: true) }
@@ -8815,9 +8700,15 @@ class DevSessionTest < Minitest::Test
     runner = runner_for(workspace)
     runner.ensure_tracking_files(slug)
     commit_tracking(workspace, slug, lifecycle: 'complete')
-    runner.send(:finalize_tracking, slug, as_is: true)
+    finalize_core(runner, slug, as_is: true)
     commit_archive_move(workspace, slug)
     runner
+  end
+
+  def finalize_core(runner, input, as_is:)
+    slug = runner.send(:lookup_slug, input, as_is:)
+    runner.send(:select_tmux_for_slug!, slug)
+    runner.send(:finalize_locked!, slug)
   end
 
   def create_bare_repo(workspace, project)
