@@ -129,7 +129,7 @@
               </nav>
               {{range $index, $service := .Services}}
               <section id="cluster-{{$cluster.Kind}}-service-{{$index}}" class="cluster-service-panel {{if eq $index 0}}active{{end}}" role="tabpanel" aria-labelledby="cluster-{{$cluster.Kind}}-service-tab-{{$index}}" data-cluster-service-panel="{{$index}}">
-                {{if $service.URL}}<dl class="service-details"><dt>Link:</dt><dd><a href="{{$service.URL}}" target="_blank" rel="noreferrer">{{$service.URL}}</a></dd></dl>{{end}}
+                {{if $service.URL}}<div class="service-link"><span>Link</span><a href="{{$service.URL}}" target="_blank" rel="noreferrer">{{$service.URL}}</a></div>{{end}}
                 {{range $service.Accounts}}
                 <section class="cluster-account">
                   <h4>{{.Label}}</h4>
