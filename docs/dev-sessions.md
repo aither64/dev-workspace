@@ -210,14 +210,16 @@ continues to work after archival because the portal scans both `work/` and
 dev-session delete api-token-rotation
 ```
 
-The command requires an interactive terminal and asks you to type the resolved
-full slug. There is no noninteractive confirmation flag. The command records
-each worktree head, retires the matching
-Codex thread, releases vpsAdmin and vpsAdminOS clusters, removes the worktrees,
-stops the managed tmux session, removes runtime authority, and moves the
-tracking directory and creation journal to private recovery storage. It records
-each completed phase in a private journal, so rerunning the same command safely
-continues an interrupted deletion instead of repeating irreversible work.
+The command requires an interactive terminal and asks for one `y/N`
+confirmation. There is no noninteractive confirmation flag. The command
+independently inventories each canonical worktree owned by the exact session,
+including its repository identity, branch, head, and dirty state, then retires
+the matching Codex thread, releases vpsAdmin and vpsAdminOS clusters, removes
+the worktrees, stops the managed tmux session, removes runtime authority, and
+moves the tracking directory and creation journal to private recovery storage.
+It records each completed phase in a private journal, so rerunning the same
+command safely continues an interrupted deletion instead of repeating
+irreversible work.
 Each persisted phase is printed in plain language. The browser uses the same
 journal to show progress and elapsed time while the command continues in the
 background.
@@ -254,11 +256,14 @@ Worktrees with changes reported by ordinary `git status --porcelain` are
 refused unless `--force` is passed. Detached worktrees and paths outside the
 exact initiative group are always refused. Cleanup delegates removal to
 `git worktree remove`; if Git refuses a worktree, resolve the reason and retry.
-`--force` also permits dirty worktrees, preserves unmanaged entries in the
-recovery directory, and interrupts an active Codex turn. If a non-forced attempt
-stops at an active turn, rerunning it with `--force` records a one-way upgrade
-to that authorization and resumes the same journal. Forced deletion still
-requires the interactive exact-slug confirmation:
+Missing or stale `portal.yml` repository entries do not block deletion when the
+actual worktrees can be proven to belong to canonical workspace repositories.
+Symlinks, unmanaged entries, foreign repositories, path escapes, and ambiguous
+ownership are always refused. `--force` permits dirty worktrees and interrupts
+an active Codex turn. If a non-forced attempt stops at an active turn, rerunning
+it with `--force` records a one-way upgrade to that authorization and resumes
+the same journal. Forced deletion still requires the interactive `y/N`
+confirmation:
 
 ```sh
 dev-session delete api-token-rotation --force

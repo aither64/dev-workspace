@@ -1444,7 +1444,7 @@ module VpsfreeDevSession
             validate_removed_tracking_commit!(slug, removal)
             validate_development_cluster_helpers!
             revalidate_session!(plan.session) if plan.session
-            snapshot_portal_repository_heads(slug, plan)
+            snapshot_removal_worktrees!(slug, removal, plan)
             advance_removal!(slug, removal, 'validated')
           end
           if removal_phase_before?(removal, 'thread_retiring')
@@ -1455,12 +1455,14 @@ module VpsfreeDevSession
             retire_portal_thread!(slug, force: removal.fetch('force'))
             advance_removal!(slug, removal, 'thread_retired')
           end
+          seal_removal_worktrees!(slug, removal)
           if removal_phase_before?(removal, 'clusters_released')
             release_development_clusters!(slug, operation: 'removal')
             advance_removal!(slug, removal, 'clusters_released')
           end
           if removal_phase_before?(removal, 'worktrees_removed')
-            execute_cleanup(slug, plan, force: removal.fetch('force'))
+            plan = removal_cleanup_plan(slug, removal)
+            execute_removal_cleanup(slug, removal, plan)
             advance_removal!(slug, removal, 'worktrees_removed')
           end
           if removal_phase_before?(removal, 'runtime_retired')
@@ -3716,30 +3718,6 @@ module VpsfreeDevSession
       candidates.fetch(0)
     end
 
-    def snapshot_portal_repository_heads(slug, plan)
-      manifest = load_portal_manifest(portal_file(slug), required: false)
-      return unless manifest
-
-      entries = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
-      repositories = manifest.fetch('repositories', [])
-      registered_names = repositories.map { |repository| repository.fetch('name') }
-      unregistered = entries.keys - registered_names
-      unless unregistered.empty?
-        raise Error, "worktrees are missing from the portal manifest: #{unregistered.sort.join(', ')}"
-      end
-
-      repositories.each do |repository|
-        entry = entries[repository['name']]
-        next unless entry
-
-        validate_portal_repository_identity!(repository, entry.fetch(:common_dir), entry.fetch(:path))
-        repository['final_head_sha'] = git_capture([
-          'git', '-C', entry.fetch(:path), 'rev-parse', 'HEAD'
-        ]).strip
-      end
-      write_portal_manifest(slug, manifest)
-    end
-
     def record_portal_repository_head(slug, name, worktree, common_dir)
       manifest = load_portal_manifest(portal_file(slug), required: false)
       return unless manifest
@@ -3825,7 +3803,7 @@ module VpsfreeDevSession
 
       entries = worktree_entries(slug)
       unexpected = unexpected_worktree_entries(slug, entries)
-      unless force || unexpected.empty?
+      unless unexpected.empty?
         raise Error, "worktree group contains unmanaged entries: #{unexpected.join(', ')}"
       end
 
@@ -3847,6 +3825,226 @@ module VpsfreeDevSession
       end
 
       CleanupPlan.new(session:, entries:, unexpected:)
+    end
+
+    def snapshot_removal_worktrees!(slug, removal, plan)
+      inventory = plan.entries.map do |entry|
+        path = entry.fetch(:path)
+        common_dir = validate_worktree_path!(slug, entry)
+        unless common_dir == entry.fetch(:common_dir)
+          raise Error, "worktree registration changed during deletion: #{path}"
+        end
+        branch = git_capture([
+          'git', '-C', path, 'symbolic-ref', '--quiet', '--short', 'HEAD'
+        ]).strip
+        validate_git_branch!(branch)
+        {
+          'name' => entry.fetch(:name),
+          'project' => legacy_project_name(common_dir),
+          'path' => path,
+          'git_common_dir' => common_dir,
+          'branch' => branch,
+          'head_sha' => git_capture(['git', '-C', path, 'rev-parse', 'HEAD']).strip,
+          'dirty' => worktree_dirty?(path),
+          'removed' => false
+        }
+      end
+      unless valid_removal_worktree_inventory?(slug, inventory)
+        raise Error, "invalid worktree inventory for deletion: #{slug}"
+      end
+
+      snapshot_registered_removal_heads(slug, plan, inventory)
+      candidate = removal.merge('worktrees' => inventory, 'worktrees_sealed' => false)
+      if JSON.generate(candidate).bytesize + 1 > AUTHORITY_MAX_SIZE
+        raise Error, "worktree inventory is too large for deletion recovery: #{slug}"
+      end
+      removal['worktrees'] = inventory
+      removal['worktrees_sealed'] = false
+      write_removal_metadata!(removal.fetch('recovery'), removal)
+      write_removal_journal!(slug, removal)
+    end
+
+    def seal_removal_worktrees!(slug, removal)
+      return if removal.fetch('worktrees_sealed', false)
+
+      plan = prepare_cleanup(slug, force: removal.fetch('force'))
+      snapshot_removal_worktrees!(slug, removal, plan) unless removal.key?('worktrees')
+      recorded = removal.fetch('worktrees')
+      current = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
+      additions = current.keys - recorded.map { |entry| entry.fetch('name') }
+      unless additions.empty?
+        raise Error,
+              "worktrees were added after deletion started: #{additions.sort.join(', ')}"
+      end
+      refreshed = recorded.map do |expected|
+        entry = current.fetch(expected.fetch('name')) do
+          raise Error,
+                "worktree disappeared before deletion inventory was sealed: #{expected.fetch('path')}"
+        end
+        actual = removal_worktree_record(slug, entry)
+        validate_removal_worktree_identity!(expected, actual)
+        actual
+      end
+      removal['worktrees'] = refreshed
+      removal['worktrees_sealed'] = true
+      snapshot_registered_removal_heads(slug, plan, refreshed)
+      write_removal_metadata!(removal.fetch('recovery'), removal)
+      write_removal_journal!(slug, removal)
+    end
+
+    def removal_cleanup_plan(slug, removal)
+      unless removal.fetch('worktrees_sealed', false)
+        raise Error, "worktree deletion inventory is not sealed: #{slug}"
+      end
+
+      plan = prepare_cleanup(slug, force: removal.fetch('force'))
+      recorded = removal.fetch('worktrees')
+      expected = recorded.to_h { |entry| [entry.fetch('name'), entry] }
+      current = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
+      additions = current.keys - expected.keys
+      unless additions.empty?
+        raise Error,
+              "worktrees were added after deletion started: #{additions.sort.join(', ')}"
+      end
+      expected.each do |name, inventory|
+        entry = current[name]
+        if entry
+          if inventory.fetch('removed', false)
+            raise Error, "removed worktree reappeared during deletion: #{inventory.fetch('path')}"
+          end
+          validate_removal_worktree_record!(slug, entry, inventory)
+        else
+          prove_removal_worktree_absent!(slug, inventory)
+          next if inventory.fetch('removed', false)
+
+          inventory['removed'] = true
+          write_removal_metadata!(removal.fetch('recovery'), removal)
+          write_removal_journal!(slug, removal)
+        end
+      end
+      plan
+    end
+
+    def removal_worktree_record(slug, entry)
+      path = entry.fetch(:path)
+      common_dir = validate_worktree_path!(slug, entry)
+      branch = git_capture([
+        'git', '-C', path, 'symbolic-ref', '--quiet', '--short', 'HEAD'
+      ]).strip
+      validate_git_branch!(branch)
+      {
+        'name' => entry.fetch(:name),
+        'project' => legacy_project_name(common_dir),
+        'path' => path,
+        'git_common_dir' => common_dir,
+        'branch' => branch,
+        'head_sha' => git_capture(['git', '-C', path, 'rev-parse', 'HEAD']).strip,
+        'dirty' => worktree_dirty?(path),
+        'removed' => false
+      }
+    end
+
+    def validate_removal_worktree_identity!(expected, actual)
+      keys = %w[name project path git_common_dir]
+      return if keys.all? { |key| expected.fetch(key) == actual.fetch(key) }
+
+      raise Error,
+            "worktree identity changed during deletion: #{expected.fetch('path')}"
+    end
+
+    def validate_removal_worktree_record!(slug, entry, expected)
+      actual = removal_worktree_record(slug, entry)
+      validate_removal_worktree_identity!(expected, actual)
+      %w[branch head_sha].each do |key|
+        next if expected.fetch(key) == actual.fetch(key)
+
+        raise Error,
+              "worktree #{key.tr('_', ' ')} changed during deletion: #{expected.fetch('path')}"
+      end
+      actual
+    end
+
+    def prove_removal_worktree_absent!(slug, expected)
+      path = expected.fetch('path')
+      if path_exists?(path)
+        raise Error, "worktree path changed during deletion: #{path}"
+      end
+
+      common_dir = expected.fetch('git_common_dir')
+      canonical = if expected.fetch('name') == 'workspace'
+                    validate_workspace_repository!(workspace)
+                  else
+                    validate_canonical_repository!(common_dir, path)
+                  end
+      unless canonical == common_dir && legacy_project_name(canonical) == expected.fetch('project')
+        raise Error, "worktree repository changed during deletion: #{path}"
+      end
+      listing = git_capture([
+        'git', "--git-dir=#{canonical}", 'worktree', 'list', '--porcelain', '-z'
+      ])
+      registered = listing.split("\0\0").any? do |candidate|
+        location = candidate.split("\0").first&.delete_prefix('worktree ')
+        location && File.expand_path(location) == File.expand_path(path)
+      end
+      raise Error, "removed worktree remains registered during deletion: #{path}" if registered
+    end
+
+    def snapshot_registered_removal_heads(slug, plan, inventory)
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      return unless manifest
+
+      entries = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
+      heads = inventory.to_h { |entry| [entry.fetch('name'), entry.fetch('head_sha')] }
+      changed = false
+      manifest.fetch('repositories', []).each do |repository|
+        name = repository.fetch('name')
+        entry = entries[name]
+        next unless entry
+
+        begin
+          validate_portal_repository_identity!(
+            repository, entry.fetch(:common_dir), entry.fetch(:path)
+          )
+        rescue Error
+          # Deletion trusts the independently verified canonical worktree rather
+          # than stale portal registration metadata.
+          next
+        end
+        repository['final_head_sha'] = heads.fetch(name)
+        changed = true
+      end
+      write_portal_manifest(slug, manifest) if changed
+    end
+
+    def valid_removal_worktree_inventory?(slug, inventory)
+      return false unless inventory.is_a?(Array)
+
+      names = []
+      paths = []
+      valid = inventory.all? do |entry|
+        required = %w[branch dirty git_common_dir head_sha name path project]
+        allowed = required + %w[removed]
+        next false unless entry.is_a?(Hash) &&
+                          (required - entry.keys).empty? &&
+                          (entry.keys - allowed).empty?
+
+        name = entry['name']
+        path = entry['path']
+        names << name
+        paths << path
+        name.is_a?(String) && !name.empty? && name != '.' && name != '..' &&
+          !name.include?(File::SEPARATOR) && !name.include?("\0") &&
+          entry['project'].is_a?(String) && entry['project'].match?(SAFE_PART) &&
+          path == File.join(worktrees_dir(slug), name) &&
+          entry['git_common_dir'].is_a?(String) &&
+          entry['git_common_dir'].start_with?(File::SEPARATOR) &&
+          entry['branch'].is_a?(String) && !entry['branch'].empty? &&
+          entry['head_sha'].is_a?(String) &&
+          entry['head_sha'].match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/) &&
+          [true, false].include?(entry['dirty']) &&
+          (!entry.key?('removed') || [true, false].include?(entry['removed']))
+      end
+      valid && names.uniq.length == names.length && paths.uniq.length == paths.length
     end
 
     def cleanup_session(slug)
@@ -3877,6 +4075,41 @@ module VpsfreeDevSession
           common_dir: entry.fetch(:common_dir),
           force:
         )
+      end
+
+      remove_worktree_group!(slug) if plan.unexpected.empty?
+    end
+
+    def execute_removal_cleanup(slug, removal, plan)
+      inventory = removal.fetch('worktrees').to_h do |entry|
+        [entry.fetch('name'), entry]
+      end
+      plan.entries.each do |entry|
+        expected = inventory.fetch(entry.fetch(:name))
+        actual = validate_removal_worktree_record!(slug, entry, expected)
+        if actual.fetch('dirty') != expected.fetch('dirty')
+          unless removal.fetch('force')
+            raise Error,
+                  "worktree dirty state changed during deletion: #{expected.fetch('path')}"
+          end
+          expected['dirty'] = actual.fetch('dirty')
+          write_removal_metadata!(removal.fetch('recovery'), removal)
+          write_removal_journal!(slug, removal)
+        end
+        remove_worktree_path(
+          slug,
+          entry,
+          common_dir: expected.fetch('git_common_dir'),
+          force: removal.fetch('force'),
+          expected:
+        ) do |actual_dirty|
+          expected['dirty'] = actual_dirty
+          write_removal_metadata!(removal.fetch('recovery'), removal)
+          write_removal_journal!(slug, removal)
+        end
+        expected['removed'] = true
+        write_removal_metadata!(removal.fetch('recovery'), removal)
+        write_removal_journal!(slug, removal)
       end
 
       remove_worktree_group!(slug) if plan.unexpected.empty?
@@ -4062,14 +4295,18 @@ module VpsfreeDevSession
       end
       data = JSON.parse(encoded)
       required = %w[schema slug workspace created_at state phase force tracking recovery]
-      allowed = required + %w[git_tracked]
+      allowed = required + %w[git_tracked worktrees worktrees_sealed]
       unless data.is_a?(Hash) && (required - data.keys).empty? && (data.keys - allowed).empty? &&
              data['schema'] == 1 && data['slug'] == slug && data['workspace'] == workspace &&
              REMOVAL_PHASES.include?(data['phase']) && [true, false].include?(data['force']) &&
              %w[work archive].include?(data['tracking']) && data['recovery'].is_a?(String) &&
              ((data['phase'] == 'removed' && data['state'] == 'removed') ||
               (data['phase'] != 'removed' && data['state'] == 'prepared')) &&
-             (!data.key?('git_tracked') || [true, false].include?(data['git_tracked']))
+             (!data.key?('git_tracked') || [true, false].include?(data['git_tracked'])) &&
+             (!data.key?('worktrees_sealed') || [true, false].include?(data['worktrees_sealed'])) &&
+             (!data.fetch('worktrees_sealed', false) || data.key?('worktrees')) &&
+             (!data.key?('worktrees') ||
+              valid_removal_worktree_inventory?(slug, data['worktrees']))
         raise Error, "invalid removal journal: #{path}"
       end
       validate_removal_recovery!(slug, data)
@@ -4199,10 +4436,6 @@ module VpsfreeDevSession
 
     def preserve_removed_state!(slug, removal, plan)
       recovery = removal.fetch('recovery')
-      if removal.fetch('force') && !plan.unexpected.empty? && path_exists?(worktrees_dir(slug))
-        target = File.join(recovery, 'unmanaged-worktrees')
-        move_to_removal_recovery!(worktrees_dir(slug), recovery, 'unmanaged-worktrees') unless path_exists?(target)
-      end
       journal = creation_journal_file(slug)
       if path_exists?(journal)
         raise Error, "creation journal is a symlink: #{journal}" if File.symlink?(journal)
@@ -4437,13 +4670,30 @@ module VpsfreeDevSession
       end
     end
 
-    def remove_worktree_path(slug, entry, common_dir:, force:)
+    def remove_worktree_path(slug, entry, common_dir:, force:, expected: nil)
       current_common_dir = validate_worktree_path!(slug, entry)
       unless current_common_dir == common_dir
         raise Error, "worktree registration changed during cleanup: #{entry.fetch(:path)}"
       end
 
       validate_worktree_head!(entry.fetch(:path))
+      if expected
+        actual = removal_worktree_record(slug, entry)
+        validate_removal_worktree_identity!(expected, actual)
+        %w[branch head_sha].each do |key|
+          next if expected.fetch(key) == actual.fetch(key)
+
+          raise Error,
+                "worktree #{key.tr('_', ' ')} changed during cleanup: #{entry.fetch(:path)}"
+        end
+        if actual.fetch('dirty') != expected.fetch('dirty')
+          unless force
+            raise Error,
+                  "worktree dirty state changed during cleanup: #{entry.fetch(:path)}"
+          end
+          yield actual.fetch('dirty') if block_given?
+        end
+      end
       unless force || !worktree_dirty?(entry.fetch(:path))
         raise Error,
               "worktree gained uncommitted changes during cleanup: #{entry.fetch(:path)}"
@@ -6917,17 +7167,22 @@ module VpsfreeDevSession
       parser.parse!(@argv)
       require_arity!(1, @argv, 'delete')
 
-      slug = authorize_session_closure!(
-        @argv.fetch(0),
-        as_is: opts.fetch(:as_is),
-        command: 'delete',
-        prompt: 'delete',
-        portal_authorized: opts.fetch(:portal_authorized),
-        warnings: [
+      slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
+      if opts.fetch(:portal_authorized)
+        validate_portal_authorization!
+      else
+        warnings = [
           'This removes the session from workspace discovery.',
           'Git branches are retained and tracking is moved to private recovery storage.'
         ]
-      )
+        warnings << 'Dirty worktrees and an active Codex turn will be discarded.' if opts.fetch(:force)
+        authorize_yes_no!(
+          slug,
+          command: 'delete',
+          question: "Delete session #{slug}?",
+          warnings:
+        )
+      end
 
       with_lifecycle_transition do
         runner.delete(slug, as_is: true, force: opts.fetch(:force))

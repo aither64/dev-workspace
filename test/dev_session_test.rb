@@ -94,7 +94,7 @@ class DevSessionTest < Minitest::Test
           '--transition-lock', path, '--', 'delete',
           '2026-06-06-demo', '--as-is'
         ],
-        input: SignalingTTYInput.new("2026-06-06-demo\n", read: prompt_read),
+        input: SignalingTTYInput.new("yes\n", read: prompt_read),
         out: StringIO.new,
         err: StringIO.new
       )
@@ -143,12 +143,12 @@ class DevSessionTest < Minitest::Test
       slave.close
 
       prompt = +''
-      until prompt.include?('Type 2026-06-06-demo to delete this session:')
+      until prompt.include?('Delete session 2026-06-06-demo? [y/N]')
         ready = IO.select([master], nil, nil, 2)
         flunk('timed out waiting for lifecycle confirmation prompt') unless ready
         prompt << master.read_nonblock(4096)
       end
-      master.write("2026-06-06-demo\n")
+      master.write("y\n")
       sleep 0.05
       refute(File.exist?(marker))
       assert(Process.kill(0, pid))
@@ -196,7 +196,7 @@ class DevSessionTest < Minitest::Test
             '--expected-host-profile-token', profile_link_token(profile),
             '--', 'delete', '2026-06-06-demo', '--as-is'
           ],
-          input: SignalingTTYInput.new("2026-06-06-demo\n", read: prompt_read),
+          input: SignalingTTYInput.new("yes\n", read: prompt_read),
           out: StringIO.new,
           err: error_output
         )
@@ -4555,14 +4555,14 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_delete_requires_the_full_slug_in_interactive_cli
+  def test_delete_uses_a_simple_interactive_confirmation
     with_workspace do |workspace|
       runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
       err = StringIO.new
 
       status = VpsfreeDevSession::CLI.new(
         ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
-        input: TTYInput.new("demo\n"),
+        input: TTYInput.new("no\n"),
         out: StringIO.new,
         err:
       ).run
@@ -4570,6 +4570,16 @@ class DevSessionTest < Minitest::Test
       assert_equal(1, status)
       assert_includes(err.string, 'was not confirmed')
       assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
+
+      status = VpsfreeDevSession::CLI.new(
+        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
+        input: TTYInput.new("yes\n"),
+        out: StringIO.new,
+        err: StringIO.new
+      ).run
+
+      assert_equal(0, status)
+      refute(File.exist?(File.join(workspace, 'work', '2026-06-06-demo')))
     end
   end
 
@@ -4613,21 +4623,67 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_remove_force_preserves_unmanaged_worktree_entries
+  def test_remove_force_refuses_unmanaged_worktree_entries
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
       File.write(File.join(workspace, 'worktrees', slug, 'unmanaged.txt'), "keep me\n")
 
-      runner.delete(slug, as_is: true, force: true)
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
 
-      recovery = removal_recovery(workspace, slug)
+      assert_includes(error.message, 'contains unmanaged entries')
       assert_equal(
         "keep me\n",
-        File.read(File.join(recovery, 'unmanaged-worktrees', 'unmanaged.txt'))
+        File.read(File.join(workspace, 'worktrees', slug, 'unmanaged.txt'))
       )
-      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_force_refuses_a_symlinked_worktree_entry
+    with_workspace do |workspace|
+      slug = '2026-06-06-symlinked-worktree'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      outside = File.join(workspace, 'outside-worktree')
+      FileUtils.mkdir_p(outside)
+      FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'linked'))
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert_includes(error.message, 'contains unmanaged entries')
+      assert(File.symlink?(File.join(workspace, 'worktrees', slug, 'linked')))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_force_refuses_a_worktree_from_a_foreign_repository
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-foreign-worktree'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      Dir.mktmpdir('external-dev-session-repository') do |external|
+        FileUtils.mkdir_p(File.join(external, 'repos'))
+        create_bare_repo(external, 'sample')
+        bare = File.join(external, 'repos', 'sample.git')
+        path = File.join(workspace, 'worktrees', slug, 'sample')
+        assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
+
+        error = assert_raises(VpsfreeDevSession::Error) do
+          runner.delete(slug, as_is: true, force: true)
+        end
+
+        assert_includes(error.message, 'outside the canonical repository root')
+        assert(File.directory?(path))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      end
     end
   end
 
@@ -4716,6 +4772,237 @@ class DevSessionTest < Minitest::Test
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
       assert_equal('thread_retiring', journal.fetch('phase'))
       assert(File.file?(File.join(recovery, 'recovery.json')))
+    end
+  end
+
+  def test_remove_seals_the_head_written_by_an_active_turn_before_cleanup
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-active-turn-head'
+      creator = runner_for(workspace)
+      creator.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      worktree = File.join(workspace, 'worktrees', slug, 'sample')
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        File.write(File.join(#{worktree.dump}, 'from-active-turn'), "changed\n")
+        system(
+          {'GIT_AUTHOR_NAME' => 'Test', 'GIT_AUTHOR_EMAIL' => 'test@example.invalid',
+           'GIT_COMMITTER_NAME' => 'Test', 'GIT_COMMITTER_EMAIL' => 'test@example.invalid'},
+          'git', '-C', #{worktree.dump}, 'add', 'from-active-turn'
+        ) or abort 'unable to stage active-turn change'
+        system(
+          {'GIT_AUTHOR_NAME' => 'Test', 'GIT_AUTHOR_EMAIL' => 'test@example.invalid',
+           'GIT_COMMITTER_NAME' => 'Test', 'GIT_COMMITTER_EMAIL' => 'test@example.invalid'},
+          'git', '-C', #{worktree.dump}, 'commit', '-m', 'active turn change'
+        ) or abort 'unable to commit active-turn change'
+      RUBY
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest['codex'] = {
+        'thread_id' => 'thread-1', 'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.153.4'
+      }
+      File.write(manifest_path, YAML.dump(manifest))
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new,
+        portal_command: [RbConfig.ruby, portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new, err: StringIO.new, today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+
+      runner.delete(slug, as_is: true, force: true)
+
+      recovery = JSON.parse(File.read(File.join(removal_recovery(workspace, slug), 'recovery.json')))
+      recorded = recovery.fetch('worktrees').fetch(0)
+      assert_equal(
+        git_capture_success(
+          'git', "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+          'rev-parse', slug
+        ).strip,
+        recorded.fetch('head_sha')
+      )
+      assert_equal(false, recorded.fetch('dirty'))
+      assert_equal(true, recorded.fetch('removed'))
+    end
+  end
+
+  def test_remove_retry_refuses_a_worktree_added_after_deletion_started
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      create_bare_repo(workspace, 'other')
+      slug = '2026-06-06-added-worktree'
+      creator = runner_for(workspace)
+      creator.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      portal = File.join(workspace, 'portal')
+      File.write(portal, "#!/bin/sh\nexit 19\n")
+      File.chmod(0o755, portal)
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest['codex'] = {
+        'thread_id' => 'thread-1', 'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.153.4'
+      }
+      File.write(manifest_path, YAML.dump(manifest))
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, portal_command: [portal],
+        codex_socket: '/run/test/codex.sock',
+        out: StringIO.new, err: StringIO.new, today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+      added = File.join(workspace, 'worktrees', slug, 'other')
+      assert_git_success(
+        'git', "--git-dir=#{File.join(workspace, 'repos', 'other.git')}",
+        'worktree', 'add', '-b', slug, added, 'master'
+      )
+      File.write(portal, "#!/bin/sh\nexit 0\n")
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert_includes(error.message, 'worktrees were added after deletion started')
+      assert(File.directory?(added))
+      assert(File.directory?(File.join(workspace, 'worktrees', slug, 'sample')))
+    end
+  end
+
+  def test_remove_retry_refuses_head_drift_after_inventory_is_sealed
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-sealed-head-drift'
+      creator = runner_for(workspace)
+      creator.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      helper = File.join(workspace, 'vpsadmin-devcluster')
+      marker = File.join(workspace, 'cluster-retried')
+      File.write(helper, <<~SH)
+        #!/bin/sh
+        if [ "$1" = cleanup-paths ]; then
+          printf '%s\n' '{"schema":1,"paths":[]}'
+          exit 0
+        fi
+        if [ ! -e #{Shellwords.escape(marker)} ]; then
+          : > #{Shellwords.escape(marker)}
+          exit 19
+        fi
+      SH
+      File.chmod(0o755, helper)
+      runner = VpsfreeDevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, vpsadmin_cluster: helper,
+        out: StringIO.new, err: StringIO.new, today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      assert_raises(VpsfreeDevSession::CommandError) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+      worktree = File.join(workspace, 'worktrees', slug, 'sample')
+      File.write(File.join(worktree, 'later'), "changed\n")
+      assert_git_success('git', '-C', worktree, 'add', 'later')
+      assert_git_success(
+        'git', '-C', worktree,
+        '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit', '-m', 'later change'
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert_includes(error.message, 'worktree head sha changed during deletion')
+      assert(File.directory?(worktree))
+    end
+  end
+
+  def test_remove_retry_proves_a_worktree_removed_before_its_journal_update
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      create_bare_repo(workspace, 'other')
+      slug = '2026-06-06-partial-worktree-removal'
+      runner = runner_for(workspace)
+      %w[sample other].each do |project|
+        runner.worktree_add(
+          slug, project, as_is: true, name: nil, branch: nil,
+          base: 'master', fetch: false
+        )
+      end
+      remove = runner.method(:remove_worktree_path)
+      interrupted = false
+      runner.define_singleton_method(:remove_worktree_path) do |*arguments, **options|
+        remove.call(*arguments, **options)
+        unless interrupted
+          interrupted = true
+          raise VpsfreeDevSession::Error, 'simulated interruption after worktree removal'
+        end
+      end
+
+      assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: false)
+      end
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal(0, journal.fetch('worktrees').count { |entry| entry.fetch('removed', false) })
+
+      runner.delete(slug, as_is: true, force: false)
+
+      recovery = JSON.parse(File.read(File.join(removal_recovery(workspace, slug), 'recovery.json')))
+      assert(recovery.fetch('worktrees').all? { |entry| entry.fetch('removed') })
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+    end
+  end
+
+  def test_remove_rechecks_the_head_immediately_before_worktree_removal
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-worktree-removal-race'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      worktree = File.join(workspace, 'worktrees', slug, 'sample')
+      remove = runner.method(:remove_worktree_path)
+      changed = false
+      runner.define_singleton_method(:remove_worktree_path) do |*arguments, **options|
+        unless changed
+          changed = true
+          File.write(File.join(worktree, 'raced'), "changed\n")
+          system('git', '-C', worktree, 'add', 'raced') or raise 'unable to stage race'
+          system(
+            'git', '-C', worktree,
+            '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            'commit', '-m', 'raced change'
+          ) or raise 'unable to commit race'
+        end
+        remove.call(*arguments, **options)
+      end
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.delete(slug, as_is: true, force: true)
+      end
+
+      assert_includes(error.message, 'worktree head sha changed during cleanup')
+      assert(File.directory?(worktree))
     end
   end
 
@@ -5382,6 +5669,77 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_remove_uses_verified_worktrees_missing_from_the_portal_manifest
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-unregistered-worktree'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest['repositories'] = []
+      File.write(manifest_path, YAML.dump(manifest))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(path))
+      recovery = JSON.parse(File.read(File.join(
+        removal_recovery(workspace, slug), 'recovery.json'
+      )))
+      assert_equal(
+        [{
+          'name' => 'sample',
+          'project' => 'sample',
+          'path' => path,
+          'git_common_dir' => File.join(workspace, 'repos', 'sample.git'),
+          'branch' => slug,
+          'head_sha' => head,
+          'dirty' => false,
+          'removed' => true
+        }],
+        recovery.fetch('worktrees')
+      )
+      assert_git_success(
+        'git', "--git-dir=#{File.join(workspace, 'repos', 'sample.git')}",
+        'show-ref', '--verify', "refs/heads/#{slug}"
+      )
+    end
+  end
+
+  def test_remove_ignores_a_stale_portal_worktree_identity
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      create_bare_repo(workspace, 'other')
+      slug = '2026-06-06-stale-worktree-registration'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(manifest_path))
+      manifest.fetch('repositories').fetch(0)['project'] = 'other'
+      File.write(manifest_path, YAML.dump(manifest))
+
+      runner.delete(slug, as_is: true, force: false)
+
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      recovery = JSON.parse(File.read(File.join(
+        removal_recovery(workspace, slug), 'recovery.json'
+      )))
+      assert_equal('sample', recovery.fetch('worktrees').fetch(0).fetch('project'))
+    end
+  end
+
   def test_remove_refuses_dirty_worktrees_without_force
     skip 'git is not available' unless command_available?('git')
 
@@ -5436,7 +5794,10 @@ class DevSessionTest < Minitest::Test
 
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
       refute(File.exist?(File.join(workspace, 'work', slug)))
-      assert(File.directory?(removal_recovery(workspace, slug)))
+      recovery = removal_recovery(workspace, slug)
+      assert(File.directory?(recovery))
+      metadata = JSON.parse(File.read(File.join(recovery, 'recovery.json')))
+      assert_equal(true, metadata.fetch('worktrees').fetch(0).fetch('dirty'))
     end
   end
 
