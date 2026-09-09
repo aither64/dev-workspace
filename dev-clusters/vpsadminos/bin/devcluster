@@ -505,7 +505,12 @@ status_cluster() {
   [ -n "$slug" ] || die "missing slug"
 
   if [ "${2:-}" = "--json" ]; then
-    devcluster_status_json vpsadminos "$slug" vpsadminos-devcluster false
+    devcluster_status_json vpsadminos "$slug" vpsadminos-devcluster false |
+      jq -c '
+        .schema = 2 |
+        if .found then .services = [] else . end |
+        del(.links, .credentials)
+      '
     return
   fi
 

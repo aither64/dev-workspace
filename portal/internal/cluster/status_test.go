@@ -21,7 +21,7 @@ func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
 		config, socketPrefix string
 	}{
 		"vpsadmin": {
-			config:       `{"topologies":{"single":["node1"]},"seed":{"users":[{"login":"custom","password":"custom-password"}]}}`,
+			config:       `{"topologies":{"single":["node1"]},"domains":{"webui":"webui.example.test"},"seed":{"users":[{"login":"custom","password":"custom-password"}]}}`,
 			socketPrefix: "vpsfree-devcluster",
 		},
 		"vpsadminos": {
@@ -62,8 +62,18 @@ func TestInspectConsumesRealPackagedHelperContracts(t *testing.T) {
 	if len(statuses) != 2 || statuses[0].Kind != "vpsadmin" || statuses[1].Kind != "vpsadminos" {
 		t.Fatalf("real helper statuses = %#v", statuses)
 	}
-	if len(statuses[0].Credentials) != 4 || statuses[0].Credentials[2].Value != "custom" {
-		t.Fatalf("custom credentials = %#v", statuses[0].Credentials)
+	if len(statuses[0].Services) != 2 || len(statuses[0].Services[0].Accounts) != 2 ||
+		statuses[0].Services[0].Accounts[1].Fields[0].Value != "custom" ||
+		!statuses[0].Services[0].Accounts[1].Fields[1].Secret {
+		t.Fatalf("custom services = %#v", statuses[0].Services)
+	}
+	adminer := statuses[0].Services[1]
+	if adminer.Label != "Adminer" || len(adminer.Accounts) != 1 ||
+		adminer.Accounts[0].Label != "Database" || len(adminer.Accounts[0].Fields) != 4 ||
+		adminer.Accounts[0].Fields[2].Value != "vpsadmin" ||
+		adminer.Accounts[0].Fields[3].Value != "testMariadbApiPassword" ||
+		!adminer.Accounts[0].Fields[3].Secret {
+		t.Fatalf("Adminer database account = %#v", adminer)
 	}
 }
 
@@ -91,13 +101,25 @@ func TestMayExistUsesOnlyProviderStateEntries(t *testing.T) {
 func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	workspace := t.TempDir()
 	vpsadmin := statusHelper(t, `{
-		"schema":1,"found":true,"kind":"vpsadmin",
+		"schema":2,"found":true,"kind":"vpsadmin",
 		"state":"stale","ready":true,"topology":"single","network":"local",
-		"links":[{"label":"Web UI","url":"https://webui.example.test:10443/"}],
 		"commands":[{"label":"services","value":"vpsadmin-devcluster ssh example services"}],
-		"credentials":[{"label":"Admin login","value":"test-admin"}]
+		"services":[
+			{
+				"label":"Web UI","url":"https://webui.example.test:10443/",
+				"accounts":[{"label":"Administrator","fields":[
+					{"label":"Login","value":"test-admin","secret":false},
+					{"label":"Password","value":"test-password","secret":true}
+				]}]
+			},
+			{
+				"label":"Adminer","accounts":[{"label":"Web authentication","fields":[
+					{"label":"Password","value":"adminer-password","secret":true}
+				]}]
+			}
+		]
 	}`)
-	vpsadminOS := statusHelper(t, `{"schema":1,"found":false,"kind":"vpsadminos"}`)
+	vpsadminOS := statusHelper(t, `{"schema":2,"found":false,"kind":"vpsadminos"}`)
 
 	statuses, err := (Runner{Workspace: workspace, Vpsadmin: vpsadmin, VpsadminOS: vpsadminOS}).Inspect("example")
 	if err != nil {
@@ -109,10 +131,13 @@ func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	if statuses[0].Label != "vpsAdmin" {
 		t.Fatalf("status label = %q", statuses[0].Label)
 	}
-	if len(statuses[0].Links) != 1 || statuses[0].Links[0].URL != "https://webui.example.test:10443/" {
-		t.Fatalf("links = %#v", statuses[0].Links)
+	if len(statuses[0].Services) != 2 ||
+		statuses[0].Services[0].URL != "https://webui.example.test:10443/" ||
+		statuses[0].Services[1].URL != "" {
+		t.Fatalf("services = %#v", statuses[0].Services)
 	}
-	if len(statuses[0].Commands) != 1 || len(statuses[0].Credentials) != 1 {
+	if len(statuses[0].Commands) != 1 ||
+		!statuses[0].Services[0].Accounts[0].Fields[1].Secret {
 		t.Fatalf("structured status = %#v", statuses[0])
 	}
 
@@ -134,16 +159,50 @@ func TestInspectUsesHelperOwnedStructuredStatus(t *testing.T) {
 	}
 }
 
+func TestInspectNormalizesLegacyHelperStatus(t *testing.T) {
+	helper := statusHelper(t, `{
+		"schema":1,"found":true,"kind":"vpsadmin","state":"stopped","ready":false,
+		"links":[{"label":"Web UI","url":"https://webui.example.test/"}],
+		"commands":[{"label":"services","value":"vpsadmin-devcluster ssh example services"}],
+		"credentials":[
+			{"label":"Admin login","value":"test-admin"},
+			{"label":"Admin password","value":"test-password"}
+		]
+	}`)
+
+	statuses, err := (Runner{Workspace: t.TempDir(), Vpsadmin: helper}).Inspect("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || len(statuses[0].Services) != 2 {
+		t.Fatalf("legacy status = %#v", statuses)
+	}
+	if statuses[0].Services[0].URL != "https://webui.example.test/" ||
+		statuses[0].Services[1].Accounts[0].Fields[0].Value != "test-admin" ||
+		!statuses[0].Services[1].Accounts[0].Fields[1].Secret {
+		t.Fatalf("normalized legacy services = %#v", statuses[0].Services)
+	}
+	if statuses[0].Links != nil || statuses[0].Credentials != nil {
+		t.Fatalf("legacy fields were not cleared: %#v", statuses[0])
+	}
+}
+
 func TestInspectRejectsIncompatibleOrInvalidHelperStatus(t *testing.T) {
 	for _, testCase := range []struct {
 		name, payload, message string
 	}{
-		{"schema", `{"schema":2,"found":true,"kind":"vpsadmin"}`, "incompatible"},
+		{"schema", `{"schema":3,"found":true,"kind":"vpsadmin"}`, "incompatible"},
 		{"kind", `{"schema":1,"found":true,"kind":"vpsadminos"}`, "incompatible"},
 		{"state", `{"schema":1,"found":true,"kind":"vpsadmin","state":"broken"}`, "invalid status"},
 		{"label", `{"schema":1,"found":true,"kind":"vpsadmin","label":"helper label","state":"stopped"}`, "invalid status"},
 		{"not-found-label", `{"schema":1,"found":false,"kind":"vpsadmin","label":"helper label"}`, "invalid status"},
 		{"unknown-field", `{"schema":1,"found":false,"kind":"vpsadmin","extra":true}`, "unknown field"},
+		{"schema-2-legacy", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped","links":[]}`, "legacy"},
+		{"schema-2-services", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped"}`, "missing services"},
+		{"unsafe-service-url", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped","services":[{"label":"Web UI","url":"javascript:alert(1)"}]}`, "service is invalid"},
+		{"empty-service", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped","services":[{"label":"Web UI"}]}`, "service is invalid"},
+		{"empty-account", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped","services":[{"label":"Web UI","url":"https://example.test/","accounts":[{"label":"Admin","fields":[]}]}]}`, "account is incomplete"},
+		{"missing-secret", `{"schema":2,"found":true,"kind":"vpsadmin","state":"stopped","services":[{"label":"Web UI","url":"https://example.test/","accounts":[{"label":"Admin","fields":[{"label":"Login","value":"admin"}]}]}]}`, "missing secret flag"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			helper := statusHelper(t, testCase.payload)
@@ -152,6 +211,25 @@ func TestInspectRejectsIncompatibleOrInvalidHelperStatus(t *testing.T) {
 				t.Fatalf("inspection error = %v", err)
 			}
 		})
+	}
+}
+
+func TestInspectContextStopsBlockedProvidersAtTheCallerDeadline(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (Runner{
+		Workspace: t.TempDir(), Vpsadmin: helper, VpsadminOS: helper,
+	}).InspectContext(ctx, "example")
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("inspection result = %v, want caller deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("inspection ignored caller deadline: %s", elapsed)
 	}
 }
 

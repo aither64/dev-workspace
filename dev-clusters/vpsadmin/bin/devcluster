@@ -1002,7 +1002,7 @@ status_cluster() {
   [ -n "$slug" ] || die "missing slug"
 
   if [ "${2:-}" = "--json" ]; then
-    devcluster_status_json vpsadmin "$slug" vpsadmin-devcluster true
+    devcluster_status_v2_json "$slug"
     return
   fi
 
@@ -1049,6 +1049,87 @@ devcluster_credentials_json() {
       {label: "Mailpit password", value: .mail.capture.webAuth.password}
     ]) | map(select(.value | type == "string" and length > 0))
   ' "$(config_json_for_slug "$slug")"
+}
+
+devcluster_services_json() {
+  local slug="$1"
+  local links="$2"
+  local config
+  config="$(config_json_for_slug "$slug")"
+  [ ! -L "$config" ] && [ -f "$config" ] || die "unsafe cluster config file"
+  [ "$(stat -c %s "$config")" -le 1048576 ] || die "cluster config exceeds 1 MiB"
+
+  jq -c --argjson links "$links" '
+    def field($label; $value; $secret):
+      {label: $label, value: $value, secret: $secret};
+    def account($label; $fields):
+      {label: $label, fields: ($fields | map(select(.value | type == "string" and length > 0)))} |
+      select(.fields | length > 0);
+    def add_account_only_service($label; $accounts):
+      . as $services |
+      if ($accounts | length) > 0 and
+         ([$services[] | select(.label == $label)] | length) == 0
+      then $services + [{label: $label, accounts: $accounts}]
+      else $services
+      end;
+
+    (.seed.users // [] | if type == "array" then . else [] end) as $users |
+    ([account("Administrator"; [
+      field("Login"; "test-admin"; false),
+      field("Password"; "testAdminPassword"; true)
+    ])] + [
+      $users[] |
+      select(type == "object") |
+      select(.login | type == "string" and length > 0) |
+      account(.login; [
+        field("Login"; .login; false),
+        field("Password"; .password; true)
+      ])
+    ]) as $vpsadminAccounts |
+    ([
+      account("Web authentication"; [
+        field("Login"; .adminer.webAuth.username; false),
+        field("Password"; .adminer.webAuth.password; true)
+      ]),
+      account("Database"; [
+        field("System"; "MySQL"; false),
+        field("Server"; "127.0.0.1"; false),
+        field("Login"; "vpsadmin"; false),
+        field("Password"; "testMariadbApiPassword"; true)
+      ])
+    ]) as $adminerAccounts |
+    ([account("Web authentication"; [
+      field("Login"; .mail.capture.webAuth.username; false),
+      field("Password"; .mail.capture.webAuth.password; true)
+    ])]) as $mailpitAccounts |
+    $links | map(
+      if .label == "Web UI" then . + {accounts: $vpsadminAccounts}
+      elif .label == "Adminer" then . + {accounts: $adminerAccounts}
+      elif .label == "Mailpit" then . + {accounts: $mailpitAccounts}
+      else . + {accounts: []}
+      end
+    ) |
+    add_account_only_service("Web UI"; $vpsadminAccounts) |
+    add_account_only_service("Adminer"; $adminerAccounts) |
+    add_account_only_service("Mailpit"; $mailpitAccounts)
+  ' "$config"
+}
+
+devcluster_status_v2_json() {
+  local slug="$1"
+  local legacy links services
+  legacy="$(devcluster_status_json vpsadmin "$slug" vpsadmin-devcluster true)"
+  links="$(jq -c '.links // []' <<<"$legacy")"
+  services='[]'
+  if [ "$(jq -r '.found' <<<"$legacy")" = true ]; then
+    services="$(devcluster_services_json "$slug" "$links")"
+  fi
+
+  jq -c --argjson services "$services" '
+    .schema = 2 |
+    if .found then .services = $services else . end |
+    del(.links, .credentials)
+  ' <<<"$legacy"
 }
 
 urls_cluster() {

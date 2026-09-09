@@ -13,39 +13,83 @@ class DevclusterStatusTest < Minitest::Test
     'vpsadminos' => File.join(ROOT, 'dev-clusters/vpsadminos/bin/devcluster')
   }.freeze
 
-  def test_vpsadmin_json_status_owns_links_commands_and_credentials
+  def test_vpsadmin_json_status_groups_services_and_accounts
     with_cluster('vpsadmin') do |workspace, directory, slug|
       write_state(directory, 'topology', "single\n")
       write_state(directory, 'network', "local\n")
       write_state(directory, 'ready', '')
       write_state(directory, 'config.json', JSON.generate(
         'topologies' => { 'single' => %w[node1] },
-        'domains' => { 'webui' => 'webui.example.test', 'auth' => 'auth.example.test' },
+        'domains' => {
+          'webui' => 'webui.example.test',
+          'auth' => 'auth.example.test',
+          'adminer' => 'adminer.example.test',
+          'mailpit' => 'mailpit.example.test'
+        },
         'adminer' => { 'webAuth' => { 'username' => 'adminer', 'password' => 'secret' } },
+        'mail' => { 'capture' => { 'webAuth' => {
+          'username' => 'mailpit', 'password' => 'mail-secret'
+        } } },
         'seed' => { 'users' => [
           { 'login' => 'custom-user1', 'password' => 'custom-password1' },
-          { 'login' => 'custom-user2', 'password' => 'custom-password2' }
+          { 'login' => 'custom-user2', 'password' => 'custom-password2' },
+          { 'login' => 42, 'password' => 'ignored-malformed-user' }
         ] }
       ))
 
       status = read_status('vpsadmin', workspace, slug)
-      assert_equal(1, status.fetch('schema'))
+      assert_equal(2, status.fetch('schema'))
       assert_equal(true, status.fetch('found'))
       assert_equal('stale', status.fetch('state'))
       assert_equal(true, status.fetch('ready'))
-      assert_equal('https://webui.example.test:10443/', status.fetch('links')[0].fetch('url'))
       assert_equal(%w[services node1], status.fetch('commands').map { |item| item.fetch('label') })
-      assert_equal(8, status.fetch('credentials').length)
-      assert_equal('custom-user1', status.fetch('credentials')[2].fetch('value'))
-      assert_equal('secret', status.fetch('credentials').last.fetch('value'))
+      refute(status.key?('links'))
+      refute(status.key?('credentials'))
+      services = status.fetch('services')
+      assert_equal(
+        ['Web UI', 'Authentication', 'Mailpit', 'Adminer'],
+        services.map { |service| service.fetch('label') }
+      )
+      webui = services.fetch(0)
+      assert_equal('https://webui.example.test:10443/', webui.fetch('url'))
+      assert_equal(
+        ['Administrator', 'custom-user1', 'custom-user2'],
+        webui.fetch('accounts').map { |account| account.fetch('label') }
+      )
+      first_user_fields = webui.fetch('accounts').fetch(1).fetch('fields')
+      assert_equal(
+        [
+          { 'label' => 'Login', 'value' => 'custom-user1', 'secret' => false },
+          { 'label' => 'Password', 'value' => 'custom-password1', 'secret' => true }
+        ],
+        first_user_fields
+      )
+      adminer = services.find { |service| service.fetch('label') == 'Adminer' }
+      adminer_password = adminer.fetch('accounts').fetch(0).fetch('fields').fetch(1)
+      assert_equal('secret', adminer_password.fetch('value'))
+      assert_equal(true, adminer_password.fetch('secret'))
+      database = adminer.fetch('accounts').fetch(1)
+      assert_equal('Database', database.fetch('label'))
+      assert_equal(
+        [
+          { 'label' => 'System', 'value' => 'MySQL', 'secret' => false },
+          { 'label' => 'Server', 'value' => '127.0.0.1', 'secret' => false },
+          { 'label' => 'Login', 'value' => 'vpsadmin', 'secret' => false },
+          { 'label' => 'Password', 'value' => 'testMariadbApiPassword', 'secret' => true }
+        ],
+        database.fetch('fields')
+      )
+      mailpit = services.find { |service| service.fetch('label') == 'Mailpit' }
+      mailpit_password = mailpit.fetch('accounts').fetch(0).fetch('fields').fetch(1)
+      assert_equal('mail-secret', mailpit_password.fetch('value'))
 
       stdout, stderr, result = Open3.capture3(
         { 'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace },
         HELPERS.fetch('vpsadmin'), 'urls', slug
       )
       assert(result.success?, stderr)
-      status.fetch('links').each do |link|
-        assert_includes(stdout, "#{link.fetch('label')}: #{link.fetch('url')}")
+      services.each do |service|
+        assert_includes(stdout, "#{service.fetch('label')}: #{service.fetch('url')}")
       end
       assert_includes(stdout, 'User login: custom-user1')
       assert_includes(stdout, 'User password: custom-password2')
@@ -53,7 +97,28 @@ class DevclusterStatusTest < Minitest::Test
     end
   end
 
-  def test_vpsadminos_json_status_owns_machine_commands
+  def test_vpsadmin_accounts_do_not_depend_on_service_domains
+    with_cluster('vpsadmin') do |workspace, directory, slug|
+      write_state(directory, 'config.json', JSON.generate(
+        'topologies' => { 'single' => %w[node1] },
+        'seed' => { 'users' => [
+          { 'login' => 'custom-user', 'password' => 'custom-password' }
+        ] }
+      ))
+
+      status = read_status('vpsadmin', workspace, slug)
+      assert_equal(%w[Web\ UI Adminer], status.fetch('services').map { |service| service.fetch('label') })
+      webui = status.fetch('services').fetch(0)
+      refute(webui.key?('url'))
+      assert_equal(
+        ['Administrator', 'custom-user'],
+        webui.fetch('accounts').map { |account| account.fetch('label') }
+      )
+      assert_equal(['Database'], status.fetch('services').fetch(1).fetch('accounts').map { |account| account.fetch('label') })
+    end
+  end
+
+  def test_vpsadminos_json_status_keeps_machine_commands_separate
     with_cluster('vpsadminos') do |workspace, directory, slug|
       write_state(directory, 'topology', "dual\n")
       write_state(directory, 'network', "bridge\n")
@@ -62,10 +127,12 @@ class DevclusterStatusTest < Minitest::Test
       ))
 
       status = read_status('vpsadminos', workspace, slug)
+      assert_equal(2, status.fetch('schema'))
       assert_equal('stopped', status.fetch('state'))
       assert_equal(%w[node1 node2], status.fetch('commands').map { |item| item.fetch('label') })
-      assert_empty(status.fetch('links'))
-      assert_empty(status.fetch('credentials'))
+      assert_empty(status.fetch('services'))
+      refute(status.key?('links'))
+      refute(status.key?('credentials'))
     end
   end
 
