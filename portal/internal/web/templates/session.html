@@ -19,14 +19,21 @@
   </header>
   <main class="page session-page">
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
+    <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
+      <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
+      <button id="lifecycle-operation-retry" type="button" class="quiet" hidden>Retry</button>
+    </section>
+    {{if .LifecycleOnly}}
+    <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
+    {{else}}
     <section class="panel session-tabs">
-      <div class="tabs">
-        {{if .Session.Codex.ThreadID}}<button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="codex" data-tab="codex">Codex</button>{{end}}
-        <button class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" type="button" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-tab="handoff">Handoff</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="repositories" data-tab="repositories">Repositories</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="clusters" data-tab="clusters">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</button>
-        <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="artifacts" data-tab="artifacts">Artifacts ({{len .Artifacts}})</button>
-      </div>
+      <nav class="tabs" role="tablist" aria-label="Session sections">
+        {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex">Codex</a>{{end}}
+        <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff">Handoff</a>
+        <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories">Repositories</a>
+        <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</a>
+        <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts">Artifacts ({{len .Artifacts}})</a>
+      </nav>
 
       {{if .Session.Codex.ThreadID}}
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel">
@@ -56,7 +63,7 @@
       </section>
       {{end}}
 
-      <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel">
+      <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel" aria-labelledby="session-tab-handoff">
         <div class="section-heading"><h2>Handoff</h2></div>
         {{if not .Session.Codex.ThreadID}}<p class="notice warning">This session has no shared Codex conversation. Start new sessions with <code>dev-session start &lt;short-name&gt;</code>.</p>{{end}}
         {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
@@ -67,42 +74,76 @@
         {{end}}
       </section>
 
-      <section id="repositories" class="tab-panel" role="tabpanel">
+      <section id="repositories" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-repositories">
         <div class="section-heading"><h2>Repositories</h2><span>{{len .Repositories}}</span></div>
         <div class="repo-grid">
         {{range .Repositories}}
           <article class="panel repo-card">
-            <div class="repo-title"><h3>{{.Name}}</h3></div>
-            <dl><dt>Branch</dt><dd><code>{{.Branch}}</code></dd>{{if .HeadSHA}}<dt>Final HEAD</dt><dd><code>{{shortSHA .HeadSHA}}</code></dd>{{end}}</dl>
+            <div class="repo-title"><h3>{{.Name}}</h3>{{if not $.Session.Archived}}{{if eq .PushStatus "exactly-pushed"}}<span class="badge active">Pushed</span>{{else if eq .PushStatus "not-pushed"}}<span class="badge warning">Not pushed</span>{{else if eq .PushStatus "remote-ahead"}}<span class="badge warning">GitHub ahead</span>{{else if eq .PushStatus "divergent"}}<span class="badge danger">Diverged</span>{{else}}<span class="badge warning">Unknown</span>{{end}}{{end}}</div>
+            <dl>
+              <dt>Branch</dt><dd><code>{{.Branch}}</code></dd>
+              {{if $.Session.Archived}}
+                {{if .HeadSHA}}<dt>Final HEAD</dt><dd><code>{{shortSHA .HeadSHA}}</code></dd>{{end}}
+              {{else}}
+                {{if .LocalHeadSHA}}<dt>Local HEAD</dt><dd><code>{{shortSHA .LocalHeadSHA}}</code></dd>{{end}}
+                {{if .RemoteHeadSHA}}<dt>GitHub HEAD</dt><dd><code>{{shortSHA .RemoteHeadSHA}}</code></dd>{{end}}
+              {{end}}
+              {{if .DefaultBranch}}<dt>Default branch</dt><dd><code>{{.DefaultBranch}}</code></dd>{{end}}
+            </dl>
             <nav class="link-row">
-              {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
-              {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Branch</a>{{end}}
+              {{if $.Session.Archived}}
+                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
+                {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Final revision</a>{{end}}
+              {{else if .RemoteHeadSHA}}
+                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
+                {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Branch</a>{{end}}
+              {{end}}
               {{if .ActionsURL}}<a href="{{.ActionsURL}}" target="_blank" rel="noreferrer">Actions</a>{{end}}
             </nav>
+            {{if .StatusError}}<p class="notice warning">Repository: {{.StatusError}}</p>{{end}}
             {{if .GitHubError}}<p class="notice warning">GitHub: {{.GitHubError}}</p>{{end}}
-            {{if .Runs}}<div class="runs">{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{.Conclusion}}">{{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{end}}
+            {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{.Conclusion}}">{{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
           </article>
         {{else}}<p class="empty">Codex has not added any repository worktrees yet.</p>{{end}}
         </div>
       </section>
 
-      <section id="clusters" class="tab-panel" role="tabpanel">
+      <section id="clusters" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-clusters">
         <div class="section-heading"><h2>Development clusters</h2><span>{{len .Clusters}}</span></div>
         <div class="repo-grid">
         {{range .Clusters}}
           <article class="panel repo-card cluster-card" data-cluster="{{.Kind}}">
             <div class="repo-title"><h3>{{.Label}}</h3><span class="badge {{if eq .State "running"}}active{{else if eq .State "stale"}}warning{{end}}">{{.State}}</span></div>
             <dl>{{if .Topology}}<dt>Topology</dt><dd>{{.Topology}}</dd>{{end}}{{if .Network}}<dt>Network</dt><dd>{{.Network}}</dd>{{end}}<dt>Ready</dt><dd>{{if .Ready}}yes{{else}}no{{end}}</dd></dl>
-            {{if .Links}}<nav class="link-row">{{range .Links}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{.Label}}</a>{{end}}</nav>{{end}}
-            {{range .Commands}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}
-            {{if .Credentials}}<details><summary>Test credentials</summary>{{range .Credentials}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}</details>{{end}}
-            {{if $.Session.Interactive}}<button type="button" class="danger" data-release-cluster="{{.Kind}}">Release cluster</button>{{end}}
+            {{if .Services}}
+            {{$cluster := .}}
+            <div class="cluster-services">
+              <nav class="cluster-service-tabs" role="tablist" aria-label="{{.Label}} services">
+                {{range $index, $service := .Services}}<button id="cluster-{{$cluster.Kind}}-service-tab-{{$index}}" type="button" class="quiet {{if eq $index 0}}active{{end}}" role="tab" aria-selected="{{if eq $index 0}}true{{else}}false{{end}}" aria-controls="cluster-{{$cluster.Kind}}-service-{{$index}}" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-cluster-service-tab="{{$index}}">{{$service.Label}}</button>{{end}}
+              </nav>
+              {{range $index, $service := .Services}}
+              <section id="cluster-{{$cluster.Kind}}-service-{{$index}}" class="cluster-service-panel {{if eq $index 0}}active{{end}}" role="tabpanel" aria-labelledby="cluster-{{$cluster.Kind}}-service-tab-{{$index}}" data-cluster-service-panel="{{$index}}">
+                {{if $service.URL}}<p class="service-link"><a href="{{$service.URL}}" target="_blank" rel="noreferrer">Open {{$service.Label}} ↗</a></p>{{end}}
+                {{range $service.Accounts}}
+                <section class="cluster-account">
+                  <h4>{{.Label}}</h4>
+                  {{range .Fields}}
+                  <label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}" {{if .Secret}}type="password" autocomplete="off" data-secret-field{{end}}><button type="button" data-copy>Copy</button>{{if .Secret}}<button type="button" class="quiet" data-reveal-secret>Reveal</button>{{end}}</div></label>
+                  {{end}}
+                </section>
+                {{end}}
+              </section>
+              {{end}}
+            </div>
+            {{end}}
+            {{if .Commands}}<section class="cluster-commands"><h4>Connect</h4>{{range .Commands}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}</section>{{end}}
+            {{if $.Session.Interactive}}<footer class="cluster-footer"><button type="button" class="danger" data-release-cluster="{{.Kind}}">Release cluster</button></footer>{{end}}
           </article>
         {{else}}<p class="empty">No development cluster state for this session.</p>{{end}}
         </div>
       </section>
 
-      <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel">
+      <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel" aria-labelledby="session-tab-artifacts">
         <div class="artifact-list" role="list" aria-label="Session artifacts">
           {{range .Artifacts}}<button type="button" class="artifact-select quiet" data-artifact-path="{{.Path}}" data-artifact-label="{{.Label}}">{{.Label}}</button>{{end}}
         </div>
@@ -112,6 +153,7 @@
         </div>
       </section>
     </section>
+    {{end}}
   </main>
   {{if .Session.Interactive}}
   <dialog id="fork-dialog">

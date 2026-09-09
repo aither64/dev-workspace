@@ -218,6 +218,9 @@ stops the managed tmux session, removes runtime authority, and moves the
 tracking directory and creation journal to private recovery storage. It records
 each completed phase in a private journal, so rerunning the same command safely
 continues an interrupted deletion instead of repeating irreversible work.
+Each persisted phase is printed in plain language. The browser uses the same
+journal to show progress and elapsed time while the command continues in the
+background.
 The journal is also a slug tombstone: starting, reviving, attaching, changing
 worktrees, or starting new cluster work for that slug is refused until the
 original `delete` command finishes. Thread retirement records its intent before
@@ -319,6 +322,8 @@ prevents portal mutations and cluster starts from racing this operation.
 Each irreversible phase is journaled in private runtime state. If a command or
 deployment interruption stops the operation, run the same `archive` command
 again with the same mode. It resumes completed phases without repeating them.
+The CLI prints phases as they are persisted. The browser exposes the same phase
+and offers Retry when an archive, delete, or revive operation fails or pauses.
 The journal binds the exact projected archive tree and retained Codex thread;
 retry refuses changed lifecycle, manifest, artifacts, or conversation identity
 before it commits tracking or retires the runtime.

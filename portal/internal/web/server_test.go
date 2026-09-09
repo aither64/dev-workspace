@@ -18,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/cluster"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
+	"github.com/aither64/vpsfree-cz-workspace/portal/internal/repository"
 	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
 	"golang.org/x/sys/unix"
 )
@@ -404,7 +406,7 @@ func writeWebTrackingFiles(t *testing.T, directory, lifecycle string) {
 	}
 }
 
-func TestIndexUsesCodexActivityAndFallsBackToTrackingTimes(t *testing.T) {
+func TestIndexDefersCodexActivityAndReturnsEnrichedStatus(t *testing.T) {
 	server := newTestServer(t)
 	base := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
 	writeSession := func(slug, threadID string, updated time.Time) {
@@ -434,20 +436,199 @@ func TestIndexUsesCodexActivityAndFallsBackToTrackingTimes(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
+	if len(controller.activityInputs) != 0 {
+		t.Fatalf("initial index performed Codex I/O: %#v", controller.activityInputs)
+	}
+	if !strings.Contains(body, "data-index-generated-at") || !strings.Contains(body, "data-session-slug") {
+		t.Fatalf("initial index lacks enrichment hooks: %s", body)
+	}
+
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("index status = %d %q", response.Code, response.Body.String())
+	}
 	if len(controller.activityInputs) != 2 || controller.activityInputs[1].ID != "thread-2" ||
 		controller.activityInputs[1].Cwd != filepath.Join(server.config.Workspace, "work", "2026-09-06-recent-codex") {
 		t.Fatalf("activity identities = %#v", controller.activityInputs)
 	}
-	if strings.Index(body, "2026-09-06-recent-codex") > strings.Index(body, "2026-09-07-recent-files") {
-		t.Fatalf("Codex activity did not sort first: %s", body)
+	var status struct {
+		Sessions      []indexSessionStatus `json:"sessions"`
+		Authoritative bool                 `json:"authoritative"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Authoritative {
+		t.Fatalf("complete index status was not authoritative: %q", response.Body.String())
+	}
+	bySlug := make(map[string]indexSessionStatus)
+	for _, item := range status.Sessions {
+		bySlug[item.Slug] = item
+	}
+	if !bySlug["2026-09-06-recent-codex"].UpdatedAt.Equal(base.Add(2*time.Hour)) ||
+		!bySlug["2026-09-07-recent-files"].UpdatedAt.Equal(base.Add(time.Hour)) {
+		t.Fatalf("enriched status = %#v", status.Sessions)
 	}
 
 	controller.activityErr = errors.New("App Server unavailable")
+	server.indexStatusMu.Lock()
+	server.indexStatusCache = cachedIndexStatus{}
+	server.indexStatusMu.Unlock()
 	response = httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	body = response.Body.String()
-	if strings.Index(body, "2026-09-07-recent-files") > strings.Index(body, "2026-09-06-recent-codex") {
-		t.Fatalf("filesystem fallback did not sort first: %s", body)
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	bySlug = make(map[string]indexSessionStatus)
+	for _, item := range status.Sessions {
+		bySlug[item.Slug] = item
+	}
+	if !bySlug["2026-09-07-recent-files"].UpdatedAt.Equal(base.Add(time.Hour)) ||
+		!bySlug["2026-09-06-recent-codex"].UpdatedAt.Equal(base) {
+		t.Fatalf("filesystem fallback status = %#v", status.Sessions)
+	}
+}
+
+func TestIndexStatusMarksPartialSessionListNonAuthoritative(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte("schema: 1\nslug: example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	if err := os.MkdirAll(filepath.Join(server.config.Workspace, "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(directory, filepath.Join(server.config.Workspace, "archive", "invalid-session")); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	var payload struct {
+		Sessions      []indexSessionStatus `json:"sessions"`
+		Authoritative bool                 `json:"authoritative"`
+		Warning       string               `json:"warning"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &payload) != nil {
+		t.Fatalf("index status = %d %q", response.Code, response.Body.String())
+	}
+	if payload.Authoritative || payload.Warning == "" || len(payload.Sessions) != 1 || payload.Sessions[0].Slug != "example" {
+		t.Fatalf("partial index status = %#v", payload)
+	}
+}
+
+func TestIndexStatusReportsArchivePlacement(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "archive", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\nfinalized_at: '2026-09-09T10:00:00Z'\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "complete")
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	var payload struct {
+		Sessions []indexSessionStatus `json:"sessions"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &payload) != nil {
+		t.Fatalf("index status = %d %q", response.Code, response.Body.String())
+	}
+	if len(payload.Sessions) != 1 || payload.Sessions[0].Slug != "example" || !payload.Sessions[0].Archived {
+		t.Fatalf("archive placement = %#v", payload.Sessions)
+	}
+}
+
+func TestIndexStatusUsesOneBoundedRefreshForConcurrentRequests(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	release := make(chan struct{})
+	controller := &browserContractCodex{activityWait: release}
+	server.config.Codex = controller
+	handler := server.Handler()
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+			responses <- response
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		controller.mu.Lock()
+		calls := controller.activityCalls
+		controller.mu.Unlock()
+		if calls == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("index refresh calls = %d", calls)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	releasedAt := time.Now()
+	close(release)
+	for range 2 {
+		if response := <-responses; response.Code != http.StatusOK {
+			t.Fatalf("index status = %d %q", response.Code, response.Body.String())
+		}
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	controller.mu.Lock()
+	calls := controller.activityCalls
+	controller.mu.Unlock()
+	if response.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("cached index status = %d, calls = %d", response.Code, calls)
+	}
+	server.indexStatusMu.Lock()
+	created := server.indexStatusCache.created
+	server.indexStatusMu.Unlock()
+	if created.Before(releasedAt) {
+		t.Fatalf("cache timestamp %s predates refresh completion %s", created, releasedAt)
+	}
+}
+
+func TestIndexStatusIncludesOperationsBeforeTheirJournalExists(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte("schema: 1\nslug: example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	server.operationMu.Lock()
+	server.operations["example"] = lifecycleOperation{Kind: "archive", State: "running", Phase: "starting"}
+	server.operationMu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	var payload struct {
+		Sessions []indexSessionStatus `json:"sessions"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &payload) != nil ||
+		len(payload.Sessions) != 1 || payload.Sessions[0].PendingLifecycle != "archive" {
+		t.Fatalf("index operation = %d %#v %q", response.Code, payload, response.Body.String())
 	}
 }
 
@@ -801,9 +982,12 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
-		`class="panel session-tabs"`, `data-tab="codex"`, `data-tab="handoff"`,
-		`data-tab="repositories"`, `data-tab="clusters"`,
-		`id="codex" class="tab-panel chat-panel active"`, `data-tab="artifacts"`,
+		`class="panel session-tabs"`, `href="#codex"`, `data-session-tab="codex"`,
+		`href="#handoff"`, `data-session-tab="handoff"`,
+		`href="#repositories"`, `data-session-tab="repositories"`,
+		`href="#clusters"`, `data-session-tab="clusters"`,
+		`id="codex" class="tab-panel chat-panel active"`, `href="#artifacts"`,
+		`data-session-tab="artifacts"`,
 		`data-artifact-path="plan.md"`, `data-artifact-path="state.md"`,
 		`data-artifact-path="report.md"`,
 	} {
@@ -811,7 +995,7 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 			t.Fatalf("session page lacks %s", marker)
 		}
 	}
-	for _, marker := range []string{`data-tab="plan"`, `data-tab="state"`, `id="plan"`, `id="state"`} {
+	for _, marker := range []string{`data-session-tab="plan"`, `data-session-tab="state"`, `id="plan"`, `id="state"`} {
 		if strings.Contains(body, marker) {
 			t.Fatalf("session page retained separate tracking tab %s", marker)
 		}
@@ -848,12 +1032,21 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"shouldSubmitMessage(event)", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"await beforeRequestInputAction(snoozeAutoResolution)",
 		"entry.html", "archive-session", "revive-session", "artifactPreview", "release-cluster", "fork-dialog",
-		"codex-settings-dialog", "codex-settings-open", "modelSelect.required",
-		"const nextSignature = JSON.stringify(entries)",
+		"codex-settings-dialog", "codex-settings-open", "data-cluster-service-tab", "data-reveal-secret",
+		"index-status", "modelSelect.required",
+		"const nextSignature = JSON.stringify(entries)", "client.operation().then((operation)",
+		"deleteDialog.showModal()", `lifecycleKind === "revive" && needsOptions`,
+		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)
 		}
+	}
+	if strings.Contains(string(javascript), "if (pendingLifecycle) {\n    client.operation()") {
+		t.Fatal("browser reload still hides lifecycle operations that precede their journal")
+	}
+	if strings.Contains(string(javascript), "client.operation().then((operation) => {\n    if (operation.state === \"complete\")") {
+		t.Fatal("a completed lifecycle operation still redirects on every page load")
 	}
 }
 
@@ -891,6 +1084,40 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 		`const existingSettings = Boolean(modelSelect.closest("#codex-settings"))`) ||
 		!strings.Contains(string(javascript), `if (!existingSettings)`) {
 		t.Fatal("existing-thread settings still offer unsupported automatic reasoning")
+	}
+}
+
+func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		Session: &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true},
+		Repositories: []repository.Status{{
+			Name: "workspace", Branch: "feature", DefaultBranch: "master",
+			LocalHeadSHA: strings.Repeat("a", 40), RemoteHeadSHA: strings.Repeat("b", 40),
+			PushStatus: repository.PushStatusDivergent,
+		}},
+		Clusters: []cluster.Status{{
+			Kind: "vpsadmin", Label: "vpsAdmin", State: "running", Ready: true,
+			Services: []cluster.Service{{
+				Label: "Web UI", URL: "https://webui.example.test/",
+				Accounts: []cluster.Account{{Label: "Administrator", Fields: []cluster.Field{
+					{Label: "Login", Value: "admin"},
+					{Label: "Password", Value: "secret", Secret: true},
+				}}},
+			}},
+			Commands: []cluster.Command{{Label: "node1", Value: "ssh node1"}},
+		}},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{
+		"Local HEAD", "GitHub HEAD", "Diverged", `data-cluster-service-tab="0"`,
+		`data-cluster-service-panel="0"`, "Open Web UI", "Administrator",
+		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("session page lacks %q: %s", marker, body)
+		}
 	}
 }
 
@@ -996,6 +1223,94 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 	})
 	if retry.Code != http.StatusServiceUnavailable {
 		t.Fatalf("archive start during shutdown status/body = %d %q", retry.Code, retry.Body.String())
+	}
+}
+
+func TestLifecycleStatusReportsDurablePhaseAndRetainsFailure(t *testing.T) {
+	server := newTestServer(t)
+	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(
+		`{"schema":2,"slug":"example","workspace":%q,"phase":"clusters_released","mode":"complete"}`,
+		server.config.Workspace,
+	)
+	if err := os.WriteFile(filepath.Join(root, "example.archive.json"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.lifecycleStatus(response, "example")
+	var operation lifecycleOperation
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation.Kind != "archive" || operation.State != "paused" ||
+		operation.Phase != "clusters_released" || operation.StartedAt == "" || operation.UpdatedAt == "" {
+		t.Fatalf("durable lifecycle status = %#v", operation)
+	}
+
+	server.operationMu.Lock()
+	server.operations["example"] = lifecycleOperation{
+		Kind: "archive", State: "failed", StartedAt: operation.StartedAt,
+		Error: "helper failed",
+	}
+	server.operationMu.Unlock()
+	response = httptest.NewRecorder()
+	server.lifecycleStatus(response, "example")
+	if err := json.Unmarshal(response.Body.Bytes(), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation.State != "failed" || operation.Phase != "clusters_released" ||
+		operation.Error != "helper failed" {
+		t.Fatalf("failed lifecycle status = %#v", operation)
+	}
+}
+
+func TestJournalOnlyDeletionRemainsVisibleAndRetryable(t *testing.T) {
+	server := newTestServer(t)
+	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"tracking_preserved","force":false}`,
+		server.config.Workspace,
+	)
+	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	index := httptest.NewRecorder()
+	handler.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), `href="/example/"`) {
+		t.Fatalf("journal-only index = %d %q", index.Code, index.Body.String())
+	}
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/", nil))
+	if page.Code != http.StatusOK ||
+		!strings.Contains(page.Body.String(), "Deletion recovery") ||
+		!strings.Contains(page.Body.String(), `data-pending-lifecycle="delete"`) ||
+		!strings.Contains(page.Body.String(), `id="delete-session-dialog"`) {
+		t.Fatalf("journal-only operation page = %d %q", page.Code, page.Body.String())
+	}
+}
+
+func TestWorkflowLookupErrorDoesNotClaimThereAreNoRuns(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		Session: &session.Summary{Manifest: session.Manifest{Slug: "example"}},
+		Repositories: []repository.Status{{
+			Name: "workspace", PushStatus: repository.PushStatusExactlyPushed,
+			GitHubError: "request timed out",
+		}},
+	})
+	body := response.Body.String()
+	if !strings.Contains(body, "GitHub: request timed out") ||
+		strings.Contains(body, "No workflow runs for this revision") {
+		t.Fatalf("workflow error rendering = %q", body)
 	}
 }
 
@@ -1230,13 +1545,28 @@ type browserContractCodex struct {
 	activities     []codex.ThreadActivity
 	activityInputs []codex.ThreadActivity
 	activityErr    error
+	activityWait   <-chan struct{}
+	activityCalls  int
 }
 
 func (client *browserContractCodex) ListThreadActivity(
-	_ context.Context, expected []codex.ThreadActivity,
+	ctx context.Context, expected []codex.ThreadActivity,
 ) ([]codex.ThreadActivity, error) {
+	client.mu.Lock()
 	client.activityInputs = append([]codex.ThreadActivity(nil), expected...)
-	return client.activities, client.activityErr
+	client.activityCalls++
+	wait := client.activityWait
+	activities := append([]codex.ThreadActivity(nil), client.activities...)
+	err := client.activityErr
+	client.mu.Unlock()
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return activities, err
 }
 
 func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ string) error {
@@ -1717,8 +2047,21 @@ func TestDeleteSessionRequiresExactConfirmationAndUsesDestructiveCLI(t *testing.
 	server.deleteSession(response, httptest.NewRequest(
 		http.MethodPost, "/", strings.NewReader(`{"confirmation":"example","force":true}`),
 	), "example")
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+	}
+	operation := waitLifecycleOperation(t, server, "example")
+	if operation.State != "complete" || operation.Kind != "delete" ||
+		operation.StartedAt == "" || operation.UpdatedAt == "" {
+		t.Fatalf("delete operation = %#v", operation)
+	}
+	statusResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(statusResponse, httptest.NewRequest(
+		http.MethodGet, "/api/sessions/example/operation", nil,
+	))
+	if statusResponse.Code != http.StatusOK ||
+		!strings.Contains(statusResponse.Body.String(), `"state":"complete"`) {
+		t.Fatalf("deleted session operation status = %d %q", statusResponse.Code, statusResponse.Body.String())
 	}
 	data, err := os.ReadFile(arguments)
 	if err != nil {
@@ -1759,7 +2102,7 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 		},
 		{
 			name: "retry archive after tracking moved", start: (*Server).startArchive,
-			body:     `{"mode":"complete"}`,
+			body:     `{"mode":"abandoned"}`,
 			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "complete"},
 			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
 			journal: ".archive.json",
@@ -1796,7 +2139,14 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 				if err := os.MkdirAll(root, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(root, "example"+testCase.journal), []byte("{}\n"), 0o600); err != nil {
+				journal := "{}\n"
+				if testCase.journal == ".archive.json" {
+					journal = fmt.Sprintf(
+						`{"schema":2,"slug":"example","workspace":%q,"phase":"tracking_archived","mode":"complete"}`,
+						server.config.Workspace,
+					)
+				}
+				if err := os.WriteFile(filepath.Join(root, "example"+testCase.journal), []byte(journal), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1865,33 +2215,70 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 	}
 	server.config.TransitionLock = lockPath
 
-	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		request := httptest.NewRequest(
-			http.MethodPost, "/api/sessions/example/delete",
-			strings.NewReader(`{"confirmation":"example"}`),
-		)
-		request.Header.Set("Origin", "https://workspace.example.test")
-		response := httptest.NewRecorder()
-		server.Handler().ServeHTTP(response, request)
-		done <- response
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("session deletion did not wait for an exclusive transition")
-	case <-time.After(100 * time.Millisecond):
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/sessions/example/delete",
+		strings.NewReader(`{"confirmation":"example"}`),
+	)
+	request.Header.Set("Origin", "https://workspace.example.test")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+	}
+	time.Sleep(100 * time.Millisecond)
+	server.operationMu.Lock()
+	operation := server.operations["example"]
+	server.operationMu.Unlock()
+	if operation.State != "running" {
+		t.Fatalf("deletion did not wait for the exclusive transition: %#v", operation)
 	}
 	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case response := <-done:
-		if response.Code != http.StatusOK {
-			t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("session deletion did not continue after the transition was released")
+	operation = waitLifecycleOperation(t, server, "example")
+	if operation.State != "complete" {
+		t.Fatalf("deletion did not continue after the transition was released: %#v", operation)
+	}
+}
+
+func TestDeleteSessionRetryUsesTheJournaledForceSetting(t *testing.T) {
+	server := newTestServer(t)
+	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true}`,
+		server.config.Workspace,
+	)
+	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arguments := filepath.Join(t.TempDir(), "arguments")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(
+		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"), 0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	server.config.DevSession = helper
+	response := httptest.NewRecorder()
+	server.deleteSession(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"confirmation":"","force":false}`),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("delete retry = %d %q", response.Code, response.Body.String())
+	}
+	if operation := waitLifecycleOperation(t, server, "example"); operation.State != "complete" {
+		t.Fatalf("delete retry operation = %#v", operation)
+	}
+	data, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n" {
+		t.Fatalf("delete retry arguments = %q", data)
 	}
 }
 
@@ -1936,15 +2323,23 @@ exit 0
 	}
 
 	first := request()
-	if first.Code != http.StatusConflict || !strings.Contains(first.Body.String(), "exit status 19") {
+	if first.Code != http.StatusAccepted {
 		t.Fatalf("first deletion = %d %q", first.Code, first.Body.String())
+	}
+	operation := waitLifecycleOperation(t, server, "example")
+	if operation.State != "failed" || !strings.Contains(operation.Error, "exit status 19") {
+		t.Fatalf("first deletion operation = %#v", operation)
 	}
 	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("tracking still exists after simulated move: %v", err)
 	}
 	second := request()
-	if second.Code != http.StatusOK {
+	if second.Code != http.StatusAccepted {
 		t.Fatalf("retry deletion = %d %q", second.Code, second.Body.String())
+	}
+	operation = waitLifecycleOperation(t, server, "example")
+	if operation.State != "complete" {
+		t.Fatalf("retry deletion operation = %#v", operation)
 	}
 }
 
@@ -2015,7 +2410,7 @@ func TestRepositoryCacheDoesNotCrossArchiveTransition(t *testing.T) {
 	}
 	active := &session.Summary{Manifest: session.Manifest{Slug: "example", Repositories: []session.Repository{repository}}, UpdatedAt: updated}
 	activeStatus := server.repositories(context.Background(), active)
-	if len(activeStatus) != 1 || !strings.Contains(activeStatus[0].CompareURL, "main...feature") {
+	if len(activeStatus) != 1 || !strings.Contains(activeStatus[0].CompareURL, "master...feature") {
 		t.Fatalf("active status = %#v", activeStatus)
 	}
 	archived := *active
@@ -2024,6 +2419,23 @@ func TestRepositoryCacheDoesNotCrossArchiveTransition(t *testing.T) {
 	archivedStatus := server.repositories(context.Background(), &archived)
 	if len(archivedStatus) != 1 || !strings.Contains(archivedStatus[0].CompareURL, strings.Repeat("1", 40)+"..."+strings.Repeat("2", 40)) {
 		t.Fatalf("archived status reused mutable cache: %#v", archivedStatus)
+	}
+}
+
+func waitLifecycleOperation(t *testing.T, server *Server, slug string) lifecycleOperation {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.operationMu.Lock()
+		operation := server.operations[slug]
+		server.operationMu.Unlock()
+		if operation.State == "complete" || operation.State == "failed" {
+			return operation
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lifecycle operation did not finish: %#v", operation)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

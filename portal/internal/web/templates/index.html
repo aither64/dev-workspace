@@ -7,12 +7,13 @@
   <title>Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
   <header class="topbar">
     <div><p class="eyebrow">vpsFree.cz development</p><h1>Workspace</h1></div>
   </header>
   <main class="page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
+    <p id="index-status-warning" class="notice warning" hidden></p>
     <section class="panel new-session">
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From aitherdev, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form method="post" action="/sessions" class="stack">
@@ -31,12 +32,13 @@
       <div class="section-heading"><h2>Work</h2><span>{{len .Active}}</span></div>
       <div class="session-grid">
         {{range .Active}}
-          <a class="session-card" href="/{{.Slug}}/">
+          <a class="session-card" href="/{{.Slug}}/" data-session-slug="{{.Slug}}">
             <span class="status-dot active"></span>
             <strong>{{.Slug}}</strong>
-            <span class="muted">Updated {{timeAgo .UpdatedAt}}</span>
-            <span>{{len .Repositories}} repositories</span>
-            {{with index $.ClusterCounts .Slug}}{{if gt . 0}}<span class="cluster-summary">{{.}} running {{if eq . 1}}cluster{{else}}clusters{{end}}</span>{{end}}{{end}}
+            <span class="muted" data-session-updated data-updated-at="{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">Updated {{timeAgo .UpdatedAt}}</span>
+            <span data-session-repositories>{{len .Repositories}} repositories</span>
+            <span class="cluster-summary" data-session-clusters hidden></span>
+            <span class="badge warning" data-session-lifecycle hidden></span>
           </a>
         {{else}}<p class="empty">No portal-enabled work sessions.</p>{{end}}
       </div>
@@ -46,11 +48,12 @@
       <div class="section-heading"><h2>Archive</h2><span>{{len .Archived}}</span></div>
       <div class="session-grid">
         {{range .Archived}}
-          <a class="session-card archived" href="/{{.Slug}}/">
+          <a class="session-card archived" href="/{{.Slug}}/" data-session-slug="{{.Slug}}">
             <span class="status-dot"></span>
             <strong>{{.Slug}}</strong>
-            <span class="muted">Finalized {{timeAgo .UpdatedAt}}</span>
-            <span>{{len .Repositories}} repositories</span>
+            <span class="muted" data-session-updated data-updated-at="{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">Finalized {{timeAgo .UpdatedAt}}</span>
+            <span data-session-repositories>{{len .Repositories}} repositories</span>
+            <span class="badge warning" data-session-lifecycle hidden></span>
           </a>
         {{else}}<p class="empty">No portal-enabled archived sessions.</p>{{end}}
       </div>

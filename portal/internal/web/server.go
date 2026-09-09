@@ -90,11 +90,30 @@ type cachedRepositories struct {
 	archived bool
 }
 
+type indexSessionStatus struct {
+	Slug             string    `json:"slug"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	Archived         bool      `json:"archived"`
+	RepositoryCount  int       `json:"repositoryCount"`
+	RunningClusters  int       `json:"runningClusters"`
+	PendingLifecycle string    `json:"pendingLifecycle,omitempty"`
+}
+
+type cachedIndexStatus struct {
+	statuses      []indexSessionStatus
+	created       time.Time
+	warning       string
+	authoritative bool
+}
+
 type lifecycleOperation struct {
-	Kind     string `json:"kind,omitempty"`
-	State    string `json:"state"`
-	Error    string `json:"error,omitempty"`
-	Redirect string `json:"redirect,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	State     string `json:"state"`
+	Phase     string `json:"phase,omitempty"`
+	StartedAt string `json:"startedAt,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Redirect  string `json:"redirect,omitempty"`
 }
 
 type Server struct {
@@ -106,6 +125,9 @@ type Server struct {
 	repository       repository.Runner
 	repositoryMu     sync.Mutex
 	repositoryCache  map[string]cachedRepositories
+	indexStatusMu    sync.Mutex
+	indexStatusCache cachedIndexStatus
+	indexStatusWait  chan struct{}
 	messageMu        sync.Mutex
 	messageLocks     map[string]*sync.Mutex
 	clusters         cluster.Runner
@@ -129,6 +151,7 @@ type hostProfileIdentity struct {
 type pageData struct {
 	BaseURL          string
 	CreationDate     string
+	IndexGeneratedAt string
 	MaxMessageBytes  int
 	Error            string
 	Active           []session.Summary
@@ -136,9 +159,9 @@ type pageData struct {
 	Session          *session.Summary
 	Repositories     []repository.Status
 	Clusters         []cluster.Status
-	ClusterCounts    map[string]int
 	Artifacts        []session.Artifact
 	PendingLifecycle string
+	LifecycleOnly    bool
 }
 
 func New(config Config) (*Server, error) {
@@ -199,7 +222,7 @@ func New(config Config) (*Server, error) {
 	return &Server{
 		config: config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
-		repository:       repository.Runner{GH: config.GH},
+		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
 		clusters:         cluster.Runner{Workspace: workspace, Vpsadmin: config.VpsadminCluster, VpsadminOS: config.VpsadminOSCluster},
 		repositoryCache:  make(map[string]cachedRepositories),
 		messageLocks:     make(map[string]*sync.Mutex),
@@ -246,6 +269,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.models(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
 		s.collaborationModes(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/index-status":
+		s.indexStatus(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifacts/"):
 		s.artifact(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifact-previews/"):
@@ -349,101 +374,259 @@ func (s *Server) validMutation(r *http.Request) bool {
 	return r.Header.Get("Origin") == s.config.BaseURL
 }
 
-func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	summaries, err := session.List(s.config.Workspace)
+func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
+	summaries, err := s.listSessions()
+	now := time.Now().UTC()
 	data := pageData{
-		BaseURL: s.config.BaseURL, CreationDate: time.Now().Format(time.DateOnly),
-		MaxMessageBytes: session.MaxMessageBytes, ClusterCounts: make(map[string]int),
+		BaseURL: s.config.BaseURL, CreationDate: now.Format(time.DateOnly),
+		IndexGeneratedAt: now.Format(time.RFC3339Nano), MaxMessageBytes: session.MaxMessageBytes,
 	}
 	if err != nil {
 		data.Error = err.Error()
 	}
-	discovered, discoveryErr := session.DiscoverActiveRepositories(s.config.Workspace)
-	if discoveryErr != nil {
-		s.config.Logger.Printf("discover active repositories: %v", discoveryErr)
-	}
 	for _, summary := range summaries {
-		if !summary.Archived {
-			merged, mergeErr := session.MergeActiveRepositories(summary.Repositories, discovered[summary.Slug])
-			if mergeErr != nil {
-				s.config.Logger.Printf("merge repositories for %s: %v", summary.Slug, mergeErr)
-			}
-			summary.Repositories = merged
-		}
-		if !summary.Archived && s.clusters.MayExist(summary.Slug) {
-			clusters, clusterErr := s.clusters.Inspect(summary.Slug)
-			if clusterErr != nil {
-				s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, clusterErr)
-			}
-			for _, cluster := range clusters {
-				if cluster.State == "running" {
-					data.ClusterCounts[summary.Slug]++
-				}
-			}
-		}
 		if summary.Archived {
 			data.Archived = append(data.Archived, summary)
 		} else {
 			data.Active = append(data.Active, summary)
 		}
 	}
-	if s.config.Codex != nil {
-		expected := make([]codex.ThreadActivity, 0, len(data.Active))
-		for index := range data.Active {
-			summary := &data.Active[index]
-			if summary.Codex.ThreadID == "" {
-				continue
-			}
-			expected = append(expected, codex.ThreadActivity{
-				ID:  summary.Codex.ThreadID,
-				Cwd: filepath.Join(s.config.Workspace, "work", summary.Slug),
-			})
+	s.render(w, "index", data)
+}
+
+func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
+	result, err := s.loadIndexStatus(r.Context())
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"sessions": result.statuses, "generatedAt": result.created,
+		"warning": result.warning, "authoritative": result.authoritative,
+	})
+}
+
+func (s *Server) loadIndexStatus(requestContext context.Context) (cachedIndexStatus, error) {
+	s.indexStatusMu.Lock()
+	if !s.indexStatusCache.created.IsZero() && time.Since(s.indexStatusCache.created) < 5*time.Second {
+		result := cloneIndexStatus(s.indexStatusCache)
+		s.indexStatusMu.Unlock()
+		return result, nil
+	}
+	if wait := s.indexStatusWait; wait != nil {
+		s.indexStatusMu.Unlock()
+		select {
+		case <-wait:
+			s.indexStatusMu.Lock()
+			result := cloneIndexStatus(s.indexStatusCache)
+			s.indexStatusMu.Unlock()
+			return result, nil
+		case <-requestContext.Done():
+			return cachedIndexStatus{}, requestContext.Err()
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		activities, activityErr := s.config.Codex.ListThreadActivity(ctx, expected)
-		cancel()
-		if activityErr != nil {
-			s.config.Logger.Printf("load Codex session activity: %v", activityErr)
-		} else {
-			activityByIdentity := make(map[string]time.Time, len(activities))
-			for _, activity := range activities {
-				activityByIdentity[activity.ID+"\x00"+activity.Cwd] = activity.UpdatedAt
+	}
+	wait := make(chan struct{})
+	s.indexStatusWait = wait
+	s.indexStatusMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(s.operationContext, 6*time.Second)
+	result := s.computeIndexStatus(ctx)
+	cancel()
+	result.created = time.Now().UTC()
+	s.indexStatusMu.Lock()
+	s.indexStatusCache = result
+	s.indexStatusWait = nil
+	close(wait)
+	s.indexStatusMu.Unlock()
+	return cloneIndexStatus(result), nil
+}
+
+func cloneIndexStatus(source cachedIndexStatus) cachedIndexStatus {
+	source.statuses = append([]indexSessionStatus(nil), source.statuses...)
+	return source
+}
+
+func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
+	result := cachedIndexStatus{}
+	summaries, err := s.listSessions()
+	result.authoritative = err == nil
+	if err != nil {
+		s.config.Logger.Printf("list sessions for index status: %v", err)
+		result.warning = "Some session status is unavailable."
+	}
+	discovered, discoveryErr := session.DiscoverActiveRepositoriesContext(ctx, s.config.Workspace)
+	if discoveryErr != nil {
+		s.config.Logger.Printf("discover active repositories for index status: %v", discoveryErr)
+		result.warning = "Some repository status is unavailable."
+	}
+
+	type clusterCount struct {
+		slug  string
+		count int
+		err   error
+	}
+	clusterResults := make(chan clusterCount, len(summaries))
+	var clusterWait sync.WaitGroup
+	clusterLimit := make(chan struct{}, 4)
+	expected := make([]codex.ThreadActivity, 0, len(summaries))
+	for index := range summaries {
+		summary := &summaries[index]
+		if !summary.Archived {
+			merged, mergeErr := session.MergeActiveRepositories(summary.Repositories, discovered[summary.Slug])
+			if mergeErr != nil {
+				s.config.Logger.Printf("merge repositories for %s: %v", summary.Slug, mergeErr)
+				result.warning = "Some repository status is unavailable."
+			} else {
+				summary.Repositories = merged
 			}
-			for index := range data.Active {
-				summary := &data.Active[index]
-				expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
-				updated := activityByIdentity[summary.Codex.ThreadID+"\x00"+expectedCwd]
-				if updated.After(summary.UpdatedAt) {
-					summary.UpdatedAt = updated
-				}
+			if summary.Codex.ThreadID != "" {
+				expected = append(expected, codex.ThreadActivity{
+					ID:  summary.Codex.ThreadID,
+					Cwd: filepath.Join(s.config.Workspace, "work", summary.Slug),
+				})
+			}
+			if s.clusters.MayExist(summary.Slug) {
+				clusterWait.Add(1)
+				go func(slug string) {
+					defer clusterWait.Done()
+					select {
+					case clusterLimit <- struct{}{}:
+						defer func() { <-clusterLimit }()
+					case <-ctx.Done():
+						clusterResults <- clusterCount{slug: slug, err: ctx.Err()}
+						return
+					}
+					clusters, inspectErr := s.clusters.InspectContext(ctx, slug)
+					count := 0
+					for _, item := range clusters {
+						if item.State == "running" {
+							count++
+						}
+					}
+					clusterResults <- clusterCount{slug: slug, count: count, err: inspectErr}
+				}(summary.Slug)
 			}
 		}
 	}
-	sort.SliceStable(data.Active, func(i, j int) bool {
-		if !data.Active[i].UpdatedAt.Equal(data.Active[j].UpdatedAt) {
-			return data.Active[i].UpdatedAt.After(data.Active[j].UpdatedAt)
+	go func() {
+		clusterWait.Wait()
+		close(clusterResults)
+	}()
+
+	activityByIdentity := make(map[string]time.Time)
+	if s.config.Codex != nil && len(expected) > 0 {
+		activities, activityErr := s.config.Codex.ListThreadActivity(ctx, expected)
+		if activityErr != nil {
+			s.config.Logger.Printf("load Codex index activity: %v", activityErr)
+			result.warning = "Some recent Codex activity is unavailable."
+		} else {
+			for _, activity := range activities {
+				activityByIdentity[activity.ID+"\x00"+activity.Cwd] = activity.UpdatedAt
+			}
 		}
-		return data.Active[i].Slug < data.Active[j].Slug
+	}
+	clustersBySlug := make(map[string]int)
+	for item := range clusterResults {
+		clustersBySlug[item.slug] = item.count
+		if item.err != nil {
+			s.config.Logger.Printf("inspect clusters for %s: %v", item.slug, item.err)
+			result.warning = "Some development cluster status is unavailable."
+		}
+	}
+	for _, summary := range summaries {
+		updated := summary.UpdatedAt
+		if !summary.Archived && summary.Codex.ThreadID != "" {
+			expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
+			if activity := activityByIdentity[summary.Codex.ThreadID+"\x00"+expectedCwd]; activity.After(updated) {
+				updated = activity
+			}
+		}
+		pending, pendingErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+		if pendingErr != nil {
+			s.config.Logger.Printf("inspect lifecycle status for %s: %v", summary.Slug, pendingErr)
+			result.warning = "Some lifecycle status is unavailable."
+		}
+		if pending == "" {
+			operation, ok := s.currentLifecycleOperation(summary.Slug)
+			if ok && (operation.State == "running" || operation.State == "failed") {
+				pending = operation.Kind
+			}
+		}
+		result.statuses = append(result.statuses, indexSessionStatus{
+			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived,
+			RepositoryCount: len(summary.Repositories),
+			RunningClusters: clustersBySlug[summary.Slug], PendingLifecycle: pending,
+		})
+	}
+	return result
+}
+
+func (s *Server) listSessions() ([]session.Summary, error) {
+	summaries, listErr := session.List(s.config.Workspace)
+	pending, pendingErr := session.PendingLifecycles(s.config.Workspace)
+	seen := make(map[string]struct{}, len(summaries))
+	for _, summary := range summaries {
+		seen[summary.Slug] = struct{}{}
+	}
+	for slug, progress := range pending {
+		if _, ok := seen[slug]; ok || progress.Operation != "delete" {
+			continue
+		}
+		summaries = append(summaries, session.Summary{
+			Manifest: session.Manifest{Slug: slug}, Lifecycle: "active",
+			UpdatedAt: progress.UpdatedAt, Workspace: s.config.Workspace,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].Archived != summaries[j].Archived {
+			return !summaries[i].Archived
+		}
+		if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
+			return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+		}
+		return summaries[i].Slug < summaries[j].Slug
 	})
-	s.render(w, "index", data)
+	return summaries, errors.Join(listErr, pendingErr)
 }
 
 func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string) {
 	summary, err := session.Find(s.config.Workspace, slug)
 	if errors.Is(err, fs.ErrNotExist) {
-		http.NotFound(w, r)
-		return
+		progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+		if progressErr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, progressErr.Error())
+			return
+		}
+		if progress == nil || progress.Operation != "delete" {
+			http.NotFound(w, r)
+			return
+		}
+		summary = &session.Summary{
+			Manifest: session.Manifest{Slug: slug}, Lifecycle: "active",
+			UpdatedAt: progress.UpdatedAt, Workspace: s.config.Workspace,
+		}
+		err = nil
 	}
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if summary.Root == "" {
+		data := pageData{
+			BaseURL: s.config.BaseURL, Session: summary, PendingLifecycle: "delete",
+			CreationDate: time.Now().Format(time.DateOnly), MaxMessageBytes: session.MaxMessageBytes,
+			LifecycleOnly: true,
+		}
+		s.render(w, "session", data)
 		return
 	}
 	s.normalizeInteractivity(r.Context(), summary)
 	var discoveryErr error
 	if !summary.Archived {
 		var repositories []session.Repository
-		repositories, discoveryErr = session.ActiveRepositories(
-			s.config.Workspace, summary.Slug, summary.Repositories,
+		repositories, discoveryErr = session.ActiveRepositoriesContext(
+			r.Context(), s.config.Workspace, summary.Slug, summary.Repositories,
 		)
 		summary.Repositories = repositories
 		if discoveryErr != nil {
@@ -465,7 +648,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error += "Some live worktrees could not be verified: " + discoveryErr.Error()
 	}
 	data.Repositories = s.repositories(r.Context(), summary)
-	data.Clusters, err = s.clusters.Inspect(summary.Slug)
+	data.Clusters, err = s.clusters.InspectContext(r.Context(), summary.Slug)
 	if err != nil {
 		if data.Error != "" {
 			data.Error += "; "
@@ -487,7 +670,9 @@ func (s *Server) repositories(ctx context.Context, summary *session.Summary) []r
 	s.repositoryMu.Unlock()
 	inspectionContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	statuses := s.repository.Inspect(inspectionContext, summary.Repositories, summary.Archived)
+	statuses := s.repository.Inspect(
+		inspectionContext, summary.Slug, summary.Repositories, summary.Archived,
+	)
 	s.repositoryMu.Lock()
 	s.repositoryCache[summary.Slug] = cachedRepositories{
 		statuses: append([]repository.Status(nil), statuses...), created: time.Now(),
@@ -811,6 +996,14 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "operation" {
+		if !session.ValidSlug(parts[0]) {
+			http.NotFound(w, r)
+			return
+		}
+		s.lifecycleStatus(w, parts[0])
+		return
+	}
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "delete" {
 		if !session.ValidSlug(parts[0]) {
 			http.NotFound(w, r)
@@ -858,10 +1051,6 @@ func (s *Server) sessionAPIForSummary(
 ) {
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
 		s.releaseCluster(w, r, summary)
-		return
-	}
-	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "operation" {
-		s.lifecycleStatus(w, summary.Slug)
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "artifact-preview" {
@@ -1140,12 +1329,6 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug stri
 	if !s.decodeJSON(w, r, &body) {
 		return
 	}
-	if body.Confirmation != slug {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "type the full session slug to confirm deletion",
-		})
-		return
-	}
 	owner, journalErr := session.PendingLifecycle(s.config.Workspace, slug)
 	if journalErr != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
@@ -1157,19 +1340,38 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug stri
 		})
 		return
 	}
-	args := []string{"delete", slug, "--as-is", "--portal-authorized"}
-	if body.Force {
-		args = append(args, "--force")
-	}
-	if err := s.executeLifecycleOperation(
-		context.Background(), 7*time.Minute, slug, "delete", args,
-	); err != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{
-			"error": err.Error(),
+	force := body.Force
+	if owner == "delete" {
+		progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+		if progressErr != nil || progress == nil {
+			if progressErr == nil {
+				progressErr = errors.New("delete journal disappeared during retry")
+			}
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": progressErr.Error()})
+			return
+		}
+		if body.Force && !progress.Force {
+			if body.Confirmation != slug {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "type the full session slug to confirm forced deletion",
+				})
+				return
+			}
+			force = true
+		} else {
+			force = progress.Force
+		}
+	} else if body.Confirmation != slug {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "type the full session slug to confirm deletion",
 		})
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"redirect": "/"})
+	args := []string{"delete", slug, "--as-is", "--portal-authorized"}
+	if force {
+		args = append(args, "--force")
+	}
+	s.startLifecycleOperation(w, slug, "delete", "/", args)
 }
 
 func completedPlan(transcript codex.Transcript) (codex.TranscriptEntry, bool) {
@@ -1406,6 +1608,17 @@ func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *s
 		})
 		return
 	}
+	if owner == "archive" {
+		progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, summary.Slug)
+		if progressErr != nil || progress == nil {
+			if progressErr == nil {
+				progressErr = errors.New("archive journal disappeared during retry")
+			}
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": progressErr.Error()})
+			return
+		}
+		body.Mode = progress.Mode
+	}
 	if summary.Archived && owner != "archive" {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already archived"})
 		return
@@ -1483,22 +1696,30 @@ func (s *Server) startLifecycleOperation(w http.ResponseWriter, slug, kind, redi
 		s.writeJSON(w, http.StatusAccepted, operation)
 		return
 	}
-	operation = lifecycleOperation{Kind: kind, State: "running", Redirect: redirect}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	operation = lifecycleOperation{
+		Kind: kind, State: "running", Phase: "starting", Redirect: redirect,
+		StartedAt: now, UpdatedAt: now,
+	}
 	s.operations[slug] = operation
 	s.operationWG.Add(1)
 	s.operationMu.Unlock()
-	go func() {
+	go func(started lifecycleOperation) {
 		defer s.operationWG.Done()
 		err := s.runLifecycleOperation(s.operationContext, slug, kind, args)
-		operation := lifecycleOperation{Kind: kind, State: "complete", Redirect: redirect}
+		finished := time.Now().UTC().Format(time.RFC3339Nano)
+		completed := started
+		completed.State = "complete"
+		completed.Phase = "complete"
+		completed.UpdatedAt = finished
 		if err != nil {
-			operation.State = "failed"
-			operation.Error = err.Error()
+			completed.State = "failed"
+			completed.Error = err.Error()
 		}
 		s.operationMu.Lock()
-		s.operations[slug] = operation
+		s.operations[slug] = completed
 		s.operationMu.Unlock()
-	}()
+	}(operation)
 	s.writeJSON(w, http.StatusAccepted, operation)
 }
 
@@ -1531,13 +1752,32 @@ func (s *Server) executeLifecycleOperation(
 }
 
 func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
-	s.operationMu.Lock()
-	operation, ok := s.operations[slug]
-	s.operationMu.Unlock()
-	if !ok {
+	operation, ok := s.currentLifecycleOperation(slug)
+	progress, err := session.PendingLifecycleProgress(s.config.Workspace, slug)
+	if err != nil {
+		operation.State = "failed"
+		operation.Error = "Session lifecycle state is unsafe: " + err.Error()
+		operation.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	} else if progress != nil {
+		if !ok || operation.Kind != progress.Operation {
+			operation = lifecycleOperation{
+				Kind: progress.Operation, State: "paused",
+				StartedAt: progress.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			}
+		}
+		operation.Phase = progress.Phase
+		operation.UpdatedAt = progress.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	} else if !ok {
 		operation = lifecycleOperation{State: "idle"}
 	}
 	s.writeJSON(w, http.StatusOK, operation)
+}
+
+func (s *Server) currentLifecycleOperation(slug string) (lifecycleOperation, bool) {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	operation, ok := s.operations[slug]
+	return operation, ok
 }
 
 func commandFailure(action, stdout, stderr string, err error) error {
