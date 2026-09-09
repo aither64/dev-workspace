@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -16,11 +17,17 @@ import (
 // identity and remote metadata are read only from the workspace checkout or a
 // canonical bare repository, never from the writable worktree itself.
 func ActiveRepositories(workspace, slug string, registered []Repository) ([]Repository, error) {
+	return ActiveRepositoriesContext(context.Background(), workspace, slug, registered)
+}
+
+func ActiveRepositoriesContext(
+	ctx context.Context, workspace, slug string, registered []Repository,
+) ([]Repository, error) {
 	if !ValidSlug(slug) {
 		return nil, errors.New("invalid session slug")
 	}
 
-	discovered, err := DiscoverActiveRepositories(workspace)
+	discovered, err := DiscoverActiveRepositoriesContext(ctx, workspace)
 	result, mergeErr := MergeActiveRepositories(registered, discovered[slug])
 	return result, errors.Join(err, mergeErr)
 }
@@ -58,10 +65,18 @@ func MergeActiveRepositories(registered, discovered []Repository) ([]Repository,
 // the result into every active manifest without an O(sessions * repositories)
 // subprocess fanout.
 func DiscoverActiveRepositories(workspace string) (map[string][]Repository, error) {
+	return DiscoverActiveRepositoriesContext(context.Background(), workspace)
+}
+
+func DiscoverActiveRepositoriesContext(ctx context.Context, workspace string) (map[string][]Repository, error) {
 	result := make(map[string][]Repository)
 	var problems []error
 	for _, source := range repositorySources(workspace) {
-		discovered, err := discoverSourceWorktrees(workspace, source)
+		if err := ctx.Err(); err != nil {
+			problems = append(problems, err)
+			break
+		}
+		discovered, err := discoverSourceWorktrees(ctx, workspace, source)
 		if err != nil {
 			problems = append(problems, err)
 			continue
@@ -107,18 +122,18 @@ func repositorySources(workspace string) []repositorySource {
 	return sources
 }
 
-func discoverSourceWorktrees(workspace string, source repositorySource) (map[string][]Repository, error) {
+func discoverSourceWorktrees(ctx context.Context, workspace string, source repositorySource) (map[string][]Repository, error) {
 	args := source.gitArgs("worktree", "list", "--porcelain", "-z")
-	output, err := exec.Command("git", args...).Output()
+	output, err := exec.CommandContext(ctx, "git", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s worktrees: %w", source.project, err)
 	}
-	remote, _ := gitText(source, "remote", "get-url", "origin")
+	remote, _ := gitText(ctx, source, "remote", "get-url", "origin")
 	github := githubRepository(remote)
-	defaultBranch, _ := gitText(source, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+	defaultBranch, _ := gitText(ctx, source, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	defaultBranch = strings.TrimPrefix(defaultBranch, "origin/")
 	if defaultBranch == "" && source.bare {
-		defaultBranch, _ = gitText(source, "symbolic-ref", "--quiet", "--short", "HEAD")
+		defaultBranch, _ = gitText(ctx, source, "symbolic-ref", "--quiet", "--short", "HEAD")
 	}
 	if defaultBranch == "" {
 		defaultBranch = "master"
@@ -170,8 +185,8 @@ func (source repositorySource) gitArgs(args ...string) []string {
 	return append([]string{"-C", source.path}, args...)
 }
 
-func gitText(source repositorySource, args ...string) (string, error) {
-	output, err := exec.Command("git", source.gitArgs(args...)...).Output()
+func gitText(ctx context.Context, source repositorySource, args ...string) (string, error) {
+	output, err := exec.CommandContext(ctx, "git", source.gitArgs(args...)...).Output()
 	return strings.TrimSpace(string(output)), err
 }
 

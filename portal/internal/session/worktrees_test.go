@@ -1,10 +1,12 @@
 package session
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestActiveRepositoriesDiscoversCanonicalUnregisteredWorktree(t *testing.T) {
@@ -57,6 +59,28 @@ func TestMergeActiveRepositoriesRejectsConflictingRegistration(t *testing.T) {
 	}
 	if len(result) != 1 || result[0].Branch != "feature" {
 		t.Fatalf("registered repository was replaced: %#v", result)
+	}
+}
+
+func TestDiscoverActiveRepositoriesHonorsCallerDeadline(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Mkdir(filepath.Join(workspace, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := DiscoverActiveRepositoriesContext(ctx, workspace)
+	if err == nil {
+		t.Fatal("blocked Git discovery ignored the caller deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Git discovery exceeded its caller deadline: %s", elapsed)
 	}
 }
 
