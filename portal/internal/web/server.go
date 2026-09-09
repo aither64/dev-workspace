@@ -63,6 +63,7 @@ type codexController interface {
 	RespondAnswers(context.Context, string, string, map[string]map[string][]string) error
 	SnoozeUserInput(string, string) error
 	RespondDecision(context.Context, string, string, string) error
+	ReconcileThreadInstructions(context.Context, string) error
 }
 
 type Config struct {
@@ -221,7 +222,7 @@ func New(config Config) (*Server, error) {
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
 	operationContext, cancelOperations := context.WithCancel(context.Background())
-	return &Server{
+	server := &Server{
 		config: config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
 		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
@@ -232,7 +233,53 @@ func New(config Config) (*Server, error) {
 		operationContext: operationContext,
 		cancelOperations: cancelOperations,
 		stopping:         make(chan struct{}),
-	}, nil
+	}
+	if config.Codex != nil {
+		server.operationWG.Add(1)
+		go server.reconcileThreadInstructions()
+	}
+	return server, nil
+}
+
+func (s *Server) reconcileThreadInstructions() {
+	defer s.operationWG.Done()
+	if s.config.Codex == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.operationContext, 30*time.Second)
+	defer cancel()
+	summaries, err := s.listSessions()
+	if err != nil {
+		s.config.Logger.Printf("list sessions for Codex instruction reconciliation: %v", err)
+	}
+	pending := make(map[string]string)
+	for _, summary := range summaries {
+		if summary.Archived || summary.Codex.ThreadID == "" {
+			continue
+		}
+		pending[summary.Slug] = summary.Codex.ThreadID
+	}
+	for len(pending) > 0 {
+		for slug, threadID := range pending {
+			if err := s.config.Codex.ReconcileThreadInstructions(ctx, threadID); err == nil {
+				delete(pending, slug)
+			} else if ctx.Err() != nil {
+				return
+			} else {
+				s.config.Logger.Printf("reconcile Codex instructions for %s: %v", slug, err)
+			}
+		}
+		if len(pending) == 0 {
+			return
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Server) Close() {

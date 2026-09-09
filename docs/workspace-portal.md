@@ -209,6 +209,12 @@ archived, forged, or stale sessions remain passive. A verified persisted thread
 can still provide a read-only transcript after stop, reboot, completion, or
 archival.
 
+Every portal-created, resumed, or forked Codex thread receives a package-owned
+developer instruction that forbids implicit archival, deletion, session stop,
+or delayed cleanup. Completing a response only leaves the session ready for a
+later explicit lifecycle action. Switching Default or Plan mode preserves this
+policy without replacing Codex's built-in mode instructions.
+
 Terminal and browser sessions use the App Server socket below
 `$XDG_RUNTIME_DIR/vpsfree-workspaces/<name>/`. The App Server runs the Codex
 package from the current aitherdev system. The user service validates a new

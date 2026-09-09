@@ -1711,6 +1711,75 @@ func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
 	}
 }
 
+func TestReconcilesDeveloperInstructionsForActiveManifestThreads(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	broken := filepath.Join(server.config.Workspace, "work", "broken")
+	if err := os.MkdirAll(broken, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "portal.yml"), []byte("not: [yaml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, broken, "active")
+	controller := &instructionReconcilingCodex{browserContractCodex: &browserContractCodex{}}
+	server.config.Codex = controller
+	server.operationWG.Add(1)
+	server.reconcileThreadInstructions()
+	if len(controller.threadIDs) != 1 || controller.threadIDs[0] != "thread-1" {
+		t.Fatalf("reconciled instruction threads = %#v", controller.threadIDs)
+	}
+}
+
+func TestRetriesDeveloperInstructionReconciliation(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	controller := &instructionReconcilingCodex{
+		browserContractCodex: &browserContractCodex{}, failures: 1,
+	}
+	server.config.Codex = controller
+	server.operationWG.Add(1)
+	server.reconcileThreadInstructions()
+	if len(controller.threadIDs) != 2 {
+		t.Fatalf("instruction reconciliation attempts = %#v", controller.threadIDs)
+	}
+}
+
+type instructionReconcilingCodex struct {
+	*browserContractCodex
+	threadIDs []string
+	failures  int
+}
+
+func (client *instructionReconcilingCodex) ReconcileThreadInstructions(
+	_ context.Context, threadID string,
+) error {
+	client.threadIDs = append(client.threadIDs, threadID)
+	if client.failures > 0 {
+		client.failures--
+		return errors.New("temporary reconciliation failure")
+	}
+	return nil
+}
+
 type browserContractCodex struct {
 	mu                     sync.Mutex
 	message                string
@@ -1739,6 +1808,12 @@ type browserContractCodex struct {
 	activityErr            error
 	activityWait           <-chan struct{}
 	activityCalls          int
+}
+
+func (client *browserContractCodex) ReconcileThreadInstructions(
+	_ context.Context, _ string,
+) error {
+	return nil
 }
 
 func (client *browserContractCodex) ListThreadActivity(
