@@ -229,14 +229,15 @@ policy without replacing Codex's built-in mode instructions.
 
 Terminal and browser sessions use the App Server socket below
 `$XDG_RUNTIME_DIR/vpsfree-workspaces/<name>/`. The App Server runs the Codex
-package from the current aitherdev system. The user service validates a new
-system Codex against the bundled protocol contract and model catalog before it
-adopts it. The transition gate blocks new browser and CLI mutations, quiesces
-terminal clients, checks every thread for idleness, restarts each App Server and
-portal as a pair, and then restores the clients. A compatible update waits on a
-five-minute retry timer while a turn is active. An incompatible update leaves
-the last compatible store path active. Stored client versions are diagnostic
-history and do not invalidate sessions after a compatible upgrade.
+package bundled with the current user-profile generation. A profile switch
+validates that exact Codex build against the package's protocol contract and
+model catalog before activation. The transition gate blocks new browser and
+CLI mutations, quiesces terminal clients, checks every thread for idleness,
+restarts each App Server and portal as a pair, and then restores the clients. A
+compatible update waits on a five-minute retry timer while a turn is active.
+An incompatible update leaves the last compatible profile and Codex pair
+active. Stored client versions are diagnostic history and do not invalidate
+sessions after a compatible upgrade.
 
 `stop` and `archive` quiesce the managed terminal client and refuse an active
 turn. `delete --force` interrupts the turn because it is an explicit discard.
@@ -390,28 +391,46 @@ CA. Trust the replacement public CA only after checking it on aitherdev.
 
 ## Packaging and deployment
 
-The workspace flake owns `packages.x86_64-linux.workspace-portal`.
-`vpsfree-cz-configuration` does not consume or pin it. NixOS owns only nginx,
-VPN exposure, TLS and Basic Auth credentials, user lingering, and the ordinary
-system Codex package. The workspace flake owns the router, portal, session and
-cluster commands, and user systemd units.
+`dev-workspace` owns the reusable application packages, user services, session
+commands, and the Codex runtime. A coordination workspace selects one exact
+`dev-workspace` revision through its thin flake. `vpsfree-cz-configuration`
+imports only the reusable host module, which owns nginx, VPN exposure, TLS,
+and Basic Auth credentials. The selected user profile retains its previous
+generation as the application rollback target.
 
-Deploy the aitherdev substrate and wildcard internal DNS first. This stops the
-former system-owned portal runtime; existing portal and terminal sessions are
-not migrated. Initiative tracking and project branches remain on disk and can
-be revived from the new runtime.
+Deploy the aitherdev substrate and wildcard internal DNS first. This leaves the
+existing user-owned portal and terminal runtime running. Switching the user
+package in the next step preserves the workspace registry, profile history,
+session tracking, thread identities, and runtime identities. The switch
+quiesces clients while it changes the matched portal and Codex pair, then
+restores them. `workspace-host rollback` selects the retained previous pair.
+During the initial compatibility window, the new browser keeps using the
+existing `/api/sessions/` conversation paths and the new server aliases those
+paths to the reusable handler. An open tab therefore survives both the upgrade
+and a rollback; `/codex/` remains the public path for new generic integrations.
+Remove these aliases only after a later portal generation has emitted
+`/codex/` paths, every profile generation that can be selected by switch or
+rollback also emits those paths, and operators either know that tabs opened on
+the older generations have been reloaded or explicitly accept that those tabs
+will require a reload.
 
-Register the workspace once and install the user application from the reviewed
-workspace feature worktree:
+The aitherdev migration preserves its installed user profile and existing
+workspace registration. Update that profile from the reviewed workspace
+feature worktree through the selected stable command:
 
 ```sh
-nix run /path/to/workspace-feature#workspace-host -- register vpsfree-cz \
-  /home/aither/workspace/ai/vpsfree.cz \
-  --hostname vpsfree-cz.workspace.aitherdev.int.vpsfree.cz \
-  --alias vpsfree-cz-workspace.aitherdev.int.vpsfree.cz
-nix run /path/to/workspace-feature#workspace-host -- switch \
-  --source /path/to/workspace-feature
+workspace-host switch --source /path/to/workspace-feature
 ```
+
+For a host without an installed profile, use the `nix run` first-install
+command from the repository README. To add another workspace to an installed
+profile, use the stable `workspace-host register` command.
+
+The workspace root owns `.dev-workspace.json`, which configures portal labels,
+the optional SSH attach host and enabled development-cluster providers without
+changing the local registry. See the repository README for its schema and
+generic defaults. The vpsFree.cz coordination workspace enables both shipped
+providers and supplies the aitherdev display and SSH values.
 
 To retire a registered workspace, first finish or stop its sessions, then run
 `workspace-host unregister NAME`. The command quiesces its terminal clients,
@@ -433,17 +452,17 @@ conversation. Current archives that retain a thread restore that exact
 conversation as described above; no Codex process itself is preserved.
 
 Later portal changes need only `workspace-host switch --source PATH`. The
-command builds a candidate, checks it against the system Codex, adds a user
-profile generation, updates stable commands and units, and restarts the router
-and portal as one transaction. It has no nonactivating mode because changing
-the stable commands without restarting the services would mix two application
-generations. Each profile generation retains the Codex store path it was tested
-with. Failed updates restore the preceding profile, Codex root, links, and
-services, then remove the rejected profile generation so rollback cannot select
-it later. A failed first installation has no preceding generation to restore;
-it leaves the validated candidate installed so the same `switch` can be
-retried. `workspace-host rollback` selects the preceding application and Codex
-pair and refuses while a thread is active. Both switch and rollback also refuse
+command builds a candidate, checks the Codex bundled with that candidate, adds
+a user profile generation, updates stable commands and units, and restarts the
+router and portal as one transaction. It has no nonactivating mode because
+changing the stable commands without restarting the services would mix two
+application generations. Each profile generation contains the Codex store path
+it was tested with. Failed updates restore the preceding profile, Codex root,
+links, and services, then remove the rejected profile generation so rollback
+cannot select it later. A failed first installation has no preceding generation
+to restore; it leaves the validated candidate installed so the same `switch`
+can be retried. `workspace-host rollback` selects the preceding application and
+Codex pair and refuses while a thread is active. Both switch and rollback also refuse
 while any archive, delete, or revive journal exists, or while a current
 identity-bound session creation journal is still `creating`, or while a fork
 or stopped-session start journal exists, because changing helpers
@@ -459,6 +478,11 @@ restored the same generation; rerun the stable command to use the installed
 generation. Each portal process retains the same profile-link identity from
 startup and rechecks it after the transition lock for every mutation, including
 an archive, delete, or revive accepted before the lock wait.
+Compatibility command and skill tombstones follow the same concrete profile
+boundary: remove a tombstone only when no generation reported by
+`nix-env --list-generations --profile "$VPSFREE_WORKSPACES_PROFILE"` remains a
+valid switch or rollback target that installed that name. This keeps a
+rollback from leaving a stale link owned by a retained package.
 When any registered workspace has development cluster state, both transitions
 also require the target package to publish the current state schema, transition
 policy, and tracking-size contract. The separate transition-policy version

@@ -440,14 +440,14 @@ deployment.
 
 Host-specific runtime options are private implementation details fixed by the
 dispatcher. Callers can select only a registered workspace, not replace its
-runtime paths. The App Server uses the Codex package from the current NixOS
-system. `workspace-host` checks its protocol and model catalog before adopting
-it and retains one tested Codex store path per application profile generation.
-Codex adoption and rollback gate new mutations, quiesce native terminal
-clients, verify all threads are idle, restart App Server and portal pairs, and
-restore the clients. A compatible system update that finds an active turn is
-retried every five minutes. Use `--no-codex` to start a shell in the left pane
-instead.
+runtime paths. The App Server uses the Codex package bundled with the current
+application profile. `workspace-host` checks its protocol and model catalog
+before activation and retains the tested Codex store path with each profile
+generation. Profile switches and rollbacks gate new mutations, quiesce native
+terminal clients, verify all threads are idle, restart App Server and portal
+pairs, and restore the clients. A compatible profile update that finds an
+active turn is retried every five minutes. Use `--no-codex` to start a shell in
+the left pane instead.
 
 New conversations use GPT-6 Astra with `xhigh` reasoning. When an explicitly
 chosen model does not support `xhigh`, its advertised default reasoning effort
