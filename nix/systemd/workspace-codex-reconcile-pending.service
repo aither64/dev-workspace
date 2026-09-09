@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry a pending compatible system Codex update
+Description=Retry a pending compatible workspace Codex update
 
 [Service]
 Type=oneshot

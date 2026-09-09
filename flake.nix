@@ -1,5 +1,5 @@
 {
-  description = "vpsFree.cz development workspace tools";
+  description = "Reusable development workspaces backed by Codex App Server";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -14,19 +14,23 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      workspacePortal = pkgs.callPackage ./nix/workspace-portal.nix {
+      devWorkspace = pkgs.callPackage ./nix/workspace-portal.nix {
         src = self;
       };
     in
     {
       packages.${system} = {
-        default = workspacePortal;
-        workspace-host = workspacePortal;
-        workspace-portal = workspacePortal;
+        default = devWorkspace;
+        dev-workspace = devWorkspace;
+        workspace-host = devWorkspace;
+        workspace-portal = devWorkspace;
       };
       apps.${system}.workspace-host = {
         type = "app";
-        program = "${workspacePortal}/bin/workspace-host";
+        program = "${devWorkspace}/bin/workspace-host";
+      };
+      checks.${system} = {
+        package = devWorkspace;
       };
     };
 }

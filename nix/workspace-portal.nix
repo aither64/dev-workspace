@@ -22,7 +22,7 @@ let
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
 in
 buildGoModule {
-  pname = "workspace-portal";
+  pname = "dev-workspace";
   version = "0.1.0";
 
   inherit src;
@@ -47,6 +47,8 @@ buildGoModule {
   checkPhase = ''
     runHook preCheck
     export HOME="$TMPDIR/home"
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
     export SHELL=${bash}/bin/bash
     export TMUX_TMPDIR="$TMPDIR/tmux"
     export VPSFREE_DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
@@ -87,7 +89,6 @@ buildGoModule {
     cp -R ${src}/dev-clusters/vpsadmin "$out/share/workspace-portal/vpsadmin-devcluster"
     cp -R ${src}/dev-clusters/vpsadminos "$out/share/workspace-portal/vpsadminos-devcluster"
     cp -R ${src}/dev-clusters/lib "$out/share/workspace-portal/lib"
-
     substituteInPlace "$out/libexec/workspace-portal/dev-session" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
     substituteInPlace "$out/libexec/workspace-host" \
@@ -167,7 +168,7 @@ buildGoModule {
   '';
 
   meta = {
-    description = "Browser interface for vpsFree.cz development sessions";
+    description = "Persistent development workspaces backed by Codex App Server";
     mainProgram = "workspace-portal";
     platforms = lib.platforms.linux;
   };

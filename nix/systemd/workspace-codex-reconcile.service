@@ -1,5 +1,5 @@
 [Unit]
-Description=Adopt the current compatible system Codex
+Description=Activate the current compatible workspace Codex
 
 [Service]
 Type=oneshot

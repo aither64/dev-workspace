@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry pending system Codex adoption
+Description=Retry pending workspace Codex activation
 
 [Timer]
 OnBootSec=2min

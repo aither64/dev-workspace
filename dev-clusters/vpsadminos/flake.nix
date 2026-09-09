@@ -32,7 +32,7 @@
       sshPubKey = env "VPSADMINOS_DEVCLUSTER_SSH_PUBKEY" "${workspace}/.dev-clusters/vpsadminos/ssh/id_ed25519.pub";
       vpsadminosSourcePath = env "VPSADMINOS_DEVCLUSTER_VPSADMINOS_SOURCE" vpsadminos.outPath;
       sharedRunnerLib = builtins.path {
-        path = "${workspace}/dev-clusters/lib";
+        path = ../lib;
         name = "devcluster-runner-lib";
       };
 

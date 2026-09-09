@@ -53,7 +53,7 @@
       vpsfStatusSourcePath = env "VPSADMIN_DEVCLUSTER_VPSF_STATUS_SOURCE" "";
       vpsadminGoClientSourcePath = env "VPSADMIN_DEVCLUSTER_VPSADMIN_GO_CLIENT_SOURCE" "";
       sharedRunnerLib = builtins.path {
-        path = "${workspace}/dev-clusters/lib";
+        path = ../lib;
         name = "devcluster-runner-lib";
       };
 
