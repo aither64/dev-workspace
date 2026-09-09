@@ -21,6 +21,7 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       devWorkspace = pkgs.callPackage ./nix/workspace-portal.nix {
         src = self;
         codex = llm-agents.packages.${system}.codex;
@@ -41,6 +42,20 @@
       };
       checks.${system} = {
         package = devWorkspace;
+        host-module = import ./nix/tests/host-module.nix {
+          inherit pkgs nixpkgs self;
+        };
+        host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
+          inherit pkgs self;
+        };
+      };
+      nixosModules.host = import ./nix/host-module.nix;
+      nixosConfigurations.example = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.host
+          ./nix/example-host.nix
+        ];
       };
     };
 }
