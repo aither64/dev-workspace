@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
-	portalweb "github.com/aither64/vpsfree-cz-workspace/portal/internal/web"
+	"github.com/aither64/dev-workspace/portal/internal/codex"
+	"github.com/aither64/dev-workspace/portal/internal/session"
+	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 )
 
 const version = "0.1.0"

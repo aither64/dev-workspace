@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 const (

@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/processgroup"
+	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 )
 
 type Link struct {

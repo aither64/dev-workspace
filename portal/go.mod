@@ -1,4 +1,4 @@
-module github.com/aither64/vpsfree-cz-workspace/portal
+module github.com/aither64/dev-workspace/portal
 
 go 1.24.0
 

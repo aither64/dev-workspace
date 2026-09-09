@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/cluster"
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/codex"
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/repository"
-	"github.com/aither64/vpsfree-cz-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/codex"
+	"github.com/aither64/dev-workspace/portal/internal/repository"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"golang.org/x/sys/unix"
 )
 
