@@ -104,6 +104,8 @@ development clusters. The equivalent terminal command is:
 dev-session fork 2026-09-03-example alternate-approach
 ```
 
+The fork dialog shows progress and elapsed time until it opens the new session.
+
 The portal discovers attached Git worktrees directly from the workspace and
 canonical bare repositories. A worktree therefore appears even when an older
 helper did not record it in `portal.yml`. The manifest remains authoritative

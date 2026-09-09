@@ -171,6 +171,7 @@
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
         <label>Reasoning effort<select name="effort" data-effort-select><option value="">Loading efforts…</option></select></label>
       </div>
+      <p id="fork-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create fork</button></div>
     </form>
   </dialog>
@@ -179,6 +180,7 @@
       <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan and uses this session's model and reasoning setting.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
+      <p id="plan-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create session</button></div>
     </form>
   </dialog>
