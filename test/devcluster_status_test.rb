@@ -1488,14 +1488,23 @@ class DevclusterStatusTest < Minitest::Test
   end
 
   def spawn_marker_process(*arguments)
+    ready_directory = Dir.mktmpdir('vpsfree-devcluster-marker-ready')
+    ready_path = File.join(ready_directory, 'ready')
+    program = <<~RUBY
+      Signal.trap('TERM', 'DEFAULT')
+      File.write(ENV.fetch('VPSFREE_MARKER_READY'), 'ready')
+      sleep 30
+    RUBY
     pid = Process.spawn(
-      RbConfig.ruby, '-e', 'sleep 30', '--', *arguments,
+      { 'VPSFREE_MARKER_READY' => ready_path },
+      RbConfig.ruby, '-e', program, '--', *arguments,
       out: File::NULL, err: File::NULL
     )
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
     loop do
       cmdline = File.read("/proc/#{pid}/cmdline").split("\0")
-      return pid if arguments.all? { |argument| cmdline.include?(argument) }
+      ready = File.file?(ready_path) && File.read(ready_path) == 'ready'
+      return pid if ready && arguments.all? { |argument| cmdline.include?(argument) }
       if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
         raise "marker process #{pid} did not start"
       end
@@ -1505,6 +1514,8 @@ class DevclusterStatusTest < Minitest::Test
   rescue StandardError
     stop_process(pid) if pid
     raise
+  ensure
+    FileUtils.remove_entry(ready_directory) if ready_directory && File.exist?(ready_directory)
   end
 
   def wait_for_pid_file(path)
