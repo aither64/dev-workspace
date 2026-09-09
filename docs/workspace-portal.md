@@ -9,27 +9,44 @@ https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz/
 The former
 `vpsfree-cz-workspace.aitherdev.int.vpsfree.cz` address redirects here.
 
-It lists active and archived initiatives that contain `portal.yml`. Both lists
-are ordered by latest activity, newest first; live Codex activity augments the
-tracking-file timestamps for active sessions. Each initiative uses full-width
-tabs for its Codex conversation, handoff commands, repositories, development
-clusters, and Artifacts. The one artifact catalog always includes Plan and
-State, followed by curated files from `portal.yml`; previews are loaded only
-when selected. It renders Codex output as sanitized Markdown and omits empty
-reasoning summaries.
+It lists active and archived initiatives that contain `portal.yml`. The initial
+page uses filesystem metadata only, so it renders without waiting for Codex or
+cluster helpers. A bounded background request adds exact Codex activity,
+repository counts, lifecycle operations, and running-cluster counts. It then
+orders both lists by latest activity, newest first, without moving the reader's
+scroll position.
+
+Each initiative uses full-width, fragment-linked tabs for its Codex
+conversation, handoff commands, repositories, development clusters, and
+Artifacts. A tab URL such as `#repositories` can be copied or opened in a new
+browser tab. The artifact catalog always includes Plan and State, followed by
+curated files from `portal.yml`; previews are loaded only when selected. Codex
+messages are rendered as sanitized Markdown. `Reasoning summary` entries are
+short user-facing summaries supplied by Codex, not hidden reasoning tokens;
+there can be more than one when a turn has several reasoning items, and empty
+summaries are omitted.
+
 An active conversation can receive messages, be interrupted, answer Codex
 questions, handle supported command or file-change approvals, and change its
 model and reasoning effort. A purple Default or Plan switch in the composer
 controls the mode used by later turns without changing the selected model or
 reasoning effort.
-Existing-thread settings require an explicit reasoning effort because the App
-Server cannot clear one back to automatic selection.
+
+The compact model and reasoning selectors stay in the composer footer beside
+Default, Plan, and Interrupt. Existing-thread settings require an explicit
+reasoning effort because the App Server cannot clear one back to automatic
+selection.
 Enter sends immediately and Shift+Enter inserts a line break. While Codex is
 working, Send becomes Steer now and adds the message to the active turn. Queue
-next instead stores it for later delivery. Queued messages are shown in order,
-can be removed, and can be started manually after an interrupted turn. The
-browser and portal runtime retain each unresolved queue identity so a lost
-response or service restart cannot silently submit the same instruction twice.
+next instead stores it for later delivery. The page shows a working indicator
+and elapsed time below the transcript until the turn stops. Queued messages are
+shown in order, can be removed, and can be started manually after an interrupted
+turn. All, Messages, and Activity views separate prose from commands and tool
+events while keeping errors and pending interaction visible. Each view retains
+its own scroll and expanded-output state. File changes use a colorized unified
+diff instead of raw JSON. The browser and portal runtime retain each unresolved
+queue identity so a lost response or service restart cannot silently submit the
+same instruction twice.
 
 The portal is not a shell or a general file browser. It exposes `plan.md`,
 `state.md`, and files explicitly listed in `portal.yml`. Curated artifacts are
@@ -93,15 +110,25 @@ helper did not record it in `portal.yml`. The manifest remains authoritative
 when it already contains the repository, and conflicting live metadata is
 reported instead of replacing the recorded values.
 
+For an active repository, the Repositories tab reads the exact local feature
+head from its canonical worktree and compares it with the authoritative GitHub
+branch head. It distinguishes pushed, not pushed, GitHub-ahead, divergent, and
+unknown states. Workflow results are shown only when they belong to the exact
+current revision; an older run for the same branch is never presented as the
+current result. Archived repositories use the recorded final head.
+
 The Clusters tab recognizes vpsAdmin and vpsAdminOS state owned by the session.
-It shows the verified runner state, topology, network, service links, SSH
-commands, and development credentials. Release cluster stops the matching
-runner and removes its temporary state. The index marks sessions with running
-clusters. New cluster socket directories include the canonical workspace in
-their identity. The only old slug-only socket adopted during this cutover is
-the existing vpsAdmin cluster for `2026-08-18-vpsadmin-password-reset`, and only
-while its live runner exposes the exact expected socket, state, PID, and ready
-paths.
+It shows the verified runner state, topology, and network. Individual services
+have nested tabs with clickable URLs. Credentials are grouped by account;
+passwords remain masked until explicitly revealed and every value can be
+copied. Generic machine access commands remain in a separate Connect section,
+and cluster release is isolated in the card footer. Release cluster stops the
+matching runner and removes its temporary state. The index shows only the
+credential-free running-cluster count. New cluster socket directories include
+the canonical workspace in their identity. The only old slug-only socket
+adopted during this cutover is the existing vpsAdmin cluster for
+`2026-08-18-vpsadmin-password-reset`, and only while its live runner exposes the
+exact expected socket, state, PID, and ready paths.
 
 Archive session offers completed and abandoned modes in one confirmation
 dialog. Completed archival first proves that every registered feature head is
@@ -115,7 +142,10 @@ the same command can safely resume an interrupted operation. Recovery verifies
 the exact archived tracking tree and retained conversation identity before it
 commits or retires anything. Terminal confirmation occurs before the CLI waits
 for the host-wide transition lock, so an interactive prompt never monopolizes
-the workspace.
+the workspace. The CLI prints each durable phase. The browser runs archive,
+delete, and revive asynchronously, showing the current phase and elapsed time;
+after a failure or service restart, it offers the deterministic retry rather
+than implying the operation finished.
 
 Revive session restores an archive as active with one confirmation. Abandoned
 archives use a stronger warning whose authorization remains in the retry
@@ -161,8 +191,9 @@ thread by its exact identity even when older archived threads share the working
 directory, and durably records a unique cwd-bound thread before archiving it
 when creation lost its ID.
 It refuses to continue if a known thread cannot be reached. Successful
-retirement removes the thread's durable submission attempts; the browser clears
-its matching local receipts and input drafts before leaving the deleted page.
+retirement removes the thread's durable submission attempts; after the
+asynchronous deletion reports completion, the browser clears its matching local
+receipts and input drafts before leaving the deleted page.
 A failed non-forced retirement can be retried with newly confirmed `--force`;
 that authorization is a durable one-way upgrade. Recovery storage is rejected
 when it is inside tracking, the creation journal, a worktree, cluster state, or
@@ -278,11 +309,11 @@ development LXC.
 
 The portal rejects mutations without the exact origin, uses a restrictive
 content security policy and sanitized Markdown, and does not expose general
-filesystem, shell, or App Server RPC access. Page rendering reads Git worktree
-registrations and immutable metadata only from the workspace checkout and
-canonical bare repositories; it does not run Git in writable feature
-worktrees. Workspace manifests are display metadata; Codex mutations also
-check uid-private host authority against tmux and the App Server.
+filesystem, shell, or App Server RPC access. Repository status runs read-only
+Git identity and revision commands only in the exact canonical worktree, checks
+that it belongs to the expected canonical repository, and bounds GitHub calls.
+Workspace manifests are display metadata; Codex mutations also check
+uid-private host authority against tmux and the App Server.
 
 The Basic Auth username is `aither`. Its random plaintext password is stored at
 `/var/lib/vpsfree-workspace-portal-password/password`. It is owned by root and

@@ -859,13 +859,14 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 			}
 			if testCase.authority {
 				body := response.Body.String()
-				codexEnd := strings.Index(body, `<section id="handoff"`)
-				if codexEnd < 0 || strings.Contains(body[:codexEnd], `id="codex-settings"`) {
-					t.Fatal("Codex settings form is still visible above the transcript")
+				for _, marker := range []string{`id="codex-model"`, `id="codex-effort"`, `class="compact-select"`} {
+					if !strings.Contains(body, marker) {
+						t.Fatalf("session page is missing inline setting %s", marker)
+					}
 				}
 				for _, marker := range []string{`id="codex-settings-open"`, `id="codex-settings-dialog"`} {
-					if !strings.Contains(body, marker) {
-						t.Fatalf("session page is missing %s", marker)
+					if strings.Contains(body, marker) {
+						t.Fatalf("session page retained obsolete setting %s", marker)
 					}
 				}
 			}
@@ -1032,8 +1033,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"shouldSubmitMessage(event)", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"await beforeRequestInputAction(snoozeAutoResolution)",
 		"entry.html", "archive-session", "revive-session", "artifactPreview", "release-cluster", "fork-dialog",
-		"codex-settings-dialog", "codex-settings-open", "data-cluster-service-tab", "data-reveal-secret",
-		"index-status", "modelSelect.required",
+		"data-cluster-service-tab", "data-reveal-secret", "index-status", "modelSelect.required",
 		"const nextSignature = JSON.stringify(entries)", "client.operation().then((operation)",
 		"deleteDialog.showModal()", `lifecycleKind === "revive" && needsOptions`,
 		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
@@ -1070,8 +1070,8 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	if count := strings.Count(body, `name="effort" data-effort-select>`); count != 2 {
-		t.Fatalf("automatic effort selects = %d", count)
+	if count := strings.Count(body, `data-effort-select`); count != 2 {
+		t.Fatalf("reasoning effort selects = %d", count)
 	}
 	if strings.Contains(body, `name="effort" data-effort-select required`) {
 		t.Fatal("fork reasoning is blocked by native required validation")
@@ -1081,7 +1081,7 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(javascript),
-		`const existingSettings = Boolean(modelSelect.closest("#codex-settings"))`) ||
+		`const existingSettings = modelSelect.dataset.existingSettings === "true"`) ||
 		!strings.Contains(string(javascript), `if (!existingSettings)`) {
 		t.Fatal("existing-thread settings still offer unsupported automatic reasoning")
 	}
