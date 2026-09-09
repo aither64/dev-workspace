@@ -1298,7 +1298,8 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 	body := response.Body.String()
 	for _, marker := range []string{
 		"Local HEAD", "GitHub HEAD", "Diverged", `data-cluster-service-tab="0"`,
-		`data-cluster-service-panel="0"`, "Open Web UI", "Administrator",
+		`data-cluster-service-panel="0"`, `<dl class="service-details"><dt>Link:</dt>`,
+		`href="https://webui.example.test/" target="_blank" rel="noreferrer">https://webui.example.test/</a>`, "Administrator",
 		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
 	} {
 		if !strings.Contains(body, marker) {
