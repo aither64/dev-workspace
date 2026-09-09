@@ -1282,6 +1282,10 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 			Name: "workspace", Branch: "feature", DefaultBranch: "master",
 			LocalHeadSHA: strings.Repeat("a", 40), RemoteHeadSHA: strings.Repeat("b", 40),
 			PushStatus: repository.PushStatusDivergent,
+			Runs: []repository.Run{
+				{WorkflowName: "queued workflow", Status: "queued", HeadSHA: strings.Repeat("a", 40), URL: "https://example.test/queued"},
+				{WorkflowName: "running workflow", Status: "in_progress", HeadSHA: strings.Repeat("a", 40), URL: "https://example.test/running"},
+			},
 		}},
 		Clusters: []cluster.Status{{
 			Kind: "vpsadmin", Label: "vpsAdmin", State: "running", Ready: true,
@@ -1301,6 +1305,8 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 		`data-cluster-service-panel="0"`, `<dl class="service-details"><dt>Link:</dt>`,
 		`href="https://webui.example.test/" target="_blank" rel="noreferrer">https://webui.example.test/</a>`, "Administrator",
 		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
+		`class="run-state queued">queued</span>queued workflow`,
+		`class="run-state in_progress">in progress</span>running workflow`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("session page lacks %q: %s", marker, body)

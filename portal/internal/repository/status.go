@@ -397,7 +397,7 @@ func (r Runner) compareHeadsOnGitHub(ctx context.Context, status *Status) (strin
 
 func (r Runner) loadRuns(ctx context.Context, status *Status, exactHead string) {
 	args := []string{
-		"run", "list", "-R", status.GitHub, "--branch", status.Branch, "--limit", "10",
+		"run", "list", "-R", status.GitHub, "--branch", status.Branch, "--limit", "100",
 		"--json", "workflowName,status,conclusion,headSha,url",
 	}
 	if exactHead != "" {

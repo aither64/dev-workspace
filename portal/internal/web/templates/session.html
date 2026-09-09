@@ -108,7 +108,7 @@
             </nav>
             {{if .StatusError}}<p class="notice warning">Repository: {{.StatusError}}</p>{{end}}
             {{if .GitHubError}}<p class="notice warning">GitHub: {{.GitHubError}}</p>{{end}}
-            {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{.Conclusion}}">{{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
+            {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
           </article>
         {{else}}<p class="empty">Codex has not added any repository worktrees yet.</p>{{end}}
         </div>

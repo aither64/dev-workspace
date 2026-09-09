@@ -115,7 +115,8 @@ head from its canonical worktree and compares it with the authoritative GitHub
 branch head. It distinguishes pushed, not pushed, GitHub-ahead, divergent, and
 unknown states. Workflow results are shown only when they belong to the exact
 current revision; an older run for the same branch is never presented as the
-current result. Archived repositories use the recorded final head.
+current result. Queued, running, and completed runs for that exact revision are
+all visible. Archived repositories use the recorded final head.
 
 The Clusters tab recognizes vpsAdmin and vpsAdminOS state owned by the session.
 It shows the verified runner state, topology, and network. Individual services

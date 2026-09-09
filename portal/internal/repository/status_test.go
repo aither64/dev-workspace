@@ -32,6 +32,8 @@ func TestActiveRepositoryExactlyPushedUsesCanonicalWorktreeAndExactRuns(t *testi
 	localHead := commitInWorktree(t, fixture.worktree, "local")
 	runs, err := json.Marshal([]Run{
 		{WorkflowName: "current", Status: "completed", Conclusion: "success", HeadSHA: localHead, URL: "https://example.test/current"},
+		{WorkflowName: "queued", Status: "queued", HeadSHA: localHead, URL: "https://example.test/queued"},
+		{WorkflowName: "running", Status: "in_progress", HeadSHA: localHead, URL: "https://example.test/running"},
 		{WorkflowName: "stale", Status: "completed", Conclusion: "failure", HeadSHA: strings.Repeat("f", 40), URL: "https://example.test/stale"},
 	})
 	if err != nil {
@@ -52,12 +54,14 @@ func TestActiveRepositoryExactlyPushedUsesCanonicalWorktreeAndExactRuns(t *testi
 		status.GitHubError != "" {
 		t.Fatalf("unexpected status: %#v", status)
 	}
-	if len(status.Runs) != 1 || status.Runs[0].WorkflowName != "current" || status.Runs[0].HeadSHA != localHead {
+	if len(status.Runs) != 3 || status.Runs[0].WorkflowName != "current" ||
+		status.Runs[1].Status != "queued" || status.Runs[2].Status != "in_progress" ||
+		status.Runs[0].HeadSHA != localHead {
 		t.Fatalf("workflow runs were not filtered to the exact head: %#v", status.Runs)
 	}
 	commands := readFile(t, logPath)
 	if !strings.Contains(commands, "run list -R example/project --branch feature") ||
-		!strings.Contains(commands, "--commit "+localHead) {
+		!strings.Contains(commands, "--limit 100") || !strings.Contains(commands, "--commit "+localHead) {
 		t.Fatalf("exact-head run filter was not passed to gh:\n%s", commands)
 	}
 }
