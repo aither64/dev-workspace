@@ -2,6 +2,9 @@
   bash,
   buildGoModule,
   coreutils,
+  codex,
+  codexWebSrc,
+  codexWebRev,
   git,
   gh,
   gnugrep,
@@ -27,7 +30,17 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-Hz8lcK5n0rrcHcyO7lkegl1xK8AhcDOOlrBtyCNFk/8=";
+  vendorHash = "sha256-saNgFV7yWM6k4BIJO+8BepcQ2tDOLXIeDLOOM5939kY=";
+
+  postPatch = ''
+    expected=${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
+    module_file=portal/go.mod
+    [ -f "$module_file" ] || module_file=go.mod
+    if ! grep -Eq "github.com/aither64/codex-web v0.0.0-[0-9]{14}-$expected" "$module_file"; then
+      echo "portal/go.mod does not pin codex-web revision $expected" >&2
+      exit 1
+    fi
+  '';
 
   subPackages = [ "cmd/workspace-portal" ];
   nativeBuildInputs = [ makeWrapper ];
@@ -56,8 +69,8 @@ buildGoModule {
     patchShebangs \
       ../dev-clusters/vpsadmin/bin/devcluster \
       ../dev-clusters/vpsadminos/bin/devcluster
-    ${contractPython}/bin/python3 ../test/codex_protocol_contract.py \
-      --coverage-only internal/codex/client.go
+    ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
+      --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
     (
@@ -70,6 +83,8 @@ buildGoModule {
   '';
 
   postInstall = ''
+    mkdir -p "$out/libexec"
+    ln -s ${codex} "$out/libexec/codex"
     install -Dm755 ${src}/libexec/dev-session \
       "$out/libexec/workspace-portal/dev-session"
     install -Dm755 ${src}/libexec/workspace-host \
@@ -78,9 +93,9 @@ buildGoModule {
       "$out/libexec/workspace-profile-identity.rb"
     ln -s ../workspace-profile-identity.rb \
       "$out/libexec/workspace-portal/workspace-profile-identity.rb"
-    install -Dm644 ${src}/test/codex_protocol_contract.py \
+    install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
       "$out/share/workspace-portal/codex_protocol_contract.py"
-    install -Dm644 ${src}/portal/internal/codex/client.go \
+    install -Dm644 ${codexWebSrc}/codex/client.go \
       "$out/share/workspace-portal/codex-client.go"
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
@@ -123,7 +138,17 @@ buildGoModule {
     }
     wrapProgram "$out/libexec/workspace-host" \
       --prefix PATH : "$hostRuntimePath"
-    clusterRuntimePath=${lib.makeBinPath [ bash coreutils git gnugrep jq openssl util-linux ]}
+    clusterRuntimePath=${
+      lib.makeBinPath [
+        bash
+        coreutils
+        git
+        gnugrep
+        jq
+        openssl
+        util-linux
+      ]
+    }
     makeWrapper "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
       "$out/libexec/workspace-portal/vpsadmin-devcluster" --prefix PATH : "$clusterRuntimePath"
     makeWrapper "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
@@ -135,29 +160,29 @@ buildGoModule {
   '';
 
   postFixup = ''
-    mkdir -p "$TMPDIR/workspace"
-    test -x "$out/bin/dev-session"
-    test -x "$out/bin/workspace-host"
-    test -f "$out/share/workspace-portal/runtime-contract.json"
-    wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
-    if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
-      echo "wrapped helper has a non-store interpreter: $wrapped" >&2
-      exit 1
-    fi
-    wrapped="$out/libexec/.workspace-host-wrapped"
-    if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
-      echo "wrapped helper has a non-store interpreter: $wrapped" >&2
-      exit 1
-    fi
-    for program in vpsadmin-devcluster vpsadminos-devcluster; do
-      if ! head -n 1 "$out/bin/$program" | grep -Eq '^#! */nix/store/'; then
-        echo "cluster helper has a non-store interpreter: $out/bin/$program" >&2
-        exit 1
-      fi
-      ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
-        VPSFREE_DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
-        "$out/libexec/workspace-portal/$program" --help >/dev/null
-    done
+        mkdir -p "$TMPDIR/workspace"
+        test -x "$out/bin/dev-session"
+        test -x "$out/bin/workspace-host"
+        test -f "$out/share/workspace-portal/runtime-contract.json"
+        wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
+        if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+          echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+          exit 1
+        fi
+        wrapped="$out/libexec/.workspace-host-wrapped"
+        if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+          echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+          exit 1
+        fi
+        for program in vpsadmin-devcluster vpsadminos-devcluster; do
+          if ! head -n 1 "$out/bin/$program" | grep -Eq '^#! */nix/store/'; then
+            echo "cluster helper has a non-store interpreter: $out/bin/$program" >&2
+            exit 1
+          fi
+          ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+            VPSFREE_DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
+            "$out/libexec/workspace-portal/$program" --help >/dev/null
+        done
 
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/libexec/workspace-portal/dev-session" --help >/dev/null

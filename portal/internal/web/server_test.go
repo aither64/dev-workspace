@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,10 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
-	"github.com/aither64/dev-workspace/portal/internal/codex"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
 
@@ -65,6 +67,111 @@ func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
 		t.Fatal(err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("portal did not acquire the released transition lock")
+	}
+}
+
+func TestLegacyConversationPathsRemainAvailableDuringRollbackWindow(t *testing.T) {
+	tests := []struct {
+		method string
+		parts  []string
+		path   string
+	}{
+		{http.MethodGet, []string{"example", "thread"}, "/codex/conversations/example/thread"},
+		{http.MethodGet, []string{"example", "events"}, "/codex/conversations/example/events"},
+		{http.MethodGet, []string{"example", "pending"}, "/codex/conversations/example/pending"},
+		{http.MethodGet, []string{"example", "queue"}, "/codex/conversations/example/queue"},
+		{http.MethodPost, []string{"example", "message"}, "/codex/conversations/example/message"},
+		{http.MethodPost, []string{"example", "message-ack"}, "/codex/conversations/example/message-ack"},
+		{http.MethodPost, []string{"example", "queue"}, "/codex/conversations/example/queue"},
+		{http.MethodDelete, []string{"example", "queue", "queued-1"}, "/codex/conversations/example/queue/queued-1"},
+		{http.MethodPost, []string{"example", "queue", "start"}, "/codex/conversations/example/queue/start"},
+		{http.MethodPost, []string{"example", "settings"}, "/codex/conversations/example/settings"},
+		{http.MethodPost, []string{"example", "interrupt"}, "/codex/conversations/example/interrupt"},
+		{http.MethodPost, []string{"example", "respond"}, "/codex/conversations/example/respond"},
+	}
+	for _, test := range tests {
+		if path := legacyConversationPath(test.parts, test.method); path != test.path {
+			t.Errorf("legacyConversationPath(%q, %q) = %q, want %q", test.parts, test.method, path, test.path)
+		}
+	}
+	for _, parts := range [][]string{
+		{"example", "archive"}, {"example", "delete"}, {"example", "operation"},
+		{"example", "release-cluster"}, {"example", "queue", "not-started"},
+	} {
+		if path := legacyConversationPath(parts, http.MethodPost); path != "" {
+			t.Errorf("workspace operation %q was aliased to %q", parts, path)
+		}
+	}
+}
+
+func TestSessionAPIRejectsNoncanonicalPathsBeforeDispatch(t *testing.T) {
+	server := newTestServer(t)
+	conversationCalls := 0
+	server.conversation = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conversationCalls++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/sessions/%65xample/thread"},
+		{http.MethodGet, "/api/sessions/%2Fexample/thread"},
+		{http.MethodGet, "/api/sessions/example/%74hread"},
+		{http.MethodGet, "/api/sessions/example/thread/"},
+		{http.MethodGet, "/api/sessions//example/thread"},
+		{http.MethodGet, "/api//sessions/example/thread"},
+		{http.MethodGet, "/api/sessions/example//thread"},
+		{http.MethodGet, "/api/sessions/example/./thread"},
+		{http.MethodGet, "/api/sessions/example/../thread"},
+		{http.MethodGet, "/api/sessions/ž/thread"},
+		{http.MethodGet, `/api/sessions/{/thread`},
+		{http.MethodDelete, "/api/sessions/example/queue/ž"},
+		{http.MethodDelete, `/api/sessions/example/queue/"`},
+		{http.MethodPost, "/api/sessions/%65xample/archive"},
+		{http.MethodPost, "/api/sessions/example/delete/"},
+		{http.MethodPost, "/api/sessions/example/operation/%72etry"},
+	}
+	handler := server.Handler()
+	for _, test := range tests {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(`{}`))
+			if test.method != http.MethodGet {
+				request.Header.Set("Origin", server.config.BaseURL)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if conversationCalls != 0 {
+		t.Fatalf("conversation handler called %d times", conversationCalls)
+	}
+	server.operationMu.Lock()
+	defer server.operationMu.Unlock()
+	if len(server.operations) != 0 {
+		t.Fatalf("lifecycle operations started: %#v", server.operations)
+	}
+}
+
+func TestTransitionLockWaitHonorsContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestServer(t)
+	server.config.TransitionLock = path
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := server.lockTransitionContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock transition error = %v, want deadline exceeded", err)
 	}
 }
 
@@ -166,7 +273,9 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	}
 	targetID := deletionTargetForTest(t, server, slug)
 	mutationLock := server.messageLock(slug)
-	mutationLock.Lock()
+	if err := mutationLock.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	result := make(chan error, 1)
 	go func() {
 		result <- server.runLifecycleOperation(
@@ -478,7 +587,7 @@ func TestIndexDefersCodexActivityAndReturnsEnrichedStatus(t *testing.T) {
 	}
 	writeSession("2026-09-07-recent-files", "thread-1", base.Add(time.Hour))
 	writeSession("2026-09-06-recent-codex", "thread-2", base)
-	controller := &browserContractCodex{activities: []codex.ThreadActivity{{
+	controller := &browserContractCodex{activities: []workspacecodex.ThreadActivity{{
 		ID: "thread-2", Cwd: filepath.Join(server.config.Workspace, "work", "2026-09-06-recent-codex"),
 		UpdatedAt: base.Add(2 * time.Hour),
 	}}}
@@ -876,51 +985,6 @@ func TestJSONTransportAcceptsMaximallyEscapedMessageAtPublishedLimit(t *testing.
 	}
 }
 
-func TestMessageAcknowledgementsAreBoundedValidatedAndDeduplicated(t *testing.T) {
-	first := "00000000-0000-4000-8000-000000000001"
-	second := "00000000-0000-4000-8000-000000000002"
-	firstDigest := strings.Repeat("a", 64)
-	secondDigest := strings.Repeat("b", 64)
-	acknowledgements, err := normalizeMessageAcknowledgements([]codex.SendAcknowledgement{
-		{ClientUserMessageID: first, Digest: firstDigest},
-		{ClientUserMessageID: " " + second + " ", Digest: " " + secondDigest + " "},
-		{ClientUserMessageID: first, Digest: firstDigest},
-	})
-	if err != nil || len(acknowledgements) != 2 ||
-		acknowledgements[0].ClientUserMessageID != first ||
-		acknowledgements[1].ClientUserMessageID != second || acknowledgements[1].Digest != secondDigest {
-		t.Fatalf("normalized acknowledgements = %#v, %v", acknowledgements, err)
-	}
-	for _, input := range [][]codex.SendAcknowledgement{
-		nil,
-		{{ClientUserMessageID: "not-a-uuid", Digest: firstDigest}},
-		{{ClientUserMessageID: first, Digest: "not-a-digest"}},
-		{
-			{ClientUserMessageID: first, Digest: firstDigest},
-			{ClientUserMessageID: first, Digest: secondDigest},
-		},
-		make([]codex.SendAcknowledgement, 101),
-	} {
-		if acknowledgements, err := normalizeMessageAcknowledgements(input); err == nil {
-			t.Fatalf("invalid acknowledgements accepted: %#v", acknowledgements)
-		}
-	}
-	maximum := make([]codex.SendAcknowledgement, 100)
-	for index := range maximum {
-		maximum[index] = codex.SendAcknowledgement{
-			ClientUserMessageID: fmt.Sprintf("00000000-0000-4000-8000-%012x", index),
-			Digest:              firstDigest,
-		}
-	}
-	if normalized, err := normalizeMessageAcknowledgements(maximum); err != nil || len(normalized) != 100 {
-		t.Fatalf("maximum acknowledgement batch = %d, %v", len(normalized), err)
-	}
-	encoded, err := json.Marshal(map[string]any{"acknowledgements": maximum})
-	if err != nil || len(encoded) > session.MaxJSONRequestBodyBytes {
-		t.Fatalf("maximum acknowledgement request size = %d, %v", len(encoded), err)
-	}
-}
-
 func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
 	server := newTestServer(t)
 	directory := filepath.Join(server.config.Workspace, "work", "example")
@@ -950,7 +1014,7 @@ func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
 	acknowledgementDone := make(chan struct{})
 	go func() {
 		request := httptest.NewRequest(
-			http.MethodPost, "/api/sessions/example/message-ack", strings.NewReader(
+			http.MethodPost, "/codex/conversations/example/message-ack", strings.NewReader(
 				`{"acknowledgements":[{"clientUserMessageId":"`+clientID+`","digest":"`+
 					strings.Repeat("a", 64)+`"}]}`,
 			),
@@ -972,7 +1036,7 @@ func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
 	retryDone := make(chan struct{})
 	go func() {
 		request := httptest.NewRequest(
-			http.MethodPost, "/api/sessions/example/message", strings.NewReader(
+			http.MethodPost, "/codex/conversations/example/message", strings.NewReader(
 				`{"message":"`+clientID+`","clientUserMessageId":"`+clientID+`","retry":true}`,
 			),
 		)
@@ -1001,6 +1065,107 @@ func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
 			"acknowledgement = %d %q, retry = %d %q",
 			acknowledgement.Code, acknowledgement.Body.String(), retry.Code, retry.Body.String(),
 		)
+	}
+}
+
+func TestImplementPlanSerializesAConcurrentConversationMutation(t *testing.T) {
+	server := newTestServer(t)
+	summary := prepareInteractiveConversation(t, server, "example")
+	plan := "Make the change."
+	readEntered := make(chan struct{}, 1)
+	readRelease := make(chan struct{})
+	queueEntered := make(chan struct{}, 1)
+	controller := &browserContractCodex{
+		readEntered: readEntered, readRelease: readRelease, queueEntered: queueEntered,
+		settings: codex.ThreadSettings{CollaborationMode: "plan"},
+		transcript: codex.Transcript{
+			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+			Entries: []codex.TranscriptEntry{{
+				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
+			}},
+		},
+	}
+	server.config.Codex = controller
+	implementation := httptest.NewRecorder()
+	implementationDone := make(chan struct{})
+	go func() {
+		body := fmt.Sprintf(
+			`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+			planDigest(plan),
+		)
+		server.implementPlan(implementation, httptest.NewRequest(
+			http.MethodPost, "/", strings.NewReader(body),
+		), summary)
+		close(implementationDone)
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("plan implementation did not enter its serialized read")
+	}
+
+	queued := httptest.NewRecorder()
+	queuedDone := make(chan struct{})
+	go func() {
+		request := httptest.NewRequest(
+			http.MethodPost, "/codex/conversations/example/queue", strings.NewReader(
+				`{"message":"later","clientUserMessageId":"00000000-0000-4000-8000-000000000002"}`,
+			),
+		)
+		request.Header.Set("Origin", server.config.BaseURL)
+		server.Handler().ServeHTTP(queued, request)
+		close(queuedDone)
+	}()
+	select {
+	case <-queueEntered:
+		t.Fatal("conversation mutation interleaved with plan implementation")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(readRelease)
+	for name, done := range map[string]<-chan struct{}{
+		"plan implementation": implementationDone,
+		"queued mutation":     queuedDone,
+	} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not finish", name)
+		}
+	}
+	if implementation.Code != http.StatusAccepted || queued.Code != http.StatusAccepted {
+		t.Fatalf(
+			"implementation = %d %q, queue = %d %q",
+			implementation.Code, implementation.Body.String(), queued.Code, queued.Body.String(),
+		)
+	}
+}
+
+func TestConversationMessageLimitMatchesTheRuntimeContract(t *testing.T) {
+	server := newTestServer(t)
+	prepareInteractiveConversation(t, server, "example")
+	server.config.Codex = &browserContractCodex{}
+	for _, operation := range []string{"message", "queue"} {
+		for _, test := range []struct {
+			size   int
+			status int
+		}{{session.MaxMessageBytes, http.StatusAccepted}, {session.MaxMessageBytes + 1, http.StatusBadRequest}} {
+			body, err := json.Marshal(map[string]string{
+				"message":             strings.Repeat("x", test.size),
+				"clientUserMessageId": "00000000-0000-4000-8000-000000000003",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(
+				http.MethodPost, "/codex/conversations/example/"+operation, bytes.NewReader(body),
+			)
+			request.Header.Set("Origin", server.config.BaseURL)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("%s with %d bytes = %d: %s", operation, test.size, response.Code, response.Body.String())
+			}
+		}
 	}
 }
 
@@ -1183,10 +1348,10 @@ func TestNonInteractiveSessionRejectsEventStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, directory, "active")
-	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/events", nil)
+	request := httptest.NewRequest(http.MethodGet, "/codex/conversations/example/events", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusConflict {
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "conversation is unavailable") {
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 	}
 }
@@ -1685,10 +1850,10 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				}
 				return nil
 			}
-			server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
-				return codex.Transcript{ThreadID: threadID, Status: "idle", Entries: []codex.TranscriptEntry{{
+			server.config.Codex = &browserContractCodex{
+				transcript: codex.Transcript{ThreadID: "thread-1", Status: "idle", Entries: []codex.TranscriptEntry{{
 					Kind: "agentMessage", Text: "# Persisted answer\n\n| Item | State |\n| --- | --- |\n| Portal | Ready |\n\n<script>alert(1)</script>",
-				}}}, nil
+				}}},
 			}
 
 			page := httptest.NewRecorder()
@@ -1703,7 +1868,7 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 			}
 
 			api := httptest.NewRecorder()
-			server.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil))
+			server.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/codex/conversations/example/thread", nil))
 			if api.Code != http.StatusOK || !strings.Contains(api.Body.String(), "Persisted answer") {
 				t.Fatalf("thread status/body = %d %q", api.Code, api.Body.String())
 			}
@@ -1716,7 +1881,49 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				strings.Contains(transcript.Entries[0].HTML, "<script") {
 				t.Fatalf("sanitized transcript Markdown = %#v", transcript.Entries)
 			}
+			for _, operation := range []string{"pending", "queue"} {
+				response := httptest.NewRecorder()
+				server.Handler().ServeHTTP(response, httptest.NewRequest(
+					http.MethodGet, "/codex/conversations/example/"+operation, nil,
+				))
+				if response.Code != http.StatusForbidden {
+					t.Fatalf("passive GET %s = %d: %s", operation, response.Code, response.Body.String())
+				}
+			}
+			snapshot := httptest.NewRecorder()
+			server.Handler().ServeHTTP(snapshot, httptest.NewRequest(
+				http.MethodGet, "/codex/conversations/example/snapshot", nil,
+			))
+			if snapshot.Code != http.StatusNotFound {
+				t.Fatalf("passive snapshot = %d: %s", snapshot.Code, snapshot.Body.String())
+			}
 		})
+	}
+}
+
+func TestServerCloseEndsActiveConversationEventStreams(t *testing.T) {
+	server := newTestServer(t)
+	prepareInteractiveConversation(t, server, "example")
+	events := make(chan struct{})
+	subscribed := make(chan struct{}, 1)
+	server.config.Codex = &browserContractCodex{events: events, subscribed: subscribed}
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(
+			http.MethodGet, "/codex/conversations/example/events", nil,
+		))
+		close(done)
+	}()
+	select {
+	case <-subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("conversation event stream did not subscribe")
+	}
+	server.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("conversation event stream remained open after server close")
 	}
 }
 
@@ -1817,8 +2024,8 @@ func TestPersistedThreadWithWrongCwdIsNotReadable(t *testing.T) {
 	writeWebTrackingFiles(t, directory, "active")
 	server.config.VerifyThread = func(context.Context, string, string) error { return errors.New("wrong cwd") }
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil))
-	if response.Code != http.StatusConflict {
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/codex/conversations/example/thread", nil))
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "conversation is unavailable") {
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 	}
 }
@@ -1849,19 +2056,6 @@ func TestSessionDeletionCanClearBrowserStateBeforeTranscriptLoads(t *testing.T) 
 	}
 	if !strings.Contains(string(template), `data-thread-id="{{.Session.Codex.ThreadID}}"`) {
 		t.Fatal("session page does not render the persisted thread identity")
-	}
-}
-
-func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
-	server := newTestServer(t)
-	server.config.Codex = &browserContractCodex{emptyPrompts: true}
-	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/pending", nil)
-	response := httptest.NewRecorder()
-
-	server.pending(response, request, "thread-1")
-
-	if response.Code != http.StatusOK || response.Body.String() != "[]\n" {
-		t.Fatalf("empty pending response = %d %q", response.Code, response.Body.String())
 	}
 }
 
@@ -1957,11 +2151,16 @@ type browserContractCodex struct {
 	snoozed                string
 	emptyPrompts           bool
 	transcript             codex.Transcript
-	activities             []codex.ThreadActivity
-	activityInputs         []codex.ThreadActivity
+	activities             []workspacecodex.ThreadActivity
+	activityInputs         []workspacecodex.ThreadActivity
 	activityErr            error
 	activityWait           <-chan struct{}
 	activityCalls          int
+	readEntered            chan<- struct{}
+	readRelease            <-chan struct{}
+	queueEntered           chan<- struct{}
+	events                 <-chan struct{}
+	subscribed             chan<- struct{}
 }
 
 func (client *browserContractCodex) ReconcileThreadInstructions(
@@ -1971,13 +2170,13 @@ func (client *browserContractCodex) ReconcileThreadInstructions(
 }
 
 func (client *browserContractCodex) ListThreadActivity(
-	ctx context.Context, expected []codex.ThreadActivity,
-) ([]codex.ThreadActivity, error) {
+	ctx context.Context, expected []workspacecodex.ThreadActivity,
+) ([]workspacecodex.ThreadActivity, error) {
 	client.mu.Lock()
-	client.activityInputs = append([]codex.ThreadActivity(nil), expected...)
+	client.activityInputs = append([]workspacecodex.ThreadActivity(nil), expected...)
 	client.activityCalls++
 	wait := client.activityWait
-	activities := append([]codex.ThreadActivity(nil), client.activities...)
+	activities := append([]workspacecodex.ThreadActivity(nil), client.activities...)
 	err := client.activityErr
 	client.mu.Unlock()
 	if wait != nil {
@@ -1998,6 +2197,15 @@ func (client *browserContractCodex) VerifyThread(_ context.Context, threadID, _ 
 }
 
 func (client *browserContractCodex) ReadThread(_ context.Context, threadID string) (codex.Transcript, error) {
+	if client.readEntered != nil {
+		select {
+		case client.readEntered <- struct{}{}:
+		default:
+		}
+	}
+	if client.readRelease != nil {
+		<-client.readRelease
+	}
 	if client.transcript.ThreadID != "" {
 		return client.transcript, nil
 	}
@@ -2139,6 +2347,12 @@ func (client *browserContractCodex) Queue(
 	client.mu.Lock()
 	client.queued = message
 	client.mu.Unlock()
+	if client.queueEntered != nil {
+		select {
+		case client.queueEntered <- struct{}{}:
+		default:
+		}
+	}
 	return codex.QueueEntry{ID: "queued-2", Text: message, ClientUserMessageID: clientID}, nil
 }
 
@@ -2175,6 +2389,15 @@ func (client *browserContractCodex) Interrupt(_ context.Context, threadID string
 func (client *browserContractCodex) Subscribe(_ context.Context, threadID string) (<-chan struct{}, func(), error) {
 	if threadID != "thread-1" {
 		return nil, nil, errors.New("unexpected event thread")
+	}
+	if client.subscribed != nil {
+		select {
+		case client.subscribed <- struct{}{}:
+		default:
+		}
+	}
+	if client.events != nil {
+		return client.events, func() {}, nil
 	}
 	events := make(chan struct{})
 	close(events)
@@ -3475,18 +3698,41 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 	}
 	writeWebTrackingFiles(t, directory, "active")
 	writeWebRuntimeAuthority(t, server, "example")
-	controller := &browserContractCodex{}
+	controller := &browserContractCodex{transcript: codex.Transcript{
+		ThreadID: "thread-1", Status: "idle", CollaborationMode: "default",
+		Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "contract response"}},
+	}}
 	server.config.Codex = controller
-	server.config.ReadThread = func(_ context.Context, threadID string) (codex.Transcript, error) {
-		return codex.Transcript{
-			ThreadID: threadID, Status: "idle", CollaborationMode: "default",
-			Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "contract response"}},
-		}, nil
-	}
 	httpServer := httptest.NewServer(server.Handler())
 	defer httpServer.Close()
-	server.config.BaseURL = httpServer.URL
-	command := exec.Command(node, "browser_contract_test.cjs", httpServer.URL)
+	legacyThread, err := http.Get(httpServer.URL + "/api/sessions/example/thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyThread.Body.Close()
+	if legacyThread.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(legacyThread.Body)
+		t.Fatalf("legacy thread endpoint = %d: %s", legacyThread.StatusCode, body)
+	}
+	assetResponse, err := http.Get(httpServer.URL + "/codex/assets/conversation.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assetResponse.Body.Close()
+	if assetResponse.StatusCode != http.StatusOK {
+		t.Fatalf("conversation browser module = %d", assetResponse.StatusCode)
+	}
+	asset, err := io.ReadAll(assetResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
+	if err := os.WriteFile(modulePath, asset, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		node, "browser_contract_test.cjs", httpServer.URL, server.config.BaseURL, modulePath,
+	)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("browser contract failed: %v\n%s", err, output)
@@ -3506,7 +3752,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		controller.acknowledged[0] != "00000000-0000-4000-8000-000000000004" ||
 		controller.actionContext != "" ||
 		controller.queued != "queue message" ||
-		controller.queueDeleted != "queued-1" || controller.queueStarted != "queued-1" ||
+		controller.queueDeleted != "start" || controller.queueStarted != "queued-1" ||
 		controller.settings.CollaborationMode != "plan" || !controller.interrupt ||
 		controller.decision != "accept" || controller.snoozed != "question-1" || answer != "yes" {
 		t.Fatalf("browser operations were not delivered: %#v", controller)
@@ -3567,6 +3813,25 @@ func deletionTargetForTest(t *testing.T, server *Server, slug string) string {
 		t.Fatal(err)
 	}
 	return targetID
+}
+
+func prepareInteractiveConversation(t *testing.T, server *Server, slug string) *session.Summary {
+	t.Helper()
+	directory := filepath.Join(server.config.Workspace, "work", slug)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: " + slug + "\ncodex:\n" +
+		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, slug)
+	return &session.Summary{Manifest: session.Manifest{
+		Slug: slug, Codex: session.Codex{ThreadID: "thread-1"},
+	}}
 }
 
 func newTestServer(t *testing.T) *Server {

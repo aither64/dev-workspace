@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const {pathToFileURL} = require("node:url");
 const {
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient,
   captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
@@ -17,6 +18,7 @@ const {
   fileChangeDiffs, formatElapsed,
   activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
+  configureDurableAttemptStore,
 } = require("./static/app.js");
 
 const baseURL = process.argv[2];
@@ -24,11 +26,27 @@ if (!baseURL) throw new Error("browser contract test requires the server URL");
 const unitOnly = baseURL === "--unit";
 const testBaseURL = unitOnly ? "http://127.0.0.1" : baseURL;
 const origin = new URL(testBaseURL).origin;
+const allowedOrigin = process.argv[3] || origin;
 const fetchRequest = (path, options = {}) => fetch(new URL(path, testBaseURL), {
   ...options,
-  headers: {Origin: origin, ...(options.headers || {})},
+  headers: {Origin: allowedOrigin, ...(options.headers || {})},
 });
-const client = createSessionClient("example", createRequest(fetchRequest));
+const request = createRequest(fetchRequest);
+const conversationModulePath = process.argv[4];
+if (!conversationModulePath) throw new Error("browser contract test requires the shared browser module");
+
+(async () => {
+const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
+configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
+const compatibilityConversation = (fetchImplementation) => (
+  conversationAssets.createConversationClient({
+    id: "example",
+    basePath: "/codex",
+    conversationPath: "/api/sessions/example",
+    fetch: fetchImplementation,
+  })
+);
+const client = createSessionClient("example", request, compatibilityConversation(fetchRequest));
 
 assert.equal(automaticReasoningLabel(), "Automatic");
 assert.equal(automaticReasoningLabel({model: "bounded"}), "Automatic");
@@ -445,12 +463,15 @@ assert.equal(loadRequestInputDraft(storage, "example", "thread-1", "request-1", 
 assert.deepEqual(loadQueueAttempts(storage, "example", "thread-2"), [firstAttempt]);
 
 const automaticRequests = [];
-const automaticClient = createSessionClient("example", async (path, options = {}) => {
+const automaticFetch = async (path, options = {}) => {
   automaticRequests.push({path, body: options.body ? JSON.parse(options.body) : null});
-  return {ok: true};
-});
+  return {ok: true, status: 200, json: async () => ({})};
+};
+const automaticClient = createSessionClient(
+  "example", createRequest(automaticFetch), compatibilityConversation(automaticFetch),
+);
 
-if (!unitOnly) (async () => {
+if (!unitOnly) {
   let snoozedBeforeWizardAction = false;
   await beforeRequestInputAction(async () => { snoozedBeforeWizardAction = true; });
   assert.equal(snoozedBeforeWizardAction, true);
@@ -476,10 +497,13 @@ if (!unitOnly) (async () => {
   assert.equal(pending[0].id, "approval-1");
   assert.equal(pending[0].kind, "command");
 
-  const legacyEmptyClient = createSessionClient("example", async (path) => {
+  const emptyFetch = async (path) => {
     assert.match(path, /\/pending$/);
-    return null;
-  });
+    return {ok: true, status: 200, json: async () => null};
+  };
+  const legacyEmptyClient = createSessionClient(
+    "example", createRequest(emptyFetch), compatibilityConversation(emptyFetch),
+  );
   assert.deepEqual(await legacyEmptyClient.pending(), []);
 
   const modes = await client.modes();
@@ -564,8 +588,9 @@ if (!unitOnly) (async () => {
     "queue message", "00000000-0000-4000-8000-000000000001",
   )).id, "queued-2");
   assert.deepEqual(await client.deleteQueued("queued-1"), {ok: true});
+  assert.deepEqual(await client.deleteQueued("start"), {ok: true});
   assert.deepEqual(await client.startQueue("queued-1"), {ok: true});
-  const unsupportedAutomatic = await fetchRequest("/api/sessions/example/settings", {
+  const unsupportedAutomatic = await fetchRequest("/codex/conversations/example/settings", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({model: "model-1", reasoningEffort: ""}),
@@ -584,6 +609,7 @@ if (!unitOnly) (async () => {
   assert.equal(events.status, 200);
   assert.match(events.headers.get("content-type"), /^text\/event-stream/);
   assert.match(await events.text(), /: connected/);
+}
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

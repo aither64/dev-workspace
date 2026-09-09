@@ -1,4 +1,4 @@
-(() => {
+(async () => {
   const apiPath = (slug, operation) => `/api/sessions/${encodeURIComponent(slug)}/${operation}`;
   const createRequest = (fetchRequest) => async (path, options = {}) => {
     const response = await fetchRequest(path, {
@@ -9,35 +9,17 @@
     if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
     return data;
   };
-  const createSessionClient = (slug, request) => ({
-    thread: () => request(apiPath(slug, "thread")),
-    pending: async () => (await request(apiPath(slug, "pending"))) || [],
-    modes: async () => (await request("/api/collaboration-modes")) || [],
-    queue: async () => (await request(apiPath(slug, "queue"))) || [],
-    message: (message, clientUserMessageId, retry = false) => request(apiPath(slug, "message"), {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry}),
-    }),
-    acknowledgeMessages: (acknowledgements) => request(apiPath(slug, "message-ack"), {
-      method: "POST", body: JSON.stringify({acknowledgements}),
-    }),
-    queueMessage: (message, clientUserMessageId) => request(apiPath(slug, "queue"), {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId}),
-    }),
-    deleteQueued: (id) => request(`${apiPath(slug, "queue")}/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    }),
-    startQueue: (queuedSubmissionId) => request(`${apiPath(slug, "queue")}/start`, {
-      method: "POST", body: JSON.stringify({queuedSubmissionId}),
-    }),
-    settings: (model, reasoningEffort, collaborationMode) => {
-      const body = {};
-      if (model !== undefined) body.model = model;
-      if (reasoningEffort !== undefined) body.reasoningEffort = reasoningEffort;
-      if (collaborationMode !== undefined) body.collaborationMode = collaborationMode;
-      return request(apiPath(slug, "settings"), {
-        method: "POST", body: JSON.stringify(body),
-      });
-    },
+  const createSessionClient = (slug, request, conversation) => ({
+    thread: conversation?.thread,
+    pending: conversation?.pending,
+    modes: () => request("/api/collaboration-modes"),
+    queue: conversation?.queue,
+    message: conversation?.message,
+    acknowledgeMessages: conversation?.acknowledgeMessages,
+    queueMessage: conversation?.queueMessage,
+    deleteQueued: conversation?.deleteQueued,
+    startQueue: conversation?.startQueue,
+    settings: conversation?.settings,
     fork: (name, creationDate, model, reasoningEffort) => request(apiPath(slug, "fork"), {
       method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort}),
     }),
@@ -65,17 +47,13 @@
     dismissOperation: (receiptId) => request(apiPath(slug, "operation"), {
       method: "DELETE", body: JSON.stringify({receiptId}),
     }),
-    interrupt: () => request(apiPath(slug, "interrupt"), {method: "POST", body: "{}"}),
+    interrupt: conversation?.interrupt,
     implementPlan: (payload) => request(apiPath(slug, "implement-plan"), {
       method: "POST", body: JSON.stringify(payload),
     }),
-    respond: (id, payload) => request(apiPath(slug, "respond"), {
-      method: "POST", body: JSON.stringify({id, ...payload}),
-    }),
-    snooze: (id) => request(apiPath(slug, "respond"), {
-      method: "POST", body: JSON.stringify({id, snooze: true}),
-    }),
-    eventsPath: () => apiPath(slug, "events"),
+    respond: conversation?.respond,
+    snooze: conversation?.snooze,
+    eventsPath: conversation?.eventsPath,
   });
   const automaticReasoningLabel = () => "Automatic";
   const messageActionLabel = (active) => active ? "Steer now" : "Send";
@@ -356,114 +334,72 @@
   const queueAttemptStorageKey = (slug, threadId, id) => (
     `${queueAttemptStoragePrefix(slug, threadId)}${id}`
   );
-  const validQueueAttemptId = (id) => (
-    typeof id === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
-  );
-  const loadQueueAttempts = (storage, slug, threadId) => {
-    if (!storage) return null;
-    try {
-      if (!threadId || typeof storage.length !== "number" || typeof storage.key !== "function") return null;
-      const prefix = queueAttemptStoragePrefix(slug, threadId);
-      const keys = [];
-      for (let index = 0; index < storage.length; index += 1) {
-        const key = storage.key(index);
-        if (typeof key === "string" && key.startsWith(prefix)) keys.push(key);
-      }
-      const attempts = [];
-      for (const key of keys.sort()) {
-        const id = key.slice(prefix.length);
-        const encoded = storage.getItem(key);
-        if (encoded === null) continue;
-        const attempt = JSON.parse(encoded);
-        if (!validQueueAttemptId(id) || !attempt || typeof attempt.message !== "string" || !attempt.message) {
-          return null;
-        }
-        attempts.push({id, message: attempt.message});
-      }
-      return attempts;
-    } catch (_error) {
-      return null;
+  let durableAttemptStoreFactory = null;
+  const configureDurableAttemptStore = (factory) => {
+    if (typeof factory !== "function") {
+      throw new TypeError("durable attempt store factory is required");
     }
+    durableAttemptStoreFactory = factory;
+  };
+  const queueAttemptStore = (storage, slug, threadId) => {
+    if (!durableAttemptStoreFactory || !threadId) return null;
+    return durableAttemptStoreFactory({
+      storage,
+      prefix: queueAttemptStoragePrefix(slug, threadId),
+      decode: (id, value) => (
+        value && typeof value.message === "string" && value.message ?
+          {id, message: value.message} : null
+      ),
+      encode: ({message}) => ({message}),
+    });
+  };
+  const loadQueueAttempts = (storage, slug, threadId) => {
+    return queueAttemptStore(storage, slug, threadId)?.load() ?? null;
   };
   const requireQueueAttempts = (storage, slug, threadId) => {
-    const attempts = loadQueueAttempts(storage, slug, threadId);
-    if (attempts === null) {
+    const store = queueAttemptStore(storage, slug, threadId);
+    const attempts = store?.load();
+    if (!store?.available() || attempts === null || attempts === undefined) {
       throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
     }
     return attempts;
   };
   const storeQueueAttempt = (storage, slug, threadId, attempt) => {
-    if (!storage || !threadId || !attempt || !validQueueAttemptId(attempt.id) ||
-        typeof attempt.message !== "string" || !attempt.message) return false;
-    try {
-      storage.setItem(
-        queueAttemptStorageKey(slug, threadId, attempt.id),
-        JSON.stringify({message: attempt.message}),
-      );
-      return true;
-    } catch (_error) {
-      return false;
-    }
+    return queueAttemptStore(storage, slug, threadId)?.store(attempt) === true;
   };
   const deleteQueueAttempt = (storage, slug, threadId, id) => {
-    if (!storage || !threadId || !validQueueAttemptId(id)) return false;
-    try {
-      storage.removeItem(queueAttemptStorageKey(slug, threadId, id));
-      return true;
-    } catch (_error) {
-      return false;
-    }
+    return queueAttemptStore(storage, slug, threadId)?.remove(id) === true;
   };
   const sendAttemptStorageKey = (slug, threadId, id) => (
     `${sendAttemptStoragePrefix(slug, threadId)}${id}`
   );
+  const sendAttemptStore = (storage, slug, threadId) => {
+    if (!durableAttemptStoreFactory || !threadId) return null;
+    return durableAttemptStoreFactory({
+      storage,
+      prefix: sendAttemptStoragePrefix(slug, threadId),
+      decode: (id, value) => {
+        if (!value || typeof value.message !== "string" || !value.message ||
+            (value.context !== undefined && typeof value.context !== "string")) return null;
+        return {
+          id, message: value.message, steered: Boolean(value.steered),
+          context: value.context || "",
+        };
+      },
+      encode: (attempt) => ({
+        message: attempt.message, steered: Boolean(attempt.steered),
+        context: typeof attempt.context === "string" ? attempt.context : "",
+      }),
+    });
+  };
   const loadSendAttempts = (storage, slug, threadId) => {
-    if (!storage) return null;
-    try {
-      const prefix = sendAttemptStoragePrefix(slug, threadId);
-      const attempts = [];
-      for (let index = 0; index < storage.length; index += 1) {
-        const key = storage.key(index);
-        if (typeof key !== "string" || !key.startsWith(prefix)) continue;
-        const id = key.slice(prefix.length);
-        const attempt = JSON.parse(storage.getItem(key));
-        if (!validQueueAttemptId(id) || !attempt || typeof attempt.message !== "string" || !attempt.message ||
-            (attempt.context !== undefined && typeof attempt.context !== "string")) return null;
-        attempts.push({
-          id, message: attempt.message, steered: Boolean(attempt.steered),
-          context: attempt.context || "",
-        });
-      }
-      return attempts;
-    } catch (_error) {
-      return null;
-    }
+    return sendAttemptStore(storage, slug, threadId)?.load() ?? null;
   };
   const storeSendAttempt = (storage, slug, threadId, attempt) => {
-    if (!storage || !threadId || !attempt || !validQueueAttemptId(attempt.id) ||
-        typeof attempt.message !== "string" || !attempt.message) return false;
-    try {
-      storage.setItem(
-        sendAttemptStorageKey(slug, threadId, attempt.id),
-        JSON.stringify({
-          message: attempt.message, steered: Boolean(attempt.steered),
-          context: typeof attempt.context === "string" ? attempt.context : "",
-        }),
-      );
-      return true;
-    } catch (_error) {
-      return false;
-    }
+    return sendAttemptStore(storage, slug, threadId)?.store(attempt) === true;
   };
   const deleteSendAttempt = (storage, slug, threadId, id) => {
-    if (!storage || !threadId || !validQueueAttemptId(id)) return false;
-    try {
-      storage.removeItem(sendAttemptStorageKey(slug, threadId, id));
-      return true;
-    } catch (_error) {
-      return false;
-    }
+    return sendAttemptStore(storage, slug, threadId)?.remove(id) === true;
   };
   const matchingSendAttempt = (attempts, message, context = "") => (
     attempts.find((candidate) => (
@@ -485,21 +421,19 @@
   const clearThreadStorage = (storage, slug, threadId) => {
     if (!storage || !threadId || typeof storage.length !== "number" ||
         typeof storage.key !== "function") return false;
-    const prefixes = [
-      queueAttemptStoragePrefix(slug, threadId),
-      sendAttemptStoragePrefix(slug, threadId),
-      `workspace-portal.request-input.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.`,
-    ];
+    const queueStore = queueAttemptStore(storage, slug, threadId);
+    const sendStore = sendAttemptStore(storage, slug, threadId);
+    if (!queueStore?.clear() || !sendStore?.clear()) return false;
+    const prefix =
+      `workspace-portal.request-input.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.`;
     try {
       const keys = [];
       for (let index = 0; index < storage.length; index += 1) {
         const key = storage.key(index);
-        if (typeof key === "string" && prefixes.some((prefix) => key.startsWith(prefix))) {
-          keys.push(key);
-        }
+        if (typeof key === "string" && key.startsWith(prefix)) keys.push(key);
       }
       keys.forEach((key) => storage.removeItem(key));
-      return true;
+      return keys.every((key) => storage.getItem(key) === null);
     } catch (_error) {
       return false;
     }
@@ -565,6 +499,7 @@
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
+      configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
       markTranscriptMessagesObserved, matchingSendAttempt,
@@ -589,6 +524,8 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
+  const conversationAssets = await import("/codex/assets/conversation.js");
+  configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   let indexNavigationPending = false;
   let indexRefreshTimer = null;
@@ -962,7 +899,12 @@
   addEventListener("hashchange", activateSessionHash);
 
   if (!slug) return;
-  const client = createSessionClient(slug, request);
+  const conversation = slug ? conversationAssets.createConversationClient({
+    id: slug,
+    basePath: "/codex",
+    conversationPath: `/api/sessions/${encodeURIComponent(slug)}`,
+  }) : null;
+  const client = createSessionClient(slug, request, conversation);
   const lifecycleStatus = document.getElementById("lifecycle-operation-status");
   const lifecycleTitle = document.getElementById("lifecycle-operation-title");
   const lifecycleDetail = document.getElementById("lifecycle-operation-detail");

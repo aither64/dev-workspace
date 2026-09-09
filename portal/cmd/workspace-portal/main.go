@@ -15,10 +15,29 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aither64/dev-workspace/portal/internal/codex"
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
+
+const sessionLifecycleDeveloperInstructions = "Completing work, preparing a handoff, or setting " +
+	"lifecycle state does not authorize archiving, deleting, stopping, finalizing, removing, " +
+	"invoking private lifecycle helpers, or scheduling delayed or background cleanup for this " +
+	"session. Perform a session lifecycle action only when the user explicitly requests that " +
+	"exact action for this exact session in the current conversation; otherwise leave the " +
+	"session open."
+
+func newCodexClient(socket, workspace string) *workspacecodex.Client {
+	return workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
+		ClientInfo: codex.ClientInfo{
+			Name: "dev-workspace", Title: "Development Workspace", Version: "0.1.0",
+		},
+		DeveloperInstructions: sessionLifecycleDeveloperInstructions,
+		// Keep the deployed retry identity while making storage ownership explicit.
+		SubmissionLedgerPath: socket + ".submission-attempts-v3.json",
+	})
+}
 
 const version = "0.1.0"
 
@@ -114,7 +133,7 @@ func serve(args []string) error {
 		return err
 	}
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
-	codexClient := codex.New(options.codexSocket)
+	codexClient := newCodexClient(options.codexSocket, options.workspace)
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		Workspace: options.workspace, BaseURL: options.baseURL, DevSession: options.devSession,
@@ -216,11 +235,11 @@ func threadCommand(args []string) error {
 			return errors.New("thread defaults accepts no positional arguments")
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{
-			"model":           codex.DefaultNewThreadModel,
-			"reasoningEffort": codex.DefaultNewThreadReasoningEffort,
+			"model":           workspacecodex.DefaultNewThreadModel,
+			"reasoningEffort": workspacecodex.DefaultNewThreadReasoningEffort,
 		})
 	}
-	client := codex.New(*socket)
+	client := newCodexClient(*socket, *workspace)
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -269,7 +288,7 @@ func threadCommand(args []string) error {
 			if listErr != nil {
 				return codex.ThreadSettings{}, fmt.Errorf("load Codex models: %w", listErr)
 			}
-			return codex.ResolveNewThreadSettings(models, settings)
+			return workspacecodex.ResolveNewThreadSettings(models, settings)
 		}
 		if *recoverArchived {
 			id, err = client.RecoverArchivedThread(ctx, *threadID, *cwd, runtime.environment())
