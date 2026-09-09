@@ -10256,6 +10256,17 @@ class DevSessionTest < Minitest::Test
     )
   end
 
+  def test_lifecycle_phase_output_uses_the_persisted_phase_name
+    Dir.mktmpdir do |workspace|
+      out = StringIO.new
+      runner = runner_for(workspace, out:)
+
+      runner.send(:announce_lifecycle_phase, 'archive', 'clusters_released')
+
+      assert_equal("archive: clusters released\n", out.string)
+    end
+  end
+
   def archived_runner(workspace, slug)
     runner = runner_for(workspace)
     runner.ensure_tracking_files(slug)

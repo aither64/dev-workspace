@@ -4041,6 +4041,7 @@ module VpsfreeDevSession
       }
       write_removal_metadata!(destination, removal)
       write_removal_journal!(slug, removal)
+      announce_lifecycle_phase('delete', 'prepared')
       removal
     rescue StandardError
       discard_prepared_removal_recovery!(destination) if destination
@@ -4151,6 +4152,7 @@ module VpsfreeDevSession
       removal['phase'] = phase
       write_removal_metadata!(removal.fetch('recovery'), removal)
       write_removal_journal!(slug, removal)
+      announce_lifecycle_phase('delete', phase)
     end
 
     def recover_removal_phase!(slug, removal)
@@ -4879,6 +4881,7 @@ module VpsfreeDevSession
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'archive'), journal, command: 'archive', create: true
       )
+      announce_lifecycle_phase('archive', 'prepared')
       journal
     end
 
@@ -4895,6 +4898,7 @@ module VpsfreeDevSession
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'archive'), journal, command: 'archive', create: false
       )
+      announce_lifecycle_phase('archive', phase)
     end
 
     def recover_archive_phase!(slug, journal)
@@ -5029,6 +5033,7 @@ module VpsfreeDevSession
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'revive'), journal, command: 'revive', create: true
       )
+      announce_lifecycle_phase('revive', 'prepared')
       journal
     end
 
@@ -5045,6 +5050,11 @@ module VpsfreeDevSession
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'revive'), journal, command: 'revive', create: false
       )
+      announce_lifecycle_phase('revive', phase)
+    end
+
+    def announce_lifecycle_phase(operation, phase)
+      @out.puts "#{operation}: #{phase.tr('_', ' ')}"
     end
 
     def recover_revive_phase!(slug, journal)
