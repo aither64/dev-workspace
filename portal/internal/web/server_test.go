@@ -819,6 +819,134 @@ func TestJSONTransportAcceptsMaximallyEscapedMessageAtPublishedLimit(t *testing.
 	}
 }
 
+func TestMessageAcknowledgementsAreBoundedValidatedAndDeduplicated(t *testing.T) {
+	first := "00000000-0000-4000-8000-000000000001"
+	second := "00000000-0000-4000-8000-000000000002"
+	firstDigest := strings.Repeat("a", 64)
+	secondDigest := strings.Repeat("b", 64)
+	acknowledgements, err := normalizeMessageAcknowledgements([]codex.SendAcknowledgement{
+		{ClientUserMessageID: first, Digest: firstDigest},
+		{ClientUserMessageID: " " + second + " ", Digest: " " + secondDigest + " "},
+		{ClientUserMessageID: first, Digest: firstDigest},
+	})
+	if err != nil || len(acknowledgements) != 2 ||
+		acknowledgements[0].ClientUserMessageID != first ||
+		acknowledgements[1].ClientUserMessageID != second || acknowledgements[1].Digest != secondDigest {
+		t.Fatalf("normalized acknowledgements = %#v, %v", acknowledgements, err)
+	}
+	for _, input := range [][]codex.SendAcknowledgement{
+		nil,
+		{{ClientUserMessageID: "not-a-uuid", Digest: firstDigest}},
+		{{ClientUserMessageID: first, Digest: "not-a-digest"}},
+		{
+			{ClientUserMessageID: first, Digest: firstDigest},
+			{ClientUserMessageID: first, Digest: secondDigest},
+		},
+		make([]codex.SendAcknowledgement, 101),
+	} {
+		if acknowledgements, err := normalizeMessageAcknowledgements(input); err == nil {
+			t.Fatalf("invalid acknowledgements accepted: %#v", acknowledgements)
+		}
+	}
+	maximum := make([]codex.SendAcknowledgement, 100)
+	for index := range maximum {
+		maximum[index] = codex.SendAcknowledgement{
+			ClientUserMessageID: fmt.Sprintf("00000000-0000-4000-8000-%012x", index),
+			Digest:              firstDigest,
+		}
+	}
+	if normalized, err := normalizeMessageAcknowledgements(maximum); err != nil || len(normalized) != 100 {
+		t.Fatalf("maximum acknowledgement batch = %d, %v", len(normalized), err)
+	}
+	encoded, err := json.Marshal(map[string]any{"acknowledgements": maximum})
+	if err != nil || len(encoded) > session.MaxJSONRequestBodyBytes {
+		t.Fatalf("maximum acknowledgement request size = %d, %v", len(encoded), err)
+	}
+}
+
+func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
+	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n" +
+		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, "example")
+	acknowledgementEntered := make(chan struct{}, 1)
+	acknowledgementRelease := make(chan struct{})
+	retryEntered := make(chan struct{}, 1)
+	clientID := "00000000-0000-4000-8000-000000000004"
+	server.config.Codex = &browserContractCodex{
+		message: clientID, messageID: clientID,
+		acknowledgementEntered: acknowledgementEntered,
+		acknowledgementRelease: acknowledgementRelease,
+		retryEntered:           retryEntered,
+	}
+
+	acknowledgement := httptest.NewRecorder()
+	acknowledgementDone := make(chan struct{})
+	go func() {
+		request := httptest.NewRequest(
+			http.MethodPost, "/api/sessions/example/message-ack", strings.NewReader(
+				`{"acknowledgements":[{"clientUserMessageId":"`+clientID+`","digest":"`+
+					strings.Repeat("a", 64)+`"}]}`,
+			),
+		)
+		request.Header.Set("Origin", server.config.BaseURL)
+		server.Handler().ServeHTTP(acknowledgement, request)
+		close(acknowledgementDone)
+	}()
+	select {
+	case <-acknowledgementEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatalf(
+			"message acknowledgement did not enter the Codex client: %d %q",
+			acknowledgement.Code, acknowledgement.Body.String(),
+		)
+	}
+
+	retry := httptest.NewRecorder()
+	retryDone := make(chan struct{})
+	go func() {
+		request := httptest.NewRequest(
+			http.MethodPost, "/api/sessions/example/message", strings.NewReader(
+				`{"message":"`+clientID+`","clientUserMessageId":"`+clientID+`","retry":true}`,
+			),
+		)
+		request.Header.Set("Origin", server.config.BaseURL)
+		server.Handler().ServeHTTP(retry, request)
+		close(retryDone)
+	}()
+	select {
+	case <-retryEntered:
+		t.Fatal("browser retry entered while its acknowledgement held the session message lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(acknowledgementRelease)
+	select {
+	case <-acknowledgementDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message acknowledgement did not finish")
+	}
+	select {
+	case <-retryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("browser retry did not continue after acknowledgement")
+	}
+	if acknowledgement.Code != http.StatusOK || retry.Code != http.StatusAccepted {
+		t.Fatalf(
+			"acknowledgement = %d %q, retry = %d %q",
+			acknowledgement.Code, acknowledgement.Body.String(), retry.Code, retry.Body.String(),
+		)
+	}
+}
+
 func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testing.T) {
 	server := newTestServer(t)
 	server.config.CodexSocket = "/run/vpsfree-workspace-codex/app-server.sock"
@@ -1583,28 +1711,33 @@ func TestPendingEndpointEncodesNoPromptsAsAnArray(t *testing.T) {
 }
 
 type browserContractCodex struct {
-	mu             sync.Mutex
-	message        string
-	messageID      string
-	actionContext  string
-	sendCount      int
-	sendErr        error
-	queued         string
-	queueDeleted   string
-	queueStarted   string
-	settings       codex.ThreadSettings
-	settingsErr    error
-	interrupt      bool
-	decision       string
-	answers        map[string]map[string][]string
-	snoozed        string
-	emptyPrompts   bool
-	transcript     codex.Transcript
-	activities     []codex.ThreadActivity
-	activityInputs []codex.ThreadActivity
-	activityErr    error
-	activityWait   <-chan struct{}
-	activityCalls  int
+	mu                     sync.Mutex
+	message                string
+	messageID              string
+	acknowledged           []string
+	acknowledgementEntered chan<- struct{}
+	acknowledgementRelease <-chan struct{}
+	retryEntered           chan<- struct{}
+	actionContext          string
+	sendCount              int
+	sendRetryCount         int
+	sendErr                error
+	queued                 string
+	queueDeleted           string
+	queueStarted           string
+	settings               codex.ThreadSettings
+	settingsErr            error
+	interrupt              bool
+	decision               string
+	answers                map[string]map[string][]string
+	snoozed                string
+	emptyPrompts           bool
+	transcript             codex.Transcript
+	activities             []codex.ThreadActivity
+	activityInputs         []codex.ThreadActivity
+	activityErr            error
+	activityWait           <-chan struct{}
+	activityCalls          int
 }
 
 func (client *browserContractCodex) ListThreadActivity(
@@ -1715,8 +1848,15 @@ func (client *browserContractCodex) SendAttempted(
 	if threadID != "thread-1" {
 		return false, errors.New("unexpected message thread")
 	}
+	if client.retryEntered != nil {
+		select {
+		case client.retryEntered <- struct{}{}:
+		default:
+		}
+	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	client.sendRetryCount++
 	if client.messageID == "" {
 		return false, nil
 	}
@@ -1724,6 +1864,33 @@ func (client *browserContractCodex) SendAttempted(
 		return false, errors.New("message identity was reused with different text")
 	}
 	return true, nil
+}
+
+func (client *browserContractCodex) AcknowledgeSends(
+	_ context.Context, threadID string, acknowledgements []codex.SendAcknowledgement,
+) ([]string, error) {
+	if threadID != "thread-1" {
+		return nil, errors.New("unexpected message acknowledgement thread")
+	}
+	client.mu.Lock()
+	acknowledged := make([]string, 0, len(acknowledgements))
+	for _, acknowledgement := range acknowledgements {
+		client.acknowledged = append(client.acknowledged, acknowledgement.ClientUserMessageID)
+		acknowledged = append(acknowledged, acknowledgement.ClientUserMessageID)
+	}
+	entered := client.acknowledgementEntered
+	release := client.acknowledgementRelease
+	client.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	return acknowledged, nil
 }
 
 func (client *browserContractCodex) ListQueue(_ context.Context, threadID string) ([]codex.QueueEntry, error) {
@@ -2445,6 +2612,9 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 	}
 	if controller.message != "browser message" ||
 		controller.messageID != "00000000-0000-4000-8000-000000000004" ||
+		controller.sendRetryCount != 1 ||
+		len(controller.acknowledged) != 1 ||
+		controller.acknowledged[0] != "00000000-0000-4000-8000-000000000004" ||
 		controller.actionContext != "" ||
 		controller.queued != "queue message" ||
 		controller.queueDeleted != "queued-1" || controller.queueStarted != "queued-1" ||

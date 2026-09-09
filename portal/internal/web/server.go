@@ -40,6 +40,7 @@ var assets embed.FS
 var queueClientMessageIDPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
 )
+var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type codexController interface {
 	VerifyThread(context.Context, string, string) error
@@ -51,6 +52,7 @@ type codexController interface {
 	Send(context.Context, string, string, string, string) (codex.SendReceipt, error)
 	PrepareSend(string, string, string, string, bool) error
 	SendAttempted(context.Context, string, string, string, string) (bool, error)
+	AcknowledgeSends(context.Context, string, []codex.SendAcknowledgement) ([]string, error)
 	ListQueue(context.Context, string) ([]codex.QueueEntry, error)
 	Queue(context.Context, string, string, string) (codex.QueueEntry, error)
 	DeleteQueueEntry(context.Context, string, string) error
@@ -1146,6 +1148,7 @@ func (s *Server) sessionAPIForSummary(
 		var body struct {
 			Message             string `json:"message"`
 			ClientUserMessageID string `json:"clientUserMessageId"`
+			Retry               bool   `json:"retry"`
 		}
 		if !s.decodeJSON(w, r, &body) {
 			return
@@ -1165,8 +1168,16 @@ func (s *Server) sessionAPIForSummary(
 		messageLock := s.messageLock(summary.Slug)
 		messageLock.Lock()
 		defer messageLock.Unlock()
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+		if body.Retry {
+			if _, err := s.config.Codex.SendAttempted(
+				ctx, threadID, message, body.ClientUserMessageID, "",
+			); err != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
+		}
 		receipt, err := s.config.Codex.Send(
 			ctx, threadID, message, body.ClientUserMessageID, "",
 		)
@@ -1175,6 +1186,31 @@ func (s *Server) sessionAPIForSummary(
 			return
 		}
 		s.writeJSON(w, http.StatusAccepted, receipt)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "message-ack":
+		var body struct {
+			Acknowledgements []codex.SendAcknowledgement `json:"acknowledgements"`
+		}
+		if !s.decodeJSON(w, r, &body) {
+			return
+		}
+		unique, err := normalizeMessageAcknowledgements(body.Acknowledgements)
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		messageLock := s.messageLock(summary.Slug)
+		messageLock.Lock()
+		defer messageLock.Unlock()
+		acknowledged, err := s.config.Codex.AcknowledgeSends(ctx, threadID, unique)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string][]string{
+			"acknowledgedClientUserMessageIds": acknowledged,
+		})
 	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "queue":
 		var body struct {
 			Message             string `json:"message"`
@@ -2043,6 +2079,35 @@ func normalizeSessionMessage(message string) (string, error) {
 		)
 	}
 	return message, nil
+}
+
+func normalizeMessageAcknowledgements(
+	acknowledgements []codex.SendAcknowledgement,
+) ([]codex.SendAcknowledgement, error) {
+	if len(acknowledgements) == 0 || len(acknowledgements) > 100 {
+		return nil, errors.New("message acknowledgement must contain between 1 and 100 identities")
+	}
+	unique := make([]codex.SendAcknowledgement, 0, len(acknowledgements))
+	seen := make(map[string]string, len(acknowledgements))
+	for _, acknowledgement := range acknowledgements {
+		acknowledgement.ClientUserMessageID = strings.TrimSpace(acknowledgement.ClientUserMessageID)
+		if !queueClientMessageIDPattern.MatchString(acknowledgement.ClientUserMessageID) {
+			return nil, errors.New("message acknowledgement has an invalid client identity")
+		}
+		acknowledgement.Digest = strings.TrimSpace(acknowledgement.Digest)
+		if !messageDigestPattern.MatchString(acknowledgement.Digest) {
+			return nil, errors.New("message acknowledgement has an invalid digest")
+		}
+		if existing, found := seen[acknowledgement.ClientUserMessageID]; found {
+			if existing != acknowledgement.Digest {
+				return nil, errors.New("message acknowledgement repeats an identity with different text")
+			}
+			continue
+		}
+		seen[acknowledgement.ClientUserMessageID] = acknowledgement.Digest
+		unique = append(unique, acknowledgement)
+	}
+	return unique, nil
 }
 
 func timeAgo(value time.Time) string {
