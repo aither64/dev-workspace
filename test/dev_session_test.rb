@@ -86,8 +86,8 @@ class DevSessionTest < Minitest::Test
       calls = []
       fake_runner = Object.new
       fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
-      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:|
-        calls << [input, as_is, force]
+      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:, operation_id:|
+        calls << [input, as_is, force, operation_id]
       end
       cli = VpsfreeDevSession::CLI.new(
         [
@@ -107,7 +107,7 @@ class DevSessionTest < Minitest::Test
       owner.flock(File::LOCK_UN)
 
       assert_equal(0, thread.value)
-      assert_equal([['2026-06-06-demo', true, false]], calls)
+      assert_equal([['2026-06-06-demo', true, false, nil]], calls)
     ensure
       owner&.flock(File::LOCK_UN)
       owner&.close
@@ -130,8 +130,8 @@ class DevSessionTest < Minitest::Test
         slave.close
         fake_runner = Object.new
         fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
-        fake_runner.define_singleton_method(:delete) do |_input, as_is:, force:|
-          File.write(marker, "#{as_is}:#{force}\n")
+        fake_runner.define_singleton_method(:delete) do |_input, as_is:, force:, operation_id:|
+          File.write(marker, "#{as_is}:#{force}:#{operation_id.inspect}\n")
         end
         cli = VpsfreeDevSession::CLI.new([
           '--transition-lock', path, '--', 'delete',
@@ -157,7 +157,7 @@ class DevSessionTest < Minitest::Test
       _waited, status = Process.wait2(pid)
       pid = nil
       assert(status.success?)
-      assert_equal("true:false\n", File.read(marker))
+      assert_equal("true:false:nil\n", File.read(marker))
     ensure
       if pid
         Process.kill('TERM', pid) rescue nil
@@ -889,7 +889,10 @@ class DevSessionTest < Minitest::Test
     cli.define_singleton_method(:runner) { fake_runner }
     assert_equal(0, cli.run)
     assert_equal(
-      [['2026-06-06-demo', { as_is: true, abandoned: false }]],
+      [[
+        '2026-06-06-demo',
+        { as_is: true, abandoned: false, operation_id: nil }
+      ]],
       calls
     )
   end
@@ -914,7 +917,10 @@ class DevSessionTest < Minitest::Test
     assert_equal(0, cli.run)
     assert_includes(err.string, 'explicitly abandoned')
     assert_equal(
-      [['2026-06-06-demo', { as_is: true, allow_abandoned: true }]],
+      [[
+        '2026-06-06-demo',
+        { as_is: true, allow_abandoned: true, operation_id: nil }
+      ]],
       calls
     )
   end
@@ -937,7 +943,10 @@ class DevSessionTest < Minitest::Test
 
     assert_equal(0, cli.run)
     assert_equal(
-      [['2026-06-06-demo', { as_is: true, allow_abandoned: true }]],
+      [[
+        '2026-06-06-demo',
+        { as_is: true, allow_abandoned: true, operation_id: nil }
+      ]],
       calls
     )
   end
@@ -984,14 +993,16 @@ class DevSessionTest < Minitest::Test
       fake_runner = Object.new
       fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
       fake_runner.define_singleton_method(:archive) { |input, **options| calls << [input, options] }
-      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:|
-        calls << [input, { as_is:, force: }]
+      fake_runner.define_singleton_method(:revive) { |input, **options| calls << [input, options] }
+      fake_runner.define_singleton_method(:delete) do |input, as_is:, force:, operation_id:|
+        calls << [input, { as_is:, force:, operation_id: }]
       end
       arguments = [
         '--require-runtime',
         '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
         '--portal-command', '/nix/store/portal/bin/workspace-portal',
-        '--', 'archive', '2026-06-06-demo', '--as-is', '--portal-authorized'
+        '--', 'archive', '2026-06-06-demo', '--as-is', '--portal-authorized',
+        '--portal-operation-id', 'a' * 64
       ]
       cli = VpsfreeDevSession::CLI.new(
         arguments,
@@ -1005,15 +1016,73 @@ class DevSessionTest < Minitest::Test
 
       assert_equal(0, cli.run)
       assert_equal(
-        [['2026-06-06-demo', { as_is: true, abandoned: false }]],
+        [[
+          '2026-06-06-demo',
+          { as_is: true, abandoned: false, operation_id: 'a' * 64 }
+        ]],
         calls
       )
+
+      missing_id = VpsfreeDevSession::CLI.new(
+        arguments.first(arguments.length - 2),
+        input: StringIO.new,
+        out: StringIO.new,
+        err: (missing_id_error = StringIO.new),
+        cgroup_file: cgroup,
+        env: {}
+      )
+      missing_id.define_singleton_method(:runner) { fake_runner }
+      assert_equal(1, missing_id.run)
+      assert_includes(missing_id_error.string, 'must be a lowercase 64-character')
+      assert_equal(1, calls.length)
+
+      revive_arguments = [
+        '--require-runtime',
+        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--portal-command', '/nix/store/portal/bin/workspace-portal',
+        '--', 'revive', '2026-06-06-demo', '--as-is', '--portal-authorized',
+        '--portal-operation-id', 'b' * 64
+      ]
+      revive = VpsfreeDevSession::CLI.new(
+        revive_arguments,
+        input: StringIO.new,
+        out: StringIO.new,
+        err: StringIO.new,
+        cgroup_file: cgroup,
+        env: {}
+      )
+      revive.define_singleton_method(:runner) { fake_runner }
+      assert_equal(0, revive.run)
+      assert_equal(
+        [
+          '2026-06-06-demo',
+          { as_is: true, allow_abandoned: false, operation_id: 'b' * 64 }
+        ],
+        calls.last
+      )
+
+      missing_revive_id = VpsfreeDevSession::CLI.new(
+        revive_arguments.first(revive_arguments.length - 2),
+        input: StringIO.new,
+        out: StringIO.new,
+        err: (missing_revive_id_error = StringIO.new),
+        cgroup_file: cgroup,
+        env: {}
+      )
+      missing_revive_id.define_singleton_method(:runner) { fake_runner }
+      assert_equal(1, missing_revive_id.run)
+      assert_includes(
+        missing_revive_id_error.string,
+        'must be a lowercase 64-character'
+      )
+      assert_equal(2, calls.length)
 
       remove_arguments = [
         '--require-runtime',
         '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
         '--portal-command', '/nix/store/portal/bin/workspace-portal',
-        '--', 'delete', '2026-06-06-demo', '--as-is', '--portal-authorized', '--force'
+        '--', 'delete', '2026-06-06-demo', '--as-is', '--portal-authorized', '--force',
+        '--portal-operation-id', 'a' * 64
       ]
       remove = VpsfreeDevSession::CLI.new(
         remove_arguments,
@@ -1026,7 +1095,7 @@ class DevSessionTest < Minitest::Test
       remove.define_singleton_method(:runner) { fake_runner }
       assert_equal(0, remove.run)
       assert_equal(
-        ['2026-06-06-demo', { as_is: true, force: true }],
+        ['2026-06-06-demo', { as_is: true, force: true, operation_id: 'a' * 64 }],
         calls.last
       )
 
@@ -1043,7 +1112,35 @@ class DevSessionTest < Minitest::Test
       rejected.define_singleton_method(:runner) { fake_runner }
       assert_equal(1, rejected.run)
       assert_includes(err.string, 'not available to this process')
-      assert_equal(2, calls.length)
+      assert_equal(3, calls.length)
+    end
+  end
+
+  def test_portal_operation_identity_is_not_accepted_by_interactive_commands
+    %w[archive revive].each do |command|
+      calls = []
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:resolve_slug) do |input, as_is:|
+        input if as_is
+      end
+      fake_runner.define_singleton_method(command) do |input, **options|
+        calls << [input, options]
+      end
+      err = StringIO.new
+      cli = VpsfreeDevSession::CLI.new(
+        [
+          command, '2026-06-06-demo', '--as-is',
+          '--portal-operation-id', 'a' * 64
+        ],
+        input: StringIO.new,
+        out: StringIO.new,
+        err:
+      )
+      cli.define_singleton_method(:runner) { fake_runner }
+
+      assert_equal(1, cli.run)
+      assert_empty(calls)
+      assert_includes(err.string, 'requires --portal-authorized')
     end
   end
 
@@ -5456,6 +5553,96 @@ class DevSessionTest < Minitest::Test
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
       refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
       refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_removal_journal_is_bound_to_the_portal_operation_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-remove-operation-identity'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      operation_id = 'a' * 64
+
+      removal = runner.send(
+        :prepare_removal!, slug, force: false, operation_id:
+      )
+      assert_equal(operation_id, removal.fetch('operation_id'))
+      assert_equal(
+        operation_id,
+        runner.send(:load_removal_journal, slug).fetch('operation_id')
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.send(
+          :prepare_removal!, slug, force: false, operation_id: 'b' * 64
+        )
+      end
+      assert_includes(error.message, 'session deletion operation changed')
+    end
+  end
+
+  def test_archive_journal_is_bound_to_the_portal_operation_identity
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-operation-identity'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      operation_id = 'a' * 64
+      plan = runner.send(:prepare_cleanup, slug, force: false)
+
+      journal = runner.send(
+        :prepare_archive_journal!,
+        slug,
+        'complete',
+        {},
+        plan,
+        operation_id:
+      )
+      assert_equal(operation_id, journal.fetch('operation_id'))
+      assert_equal(
+        operation_id,
+        runner.send(:load_archive_journal, slug).fetch('operation_id')
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.archive(
+          slug,
+          as_is: true,
+          operation_id: 'b' * 64
+        )
+      end
+      assert_includes(error.message, 'session archive operation changed')
+    end
+  end
+
+  def test_revive_journal_is_bound_to_the_portal_operation_identity
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-operation-identity'
+      runner = archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      operation_id = 'a' * 64
+
+      journal = runner.send(
+        :prepare_revive_journal!,
+        slug,
+        'complete',
+        operation_id:
+      )
+      assert_equal(operation_id, journal.fetch('operation_id'))
+      assert_equal(
+        operation_id,
+        runner.send(:load_revive_journal, slug).fetch('operation_id')
+      )
+
+      error = assert_raises(VpsfreeDevSession::Error) do
+        runner.revive(
+          slug,
+          as_is: true,
+          operation_id: 'b' * 64
+        )
+      end
+      assert_includes(error.message, 'session revive operation changed')
     end
   end
 

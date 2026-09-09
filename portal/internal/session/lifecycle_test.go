@@ -43,7 +43,8 @@ func TestPendingLifecycleProgressReadsTheValidatedJournalPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "example.archive.json")
-	payload := `{"schema":2,"slug":"example","workspace":"` + workspace + `","phase":"clusters_released","mode":"complete"}`
+	journalID := strings.Repeat("a", 64)
+	payload := `{"schema":2,"slug":"example","workspace":"` + workspace + `","phase":"clusters_released","mode":"complete","operation_id":"` + journalID + `"}`
 	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +54,32 @@ func TestPendingLifecycleProgressReadsTheValidatedJournalPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if progress.Operation != "archive" || progress.Phase != "clusters_released" ||
-		progress.Mode != "complete" || progress.UpdatedAt.IsZero() {
+		progress.Mode != "complete" || progress.JournalID != journalID || progress.UpdatedAt.IsZero() {
+		t.Fatalf("progress = %#v", progress)
+	}
+}
+
+func TestPendingLifecycleProgressReadsReviveOperationIdentity(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalID := strings.Repeat("b", 64)
+	payload := `{"schema":3,"slug":"example","workspace":"` + workspace +
+		`","phase":"prepared","operation_id":"` + journalID + `"}`
+	if err := os.WriteFile(
+		filepath.Join(root, "example.revive.json"), []byte(payload), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := PendingLifecycleProgress(workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Operation != "revive" || progress.Phase != "prepared" ||
+		progress.JournalID != journalID {
 		t.Fatalf("progress = %#v", progress)
 	}
 }
@@ -65,7 +91,7 @@ func TestPendingLifecycleProgressToleratesAtomicJournalReplacement(t *testing.T)
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "example.archive.json")
-	payload := []byte(`{"schema":2,"slug":"example","workspace":"` + workspace + `","phase":"prepared","mode":"complete"}`)
+	payload := []byte(`{"schema":2,"slug":"example","workspace":"` + workspace + `","phase":"prepared","mode":"complete","operation_id":"` + strings.Repeat("a", 64) + `"}`)
 	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +144,7 @@ func TestPendingLifecyclesIncludesJournalOnlyDeletion(t *testing.T) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"schema":1,"slug":"example","workspace":"` + workspace + `","phase":"tracking_preserved","force":false}`
+	payload := `{"schema":1,"slug":"example","workspace":"` + workspace + `","phase":"tracking_preserved","force":false,"operation_id":"` + strings.Repeat("a", 64) + `"}`
 	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +153,25 @@ func TestPendingLifecyclesIncludesJournalOnlyDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending["example"].Operation != "delete" || pending["example"].Phase != "tracking_preserved" {
+	if pending["example"].Operation != "delete" || pending["example"].Phase != "tracking_preserved" ||
+		pending["example"].JournalID != strings.Repeat("a", 64) {
 		t.Fatalf("pending lifecycles = %#v", pending)
+	}
+}
+
+func TestPendingLifecycleProgressRejectsAnInvalidOperationIdentity(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"schema":1,"slug":"example","workspace":"` + workspace + `","phase":"prepared","force":false,"operation_id":"NOT-AN-ID"}`
+	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PendingLifecycleProgress(workspace, "example"); err == nil ||
+		!strings.Contains(err.Error(), "operation identity") {
+		t.Fatalf("invalid operation identity error = %v", err)
 	}
 }
 
@@ -154,9 +197,9 @@ func TestPendingLifecycleProgressRejectsFIFOWithoutBlocking(t *testing.T) {
 
 func TestPendingLifecycleProgressRejectsAnInvalidOrForeignPhase(t *testing.T) {
 	for _, payload := range []string{
-		`{"slug":"other","workspace":"WORKSPACE","phase":"prepared","mode":"complete"}`,
-		`{"slug":"example","workspace":"WORKSPACE","phase":"invented","mode":"complete"}`,
-		`{"slug":"example","workspace":"WORKSPACE","phase":"prepared","mode":"invented"}`,
+		`{"slug":"other","workspace":"WORKSPACE","phase":"prepared","mode":"complete","operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"slug":"example","workspace":"WORKSPACE","phase":"invented","mode":"complete","operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"slug":"example","workspace":"WORKSPACE","phase":"prepared","mode":"invented","operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
 	} {
 		workspace := t.TempDir()
 		root := filepath.Join(workspace, "worktrees", ".locks")

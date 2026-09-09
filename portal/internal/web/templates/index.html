@@ -16,7 +16,7 @@
     <p id="index-status-warning" class="notice warning" hidden></p>
     <section class="panel new-session">
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From aitherdev, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
-      <form method="post" action="/sessions" class="stack">
+      <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
         <div class="field-grid">
@@ -24,8 +24,14 @@
           <label>Reasoning effort<select name="effort" data-effort-select><option value="">Automatic</option></select></label>
         </div>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
+        <p id="new-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
         <button type="submit">Create session</button>
       </form>
+    </section>
+
+    <section id="operations" class="panel operations-panel" hidden>
+      <div class="section-heading"><h2>Operations</h2><span id="operation-count">0</span></div>
+      <div id="operation-list" class="operation-list" aria-live="polite"></div>
     </section>
 
     <section>

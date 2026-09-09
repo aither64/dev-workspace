@@ -21,6 +21,7 @@ type LifecycleProgress struct {
 	Phase     string    `json:"phase"`
 	Mode      string    `json:"mode,omitempty"`
 	Force     bool      `json:"force,omitempty"`
+	JournalID string    `json:"journalId,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -201,11 +202,12 @@ func readLifecycleProgressFile(
 		return nil, false, errors.New("lifecycle journal progress exceeds 64 KiB")
 	}
 	var payload struct {
-		Slug      string `json:"slug"`
-		Workspace string `json:"workspace"`
-		Phase     string `json:"phase"`
-		Mode      string `json:"mode"`
-		Force     *bool  `json:"force"`
+		Slug        string `json:"slug"`
+		Workspace   string `json:"workspace"`
+		Phase       string `json:"phase"`
+		Mode        string `json:"mode"`
+		Force       *bool  `json:"force"`
+		OperationID string `json:"operation_id"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, false, fmt.Errorf("decode lifecycle journal progress: %w", err)
@@ -222,12 +224,29 @@ func readLifecycleProgressFile(
 	if operation == "delete" && payload.Force == nil {
 		return nil, false, errors.New("delete journal progress has no force setting")
 	}
+	if !validLifecycleJournalID(payload.OperationID) {
+		return nil, false, errors.New("lifecycle journal has an invalid operation identity")
+	}
 	force := false
 	if payload.Force != nil {
 		force = *payload.Force
 	}
 	return &LifecycleProgress{
 		Operation: operation, Phase: payload.Phase, Mode: payload.Mode,
-		Force: force, UpdatedAt: opened.ModTime(),
+		Force: force, JournalID: payload.OperationID, UpdatedAt: opened.ModTime(),
 	}, true, nil
+}
+
+func validLifecycleJournalID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }

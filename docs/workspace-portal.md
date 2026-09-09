@@ -63,6 +63,8 @@ requests replay their existing result instead of creating another session or
 turn. Creation reports success only after the rollout exists and its first user
 message exactly matches the submitted request. The terminal client starts
 after that verification, so it cannot race an empty thread.
+The browser shows creation progress and elapsed time while this work runs, then
+opens the new session. Index refresh cannot replace a pending creation request.
 
 The terminal command asks for the same initial request before it creates a new
 Codex session, then attaches to the persisted thread:
@@ -145,10 +147,13 @@ the same command can safely resume an interrupted operation. Recovery verifies
 the exact archived tracking tree and retained conversation identity before it
 commits or retires anything. Terminal confirmation occurs before the CLI waits
 for the host-wide transition lock, so an interactive prompt never monopolizes
-the workspace. The CLI prints each durable phase. The browser runs archive,
-delete, and revive asynchronously, showing the current phase and elapsed time;
-after a failure or service restart, it offers the deterministic retry rather
-than implying the operation finished.
+the workspace. The CLI prints each durable phase. The browser accepts archive,
+delete, and revive asynchronously and returns to the index immediately. Its
+Operations panel shows the current phase and elapsed time. Operation receipts
+survive a portal restart; failures remain until retried or dismissed, while
+successes remain visible for 15 minutes. A later successful CLI or browser
+retry replaces an older failure after the authoritative session state confirms
+the result.
 
 Revive session restores an archive as active with one confirmation. Abandoned
 archives use a stronger warning whose authorization remains in the retry
@@ -183,14 +188,18 @@ after a portal restart. New output follows the scroll position only when the
 reader is already near the bottom. Otherwise, the page preserves the current
 position and shows a New output button.
 
-Delete session requires the full slug. It removes active, archived, and failed
-creations from the portal, retains Git branches, and moves tracking into the
-private XDG recovery directory documented in `docs/dev-sessions.md`. Forced
-deletion can discard dirty worktrees and interrupt an active turn. Removal is
-journaled and can be retried after a partial failure. Its journal reserves the
-slug against session changes and new cluster work until removal finishes. The
-helper records thread-retirement intent first, reconciles an already archived
-thread by its exact identity even when older archived threads share the working
+Delete session uses one confirmation; it does not ask you to type the slug. It
+removes active, archived, and failed creations from the portal, retains Git
+branches, and moves tracking and worktree recovery metadata into the private
+XDG recovery directory documented in `docs/dev-sessions.md`. Normal deletion
+requires clean worktrees and an idle conversation. Forced deletion can discard
+dirty worktrees and interrupt an active turn. The worktree inventory comes from
+Git's canonical workspace metadata, so a missing or stale portal registration
+does not strand an otherwise unambiguous session worktree. Removal is journaled
+and can be retried after a partial failure. Its journal reserves the slug
+against session changes and new cluster work until removal finishes. The helper
+records thread-retirement intent first, reconciles an already archived thread
+by its exact identity even when older archived threads share the working
 directory, and durably records a unique cwd-bound thread before archiving it
 when creation lost its ID.
 It refuses to continue if a known thread cannot be reached. Successful

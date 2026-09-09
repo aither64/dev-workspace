@@ -553,7 +553,8 @@ module VpsfreeDevSession
       model: nil,
       effort: nil,
       allow_empty_thread: false,
-      lifecycle_operation: nil
+      lifecycle_operation: nil,
+      lifecycle_operation_id: nil
     )
       if goal_file && goal_text
         raise Error, 'initial request cannot use both a goal file and direct text'
@@ -593,7 +594,9 @@ module VpsfreeDevSession
 
         selected_session = with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
-          prepare_revive_runtime_start!(slug) if lifecycle_operation == 'revive'
+          if lifecycle_operation == 'revive'
+            prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
+          end
           creation_journal = prepare_creation_journal(
             slug,
             goal_file,
@@ -1234,14 +1237,17 @@ module VpsfreeDevSession
       lookup_slug(input, as_is:)
     end
 
-    def archive(input, as_is:, abandoned: false)
+    def archive(input, as_is:, abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       mode = abandoned ? 'abandoned' : 'complete'
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid session archive operation identity'
+      end
       with_creation_lock(slug) do
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
-          journal = load_archive_journal(slug)
+          journal = load_archive_journal(slug, operation_id:)
           ensure_retirement_identity!(slug, cleanup_session(slug))
           unless journal
             source = validate_work_directory!(slug)
@@ -1265,7 +1271,9 @@ module VpsfreeDevSession
               raise Error, 'work and archive directories must be on the same filesystem'
             end
             validate_tracking_transition_commit!(slug)
-            journal = prepare_archive_journal!(slug, mode, proven_heads, plan)
+            journal = prepare_archive_journal!(
+              slug, mode, proven_heads, plan, operation_id:
+            )
           end
           unless journal.fetch('mode') == mode
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
@@ -1327,13 +1335,16 @@ module VpsfreeDevSession
       end
     end
 
-    def revive(input, as_is:, allow_abandoned: false)
+    def revive(input, as_is:, allow_abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid session revive operation identity'
+      end
       journal = with_creation_lock(slug) do
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'revive')
-          current = load_revive_journal(slug)
+          current = load_revive_journal(slug, operation_id:)
           unless current
             lifecycle = lifecycle_state(
               read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
@@ -1344,7 +1355,8 @@ module VpsfreeDevSession
             current = prepare_revive_journal!(
               slug,
               lifecycle,
-              abandoned_confirmed: lifecycle != 'abandoned' || allow_abandoned
+              abandoned_confirmed: lifecycle != 'abandoned' || allow_abandoned,
+              operation_id:
             )
           end
           recover_revive_phase!(slug, current)
@@ -1354,7 +1366,7 @@ module VpsfreeDevSession
       if revive_phase_before?(journal, 'tracking_restored')
         journal = with_creation_lock(slug) do
           with_slug_lock(slug) do
-            current = load_revive_journal(slug)
+            current = load_revive_journal(slug, operation_id:)
             finish_revive_tracking!(slug, current)
             current
           end
@@ -1363,7 +1375,7 @@ module VpsfreeDevSession
       if revive_phase_before?(journal, 'tracking_committed')
         journal = with_creation_lock(slug) do
           with_slug_lock(slug) do
-            current = load_revive_journal(slug)
+            current = load_revive_journal(slug, operation_id:)
             verify_revived_tracking_tree!(slug, current)
             commit_tracking_transition!(slug, direction: 'revive', mode: current.fetch('lifecycle'))
             verify_revived_tracking_tree!(slug, current)
@@ -1383,20 +1395,21 @@ module VpsfreeDevSession
             run_codex: true,
             exclusive: false,
             allow_empty_thread: journal.fetch('legacy_without_portal'),
-            lifecycle_operation: 'revive'
+            lifecycle_operation: 'revive',
+            lifecycle_operation_id: operation_id
           )
         else
           with_creation_lock(slug) do
             with_slug_lock(slug) do
-              prepare_revive_runtime_start!(slug)
+              prepare_revive_runtime_start!(slug, operation_id:)
             end
           end
         end
         journal = with_creation_lock(slug) do
           with_slug_lock(slug) do
-            current = load_revive_journal(slug)
+            current = load_revive_journal(slug, operation_id:)
             if current.fetch('phase') == 'tracking_committed'
-              current = prepare_revive_runtime_start!(slug)
+              current = prepare_revive_runtime_start!(slug, operation_id:)
             end
             advance_revive!(slug, current, 'runtime_started')
             current
@@ -1405,7 +1418,7 @@ module VpsfreeDevSession
       end
       with_creation_lock(slug) do
         with_slug_lock(slug) do
-          finish_revive_journal!(slug, load_revive_journal(slug))
+          finish_revive_journal!(slug, load_revive_journal(slug, operation_id:))
         end
       end
       @out.puts "revived session: #{slug}"
@@ -1428,7 +1441,7 @@ module VpsfreeDevSession
       end
     end
 
-    def delete(input, as_is:, force:)
+    def delete(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       removal = nil
       quiesced = nil
@@ -1437,7 +1450,7 @@ module VpsfreeDevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'delete')
           ensure_retirement_identity!(slug, cleanup_session(slug))
-          removal = prepare_removal!(slug, force:)
+          removal = prepare_removal!(slug, force:, operation_id:)
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')
             validate_removal_tracking!(slug)
@@ -4230,8 +4243,14 @@ module VpsfreeDevSession
             "session #{label} is unfinished: #{slug}; retry dev-session #{command} with the original options"
     end
 
-    def prepare_removal!(slug, force:)
+    def prepare_removal!(slug, force:, operation_id: nil)
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid session deletion operation identity'
+      end
       if (existing = load_removal_journal(slug))
+        if operation_id && existing.fetch('operation_id') != operation_id
+          raise Error, "session deletion operation changed: #{slug}"
+        end
         if !existing.fetch('force') && force
           existing['force'] = true
           write_removal_metadata!(existing.fetch('recovery'), existing)
@@ -4266,6 +4285,7 @@ module VpsfreeDevSession
         'slug' => slug,
         'workspace' => workspace,
         'created_at' => Time.now.utc.iso8601(6),
+        'operation_id' => operation_id || SecureRandom.hex(32),
         'state' => 'prepared',
         'phase' => 'prepared',
         'force' => force,
@@ -4294,10 +4314,11 @@ module VpsfreeDevSession
         raise Error, "removal journal exceeds 64 KiB: #{path}"
       end
       data = JSON.parse(encoded)
-      required = %w[schema slug workspace created_at state phase force tracking recovery]
+      required = %w[schema slug workspace created_at operation_id state phase force tracking recovery]
       allowed = required + %w[git_tracked worktrees worktrees_sealed]
       unless data.is_a?(Hash) && (required - data.keys).empty? && (data.keys - allowed).empty? &&
              data['schema'] == 1 && data['slug'] == slug && data['workspace'] == workspace &&
+             data['operation_id'].is_a?(String) && data['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
              REMOVAL_PHASES.include?(data['phase']) && [true, false].include?(data['force']) &&
              %w[work archive].include?(data['tracking']) && data['recovery'].is_a?(String) &&
              ((data['phase'] == 'removed' && data['state'] == 'removed') ||
@@ -5089,12 +5110,19 @@ module VpsfreeDevSession
       end
     end
 
-    def load_archive_journal(slug)
+    def load_archive_journal(slug, operation_id: nil)
       path = lifecycle_journal_file(slug, 'archive')
       return nil unless path_exists?(path)
 
       journal = load_lifecycle_journal(path, slug)
-      unless journal['schema'] == 2 && ARCHIVE_PHASES.include?(journal['phase']) &&
+      keys = %w[
+        schema slug workspace operation_id phase mode proven_heads finalized_at
+        retained_thread_id target_tracking_sha256
+      ]
+      unless journal.keys.sort == keys.sort &&
+             journal['schema'] == 2 && ARCHIVE_PHASES.include?(journal['phase']) &&
+             journal['operation_id'].is_a?(String) &&
+             journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
              %w[complete abandoned].include?(journal['mode']) &&
              journal['finalized_at'].is_a?(String) &&
              valid_rfc3339_timestamp?(journal['finalized_at']) &&
@@ -5109,10 +5137,16 @@ module VpsfreeDevSession
              end
         raise Error, "invalid archive journal: #{path}"
       end
+      if operation_id && journal.fetch('operation_id') != operation_id
+        raise Error, "session archive operation changed: #{slug}"
+      end
       journal
     end
 
-    def prepare_archive_journal!(slug, mode, proven_heads, plan)
+    def prepare_archive_journal!(slug, mode, proven_heads, plan, operation_id: nil)
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid session archive operation identity'
+      end
       finalized_at = Time.now.utc.iso8601
       target_tracking_sha256, retained_thread_id = archived_tracking_identity(
         slug, plan, mode, proven_heads, finalized_at
@@ -5121,6 +5155,7 @@ module VpsfreeDevSession
         'schema' => 2,
         'slug' => slug,
         'workspace' => workspace,
+        'operation_id' => operation_id || SecureRandom.hex(32),
         'phase' => 'prepared',
         'mode' => mode,
         'proven_heads' => proven_heads,
@@ -5185,13 +5220,13 @@ module VpsfreeDevSession
       fsync_directory(File.dirname(path))
     end
 
-    def load_revive_journal(slug)
+    def load_revive_journal(slug, operation_id: nil)
       path = lifecycle_journal_file(slug, 'revive')
       return nil unless path_exists?(path)
 
       journal = load_lifecycle_journal(path, slug)
       keys = %w[
-        schema slug workspace phase lifecycle legacy_without_portal
+        schema slug workspace operation_id phase lifecycle legacy_without_portal
         abandoned_confirmed retained_thread_id target_tracking_sha256
         plan_sha256 state_sha256 target_state_sha256 portal_sha256
         target_portal_sha256
@@ -5202,6 +5237,8 @@ module VpsfreeDevSession
       ]
       unless journal.keys.sort == keys.sort &&
              journal['schema'] == 3 && REVIVE_PHASES.include?(journal['phase']) &&
+             journal['operation_id'].is_a?(String) &&
+             journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
              %w[complete abandoned].include?(journal['lifecycle']) &&
              [true, false].include?(journal['legacy_without_portal']) &&
              [true, false].include?(journal['abandoned_confirmed']) &&
@@ -5218,10 +5255,21 @@ module VpsfreeDevSession
                 journal['portal_sha256'].match?(/\A[0-9a-f]{64}\z/)))
         raise Error, "invalid revive journal: #{path}"
       end
+      if operation_id && journal.fetch('operation_id') != operation_id
+        raise Error, "session revive operation changed: #{slug}"
+      end
       journal
     end
 
-    def prepare_revive_journal!(slug, lifecycle, abandoned_confirmed: lifecycle != 'abandoned')
+    def prepare_revive_journal!(
+      slug,
+      lifecycle,
+      abandoned_confirmed: lifecycle != 'abandoned',
+      operation_id: nil
+    )
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'invalid session revive operation identity'
+      end
       validate_archive_committed!(slug)
       raise Error, "active tracking already exists: #{work_dir(slug)}" if path_exists?(work_dir(slug))
       if path_exists?(worktrees_dir(slug))
@@ -5262,6 +5310,7 @@ module VpsfreeDevSession
         'schema' => 3,
         'slug' => slug,
         'workspace' => workspace,
+        'operation_id' => operation_id || SecureRandom.hex(32),
         'phase' => 'prepared',
         'lifecycle' => lifecycle,
         'legacy_without_portal' => portal.nil?,
@@ -5335,8 +5384,8 @@ module VpsfreeDevSession
       end
     end
 
-    def prepare_revive_runtime_start!(slug)
-      journal = load_revive_journal(slug)
+    def prepare_revive_runtime_start!(slug, operation_id: nil)
+      journal = load_revive_journal(slug, operation_id:)
       raise Error, "revive journal is missing for #{slug}" unless journal
 
       case journal.fetch('phase')
@@ -5455,12 +5504,12 @@ module VpsfreeDevSession
       end
       allowed = if command == 'archive'
                   %w[
-                    schema slug workspace phase mode proven_heads finalized_at
+                    schema slug workspace operation_id phase mode proven_heads finalized_at
                     retained_thread_id target_tracking_sha256
                   ]
                 elsif command == 'revive'
                   %w[
-                    schema slug workspace phase lifecycle legacy_without_portal
+                    schema slug workspace operation_id phase lifecycle legacy_without_portal
                     abandoned_confirmed retained_thread_id target_tracking_sha256
                     plan_sha256 state_sha256 target_state_sha256 portal_sha256
                     target_portal_sha256
@@ -7158,11 +7207,15 @@ module VpsfreeDevSession
     end
 
     def run_delete
-      opts = { as_is: false, force: false, portal_authorized: false }
+      opts = {
+        as_is: false, force: false, portal_authorized: false,
+        portal_operation_id: nil
+      }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--force') { opts[:force] = true }
         parser_opts.on('--portal-authorized') { opts[:portal_authorized] = true }
+        parser_opts.on('--portal-operation-id ID') { |value| opts[:portal_operation_id] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'delete')
@@ -7170,7 +7223,14 @@ module VpsfreeDevSession
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       if opts.fetch(:portal_authorized)
         validate_portal_authorization!
+        operation_id = opts.fetch(:portal_operation_id)
+        unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
+        end
       else
+        if opts.fetch(:portal_operation_id)
+          raise Error, '--portal-operation-id requires --portal-authorized'
+        end
         warnings = [
           'This removes the session from workspace discovery.',
           'Git branches are retained and tracking is moved to private recovery storage.'
@@ -7185,7 +7245,12 @@ module VpsfreeDevSession
       end
 
       with_lifecycle_transition do
-        runner.delete(slug, as_is: true, force: opts.fetch(:force))
+        runner.delete(
+          slug,
+          as_is: true,
+          force: opts.fetch(:force),
+          operation_id: opts.fetch(:portal_operation_id)
+        )
       end
     end
 
@@ -7202,16 +7267,29 @@ module VpsfreeDevSession
     end
 
     def run_archive
-      opts = { as_is: false, abandoned: false, portal_authorized: false }
+      opts = {
+        as_is: false, abandoned: false, portal_authorized: false,
+        portal_operation_id: nil
+      }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--abandoned') { opts[:abandoned] = true }
         parser_opts.on('--portal-authorized') { opts[:portal_authorized] = true }
+        parser_opts.on('--portal-operation-id ID') { |value| opts[:portal_operation_id] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'archive')
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
-      unless opts.fetch(:portal_authorized)
+      if opts.fetch(:portal_authorized)
+        validate_portal_authorization!
+        operation_id = opts.fetch(:portal_operation_id)
+        unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
+        end
+      else
+        if opts.fetch(:portal_operation_id)
+          raise Error, '--portal-operation-id requires --portal-authorized'
+        end
         warnings = if opts.fetch(:abandoned)
                      ['This explicitly discards the initiative without requiring merged feature heads.']
                    else
@@ -7224,11 +7302,14 @@ module VpsfreeDevSession
             "Archive #{slug} as abandoned?" : "Archive completed session #{slug}?",
           warnings:
         )
-      else
-        validate_portal_authorization!
       end
       with_lifecycle_transition do
-        runner.archive(slug, as_is: true, abandoned: opts.fetch(:abandoned))
+        runner.archive(
+          slug,
+          as_is: true,
+          abandoned: opts.fetch(:abandoned),
+          operation_id: opts.fetch(:portal_operation_id)
+        )
       end
     end
 
@@ -7304,18 +7385,29 @@ module VpsfreeDevSession
     end
 
     def run_revive
-      opts = { as_is: false, allow_abandoned: false, portal_authorized: false }
+      opts = {
+        as_is: false, allow_abandoned: false, portal_authorized: false,
+        portal_operation_id: nil
+      }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--allow-abandoned') { opts[:allow_abandoned] = true }
         parser_opts.on('--portal-authorized') { opts[:portal_authorized] = true }
+        parser_opts.on('--portal-operation-id ID') { |value| opts[:portal_operation_id] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'revive')
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       if opts.fetch(:portal_authorized)
         validate_portal_authorization!
+        operation_id = opts.fetch(:portal_operation_id)
+        unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
+          raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
+        end
       else
+        if opts.fetch(:portal_operation_id)
+          raise Error, '--portal-operation-id requires --portal-authorized'
+        end
         if opts.fetch(:allow_abandoned)
           raise Error, '--allow-abandoned is reserved for the portal confirmation flow'
         end
@@ -7335,7 +7427,12 @@ module VpsfreeDevSession
         opts[:allow_abandoned] = lifecycle == 'abandoned'
       end
       with_lifecycle_transition do
-        runner.revive(slug, as_is: true, allow_abandoned: opts.fetch(:allow_abandoned))
+        runner.revive(
+          slug,
+          as_is: true,
+          allow_abandoned: opts.fetch(:allow_abandoned),
+          operation_id: opts.fetch(:portal_operation_id)
+        )
       end
     end
 

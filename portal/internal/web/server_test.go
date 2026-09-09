@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -152,12 +153,25 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	}
 	server.config.DevSession = helper
 	slug := "2026-09-06-lock-order"
+	tracking := filepath.Join(server.config.Workspace, "work", slug)
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: "+slug+"\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	targetID := deletionTargetForTest(t, server, slug)
 	mutationLock := server.messageLock(slug)
 	mutationLock.Lock()
 	result := make(chan error, 1)
 	go func() {
 		result <- server.runLifecycleOperation(
 			context.Background(), slug, "archive", []string{"archive", slug, "--as-is"},
+			lifecycleOperationOptions{Mode: "abandoned", TargetID: targetID},
 		)
 	}()
 
@@ -221,6 +235,7 @@ func TestLifecycleOperationRejectsProfileSwitchWhileWaiting(t *testing.T) {
 			go func() {
 				result <- server.runLifecycleOperation(
 					context.Background(), "example", "archive", []string{"archive", "example", "--as-is"},
+					lifecycleOperationOptions{},
 				)
 			}()
 			select {
@@ -264,6 +279,41 @@ func TestLifecycleOperationRejectsProfileSwitchWhileWaiting(t *testing.T) {
 				t.Fatalf("superseded lifecycle helper ran: %v", err)
 			}
 		})
+	}
+}
+
+func TestLifecycleOperationRechecksTheDeletionTargetBeforeTheCommand(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	invoked := filepath.Join(t.TempDir(), "invoked")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(
+		helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INVOKED", invoked)
+	server.config.DevSession = helper
+	err := server.runLifecycleOperation(
+		context.Background(), "example", "delete", []string{"delete", "example", "--as-is"},
+		lifecycleOperationOptions{TargetID: strings.Repeat("a", 64)},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match the current session") {
+		t.Fatalf("replacement deletion preflight error = %v", err)
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement session delete command ran: %v", err)
 	}
 }
 
@@ -439,7 +489,9 @@ func TestIndexDefersCodexActivityAndReturnsEnrichedStatus(t *testing.T) {
 	if len(controller.activityInputs) != 0 {
 		t.Fatalf("initial index performed Codex I/O: %#v", controller.activityInputs)
 	}
-	if !strings.Contains(body, "data-index-generated-at") || !strings.Contains(body, "data-session-slug") {
+	if !strings.Contains(body, "data-index-generated-at") || !strings.Contains(body, "data-session-slug") ||
+		!strings.Contains(body, `id="operations"`) ||
+		!strings.Contains(body, `id="new-session-progress"`) {
 		t.Fatalf("initial index lacks enrichment hooks: %s", body)
 	}
 
@@ -675,8 +727,13 @@ func TestIndexStatusIncludesOperationsBeforeTheirJournalExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, directory, "active")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	server.operationMu.Lock()
-	server.operations["example"] = lifecycleOperation{Kind: "archive", State: "running", Phase: "starting"}
+	server.operations["example"] = lifecycleOperation{
+		Slug: "example", Kind: "archive", State: "running", Phase: "starting",
+		StartedAt: now, UpdatedAt: now, Redirect: "/",
+		Options: lifecycleOperationOptions{Mode: "complete"},
+	}
 	server.operationMu.Unlock()
 
 	response := httptest.NewRecorder()
@@ -1156,7 +1213,8 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
-		BaseURL: "https://workspace.example.test",
+		BaseURL:           "https://workspace.example.test",
+		LifecycleTargetID: strings.Repeat("a", 64),
 		Session: &session.Summary{Manifest: session.Manifest{
 			Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
 			Artifacts: []session.Artifact{{Label: "Report", Path: "report.md"}},
@@ -1170,6 +1228,7 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 	body := response.Body.String()
 	for _, marker := range []string{
 		`class="panel session-tabs"`, `href="#codex"`, `data-session-tab="codex"`,
+		`data-lifecycle-target-id="` + strings.Repeat("a", 64) + `"`,
 		`href="#handoff"`, `data-session-tab="handoff"`,
 		`href="#repositories"`, `data-session-tab="repositories"`,
 		`href="#clusters"`, `data-session-tab="clusters"`,
@@ -1223,6 +1282,8 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"const nextSignature = JSON.stringify(entries)", "client.operation().then((operation)",
 		"deleteDialog.showModal()", `lifecycleKind === "revive" && needsOptions`,
 		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
+		"renderIndexOperations(payload.operations)", "indexNavigationPending = true",
+		`timedProgress(progress, "Creating session")`, `operation")}/retry`, "fork-progress",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)
@@ -1366,13 +1427,20 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 	}
 	t.Setenv("STARTED", started)
 	server.config.DevSession = devSession
+	summary, err := session.Find(server.config.Workspace, slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
 	response := httptest.NewRecorder()
 	server.startArchive(response, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(`{"mode":"complete"}`),
-	), &session.Summary{
-		Manifest:  session.Manifest{Slug: slug},
-		Lifecycle: "complete",
-	})
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"mode":"complete","targetId":%q}`, targetID,
+		)),
+	), summary)
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("archive start status/body = %d %q", response.Code, response.Body.String())
 	}
@@ -1409,13 +1477,89 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 	}
 	retry := httptest.NewRecorder()
 	server.startArchive(retry, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(`{"mode":"complete"}`),
-	), &session.Summary{
-		Manifest:  session.Manifest{Slug: slug},
-		Lifecycle: "complete",
-	})
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"mode":"complete","targetId":%q}`, targetID,
+		)),
+	), summary)
 	if retry.Code != http.StatusServiceUnavailable {
 		t.Fatalf("archive start during shutdown status/body = %d %q", retry.Code, retry.Body.String())
+	}
+}
+
+func TestLifecycleOperationDoesNotRemainRunningWhenFinalPersistenceFails(t *testing.T) {
+	server := newTestServer(t)
+	slug := "2026-09-05-final-persistence"
+	tracking := filepath.Join(server.config.Workspace, "work", slug)
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "complete")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"), []byte("schema: 1\nslug: "+slug+"\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	script := `#!/bin/sh
+: > "$STARTED"
+while [ ! -e "$RELEASE" ]; do sleep 0.01; done
+exit 19
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STARTED", started)
+	t.Setenv("RELEASE", release)
+	server.config.DevSession = helper
+	summary, err := session.Find(server.config.Workspace, slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.startArchive(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"mode":"complete","targetId":%q}`, targetID,
+		)),
+	), summary)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("archive start status/body = %d %q", response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lifecycle helper did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	blockedDirectory := server.operationStore.directory + ".blocked"
+	if err := os.Rename(server.operationStore.directory, blockedDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.operationStore.directory, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Remove(server.operationStore.directory)
+		_ = os.Rename(blockedDirectory, server.operationStore.directory)
+	}()
+	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operation := waitLifecycleOperation(t, server, slug)
+	if operation.State != "failed" || operation.Phase != "starting" ||
+		!strings.Contains(operation.Error, "could not save its final status") {
+		t.Fatalf("operation after final persistence failure = %#v", operation)
 	}
 }
 
@@ -1426,8 +1570,8 @@ func TestLifecycleStatusReportsDurablePhaseAndRetainsFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := fmt.Sprintf(
-		`{"schema":2,"slug":"example","workspace":%q,"phase":"clusters_released","mode":"complete"}`,
-		server.config.Workspace,
+		`{"schema":2,"slug":"example","workspace":%q,"phase":"clusters_released","mode":"complete","operation_id":%q}`,
+		server.config.Workspace, strings.Repeat("a", 64),
 	)
 	if err := os.WriteFile(filepath.Join(root, "example.archive.json"), []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
@@ -1445,8 +1589,12 @@ func TestLifecycleStatusReportsDurablePhaseAndRetainsFailure(t *testing.T) {
 
 	server.operationMu.Lock()
 	server.operations["example"] = lifecycleOperation{
-		Kind: "archive", State: "failed", StartedAt: operation.StartedAt,
-		Error: "helper failed",
+		Slug: "example", Kind: "archive", State: "failed", Phase: operation.Phase,
+		StartedAt: operation.StartedAt, UpdatedAt: operation.UpdatedAt,
+		Error: "helper failed", Redirect: "/", ReceiptID: operation.ReceiptID,
+		Options: lifecycleOperationOptions{
+			Mode: "complete", JournalID: strings.Repeat("a", 64), JournalExpected: true,
+		},
 	}
 	server.operationMu.Unlock()
 	response = httptest.NewRecorder()
@@ -1467,8 +1615,8 @@ func TestJournalOnlyDeletionRemainsVisibleAndRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := fmt.Sprintf(
-		`{"schema":1,"slug":"example","workspace":%q,"phase":"tracking_preserved","force":false}`,
-		server.config.Workspace,
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"tracking_preserved","force":false,"operation_id":%q}`,
+		server.config.Workspace, strings.Repeat("a", 64),
 	)
 	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
@@ -1606,11 +1754,11 @@ func TestArchiveRequiresAnExplicitMode(t *testing.T) {
 		Manifest:  session.Manifest{Slug: "2026-09-07-example"},
 		Lifecycle: "complete",
 	}
-	for _, body := range []string{`{}`, `{"confirmation":"example"}`} {
+	for _, body := range []string{`{}`, `{"mode":"invalid"}`} {
 		response := httptest.NewRecorder()
 		server.startArchive(response, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)), summary)
 		if response.Code != http.StatusBadRequest {
-			t.Fatalf("confirmation %s returned %d %q", body, response.Code, response.Body.String())
+			t.Fatalf("archive request %s returned %d %q", body, response.Code, response.Body.String())
 		}
 	}
 	server.operationMu.Lock()
@@ -2331,8 +2479,27 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 	}
 }
 
-func TestDeleteSessionRequiresExactConfirmationAndUsesDestructiveCLI(t *testing.T) {
+func TestDeleteSessionUsesOneBrowserConfirmationAndTheDestructiveCLI(t *testing.T) {
+	template, err := assets.ReadFile("templates/session.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(template), `name="confirmation"`) {
+		t.Fatal("delete dialog still requires a typed session slug")
+	}
 	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\ncodex:\n  thread_id: deleted-thread\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
 	helper := filepath.Join(directory, "dev-session")
@@ -2342,24 +2509,21 @@ func TestDeleteSessionRequiresExactConfirmationAndUsesDestructiveCLI(t *testing.
 	}
 	t.Setenv("ARGUMENTS", arguments)
 	server.config.DevSession = helper
-	bad := httptest.NewRecorder()
-	server.deleteSession(bad, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(`{"confirmation":"wrong"}`),
-	), "example")
-	if bad.Code != http.StatusBadRequest {
-		t.Fatalf("bad confirmation status = %d", bad.Code)
-	}
-
+	targetID := deletionTargetForTest(t, server, "example")
 	response := httptest.NewRecorder()
 	server.deleteSession(response, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(`{"confirmation":"example","force":true}`),
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"force":true,"targetId":%q}`, targetID,
+		)),
 	), "example")
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
 	}
 	operation := waitLifecycleOperation(t, server, "example")
 	if operation.State != "complete" || operation.Kind != "delete" ||
-		operation.StartedAt == "" || operation.UpdatedAt == "" {
+		operation.StartedAt == "" || operation.UpdatedAt == "" ||
+		operation.Options.TargetID != targetID ||
+		operation.Options.DeletedThreadID != "deleted-thread" {
 		t.Fatalf("delete operation = %#v", operation)
 	}
 	statusResponse := httptest.NewRecorder()
@@ -2374,8 +2538,538 @@ func TestDeleteSessionRequiresExactConfirmationAndUsesDestructiveCLI(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n" {
-		t.Fatalf("delete arguments = %q", data)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 7 || strings.Join(lines[:5], "\n") !=
+		"delete\nexample\n--as-is\n--portal-authorized\n--force" ||
+		lines[5] != "--portal-operation-id" || !messageDigestPattern.MatchString(lines[6]) {
+		t.Fatalf("delete arguments = %#v", lines)
+	}
+}
+
+func TestDeleteSessionRejectsAStalePageAndAcceptsTheCurrentTarget(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\ncodex:\n  thread_id: deleted-thread\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	deletedTargetID := deletionTargetForTest(t, server, "example")
+	if err := os.RemoveAll(tracking); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\ncodex:\n  thread_id: replacement-thread\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	server.operationMu.Lock()
+	if err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
+		Slug: "example", Kind: "delete", State: "complete", Phase: "complete",
+		StartedAt: now, UpdatedAt: now, Redirect: "/",
+		Options: lifecycleOperationOptions{
+			TargetID: deletedTargetID, DeletedThreadID: "deleted-thread",
+		},
+	}); err != nil {
+		server.operationMu.Unlock()
+		t.Fatal(err)
+	}
+	server.operationMu.Unlock()
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	currentTargetID := deletionTargetForTest(t, server, "example")
+	if currentTargetID == deletedTargetID {
+		t.Fatal("recreated session retained its deletion identity")
+	}
+	stale := httptest.NewRecorder()
+	server.deleteSession(stale, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"force":false,"targetId":%q}`, deletedTargetID,
+		)),
+	), "example")
+	if stale.Code != http.StatusConflict ||
+		!strings.Contains(stale.Body.String(), "does not match the current session") {
+		t.Fatalf("stale page deletion = %d %q", stale.Code, stale.Body.String())
+	}
+	response := httptest.NewRecorder()
+	server.deleteSession(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"force":false,"targetId":%q}`, currentTargetID,
+		)),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+	}
+	operation := waitLifecycleOperation(t, server, "example")
+	if operation.Options.TargetID != currentTargetID ||
+		operation.Options.DeletedThreadID != "replacement-thread" {
+		t.Fatalf("replacement deletion operation = %#v", operation)
+	}
+}
+
+func TestDeleteSessionRejectsAnAbsentFreshTarget(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.deleteSession(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"force":false,"targetId":%q}`, strings.Repeat("a", 64),
+		)),
+	), "example")
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(response.Body.String(), "session no longer exists") {
+		t.Fatalf("absent deletion response = %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestReadOnlySessionPageDeletionUsesThePersistedIdentity(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\ncodex:\n  thread_id: persisted-thread\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	server.sessionPage(page, httptest.NewRequest(http.MethodGet, "/example/", nil), "example")
+	if page.Code != http.StatusOK {
+		t.Fatalf("read-only session page = %d %q", page.Code, page.Body.String())
+	}
+	match := regexp.MustCompile(`data-lifecycle-target-id="([0-9a-f]{64})"`).FindStringSubmatch(
+		page.Body.String(),
+	)
+	if len(match) != 2 {
+		t.Fatalf("read-only session page has no deletion target: %q", page.Body.String())
+	}
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = helper
+	response := httptest.NewRecorder()
+	server.deleteSession(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"force":false,"targetId":%q}`, match[1],
+		)),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("read-only session deletion = %d %q", response.Code, response.Body.String())
+	}
+	operation := waitLifecycleOperation(t, server, "example")
+	if operation.State != "complete" || operation.Options.DeletedThreadID != "persisted-thread" {
+		t.Fatalf("read-only session deletion operation = %#v", operation)
+	}
+}
+
+func TestDeleteRetryRefusesARecreatedSession(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\ncodex:\n  thread_id: replacement-thread\nrepositories: []\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	server.operationMu.Lock()
+	if err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
+		Slug: "example", Kind: "delete", State: "failed", Phase: "starting",
+		StartedAt: now, UpdatedAt: now, Redirect: "/", Error: "portal stopped",
+		ReceiptID: strings.Repeat("d", 64),
+		Options: lifecycleOperationOptions{
+			TargetID: strings.Repeat("a", 64), DeletedThreadID: "deleted-thread",
+			JournalID: strings.Repeat("c", 64),
+		},
+	}); err != nil {
+		server.operationMu.Unlock()
+		t.Fatal(err)
+	}
+	server.operationMu.Unlock()
+	invoked := filepath.Join(t.TempDir(), "invoked")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(
+		helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INVOKED", invoked)
+	server.config.DevSession = helper
+	response := httptest.NewRecorder()
+	server.retryLifecycleOperation(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q}`,
+			strings.Repeat("d", 64), strings.Repeat("c", 64),
+		)),
+	), "example")
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(response.Body.String(), "does not match the current session") {
+		t.Fatalf("replacement retry response = %d %q", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement session delete command ran: %v", err)
+	}
+}
+
+func TestDeleteRetryRequiresTheDisplayedReceiptBeforeAJournalExists(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\nrepositories: []\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	receiptJournalID := strings.Repeat("a", 64)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	server.operationMu.Lock()
+	if err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
+		Slug: "example", Kind: "delete", State: "failed", Phase: "starting",
+		StartedAt: now, UpdatedAt: now, Redirect: "/", Error: "helper did not start",
+		ReceiptID: strings.Repeat("b", 64),
+		Options: lifecycleOperationOptions{
+			TargetID:  deletionTargetForTest(t, server, "example"),
+			JournalID: receiptJournalID,
+		},
+	}); err != nil {
+		server.operationMu.Unlock()
+		t.Fatal(err)
+	}
+	server.operationMu.Unlock()
+
+	invoked := filepath.Join(t.TempDir(), "invoked")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INVOKED", invoked)
+	server.config.DevSession = helper
+	for _, body := range []string{fmt.Sprintf(
+		`{"receiptId":%q}`, strings.Repeat("b", 64),
+	), fmt.Sprintf(
+		`{"receiptId":%q,"journalId":%q}`,
+		strings.Repeat("b", 64), strings.Repeat("c", 64),
+	)} {
+		response := httptest.NewRecorder()
+		server.retryLifecycleOperation(response, httptest.NewRequest(
+			http.MethodPost, "/", strings.NewReader(body),
+		), "example")
+		if response.Code != http.StatusConflict ||
+			!strings.Contains(response.Body.String(), "lifecycle operation changed") {
+			t.Fatalf("stale receipt retry = %d %q", response.Code, response.Body.String())
+		}
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale receipt invoked delete helper: %v", err)
+	}
+}
+
+func TestDeleteJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.WriteFile(
+		filepath.Join(tracking, "portal.yml"),
+		[]byte("schema: 1\nslug: example\nrepositories: []\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(journalRoot, "example.removal.json")
+	journalA := strings.Repeat("a", 64)
+	journal := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true,"operation_id":%q}`,
+		server.config.Workspace, journalA,
+	)
+	if err := os.WriteFile(journalPath, []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invoked := filepath.Join(t.TempDir(), "invoked")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(
+		helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INVOKED", invoked)
+	server.config.DevSession = helper
+	lockPath := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = lockPath
+	initialOperation, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists {
+		t.Fatalf("discover initial journal receipt = %t, %v", exists, err)
+	}
+	response := httptest.NewRecorder()
+	server.retryLifecycleOperation(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q}`,
+			initialOperation.ReceiptID, journalA,
+		)),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("journal retry response = %d %q", response.Code, response.Body.String())
+	}
+	server.operationMu.Lock()
+	attemptA := server.operations["example"]
+	server.operationMu.Unlock()
+	replacement := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":false,"operation_id":%q}`,
+		server.config.Workspace, strings.Repeat("b", 64),
+	)
+	if err := os.WriteFile(journalPath, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacementOperation, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || replacementOperation.State != "paused" ||
+		replacementOperation.Options.JournalID != strings.Repeat("b", 64) ||
+		replacementOperation.ReceiptID == attemptA.ReceiptID {
+		t.Fatalf("replacement receipt = %#v, %t, %v", replacementOperation, exists, err)
+	}
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	server.operationWG.Wait()
+	operation, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || operation.State != "paused" ||
+		operation.ReceiptID != replacementOperation.ReceiptID ||
+		operation.Options.JournalID != strings.Repeat("b", 64) {
+		t.Fatalf("replacement journal receipt was overwritten = %#v, %t, %v", operation, exists, err)
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement session delete command ran: %v", err)
+	}
+}
+
+func TestArchiveJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *testing.T) {
+	server := newTestServer(t)
+	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(journalRoot, "example.archive.json")
+	journalA := strings.Repeat("a", 64)
+	writeJournal := func(mode, journalID string) {
+		t.Helper()
+		journal := fmt.Sprintf(
+			`{"schema":2,"slug":"example","workspace":%q,"phase":"prepared","mode":%q,"operation_id":%q}`,
+			server.config.Workspace, mode, journalID,
+		)
+		temporary := journalPath + ".tmp"
+		if err := os.WriteFile(temporary, []byte(journal), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(temporary, journalPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeJournal("complete", journalA)
+
+	invoked := filepath.Join(t.TempDir(), "invoked")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INVOKED", invoked)
+	server.config.DevSession = helper
+	lockPath := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = lockPath
+	initial, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists {
+		t.Fatalf("discover archive receipt = %t, %v", exists, err)
+	}
+	response := httptest.NewRecorder()
+	server.retryLifecycleOperation(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q}`, initial.ReceiptID, journalA,
+		)),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("archive retry = %d %q", response.Code, response.Body.String())
+	}
+	server.operationMu.Lock()
+	attemptA := server.operations["example"]
+	server.operationMu.Unlock()
+	journalB := strings.Repeat("b", 64)
+	writeJournal("abandoned", journalB)
+	replacement, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || replacement.State != "paused" ||
+		replacement.Options.Mode != "abandoned" || replacement.Options.JournalID != journalB ||
+		replacement.ReceiptID == attemptA.ReceiptID {
+		t.Fatalf("replacement archive receipt = %#v, %t, %v", replacement, exists, err)
+	}
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	server.operationWG.Wait()
+	current, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || current.ReceiptID != replacement.ReceiptID ||
+		current.Options.Mode != "abandoned" || current.Options.JournalID != journalB {
+		t.Fatalf("replacement archive was overwritten = %#v, %t, %v", current, exists, err)
+	}
+	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement archive command ran: %v", err)
+	}
+}
+
+func TestLifecycleRetryCompareAndSwapRejectsAReplacementReceipt(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	replacement := lifecycleOperation{
+		Slug: "example", Kind: "archive", State: "failed", Phase: "starting",
+		StartedAt: now, UpdatedAt: now, Redirect: "/", ReceiptID: strings.Repeat("b", 64),
+		Options: lifecycleOperationOptions{
+			Mode: "complete", JournalID: strings.Repeat("c", 64),
+		},
+	}
+	server.operationMu.Lock()
+	if err := server.replaceLifecycleOperationLocked("example", replacement); err != nil {
+		server.operationMu.Unlock()
+		t.Fatal(err)
+	}
+	server.operationMu.Unlock()
+	response := httptest.NewRecorder()
+	server.startLifecycleOperation(
+		response, "example", "archive", "/", []string{"archive", "example"},
+		replacement.Options, strings.Repeat("a", 64),
+	)
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(response.Body.String(), "operation changed") {
+		t.Fatalf("stale retry CAS = %d %q", response.Code, response.Body.String())
+	}
+	server.operationMu.Lock()
+	current := server.operations["example"]
+	server.operationMu.Unlock()
+	if current.ReceiptID != replacement.ReceiptID || current.State != "failed" {
+		t.Fatalf("replacement receipt was overwritten: %#v", current)
+	}
+}
+
+func TestPreJournalLifecycleRetryRejectsReplacementTracking(t *testing.T) {
+	for _, testCase := range []struct {
+		kind      string
+		root      string
+		lifecycle string
+		options   lifecycleOperationOptions
+	}{
+		{
+			kind: "archive", root: "work", lifecycle: "active",
+			options: lifecycleOperationOptions{Mode: "abandoned"},
+		},
+		{
+			kind: "revive", root: "archive", lifecycle: "complete",
+			options: lifecycleOperationOptions{},
+		},
+	} {
+		t.Run(testCase.kind, func(t *testing.T) {
+			server := newTestServer(t)
+			tracking := filepath.Join(server.config.Workspace, testCase.root, "example")
+			writeTracking := func(threadID string) {
+				t.Helper()
+				if err := os.MkdirAll(tracking, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeWebTrackingFiles(t, tracking, testCase.lifecycle)
+				manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: " + threadID + "\n"
+				if testCase.root == "archive" {
+					manifest += "finalized_at: \"2026-09-09T10:06:13Z\"\n"
+				}
+				if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeTracking("thread-a")
+			testCase.options.TargetID = deletionTargetForTest(t, server, "example")
+			testCase.options.JournalID = strings.Repeat("a", 64)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			receiptID := strings.Repeat("b", 64)
+			server.operationMu.Lock()
+			if err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
+				Slug: "example", Kind: testCase.kind, State: "failed", Phase: "starting",
+				StartedAt: now, UpdatedAt: now, Redirect: operationRedirect("example", testCase.kind),
+				ReceiptID: receiptID, Error: "helper did not start", Options: testCase.options,
+			}); err != nil {
+				server.operationMu.Unlock()
+				t.Fatal(err)
+			}
+			server.operationMu.Unlock()
+			if err := os.RemoveAll(tracking); err != nil {
+				t.Fatal(err)
+			}
+			writeTracking("thread-b")
+
+			invoked := filepath.Join(t.TempDir(), "invoked")
+			helper := filepath.Join(t.TempDir(), "dev-session")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("INVOKED", invoked)
+			server.config.DevSession = helper
+			response := httptest.NewRecorder()
+			server.retryLifecycleOperation(response, httptest.NewRequest(
+				http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+					`{"receiptId":%q,"journalId":%q}`,
+					receiptID, testCase.options.JournalID,
+				)),
+			), "example")
+			if response.Code != http.StatusConflict ||
+				!strings.Contains(response.Body.String(), "does not match the current session") {
+				t.Fatalf("replacement retry = %d %q", response.Code, response.Body.String())
+			}
+			if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replacement %s command ran: %v", testCase.kind, err)
+			}
+		})
 	}
 }
 
@@ -2387,7 +3081,6 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 		summary   *session.Summary
 		expected  string
 		operation string
-		journal   string
 	}{
 		{
 			name: "complete archive", start: (*Server).startArchive,
@@ -2407,32 +3100,45 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "complete"},
 			expected: "revive\nexample\n--as-is\n--portal-authorized\n", operation: "revive",
 		},
-		{
-			name: "retry archive after tracking moved", start: (*Server).startArchive,
-			body:     `{"mode":"abandoned"}`,
-			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "complete"},
-			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
-			journal: ".archive.json",
-		},
-		{
-			name: "retry revive after tracking moved", start: (*Server).startRevive,
-			body:     `{"allowAbandoned":false}`,
-			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
-			expected: "revive\nexample\n--as-is\n--portal-authorized\n", operation: "revive",
-			journal: ".revive.json",
-		},
-		{
-			name: "retry abandoned revive without another confirmation", start: (*Server).startRevive,
-			body: `{"allowAbandoned":false}`,
-			summary: &session.Summary{
-				Manifest: session.Manifest{Slug: "example"}, Archived: true, Lifecycle: "abandoned",
-			},
-			expected:  "revive\nexample\n--as-is\n--portal-authorized\n--allow-abandoned\n",
-			operation: "revive", journal: ".revive.json",
-		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			server := newTestServer(t)
+			root := "work"
+			if testCase.summary.Archived {
+				root = "archive"
+			}
+			tracking := filepath.Join(server.config.Workspace, root, "example")
+			if err := os.MkdirAll(tracking, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, tracking, testCase.summary.Lifecycle)
+			manifest := "schema: 1\nslug: example\n"
+			if testCase.summary.Archived {
+				manifest += "finalized_at: \"2026-09-09T10:06:13Z\"\n"
+			}
+			if err := os.WriteFile(
+				filepath.Join(tracking, "portal.yml"),
+				[]byte(manifest), 0o644,
+			); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := session.Find(server.config.Workspace, "example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetID, err := lifecycleTargetIdentity(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requestBody map[string]any
+			if err := json.Unmarshal([]byte(testCase.body), &requestBody); err != nil {
+				t.Fatal(err)
+			}
+			requestBody["targetId"] = targetID
+			encodedBody, err := json.Marshal(requestBody)
+			if err != nil {
+				t.Fatal(err)
+			}
 			arguments := filepath.Join(t.TempDir(), "arguments")
 			helper := filepath.Join(t.TempDir(), "dev-session")
 			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"
@@ -2441,26 +3147,10 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 			}
 			t.Setenv("ARGUMENTS", arguments)
 			server.config.DevSession = helper
-			if testCase.journal != "" {
-				root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
-				if err := os.MkdirAll(root, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				journal := "{}\n"
-				if testCase.journal == ".archive.json" {
-					journal = fmt.Sprintf(
-						`{"schema":2,"slug":"example","workspace":%q,"phase":"tracking_archived","mode":"complete"}`,
-						server.config.Workspace,
-					)
-				}
-				if err := os.WriteFile(filepath.Join(root, "example"+testCase.journal), []byte(journal), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
 			response := httptest.NewRecorder()
 			testCase.start(server, response, httptest.NewRequest(
-				http.MethodPost, "/", strings.NewReader(testCase.body),
-			), testCase.summary)
+				http.MethodPost, "/", strings.NewReader(string(encodedBody)),
+			), summary)
 			if response.Code != http.StatusAccepted {
 				t.Fatalf("start = %d %q", response.Code, response.Body.String())
 			}
@@ -2487,8 +3177,14 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(data) != testCase.expected {
+			if !strings.HasPrefix(string(data), testCase.expected) {
 				t.Fatalf("arguments = %q", data)
+			}
+			trailing := strings.TrimPrefix(string(data), testCase.expected)
+			parts := strings.Split(strings.TrimSpace(trailing), "\n")
+			if len(parts) != 2 || parts[0] != "--portal-operation-id" ||
+				!messageDigestPattern.MatchString(parts[1]) {
+				t.Fatalf("operation identity arguments = %q", trailing)
 			}
 		})
 	}
@@ -2524,7 +3220,10 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 
 	request := httptest.NewRequest(
 		http.MethodPost, "/api/sessions/example/delete",
-		strings.NewReader(`{"confirmation":"example"}`),
+		strings.NewReader(fmt.Sprintf(
+			`{"force":false,"targetId":%q}`,
+			deletionTargetForTest(t, server, "example"),
+		)),
 	)
 	request.Header.Set("Origin", "https://workspace.example.test")
 	response := httptest.NewRecorder()
@@ -2548,15 +3247,15 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 	}
 }
 
-func TestDeleteSessionRetryUsesTheJournaledForceSetting(t *testing.T) {
+func TestDeleteOperationRetryUsesTheJournaledForceSetting(t *testing.T) {
 	server := newTestServer(t)
 	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	journal := fmt.Sprintf(
-		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true}`,
-		server.config.Workspace,
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true,"operation_id":%q}`,
+		server.config.Workspace, strings.Repeat("a", 64),
 	)
 	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
@@ -2570,9 +3269,24 @@ func TestDeleteSessionRetryUsesTheJournaledForceSetting(t *testing.T) {
 	}
 	t.Setenv("ARGUMENTS", arguments)
 	server.config.DevSession = helper
+	freshDelete := httptest.NewRecorder()
+	server.deleteSession(freshDelete, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(`{"force":false}`),
+	), "example")
+	if freshDelete.Code != http.StatusConflict ||
+		!strings.Contains(freshDelete.Body.String(), "Use the retry action") {
+		t.Fatalf("pending journal through fresh delete = %d %q", freshDelete.Code, freshDelete.Body.String())
+	}
+	pendingOperation, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists {
+		t.Fatalf("discover delete operation = %t, %v", exists, err)
+	}
 	response := httptest.NewRecorder()
-	server.deleteSession(response, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(`{"confirmation":"","force":false}`),
+	server.retryLifecycleOperation(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q}`,
+			pendingOperation.ReceiptID, strings.Repeat("a", 64),
+		)),
 	), "example")
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("delete retry = %d %q", response.Code, response.Body.String())
@@ -2584,8 +3298,61 @@ func TestDeleteSessionRetryUsesTheJournaledForceSetting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n" {
+	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n--portal-operation-id\n"+
+		strings.Repeat("a", 64)+"\n" {
 		t.Fatalf("delete retry arguments = %q", data)
+	}
+}
+
+func TestDeleteOperationRetryCanUpgradeTheJournaledForceSetting(t *testing.T) {
+	server := newTestServer(t)
+	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalID := strings.Repeat("a", 64)
+	journal := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"prepared","force":false,"operation_id":%q}`,
+		server.config.Workspace, journalID,
+	)
+	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arguments := filepath.Join(t.TempDir(), "arguments")
+	helper := filepath.Join(t.TempDir(), "dev-session")
+	if err := os.WriteFile(
+		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"), 0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGUMENTS", arguments)
+	server.config.DevSession = helper
+	operation, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists {
+		t.Fatalf("discover delete operation = %t, %v", exists, err)
+	}
+	originalStartedAt := operation.StartedAt
+	response := httptest.NewRecorder()
+	server.retryLifecycleOperation(response, httptest.NewRequest(
+		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q,"force":true}`,
+			operation.ReceiptID, journalID,
+		)),
+	), "example")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("force-upgrade retry = %d %q", response.Code, response.Body.String())
+	}
+	if operation := waitLifecycleOperation(t, server, "example"); operation.State != "complete" ||
+		!operation.Options.Force || operation.StartedAt != originalStartedAt {
+		t.Fatalf("force-upgrade operation = %#v", operation)
+	}
+	data, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "delete\nexample\n--as-is\n--portal-authorized\n--force\n"+
+		"--portal-operation-id\n"+journalID+"\n" {
+		t.Fatalf("force-upgrade arguments = %q", data)
 	}
 }
 
@@ -2602,13 +3369,37 @@ func TestDeleteSessionRetryReachesTheRemovalJournalAfterTrackingMoved(t *testing
 		t.Fatal(err)
 	}
 	marker := filepath.Join(t.TempDir(), "first-attempt")
+	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(journalRoot, "example.removal.json")
+	journalSource := filepath.Join(t.TempDir(), "removal.json")
+	journal := fmt.Sprintf(
+		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":false,"operation_id":"OPERATION_ID"}`,
+		server.config.Workspace,
+	)
+	if err := os.WriteFile(journalSource, []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	script := `#!/bin/sh
+operation_id=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--portal-operation-id" ]; then
+    operation_id="$2"
+    break
+  fi
+  shift
+done
 if [ ! -e "$DELETE_MARKER" ]; then
   : > "$DELETE_MARKER"
+  sed "s/OPERATION_ID/$operation_id/" "$DELETE_JOURNAL_SOURCE" > "$DELETE_JOURNAL"
+  chmod 600 "$DELETE_JOURNAL"
   rm -rf -- "$DELETE_TRACKING"
   exit 19
 fi
+rm -f -- "$DELETE_JOURNAL"
 exit 0
 `
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
@@ -2616,12 +3407,18 @@ exit 0
 	}
 	t.Setenv("DELETE_MARKER", marker)
 	t.Setenv("DELETE_TRACKING", directory)
+	t.Setenv("DELETE_JOURNAL", journalPath)
+	t.Setenv("DELETE_JOURNAL_SOURCE", journalSource)
 	server.config.DevSession = helper
 	handler := server.Handler()
+	targetID := deletionTargetForTest(t, server, "example")
 	request := func() *httptest.ResponseRecorder {
 		r := httptest.NewRequest(
 			http.MethodPost, "/api/sessions/example/delete",
-			strings.NewReader(`{"confirmation":"example"}`),
+			strings.NewReader(fmt.Sprintf(
+				`{"force":false,"targetId":%q}`,
+				targetID,
+			)),
 		)
 		r.Header.Set("Origin", "https://workspace.example.test")
 		response := httptest.NewRecorder()
@@ -2634,13 +3431,23 @@ exit 0
 		t.Fatalf("first deletion = %d %q", first.Code, first.Body.String())
 	}
 	operation := waitLifecycleOperation(t, server, "example")
-	if operation.State != "failed" || !strings.Contains(operation.Error, "exit status 19") {
+	if operation.State != "failed" || operation.Phase != "validated" ||
+		!strings.Contains(operation.Error, "exit status 19") {
 		t.Fatalf("first deletion operation = %#v", operation)
 	}
 	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("tracking still exists after simulated move: %v", err)
 	}
-	second := request()
+	retryRequest := httptest.NewRequest(
+		http.MethodPost, "/api/sessions/example/operation/retry",
+		strings.NewReader(fmt.Sprintf(
+			`{"receiptId":%q,"journalId":%q}`,
+			operation.ReceiptID, operation.Options.JournalID,
+		)),
+	)
+	retryRequest.Header.Set("Origin", "https://workspace.example.test")
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, retryRequest)
 	if second.Code != http.StatusAccepted {
 		t.Fatalf("retry deletion = %d %q", second.Code, second.Body.String())
 	}
@@ -2749,6 +3556,19 @@ func waitLifecycleOperation(t *testing.T, server *Server, slug string) lifecycle
 	}
 }
 
+func deletionTargetForTest(t *testing.T, server *Server, slug string) string {
+	t.Helper()
+	summary, err := session.Find(server.config.Workspace, slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return targetID
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	workspace := t.TempDir()
@@ -2761,14 +3581,16 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	server, err := New(Config{
-		Workspace:    workspace,
-		BaseURL:      "https://workspace.example.test",
-		DevSession:   "/run/current-system/sw/bin/dev-session",
-		HostProfile:  profile,
-		AuthorityDir: authorityDir,
-		CodexSocket:  "/run/vpsfree-workspace-codex/app-server.sock",
-		CodexVersion: "0.152.1",
-		Logger:       log.New(io.Discard, "", 0),
+		Workspace:         workspace,
+		BaseURL:           "https://workspace.example.test",
+		DevSession:        "/run/current-system/sw/bin/dev-session",
+		HostProfile:       profile,
+		AuthorityDir:      authorityDir,
+		CodexSocket:       "/run/vpsfree-workspace-codex/app-server.sock",
+		CodexVersion:      "0.152.1",
+		OperationStateDir: filepath.Join(t.TempDir(), "operations"),
+		RemovalStateHome:  t.TempDir(),
+		Logger:            log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)

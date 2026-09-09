@@ -7,7 +7,7 @@
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <header class="topbar">
     <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
     <div class="header-actions">
@@ -205,7 +205,6 @@
   <dialog id="delete-session-dialog">
     <form id="delete-session-form" class="stack">
       <div><p class="eyebrow danger-text">Destructive action</p><h2>Delete session</h2><p>This removes the session, worktrees, cluster state, and browser and terminal runtime. Git branches are retained. Tracking is moved to private recovery storage.</p></div>
-      <label>Type <code>{{.Session.Slug}}</code> to confirm<input name="confirmation" required autocomplete="off"></label>
       <label class="checkbox"><input name="force" type="checkbox"> Force deletion of dirty worktrees or an active Codex turn</label>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
