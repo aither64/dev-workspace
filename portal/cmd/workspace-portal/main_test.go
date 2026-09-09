@@ -116,6 +116,12 @@ func TestValidateCommandRejectsInvalidPersistedManifest(t *testing.T) {
 	}
 }
 
+func TestValidateCommandRequiresWorkspace(t *testing.T) {
+	if err := validateCommand(nil); err == nil || err.Error() != "validate requires --workspace" {
+		t.Fatalf("validateCommand() error = %v", err)
+	}
+}
+
 func TestPortalUnixSocketIsPrivateToItsOwnerAndGroup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "portal.sock")
 	listener, err := portalListener(path)

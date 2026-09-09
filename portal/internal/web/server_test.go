@@ -903,6 +903,39 @@ func TestNewRejectsAnHTTPBaseURL(t *testing.T) {
 	}
 }
 
+func TestPortalLabelsAndSSHAttachHostAreConfigurable(t *testing.T) {
+	server := newTestServer(t)
+	server.config.DisplayLabel = "Example development"
+	server.config.HostLabel = "build-host"
+	server.config.SSHHost = "build-host.example.test"
+	index := httptest.NewRecorder()
+	server.Handler().ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "Example development") ||
+		!strings.Contains(index.Body.String(), "From build-host") {
+		t.Fatalf("configured index = %d %q", index.Code, index.Body.String())
+	}
+	summary := &session.Summary{
+		Manifest: session.Manifest{Slug: "example"}, Interactive: true,
+		Tmux: session.Tmux{SocketPath: "/run/example.sock"},
+	}
+	page := httptest.NewRecorder()
+	server.render(page, "session", pageData{
+		BaseURL: server.config.BaseURL, Session: summary,
+	})
+	if !strings.Contains(page.Body.String(), "Attach from build-host") ||
+		!strings.Contains(page.Body.String(), "ssh -t build-host.example.test") {
+		t.Fatalf("configured session page = %q", page.Body.String())
+	}
+	server.config.SSHHost = ""
+	page = httptest.NewRecorder()
+	server.render(page, "session", pageData{
+		BaseURL: server.config.BaseURL, Session: summary,
+	})
+	if strings.Contains(page.Body.String(), "Attach over SSH") {
+		t.Fatalf("session page rendered an unset SSH host: %q", page.Body.String())
+	}
+}
+
 func TestNewRequiresAnAbsoluteInstalledDevSessionCommand(t *testing.T) {
 	for _, command := range []string{"", "dev-session"} {
 		_, err := New(Config{

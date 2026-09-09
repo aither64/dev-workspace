@@ -58,6 +58,9 @@ type codexController interface {
 type Config struct {
 	Workspace         string
 	BaseURL           string
+	DisplayLabel      string
+	HostLabel         string
+	SSHHost           string
 	DevSession        string
 	HostProfile       string
 	GH                string
@@ -159,6 +162,9 @@ type hostProfileIdentity struct {
 
 type pageData struct {
 	BaseURL           string
+	DisplayLabel      string
+	HostLabel         string
+	SSHHost           string
 	CreationDate      string
 	IndexGeneratedAt  string
 	MaxMessageBytes   int
@@ -177,6 +183,12 @@ type pageData struct {
 func New(config Config) (*Server, error) {
 	if config.Logger == nil {
 		config.Logger = log.Default()
+	}
+	if config.DisplayLabel == "" {
+		config.DisplayLabel = "Development workspace"
+	}
+	if config.HostLabel == "" {
+		config.HostLabel = "this host"
 	}
 	if config.Tmux == "" {
 		config.Tmux = "tmux"
@@ -2368,6 +2380,9 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	s.renderStatus(w, http.StatusOK, name, data)
 }
 func (s *Server) renderStatus(w http.ResponseWriter, status int, name string, data pageData) {
+	data.DisplayLabel = s.config.DisplayLabel
+	data.HostLabel = s.config.HostLabel
+	data.SSHHost = s.config.SSHHost
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := s.templates.ExecuteTemplate(w, name, data); err != nil {

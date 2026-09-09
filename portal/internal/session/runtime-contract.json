@@ -47,6 +47,9 @@
   "portalServeFlags": [
     "--workspace",
     "--base-url",
+    "--display-label",
+    "--host-label",
+    "--ssh-host",
     "--unix-socket",
     "--dev-session",
     "--authority-dir",

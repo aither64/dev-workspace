@@ -9,13 +9,13 @@
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
   <header class="topbar">
-    <div><p class="eyebrow">vpsFree.cz development</p><h1>Workspace</h1></div>
+    <div><p class="eyebrow">{{.DisplayLabel}}</p><h1>Workspace</h1></div>
   </header>
   <main class="page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
     <p id="index-status-warning" class="notice warning" hidden></p>
     <section class="panel new-session">
-      <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From aitherdev, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
+      <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>

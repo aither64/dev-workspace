@@ -102,6 +102,7 @@ func run(args []string) error {
 
 type serveOptions struct {
 	unixSocket, workspace, baseURL, devSession, authorityDir string
+	displayLabel, hostLabel, sshHost                         string
 	hostProfile, transitionLock                              string
 	codexSocket, codexVersion                                string
 	gh, tmux                                                 string
@@ -112,8 +113,11 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	options := &serveOptions{}
 	flags.StringVar(&options.unixSocket, "unix-socket", "", "required HTTP Unix socket")
-	flags.StringVar(&options.workspace, "workspace", "/home/aither/workspace/ai/vpsfree.cz", "workspace root")
-	flags.StringVar(&options.baseURL, "base-url", "https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz", "external base URL")
+	flags.StringVar(&options.workspace, "workspace", "", "required workspace root")
+	flags.StringVar(&options.baseURL, "base-url", "", "required external base URL")
+	flags.StringVar(&options.displayLabel, "display-label", "Development workspace", "workspace label shown in the portal")
+	flags.StringVar(&options.hostLabel, "host-label", "this host", "host label shown in local commands")
+	flags.StringVar(&options.sshHost, "ssh-host", "", "optional SSH host for remote attach commands")
 	flags.StringVar(&options.devSession, "dev-session", "", "absolute installed dev-session command")
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
 	flags.StringVar(&options.hostProfile, "host-profile", "", "selected workspace host profile")
@@ -136,7 +140,8 @@ func serve(args []string) error {
 	codexClient := newCodexClient(options.codexSocket, options.workspace)
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
-		Workspace: options.workspace, BaseURL: options.baseURL, DevSession: options.devSession,
+		Workspace: options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
+		HostLabel: options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		TransitionLock:  options.transitionLock,
 		CodexSocket:     options.codexSocket,
@@ -374,12 +379,15 @@ func threadCommand(args []string) error {
 
 func validateCommand(args []string) error {
 	flags := flag.NewFlagSet("validate", flag.ContinueOnError)
-	workspace := flags.String("workspace", "/home/aither/workspace/ai/vpsfree.cz", "workspace root")
+	workspace := flags.String("workspace", "", "workspace root")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("validate accepts no positional arguments")
+	}
+	if *workspace == "" {
+		return errors.New("validate requires --workspace")
 	}
 	summaries, err := session.List(*workspace)
 	if err != nil {

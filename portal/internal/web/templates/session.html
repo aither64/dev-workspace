@@ -75,8 +75,8 @@
         {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
-        <label>Attach from aitherdev<div class="copy-row"><input readonly value="dev-session attach {{.Session.Slug}}"><button type="button" data-copy>Copy</button></div></label>
-        <label>Attach over SSH<div class="copy-row"><input readonly value="ssh -t aitherdev.int.vpsfree.cz &quot;dev-session attach {{.Session.Slug}}&quot;"><button type="button" data-copy>Copy</button></div></label>
+        <label>Attach from {{.HostLabel}}<div class="copy-row"><input readonly value="dev-session attach {{.Session.Slug}}"><button type="button" data-copy>Copy</button></div></label>
+        {{if .SSHHost}}<label>Attach over SSH<div class="copy-row"><input readonly value="ssh -t {{.SSHHost}} &quot;dev-session attach {{.Session.Slug}}&quot;"><button type="button" data-copy>Copy</button></div></label>{{end}}
         {{end}}
       </section>
 
