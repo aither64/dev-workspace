@@ -522,6 +522,64 @@ func TestIndexStatusMarksPartialSessionListNonAuthoritative(t *testing.T) {
 	}
 }
 
+func TestIndexStatusDoesNotPromoteASessionRepositoryConflict(t *testing.T) {
+	server := newTestServer(t)
+	repository := filepath.Join(server.config.Workspace, "repos", "example.git")
+	worktree := filepath.Join(server.config.Workspace, "worktrees", "example", "example")
+	if err := os.MkdirAll(filepath.Dir(repository), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "init", "--bare", "--initial-branch=master", repository)
+	runWebGit(t, "--git-dir="+repository, "config", "remote.origin.url", "git@github.com:vpsfreecz/example.git")
+	seed := t.TempDir()
+	runWebGit(t, "init", "--initial-branch=master", seed)
+	runWebGit(t, "-C", seed, "config", "user.email", "test@example.invalid")
+	runWebGit(t, "-C", seed, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(seed, "README"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "-C", seed, "add", "README")
+	runWebGit(t, "-C", seed, "commit", "-m", "seed")
+	head := strings.TrimSpace(webGitOutput(t, "-C", seed, "rev-parse", "HEAD"))
+	runWebGit(t, "--git-dir="+repository, "fetch", seed, head+":refs/heads/live")
+	if err := os.MkdirAll(filepath.Dir(worktree), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "--git-dir="+repository, "worktree", "add", worktree, "live")
+
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\nrepositories:\n" +
+		"  - name: example\n    project: example\n" +
+		"    github: vpsfreecz/example\n    branch: registered\n"
+	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+
+	status := server.computeIndexStatus(context.Background())
+	if status.warning != "" {
+		t.Fatalf("session repository conflict became a global warning: %q", status.warning)
+	}
+	if len(status.statuses) != 1 || status.statuses[0].RepositoryCount != 1 {
+		t.Fatalf("index status = %#v", status.statuses)
+	}
+}
+
+func TestIndexStatusReportsRepositoryDiscoveryFailure(t *testing.T) {
+	server := newTestServer(t)
+	if err := os.Mkdir(filepath.Join(server.config.Workspace, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	status := server.computeIndexStatus(context.Background())
+	if status.warning != "Some repository status is unavailable." {
+		t.Fatalf("repository discovery warning = %q", status.warning)
+	}
+}
+
 func TestIndexStatusReportsArchivePlacement(t *testing.T) {
 	server := newTestServer(t)
 	directory := filepath.Join(server.config.Workspace, "archive", "example")
@@ -2464,4 +2522,20 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	return server
+}
+
+func runWebGit(t *testing.T, args ...string) {
+	t.Helper()
+	if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %s: %v", args, output, err)
+	}
+}
+
+func webGitOutput(t *testing.T, args ...string) string {
+	t.Helper()
+	output, err := exec.Command("git", args...).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }

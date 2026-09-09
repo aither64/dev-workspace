@@ -43,7 +43,7 @@ func MergeActiveRepositories(registered, discovered []Repository) ([]Repository,
 	var problems []error
 	for _, repository := range discovered {
 		if existing, ok := byName[repository.Name]; ok {
-			if existing.Project != repository.Project ||
+			if (existing.Project != repository.Project && !verifiedProjectAlias(existing, repository)) ||
 				(existing.Branch != "" && existing.Branch != repository.Branch) ||
 				(existing.GitHub != "" && repository.GitHub != "" && existing.GitHub != repository.GitHub) {
 				problems = append(problems, fmt.Errorf(
@@ -58,6 +58,19 @@ func MergeActiveRepositories(registered, discovered []Repository) ([]Repository,
 
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, errors.Join(problems...)
+}
+
+// verifiedProjectAlias recognizes a renamed canonical repository without
+// weakening conflict detection for unrelated or incompletely identified
+// worktrees. The worktree name already matches because callers look entries up
+// by Name before reaching this helper.
+func verifiedProjectAlias(registered, discovered Repository) bool {
+	return registered.Branch != "" &&
+		registered.Branch == discovered.Branch &&
+		registered.GitHub != "" &&
+		registered.GitHub == discovered.GitHub &&
+		gitHubPattern.MatchString(registered.GitHub) &&
+		gitHubPattern.MatchString(discovered.GitHub)
 }
 
 // DiscoverActiveRepositories scans each canonical Git source once and groups

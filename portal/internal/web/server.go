@@ -474,11 +474,9 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 		summary := &summaries[index]
 		if !summary.Archived {
 			merged, mergeErr := session.MergeActiveRepositories(summary.Repositories, discovered[summary.Slug])
+			summary.Repositories = merged
 			if mergeErr != nil {
 				s.config.Logger.Printf("merge repositories for %s: %v", summary.Slug, mergeErr)
-				result.warning = "Some repository status is unavailable."
-			} else {
-				summary.Repositories = merged
 			}
 			if summary.Codex.ThreadID != "" {
 				expected = append(expected, codex.ThreadActivity{

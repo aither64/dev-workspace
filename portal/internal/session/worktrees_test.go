@@ -62,6 +62,57 @@ func TestMergeActiveRepositoriesRejectsConflictingRegistration(t *testing.T) {
 	}
 }
 
+func TestMergeActiveRepositoriesAcceptsVerifiedProjectAlias(t *testing.T) {
+	registered := []Repository{{
+		Name: "vpsfree-kb-contracts", Project: "vpsfree-kb-contracts",
+		Branch: "2026-08-18-vpsadmin-password-reset", GitHub: "vpsfreecz/vpsfree-kb-contracts",
+	}}
+	discovered := []Repository{{
+		Name: "vpsfree-kb-contracts", Project: "vpsadmin-kb-captures",
+		Branch: "2026-08-18-vpsadmin-password-reset", GitHub: "vpsfreecz/vpsfree-kb-contracts",
+	}}
+
+	result, err := MergeActiveRepositories(registered, discovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 1 || result[0].Project != "vpsfree-kb-contracts" {
+		t.Fatalf("registered repository was not preserved: %#v", result)
+	}
+}
+
+func TestMergeActiveRepositoriesRejectsUnverifiedProjectAlias(t *testing.T) {
+	testCases := []struct {
+		name       string
+		branch     string
+		registered string
+		discovered string
+	}{
+		{name: "missing branch", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/vpsfree-kb-contracts"},
+		{name: "different branch", branch: "different", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/vpsfree-kb-contracts"},
+		{name: "missing registered GitHub", branch: "feature", discovered: "vpsfreecz/vpsfree-kb-contracts"},
+		{name: "missing discovered GitHub", branch: "feature", registered: "vpsfreecz/vpsfree-kb-contracts"},
+		{name: "different GitHub", branch: "feature", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/other"},
+		{name: "invalid GitHub", branch: "feature", registered: "not a repository", discovered: "not a repository"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			registered := []Repository{{
+				Name: "vpsfree-kb-contracts", Project: "vpsfree-kb-contracts",
+				Branch: "feature", GitHub: testCase.registered,
+			}}
+			discovered := []Repository{{
+				Name: "vpsfree-kb-contracts", Project: "vpsadmin-kb-captures",
+				Branch: testCase.branch, GitHub: testCase.discovered,
+			}}
+
+			if _, err := MergeActiveRepositories(registered, discovered); err == nil {
+				t.Fatal("expected unverified project alias to be rejected")
+			}
+		})
+	}
+}
+
 func TestDiscoverActiveRepositoriesHonorsCallerDeadline(t *testing.T) {
 	workspace := t.TempDir()
 	if err := os.Mkdir(filepath.Join(workspace, ".git"), 0o755); err != nil {
