@@ -96,6 +96,109 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_compatibility_inventory_covers_every_packaged_extension
+    expected_commands = Dir.children(File.expand_path('../bin', __dir__)).sort
+    expected_skills = Dir.children(File.expand_path('../skills', __dir__)).sort
+
+    assert_empty(expected_commands - VpsfreeWorkspaceHost::COMPATIBILITY_COMMANDS)
+    assert_empty(expected_skills - VpsfreeWorkspaceHost::COMPATIBILITY_SKILLS)
+  end
+
+  def test_link_install_reconciles_extension_links_across_full_core_and_legacy_rollback
+    Dir.mktmpdir('workspace-host-link-test') do |directory|
+      full = make_package(directory, 'package-full')
+      core = make_package(directory, 'package-core')
+      command = 'kb-page'
+      command_source = File.join(full, 'bin', command)
+      File.write(command_source, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, command_source)
+      skill_name = 'mandatory-change-review'
+      skill_source = File.join(full, 'share/codex/skills', skill_name)
+      FileUtils.mkdir_p(skill_source)
+      File.write(File.join(skill_source, 'SKILL.md'), "# Example\n")
+
+      state = File.join(directory, 'state')
+      profile = File.join(state, 'profile')
+      FileUtils.mkdir_p(state)
+      File.symlink(core, profile)
+      File.symlink(full, "#{profile}-1-link")
+      environment = {
+        'HOME' => directory, 'PATH' => ENV.fetch('PATH'),
+        'VPSFREE_WORKSPACES_STATE' => state, 'VPSFREE_WORKSPACES_PROFILE' => profile,
+        'VPSFREE_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
+      }
+      full_host = CompatibilityLinkHost.new(
+        package_root: full, env: environment, out: StringIO.new, err: StringIO.new
+      )
+      core_host = CompatibilityLinkHost.new(
+        package_root: core, env: environment, out: StringIO.new, err: StringIO.new
+      )
+      command_link = File.join(directory, 'bin', command)
+      skill_link = File.join(directory, '.codex/skills', skill_name)
+
+      full_host.send(:install_links)
+      assert_equal(command_source, File.readlink(command_link))
+      assert_equal(skill_source, File.readlink(skill_link))
+
+      core_host.send(:install_links)
+      refute(File.exist?(command_link))
+      refute(File.exist?(skill_link))
+
+      unrelated = File.join(directory, 'unrelated-command')
+      File.write(unrelated, "#!/bin/sh\nexit 0\n")
+      File.symlink(unrelated, command_link)
+      core_host.send(:install_links)
+      assert_equal(unrelated, File.readlink(command_link))
+      File.unlink(command_link)
+
+      # A retained pre-inventory generation recreates its static links during
+      # rollback. The next core activation must remove them without journal
+      # state from that older package.
+      File.symlink(command_source, command_link)
+      File.symlink(skill_source, skill_link)
+      core_host.send(:install_links)
+      refute(File.exist?(command_link))
+      refute(File.exist?(skill_link))
+    end
+  end
+
+  def test_candidate_activation_links_the_candidate_extensions
+    Dir.mktmpdir('workspace-host-candidate-links-test') do |directory|
+      candidate = make_package(directory, 'package-candidate')
+      command = 'kb-release'
+      command_source = File.join(candidate, 'bin', command)
+      File.write(command_source, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, command_source)
+      skill_name = 'dev-session-handoff'
+      skill_source = File.join(candidate, 'share/codex/skills', skill_name)
+      FileUtils.mkdir_p(skill_source)
+      File.write(File.join(skill_source, 'SKILL.md'), "# Example\n")
+      config = File.join(directory, 'config', 'registry.json')
+      VpsfreeWorkspaceHost::Registry.new(config)
+      state = File.join(directory, 'state')
+      profile = File.join(state, 'profile')
+      FileUtils.mkdir_p(state)
+      File.symlink(candidate, profile)
+      host = ActivationGuardHost.new(
+        package: candidate,
+        env: host_environment(directory, config:).merge(
+          'VPSFREE_WORKSPACES_PROFILE' => profile,
+          'VPSFREE_WORKSPACE_ACTIVATION' => '1'
+        ),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(0, host.run('workspace-host', ['_activate']))
+      assert(host.configured)
+      assert_equal(command_source, File.readlink(File.join(directory, 'bin', command)))
+      assert_equal(
+        skill_source,
+        File.readlink(File.join(directory, '.codex/skills', skill_name))
+      )
+    end
+  end
+
   def test_unregister_stops_instance_services_and_removes_the_registry_entry
     Dir.mktmpdir('workspace-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
@@ -202,6 +305,15 @@ class WorkspaceHostTest < Minitest::Test
       end
       refute_nil(enable)
       assert_equal([:quiesced], host.restored)
+      error_output = host.instance_variable_get(:@err).string
+      primary = error_output.index('injected partial disable failure')
+      units = error_output.index('failed to re-enable workspace services: injected unit recovery failure')
+      clients = error_output.index('failed to restore terminal clients: injected terminal recovery failure')
+      refute_nil(primary)
+      refute_nil(units)
+      refute_nil(clients)
+      assert_operator(primary, :<, units)
+      assert_operator(units, :<, clients)
     end
   end
 
@@ -1204,6 +1316,115 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(File.realpath(paths.fetch(:system_codex)), File.realpath(host.send(:active_codex)))
       assert_includes(host.events, [:router_restarted])
       assert_includes(host.events, [:consumers_restarted])
+      assert_includes(
+        host.events,
+        [:sessions_restored, File.realpath(host.send(:profile_generation_path, 1))]
+      )
+    end
+  end
+
+  def test_rollback_keeps_the_selected_generation_when_terminal_restoration_fails
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      second_package = make_package(paths.fetch(:root), 'package-two')
+      host.candidate = second_package
+      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.fail_restore = true
+
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(1, host.send(:profile_generation))
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'workspace package rollback completed, but terminal clients need dev-session sync'
+      )
+    end
+  end
+
+  def test_terminal_restoration_attempts_every_session_with_one_package_generation
+    Dir.mktmpdir('workspace-host-restoration-test') do |directory|
+      first = {
+        'name' => 'first', 'root' => make_workspace(directory, 'first'),
+        'hostname' => 'first.workspace.example.test'
+      }
+      second = {
+        'name' => 'second', 'root' => make_workspace(directory, 'second'),
+        'hostname' => 'second.workspace.example.test'
+      }
+      config = File.join(directory, 'config', 'registry.json')
+      target = make_package(directory, 'target-package')
+      environment = host_environment(directory, config:)
+      profile = environment.fetch('VPSFREE_WORKSPACES_PROFILE')
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(target, profile)
+      host = RestorationHost.new(
+        fail_slug: 'broken', env: environment,
+        out: StringIO.new, err: StringIO.new
+      )
+
+      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+        host.send(
+          :restore_quiesced_sessions,
+          [[first, 'broken'], [second, 'restored']],
+          package: target
+        )
+      end
+
+      assert_includes(error.message, 'first/broken: injected sync failure')
+      assert_equal(2, host.invocations.length)
+      host.invocations.each do |_environment, command, arguments|
+        assert_equal(File.join(target, 'libexec/workspace-portal/dev-session'), command)
+        assert_equal(target, arguments.fetch(arguments.index('--expected-host-generation') + 1))
+        assert_equal(
+          File.join(target, 'bin/workspace-portal'),
+          arguments.fetch(arguments.index('--portal-command') + 1)
+        )
+        assert_equal(
+          File.join(target, 'libexec/workspace-portal/vpsadmin-devcluster'),
+          arguments.fetch(arguments.index('--vpsadmin-cluster') + 1)
+        )
+        assert_equal(
+          File.join(target, 'libexec/workspace-portal/vpsadminos-devcluster'),
+          arguments.fetch(arguments.index('--vpsadminos-cluster') + 1)
+        )
+        assert_equal(
+          VpsfreeWorkspaceProfileIdentity.token(profile),
+          arguments.fetch(arguments.index('--expected-host-profile-token') + 1)
+        )
+      end
+    end
+  end
+
+  def test_terminal_restoration_preserves_the_primary_failure
+    Dir.mktmpdir('workspace-host-restoration-error-test') do |directory|
+      entry = {
+        'name' => 'first', 'root' => make_workspace(directory, 'first'),
+        'hostname' => 'first.workspace.example.test'
+      }
+      config = File.join(directory, 'config', 'registry.json')
+      target = make_package(directory, 'target-package')
+      host = RestorationHost.new(
+        fail_slug: 'broken', env: host_environment(directory, config:),
+        out: StringIO.new, err: StringIO.new
+      )
+      primary = VpsfreeWorkspaceHost::Error.new('injected primary failure')
+
+      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+        host.send(
+          :reraise_after_terminal_restoration,
+          primary,
+          [[entry, 'broken']],
+          package: target
+        )
+      end
+
+      assert_equal(
+        'injected primary failure; unable to restore terminal clients: ' \
+        'first/broken: injected sync failure',
+        error.message
+      )
     end
   end
 
@@ -1340,12 +1561,20 @@ class WorkspaceHostTest < Minitest::Test
       host.instance_variable_set(:@system_codex, second_codex)
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       host.fail_restart = true
+      host.fail_restore = true
 
       assert_equal(1, host.run('workspace-host', ['rollback']))
 
       assert_equal(2, host.send(:profile_generation))
       assert_equal(File.realpath(second_codex), File.realpath(host.send(:active_codex)))
       assert_includes(host.events, [:profile_selected, 2])
+      assert_includes(
+        host.events,
+        [:sessions_restored, File.realpath(host.send(:profile_generation_path, 2))]
+      )
+      error_output = host.instance_variable_get(:@err).string
+      assert_includes(error_output, 'injected consumer restart failure')
+      assert_includes(error_output, 'injected restoration failure')
     end
   end
 
@@ -1441,6 +1670,19 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  class CompatibilityLinkHost < VpsfreeWorkspaceHost::Host
+    def initialize(package_root:, **options)
+      @test_package_root = package_root
+      super(**options)
+    end
+
+    private
+
+    def package_root
+      @test_package_root
+    end
+  end
+
   class FinalizeHost < VpsfreeWorkspaceHost::Host
     attr_reader :commands
     attr_accessor :cluster_active
@@ -1531,20 +1773,23 @@ class WorkspaceHostTest < Minitest::Test
       [:quiesced]
     end
 
-    def restore_quiesced_sessions(sessions)
+    def restore_quiesced_sessions(sessions, **)
       @restored = sessions
+      raise VpsfreeWorkspaceHost::Error, 'injected terminal recovery failure'
     end
 
     def system!(*argv)
       @commands << argv
       if argv[0, 4] == ['systemctl', '--user', 'disable', '--now']
         raise VpsfreeWorkspaceHost::Error, 'injected partial disable failure'
+      elsif argv[0, 4] == ['systemctl', '--user', 'enable', '--now']
+        raise VpsfreeWorkspaceHost::Error, 'injected unit recovery failure'
       end
     end
   end
 
   class TransitionHost < VpsfreeWorkspaceHost::Host
-    attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart
+    attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart, :fail_restore
     attr_reader :events
 
     def initialize(candidate:, busy:, **options)
@@ -1614,7 +1859,7 @@ class WorkspaceHostTest < Minitest::Test
       File.symlink(package, root)
     end
 
-    def install_links
+    def install_links(**)
       @events << [:links_installed]
       if fail_links
         self.fail_links = false
@@ -1645,8 +1890,12 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:codex_ready]
     end
 
-    def restore_quiesced_sessions(_sessions)
-      @events << [:sessions_restored]
+    def restore_quiesced_sessions(_sessions, package: nil)
+      @events << [:sessions_restored, package && File.realpath(package)]
+      if fail_restore
+        self.fail_restore = false
+        raise VpsfreeWorkspaceHost::Error, 'injected restoration failure'
+      end
     end
 
     def check_codex(command)
@@ -1663,6 +1912,28 @@ class WorkspaceHostTest < Minitest::Test
         self.fail_restart = false
         raise VpsfreeWorkspaceHost::Error, 'injected consumer restart failure'
       end
+    end
+  end
+
+  class RestorationHost < VpsfreeWorkspaceHost::Host
+    attr_reader :invocations
+
+    def initialize(fail_slug:, **options)
+      super(**options)
+      @fail_slug = fail_slug
+      @invocations = []
+    end
+
+    private
+
+    def codex_version(_command)
+      '0.153.4'
+    end
+
+    def system_env!(environment, command, *arguments)
+      @invocations << [environment, command, arguments]
+      slug = arguments.fetch(-2)
+      raise VpsfreeWorkspaceHost::Error, 'injected sync failure' if slug == @fail_slug
     end
   end
 

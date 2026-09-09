@@ -14,7 +14,17 @@ require_relative 'workspace-profile-identity'
 module VpsfreeWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
   HOSTNAME_LABEL = /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/
-  COMMANDS = %w[workspace-host dev-session vpsadmin-devcluster vpsadminos-devcluster].freeze
+  CORE_COMMANDS = %w[workspace-host dev-session vpsadmin-devcluster vpsadminos-devcluster].freeze
+  # Keep renamed or retired entries as tombstones until every package
+  # generation that could have installed them is outside the rollback window.
+  COMPATIBILITY_COMMANDS = %w[
+    kb-cleanup kb-contract-build kb-contract-fetch kb-contract-manifest
+    kb-contract-reconcile kb-page kb-release kb-stage
+  ].freeze
+  COMPATIBILITY_SKILLS = %w[
+    dev-session-handoff humanizer-cs humanizer-en mandatory-change-review
+    vpsfree-user-facing-writing
+  ].freeze
 
   def self.load_runtime_contract
     candidates = [
@@ -242,7 +252,12 @@ module VpsfreeWorkspaceHost
       @state = env.fetch('VPSFREE_WORKSPACES_STATE', File.join(@home, '.local/state/vpsfree-workspaces'))
       @runtime = env.fetch('VPSFREE_WORKSPACES_RUNTIME_DIR', File.join(env.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}"), 'vpsfree-workspaces'))
       @profile = env.fetch('VPSFREE_WORKSPACES_PROFILE', File.join(@state, 'profile'))
-      @system_codex = env.fetch('VPSFREE_WORKSPACES_SYSTEM_CODEX', '/run/current-system/sw/bin/codex')
+      @skills = env.fetch('VPSFREE_WORKSPACES_SKILLS_DIR', File.join(@home, '.codex/skills'))
+      @system_codex = if env.key?('VPSFREE_WORKSPACES_SYSTEM_CODEX')
+                        env.fetch('VPSFREE_WORKSPACES_SYSTEM_CODEX')
+                      else
+                        File.join(package_root, 'libexec/codex/bin/codex')
+                      end
       @router_socket = env.fetch(
         'VPSFREE_WORKSPACES_ROUTER_SOCKET',
         '/run/vpsfree-workspace-router/router.sock'
@@ -357,23 +372,40 @@ module VpsfreeWorkspaceHost
       system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
       discard_retired_runtime(retired_runtime)
       @out.puts "unregistered #{name}"
-    rescue StandardError
+    rescue StandardError => primary_error
+      recovery_errors = []
       if unregistered
-        selected_registry.register(
-          name: entry.fetch('name'),
-          root: entry.fetch('root'),
-          hostname: entry.fetch('hostname'),
-          aliases: entry.fetch('aliases'),
-          replace: false
-        )
+        capture_recovery_error(recovery_errors, 'failed to restore workspace registration') do
+          selected_registry.register(
+            name: entry.fetch('name'),
+            root: entry.fetch('root'),
+            hostname: entry.fetch('hostname'),
+            aliases: entry.fetch('aliases'),
+            replace: false
+          )
+        end
       end
-      restore_instance_runtime(retired_runtime, entry) if retired_runtime
-      if selected_registry&.find(name)
-        system! 'systemctl', '--user', 'enable', '--now', *units if disabled
-        system! 'systemctl', '--user', 'try-restart', 'workspace-router.service' if unregistered
+      if retired_runtime
+        capture_recovery_error(recovery_errors, 'failed to restore workspace runtime') do
+          restore_instance_runtime(retired_runtime, entry)
+        end
+      end
+      if disabled
+        capture_recovery_error(recovery_errors, 'failed to re-enable workspace services') do
+          system! 'systemctl', '--user', 'enable', '--now', *units
+        end
+      end
+      if unregistered
+        capture_recovery_error(recovery_errors, 'failed to restart the workspace router') do
+          system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
+        end
+      end
+      capture_recovery_error(recovery_errors, 'failed to restore terminal clients') do
         restore_quiesced_sessions(quiesced || [])
       end
-      raise
+      raise primary_error if recovery_errors.empty?
+
+      raise Error, ([primary_error.message] + recovery_errors).join('; ')
     end
 
     def switch(argv)
@@ -411,18 +443,23 @@ module VpsfreeWorkspaceHost
         generation = profile_generation
         retain_codex_for_generation(generation, current_codex)
         adopt_codex(current_codex)
-        install_links
+        install_links(package: candidate)
         activate_installed(candidate_host)
       rescue StandardError => transition_error
         if original_generation
           failed_generation = profile_generation
           failed_generation = nil if failed_generation == original_generation
-          compensate_profile_transition(
-            original_generation,
-            original_codex,
-            transition_error,
-            discard_generation: failed_generation
-          )
+          begin
+            compensate_profile_transition(
+              original_generation,
+              original_codex,
+              discard_generation: failed_generation
+            )
+          rescue StandardError => compensation_error
+            raise Error,
+                  "#{transition_error.message}; failed to restore workspace generation " \
+                  "#{original_generation}: #{compensation_error.message}"
+          end
         end
         raise
       end
@@ -435,6 +472,10 @@ module VpsfreeWorkspaceHost
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
+      # The stable dispatcher invokes this method from the selected candidate.
+      # Relink package-specific commands and skills here so a successful switch
+      # never leaves them attached to the generation that initiated it.
+      install_links
       configure_user_services
       reconcile_codex_update(defer_busy: true)
     end
@@ -467,34 +508,55 @@ module VpsfreeWorkspaceHost
           raise Error, "nix-env selected an unexpected workspace profile generation"
         end
         adopt_codex(target_codex)
-        install_links
+        install_links(package: target_profile)
         system! 'systemctl', '--user', 'daemon-reload'
         system! 'systemctl', '--user', 'restart', 'workspace-router.service'
         restart_codex_consumers
         wait_for_codex_sockets
       rescue StandardError => transition_error
-        compensate_profile_transition(original_generation, original_codex, transition_error)
-        restore_quiesced_sessions(quiesced)
+        compensation_error = nil
+        begin
+          compensate_profile_transition(original_generation, original_codex)
+        rescue StandardError => error
+          compensation_error = error
+        end
+        restoration_error = nil
+        begin
+          restore_quiesced_sessions(quiesced, package: package_root)
+        rescue StandardError => error
+          restoration_error = error
+        end
+        if compensation_error || restoration_error
+          details = [transition_error.message]
+          if compensation_error
+            details << "failed to restore workspace generation " \
+                       "#{original_generation}: #{compensation_error.message}"
+          end
+          details << restoration_error.message if restoration_error
+          raise Error, details.join('; ')
+        end
         raise
       end
-      restore_quiesced_sessions(quiesced)
+      begin
+        restore_quiesced_sessions(quiesced, package: target_profile)
+      rescue StandardError => restore_error
+        raise Error,
+              "workspace package rollback completed, but terminal clients need " \
+              "dev-session sync: #{restore_error.message}"
+      end
       @out.puts "workspace package: #{File.realpath(@profile)}"
     end
 
-    def compensate_profile_transition(generation, codex, transition_error, discard_generation: nil)
+    def compensate_profile_transition(generation, codex, discard_generation: nil)
       system! 'nix-env', '--profile', @profile, '--switch-generation', generation.to_s
       adopt_codex(codex)
       retain_codex_for_generation(generation, codex)
-      install_links
+      install_links(package: profile_generation_path(generation))
       system! 'systemctl', '--user', 'daemon-reload'
       system! 'systemctl', '--user', 'restart', 'workspace-router.service'
       restart_codex_consumers
       wait_for_codex_sockets
       discard_profile_generation(discard_generation) if discard_generation
-    rescue StandardError => compensation_error
-      raise Error,
-            "#{transition_error.message}; failed to restore workspace generation " \
-            "#{generation}: #{compensation_error.message}"
     end
 
     def discard_profile_generation(generation)
@@ -527,22 +589,70 @@ module VpsfreeWorkspaceHost
       system! 'systemctl', '--user', 'stop', 'workspace-codex-reconcile-pending.service'
       system! 'systemctl', '--user', 'disable', '--now', *instances, *common
       @out.puts 'workspace portal user services are suspended'
-    rescue StandardError
-      restore_quiesced_sessions(quiesced || [])
-      raise
+    rescue StandardError => primary_error
+      reraise_after_terminal_restoration(primary_error, quiesced || [])
     end
 
-    def install_links
+    def install_links(package: package_root)
       bin = File.join(@home, 'bin')
       units = File.join(@home, '.config/systemd/user')
+      selected_package = File.realpath(package)
+      retained_packages = retained_package_roots(selected_package)
       FileUtils.mkdir_p(bin)
       FileUtils.mkdir_p(units)
-      COMMANDS.each do |command|
+      FileUtils.mkdir_p(@skills)
+
+      CORE_COMMANDS.each do |command|
         atomic_symlink(File.join(@profile, 'bin', command), File.join(bin, command))
+      end
+      COMPATIBILITY_COMMANDS.each do |command|
+        source = File.join(selected_package, 'bin', command)
+        destination = File.join(bin, command)
+        if File.exist?(source)
+          raise Error, "packaged command is not executable: #{source}" unless File.executable?(source)
+          atomic_symlink(source, destination)
+        else
+          remove_compatibility_link(destination, retained_packages, 'bin', command)
+        end
       end
       Dir[File.join(@profile, 'share/systemd/user/workspace-*')].each do |source|
         atomic_symlink(source, File.join(units, File.basename(source)))
       end
+      COMPATIBILITY_SKILLS.each do |skill|
+        source = File.join(selected_package, 'share/codex/skills', skill)
+        destination = File.join(@skills, skill)
+        if File.directory?(source)
+          atomic_symlink(source, destination)
+        else
+          remove_compatibility_link(
+            destination, retained_packages, 'share', 'codex', 'skills', skill
+          )
+        end
+      end
+    end
+
+    def retained_package_roots(selected_package)
+      candidates = [selected_package, @profile]
+      candidates.concat(Dir["#{@profile}-*-link"])
+      candidates.filter_map do |path|
+        File.realpath(path) if File.directory?(path)
+      rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+        nil
+      end.uniq
+    end
+
+    def remove_compatibility_link(destination, packages, *parts)
+      return unless File.symlink?(destination)
+
+      target = File.expand_path(File.readlink(destination), File.dirname(destination))
+      resolved_target = File.realpath(target)
+      managed = packages.any? do |package|
+        source = File.join(package, *parts)
+        File.exist?(source) && File.realpath(source) == resolved_target
+      end
+      File.unlink(destination) if managed
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+      nil
     end
 
     def configure_user_services
@@ -566,7 +676,7 @@ module VpsfreeWorkspaceHost
     def status(argv)
       raise Error, 'status takes no arguments' unless argv.empty?
       @out.puts "package: #{File.exist?(@profile) ? File.realpath(@profile) : 'not installed'}"
-      @out.puts "system Codex: #{@system_codex}"
+      @out.puts "profile Codex: #{@system_codex}"
       @out.puts "active Codex: #{active_codex}"
       registry.entries.each do |entry|
         @out.puts "#{entry.fetch('name')}: #{entry.fetch('root')} https://#{entry.fetch('hostname')}/"
@@ -602,20 +712,20 @@ module VpsfreeWorkspaceHost
       exec_with_workspace(entry, private_command, *arguments)
     end
 
-    def dev_session_invocation(entry, argv, transition_lock:)
+    def dev_session_invocation(entry, argv, transition_lock:, package: package_root)
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
       version = codex_version(active_codex)
-      private_command = File.join(package_root, 'libexec/workspace-portal/dev-session')
+      private_command = File.join(package, 'libexec/workspace-portal/dev-session')
       arguments = [
         '--require-runtime', '--workspace', entry.fetch('root'),
-        '--host-profile', @profile, '--expected-host-generation', package_root,
+        '--host-profile', @profile, '--expected-host-generation', package,
         '--authority-dir', runtime.fetch(:authority), '--tmux-socket', runtime.fetch(:tmux),
         '--codex-command', active_codex, '--codex-socket', runtime.fetch(:codex),
-        '--codex-version', version, '--portal-command', File.join(package_root, 'bin/workspace-portal'),
+        '--codex-version', version, '--portal-command', File.join(package, 'bin/workspace-portal'),
         '--portal-base-url', "https://#{entry.fetch('hostname')}",
-        '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster'),
-        '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster'),
+        '--vpsadmin-cluster', File.join(package, 'libexec/workspace-portal/vpsadmin-devcluster'),
+        '--vpsadminos-cluster', File.join(package, 'libexec/workspace-portal/vpsadminos-devcluster'),
         '--', *argv
       ]
       if File.symlink?(@profile)
@@ -845,9 +955,8 @@ module VpsfreeWorkspaceHost
         end
       end
       quiesced
-    rescue StandardError
-      restore_quiesced_sessions(quiesced)
-      raise
+    rescue StandardError => primary_error
+      reraise_after_terminal_restoration(primary_error, quiesced)
     end
 
     def require_no_unfinished_lifecycle_operations!(
@@ -1033,15 +1142,46 @@ module VpsfreeWorkspaceHost
       false
     end
 
-    def restore_quiesced_sessions(sessions)
+    def restore_quiesced_sessions(sessions, package: package_root)
+      failures = []
       sessions.each do |entry, slug|
-        environment, command, arguments = dev_session_invocation(
-          entry,
-          ['sync', slug, '--as-is'],
-          transition_lock: false
-        )
-        system_env!(environment, command, *arguments)
+        begin
+          environment, command, arguments = dev_session_invocation(
+            entry,
+            ['sync', slug, '--as-is'],
+            transition_lock: false,
+            package:
+          )
+          system_env!(environment, command, *arguments)
+        rescue StandardError => error
+          message = error.message.lines.first.to_s.strip
+          message = error.class.to_s if message.empty?
+          failures << "#{entry.fetch('name')}/#{slug}: #{message}"
+        end
       end
+      return if failures.empty?
+
+      raise Error, "unable to restore terminal clients: #{failures.join('; ')}"
+    end
+
+    def reraise_after_terminal_restoration(primary_error, sessions, package: package_root)
+      restoration_error = nil
+      begin
+        restore_quiesced_sessions(sessions, package:)
+      rescue StandardError => error
+        restoration_error = error
+      end
+      raise primary_error unless restoration_error
+
+      raise Error, "#{primary_error.message}; #{restoration_error.message}"
+    end
+
+    def capture_recovery_error(errors, label)
+      yield
+    rescue StandardError => error
+      message = error.message.lines.first.to_s.strip
+      message = error.class.to_s if message.empty?
+      errors << "#{label}: #{message}"
     end
 
     def wait_for_codex_sockets
