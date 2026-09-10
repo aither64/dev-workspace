@@ -365,48 +365,57 @@ module VpsfreeWorkspaceHost
 
       quiesced = quiesce_sessions([entry])
       units = %w[portal codex tmux].map { |kind| "workspace-#{kind}@#{name}.service" }
-      disabled = true
-      system! 'systemctl', '--user', 'disable', '--now', *units
-      retired_runtime = quarantine_instance_runtime(entry)
-      selected_registry.unregister(name)
-      unregistered = true
-      system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
-      discard_retired_runtime(retired_runtime)
-      @out.puts "unregistered #{name}"
-    rescue StandardError => primary_error
-      recovery_errors = []
-      if unregistered
-        capture_recovery_error(recovery_errors, 'failed to restore workspace registration') do
-          selected_registry.register(
-            name: entry.fetch('name'),
-            root: entry.fetch('root'),
-            hostname: entry.fetch('hostname'),
-            aliases: entry.fetch('aliases'),
-            replace: false
+      disable_started = false
+      retired_runtime = nil
+      begin
+        disable_started = true
+        system! 'systemctl', '--user', 'disable', '--now', *units
+        retired_runtime = quarantine_instance_runtime(entry)
+        selected_registry.unregister(name)
+        system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
+      rescue StandardError => primary_error
+        recovery_errors = []
+        registration = restore_workspace_registration(selected_registry.path, entry)
+        if registration[:error]
+          record_recovery_error(
+            recovery_errors,
+            'failed to restore workspace registration',
+            registration.fetch(:error)
           )
         end
-      end
-      if retired_runtime
-        capture_recovery_error(recovery_errors, 'failed to restore workspace runtime') do
-          restore_instance_runtime(retired_runtime, entry)
+        registration_ready = %i[original restored].include?(registration.fetch(:state))
+        runtime_ready = retired_runtime.nil?
+        if retired_runtime && registration_ready
+          runtime_ready = capture_recovery_error(
+            recovery_errors, 'failed to restore workspace runtime'
+          ) do
+            restore_instance_runtime(retired_runtime, entry)
+          end
         end
-      end
-      if disabled
-        capture_recovery_error(recovery_errors, 'failed to re-enable workspace services') do
-          system! 'systemctl', '--user', 'enable', '--now', *units
+        if disable_started && registration_ready && runtime_ready
+          capture_recovery_error(recovery_errors, 'failed to re-enable workspace services') do
+            system! 'systemctl', '--user', 'enable', '--now', *units
+          end
         end
-      end
-      if unregistered
-        capture_recovery_error(recovery_errors, 'failed to restart the workspace router') do
-          system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
+        if registration.fetch(:state) == :restored
+          capture_recovery_error(recovery_errors, 'failed to restart the workspace router') do
+            system! 'systemctl', '--user', 'try-restart', 'workspace-router.service'
+          end
         end
-      end
-      capture_recovery_error(recovery_errors, 'failed to restore terminal clients') do
-        restore_quiesced_sessions(quiesced || [])
-      end
-      raise primary_error if recovery_errors.empty?
+        if registration_ready && runtime_ready
+          capture_recovery_error(recovery_errors, 'failed to restore terminal clients') do
+            restore_quiesced_sessions(quiesced)
+          end
+        end
+        raise primary_error if recovery_errors.empty?
 
-      raise Error, ([primary_error.message] + recovery_errors).join('; ')
+        raise Error, ([primary_error.message] + recovery_errors).join('; ')
+      end
+
+      # The workspace is committed as unregistered once the reversible block
+      # completes. Cleanup and success reporting must never trigger rollback.
+      discard_retired_runtime(retired_runtime)
+      @out.puts "unregistered #{name}"
     end
 
     def switch(argv)
@@ -1222,10 +1231,75 @@ module VpsfreeWorkspaceHost
 
     def capture_recovery_error(errors, label)
       yield
+      true
     rescue StandardError => error
+      record_recovery_error(errors, label, error)
+      false
+    end
+
+    def record_recovery_error(errors, label, error)
       message = error.message.lines.first.to_s.strip
       message = error.class.to_s if message.empty?
       errors << "#{label}: #{message}"
+    end
+
+    def restore_workspace_registration(registry_path, entry)
+      begin
+        authoritative_registry = open_registry(registry_path)
+      rescue StandardError => error
+        return { state: :unknown, error: }
+      end
+
+      current = authoritative_registry.find(entry.fetch('name'))
+      return { state: :original } if current == entry
+      if current
+        return {
+          state: :foreign,
+          error: Error.new(
+            "workspace registration changed during unregister recovery: #{entry.fetch('name')}"
+          )
+        }
+      end
+
+      begin
+        authoritative_registry.register(
+          name: entry.fetch('name'),
+          root: entry.fetch('root'),
+          hostname: entry.fetch('hostname'),
+          aliases: entry.fetch('aliases'),
+          replace: false
+        )
+        { state: :restored }
+      rescue StandardError => error
+        reconcile_failed_registration_write(registry_path, entry, error)
+      end
+    end
+
+    def reconcile_failed_registration_write(registry_path, entry, write_error)
+      begin
+        current = open_registry(registry_path).find(entry.fetch('name'))
+      rescue StandardError => read_error
+        return {
+          state: :unknown,
+          error: Error.new(
+            "#{write_error.message}; cannot verify workspace registration: #{read_error.message}"
+          )
+        }
+      end
+
+      return { state: :unverified, error: write_error } if current == entry
+      return { state: :absent, error: write_error } unless current
+
+      {
+        state: :foreign,
+        error: Error.new(
+          "workspace registration changed during unregister recovery: #{entry.fetch('name')}"
+        )
+      }
+    end
+
+    def open_registry(path)
+      Registry.new(path)
     end
 
     def wait_for_codex_sockets

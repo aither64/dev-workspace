@@ -379,6 +379,200 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_unregister_reconciles_persisted_registration_after_a_post_commit_failure
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'config', 'registry.json')
+      runtime = File.join(directory, 'runtime')
+      state = File.join(directory, 'state')
+      entry = PostCommitFailureRegistry.new(config).register(
+        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        aliases: [], replace: false
+      )
+      runtime_root = File.join(runtime, 'vpsfree-cz')
+      FileUtils.mkdir_p(runtime_root)
+      host = PostCommitFailureUnregisterHost.new(
+        env: install_source_profile(host_environment(directory, config:, runtime:).merge(
+          'VPSFREE_WORKSPACES_STATE' => state
+        )),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      assert_equal(entry, VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert(File.directory?(runtime_root))
+      assert(host.commands.any? do |command|
+        command[0, 4] == ['systemctl', '--user', 'enable', '--now']
+      end)
+      assert_equal(
+        1,
+        host.commands.count do |command|
+          command == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
+        end
+      )
+      assert_equal([:quiesced], host.restored)
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'injected failure after the registry replacement'
+      )
+    end
+  end
+
+  def test_unregister_skips_dependent_recovery_when_prerequisites_cannot_be_restored
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      replacement = make_workspace(directory, 'replacement')
+      config = File.join(directory, 'config', 'registry.json')
+      runtime = File.join(directory, 'runtime')
+      VpsfreeWorkspaceHost::Registry.new(config).register(
+        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        aliases: [], replace: false
+      )
+      FileUtils.mkdir_p(File.join(runtime, 'vpsfree-cz'))
+      host = FailedLateUnregisterHost.new(
+        env: install_source_profile(host_environment(directory, config:, runtime:)),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      assert_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      refute(File.exist?(File.join(runtime, 'vpsfree-cz')))
+      assert_equal(1, Dir[File.join(runtime, '.retired-vpsfree-cz-*')].length)
+      refute(host.runtime_restore_attempted)
+      refute(host.commands.any? do |command|
+        command[0, 4] == ['systemctl', '--user', 'enable', '--now']
+      end)
+      assert_equal(
+        1,
+        host.commands.count do |command|
+          command == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
+        end
+      )
+      assert_nil(host.restored)
+      error_output = host.instance_variable_get(:@err).string
+      primary = error_output.index('injected router failure')
+      registration = error_output.index(
+        'failed to restore workspace registration: injected registration recovery failure'
+      )
+      refute_nil(primary)
+      refute_nil(registration)
+      assert_operator(primary, :<, registration)
+
+      registered = VpsfreeWorkspaceHost::Registry.new(config).register(
+        name: 'vpsfree-cz', root: replacement,
+        hostname: 'replacement.workspace.example.test', aliases: [], replace: false
+      )
+      assert_equal(replacement, registered.fetch('root'))
+      refute(File.exist?(File.join(runtime, 'vpsfree-cz')))
+      assert_equal(1, Dir[File.join(runtime, '.retired-vpsfree-cz-*')].length)
+    end
+  end
+
+  def test_unregister_keeps_old_runtime_quarantined_for_a_replacement_registration
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      original = make_workspace(directory, 'original')
+      replacement = make_workspace(directory, 'replacement')
+      config = File.join(directory, 'config', 'registry.json')
+      runtime = File.join(directory, 'runtime')
+      VpsfreeWorkspaceHost::Registry.new(config).register(
+        name: 'vpsfree-cz', root: original,
+        hostname: 'vpsfree-cz.workspace.example.test', aliases: [], replace: false
+      )
+      runtime_root = File.join(runtime, 'vpsfree-cz')
+      FileUtils.mkdir_p(runtime_root)
+      File.write(File.join(runtime_root, 'original-authority'), "original\n")
+      host = ReplacementDuringUnregisterHost.new(
+        replacement:,
+        env: install_source_profile(host_environment(directory, config:, runtime:)),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      registered = VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz')
+      assert_equal(replacement, registered.fetch('root'))
+      refute(File.exist?(runtime_root))
+      retired = Dir[File.join(runtime, '.retired-vpsfree-cz-*')]
+      assert_equal(1, retired.length)
+      assert(File.file?(File.join(retired.fetch(0), 'original-authority')))
+      refute(host.commands.any? do |command|
+        command[0, 4] == ['systemctl', '--user', 'enable', '--now']
+      end)
+      assert_equal(
+        1,
+        host.commands.count do |command|
+          command == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
+        end
+      )
+      assert_includes(
+        host.instance_variable_get(:@err).string,
+        'workspace registration changed during unregister recovery: vpsfree-cz'
+      )
+    end
+  end
+
+  def test_unregister_keeps_runtime_quarantined_after_an_ambiguous_recovery_write
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'config', 'registry.json')
+      runtime = File.join(directory, 'runtime')
+      entry = PostCommitFailureRegistry.new(config).register(
+        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        aliases: [], replace: false
+      )
+      runtime_root = File.join(runtime, 'vpsfree-cz')
+      FileUtils.mkdir_p(runtime_root)
+      File.write(File.join(runtime_root, 'original-authority'), "original\n")
+      host = AmbiguousRecoveryWriteUnregisterHost.new(
+        env: install_source_profile(host_environment(directory, config:, runtime:)),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      assert_equal(entry, VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      refute(File.exist?(runtime_root))
+      retired = Dir[File.join(runtime, '.retired-vpsfree-cz-*')]
+      assert_equal(1, retired.length)
+      assert(File.file?(File.join(retired.fetch(0), 'original-authority')))
+      refute(host.commands.any? do |command|
+        command[0, 4] == ['systemctl', '--user', 'enable', '--now']
+      end)
+      assert_nil(host.restored)
+      error_output = host.instance_variable_get(:@err).string
+      primary = error_output.index('injected failure after the registry replacement')
+      recovery = error_output.index('injected failure after the recovery replacement')
+      refute_nil(primary)
+      refute_nil(recovery)
+      assert_operator(primary, :<, recovery)
+    end
+  end
+
+  def test_unregister_does_not_compensate_after_committed_success_output_failure
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'config', 'registry.json')
+      VpsfreeWorkspaceHost::Registry.new(config).register(
+        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        aliases: [], replace: false
+      )
+      host = UnregisterHost.new(
+        env: install_source_profile(host_environment(directory, config:)),
+        out: FailedOutput.new,
+        err: StringIO.new
+      )
+
+      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      assert_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      refute(host.commands.any? do |command|
+        command[0, 4] == ['systemctl', '--user', 'enable', '--now']
+      end)
+      assert_includes(host.instance_variable_get(:@err).string, 'Broken pipe')
+    end
+  end
+
   def test_unregister_refuses_workspace_with_development_cluster_state
     Dir.mktmpdir('workspace-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
@@ -1869,6 +2063,126 @@ class WorkspaceHostTest < Minitest::Test
       elsif argv[0, 4] == ['systemctl', '--user', 'enable', '--now']
         raise VpsfreeWorkspaceHost::Error, 'injected unit recovery failure'
       end
+    end
+  end
+
+  class PostCommitFailureRegistry < VpsfreeWorkspaceHost::Registry
+    def unregister(name)
+      existing = find(name)
+      raise VpsfreeWorkspaceHost::Error, "workspace is not registered: #{name}" unless existing
+
+      # Model a failure after the replacement became visible but before the
+      # Registry instance updated its cached entries.
+      send(:write, entries.reject { |entry| entry.fetch('name') == name })
+      raise VpsfreeWorkspaceHost::Error,
+            'injected failure after the registry replacement'
+    end
+  end
+
+  class PostCommitFailureUnregisterHost < UnregisterHost
+    attr_reader :restored
+
+    private
+
+    def registry
+      @injected_registry ||= PostCommitFailureRegistry.new(@config)
+    end
+
+    def quiesce_sessions(_entries)
+      [:quiesced]
+    end
+
+    def restore_quiesced_sessions(sessions, **)
+      @restored = sessions
+    end
+  end
+
+  class FailedLateUnregisterHost < VpsfreeWorkspaceHost::Host
+    attr_reader :commands, :restored, :runtime_restore_attempted
+
+    def initialize(**options)
+      super
+      @commands = []
+    end
+
+    private
+
+    def quiesce_sessions(_entries)
+      [:quiesced]
+    end
+
+    def system!(*argv)
+      @commands << argv
+      if argv == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
+        raise VpsfreeWorkspaceHost::Error, 'injected router failure'
+      end
+    end
+
+    def restore_workspace_registration(_registry_path, _entry)
+      {
+        state: :absent,
+        error: VpsfreeWorkspaceHost::Error.new('injected registration recovery failure')
+      }
+    end
+
+    def restore_instance_runtime(_retired, _entry)
+      @runtime_restore_attempted = true
+      raise VpsfreeWorkspaceHost::Error, 'injected runtime recovery failure'
+    end
+
+    def restore_quiesced_sessions(sessions, **)
+      @restored = sessions
+    end
+  end
+
+  class AmbiguousRecoveryWriteRegistry < VpsfreeWorkspaceHost::Registry
+    def register(**options)
+      super
+      raise VpsfreeWorkspaceHost::Error,
+            'injected failure after the recovery replacement'
+    end
+  end
+
+  class AmbiguousRecoveryWriteUnregisterHost < PostCommitFailureUnregisterHost
+    private
+
+    def open_registry(path)
+      @registry_open_count ||= 0
+      @registry_open_count += 1
+      if @registry_open_count == 1
+        AmbiguousRecoveryWriteRegistry.new(path)
+      else
+        VpsfreeWorkspaceHost::Registry.new(path)
+      end
+    end
+  end
+
+  class ReplacementDuringUnregisterHost < UnregisterHost
+    def initialize(replacement:, **options)
+      super(**options)
+      @replacement = replacement
+      @router_failed = false
+    end
+
+    private
+
+    def system!(*argv)
+      @commands << argv
+      return unless argv == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
+      return if @router_failed
+
+      @router_failed = true
+      VpsfreeWorkspaceHost::Registry.new(@config).register(
+        name: 'vpsfree-cz', root: @replacement,
+        hostname: 'replacement.workspace.example.test', aliases: [], replace: false
+      )
+      raise VpsfreeWorkspaceHost::Error, 'injected router failure after replacement'
+    end
+  end
+
+  class FailedOutput < StringIO
+    def puts(*)
+      raise Errno::EPIPE
     end
   end
 
