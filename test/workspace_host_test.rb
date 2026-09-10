@@ -202,8 +202,22 @@ class WorkspaceHostTest < Minitest::Test
       )
       command_link = File.join(directory, 'bin', command)
       skill_link = File.join(directory, '.codex/skills', skill_name)
+      portal_target = File.join(directory, 'unrelated-workspace-portal')
+      portal_link = File.join(directory, 'bin', 'workspace-portal')
+      File.write(portal_target, "#!/bin/sh\nexit 0\n")
+      FileUtils.mkdir_p(File.dirname(portal_link))
+      File.symlink(portal_target, portal_link)
 
       full_host.send(:install_links)
+      assert_equal(
+        File.join(profile, 'bin', 'workspace-host'),
+        File.readlink(File.join(directory, 'bin', 'workspace-host'))
+      )
+      assert_equal(
+        File.join(profile, 'bin', 'dev-session'),
+        File.readlink(File.join(directory, 'bin', 'dev-session'))
+      )
+      assert_equal(portal_target, File.readlink(portal_link))
       assert_equal(command_source, File.readlink(command_link))
       assert_equal(skill_source, File.readlink(skill_link))
 
@@ -226,6 +240,36 @@ class WorkspaceHostTest < Minitest::Test
       core_host.send(:install_links)
       refute(File.exist?(command_link))
       refute(File.exist?(skill_link))
+    end
+  end
+
+  def test_link_install_removes_only_the_predecessor_portal_home_link
+    Dir.mktmpdir('workspace-host-legacy-portal-link-test') do |directory|
+      package = make_package(directory, 'package')
+      state = File.join(directory, 'state')
+      profile = File.join(state, 'profile')
+      FileUtils.mkdir_p(state)
+      File.symlink(package, profile)
+      environment = {
+        'HOME' => directory, 'PATH' => ENV.fetch('PATH'),
+        'DEV_WORKSPACES_STATE' => state, 'DEV_WORKSPACES_PROFILE' => profile,
+        'DEV_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
+      }
+      host = CompatibilityLinkHost.new(
+        package_root: package, env: environment, out: StringIO.new, err: StringIO.new
+      )
+      link = File.join(directory, 'bin', 'workspace-portal')
+      FileUtils.mkdir_p(File.dirname(link))
+      File.symlink(File.join(profile, 'bin', 'workspace-portal'), link)
+
+      host.send(:install_links)
+      refute(File.symlink?(link))
+
+      unrelated = File.join(directory, 'unrelated-workspace-portal')
+      File.write(unrelated, "#!/bin/sh\nexit 0\n")
+      File.symlink(unrelated, link)
+      host.send(:install_links)
+      assert_equal(unrelated, File.readlink(link))
     end
   end
 

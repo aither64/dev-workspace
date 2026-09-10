@@ -14,7 +14,8 @@ require_relative 'workspace-profile-identity'
 module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
   HOSTNAME_LABEL = /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/
-  CORE_COMMANDS = %w[workspace-host workspace-portal dev-session].freeze
+  HOME_COMMANDS = %w[workspace-host dev-session].freeze
+  RESERVED_COMMANDS = (HOME_COMMANDS + %w[workspace-portal]).freeze
 
   def self.load_runtime_contract
     candidates = [
@@ -96,7 +97,7 @@ module DevWorkspaceHost
         [provider.fetch('id'), provider.freeze]
       end
       all_names = commands.keys + cluster_providers.keys.map { |name| "#{name}-devcluster" }
-      unless all_names.uniq.length == all_names.length && (all_names & CORE_COMMANDS).empty? &&
+      unless all_names.uniq.length == all_names.length && (all_names & RESERVED_COMMANDS).empty? &&
              cluster_providers.length == providers.length
         raise Error, "duplicate workspace extension name: #{path}"
       end
@@ -724,9 +725,13 @@ module DevWorkspaceHost
       FileUtils.mkdir_p(units)
       FileUtils.mkdir_p(@skills)
 
-      CORE_COMMANDS.each do |command|
+      HOME_COMMANDS.each do |command|
         atomic_symlink(File.join(@profile, 'bin', command), File.join(bin, command))
       end
+      remove_exact_link(
+        File.join(bin, 'workspace-portal'),
+        File.join(@profile, 'bin', 'workspace-portal')
+      )
       selected_catalog.commands.each do |command, source|
         raise Error, "packaged command is not executable: #{source}" unless File.executable?(source)
         atomic_symlink(source, File.join(bin, command))
@@ -781,6 +786,15 @@ module DevWorkspaceHost
         File.exist?(source) && File.realpath(source) == resolved_target
       end
       File.unlink(destination) if managed
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+      nil
+    end
+
+    def remove_exact_link(destination, source)
+      return unless File.symlink?(destination)
+
+      target = File.expand_path(File.readlink(destination), File.dirname(destination))
+      File.unlink(destination) if target == source
     rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
       nil
     end
