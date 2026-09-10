@@ -534,7 +534,7 @@ module DevWorkspaceHost
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
       source = File.realpath(File.expand_path(options.fetch(:source)))
       output = capture!(
-        'nix', 'build', '--no-link', '--print-out-paths', "#{source}#workspace-portal"
+        'nix', 'build', '--no-link', '--print-out-paths', source
       )
       candidates = output.lines.map(&:strip).reject(&:empty?).uniq
       raise Error, "workspace build returned #{candidates.length} package paths" unless candidates.length == 1
