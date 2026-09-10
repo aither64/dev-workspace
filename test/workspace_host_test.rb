@@ -199,6 +199,68 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_workspace_configuration_defaults_and_validates_provider_selection
+    Dir.mktmpdir('workspace-host-config-test') do |directory|
+      package = make_package(directory, 'package')
+      environment = {
+        'HOME' => directory, 'PATH' => ENV.fetch('PATH'),
+        'VPSFREE_WORKSPACES_STATE' => File.join(directory, 'state'),
+        'VPSFREE_WORKSPACES_PROFILE' => File.join(directory, 'state/profile'),
+        'VPSFREE_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
+      }
+      host = CompatibilityLinkHost.new(
+        package_root: package, env: environment, out: StringIO.new, err: StringIO.new
+      )
+      entry = {'root' => directory}
+      assert_equal([], host.send(:workspace_configuration, entry).fetch('developmentClusterProviders'))
+      config = File.join(directory, '.dev-workspace.json')
+      File.write(config, JSON.generate(
+        'schema' => 1, 'displayLabel' => 'vpsFree.cz development',
+        'hostLabel' => 'aitherdev', 'sshHost' => 'aitherdev.int.vpsfree.cz',
+        'developmentClusterProviders' => %w[vpsadmin vpsadminos]
+      ))
+      parsed = host.send(:workspace_configuration, entry)
+      assert_equal('aitherdev', parsed.fetch('hostLabel'))
+      File.write(config, JSON.generate(parsed.merge('developmentClusterProviders' => ['unknown'])))
+      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+      File.write(config, "{\"schema\":1}" + (' ' * (64 * 1024)))
+      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+      File.unlink(config)
+      File.symlink('/dev/null', config)
+      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+    end
+  end
+
+  def test_run_portal_applies_workspace_display_and_provider_configuration
+    Dir.mktmpdir('workspace-host-portal-config-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      File.write(File.join(root, '.dev-workspace.json'), JSON.generate(
+        'schema' => 1, 'displayLabel' => 'vpsFree.cz development',
+        'hostLabel' => 'aitherdev', 'sshHost' => 'aitherdev.int.vpsfree.cz',
+        'developmentClusterProviders' => %w[vpsadmin]
+      ))
+      config = File.join(directory, 'config/registry.json')
+      VpsfreeWorkspaceHost::Registry.new(config).register(
+        name: 'vpsfree-cz', root:, hostname: 'workspace.example.test', aliases: [], replace: false
+      )
+      package = make_package(directory, 'package')
+      profile = File.join(directory, 'state/profile')
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(package, profile)
+      host = PortalArgumentHost.new(
+        package_root: package, env: host_environment(directory, config:),
+        out: StringIO.new, err: StringIO.new
+      )
+      host.send(:run_portal, ['vpsfree-cz'])
+      arguments = host.execution.drop(2)
+      assert_equal('vpsFree.cz development', arguments[arguments.index('--display-label') + 1])
+      assert_equal('aitherdev', arguments[arguments.index('--host-label') + 1])
+      assert_equal('aitherdev.int.vpsfree.cz', arguments[arguments.index('--ssh-host') + 1])
+      assert_includes(arguments, '--vpsadmin-cluster')
+      refute_includes(arguments, '--vpsadminos-cluster')
+    end
+  end
+
   def test_unregister_stops_instance_services_and_removes_the_registry_entry
     Dir.mktmpdir('workspace-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
@@ -1680,6 +1742,28 @@ class WorkspaceHostTest < Minitest::Test
 
     def package_root
       @test_package_root
+    end
+  end
+
+  class PortalArgumentHost < CompatibilityLinkHost
+    attr_reader :execution
+
+    private
+
+    def exec(*arguments)
+      @execution = arguments
+    end
+
+    def active_codex
+      '/nix/store/codex/bin/codex'
+    end
+
+    def codex_version(_command)
+      '0.152.1'
+    end
+
+    def find_command(name)
+      "/usr/bin/#{name}"
     end
   end
 

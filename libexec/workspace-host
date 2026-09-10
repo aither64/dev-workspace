@@ -25,6 +25,7 @@ module VpsfreeWorkspaceHost
     dev-session-handoff humanizer-cs humanizer-en mandatory-change-review
     vpsfree-user-facing-writing
   ].freeze
+  DEVELOPMENT_CLUSTER_PROVIDERS = %w[vpsadmin vpsadminos].freeze
 
   def self.load_runtime_contract
     candidates = [
@@ -809,20 +810,63 @@ module VpsfreeWorkspaceHost
     def run_portal(argv)
       entry = instance_argument(argv, 'run-portal')
       runtime = instance_runtime(entry)
+      workspace = workspace_configuration(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
       environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
-      exec(
-        environment,
-        File.join(package_root, 'bin/workspace-portal'), 'serve',
+      arguments = [
+        'serve',
         '--workspace', entry.fetch('root'), '--base-url', "https://#{entry.fetch('hostname')}",
+        '--display-label', workspace.fetch('displayLabel'),
+        '--host-label', workspace.fetch('hostLabel'),
         '--unix-socket', runtime.fetch(:portal), '--dev-session', File.join(package_root, 'bin/dev-session'),
         '--authority-dir', runtime.fetch(:authority), '--codex-socket', runtime.fetch(:codex),
         '--host-profile', @profile, '--transition-lock', transition_lock_file,
-        '--codex-version', codex_version(active_codex), '--tmux', find_command('tmux'),
-        '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster'),
-        '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster')
-      )
+        '--codex-version', codex_version(active_codex), '--tmux', find_command('tmux')
+      ]
+      unless workspace.fetch('sshHost').empty?
+        arguments.concat(['--ssh-host', workspace.fetch('sshHost')])
+      end
+      if workspace.fetch('developmentClusterProviders').include?('vpsadmin')
+        arguments.concat([
+          '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster')
+        ])
+      end
+      if workspace.fetch('developmentClusterProviders').include?('vpsadminos')
+        arguments.concat([
+          '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster')
+        ])
+      end
+      exec(environment, File.join(package_root, 'bin/workspace-portal'), *arguments)
+    end
+
+    def workspace_configuration(entry)
+      path = File.join(entry.fetch('root'), '.dev-workspace.json')
+      return {
+        'displayLabel' => 'Development workspace', 'hostLabel' => 'this host',
+        'sshHost' => '', 'developmentClusterProviders' => []
+      } unless File.exist?(path)
+      raise Error, "workspace configuration is a symlink: #{path}" if File.symlink?(path)
+      contents = File.binread(path, 64 * 1024 + 1)
+      raise Error, "workspace configuration is too large: #{path}" if contents.bytesize > 64 * 1024
+      data = JSON.parse(contents)
+      expected = %w[developmentClusterProviders displayLabel hostLabel schema sshHost]
+      providers = data['developmentClusterProviders']
+      unless data.is_a?(Hash) && data.keys.sort == expected && data['schema'] == 1 &&
+             data['displayLabel'].is_a?(String) && !data['displayLabel'].empty? &&
+             data['displayLabel'].bytesize <= 128 && data['hostLabel'].is_a?(String) &&
+             !data['hostLabel'].empty? && data['hostLabel'].bytesize <= 128 &&
+             data['sshHost'].is_a?(String) && data['sshHost'].bytesize <= 253 &&
+             providers.is_a?(Array) && providers.uniq == providers &&
+             (providers - DEVELOPMENT_CLUSTER_PROVIDERS).empty?
+        raise Error, "invalid workspace configuration: #{path}"
+      end
+      unless data['sshHost'].empty? || data['sshHost'].split('.').all? { |label| label.match?(HOSTNAME_LABEL) }
+        raise Error, "invalid workspace SSH host: #{path}"
+      end
+      data
+    rescue JSON::ParserError, Errno::ENOENT, Errno::EACCES => e
+      raise Error, "invalid workspace configuration #{path}: #{e.message}"
     end
 
     def run_codex(argv)
