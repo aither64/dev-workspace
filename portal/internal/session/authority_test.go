@@ -112,6 +112,15 @@ func TestRuntimeAuthorityRejectsMismatchedAndMalformedLiveTmuxIdentities(t *test
 	if err := write(legacy, ""); err != nil {
 		t.Fatalf("legacy authority with an empty live identity was rejected: %v", err)
 	}
+	renamed := record
+	renamed.TmuxSocket = "/run/renamed/tmux.sock"
+	if err := write(renamed, record.TmuxIdentity); err != nil {
+		t.Fatalf("identity-bound authority rejected a renamed live socket: %v", err)
+	}
+	renamed.TmuxIdentity = ""
+	if err := write(renamed, record.TmuxIdentity); err == nil {
+		t.Fatal("legacy authority accepted a mismatched reported socket path")
+	}
 }
 
 func TestRuntimeAuthoritySharedCorpus(t *testing.T) {

@@ -7,6 +7,7 @@ require 'open3'
 require 'optparse'
 require 'pathname'
 require 'shellwords'
+require 'socket'
 require 'tmpdir'
 require 'yaml'
 require_relative 'workspace-profile-identity'
@@ -1041,9 +1042,8 @@ module DevWorkspaceHost
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       socket = runtime.fetch(:tmux)
-      raise Error, "tmux socket already exists: #{socket}" if File.exist?(socket)
       tmux = find_command('tmux')
-      system! tmux, '-S', socket, 'new-session', '-d', '-s', '__workspace_portal_keeper'
+      ensure_tmux_server(socket, tmux)
       stop = false
       %w[INT TERM].each { |signal| Signal.trap(signal) { stop = true } }
       until stop
@@ -1052,6 +1052,51 @@ module DevWorkspaceHost
         raise Error, 'workspace tmux server stopped unexpectedly' unless status.success?
       end
       system(tmux, '-S', socket, 'kill-server', out: File::NULL, err: File::NULL)
+      remove_stopped_tmux_socket(socket)
+    end
+
+    def ensure_tmux_server(socket, tmux)
+      if File.exist?(socket)
+        unless File.socket?(socket)
+          raise Error, "tmux socket path is not a socket: #{socket}"
+        end
+        _output, error, status = Open3.capture3(
+          tmux, '-S', socket, 'has-session', '-t', '__workspace_portal_keeper'
+        )
+        unless status.success?
+          detail = error.to_s.strip
+          raise Error, "existing tmux server cannot be adopted: #{detail}"
+        end
+        return false
+      end
+
+      system! tmux, '-S', socket, 'new-session', '-d', '-s', '__workspace_portal_keeper'
+      true
+    end
+
+    def remove_stopped_tmux_socket(socket)
+      before = File.lstat(socket)
+      return unless before.socket?
+
+      stale = false
+      50.times do
+        begin
+          connection = UNIXSocket.new(socket)
+          connection.close
+        rescue Errno::ECONNREFUSED
+          stale = true
+          break
+        end
+        sleep 0.02
+      end
+      return unless stale
+
+      after = File.lstat(socket)
+      return unless after.socket? && after.dev == before.dev && after.ino == before.ino
+
+      File.unlink(socket)
+    rescue Errno::ENOENT
+      nil
     end
 
     def reconcile_codex(argv)

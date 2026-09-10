@@ -221,9 +221,11 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 		return fmt.Errorf("inspect live tmux session: %w", err)
 	}
 	fields := strings.Split(strings.TrimSuffix(string(output), "\n"), "\t")
-	if len(fields) != 12 || fields[0] != a.TmuxSessionID || fields[1] != a.Slug ||
+	socketMatches := len(fields) == 12 && (fields[6] == a.TmuxSocket ||
+		(a.TmuxIdentity != "" && fields[11] == a.TmuxIdentity))
+	if !socketMatches || fields[0] != a.TmuxSessionID || fields[1] != a.Slug ||
 		fields[2] != "1" || fields[3] != a.Slug || fields[4] != a.Workspace ||
-		fields[5] != a.Slug || fields[6] != a.TmuxSocket ||
+		fields[5] != a.Slug ||
 		fields[7] != a.CodexThreadID || fields[8] != a.CodexSocketPath ||
 		fields[9] != a.CodexClientVersion ||
 		(a.CodexThreadID != "" && (len(fields[10]) < 2 || fields[10][0] != '%' || strings.Trim(fields[10][1:], "0123456789") != "")) ||

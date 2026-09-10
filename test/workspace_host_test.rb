@@ -419,6 +419,72 @@ class WorkspaceHostTest < Minitest::Test
     assert_includes(error.message, 'activation aliases are invalid')
   end
 
+  def test_tmux_keeper_adopts_an_existing_server
+    skip 'real tmux tests are disabled' if ENV['DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+
+    Dir.mktmpdir('workspace-host-tmux-adoption-test') do |directory|
+      socket = File.join(directory, 'tmux.sock')
+      system('tmux', '-S', socket, 'new-session', '-d', '-s', '__workspace_portal_keeper')
+      host = DevWorkspaceHost::Host.new(
+        env: host_environment(directory, config: File.join(directory, 'registry.json')),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      refute(host.send(:ensure_tmux_server, socket, 'tmux'))
+      assert(system('tmux', '-S', socket, 'has-session', '-t', '__workspace_portal_keeper'))
+    ensure
+      system('tmux', '-S', socket, 'kill-server', out: File::NULL, err: File::NULL) if socket
+    end
+  end
+
+  def test_tmux_shutdown_cleanup_removes_a_socket_left_by_a_directory_rename
+    skip 'real tmux tests are disabled' if ENV['DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+
+    Dir.mktmpdir('workspace-host-tmux-rename-test') do |directory|
+      old_directory = File.join(directory, 'old')
+      new_directory = File.join(directory, 'new')
+      FileUtils.mkdir_p(old_directory)
+      old_socket = File.join(old_directory, 'tmux.sock')
+      new_socket = File.join(new_directory, 'tmux.sock')
+      system('tmux', '-S', old_socket, 'new-session', '-d', '-s', '__workspace_portal_keeper')
+      File.rename(old_directory, new_directory)
+      host = DevWorkspaceHost::Host.new(
+        env: host_environment(directory, config: File.join(directory, 'registry.json')),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert(system('tmux', '-S', new_socket, 'kill-server'))
+      assert(File.socket?(new_socket))
+      host.send(:remove_stopped_tmux_socket, new_socket)
+      refute(File.exist?(new_socket))
+    ensure
+      system('tmux', '-S', new_socket, 'kill-server', out: File::NULL, err: File::NULL) if new_socket
+      File.unlink(new_socket) if new_socket && File.socket?(new_socket)
+    end
+  end
+
+  def test_tmux_shutdown_cleanup_preserves_a_live_server_without_the_keeper
+    skip 'real tmux tests are disabled' if ENV['DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+
+    Dir.mktmpdir('workspace-host-live-tmux-test') do |directory|
+      socket = File.join(directory, 'tmux.sock')
+      system('tmux', '-S', socket, 'new-session', '-d', '-s', 'unrelated')
+      host = DevWorkspaceHost::Host.new(
+        env: host_environment(directory, config: File.join(directory, 'registry.json')),
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      host.send(:remove_stopped_tmux_socket, socket)
+      assert(File.socket?(socket))
+      assert(system('tmux', '-S', socket, 'has-session', '-t', 'unrelated'))
+    ensure
+      system('tmux', '-S', socket, 'kill-server', out: File::NULL, err: File::NULL) if socket
+    end
+  end
+
   def test_run_portal_applies_workspace_display_and_provider_configuration
     Dir.mktmpdir('workspace-host-portal-config-test') do |directory|
       root = make_workspace(directory, 'workspace')

@@ -401,12 +401,13 @@ module DevSession
       unless fields.fetch(0).match?(/\A\$[0-9]+\z/) && !fields.fetch(1).empty?
         raise Error, 'tmux returned an invalid session identity'
       end
-      id, name, mark, slug, workspace, environment_slug, socket_path,
+      id, name, mark, slug, workspace, environment_slug, reported_socket_path,
         codex_thread_id, codex_socket_path, codex_client_version, codex_pane_id,
         identity_token = fields
       unless identity_token.empty? || identity_token.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'tmux returned an invalid session identity'
       end
+      socket_path = @socket&.start_with?('/') ? @socket : reported_socket_path
       Session.new(
         id:, name:, mark:, slug:, workspace:, environment_slug:, socket_path:,
         codex_thread_id:, codex_socket_path:, codex_client_version:, codex_pane_id:,

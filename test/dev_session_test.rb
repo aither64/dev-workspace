@@ -7006,6 +7006,30 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_tmux_identity_uses_the_connected_socket_after_its_directory_is_renamed
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
+
+    Dir.mktmpdir('dev-session-renamed-socket-test') do |directory|
+      old_directory = File.join(directory, 'old')
+      new_directory = File.join(directory, 'new')
+      FileUtils.mkdir_p(old_directory)
+      old_socket = File.join(old_directory, 'tmux.sock')
+      new_socket = File.join(new_directory, 'tmux.sock')
+      slug = '2026-06-06-demo'
+      command_runner = DevSession::CommandRunner.new(out: StringIO.new, err: StringIO.new)
+
+      assert(system('tmux', '-S', old_socket, 'new-session', '-d', '-s', slug))
+      File.rename(old_directory, new_directory)
+      tmux = DevSession::Tmux.new(runner: command_runner, socket: new_socket)
+
+      assert_equal(old_socket, tmux.capture('display-message', '-p', '#{socket_path}').first.strip)
+      assert_equal(new_socket, tmux.session(slug).socket_path)
+    ensure
+      system('tmux', '-S', new_socket, 'kill-server', out: File::NULL, err: File::NULL) if new_socket
+      File.unlink(new_socket) if new_socket && File.socket?(new_socket)
+    end
+  end
+
   def test_tmux_conditional_retirement_kills_only_the_matching_identity
     skip 'tmux cannot run in this environment' unless tmux_test_available?
 
