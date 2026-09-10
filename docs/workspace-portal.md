@@ -78,7 +78,11 @@ default user config, state, runtime and profile paths, including portal
 lifecycle receipts and deletion recovery, without changing the generic command
 or environment-variable names. Keep the defaults for new deployments; use
 overrides only while an existing installation is moving its state to the
-generic namespace.
+generic namespace. `activationEnvironmentAliases` can name a
+validated legacy activation marker when the installed generation must invoke
+that compatibility package. The selected values are recorded in
+`share/dev-workspace/package.json` so a deployment-specific migration can
+verify both sides of a cutover before moving state.
 
 ## Host module
 

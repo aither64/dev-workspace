@@ -1,4 +1,5 @@
 {
+  activationEnvironmentAliases ? [ ],
   bash,
   buildGoModule,
   coreutils,
@@ -26,6 +27,17 @@
 }:
 let
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
+  validActivationEnvironmentAliases =
+    builtins.isList activationEnvironmentAliases
+    &&
+      builtins.length activationEnvironmentAliases
+      == builtins.length (lib.unique activationEnvironmentAliases)
+    && builtins.all (
+      name:
+      builtins.isString name
+      && builtins.match "[A-Z][A-Z0-9_]*" name != null
+      && name != "DEV_WORKSPACE_ACTIVATION"
+    ) activationEnvironmentAliases;
   validUserNamespace =
     builtins.stringLength userNamespace <= 63
     && builtins.match "[a-z0-9][a-z0-9-]*" userNamespace != null;
@@ -101,7 +113,15 @@ let
     }) providerNames;
   };
   extensionCatalog = writeText "dev-workspace-extensions.json" (builtins.toJSON extensionCatalogData);
+  packageConfiguration = writeText "dev-workspace-package.json" (
+    builtins.toJSON {
+      schema = 1;
+      inherit activationEnvironmentAliases routerSocket userNamespace;
+    }
+  );
 in
+assert lib.assertMsg validActivationEnvironmentAliases
+  "dev-workspace activation environment aliases must be unique uppercase names";
 assert lib.assertMsg validUserNamespace
   "dev-workspace user namespace must be a lowercase identifier";
 assert lib.assertMsg validRouterSocket
@@ -183,6 +203,7 @@ buildGoModule {
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
+    install -Dm644 ${packageConfiguration} "$out/share/dev-workspace/package.json"
     install -Dm644 ${src}/nix/systemd/workspace-* \
       -t "$out/share/systemd/user"
     substituteInPlace "$out/share/systemd/user/"workspace-*.service \
@@ -236,6 +257,8 @@ buildGoModule {
       makeWrapper "$out/libexec/workspace-host" "$out/bin/$command" \
         --set DEV_WORKSPACE_HOST_MODE "$command" \
         --set DEV_WORKSPACES_EXTENSION_CATALOG "$out/share/dev-workspace/extensions.json" \
+        --set DEV_WORKSPACE_ACTIVATION_ALIASES \
+          ${lib.escapeShellArg (lib.concatStringsSep ":" activationEnvironmentAliases)} \
         --set-default DEV_WORKSPACES_NAMESPACE ${lib.escapeShellArg userNamespace} \
         --set-default DEV_WORKSPACES_ROUTER_SOCKET ${lib.escapeShellArg routerSocket}
     done
@@ -247,6 +270,7 @@ buildGoModule {
     test -x "$out/bin/workspace-host"
     test -f "$out/share/workspace-portal/runtime-contract.json"
     test -f "$out/share/dev-workspace/extensions.json"
+    test -f "$out/share/dev-workspace/package.json"
     wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
     if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
       echo "wrapped helper has a non-store interpreter: $wrapped" >&2
@@ -275,6 +299,14 @@ buildGoModule {
       "$out/bin/workspace-host" --help >/dev/null
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/bin/dev-session" --help >/dev/null
+    if ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+      DEV_WORKSPACE_ACTIVATION_ALIASES=HOSTILE_WORKSPACE_ACTIVATION \
+      HOSTILE_WORKSPACE_ACTIVATION=1 \
+      "$out/bin/workspace-host" _activate >"$TMPDIR/hostile-activation" 2>&1; then
+      echo "ambient activation alias bypassed the packaged wrapper" >&2
+      exit 1
+    fi
+    grep -q 'workspace activation is private' "$TMPDIR/hostile-activation"
   '';
 
   meta = {

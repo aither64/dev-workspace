@@ -336,6 +336,35 @@ class WorkspaceHostTest < Minitest::Test
     assert_includes(error.message, 'invalid workspace user namespace')
   end
 
+  def test_private_activation_accepts_a_packaged_legacy_alias
+    host = DevWorkspaceHost::Host.new(
+      env: {
+        'HOME' => Dir.pwd,
+        'DEV_WORKSPACE_ACTIVATION_ALIASES' => 'PREVIOUS_WORKSPACE_ACTIVATION',
+        'PREVIOUS_WORKSPACE_ACTIVATION' => '1'
+      },
+      out: StringIO.new,
+      err: StringIO.new
+    )
+
+    assert(host.send(:private_activation?))
+  end
+
+  def test_private_activation_rejects_invalid_aliases
+    host = DevWorkspaceHost::Host.new(
+      env: {
+        'HOME' => Dir.pwd,
+        'DEV_WORKSPACE_ACTIVATION_ALIASES' => 'unsafe-name',
+        'unsafe-name' => '1'
+      },
+      out: StringIO.new,
+      err: StringIO.new
+    )
+
+    error = assert_raises(DevWorkspaceHost::Error) { host.send(:private_activation?) }
+    assert_includes(error.message, 'activation aliases are invalid')
+  end
+
   def test_run_portal_applies_workspace_display_and_provider_configuration
     Dir.mktmpdir('workspace-host-portal-config-test') do |directory|
       root = make_workspace(directory, 'workspace')

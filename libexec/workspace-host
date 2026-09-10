@@ -368,7 +368,7 @@ module DevWorkspaceHost
       when 'check-codex' then check_codex_command(argv)
       when 'reconcile-codex' then with_current_generation_lock { reconcile_codex(argv) }
       when '_activate'
-        raise Error, 'workspace activation is private' unless @env['DEV_WORKSPACE_ACTIVATION'] == '1'
+        raise Error, 'workspace activation is private' unless private_activation?
         activate(argv)
       when 'run-router' then run_router(argv)
       when 'run-portal' then run_portal(argv)
@@ -381,6 +381,15 @@ module DevWorkspaceHost
         raise Error, "unknown workspace-host command: #{command}"
       end
       0
+    end
+
+    def private_activation?
+      aliases = @env.fetch('DEV_WORKSPACE_ACTIVATION_ALIASES', '').split(':').reject(&:empty?)
+      unless aliases.uniq == aliases && aliases.all? { |name| name.match?(/\A[A-Z][A-Z0-9_]*\z/) }
+        raise Error, 'workspace activation aliases are invalid'
+      end
+
+      @env['DEV_WORKSPACE_ACTIVATION'] == '1' || aliases.any? { |name| @env[name] == '1' }
     end
 
     def usage

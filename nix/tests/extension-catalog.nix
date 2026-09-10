@@ -37,12 +37,20 @@ let
         routerSocket = "/tmp/router.sock";
       }) true
     )).success;
+  rejectsUnsafeActivationAlias =
+    !(builtins.tryEval (
+      builtins.deepSeq (mkPackage {
+        activationEnvironmentAliases = [ "unsafe-name" ];
+        inherit pkgs;
+      }) true
+    )).success;
 in
 assert rejectsLongName;
 assert rejectsMutableTarget;
 assert rejectsProgramCollision;
 assert rejectsUnsafeUserNamespace;
 assert rejectsUnsafeRouterSocket;
+assert rejectsUnsafeActivationAlias;
 pkgs.runCommand "dev-workspace-extension-catalog-validation" { } ''
   touch "$out"
 ''

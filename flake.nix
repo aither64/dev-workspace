@@ -24,6 +24,7 @@
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       mkPackage =
         {
+          activationEnvironmentAliases ? [ ],
           pkgs,
           extensions ? { },
           routerSocket ? hostPaths.routerSocket,
@@ -34,7 +35,12 @@
           codex = llm-agents.packages.${pkgs.system}.codex;
           codexWebSrc = codex-web;
           codexWebRev = codex-web.rev;
-          inherit extensions routerSocket userNamespace;
+          inherit
+            activationEnvironmentAliases
+            extensions
+            routerSocket
+            userNamespace
+            ;
         };
       runtimeContract = "${self}/portal/internal/session/runtime-contract.json";
       devWorkspace = mkPackage { inherit pkgs; };
