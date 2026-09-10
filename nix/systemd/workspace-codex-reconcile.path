@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch for a new aitherdev system generation
+Description=Watch for a new workspace host generation
 
 [Path]
 PathChanged=/run/current-system/sw

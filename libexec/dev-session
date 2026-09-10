@@ -86,7 +86,7 @@ module VpsfreeDevSession
     ENV_PORTAL_COMMAND => '--portal-command'
   }.freeze
 
-  DEFAULT_PORTAL_BASE_URL = 'https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz'
+  DEFAULT_PORTAL_BASE_URL = 'http://127.0.0.1:8080'
   PORTAL_MANIFEST = 'portal.yml'
   PRESERVED_MANIFEST_TRACKING_KEYS = %w[
     tracking_origin tracking_plan_sha256 tracking_state_sha256

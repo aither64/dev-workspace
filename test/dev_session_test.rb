@@ -3530,8 +3530,14 @@ class DevSessionTest < Minitest::Test
         assert_includes(command, "--workspace #{workspace}")
         assert_includes(command, "--session-slug #{slug}")
         assert_includes(command, "--worktrees-dir #{File.join(workspace, 'worktrees', slug)}")
-        assert_includes(command, '--portal-base-url https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz')
-        assert_includes(command, "--portal-url https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz/#{slug}/")
+        assert_includes(
+          command,
+          "--portal-base-url #{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}"
+        )
+        assert_includes(
+          command,
+          "--portal-url #{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/"
+        )
       end
       assert_equal('thread-recovered', File.read(thread_marker).strip)
     end
