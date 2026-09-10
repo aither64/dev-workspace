@@ -18,6 +18,7 @@
   systemd,
   tmux,
   util-linux,
+  writeText,
   extensions ? { },
   src,
 }:
@@ -59,9 +60,7 @@ let
       command = toString clusterProviders.${name}.command;
     }) providerNames;
   };
-  extensionCatalog = builtins.toFile "dev-workspace-extensions.json" (
-    builtins.toJSON extensionCatalogData
-  );
+  extensionCatalog = writeText "dev-workspace-extensions.json" (builtins.toJSON extensionCatalogData);
 in
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
