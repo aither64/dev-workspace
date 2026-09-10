@@ -18,7 +18,7 @@ const {
   fileChangeDiffs, formatElapsed,
   activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
-  configureDurableAttemptStore,
+  configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
 
 const baseURL = process.argv[2];
@@ -289,6 +289,27 @@ assert.equal(autoResolutionLabel(1000, 2000, 62000, false), "");
 assert.equal(autoResolutionLabel(2000, 2000, 62000, false), "Auto-resolves unanswered in 60s.");
 assert.equal(autoResolutionLabel(2000, 2000, 62000, true), "Auto-resolution paused while you answer.");
 
+const selectedModes = [];
+const modeContainer = {
+  ownerDocument: {
+    createElement: () => ({
+      dataset: {},
+      addEventListener(_name, listener) { this.activate = listener; },
+    }),
+  },
+  replaceChildren(...children) { this.children = children; },
+};
+const modeButtons = renderCollaborationModes(modeContainer, [
+  {mode: "default", name: "Default"},
+  {mode: "plan", name: "Plan"},
+  {mode: "review", name: "Review", description: "Review the current change"},
+], (mode) => selectedModes.push(mode));
+assert.deepEqual(modeButtons.map((button) => button.dataset.codexMode), ["default", "plan", "review"]);
+assert.equal(modeButtons[2].textContent, "Review");
+assert.equal(modeButtons[2].title, "Review the current change");
+modeButtons[2].activate();
+assert.deepEqual(selectedModes, ["review"]);
+
 const stored = new Map();
 const storage = {
   get length() { return stored.size; },
@@ -486,6 +507,8 @@ if (!unitOnly) {
   assert.match(sessionHTML, /id="codex-model"[^>]+data-existing-settings="true"/);
   assert.match(sessionHTML, /id="codex-work"/);
   assert.match(sessionHTML, /id="lifecycle-operation-status"/);
+  assert.match(sessionHTML, /id="codex-mode"[^>]*><\/div>/);
+  assert.doesNotMatch(sessionHTML, /data-codex-mode=/);
   assert.doesNotMatch(sessionHTML, /codex-settings-dialog|codex-settings-open/);
 
   const thread = await client.thread();

@@ -326,6 +326,24 @@
     }
     return [];
   };
+  const renderCollaborationModes = (container, modes, selectMode = () => {}) => {
+    if (!container) return [];
+    const ownerDocument = container.ownerDocument || document;
+    const buttons = (modes || []).filter((mode) => (
+      mode && typeof mode.mode === "string" && mode.mode
+    )).map((mode) => {
+      const button = ownerDocument.createElement("button");
+      button.type = "button";
+      button.className = mode.mode === "plan" ? "quiet plan-mode" : "quiet";
+      button.dataset.codexMode = mode.mode;
+      button.textContent = mode.name || mode.mode;
+      if (mode.description) button.title = mode.description;
+      button.addEventListener("click", () => selectMode(mode.mode));
+      return button;
+    });
+    container.replaceChildren(...buttons);
+    return buttons;
+  };
   const attemptStoragePrefix = (kind, slug, threadId) => (
     `workspace-portal.${kind}-attempt.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.`
   );
@@ -505,6 +523,7 @@
       markTranscriptMessagesObserved, matchingSendAttempt,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript,
+      renderCollaborationModes,
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
@@ -810,7 +829,7 @@
     document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
     const modeToggle = document.getElementById("codex-mode");
     const availableModes = new Set(collaborationModes.map((mode) => mode.mode));
-    const hasModeToggle = availableModes.has("default") && availableModes.has("plan") && currentMode;
+    const hasModeToggle = availableModes.size > 0 && currentMode;
     if (modeToggle) modeToggle.hidden = !hasModeToggle;
     document.querySelectorAll("[data-codex-mode]").forEach((button) => {
       const active = button.dataset.codexMode === currentMode;
@@ -1469,12 +1488,36 @@
     if (interruptButton) interruptButton.disabled = !threadActive;
   };
 
+  const saveCollaborationMode = async (mode) => {
+    const controls = Array.from(document.querySelectorAll(
+      "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
+    ));
+    controls.forEach((control) => { control.disabled = true; });
+    try {
+      const saved = await client.settings(undefined, undefined, mode);
+      currentModel = saved.model;
+      currentEffort = saved.reasoningEffort;
+      currentMode = saved.collaborationMode || currentMode;
+      applyCurrentSettings();
+      scheduleRefresh(0);
+    } catch (error) { alert(error.message); }
+    finally {
+      controls.forEach((control) => { control.disabled = false; });
+      applyCurrentSettings();
+      updateMessageActions();
+    }
+  };
+
   const loadCollaborationModes = async () => {
     try {
       collaborationModes = await client.modes();
+      renderCollaborationModes(
+        document.getElementById("codex-mode"), collaborationModes, saveCollaborationMode,
+      );
       applyCurrentSettings();
     } catch (_error) {
       collaborationModes = [];
+      renderCollaborationModes(document.getElementById("codex-mode"), []);
       applyCurrentSettings();
     }
   };
@@ -2157,28 +2200,6 @@
       await refreshQueue();
       scheduleRefresh(0);
     }
-  });
-
-  document.querySelectorAll("[data-codex-mode]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const controls = Array.from(document.querySelectorAll(
-        "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
-      ));
-      controls.forEach((control) => { control.disabled = true; });
-      try {
-        const saved = await client.settings(undefined, undefined, button.dataset.codexMode);
-        currentModel = saved.model;
-        currentEffort = saved.reasoningEffort;
-        currentMode = saved.collaborationMode || currentMode;
-        applyCurrentSettings();
-        scheduleRefresh(0);
-      } catch (error) { alert(error.message); }
-      finally {
-        controls.forEach((control) => { control.disabled = false; });
-        applyCurrentSettings();
-        updateMessageActions();
-      }
-    });
   });
 
   const planActions = document.getElementById("plan-actions");
