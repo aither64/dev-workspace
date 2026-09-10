@@ -19,7 +19,7 @@ This works anywhere under the registered root, including `work/` and
 name the workspace before the subcommand:
 
 ```sh
-dev-session --workspace vpsfree-cz start api-token-rotation
+dev-session --workspace example-workspace start api-token-rotation
 ```
 
 If only one workspace is registered, it is the fallback outside its root. Once
@@ -87,14 +87,14 @@ The first window is named `dev` and contains three panes:
 
 Managed tmux panes and worktree windows receive these environment variables:
 
-- `VPSFREE_DEV_SESSION_SLUG`;
-- `VPSFREE_DEV_SESSION_WORKSPACE`;
-- `VPSFREE_DEV_SESSION_WORK_DIR`;
-- `VPSFREE_DEV_SESSION_WORKTREES_DIR`;
-- `VPSFREE_DEV_SESSION_PORTAL_BASE_URL`, the reusable portal origin;
-- `VPSFREE_DEV_SESSION_URL`, the resolved link for this session.
+- `DEV_SESSION_SLUG`;
+- `DEV_SESSION_WORKSPACE`;
+- `DEV_SESSION_WORK_DIR`;
+- `DEV_SESSION_WORKTREES_DIR`;
+- `DEV_SESSION_PORTAL_BASE_URL`, the reusable portal origin;
+- `DEV_SESSION_URL`, the resolved link for this session.
 
-Do not use `VPSFREE_DEV_SESSION_URL` as the input for another session. Its
+Do not use `DEV_SESSION_URL` as the input for another session. Its
 value already contains the current slug. The registry-backed dispatcher passes
 the base URL explicitly and exports both values into each managed pane.
 
@@ -189,8 +189,8 @@ cwd under `work/<slug>` / `worktrees/<slug>`. It never falls back to tmux's
 server-current session when called outside a tmux pane. It exits with an error
 when no active session can be found or when those sources disagree. Codex
 instances should run it before creating a new initiative slug. The helper
-accepts session identity only when both `VPSFREE_DEV_SESSION_SLUG` and the
-canonical `VPSFREE_DEV_SESSION_WORKSPACE` match. It filters managed sessions
+accepts session identity only when both `DEV_SESSION_SLUG` and the
+canonical `DEV_SESSION_WORKSPACE` match. It filters managed sessions
 owned by other workspaces from listing and short-name lookup.
 
 Managed sessions created before workspace identity metadata was introduced are
@@ -214,7 +214,7 @@ The command requires an interactive terminal and asks for one `y/N`
 confirmation. There is no noninteractive confirmation flag. The command
 independently inventories each canonical worktree owned by the exact session,
 including its repository identity, branch, head, and dirty state, then retires
-the matching Codex thread, releases vpsAdmin and vpsAdminOS clusters, removes
+the matching Codex thread, releases configured development clusters, removes
 the worktrees, stops the managed tmux session, removes runtime authority, and
 moves the tracking directory and creation journal to private recovery storage.
 It records each completed phase in a private journal, so rerunning the same
@@ -235,7 +235,7 @@ that thread's durable send and queue attempts.
 Recovery state is stored under:
 
 ```text
-$XDG_STATE_HOME/vpsfree-workspaces/removed/<workspace-id>/
+$XDG_STATE_HOME/dev-workspaces/removed/<workspace-id>/
 ```
 
 The session disappears from active and archived discovery. Git branches are
@@ -370,14 +370,14 @@ as archive.
 Create a project worktree through the canonical bare repository:
 
 ```sh
-dev-session worktree add api-token-rotation vpsadmin
+dev-session worktree add api-token-rotation api-service
 ```
 
 This uses:
 
-- bare repo: `repos/vpsadmin.git`;
+- bare repo: `repos/api-service.git`;
 - branch: `<slug>`;
-- worktree path: `worktrees/<slug>/vpsadmin`;
+- worktree path: `worktrees/<slug>/api-service`;
 - base ref: `origin/HEAD`, falling back to `origin/master`;
 - `git fetch origin` before creation.
 
@@ -410,15 +410,15 @@ non-bare repositories remain refused.
 Useful options:
 
 ```sh
-dev-session worktree add api-token-rotation vpsadmin --base origin/main
-dev-session worktree add api-token-rotation vpsadmin --name vpsadmin-master --branch master
-dev-session worktree add api-token-rotation vpsadmin --no-fetch
+dev-session worktree add api-token-rotation api-service --base origin/main
+dev-session worktree add api-token-rotation api-service --name api-service-master --branch master
+dev-session worktree add api-token-rotation api-service --no-fetch
 ```
 
 Remove a worktree without deleting its branch:
 
 ```sh
-dev-session worktree remove api-token-rotation vpsadmin
+dev-session worktree remove api-token-rotation api-service
 ```
 
 Worktrees with changes reported by ordinary `git status --porcelain` are
@@ -432,7 +432,7 @@ the worktree is intentional.
 The workspace flake installs the public commands and user systemd units in a
 dedicated user Nix profile. A private registry maps workspace names to roots
 and hostnames. Per-workspace portal, App Server, authority, and tmux state lives
-below `$XDG_RUNTIME_DIR/vpsfree-workspaces/`; the public command derives those
+below `$XDG_RUNTIME_DIR/dev-workspaces/`; the public command derives those
 paths and does not require callers to repeat them. Run
 `dev-session validate` to validate every persisted portal entry, including its
 plan, anchored lifecycle, active/archive placement, and manifest, before

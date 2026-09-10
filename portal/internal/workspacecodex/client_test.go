@@ -232,7 +232,7 @@ func TestRecoverForkThreadResumesMatchingPersistedFork(t *testing.T) {
 	defer cancel()
 	id, err := client.RecoverForkThread(
 		ctx, "thread-source", "/workspace/work/fork",
-		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"}, codex.ThreadSettings{},
+		map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"}, codex.ThreadSettings{},
 	)
 	if err != nil || id != "thread-fork" {
 		t.Fatalf("recovered fork = %q, %v", id, err)
@@ -300,7 +300,7 @@ func TestRecoverArchivedThreadUnarchivesAndResumesExactIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	id, err := client.RecoverArchivedThread(
-		ctx, threadID, cwd, map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+		ctx, threadID, cwd, map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"},
 	)
 	if err != nil || id != threadID {
 		t.Fatalf("recovered thread = %q, %v", id, err)
@@ -453,7 +453,7 @@ func TestRecoverCreatingThreadIgnoresLoadedStructuredSources(t *testing.T) {
 	defer cancel()
 	id, err := client.RecoverCreatingThread(
 		ctx, "", "/workspace/work/example",
-		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+		map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"},
 	)
 	if err != nil || id != "thread-new" {
 		t.Fatalf("structured unrelated source recovery = %q, %v", id, err)
@@ -656,12 +656,12 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		t.Fatal(err)
 	}
 	environment := map[string]string{
-		"VPSFREE_DEV_SESSION_SLUG":            "example",
-		"VPSFREE_DEV_SESSION_WORKSPACE":       "/workspace",
-		"VPSFREE_DEV_SESSION_WORK_DIR":        "/workspace/work/example",
-		"VPSFREE_DEV_SESSION_WORKTREES_DIR":   "/workspace/worktrees/example",
-		"VPSFREE_DEV_SESSION_PORTAL_BASE_URL": "https://workspace.example",
-		"VPSFREE_DEV_SESSION_URL":             "https://workspace.example/example/",
+		"DEV_SESSION_SLUG":            "example",
+		"DEV_SESSION_WORKSPACE":       "/workspace",
+		"DEV_SESSION_WORK_DIR":        "/workspace/work/example",
+		"DEV_SESSION_WORKTREES_DIR":   "/workspace/worktrees/example",
+		"DEV_SESSION_PORTAL_BASE_URL": "https://workspace.example",
+		"DEV_SESSION_URL":             "https://workspace.example/example/",
 	}
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
@@ -716,7 +716,7 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		}
 		policy := config["shell_environment_policy"].(map[string]any)
 		set := policy["set"].(map[string]any)
-		if set["VPSFREE_DEV_SESSION_PORTAL_BASE_URL"] != "https://workspace.example" {
+		if set["DEV_SESSION_PORTAL_BASE_URL"] != "https://workspace.example" {
 			return fmt.Errorf("persisted thread runtime environment was not refreshed: %#v", set)
 		}
 		return writeObject(connection, map[string]any{
@@ -787,7 +787,7 @@ func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testi
 	defer cancel()
 	id, err := client.RecoverCreatingThread(
 		ctx, "thread-vanished", "/workspace/work/example", map[string]string{
-			"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+			"DEV_SESSION_WORKSPACE": "/workspace",
 		},
 	)
 	if err != nil {
@@ -881,7 +881,7 @@ func TestRecoverCreatingThreadRejectsDifferentMaterializedCandidate(t *testing.T
 		ctx,
 		"thread-vanished",
 		"/workspace/work/example",
-		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+		map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"},
 	)
 	if err == nil || !strings.Contains(err.Error(), "different materialized") {
 		t.Fatalf("different materialized candidate result = %v", err)

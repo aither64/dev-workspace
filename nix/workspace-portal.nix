@@ -7,26 +7,67 @@
   codexWebRev,
   git,
   gh,
-  gnugrep,
+  jq,
   lib,
   makeWrapper,
   nodejs,
   nix,
   openssl,
-  jq,
   python3,
   ruby,
   systemd,
   tmux,
   util-linux,
+  extensions ? { },
   src,
 }:
 let
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
+  extensionCommands = extensions.commands or { };
+  extensionSkills = extensions.skills or { };
+  clusterProviders = extensions.clusterProviders or { };
+  validName = name: builtins.match "[a-z0-9][a-z0-9-]*" name != null;
+  commandNames = builtins.attrNames extensionCommands;
+  skillNames = builtins.attrNames extensionSkills;
+  providerNames = builtins.attrNames clusterProviders;
+  providerPrograms = map (name: "${name}-devcluster") providerNames;
+  allNamesValid = builtins.all validName (commandNames ++ skillNames ++ providerNames);
+  providersValid = builtins.all (
+    name:
+    let
+      provider = clusterProviders.${name};
+    in
+    builtins.isAttrs provider
+    && provider ? label
+    && provider ? command
+    && builtins.isString provider.label
+    && provider.label != ""
+  ) providerNames;
+  extensionCatalogData = {
+    schema = 1;
+    commands = map (name: {
+      inherit name;
+      path = toString extensionCommands.${name};
+    }) commandNames;
+    skills = map (name: {
+      inherit name;
+      path = toString extensionSkills.${name};
+    }) skillNames;
+    clusterProviders = map (name: {
+      id = name;
+      inherit (clusterProviders.${name}) label;
+      command = toString clusterProviders.${name}.command;
+    }) providerNames;
+  };
+  extensionCatalog = builtins.toFile "dev-workspace-extensions.json" (
+    builtins.toJSON extensionCatalogData
+  );
 in
+assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
+assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
 buildGoModule {
   pname = "dev-workspace";
-  version = "0.1.0";
+  version = "0.2.0";
 
   inherit src;
   modRoot = "portal";
@@ -64,11 +105,8 @@ buildGoModule {
     export LC_ALL=C.UTF-8
     export SHELL=${bash}/bin/bash
     export TMUX_TMPDIR="$TMPDIR/tmux"
-    export VPSFREE_DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
+    export DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
     mkdir -p "$HOME" "$TMUX_TMPDIR"
-    patchShebangs \
-      ../dev-clusters/vpsadmin/bin/devcluster \
-      ../dev-clusters/vpsadminos/bin/devcluster
     ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
@@ -76,14 +114,13 @@ buildGoModule {
     (
       cd ..
       ruby test/dev_session_test.rb
-      ruby test/devcluster_status_test.rb
       ruby test/workspace_host_test.rb
     )
     runHook postCheck
   '';
 
   postInstall = ''
-    mkdir -p "$out/libexec"
+    mkdir -p "$out/libexec/workspace-portal" "$out/share/dev-workspace"
     ln -s ${codex} "$out/libexec/codex"
     install -Dm755 ${src}/libexec/dev-session \
       "$out/libexec/workspace-portal/dev-session"
@@ -99,25 +136,32 @@ buildGoModule {
       "$out/share/workspace-portal/codex-client.go"
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
+    install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
     install -Dm644 ${src}/nix/systemd/workspace-* \
       -t "$out/share/systemd/user"
-    cp -R ${src}/dev-clusters/vpsadmin "$out/share/workspace-portal/vpsadmin-devcluster"
-    cp -R ${src}/dev-clusters/vpsadminos "$out/share/workspace-portal/vpsadminos-devcluster"
-    cp -R ${src}/dev-clusters/lib "$out/share/workspace-portal/lib"
+    ${lib.concatMapStringsSep "\n" (name: ''
+      ln -s ${lib.escapeShellArg (toString extensionCommands.${name})} \
+        "$out/bin/${name}"
+    '') commandNames}
+    mkdir -p "$out/share/codex/skills"
+    ${lib.concatMapStringsSep "\n" (name: ''
+      ln -s ${lib.escapeShellArg (toString extensionSkills.${name})} \
+        "$out/share/codex/skills/${name}"
+    '') skillNames}
+    ${lib.concatMapStringsSep "\n" (name: ''
+      ln -s ${lib.escapeShellArg (toString clusterProviders.${name}.command)} \
+        "$out/libexec/workspace-portal/${name}-devcluster"
+    '') providerNames}
+
     substituteInPlace "$out/libexec/workspace-portal/dev-session" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
     substituteInPlace "$out/libexec/workspace-host" \
       --replace-fail '#!/usr/bin/env ruby' '#!${ruby}/bin/ruby'
-    substituteInPlace \
-      "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
-      "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
-      --replace-fail '#!/usr/bin/env bash' '#!${bash}/bin/bash'
 
     runtimePath=${
       lib.makeBinPath [
         coreutils
         git
-        gnugrep
         ruby
         tmux
       ]
@@ -138,52 +182,35 @@ buildGoModule {
     }
     wrapProgram "$out/libexec/workspace-host" \
       --prefix PATH : "$hostRuntimePath"
-    clusterRuntimePath=${
-      lib.makeBinPath [
-        bash
-        coreutils
-        git
-        gnugrep
-        jq
-        openssl
-        util-linux
-      ]
-    }
-    makeWrapper "$out/share/workspace-portal/vpsadmin-devcluster/bin/devcluster" \
-      "$out/libexec/workspace-portal/vpsadmin-devcluster" --prefix PATH : "$clusterRuntimePath"
-    makeWrapper "$out/share/workspace-portal/vpsadminos-devcluster/bin/devcluster" \
-      "$out/libexec/workspace-portal/vpsadminos-devcluster" --prefix PATH : "$clusterRuntimePath"
-    for command in workspace-host dev-session vpsadmin-devcluster vpsadminos-devcluster; do
+    for command in workspace-host dev-session ${lib.concatStringsSep " " providerPrograms}; do
       makeWrapper "$out/libexec/workspace-host" "$out/bin/$command" \
-        --set VPSFREE_WORKSPACE_HOST_MODE "$command"
+        --set DEV_WORKSPACE_HOST_MODE "$command" \
+        --set DEV_WORKSPACES_EXTENSION_CATALOG "$out/share/dev-workspace/extensions.json"
     done
   '';
 
   postFixup = ''
-        mkdir -p "$TMPDIR/workspace"
-        test -x "$out/bin/dev-session"
-        test -x "$out/bin/workspace-host"
-        test -f "$out/share/workspace-portal/runtime-contract.json"
-        wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
-        if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
-          echo "wrapped helper has a non-store interpreter: $wrapped" >&2
-          exit 1
-        fi
-        wrapped="$out/libexec/.workspace-host-wrapped"
-        if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
-          echo "wrapped helper has a non-store interpreter: $wrapped" >&2
-          exit 1
-        fi
-        for program in vpsadmin-devcluster vpsadminos-devcluster; do
-          if ! head -n 1 "$out/bin/$program" | grep -Eq '^#! */nix/store/'; then
-            echo "cluster helper has a non-store interpreter: $out/bin/$program" >&2
-            exit 1
-          fi
-          ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
-            VPSFREE_DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
-            "$out/libexec/workspace-portal/$program" --help >/dev/null
-        done
-
+    mkdir -p "$TMPDIR/workspace"
+    test -x "$out/bin/dev-session"
+    test -x "$out/bin/workspace-host"
+    test -f "$out/share/workspace-portal/runtime-contract.json"
+    test -f "$out/share/dev-workspace/extensions.json"
+    wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
+    if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+      echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+      exit 1
+    fi
+    wrapped="$out/libexec/.workspace-host-wrapped"
+    if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
+      echo "wrapped helper has a non-store interpreter: $wrapped" >&2
+      exit 1
+    fi
+    ${lib.concatMapStringsSep "\n" (name: ''
+      test -x "$out/bin/${name}-devcluster"
+      ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+        DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
+        "$out/bin/${name}-devcluster" --help >/dev/null
+    '') providerNames}
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/libexec/workspace-portal/dev-session" --help >/dev/null
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \

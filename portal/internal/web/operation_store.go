@@ -50,7 +50,7 @@ func newLifecycleOperationStore(workspace, configuredDirectory string) (*lifecyc
 		workspaceDigest := sha256.Sum256([]byte(workspace))
 		workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(workspaceDigest[:8])
 		directory = filepath.Join(
-			absoluteStateHome, "vpsfree-workspaces", "portal", workspaceID,
+			absoluteStateHome, "dev-workspaces", "portal", workspaceID,
 		)
 	} else {
 		absoluteDirectory, err := filepath.Abs(directory)

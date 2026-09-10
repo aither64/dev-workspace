@@ -85,22 +85,14 @@ type Status struct {
 }
 
 type Runner struct {
-	Workspace  string
-	Vpsadmin   string
-	VpsadminOS string
+	Workspace string
+	Providers []Provider
 }
 
-type provider struct {
-	name   string
-	label  string
-	helper string
-}
-
-func (r Runner) providers() []provider {
-	return []provider{
-		{name: "vpsadmin", label: "vpsAdmin", helper: r.Vpsadmin},
-		{name: "vpsadminos", label: "vpsAdminOS", helper: r.VpsadminOS},
-	}
+type Provider struct {
+	Name   string
+	Label  string
+	Helper string
 }
 
 func (r Runner) Inspect(slug string) ([]Status, error) {
@@ -118,12 +110,12 @@ func (r Runner) InspectContext(ctx context.Context, slug string) ([]Status, erro
 		found  bool
 		err    error
 	}
-	providers := r.providers()
+	providers := r.Providers
 	results := make([]result, len(providers))
 	var wait sync.WaitGroup
 	wait.Add(len(providers))
 	for index, currentProvider := range providers {
-		go func(index int, currentProvider provider) {
+		go func(index int, currentProvider Provider) {
 			defer wait.Done()
 			results[index].status, results[index].found, results[index].err =
 				r.inspectProvider(ctx, currentProvider, slug)
@@ -135,7 +127,7 @@ func (r Runner) InspectContext(ctx context.Context, slug string) ([]Status, erro
 	for index, provider := range providers {
 		result := results[index]
 		if result.err != nil {
-			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.name, result.err))
+			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.Name, result.err))
 			continue
 		}
 		if result.found {
@@ -152,8 +144,8 @@ func (r Runner) MayExist(slug string) bool {
 	if !validSlug(slug) {
 		return false
 	}
-	for _, provider := range r.providers() {
-		path := filepath.Join(r.Workspace, ".dev-clusters", provider.name, "clusters", slug)
+	for _, provider := range r.Providers {
+		path := filepath.Join(r.Workspace, ".dev-clusters", provider.Name, "clusters", slug)
 		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 			return true
 		}
@@ -166,9 +158,9 @@ func (r Runner) MayExist(slug string) bool {
 // a cluster cannot appear between a one-time status snapshot and finalization.
 func (r Runner) ReleaseAll(ctx context.Context, slug string) error {
 	var problems []error
-	for _, provider := range r.providers() {
+	for _, provider := range r.Providers {
 		if err := r.releaseProvider(ctx, provider, slug); err != nil {
-			problems = append(problems, fmt.Errorf("release %s cluster: %w", provider.label, err))
+			problems = append(problems, fmt.Errorf("release %s cluster: %w", provider.Label, err))
 		}
 	}
 	return errors.Join(problems...)
@@ -178,20 +170,20 @@ func (r Runner) Release(ctx context.Context, kind, slug string) error {
 	if !validSlug(slug) {
 		return errors.New("invalid session slug")
 	}
-	for _, provider := range r.providers() {
-		if provider.name == kind {
+	for _, provider := range r.Providers {
+		if provider.Name == kind {
 			return r.releaseProvider(ctx, provider, slug)
 		}
 	}
 	return errors.New("unknown development cluster")
 }
 
-func (r Runner) releaseProvider(ctx context.Context, provider provider, slug string) error {
-	if provider.helper == "" || !filepath.IsAbs(provider.helper) {
+func (r Runner) releaseProvider(ctx context.Context, provider Provider, slug string) error {
+	if provider.Helper == "" || !filepath.IsAbs(provider.Helper) {
 		return errors.New("development cluster helper is unavailable")
 	}
-	command := exec.Command(provider.helper, "reset", slug)
-	command.Env = append(os.Environ(), "VPSFREE_DEVCLUSTER_WORKSPACE="+r.Workspace)
+	command := exec.Command(provider.Helper, "reset", slug)
+	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace)
 	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -203,17 +195,17 @@ func (r Runner) releaseProvider(ctx context.Context, provider provider, slug str
 	return nil
 }
 
-func (r Runner) inspectProvider(parent context.Context, provider provider, slug string) (Status, bool, error) {
-	if provider.helper == "" {
+func (r Runner) inspectProvider(parent context.Context, provider Provider, slug string) (Status, bool, error) {
+	if provider.Helper == "" {
 		return Status{}, false, nil
 	}
-	if !filepath.IsAbs(provider.helper) {
+	if !filepath.IsAbs(provider.Helper) {
 		return Status{}, false, errors.New("development cluster helper is not absolute")
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	command := exec.Command(provider.helper, "status", slug, "--json")
-	command.Env = append(os.Environ(), "VPSFREE_DEVCLUSTER_WORKSPACE="+r.Workspace)
+	command := exec.Command(provider.Helper, "status", slug, "--json")
+	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace)
 	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -235,7 +227,7 @@ func (r Runner) inspectProvider(parent context.Context, provider provider, slug 
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Status{}, false, errors.New("development cluster helper returned trailing output")
 	}
-	if (response.Schema != 1 && response.Schema != 2) || response.Kind != provider.name {
+	if (response.Schema != 1 && response.Schema != 2) || response.Kind != provider.Name {
 		return Status{}, false, errors.New("development cluster helper returned an incompatible status")
 	}
 	if response.Label != "" {
@@ -255,7 +247,7 @@ func (r Runner) inspectProvider(parent context.Context, provider provider, slug 
 		response.Links = nil
 		response.Credentials = nil
 	}
-	response.Label = provider.label
+	response.Label = provider.Label
 	return response.Status, true, nil
 }
 

@@ -12,10 +12,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -56,19 +60,19 @@ func (runtime threadRuntime) complete() bool {
 
 func (runtime threadRuntime) environment() map[string]string {
 	return map[string]string{
-		"VPSFREE_DEV_SESSION_SLUG":            runtime.Slug,
-		"VPSFREE_DEV_SESSION_WORKSPACE":       runtime.Workspace,
-		"VPSFREE_DEV_SESSION_WORK_DIR":        runtime.WorkDir,
-		"VPSFREE_DEV_SESSION_WORKTREES_DIR":   runtime.WorktreesDir,
-		"VPSFREE_DEV_SESSION_PORTAL_BASE_URL": runtime.PortalBaseURL,
-		"VPSFREE_DEV_SESSION_URL":             runtime.PortalURL,
-		"VPSFREE_DEV_SESSION_AUTHORITY_DIR":   runtime.AuthorityDir,
-		"VPSFREE_DEV_SESSION_TMUX_SOCKET":     runtime.TmuxSocket,
-		"VPSFREE_DEV_SESSION_CODEX":           runtime.CodexCommand,
-		"VPSFREE_DEV_SESSION_CODEX_SOCKET":    runtime.CodexSocket,
-		"VPSFREE_DEV_SESSION_CODEX_VERSION":   runtime.CodexVersion,
-		"VPSFREE_DEV_SESSION_PORTAL_COMMAND":  runtime.PortalCommand,
-		"VPSFREE_DEV_SESSION_REQUIRE_RUNTIME": "1",
+		"DEV_SESSION_SLUG":            runtime.Slug,
+		"DEV_SESSION_WORKSPACE":       runtime.Workspace,
+		"DEV_SESSION_WORK_DIR":        runtime.WorkDir,
+		"DEV_SESSION_WORKTREES_DIR":   runtime.WorktreesDir,
+		"DEV_SESSION_PORTAL_BASE_URL": runtime.PortalBaseURL,
+		"DEV_SESSION_URL":             runtime.PortalURL,
+		"DEV_SESSION_AUTHORITY_DIR":   runtime.AuthorityDir,
+		"DEV_SESSION_TMUX_SOCKET":     runtime.TmuxSocket,
+		"DEV_SESSION_CODEX":           runtime.CodexCommand,
+		"DEV_SESSION_CODEX_SOCKET":    runtime.CodexSocket,
+		"DEV_SESSION_CODEX_VERSION":   runtime.CodexVersion,
+		"DEV_SESSION_PORTAL_COMMAND":  runtime.PortalCommand,
+		"DEV_SESSION_REQUIRE_RUNTIME": "1",
 	}
 }
 
@@ -106,7 +110,28 @@ type serveOptions struct {
 	hostProfile, transitionLock                              string
 	codexSocket, codexVersion                                string
 	gh, tmux                                                 string
-	vpsadminCluster, vpsadminOSCluster                       string
+	clusterProviders                                         clusterProviderValues
+}
+
+var clusterProviderName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+type clusterProviderValues []cluster.Provider
+
+func (values *clusterProviderValues) String() string { return "" }
+
+func (values *clusterProviderValues) Set(value string) error {
+	parts := strings.SplitN(value, "=", 3)
+	if len(parts) != 3 || !clusterProviderName.MatchString(parts[0]) || parts[1] == "" ||
+		!filepath.IsAbs(parts[2]) {
+		return errors.New("cluster provider must be ID=LABEL=/absolute/helper")
+	}
+	for _, existing := range *values {
+		if existing.Name == parts[0] {
+			return fmt.Errorf("duplicate cluster provider %q", parts[0])
+		}
+	}
+	*values = append(*values, cluster.Provider{Name: parts[0], Label: parts[1], Helper: parts[2]})
+	return nil
 }
 
 func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
@@ -126,8 +151,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.codexVersion, "codex-version", "", "Codex client version used by attached terminal sessions")
 	flags.StringVar(&options.gh, "gh", "gh", "GitHub CLI executable")
 	flags.StringVar(&options.tmux, "tmux", "tmux", "tmux executable")
-	flags.StringVar(&options.vpsadminCluster, "vpsadmin-cluster", "", "absolute vpsAdmin development cluster helper")
-	flags.StringVar(&options.vpsadminOSCluster, "vpsadminos-cluster", "", "absolute vpsAdminOS development cluster helper")
+	flags.Var(&options.clusterProviders, "cluster-provider", "ID=LABEL=/absolute/helper (repeatable)")
 	return flags, options
 }
 
@@ -143,11 +167,10 @@ func serve(args []string) error {
 		Workspace: options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
 		HostLabel: options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
-		TransitionLock:  options.transitionLock,
-		CodexSocket:     options.codexSocket,
-		CodexVersion:    options.codexVersion,
-		VpsadminCluster: options.vpsadminCluster, VpsadminOSCluster: options.vpsadminOSCluster,
-		Logger: logger, Codex: codexClient,
+		TransitionLock: options.transitionLock,
+		CodexSocket:    options.codexSocket, CodexVersion: options.codexVersion,
+		ClusterProviders: options.clusterProviders,
+		Logger:           logger, Codex: codexClient,
 	})
 	if err != nil {
 		return err

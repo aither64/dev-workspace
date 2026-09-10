@@ -11,13 +11,13 @@ import (
 
 func TestActiveRepositoriesDiscoversCanonicalUnregisteredWorktree(t *testing.T) {
 	workspace := t.TempDir()
-	repository := filepath.Join(workspace, "repos", "vpsadminos.git")
-	worktree := filepath.Join(workspace, "worktrees", "2026-09-04-test", "vpsadminos")
+	repository := filepath.Join(workspace, "repos", "beta.git")
+	worktree := filepath.Join(workspace, "worktrees", "2026-09-04-test", "beta")
 	if err := os.MkdirAll(filepath.Dir(repository), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, "init", "--bare", "--initial-branch=master", repository)
-	runGit(t, "--git-dir="+repository, "config", "remote.origin.url", "git@github.com:vpsfreecz/vpsadminos.git")
+	runGit(t, "--git-dir="+repository, "config", "remote.origin.url", "git@github.com:example-org/beta.git")
 	runGit(t, "--git-dir="+repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
 	seed := t.TempDir()
 	runGit(t, "init", "--initial-branch=master", seed)
@@ -39,18 +39,18 @@ func TestActiveRepositoriesDiscoversCanonicalUnregisteredWorktree(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(repositories) != 1 || repositories[0].Name != "vpsadminos" ||
-		repositories[0].Project != "vpsadminos" || repositories[0].GitHub != "vpsfreecz/vpsadminos" {
+	if len(repositories) != 1 || repositories[0].Name != "beta" ||
+		repositories[0].Project != "beta" || repositories[0].GitHub != "example-org/beta" {
 		t.Fatalf("repositories = %#v", repositories)
 	}
 }
 
 func TestMergeActiveRepositoriesRejectsConflictingRegistration(t *testing.T) {
 	registered := []Repository{{
-		Name: "vpsadminos", Project: "vpsadminos", Branch: "feature", GitHub: "vpsfreecz/vpsadminos",
+		Name: "beta", Project: "beta", Branch: "feature", GitHub: "example-org/beta",
 	}}
 	discovered := []Repository{{
-		Name: "vpsadminos", Project: "vpsadminos", Branch: "different", GitHub: "vpsfreecz/vpsadminos",
+		Name: "beta", Project: "beta", Branch: "different", GitHub: "example-org/beta",
 	}}
 
 	result, err := MergeActiveRepositories(registered, discovered)
@@ -64,19 +64,19 @@ func TestMergeActiveRepositoriesRejectsConflictingRegistration(t *testing.T) {
 
 func TestMergeActiveRepositoriesAcceptsVerifiedProjectAlias(t *testing.T) {
 	registered := []Repository{{
-		Name: "vpsfree-kb-contracts", Project: "vpsfree-kb-contracts",
-		Branch: "2026-08-18-vpsadmin-password-reset", GitHub: "vpsfreecz/vpsfree-kb-contracts",
+		Name: "example-kb-contracts", Project: "example-kb-contracts",
+		Branch: "2026-08-18-alpha-password-reset", GitHub: "example-org/example-kb-contracts",
 	}}
 	discovered := []Repository{{
-		Name: "vpsfree-kb-contracts", Project: "vpsadmin-kb-captures",
-		Branch: "2026-08-18-vpsadmin-password-reset", GitHub: "vpsfreecz/vpsfree-kb-contracts",
+		Name: "example-kb-contracts", Project: "alpha-kb-captures",
+		Branch: "2026-08-18-alpha-password-reset", GitHub: "example-org/example-kb-contracts",
 	}}
 
 	result, err := MergeActiveRepositories(registered, discovered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result) != 1 || result[0].Project != "vpsfree-kb-contracts" {
+	if len(result) != 1 || result[0].Project != "example-kb-contracts" {
 		t.Fatalf("registered repository was not preserved: %#v", result)
 	}
 }
@@ -88,21 +88,21 @@ func TestMergeActiveRepositoriesRejectsUnverifiedProjectAlias(t *testing.T) {
 		registered string
 		discovered string
 	}{
-		{name: "missing branch", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/vpsfree-kb-contracts"},
-		{name: "different branch", branch: "different", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/vpsfree-kb-contracts"},
-		{name: "missing registered GitHub", branch: "feature", discovered: "vpsfreecz/vpsfree-kb-contracts"},
-		{name: "missing discovered GitHub", branch: "feature", registered: "vpsfreecz/vpsfree-kb-contracts"},
-		{name: "different GitHub", branch: "feature", registered: "vpsfreecz/vpsfree-kb-contracts", discovered: "vpsfreecz/other"},
+		{name: "missing branch", registered: "example-org/example-kb-contracts", discovered: "example-org/example-kb-contracts"},
+		{name: "different branch", branch: "different", registered: "example-org/example-kb-contracts", discovered: "example-org/example-kb-contracts"},
+		{name: "missing registered GitHub", branch: "feature", discovered: "example-org/example-kb-contracts"},
+		{name: "missing discovered GitHub", branch: "feature", registered: "example-org/example-kb-contracts"},
+		{name: "different GitHub", branch: "feature", registered: "example-org/example-kb-contracts", discovered: "example-org/other"},
 		{name: "invalid GitHub", branch: "feature", registered: "not a repository", discovered: "not a repository"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			registered := []Repository{{
-				Name: "vpsfree-kb-contracts", Project: "vpsfree-kb-contracts",
+				Name: "example-kb-contracts", Project: "example-kb-contracts",
 				Branch: "feature", GitHub: testCase.registered,
 			}}
 			discovered := []Repository{{
-				Name: "vpsfree-kb-contracts", Project: "vpsadmin-kb-captures",
+				Name: "example-kb-contracts", Project: "alpha-kb-captures",
 				Branch: testCase.branch, GitHub: testCase.discovered,
 			}}
 

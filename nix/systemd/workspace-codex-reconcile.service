@@ -3,7 +3,7 @@ Description=Activate the current compatible workspace Codex
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host reconcile-codex
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host reconcile-codex
 
 [Install]
 WantedBy=default.target

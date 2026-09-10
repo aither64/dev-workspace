@@ -32,7 +32,7 @@ state_home = ARGV.fetch(2)
 slug = ARGV.fetch(3)
 env = ENV.to_h.merge('XDG_STATE_HOME' => state_home)
 env['PATH'] = File.dirname(env.fetch('SHELL'))
-runner = VpsfreeDevSession::Runner.new(workspace: workspace, env: env)
+runner = DevSession::Runner.new(workspace: workspace, env: env)
 operation_id = ARGV.fetch(4)
 removal = runner.send(:prepare_removal!, slug, force: false, operation_id: operation_id)
 %w[

@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix/c2a308c84bbfa9f30827344219b7284f8104bdd8";
     codex-web = {
-      url = "github:aither64/codex-web/e8655b7b2689da9b1aabe10df69858c32725dd61";
+      url = "github:aither64/codex-web/7a05da0cd79b19f3c9a0a8fa23b7043a1f984d4e";
       flake = false;
     };
   };
@@ -22,14 +22,22 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
-      devWorkspace = pkgs.callPackage ./nix/workspace-portal.nix {
-        src = self;
-        codex = llm-agents.packages.${system}.codex;
-        codexWebSrc = codex-web;
-        codexWebRev = codex-web.rev;
-      };
+      mkPackage =
+        {
+          pkgs,
+          extensions ? { },
+        }:
+        pkgs.callPackage ./nix/workspace-portal.nix {
+          src = self;
+          codex = llm-agents.packages.${pkgs.system}.codex;
+          codexWebSrc = codex-web;
+          codexWebRev = codex-web.rev;
+          inherit extensions;
+        };
+      devWorkspace = mkPackage { inherit pkgs; };
     in
     {
+      lib = { inherit hostPaths mkPackage; };
       packages.${system} = {
         default = devWorkspace;
         dev-workspace = devWorkspace;
@@ -48,6 +56,20 @@
         host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
           inherit pkgs self;
         };
+        generic-source = pkgs.runCommand "dev-workspace-generic-source" { } ''
+          first=vps
+          second=aither
+          forbidden="$first"'free|'"$second"'dev'
+          if grep -RilE "$forbidden" ${self} --exclude-dir=.git > matches; then
+            cat matches >&2
+            exit 1
+          fi
+          if ${pkgs.findutils}/bin/find ${self} -printf '%P\n' | grep -iE "$forbidden" > matches; then
+            cat matches >&2
+            exit 1
+          fi
+          touch "$out"
+        '';
       };
       nixosModules.host = import ./nix/host-module.nix;
       nixosConfigurations.example = nixpkgs.lib.nixosSystem {

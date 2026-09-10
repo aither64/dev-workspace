@@ -1,548 +1,113 @@
 # Workspace portal
 
-The workspace portal is the browser view for development initiatives:
+The workspace portal keeps long-running development sessions available through
+both a browser and tmux. One installed package generation supplies the portal,
+Codex CLI, session helper, user units and any configured extensions.
 
-```text
-https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz/
+## Workspace configuration
+
+Each workspace can contain `.dev-workspace.json`:
+
+```json
+{
+  "schema": 2,
+  "displayLabel": "Example development",
+  "hostLabel": "build-host",
+  "sshHost": "build-host.example.test",
+  "portal": {
+    "hostname": "workspace.example.test",
+    "aliases": ["old-workspace.example.test"]
+  },
+  "developmentClusterProviders": ["service"]
+}
 ```
 
-The former
-`vpsfree-cz-workspace.aitherdev.int.vpsfree.cz` address redirects here.
+The portal hostname and aliases are configuration, not application constants.
+`workspace-host register` reads them when no command-line override is supplied.
+The registry stores the resolved values so routing remains deterministic until
+the next explicit registration update.
 
-It lists active and archived initiatives that contain `portal.yml`. The initial
-page uses filesystem metadata only, so it renders without waiting for Codex or
-cluster helpers. A bounded background request adds exact Codex activity,
-repository counts, lifecycle operations, and running-cluster counts. It then
-orders both lists by latest activity, newest first, without moving the reader's
-scroll position.
+Provider IDs must exist in the immutable package extension catalog. Workspace
+files cannot choose executable paths or labels.
 
-Each initiative uses full-width, fragment-linked tabs for its Codex
-conversation, handoff commands, repositories, development clusters, and
-Artifacts. A tab URL such as `#repositories` can be copied or opened in a new
-browser tab. The artifact catalog always includes Plan and State, followed by
-curated files from `portal.yml`; previews are loaded only when selected. Codex
-messages are rendered as sanitized Markdown. `Reasoning summary` entries are
-short user-facing summaries supplied by Codex, not hidden reasoning tokens;
-there can be more than one when a turn has several reasoning items, and empty
-summaries are omitted.
+## User-profile state
 
-An active conversation can receive messages, be interrupted, answer Codex
-questions, handle supported command or file-change approvals, and change its
-model and reasoning effort. A purple Default or Plan switch in the composer
-controls the mode used by later turns without changing the selected model or
-reasoning effort.
+The default paths are:
 
-The compact model and reasoning selectors stay in the composer footer beside
-Default, Plan, and Interrupt. Existing-thread settings require an explicit
-reasoning effort because the App Server cannot clear one back to automatic
-selection.
-Enter sends immediately and Shift+Enter inserts a line break. While Codex is
-working, Send becomes Steer now and adds the message to the active turn. Queue
-next instead stores it for later delivery. The page shows a working indicator
-and elapsed time below the transcript until the turn stops. Queued messages are
-shown in order, can be removed, and can be started manually after an interrupted
-turn. All, Messages, and Activity views separate prose from commands and tool
-events while keeping errors and pending interaction visible. Each view retains
-its own scroll and expanded-output state. File changes use a colorized unified
-diff instead of raw JSON. The browser and portal runtime retain each unresolved
-queue identity so a lost response or service restart cannot silently submit the
-same instruction twice.
+- registry: `~/.config/dev-workspaces/registry.json`;
+- installed profile and retained Codex roots:
+  `~/.local/state/dev-workspaces/`;
+- per-workspace sockets and runtime authority:
+  `$XDG_RUNTIME_DIR/dev-workspaces/<name>/`;
+- router socket: `/run/dev-workspaces/router.sock`.
 
-The portal is not a shell or a general file browser. It exposes `plan.md`,
-`state.md`, and files explicitly listed in `portal.yml`. Curated artifacts are
-limited to plain text, Markdown, JSON, YAML, and passive raster images. Active
-formats such as HTML, SVG, JavaScript, XHTML, and XML are refused.
+The profile switcher retains the previous generation and its exact Codex build.
+`workspace-host rollback` selects that pair together. Commands waiting on a
+transition lock reject a generation change and must be run again.
 
-## Starting and attaching to sessions
+## Extension catalog
 
-The New session form accepts a short name and an initial request. It runs the
-packaged `dev-session`, journals creation before changing initiative state,
-creates a persisted Codex thread, and sends the request as the first turn. A
-retry uses the same dated slug and must contain the same request. Completed
-requests replay their existing result instead of creating another session or
-turn. Creation reports success only after the rollout exists and its first user
-message exactly matches the submitted request. The terminal client starts
-after that verification, so it cannot race an empty thread.
-The browser shows creation progress and elapsed time while this work runs, then
-opens the new session. Index refresh cannot replace a pending creation request.
+Downstream flakes call `dev-workspace.lib.mkPackage` with three attribute sets:
 
-The terminal command asks for the same initial request before it creates a new
-Codex session, then attaches to the persisted thread:
+- `commands`, mapping command names to absolute executables;
+- `skills`, mapping skill names to package directories;
+- `clusterProviders`, mapping provider IDs to a label and helper executable.
 
-```text
-$ dev-session start example
-Initial request: Investigate the reported API failure.
-```
+The resulting package writes `share/dev-workspace/extensions.json`. Activation
+uses only this catalog when linking commands and skills. Cluster helpers receive
+the selected workspace through `DEVCLUSTER_WORKSPACE` and keep ownership of
+their `status`, `reset`, `cleanup-paths` and `transition-adopt` protocols.
 
-For scripts or redirected input, place the request in a file:
+## Host module
+
+`nixosModules.host` configures the privileged nginx and TLS substrate. Its
+defaults use:
+
+- `/var/lib/dev-workspaces/password/password`;
+- `/var/lib/dev-workspaces/auth/htpasswd`;
+- `/var/lib/dev-workspaces/pki`;
+- `/var/lib/dev-workspaces/tls`;
+- `/var/lib/dev-workspaces/public/ca.pem`;
+- `/run/lock/dev-workspace-substrate.lock`.
+
+All persistent outputs must remain below root-controlled `/var/lib`. Runtime
+paths must remain below `/run`, and the lock file must sit directly below
+`/run/lock`. Output directories must be distinct and mutually non-nested.
+
+Reconciliation rejects symlinked path components, unsafe ownership or modes,
+unexpected mounts and physical directory aliases. Existing CA files and the
+selected leaf pair must pass their complete metadata and certificate checks
+before any state is changed. The retained leaf is checked against the local CA
+without consulting ambient trust stores.
+
+The firewall stays closed unless `services.dev-workspaces.firewall.sourceRanges`
+contains an allowed network.
+
+## Deployment order
+
+Deploy the host module before registering a workspace. Then build and select the
+user-profile package, register the workspace, and verify the router and portal
+units. A package transition must contain compatible cluster and runtime-authority
+contracts whenever persistent state exists.
+
+Namespace migrations are deployment-specific. Stop writers, preserve state
+bytes and metadata, rewrite machine-consumed paths as one journaled operation,
+then start the new generation. Rollback requires the reverse migration; old and
+new namespaces must not run together.
+
+## Development
+
+Run the quick checks with:
 
 ```sh
-dev-session start example --goal-file request.txt --no-attach
+nix flake check --no-build --show-trace
 ```
 
-Without an interactive terminal, a new Codex session requires `--goal-file`.
-An existing session that already has a persisted thread can be attached without
-another request.
-
-Codex receives the workspace instructions and selects affected repositories.
-The terminal and browser share one App Server thread and a dedicated
-per-workspace tmux server. Use the registry-backed command for terminal
-actions:
+Run the complete suite with:
 
 ```sh
-dev-session attach 2026-09-03-example
-dev-session stop 2026-09-03-example
-dev-session url 2026-09-03-example
+nix flake check --print-build-logs
 ```
 
-The full dated slug is accepted directly. You can also use a short name when it
-matches exactly one session.
-
-Fork session copies the Codex conversation and selected model settings into a
-new session. It does not copy worktrees, tracking files, artifacts, or
-development clusters. The equivalent terminal command is:
-
-```sh
-dev-session fork 2026-09-03-example alternate-approach
-```
-
-The fork dialog shows progress and elapsed time until it opens the new session.
-
-The portal discovers attached Git worktrees directly from the workspace and
-canonical bare repositories. A worktree therefore appears even when an older
-helper did not record it in `portal.yml`. The manifest remains authoritative
-when it already contains the repository, and conflicting live metadata is
-reported instead of replacing the recorded values.
-
-For an active repository, the Repositories tab reads the exact local feature
-head from its canonical worktree and compares it with the authoritative GitHub
-branch head. It distinguishes pushed, not pushed, GitHub-ahead, divergent, and
-unknown states. Workflow results are shown only when they belong to the exact
-current revision; an older run for the same branch is never presented as the
-current result. Queued, running, and completed runs for that exact revision are
-all visible. Archived repositories use the recorded final head.
-
-The Clusters tab recognizes vpsAdmin and vpsAdminOS state owned by the session.
-It shows the verified runner state, topology, and network. Individual services
-have nested tabs with clickable URLs. Credentials are grouped by account;
-passwords remain masked until explicitly revealed and every value can be
-copied. Generic machine access commands remain in a separate Connect section,
-and cluster release is isolated in the card footer. Release cluster stops the
-matching runner and removes its temporary state. The index shows only the
-credential-free running-cluster count. New cluster socket directories include
-the canonical workspace in their identity. The only old slug-only socket
-adopted during this cutover is the existing vpsAdmin cluster for
-`2026-08-18-vpsadmin-password-reset`, and only while its live runner exposes the
-exact expected socket, state, PID, and ready paths.
-
-Archive session offers completed and abandoned modes in one confirmation
-dialog. Completed archival first proves that every registered feature head is
-merged and reproves those exact journaled heads before every remaining
-destructive phase. The high-level command then proves the shared thread idle
-with no pending request or queued message, releases development clusters,
-validates and removes clean worktrees, moves tracking to `archive/`, commits
-only that transition on the shared workspace `master`, and retires the
-conversation and runtime. It never pushes `master`. Each phase is journaled so
-the same command can safely resume an interrupted operation. Recovery verifies
-the exact archived tracking tree and retained conversation identity before it
-commits or retires anything. Terminal confirmation occurs before the CLI waits
-for the host-wide transition lock, so an interactive prompt never monopolizes
-the workspace. The CLI prints each durable phase. The browser accepts archive,
-delete, and revive asynchronously and returns to the index immediately. Its
-Operations panel shows the current phase and elapsed time. Operation receipts
-survive a portal restart; failures remain until retried or dismissed, while
-successes remain visible for 15 minutes. A later successful CLI or browser
-retry replaces an older failure after the authoritative session state confirms
-the result.
-
-Revive session restores an archive as active with one confirmation. Abandoned
-archives use a stronger warning whose authorization remains in the retry
-journal. It verifies and commits the complete tracking transition and resumes
-the exact retained Codex thread, but it does not recreate worktrees. A legacy
-archive without `portal.yml` gets a fresh shared conversation through durable
-thread-creation recovery. A current manifest without a retained thread is
-restored as coordination-only tracking.
-
-When Plan mode returns a completed plan, the browser can implement it in the
-same conversation or create a named session whose first request contains that
-exact plan. The server checks the plan turn and digest again before either
-action. The browser and server bind the retry identity to that plan's digest,
-so approving a later plan cannot reuse an ambiguous attempt for an earlier one.
-Continuing in the same conversation records the intended send before switching
-out of Plan mode, so a lost settings or send response can be retried without
-losing the action or submitting it twice. Codex input questions use a
-page-by-page selector like the terminal client: each option accepts a note,
-"None of the above" accepts a custom answer, and questions may be left
-unanswered after confirmation. Nonblocking questions follow Codex's one-minute
-grace and one-minute visible countdown; typing, selecting, navigating, or
-submitting pauses automatic resolution. Nonsecret drafts survive a page reload
-in that browser tab, while secret answers stay only in memory.
-
-Message and steer submissions remain visible above the conversation while they
-are being sent. If the response is lost, the browser shows the outcome as
-unknown and reuses the same submission identity when asked to check again; it
-does not silently submit a duplicate. The receipt disappears when the matching
-Codex message appears. Queue removal records the exact queued and client
-identities before contacting Codex, so a lost delete response can be reconciled
-after a portal restart. New output follows the scroll position only when the
-reader is already near the bottom. Otherwise, the page preserves the current
-position and shows a New output button.
-
-Delete session uses one confirmation; it does not ask you to type the slug. It
-removes active, archived, and failed creations from the portal, retains Git
-branches, and moves tracking and worktree recovery metadata into the private
-XDG recovery directory documented in `docs/dev-sessions.md`. Normal deletion
-requires clean worktrees and an idle conversation. Forced deletion can discard
-dirty worktrees and interrupt an active turn. The worktree inventory comes from
-Git's canonical workspace metadata, so a missing or stale portal registration
-does not strand an otherwise unambiguous session worktree. Removal is journaled
-and can be retried after a partial failure. Its journal reserves the slug
-against session changes and new cluster work until removal finishes. The helper
-records thread-retirement intent first, reconciles an already archived thread
-by its exact identity even when older archived threads share the working
-directory, and durably records a unique cwd-bound thread before archiving it
-when creation lost its ID.
-It refuses to continue if a known thread cannot be reached. Successful
-retirement removes the thread's durable submission attempts; after the
-asynchronous deletion reports completion, the browser clears its matching local
-receipts and input drafts before leaving the deleted page.
-A failed non-forced retirement can be retried with newly confirmed `--force`;
-that authorization is a durable one-way upgrade. Recovery storage is rejected
-when it is inside tracking, the creation journal, a worktree, cluster state, or
-a cluster socket directory that deletion would move or remove. If tracking was
-committed, the helper fetches and rechecks
-`origin/master` immediately before committing only its deletion on a compatible
-shared `master`; it never pushes.
-
-The page shows attach and conversation controls only when host-only authority
-under the private per-workspace runtime directory is ready and matches the live
-tmux session, App Server socket, and persisted thread working directory. Stopped,
-archived, forged, or stale sessions remain passive. A verified persisted thread
-can still provide a read-only transcript after stop, reboot, completion, or
-archival.
-
-Every portal-created, resumed, or forked Codex thread receives a package-owned
-developer instruction that forbids implicit archival, deletion, session stop,
-or delayed cleanup. Completing a response only leaves the session ready for a
-later explicit lifecycle action. Switching Default or Plan mode preserves this
-policy without replacing Codex's built-in mode instructions.
-
-Terminal and browser sessions use the App Server socket below
-`$XDG_RUNTIME_DIR/vpsfree-workspaces/<name>/`. The App Server runs the Codex
-package bundled with the current user-profile generation. A profile switch
-validates that exact Codex build against the package's protocol contract and
-model catalog before activation. The transition gate blocks new browser and
-CLI mutations, quiesces terminal clients, checks every thread for idleness,
-restarts each App Server and portal as a pair, and then restores the clients. A
-compatible update waits on a five-minute retry timer while a turn is active.
-An incompatible update leaves the last compatible profile and Codex pair
-active. Stored client versions are diagnostic history and do not invalidate
-sessions after a compatible upgrade.
-
-`stop` and `archive` quiesce the managed terminal client and refuse an active
-turn. `delete --force` interrupts the turn because it is an explicit discard.
-If tmux disappears before authority cleanup, inspect the
-session and remove only a validated, idle stale record:
-
-```sh
-dev-session recover-stale 2026-09-03-example
-```
-
-The local journal provides at-most-once initial-goal delivery. Codex does not
-accept caller-supplied idempotency keys for thread or turn creation, so the
-helper durably records an initial submission attempt in a temporary schema-2
-manifest before calling `turn/start`. A retry against the same unmaterialized
-thread fails closed; it does not rely on a briefly stale idle status. Once
-history materializes, the retry requires exactly one matching initial user
-message. If an App Server restart removes the recorded memory-only thread,
-creation-only reconciliation can select or create one exact fresh replacement
-and clear the attempt marker.
-A crash between recording the attempt and sending it can therefore require an
-App Server restart before retrying.
-
-A lost `thread/start` response can race the App Server's in-memory registration
-and leave an unprompted orphan. Recovery refuses multiple visible candidates;
-restarting the App Server clears such memory-only orphans. This does not resend
-the initial goal because initial-goal delivery has its own durable attempt
-marker. Completion removes the marker and writes the ordinary schema-1
-manifest, so completed sessions remain readable after a rollback. A previous
-portal version intentionally rejects an in-flight schema-2 creation; redeploy
-the current version to reconcile it.
-
-A ready manifest written by the earlier empty-thread implementation is not
-silently adopted when its rollout is still missing. Archive that incomplete
-session and start a new one with an initial request.
-
-An active initiative with committed `plan.md` and `state.md` but no manifest
-can be restarted under its exact slug after the old session is stopped. The
-helper preserves those files, creates a fresh portal conversation, and records
-canonical worktrees already present below `worktrees/<slug>/`. The old Codex
-rollout is left untouched and is not connected to the new session.
-
-## Portal manifest
-
-`dev-session start` creates `work/<slug>/portal.yml`. Worktree creation records
-the repository identity, branch, GitHub repository, default branch, and initial
-commit. Cleanup records final commits, and archival preserves the same URL
-under `archive/<slug>`. The example is the stable schema written after creation;
-schema 2 exists only while an initial goal has an unresolved delivery outcome.
-
-```yaml
-schema: 1
-slug: 2026-09-03-example
-forked_from: 2026-09-03-original
-codex:
-  thread_id: 01a00000-0000-0000-0000-000000000000
-  socket_path: /run/user/1000/vpsfree-workspaces/vpsfree-cz/app-server.sock
-  client_version: 0.152.1
-creation:
-  state: ready
-  initial_goal_sent: true
-  goal_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-repositories:
-  - name: vpsadmin
-    project: vpsadmin
-    github: vpsfreecz/vpsadmin
-    branch: 2026-09-03-example
-    default_branch: master
-    initial_base_sha: 0123456789abcdef0123456789abcdef01234567
-artifacts:
-  - label: Deployment notes
-    path: deployment.md
-```
-
-The version is informational; thread ID, canonical working directory, App
-Server endpoint, and live host authority control access. Do not list
-credentials, private keys, caches, or bulk captures. Artifact paths cannot
-leave the tracking directory, and symlinks are refused. Unknown fields,
-explicit nulls, aliases, duplicate keys, tags, and multiple YAML documents are
-invalid.
-
-## Authentication and security boundary
-
-nginx accepts HTTPS only from the WireGuard network and requires Basic
-Authentication. It proxies to a group-restricted Host router socket; each
-portal listens on a user-private Unix socket. The portal cannot read nginx's
-password hash, TLS key, or CA key, and its sockets are not mounted into the
-development LXC.
-
-The portal rejects mutations without the exact origin, uses a restrictive
-content security policy and sanitized Markdown, and does not expose general
-filesystem, shell, or App Server RPC access. Repository status runs read-only
-Git identity and revision commands only in the exact canonical worktree, checks
-that it belongs to the expected canonical repository, and bounds GitHub calls.
-Workspace manifests are display metadata; Codex mutations also check
-uid-private host authority against tmux and the App Server.
-
-The Basic Auth username is `aither`. Its random plaintext password is stored at
-`/var/lib/vpsfree-workspace-portal-password/password`. It is owned by root and
-readable only by the dedicated group containing `aither`; the portal services
-cannot modify it. NixOS activation derives the root-owned nginx hash from this
-file. Neither value enters Git or the Nix store. Browsers commonly cache Basic
-Auth credentials until their session is closed.
-
-Portal access grants control comparable to an interactive Codex client running
-as `aither`. Keep the password unique, keep the hostname VPN-only, and remove
-the private CA from a lost device. Permission approval request types that
-cannot be verified through the App Server remain terminal-only.
-
-The `aither` account is the portal's trust boundary, not an adversarial
-isolation boundary. A process running as `aither` can read the Basic Auth
-password, alter the session's files, and control its tmux server. Exact-slug
-prompts, browser confirmations, and service-cgroup checks prevent accidental or
-supported unattended closure; they cannot prove that an intentionally hostile
-same-uid process represents a human browser action. Agents are therefore also
-bound by the workspace rule that forbids closure without an explicit user
-request. Protecting against a hostile same-uid process would require a separate
-user-held credential, such as WebAuthn or a client certificate, and is outside
-this deployment's security model.
-
-## Private CA and certificate renewal
-
-The first aitherdev activation creates the CA and leaf directly in root-owned
-`/var/lib/vpsfree-workspace-pki`, installs the nginx leaf pair, and exports the
-public CA to the user-readable
-`/var/lib/vpsfree-workspace-portal-public/ca.pem`.
-
-The NixOS configuration installs the single host-side reconciler. Run it as
-root to validate the password and CA state, create missing credentials, or
-renew an expiring leaf:
-
-```sh
-sudo workspace-portal-substrate-reconcile
-sudo systemctl reload nginx.service
-```
-
-The unencrypted CA key is protected by root ownership and mode `0600`; the
-portal cannot read it. The nginx key is `root:nginx` mode `0640`. Certificates
-and keys are switched as atomic versioned pairs. A weekly timer renews a leaf
-with less than 30 days remaining, preserves the CA, and reloads nginx. Repeated
-deployments validate and reuse existing state.
-
-Copy only the public CA to VPN clients and trust it for TLS. Never copy the CA
-key or server keys to a client.
-
-Removing the NixOS configuration does not revoke the CA on clients. To
-decommission the portal permanently, remove the CA from every client's trust
-store, remove the internal DNS record, and delete the CA state on aitherdev.
-If the CA key may have been exposed, stop the portal, remove client trust and
-the DNS record, delete the compromised CA state, and redeploy to create a new
-CA. Trust the replacement public CA only after checking it on aitherdev.
-
-## Packaging and deployment
-
-`dev-workspace` owns the reusable application packages, user services, session
-commands, and the Codex runtime. A coordination workspace selects one exact
-`dev-workspace` revision through its thin flake. `vpsfree-cz-configuration`
-imports only the reusable host module, which owns nginx, VPN exposure, TLS,
-and Basic Auth credentials. The selected user profile retains its previous
-generation as the application rollback target.
-
-Deploy the aitherdev substrate and wildcard internal DNS first. This leaves the
-existing user-owned portal and terminal runtime running. Switching the user
-package in the next step preserves the workspace registry, profile history,
-session tracking, thread identities, and runtime identities. The switch
-quiesces clients while it changes the matched portal and Codex pair, then
-restores them. `workspace-host rollback` selects the retained previous pair.
-During the initial compatibility window, the new browser keeps using the
-existing `/api/sessions/` conversation paths and the new server aliases those
-paths to the reusable handler. An open tab therefore survives both the upgrade
-and a rollback; `/codex/` remains the public path for new generic integrations.
-Remove these aliases only after a later portal generation has emitted
-`/codex/` paths, every profile generation that can be selected by switch or
-rollback also emits those paths, and operators either know that tabs opened on
-the older generations have been reloaded or explicitly accept that those tabs
-will require a reload.
-
-The aitherdev migration preserves its installed user profile and existing
-workspace registration. Update that profile from the reviewed workspace
-feature worktree through the selected stable command:
-
-```sh
-workspace-host switch --source /path/to/workspace-feature
-```
-
-For a host without an installed profile, use the `nix run` first-install
-command from the repository README. To add another workspace to an installed
-profile, use the stable `workspace-host register` command.
-
-The workspace root owns `.dev-workspace.json`, which configures portal labels,
-the optional SSH attach host and enabled development-cluster providers without
-changing the local registry. See the repository README for its schema and
-generic defaults. The vpsFree.cz coordination workspace enables both shipped
-providers and supplies the aitherdev display and SSH values.
-
-To retire a registered workspace, first finish or stop its sessions, then run
-`workspace-host unregister NAME`. The command quiesces its terminal clients,
-disables the three instance services, updates the registry atomically, and
-restarts the router. It also retires that name's runtime sockets and session
-authority before the name can be registered for another workspace root. It
-refuses while that workspace has any development cluster state; reset those
-clusters first so their workspace identity and control path are not lost.
-
-The DNS wildcard is `*.workspace.aitherdev.int.vpsfree.cz`; point it at
-aitherdev's VPN address. NixOS creates the password, CA, wildcard certificate,
-and nginx proxy automatically. `workspace-host status` shows the active user
-package, Codex path, and registered workspace URLs.
-
-The first user-profile switch starts the router, App Server, tmux server, and
-portal. Start a fresh session for browser or terminal testing. Legacy
-initiatives without a retained portal thread can be revived with a fresh
-conversation. Current archives that retain a thread restore that exact
-conversation as described above; no Codex process itself is preserved.
-
-Later portal changes need only `workspace-host switch --source PATH`. The
-command builds a candidate, checks the Codex bundled with that candidate, adds
-a user profile generation, updates stable commands and units, and restarts the
-router and portal as one transaction. It has no nonactivating mode because
-changing the stable commands without restarting the services would mix two
-application generations. Each profile generation contains the Codex store path
-it was tested with. Failed updates restore the preceding profile, Codex root,
-links, and services, then remove the rejected profile generation so rollback
-cannot select it later. A failed first installation has no preceding generation
-to restore; it leaves the validated candidate installed so the same `switch`
-can be retried. `workspace-host rollback` selects the preceding application and
-Codex pair and refuses while a thread is active. Both switch and rollback also refuse
-while any archive, delete, or revive journal exists, or while a current
-identity-bound session creation journal is still `creating`, or while a fork
-or stopped-session start journal exists, because changing helpers
-mid-transaction would make its retry semantics version-dependent.
-Legacy journal-only creation attempts are admitted: on retry the new helper
-first proves that no corresponding tmux session survives, then records a fresh
-creation identity before starting tmux.
-Every stable command records the package generation that dispatched it and
-checks both that generation and the profile-link identity again after acquiring
-the shared transition lock. A command that waited across a successful or
-compensated switch therefore fails as superseded even when compensation
-restored the same generation; rerun the stable command to use the installed
-generation. Each portal process retains the same profile-link identity from
-startup and rechecks it after the transition lock for every mutation, including
-an archive, delete, or revive accepted before the lock wait.
-Compatibility command and skill tombstones follow the same concrete profile
-boundary: remove a tombstone only when no generation reported by
-`nix-env --list-generations --profile "$VPSFREE_WORKSPACES_PROFILE"` remains a
-valid switch or rollback target that installed that name. This keeps a
-rollback from leaving a stale link owned by a retained package.
-When any registered workspace has development cluster state, both transitions
-also require the target package to publish the current state schema, transition
-policy, and tracking-size contract. The separate transition-policy version
-prevents rollback to a helper with more permissive ownership inference even
-when its persisted-state schema is unchanged.
-Each target provider must prove that existing state already records its socket
-identity. Pre-contract state without that record fails closed and must be reset;
-the transition never infers or migrates ownership because an old helper could
-already be waiting on its independent per-cluster lock. Only the explicitly
-known password-reset cluster may retain its recorded legacy socket, and its
-complete owner record must prove the known runner tuple. Other legacy state
-fails closed. Older target generations that could orphan workspace-scoped
-socket identities are refused.
-An identity-bound tmux authority similarly requires the target package to
-publish the runtime-authority identity policy. Rollback to an older package that
-cannot parse and verify that identity is refused while such an authority exists.
-New cluster creation records the workspace-scoped socket identity in the same
-per-cluster locked transaction that creates the state directory. Every later
-operation rejects an existing directory without that record. An explicit reset
-can recover late pre-contract state only when the runner's complete socket,
-state, PID-file, and ready-file arguments prove ownership. It stops that runner
-and accepts only its process tree; ambiguous legacy state is left in place for
-manual inspection.
-Reset unsupported cluster state before switching or rolling back. Candidate
-activation repeats this check, so invoking `workspace-host switch` from a
-pre-contract installed generation cannot bypass it; a refusal uses normal
-switch compensation.
-
-Do not switch or roll back the workspace package during an unfinished lifecycle
-or session-creation operation. The host command detects lifecycle journals and
-identity-bound `creating` session journals and refuses the transition until the
-matching command has been retried successfully. Fork and stopped-session start
-journals have the same transition guard. A legacy tokenless journal is safe to
-carry forward because retry refuses any surviving unbound tmux session before
-upgrading the journal.
-
-Before rolling back the NixOS substrate, stop the user layer so two portal
-runtimes cannot run at once:
-
-```sh
-workspace-host suspend
-```
-
-No conversation migration is attempted in either direction. Redeploying the
-hybrid substrate and running `workspace-host switch` recreates the user
-services. Routine portal iteration does not need a NixOS rebuild or a
-configuration input update.
-
-The portal continues serving initiative status when GitHub or the App Server is
-temporarily unavailable. Only the affected integration reports an error. The
-browser displays the 20 most recent turns; attach from a terminal for older
-conversation history.
-
-## ChatGPT desktop and mobile access
-
-The portal works in a macOS or mobile browser once the VPN is connected,
-internal DNS resolves, and the private CA is trusted. It does not register its
-sessions as native ChatGPT Remote sessions.
-
-Separately, the ChatGPT macOS app can connect to aitherdev over SSH and start
-its own remote Codex App Server. ChatGPT mobile can then control those native
-remote chats through a paired desktop host. These are a separate session
-population from the workspace portal.
+The focused NixOS test is defined in
+`nix/tests/host-module-idempotency.nix`, outside the flake output declaration.

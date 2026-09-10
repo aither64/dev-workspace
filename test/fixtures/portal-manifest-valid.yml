@@ -2,7 +2,7 @@ schema: 1
 slug: 2026-09-03-example
 codex:
   thread_id: 01a0678c-baae-7600-bcf6-9a0cb6c83232
-  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  socket_path: /run/dev-workspace-codex/app-server.sock
   client_version: 0.152.1
 creation:
   state: ready
@@ -11,7 +11,7 @@ creation:
 repositories:
   - name: example
     project: example
-    github: vpsfreecz/example
+    github: example-org/example
     branch: 2026-09-03-example
     default_branch: master
     initial_base_sha: 0123456789abcdef0123456789abcdef01234567

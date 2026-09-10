@@ -15,7 +15,7 @@ require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 
-module VpsfreeDevSession
+module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
 
   def self.load_runtime_contract
@@ -47,29 +47,29 @@ module VpsfreeDevSession
     raise 'workspace runtime contract must map each lifecycle command to one unique journal'
   end
 
-  SESSION_MARK = '@vpsfree_dev_session'
-  SESSION_SLUG = '@vpsfree_dev_session_slug'
-  WINDOW_KIND = '@vpsfree_dev_session_window'
-  WINDOW_WORKTREE = '@vpsfree_dev_session_worktree'
-  SESSION_CODEX_THREAD = '@vpsfree_dev_session_codex_thread'
-  SESSION_CODEX_SOCKET = '@vpsfree_dev_session_codex_socket'
-  SESSION_CODEX_VERSION = '@vpsfree_dev_session_codex_version'
-  SESSION_CODEX_PANE = '@vpsfree_dev_session_codex_pane'
+  SESSION_MARK = '@dev_session'
+  SESSION_SLUG = '@dev_session_slug'
+  WINDOW_KIND = '@dev_session_window'
+  WINDOW_WORKTREE = '@dev_session_worktree'
+  SESSION_CODEX_THREAD = '@dev_session_codex_thread'
+  SESSION_CODEX_SOCKET = '@dev_session_codex_socket'
+  SESSION_CODEX_VERSION = '@dev_session_codex_version'
+  SESSION_CODEX_PANE = '@dev_session_codex_pane'
 
-  ENV_SLUG = 'VPSFREE_DEV_SESSION_SLUG'
-  ENV_WORKSPACE = 'VPSFREE_DEV_SESSION_WORKSPACE'
-  ENV_WORK_DIR = 'VPSFREE_DEV_SESSION_WORK_DIR'
-  ENV_WORKTREES_DIR = 'VPSFREE_DEV_SESSION_WORKTREES_DIR'
-  ENV_PORTAL_BASE_URL = 'VPSFREE_DEV_SESSION_PORTAL_BASE_URL'
-  ENV_PORTAL_URL = 'VPSFREE_DEV_SESSION_URL'
-  ENV_PORTAL_COMMAND = 'VPSFREE_DEV_SESSION_PORTAL_COMMAND'
-  ENV_AUTHORITY_DIR = 'VPSFREE_DEV_SESSION_AUTHORITY_DIR'
-  ENV_TMUX_SOCKET = 'VPSFREE_DEV_SESSION_TMUX_SOCKET'
-  ENV_CODEX_COMMAND = 'VPSFREE_DEV_SESSION_CODEX'
-  ENV_CODEX_SOCKET = 'VPSFREE_DEV_SESSION_CODEX_SOCKET'
-  ENV_CODEX_VERSION = 'VPSFREE_DEV_SESSION_CODEX_VERSION'
-  ENV_REQUIRE_RUNTIME = 'VPSFREE_DEV_SESSION_REQUIRE_RUNTIME'
-  ENV_TMUX_IDENTITY = 'VPSFREE_DEV_SESSION_TMUX_IDENTITY'
+  ENV_SLUG = 'DEV_SESSION_SLUG'
+  ENV_WORKSPACE = 'DEV_SESSION_WORKSPACE'
+  ENV_WORK_DIR = 'DEV_SESSION_WORK_DIR'
+  ENV_WORKTREES_DIR = 'DEV_SESSION_WORKTREES_DIR'
+  ENV_PORTAL_BASE_URL = 'DEV_SESSION_PORTAL_BASE_URL'
+  ENV_PORTAL_URL = 'DEV_SESSION_URL'
+  ENV_PORTAL_COMMAND = 'DEV_SESSION_PORTAL_COMMAND'
+  ENV_AUTHORITY_DIR = 'DEV_SESSION_AUTHORITY_DIR'
+  ENV_TMUX_SOCKET = 'DEV_SESSION_TMUX_SOCKET'
+  ENV_CODEX_COMMAND = 'DEV_SESSION_CODEX'
+  ENV_CODEX_SOCKET = 'DEV_SESSION_CODEX_SOCKET'
+  ENV_CODEX_VERSION = 'DEV_SESSION_CODEX_VERSION'
+  ENV_REQUIRE_RUNTIME = 'DEV_SESSION_REQUIRE_RUNTIME'
+  ENV_TMUX_IDENTITY = 'DEV_SESSION_TMUX_IDENTITY'
 
   THREAD_ENV_ARGUMENTS = {
     ENV_SLUG => '--session-slug',
@@ -340,8 +340,8 @@ module VpsfreeDevSession
       format = [
         "\#{window_id}",
         "\#{window_name}",
-        "\#{@vpsfree_dev_session_window}",
-        "\#{@vpsfree_dev_session_worktree}"
+        "\#{@dev_session_window}",
+        "\#{@dev_session_worktree}"
       ].join("\t")
       stdout, _stderr, status = capture(
         'list-windows',
@@ -422,7 +422,7 @@ module VpsfreeDevSession
         raise Error, 'invalid tmux session retirement identity'
       end
 
-      mismatch = 'vpsfree-dev-session-identity-mismatch'
+      mismatch = 'dev-session-identity-mismatch'
       condition = "\#{==:\#{E:#{ENV_TMUX_IDENTITY}},#{identity_token}}"
       stdout, stderr, status = capture(
         'if-shell', '-F', '-t', Tmux.session_target(id), condition,
@@ -446,7 +446,7 @@ module VpsfreeDevSession
         raise Error, 'invalid tmux session identity initialization'
       end
 
-      mismatch = 'vpsfree-dev-session-identity-mismatch'
+      mismatch = 'dev-session-identity-mismatch'
       condition =
         "\#{&&:\#{==:\#{E:#{ENV_TMUX_IDENTITY}},}," \
         "\#{==:\#{#{SESSION_MARK}},1}}"
@@ -487,8 +487,7 @@ module VpsfreeDevSession
       process_exec: nil,
       portal_command: nil,
       portal_url: nil,
-      vpsadmin_cluster: nil,
-      vpsadminos_cluster: nil,
+      cluster_providers: { },
       require_runtime: nil,
       env: ENV,
       cwd: Dir.pwd
@@ -532,10 +531,14 @@ module VpsfreeDevSession
       @portal_url = (
         portal_url || env.fetch(ENV_PORTAL_BASE_URL, DEFAULT_PORTAL_BASE_URL)
       ).sub(%r{/+\z}, '')
-      @cluster_commands = {
-        'vpsadmin-devcluster' => vpsadmin_cluster,
-        'vpsadminos-devcluster' => vpsadminos_cluster
-      }
+      unless cluster_providers.is_a?(Hash) && cluster_providers.keys.all? do |provider_id|
+        provider_id.is_a?(String) && provider_id.match?(SAFE_PART)
+      end
+        raise Error, 'development cluster providers are invalid'
+      end
+      @cluster_commands = cluster_providers.to_h do |provider_id, command|
+        ["#{provider_id}-devcluster", command]
+      end
       @require_runtime = require_runtime.nil? ? env[ENV_REQUIRE_RUNTIME] == '1' : require_runtime
       validate_required_runtime! if @require_runtime
     end
@@ -4148,7 +4151,7 @@ module VpsfreeDevSession
 
     def removal_recovery_root_path
       workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
-      File.join(@state_home, 'vpsfree-workspaces', 'removed', workspace_id)
+      File.join(@state_home, 'dev-workspaces', 'removed', workspace_id)
     end
 
     def development_cluster_cleanup_paths(slug)
@@ -4161,7 +4164,7 @@ module VpsfreeDevSession
         end
         stdout, _stderr, = @command_runner.capture(
           [command, 'cleanup-paths', slug],
-          env: @env.merge('VPSFREE_DEVCLUSTER_WORKSPACE' => workspace)
+          env: @env.merge('DEVCLUSTER_WORKSPACE' => workspace)
         )
         raise Error, "development cluster cleanup contract is too large: #{name}" if stdout.bytesize > AUTHORITY_MAX_SIZE
 
@@ -4606,10 +4609,10 @@ module VpsfreeDevSession
         @command_runner.run(
           [command, 'reset', slug],
           env: @env.merge(
-            'VPSFREE_DEVCLUSTER_WORKSPACE' => workspace,
-            'VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION' => operation,
-            'VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_FD' => lock_file.fileno.to_s,
-            'VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path)
+            'DEVCLUSTER_WORKSPACE' => workspace,
+            'DEV_SESSION_LIFECYCLE_OPERATION' => operation,
+            'DEV_SESSION_LIFECYCLE_LOCK_FD' => lock_file.fileno.to_s,
+            'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path)
           ),
           pass_fds: [lock_file]
         )
@@ -6162,9 +6165,7 @@ module VpsfreeDevSession
         'tmux socket' => @configured_tmux_socket,
         'Codex socket' => @codex_socket,
         'Codex version' => @codex_version,
-        'portal command' => @portal_command&.first,
-        'vpsAdmin cluster command' => @cluster_commands['vpsadmin-devcluster'],
-        'vpsAdminOS cluster command' => @cluster_commands['vpsadminos-devcluster']
+        'portal command' => @portal_command&.first
       }
       missing = values.select { |_label, value| value.nil? || value.empty? }.keys
       unless missing.empty?
@@ -6176,17 +6177,14 @@ module VpsfreeDevSession
         'tmux socket' => @configured_tmux_socket,
         'Codex command' => @codex_command_argv.first,
         'Codex socket' => @codex_socket,
-        'portal command' => @portal_command.first,
-        'vpsAdmin cluster command' => @cluster_commands.fetch('vpsadmin-devcluster'),
-        'vpsAdminOS cluster command' => @cluster_commands.fetch('vpsadminos-devcluster')
+        'portal command' => @portal_command.first
       }
       invalid = paths.select { |_label, value| !value.start_with?(File::SEPARATOR) }.keys
       unless invalid.empty?
         raise Error, "portal runtime paths must be absolute: #{invalid.join(', ')}"
       end
 
-      helpers = paths.slice('vpsAdmin cluster command', 'vpsAdminOS cluster command')
-      unavailable = helpers.select do |_label, value|
+      unavailable = @cluster_commands.select do |_label, value|
         !File.file?(value) || !File.executable?(value)
       end.keys
       unless unavailable.empty?
@@ -6200,7 +6198,7 @@ module VpsfreeDevSession
       executable = @codex_command_argv.first
       unless executable.start_with?(File::SEPARATOR) && File.file?(executable) && File.executable?(executable)
         raise Error,
-              'Codex provenance requires VPSFREE_DEV_SESSION_CODEX to name an absolute executable path'
+              'Codex provenance requires DEV_SESSION_CODEX to name an absolute executable path'
       end
       stdout, stderr, status = @command_runner.capture(
         [executable, '--version'],
@@ -6863,8 +6861,7 @@ module VpsfreeDevSession
       @codex_command = nil
       @portal_command = nil
       @portal_url = nil
-      @vpsadmin_cluster = nil
-      @vpsadminos_cluster = nil
+      @cluster_providers = { }
       @require_runtime = nil
       @transition_lock = nil
       @host_profile = nil
@@ -6973,7 +6970,7 @@ module VpsfreeDevSession
     end
 
     def profile_link_token(path)
-      VpsfreeWorkspaceProfileIdentity.token(path)
+      DevWorkspaceProfileIdentity.token(path)
     end
 
     def parse_global_options
@@ -7055,17 +7052,13 @@ module VpsfreeDevSession
         when /\A--portal-base-url=(.+)\z/
           @portal_url = Regexp.last_match(1)
           @argv.shift
-        when '--vpsadmin-cluster'
+        when '--cluster-provider'
           @argv.shift
-          @vpsadmin_cluster = @argv.shift || raise(Error, '--vpsadmin-cluster requires PATH')
-        when /\A--vpsadmin-cluster=(.+)\z/
-          @vpsadmin_cluster = Regexp.last_match(1)
-          @argv.shift
-        when '--vpsadminos-cluster'
-          @argv.shift
-          @vpsadminos_cluster = @argv.shift || raise(Error, '--vpsadminos-cluster requires PATH')
-        when /\A--vpsadminos-cluster=(.+)\z/
-          @vpsadminos_cluster = Regexp.last_match(1)
+          add_cluster_provider(
+            @argv.shift || raise(Error, '--cluster-provider requires ID=PATH')
+          )
+        when /\A--cluster-provider=(.+)\z/
+          add_cluster_provider(Regexp.last_match(1))
           @argv.shift
         when '--require-runtime'
           @require_runtime = true
@@ -7097,13 +7090,21 @@ module VpsfreeDevSession
         codex_command: @codex_command,
         portal_command: @portal_command,
         portal_url: @portal_url,
-        vpsadmin_cluster: @vpsadmin_cluster,
-        vpsadminos_cluster: @vpsadminos_cluster,
+        cluster_providers: @cluster_providers,
         require_runtime: @require_runtime,
         env: @env,
         out: @out,
         err: @err
       )
+    end
+
+    def add_cluster_provider(specification)
+      provider_id, path = specification.split('=', 2)
+      unless provider_id&.match?(SAFE_PART) && path&.start_with?(File::SEPARATOR) &&
+             !@cluster_providers.key?(provider_id)
+        raise Error, "invalid --cluster-provider: #{specification.inspect}"
+      end
+      @cluster_providers[provider_id] = path
     end
 
     def run_start
@@ -7499,5 +7500,5 @@ module VpsfreeDevSession
 end
 
 if $PROGRAM_NAME == __FILE__
-  exit VpsfreeDevSession::CLI.new(ARGV).run
+  exit DevSession::CLI.new(ARGV).run
 end

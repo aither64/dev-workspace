@@ -13,19 +13,19 @@
     { "name": "revive", "command": "revive" }
   ],
   "threadEnvironmentKeys": [
-    "VPSFREE_DEV_SESSION_SLUG",
-    "VPSFREE_DEV_SESSION_WORKSPACE",
-    "VPSFREE_DEV_SESSION_WORK_DIR",
-    "VPSFREE_DEV_SESSION_WORKTREES_DIR",
-    "VPSFREE_DEV_SESSION_PORTAL_BASE_URL",
-    "VPSFREE_DEV_SESSION_URL",
-    "VPSFREE_DEV_SESSION_AUTHORITY_DIR",
-    "VPSFREE_DEV_SESSION_TMUX_SOCKET",
-    "VPSFREE_DEV_SESSION_CODEX",
-    "VPSFREE_DEV_SESSION_CODEX_SOCKET",
-    "VPSFREE_DEV_SESSION_CODEX_VERSION",
-    "VPSFREE_DEV_SESSION_PORTAL_COMMAND",
-    "VPSFREE_DEV_SESSION_REQUIRE_RUNTIME"
+    "DEV_SESSION_SLUG",
+    "DEV_SESSION_WORKSPACE",
+    "DEV_SESSION_WORK_DIR",
+    "DEV_SESSION_WORKTREES_DIR",
+    "DEV_SESSION_PORTAL_BASE_URL",
+    "DEV_SESSION_URL",
+    "DEV_SESSION_AUTHORITY_DIR",
+    "DEV_SESSION_TMUX_SOCKET",
+    "DEV_SESSION_CODEX",
+    "DEV_SESSION_CODEX_SOCKET",
+    "DEV_SESSION_CODEX_VERSION",
+    "DEV_SESSION_PORTAL_COMMAND",
+    "DEV_SESSION_REQUIRE_RUNTIME"
   ],
   "devSessionFlags": [
     "--require-runtime",
@@ -40,8 +40,7 @@
     "--codex-version",
     "--portal-command",
     "--portal-base-url",
-    "--vpsadmin-cluster",
-    "--vpsadminos-cluster",
+    "--cluster-provider",
     "--transition-lock"
   ],
   "portalServeFlags": [
@@ -58,7 +57,6 @@
     "--codex-socket",
     "--codex-version",
     "--tmux",
-    "--vpsadmin-cluster",
-    "--vpsadminos-cluster"
+    "--cluster-provider"
   ]
 }

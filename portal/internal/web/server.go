@@ -69,8 +69,7 @@ type Config struct {
 	TransitionLock    string
 	CodexSocket       string
 	CodexVersion      string
-	VpsadminCluster   string
-	VpsadminOSCluster string
+	ClusterProviders  []cluster.Provider
 	OperationStateDir string
 	RemovalStateHome  string
 	Logger            *log.Logger
@@ -255,7 +254,7 @@ func New(config Config) (*Server, error) {
 		config: config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
 		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
-		clusters:         cluster.Runner{Workspace: workspace, Vpsadmin: config.VpsadminCluster, VpsadminOS: config.VpsadminOSCluster},
+		clusters:         cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders},
 		repositoryCache:  make(map[string]cachedRepositories),
 		messageLocks:     make(map[string]conversation.MutationLocker),
 		operations:       operations,
@@ -926,7 +925,7 @@ func (s *Server) runDevSessionWithTransition(
 	command := exec.Command(s.config.DevSession, args...)
 	if transition != nil {
 		command.ExtraFiles = []*os.File{transition}
-		command.Env = append(os.Environ(), "VPSFREE_WORKSPACE_TRANSITION_LOCK_FD=3")
+		command.Env = append(os.Environ(), "DEV_WORKSPACE_TRANSITION_LOCK_FD=3")
 	}
 	return runDevSessionCommand(commandCtx, command)
 }

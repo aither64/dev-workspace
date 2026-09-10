@@ -33,7 +33,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  class LockingCLI < VpsfreeDevSession::CLI
+  class LockingCLI < DevSession::CLI
     def initialize(*args, entered:, release:, **options)
       super(*args, **options)
       @entered = entered
@@ -89,7 +89,7 @@ class DevSessionTest < Minitest::Test
       fake_runner.define_singleton_method(:delete) do |input, as_is:, force:, operation_id:|
         calls << [input, as_is, force, operation_id]
       end
-      cli = VpsfreeDevSession::CLI.new(
+      cli = DevSession::CLI.new(
         [
           '--transition-lock', path, '--', 'delete',
           '2026-06-06-demo', '--as-is'
@@ -133,7 +133,7 @@ class DevSessionTest < Minitest::Test
         fake_runner.define_singleton_method(:delete) do |_input, as_is:, force:, operation_id:|
           File.write(marker, "#{as_is}:#{force}:#{operation_id.inspect}\n")
         end
-        cli = VpsfreeDevSession::CLI.new([
+        cli = DevSession::CLI.new([
           '--transition-lock', path, '--', 'delete',
           '2026-06-06-demo', '--as-is'
         ])
@@ -188,7 +188,7 @@ class DevSessionTest < Minitest::Test
         fake_runner = Object.new
         fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
         fake_runner.define_singleton_method(:delete) { |*arguments, **options| calls << [arguments, options] }
-        cli = VpsfreeDevSession::CLI.new(
+        cli = DevSession::CLI.new(
           [
             '--transition-lock', path,
             '--host-profile', profile,
@@ -260,7 +260,7 @@ class DevSessionTest < Minitest::Test
     end
 
     def current_session_identity(_pane)
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$current',
         name: @slug,
         mark: '1',
@@ -348,11 +348,11 @@ class DevSessionTest < Minitest::Test
           @pane_current_command = 'codex'
         end
       end
-      if args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_CODEX_VERSION
+      if args.first == 'set-option' && args[-2] == DevSession::SESSION_CODEX_VERSION
         @codex_client_version = args.last
         return
       end
-      if args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+      if args.first == 'set-environment' && args[-2] == DevSession::ENV_TMUX_IDENTITY
         @identity_token = args.last
         return
       end
@@ -381,7 +381,7 @@ class DevSessionTest < Minitest::Test
     private
 
     def identity
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: @id,
         name: @slug,
         mark: '1',
@@ -442,7 +442,7 @@ class DevSessionTest < Minitest::Test
       return unless killing && !@reported_failure
 
       @reported_failure = true
-      raise VpsfreeDevSession::Error, 'simulated failure after tmux removal'
+      raise DevSession::Error, 'simulated failure after tmux removal'
     end
   end
 
@@ -450,7 +450,7 @@ class DevSessionTest < Minitest::Test
     def session_by_id(id)
       return super unless @killed && id == @id
 
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$12',
         name: @slug,
         mark: '1',
@@ -490,7 +490,7 @@ class DevSessionTest < Minitest::Test
 
     def run(*args)
       if args.first == 'set-environment' &&
-         args[-2] == VpsfreeDevSession::ENV_WORKSPACE
+         args[-2] == DevSession::ENV_WORKSPACE
         @workspace = args.last
       else
         super
@@ -507,7 +507,7 @@ class DevSessionTest < Minitest::Test
     def session(slug)
       return unless slug == @slug
 
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$unmanaged',
         name: @slug,
         mark: '',
@@ -531,7 +531,7 @@ class DevSessionTest < Minitest::Test
     def session(slug)
       return unless slug == @slug
 
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$12',
         name: @slug,
         mark: '1',
@@ -564,7 +564,7 @@ class DevSessionTest < Minitest::Test
       @name_lookups += 1
       return unless @created && slug == @slug
 
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$replacement',
         name: @slug,
         mark: '',
@@ -630,7 +630,7 @@ class DevSessionTest < Minitest::Test
                when 'new-session'
                  @created = true
                  identity = args.find do |value|
-                   value.start_with?("#{VpsfreeDevSession::ENV_TMUX_IDENTITY}=")
+                   value.start_with?("#{DevSession::ENV_TMUX_IDENTITY}=")
                  end
                  @identity_token = identity&.partition('=')&.last
                  '$original'
@@ -647,7 +647,7 @@ class DevSessionTest < Minitest::Test
 
     def run(*args)
       @mutations << args
-      if args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+      if args.first == 'set-environment' && args[-2] == DevSession::ENV_TMUX_IDENTITY
         @identity_token = args.last
       end
     end
@@ -659,7 +659,7 @@ class DevSessionTest < Minitest::Test
     private
 
     def identity(id, managed:)
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id:,
         name: @slug,
         mark: managed ? '1' : '',
@@ -704,25 +704,25 @@ class DevSessionTest < Minitest::Test
         @created = true
         @mark = ''
         @session_slug = ''
-        identity = args.find { |value| value.start_with?("#{VpsfreeDevSession::ENV_TMUX_IDENTITY}=") }
+        identity = args.find { |value| value.start_with?("#{DevSession::ENV_TMUX_IDENTITY}=") }
         @identity_token = identity&.partition('=')&.last
         ["$partial\n", '', nil]
       when 'display-message'
         ["%left\n", '', nil]
       when 'split-window'
         @split_attempts += 1
-        raise VpsfreeDevSession::Error, 'split failed'
+        raise DevSession::Error, 'split failed'
       else
         raise "unexpected tmux capture: #{args.inspect}"
       end
     end
 
     def run(*args)
-      if args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_MARK
+      if args.first == 'set-option' && args[-2] == DevSession::SESSION_MARK
         @mark = args.last
-      elsif args.first == 'set-option' && args[-2] == VpsfreeDevSession::SESSION_SLUG
+      elsif args.first == 'set-option' && args[-2] == DevSession::SESSION_SLUG
         @session_slug = args.last
-      elsif args.first == 'set-environment' && args[-2] == VpsfreeDevSession::ENV_TMUX_IDENTITY
+      elsif args.first == 'set-environment' && args[-2] == DevSession::ENV_TMUX_IDENTITY
         @identity_token = args.last
       elsif args.first == 'kill-session'
         @created = false
@@ -740,7 +740,7 @@ class DevSessionTest < Minitest::Test
     private
 
     def identity
-      VpsfreeDevSession::Tmux::Session.new(
+      DevSession::Tmux::Session.new(
         id: '$partial',
         name: @slug,
         mark: @mark,
@@ -771,7 +771,7 @@ class DevSessionTest < Minitest::Test
 
   class CallbackCommandRunner
     def initialize(out:, err:, &callback)
-      @delegate = VpsfreeDevSession::CommandRunner.new(out:, err:)
+      @delegate = DevSession::CommandRunner.new(out:, err:)
       @callback = callback
     end
 
@@ -802,7 +802,7 @@ class DevSessionTest < Minitest::Test
       }
     end
     err = StringIO.new
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['start', 'demo', '--no-attach'],
       input: TTYInput.new("Investigate the API failure.\n"),
       out: StringIO.new,
@@ -824,7 +824,7 @@ class DevSessionTest < Minitest::Test
     end
     fake_runner.define_singleton_method(:start) { raise 'must not start' }
     err = StringIO.new
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['start', 'demo', '--no-attach'],
       input: StringIO.new("ignored\n"),
       out: StringIO.new,
@@ -839,7 +839,7 @@ class DevSessionTest < Minitest::Test
   def test_retired_lifecycle_commands_are_not_public
     %w[finalize remove reopen _finalize-url].each do |command|
       err = StringIO.new
-      cli = VpsfreeDevSession::CLI.new(
+      cli = DevSession::CLI.new(
         [command, '2026-06-06-demo', '--as-is'],
         input: StringIO.new,
         out: StringIO.new,
@@ -856,7 +856,7 @@ class DevSessionTest < Minitest::Test
     fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
     fake_runner.define_singleton_method(:archive) { |input, **options| calls << [input, options] }
     err = StringIO.new
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['archive', '2026-06-06-demo', '--as-is'],
       input: StringIO.new,
       out: StringIO.new,
@@ -869,7 +869,7 @@ class DevSessionTest < Minitest::Test
     assert_includes(err.string, 'requires an interactive terminal')
 
     err = StringIO.new
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['archive', '2026-06-06-demo', '--as-is'],
       input: TTYInput.new("no\n"),
       out: StringIO.new,
@@ -880,7 +880,7 @@ class DevSessionTest < Minitest::Test
     assert_empty(calls)
     assert_includes(err.string, 'was not confirmed')
 
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['archive', '2026-06-06-demo', '--as-is'],
       input: TTYInput.new("yes\n"),
       out: StringIO.new,
@@ -908,7 +908,7 @@ class DevSessionTest < Minitest::Test
       calls << [input, options]
     end
     err = StringIO.new
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['revive', '2026-06-06-demo', '--as-is'],
       input: TTYInput.new("yes\n"), out: StringIO.new, err:
     )
@@ -935,7 +935,7 @@ class DevSessionTest < Minitest::Test
     fake_runner.define_singleton_method(:revive) do |input, **options|
       calls << [input, options]
     end
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['revive', '2026-06-06-demo', '--as-is'],
       input: StringIO.new, out: StringIO.new, err: StringIO.new
     )
@@ -957,7 +957,7 @@ class DevSessionTest < Minitest::Test
     fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
     fake_runner.define_singleton_method(:stop) { |input, as_is:| stopped << [input, as_is] }
     err = StringIO.new
-    rejected = VpsfreeDevSession::CLI.new(
+    rejected = DevSession::CLI.new(
       ['stop', '2026-06-06-demo', '--as-is'],
       input: StringIO.new,
       out: StringIO.new,
@@ -969,7 +969,7 @@ class DevSessionTest < Minitest::Test
     assert_empty(stopped)
     assert_includes(err.string, 'requires an interactive terminal')
 
-    cli = VpsfreeDevSession::CLI.new(
+    cli = DevSession::CLI.new(
       ['stop', '2026-06-06-demo', '--as-is'],
       input: TTYInput.new("2026-06-06-demo\n"),
       out: StringIO.new,
@@ -987,7 +987,7 @@ class DevSessionTest < Minitest::Test
       File.write(
         cgroup,
         "0::/user.slice/user-1000.slice/user@1000.service/app.slice/" \
-        "workspace-portal@vpsfree-cz.service\n"
+        "workspace-portal@example-workspace.service\n"
       )
       calls = []
       fake_runner = Object.new
@@ -999,12 +999,12 @@ class DevSessionTest < Minitest::Test
       end
       arguments = [
         '--require-runtime',
-        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--authority-dir', '/run/user/1000/dev-workspaces/example-workspace/authority',
         '--portal-command', '/nix/store/portal/bin/workspace-portal',
         '--', 'archive', '2026-06-06-demo', '--as-is', '--portal-authorized',
         '--portal-operation-id', 'a' * 64
       ]
-      cli = VpsfreeDevSession::CLI.new(
+      cli = DevSession::CLI.new(
         arguments,
         input: StringIO.new,
         out: StringIO.new,
@@ -1023,7 +1023,7 @@ class DevSessionTest < Minitest::Test
         calls
       )
 
-      missing_id = VpsfreeDevSession::CLI.new(
+      missing_id = DevSession::CLI.new(
         arguments.first(arguments.length - 2),
         input: StringIO.new,
         out: StringIO.new,
@@ -1038,12 +1038,12 @@ class DevSessionTest < Minitest::Test
 
       revive_arguments = [
         '--require-runtime',
-        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--authority-dir', '/run/user/1000/dev-workspaces/example-workspace/authority',
         '--portal-command', '/nix/store/portal/bin/workspace-portal',
         '--', 'revive', '2026-06-06-demo', '--as-is', '--portal-authorized',
         '--portal-operation-id', 'b' * 64
       ]
-      revive = VpsfreeDevSession::CLI.new(
+      revive = DevSession::CLI.new(
         revive_arguments,
         input: StringIO.new,
         out: StringIO.new,
@@ -1061,7 +1061,7 @@ class DevSessionTest < Minitest::Test
         calls.last
       )
 
-      missing_revive_id = VpsfreeDevSession::CLI.new(
+      missing_revive_id = DevSession::CLI.new(
         revive_arguments.first(revive_arguments.length - 2),
         input: StringIO.new,
         out: StringIO.new,
@@ -1079,12 +1079,12 @@ class DevSessionTest < Minitest::Test
 
       remove_arguments = [
         '--require-runtime',
-        '--authority-dir', '/run/user/1000/vpsfree-workspaces/vpsfree-cz/authority',
+        '--authority-dir', '/run/user/1000/dev-workspaces/example-workspace/authority',
         '--portal-command', '/nix/store/portal/bin/workspace-portal',
         '--', 'delete', '2026-06-06-demo', '--as-is', '--portal-authorized', '--force',
         '--portal-operation-id', 'a' * 64
       ]
-      remove = VpsfreeDevSession::CLI.new(
+      remove = DevSession::CLI.new(
         remove_arguments,
         input: StringIO.new,
         out: StringIO.new,
@@ -1099,9 +1099,9 @@ class DevSessionTest < Minitest::Test
         calls.last
       )
 
-      File.write(cgroup, "0::/user.slice/workspace-tmux@vpsfree-cz.service\n")
+      File.write(cgroup, "0::/user.slice/workspace-tmux@example-workspace.service\n")
       err = StringIO.new
-      rejected = VpsfreeDevSession::CLI.new(
+      rejected = DevSession::CLI.new(
         arguments,
         input: StringIO.new,
         out: StringIO.new,
@@ -1127,7 +1127,7 @@ class DevSessionTest < Minitest::Test
         calls << [input, options]
       end
       err = StringIO.new
-      cli = VpsfreeDevSession::CLI.new(
+      cli = DevSession::CLI.new(
         [
           command, '2026-06-06-demo', '--as-is',
           '--portal-operation-id', 'a' * 64
@@ -1153,8 +1153,8 @@ class DevSessionTest < Minitest::Test
     fake_runner.define_singleton_method(:start) do |_input, **options|
       captured = options.fetch(:goal_text)
     end
-    request = 'x' * VpsfreeDevSession::MAX_MESSAGE_BYTES
-    cli = VpsfreeDevSession::CLI.new(
+    request = 'x' * DevSession::MAX_MESSAGE_BYTES
+    cli = DevSession::CLI.new(
       ['start', 'demo', '--no-attach'],
       input: TTYInput.new("#{request}\n"),
       out: StringIO.new,
@@ -1163,13 +1163,13 @@ class DevSessionTest < Minitest::Test
     cli.define_singleton_method(:runner) { fake_runner }
 
     assert_equal(0, cli.run)
-    assert_equal(VpsfreeDevSession::MAX_MESSAGE_BYTES, captured.bytesize)
+    assert_equal(DevSession::MAX_MESSAGE_BYTES, captured.bytesize)
     assert_equal(request, captured)
   end
 
   def test_new_shared_session_requires_an_initial_request_before_writes
     with_workspace do |workspace|
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         codex_socket: '/run/codex.sock',
@@ -1182,7 +1182,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start('demo', as_is: false, new: false, attach: false, run_codex: true)
       end
       assert_includes(error.message, 'requires an initial request')
@@ -1198,7 +1198,7 @@ class DevSessionTest < Minitest::Test
       File.write(target, "Do the work.\n")
       File.symlink(target, link)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).send(:read_goal, link)
       end
       assert_includes(error.message, 'goal file is a symlink')
@@ -1242,11 +1242,11 @@ class DevSessionTest < Minitest::Test
           puts JSON.generate(threadId: 'thread-fork')
         end
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_args, **kwargs|
           session.identity_token = kwargs.fetch(:identity_token)
           session
@@ -1294,7 +1294,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:write_portal_manifest, '2026-06-05-source', manifest)
       runner.ensure_tracking_files('2026-06-06-taken')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.fork('2026-06-05-source', 'taken', as_is: false, json: true)
       end
       assert_includes(error.message, 'already exists')
@@ -1316,7 +1316,7 @@ class DevSessionTest < Minitest::Test
       setup.send(:write_portal_manifest, source_slug, manifest)
       called = File.join(workspace, 'portal-called')
       portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         codex_socket: '/run/current/app-server.sock',
@@ -1328,7 +1328,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.fork(source_slug, 'fork', as_is: false, json: true)
       end
 
@@ -1359,24 +1359,24 @@ class DevSessionTest < Minitest::Test
           puts JSON.generate(threadId: 'thread-fork')
         end
       RUBY
-      failing_class = Class.new(VpsfreeDevSession::Runner) do
+      failing_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_args, **_kwargs|
-          raise VpsfreeDevSession::Error, 'tmux failed'
+          raise DevSession::Error, 'tmux failed'
         end
       end
       failing = failing_class.new(
         workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
         out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
       )
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         failing.fork(source_slug, 'retry', as_is: false, json: true)
       end
 
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
-      retry_class = Class.new(VpsfreeDevSession::Runner) do
+      retry_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_args, **kwargs|
           session.identity_token = kwargs.fetch(:identity_token)
           session
@@ -1401,9 +1401,9 @@ class DevSessionTest < Minitest::Test
       source = setup.send(:ensure_portal_manifest, source_slug)
       source['codex'] = { 'thread_id' => 'thread-source' }
       setup.send(:write_portal_manifest, source_slug, source)
-      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_class = Class.new(DevSession::Runner) do
         define_method(:create_portal_fork) do |*_arguments, **_keywords|
-          raise VpsfreeDevSession::Error, 'simulated crash before forked thread creation'
+          raise DevSession::Error, 'simulated crash before forked thread creation'
         end
       end
       crashing = crashing_class.new(
@@ -1415,7 +1415,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         crashing.fork(
           source_slug,
           'retry',
@@ -1438,12 +1438,12 @@ class DevSessionTest < Minitest::Test
       assert_nil(partial.dig('codex', 'thread_id'))
       FileUtils.rm_r(File.join(workspace, 'work', source_slug))
 
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$12', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
       forked_from_thread = nil
-      retry_class = Class.new(VpsfreeDevSession::Runner) do
+      retry_class = Class.new(DevSession::Runner) do
         define_method(:create_portal_fork) do |_slug, source_thread_id, **_keywords|
           forked_from_thread = source_thread_id
           'thread-fork'
@@ -1465,7 +1465,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         retry_runner.fork(
           'source',
           'retry',
@@ -1504,11 +1504,11 @@ class DevSessionTest < Minitest::Test
       source = setup.send(:ensure_portal_manifest, source_slug)
       source['codex'] = { 'thread_id' => 'thread-source' }
       setup.send(:write_portal_manifest, source_slug, source)
-      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_class = Class.new(DevSession::Runner) do
         def ensure_fork_tracking_file!(path, expected, label)
           super
           if label == 'plan.md'
-            raise VpsfreeDevSession::Error, 'simulated crash between tracking files'
+            raise DevSession::Error, 'simulated crash between tracking files'
           end
         end
       end
@@ -1521,7 +1521,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         crashing.fork(source_slug, 'retry', as_is: false, json: true)
       end
       assert(File.file?(setup.send(:fork_journal_file, destination_slug)))
@@ -1542,9 +1542,9 @@ class DevSessionTest < Minitest::Test
         File.stat(File.join(destination_work, '.state.md.123.tmp')).mode & 0o777
       )
       FileUtils.rm_r(File.join(workspace, 'work', source_slug))
-      retry_class = Class.new(VpsfreeDevSession::Runner) do
+      retry_class = Class.new(DevSession::Runner) do
         define_method(:create_portal_fork) do |*_arguments, **_keywords|
-          raise VpsfreeDevSession::Error, 'reached thread creation'
+          raise DevSession::Error, 'reached thread creation'
         end
       end
       retry_runner = retry_class.new(
@@ -1556,7 +1556,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         retry_runner.fork('source', 'retry', as_is: false, json: true)
       end
 
@@ -1581,10 +1581,10 @@ class DevSessionTest < Minitest::Test
       source = setup.send(:ensure_portal_manifest, source_slug)
       source['codex'] = { 'thread_id' => 'thread-source' }
       setup.send(:write_portal_manifest, source_slug, source)
-      crashing_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_class = Class.new(DevSession::Runner) do
         def ensure_fork_portal_manifest(slug, _source_slug)
           write_portal_manifest(slug, new_portal_manifest(slug))
-          raise VpsfreeDevSession::Error, 'simulated crash before fork provenance'
+          raise DevSession::Error, 'simulated crash before fork provenance'
         end
       end
       crashing = crashing_class.new(
@@ -1596,7 +1596,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         crashing.fork(source_slug, 'retry', as_is: false, json: true)
       end
       partial = YAML.safe_load(
@@ -1608,9 +1608,9 @@ class DevSessionTest < Minitest::Test
       )
       File.write(portal_temporary, "partial: true\n")
       FileUtils.rm_r(File.join(workspace, 'work', source_slug))
-      retry_class = Class.new(VpsfreeDevSession::Runner) do
+      retry_class = Class.new(DevSession::Runner) do
         define_method(:create_portal_fork) do |*_arguments, **_keywords|
-          raise VpsfreeDevSession::Error, 'reached thread creation'
+          raise DevSession::Error, 'reached thread creation'
         end
       end
       retry_runner = retry_class.new(
@@ -1622,7 +1622,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         retry_runner.fork('source', 'retry', as_is: false, json: true)
       end
 
@@ -1645,7 +1645,7 @@ class DevSessionTest < Minitest::Test
       source['codex'] = { 'thread_id' => 'thread-source' }
       setup.send(:write_portal_manifest, source_slug, source)
       load_count = 0
-      racing_class = Class.new(VpsfreeDevSession::Runner) do
+      racing_class = Class.new(DevSession::Runner) do
         define_method(:load_fork_journal) do |slug, expected_source = nil|
           load_count += 1
           if load_count == 2
@@ -1669,7 +1669,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.fork(
           source_slug,
           'alternative',
@@ -1715,7 +1715,7 @@ class DevSessionTest < Minitest::Test
       )
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'remove archive checkout')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         setup.fork(source_slug, 'alternative', as_is: false, json: true)
       end
 
@@ -1739,7 +1739,7 @@ class DevSessionTest < Minitest::Test
         warn 'Codex model is unavailable'
         exit 1
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         portal_command: [RbConfig.ruby, portal],
@@ -1749,7 +1749,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.fork(
           source_slug,
           'alternative',
@@ -1786,7 +1786,7 @@ class DevSessionTest < Minitest::Test
         model: nil, effort: nil
       )
       FileUtils.mkdir_p(File.join(workspace, 'worktrees', destination_slug))
-      original = VpsfreeDevSession::Tmux::Session.new(
+      original = DevSession::Tmux::Session.new(
         id: '$11', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, environment_slug: destination_slug,
         socket_path: '/run/test.sock', identity_token: 'a' * 64
@@ -1797,7 +1797,7 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:, authority_dir:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.fork(source_slug, 'alternative', as_is: false, json: true)
       end
 
@@ -1828,13 +1828,13 @@ class DevSessionTest < Minitest::Test
       tmux = PartialManagedTmux.new(
         destination_slug, workspace:, identity_token: journal.fetch('tmux_identity')
       )
-      created = VpsfreeDevSession::Tmux::Session.new(
+      created = DevSession::Tmux::Session.new(
         id: '$12', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, environment_slug: destination_slug,
         socket_path: '/run/test.sock', codex_thread_id: 'thread-fork',
         codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_arguments, **keywords|
           created.identity_token = keywords.fetch(:identity_token)
           created
@@ -1880,7 +1880,7 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.fork(source_slug, 'alternative', as_is: false, json: true)
       end
 
@@ -1980,7 +1980,7 @@ class DevSessionTest < Minitest::Test
         codex_thread_id: 'thread-fork'
       )
       out = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         out:,
@@ -2002,11 +2002,11 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner = runner_for(workspace)
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.build_slug('../escape', as_is: false)
       end
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.build_slug('demo:1', as_is: false)
       end
     end
@@ -2018,7 +2018,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'worktrees', '2026-06-06-demo'))
 
       runner = runner_for(workspace)
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.lookup_slug('demo', as_is: false)
       end
 
@@ -2033,7 +2033,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new('x/2026-06-06-demo', workspace:)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.lookup_slug('demo', as_is: false)
       end
 
@@ -2071,7 +2071,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-06-demo'))
 
       runner = runner_for(workspace)
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.resolve_start_slug('demo', as_is: false, new: false)
       end
 
@@ -2110,7 +2110,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner = runner_for(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.resolve_start_slug('demo', as_is: true, new: true)
       end
 
@@ -2122,7 +2122,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner = runner_for(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.resolve_start_slug('2026-06-05-demo', as_is: false, new: true)
       end
 
@@ -2134,7 +2134,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner = runner_for(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.resolve_start_slug('../escape', as_is: true, new: false)
       end
 
@@ -2146,7 +2146,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).start(
           slug,
           as_is: true,
@@ -2188,7 +2188,7 @@ class DevSessionTest < Minitest::Test
       out = StringIO.new
       socket_path = '/run/user/1000/tmux-1000/default'
       tmux = ManagedTmux.new(slug, workspace:, socket_path:)
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         out:,
@@ -2210,13 +2210,13 @@ class DevSessionTest < Minitest::Test
 
   def test_tmux_socket_can_come_from_deployment_environment
     with_workspace do |workspace|
-      socket = '/run/vpsfree-workspace-tmux/tmux.sock'
-      runner = VpsfreeDevSession::Runner.new(
+      socket = '/run/dev-workspace-tmux/tmux.sock'
+      runner = DevSession::Runner.new(
         workspace:,
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
-        env: { 'VPSFREE_DEV_SESSION_TMUX_SOCKET' => socket }
+        env: { 'DEV_SESSION_TMUX_SOCKET' => socket }
       )
 
       assert_equal(socket, runner.instance_variable_get(:@tmux).socket)
@@ -2225,8 +2225,8 @@ class DevSessionTest < Minitest::Test
 
   def test_portal_runtime_mode_fails_closed_and_propagates_to_sessions
     with_workspace do |workspace|
-      error = assert_raises(VpsfreeDevSession::Error) do
-        VpsfreeDevSession::Runner.new(
+      error = assert_raises(DevSession::Error) do
+        DevSession::Runner.new(
           workspace:,
           tmux: NullTmux.new,
           require_runtime: true,
@@ -2237,7 +2237,29 @@ class DevSessionTest < Minitest::Test
       end
       assert_includes(error.message, 'portal runtime configuration is incomplete')
 
-      runner = VpsfreeDevSession::Runner.new(
+      error = assert_raises(DevSession::Error) do
+        DevSession::Runner.new(
+          workspace:,
+          tmux: NullTmux.new,
+          authority_dir: '/run/workspace-authority',
+          tmux_socket: '/run/workspace-tmux/tmux.sock',
+          codex_socket: '/run/workspace-codex/app-server.sock',
+          codex_version: '0.152.1',
+          codex_command: '/bin/true',
+          portal_command: ['/run/current-system/sw/bin/workspace-portal'],
+          cluster_providers: {
+            'alpha' => File.join(workspace, 'missing-devcluster'),
+            'beta' => RbConfig.ruby
+          },
+          require_runtime: true,
+          out: StringIO.new,
+          err: StringIO.new,
+          env: {}
+        )
+      end
+      assert_equal('portal runtime commands are unavailable: alpha-devcluster', error.message)
+
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         authority_dir: '/run/workspace-authority',
@@ -2246,8 +2268,7 @@ class DevSessionTest < Minitest::Test
         codex_version: '0.152.1',
         codex_command: '/bin/true',
         portal_command: ['/run/current-system/sw/bin/workspace-portal'],
-        vpsadmin_cluster: RbConfig.ruby,
-        vpsadminos_cluster: RbConfig.ruby,
+        cluster_providers: { 'alpha' => RbConfig.ruby, 'beta' => RbConfig.ruby },
         require_runtime: true,
         out: StringIO.new,
         err: StringIO.new,
@@ -2258,21 +2279,21 @@ class DevSessionTest < Minitest::Test
         File.read(File.expand_path('../portal/internal/session/runtime-contract.json', __dir__))
       )
       assert_equal(
-        VpsfreeDevSession::MAX_MESSAGE_BYTES,
+        DevSession::MAX_MESSAGE_BYTES,
         contract.fetch('maxMessageBytes')
       )
       assert_equal(
-        VpsfreeDevSession::TRACKING_MAX_SIZE,
+        DevSession::TRACKING_MAX_SIZE,
         contract.fetch('trackingMaxBytes')
       )
       assert_equal(
-        VpsfreeDevSession::LIFECYCLE_JOURNALS,
+        DevSession::LIFECYCLE_JOURNALS,
         contract.fetch('lifecycleJournals')
       )
       expected_journals = contract.fetch('lifecycleJournals').to_h do |journal|
         [journal.fetch('command'), journal.fetch('name')]
       end
-      assert_equal(expected_journals, VpsfreeDevSession::LIFECYCLE_JOURNAL_NAMES)
+      assert_equal(expected_journals, DevSession::LIFECYCLE_JOURNAL_NAMES)
       assert_equal(%w[archive delete revive], expected_journals.keys.sort)
       assert_equal(expected_journals.length, expected_journals.values.uniq.length)
       expected_journals.each do |command, name|
@@ -2284,21 +2305,21 @@ class DevSessionTest < Minitest::Test
       environment_keys = contract.fetch('threadEnvironmentKeys')
       assert_equal(environment_keys.sort, environment.keys.sort)
       assert_equal(
-        (environment_keys - [VpsfreeDevSession::ENV_REQUIRE_RUNTIME]).sort,
-        VpsfreeDevSession::THREAD_ENV_ARGUMENTS.keys.sort
+        (environment_keys - [DevSession::ENV_REQUIRE_RUNTIME]).sort,
+        DevSession::THREAD_ENV_ARGUMENTS.keys.sort
       )
-      assert_equal('1', environment.fetch(VpsfreeDevSession::ENV_REQUIRE_RUNTIME))
+      assert_equal('1', environment.fetch(DevSession::ENV_REQUIRE_RUNTIME))
       assert_equal(
-        VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL,
-        environment.fetch(VpsfreeDevSession::ENV_PORTAL_BASE_URL)
+        DevSession::DEFAULT_PORTAL_BASE_URL,
+        environment.fetch(DevSession::ENV_PORTAL_BASE_URL)
       )
       assert_equal(
-        "#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/2026-06-06-demo/",
-        environment.fetch(VpsfreeDevSession::ENV_PORTAL_URL)
+        "#{DevSession::DEFAULT_PORTAL_BASE_URL}/2026-06-06-demo/",
+        environment.fetch(DevSession::ENV_PORTAL_URL)
       )
       assert_equal(
         '/run/current-system/sw/bin/workspace-portal',
-        environment.fetch(VpsfreeDevSession::ENV_PORTAL_COMMAND)
+        environment.fetch(DevSession::ENV_PORTAL_COMMAND)
       )
     end
   end
@@ -2319,8 +2340,7 @@ class DevSessionTest < Minitest::Test
         '--codex-version' => 'test-version',
         '--portal-command' => '/bin/true',
         '--portal-base-url' => 'https://workspace.example.test',
-        '--vpsadmin-cluster' => RbConfig.ruby,
-        '--vpsadminos-cluster' => RbConfig.ruby,
+        '--cluster-provider' => "alpha=#{RbConfig.ruby}",
         '--transition-lock' => File.join(workspace, 'transition.lock')
       }
       FileUtils.mkdir_p(values.fetch('--expected-host-generation'))
@@ -2335,7 +2355,7 @@ class DevSessionTest < Minitest::Test
       end
       out = StringIO.new
       err = StringIO.new
-      status = VpsfreeDevSession::CLI.new(arguments + ['validate'], out:, err:).run
+      status = DevSession::CLI.new(arguments + ['validate'], out:, err:).run
       assert_equal(0, status, err.string)
     end
   end
@@ -2359,7 +2379,7 @@ class DevSessionTest < Minitest::Test
 
       out = StringIO.new
       err = StringIO.new
-      status = VpsfreeDevSession::CLI.new(arguments + ['--help'], out:, err:).run
+      status = DevSession::CLI.new(arguments + ['--help'], out:, err:).run
       assert_equal(0, status, err.string)
       assert_includes(out.string, 'Usage:')
 
@@ -2367,7 +2387,7 @@ class DevSessionTest < Minitest::Test
         caller_arguments = override == '--workspace' ? [override, '/tmp/caller'] : [override]
         out = StringIO.new
         err = StringIO.new
-        status = VpsfreeDevSession::CLI.new(
+        status = DevSession::CLI.new(
           arguments + caller_arguments + ['validate'], out:, err:
         ).run
         assert_equal(1, status)
@@ -2381,14 +2401,14 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       FileUtils.mkdir_p(File.join(workspace, 'work', slug))
       out = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         out:,
         err: StringIO.new,
         env: {
-          VpsfreeDevSession::ENV_PORTAL_BASE_URL => 'https://workspace.example.test',
-          VpsfreeDevSession::ENV_PORTAL_URL => "https://workspace.example.test/#{slug}/"
+          DevSession::ENV_PORTAL_BASE_URL => 'https://workspace.example.test',
+          DevSession::ENV_PORTAL_URL => "https://workspace.example.test/#{slug}/"
         }
       )
 
@@ -2411,7 +2431,7 @@ class DevSessionTest < Minitest::Test
         former_tmpdir = ENV['TMUX_TMPDIR']
         ENV['TMUX_TMPDIR'] = File.join(socket_directory, 'ignored')
         begin
-          runner = VpsfreeDevSession::Runner.new(
+          runner = DevSession::Runner.new(
             workspace:,
             tmux_socket: socket,
             authority_dir:,
@@ -2434,7 +2454,7 @@ class DevSessionTest < Minitest::Test
           assert(status.success?, 'explicit tmux socket did not survive TMUX_TMPDIR drift')
 
           out = StringIO.new
-          ordinary_runner = VpsfreeDevSession::Runner.new(
+          ordinary_runner = DevSession::Runner.new(
             workspace:,
             authority_dir:,
             out:,
@@ -2445,7 +2465,7 @@ class DevSessionTest < Minitest::Test
           ordinary_runner.list(slug, as_is: true)
           assert_includes(out.string, 'managed')
 
-          mismatch = VpsfreeDevSession::Runner.new(
+          mismatch = DevSession::Runner.new(
             workspace:,
             tmux_socket: File.join(socket_directory, 'other.sock'),
             authority_dir:,
@@ -2454,7 +2474,7 @@ class DevSessionTest < Minitest::Test
             today: TODAY,
             env: {}
           )
-          error = assert_raises(VpsfreeDevSession::Error) do
+          error = assert_raises(DevSession::Error) do
             mismatch.list(slug, as_is: true)
           end
           assert_includes(error.message, 'does not match trusted session authority')
@@ -2476,10 +2496,10 @@ class DevSessionTest < Minitest::Test
       target = ManagedTmux.new(
         slug,
         workspace:,
-        socket_path: '/run/vpsfree-workspace-tmux/tmux.sock'
+        socket_path: '/run/dev-workspace-tmux/tmux.sock'
       )
       calls = []
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: target,
         process_exec: ->(environment, argv) { calls << [environment, argv] },
@@ -2510,10 +2530,10 @@ class DevSessionTest < Minitest::Test
       target = ManagedTmux.new(
         slug,
         workspace:,
-        socket_path: '/run/vpsfree-workspace-tmux/tmux.sock'
+        socket_path: '/run/dev-workspace-tmux/tmux.sock'
       )
       calls = []
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: target,
         process_exec: ->(environment, argv) { calls << [environment, argv] },
@@ -2547,14 +2567,14 @@ class DevSessionTest < Minitest::Test
         '-e',
         "require 'json'; puts JSON.generate(threadId: 'thread-123')"
       ]
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$created',
         name: slug,
         mark: '1',
         slug:,
         workspace:
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |
           _slug, run_codex:, thread_id:, launch_codex:, identity_token:
         |
@@ -2638,10 +2658,10 @@ class DevSessionTest < Minitest::Test
           File.write(#{snapshot_record.dump}, "\#{input}\n\#{File.stat(input).mode & 0o777}\n")
         end
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$created', name: slug, mark: '1', slug:, workspace:
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:prepare_creation_journal) do |*arguments, **keywords|
           journal = super(*arguments, **keywords)
           File.write(goal, "A replacement request that must be ignored.\n")
@@ -2700,7 +2720,7 @@ class DevSessionTest < Minitest::Test
         warn 'recorded thread is unavailable'
         exit 1
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         codex_socket: '/run/test/codex.sock',
@@ -2721,7 +2741,7 @@ class DevSessionTest < Minitest::Test
       }
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.start(
           slug,
           as_is: true,
@@ -2755,7 +2775,7 @@ class DevSessionTest < Minitest::Test
         warn 'recorded thread has no rollout'
         exit 1
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         codex_socket: '/run/test/codex.sock',
@@ -2791,7 +2811,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:write_portal_manifest, slug, manifest)
       runner.send(:mark_creation_journal_ready, slug, journal)
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.start(
           slug,
           as_is: true,
@@ -2809,7 +2829,7 @@ class DevSessionTest < Minitest::Test
       unchanged = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', unchanged.dig('creation', 'state'))
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.start(
           slug,
           as_is: true,
@@ -2831,7 +2851,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       tmux = ManagedTmux.new(slug, workspace:)
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         out: StringIO.new,
@@ -2842,7 +2862,7 @@ class DevSessionTest < Minitest::Test
       )
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
-      shared_runner = VpsfreeDevSession::Runner.new(
+      shared_runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         out: StringIO.new,
@@ -2855,7 +2875,7 @@ class DevSessionTest < Minitest::Test
           "require 'json'; puts JSON.generate(threadId: 'unexpected')"
         ]
       )
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         shared_runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
       end
       assert_match(/no shared Codex thread/, error.message)
@@ -2904,11 +2924,11 @@ class DevSessionTest < Minitest::Test
         end
       RUBY
       out = StringIO.new
-      created_session = VpsfreeDevSession::Tmux::Session.new(
+      created_session = DevSession::Tmux::Session.new(
         id: '$created', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/test/tmux.sock'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_arguments, **_keywords|
           created_session
         end
@@ -2931,7 +2951,7 @@ class DevSessionTest < Minitest::Test
         portal_command: [RbConfig.ruby, portal]
       )
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.start(
           slug,
           as_is: true,
@@ -2953,7 +2973,7 @@ class DevSessionTest < Minitest::Test
       creation_identity = JSON.parse(
         File.read(runner.send(:creation_journal_file, slug))
       ).fetch('tmux_identity')
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out:,
@@ -3010,7 +3030,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('ready', journal.fetch('state'))
 
       replay_out = StringIO.new
-      replay_runner = VpsfreeDevSession::Runner.new(
+      replay_runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         out: replay_out,
@@ -3034,10 +3054,10 @@ class DevSessionTest < Minitest::Test
       assert_nil(replay.fetch('attach'))
       assert_equal(replayed_commands, File.readlines(log, chomp: true))
 
-      stopped_session = VpsfreeDevSession::Tmux::Session.new(
+      stopped_session = DevSession::Tmux::Session.new(
         id: '$restarted', name: slug, mark: '1', slug:, workspace:
       )
-      restart_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      restart_runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| stopped_session }
         define_method(:sync_slug) { |*_arguments, **_keywords| stopped_session }
         define_method(:revalidate_session!) { |_expected| stopped_session }
@@ -3082,7 +3102,7 @@ class DevSessionTest < Minitest::Test
         puts JSON.generate(threadId: 'thread-manifest') if ARGV[1] == 'create'
       RUBY
 
-      setup = VpsfreeDevSession::Runner.new(
+      setup = DevSession::Runner.new(
         workspace:, authority_dir:, tmux: NullTmux.new,
         out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
       )
@@ -3094,7 +3114,7 @@ class DevSessionTest < Minitest::Test
         'client_version' => '0.152.1'
       }
       setup.send(:write_portal_manifest, slug, manifest)
-      stale = VpsfreeDevSession::Tmux::Session.new(
+      stale = DevSession::Tmux::Session.new(
         id: '$7', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-stale',
         codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
@@ -3105,7 +3125,7 @@ class DevSessionTest < Minitest::Test
       created = stale.dup
       created.id = '$8'
       created.codex_thread_id = 'thread-manifest'
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |_slug, thread_id:, **_keywords|
           created_threads << thread_id
           created
@@ -3148,14 +3168,14 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test.sock',
         identity_token: 'a' * 64
       )
       runner.send(:write_session_authority, slug, session, state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       end
 
@@ -3192,12 +3212,12 @@ class DevSessionTest < Minitest::Test
           File.write(#{observation.dump}, "ready for initial turn\n")
         end
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$7', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-123',
         codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
@@ -3259,13 +3279,13 @@ class DevSessionTest < Minitest::Test
           exit 1 if id == 'thread-vanished'
         end
       RUBY
-      original = VpsfreeDevSession::Tmux::Session.new(
+      original = DevSession::Tmux::Session.new(
         id: '$7', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test/tmux.sock',
         codex_thread_id: 'thread-vanished', codex_socket_path: '/run/test/codex.sock',
         codex_client_version: '0.153.0', codex_pane_id: '%1'
       )
-      first_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      first_runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_arguments, **keywords|
           original.identity_token = keywords.fetch(:identity_token)
           original
@@ -3280,7 +3300,7 @@ class DevSessionTest < Minitest::Test
         portal_command: [RbConfig.ruby, portal], out: StringIO.new,
         err: StringIO.new, today: TODAY, env: {}
       )
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         first.start(
           slug, as_is: true, new: false, attach: false, run_codex: true,
           goal_file: goal, json: true, exclusive: true
@@ -3300,7 +3320,7 @@ class DevSessionTest < Minitest::Test
       replacement = original.dup
       replacement.id = '$8'
       replacement.codex_thread_id = 'thread-replacement'
-      second_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      second_runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_arguments, **keywords|
           replacement.identity_token = keywords.fetch(:identity_token)
           replacement
@@ -3357,12 +3377,12 @@ class DevSessionTest < Minitest::Test
         require 'json'
         puts JSON.generate(threadId: 'thread-crash') if ARGV[1] == 'create'
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$8', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-crash',
         codex_socket_path: '/run/test/codex.sock', codex_client_version: '0.152.1'
       )
-      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |_expected| session }
@@ -3370,7 +3390,7 @@ class DevSessionTest < Minitest::Test
 
         def mark_creation_journal_ready(slug, journal)
           super
-          raise VpsfreeDevSession::Error, 'simulated crash before authority publication'
+          raise DevSession::Error, 'simulated crash before authority publication'
         end
       end
       runner = crashing_runner_class.new(
@@ -3388,7 +3408,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.start(
           slug, as_is: true, new: false, attach: false, run_codex: true,
           goal_file: goal, json: true, exclusive: true
@@ -3403,7 +3423,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('creating', authority.fetch('state'))
 
       out = StringIO.new
-      replay = VpsfreeDevSession::Runner.new(
+      replay = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         tmux: ManagedTmux.new(
@@ -3454,7 +3474,7 @@ class DevSessionTest < Minitest::Test
           puts JSON.generate(threadId: File.read(#{thread_marker.dump}).strip)
         end
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         out: StringIO.new,
@@ -3464,7 +3484,7 @@ class DevSessionTest < Minitest::Test
         portal_command: [RbConfig.ruby, portal]
       )
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.start(
           slug,
           as_is: true,
@@ -3482,7 +3502,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('creating', partial.dig('creation', 'state'))
       assert_nil(partial.dig('codex', 'thread_id'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -3497,7 +3517,7 @@ class DevSessionTest < Minitest::Test
       assert_includes(error.message, 'does not match the recorded goal')
 
       creation_identity = JSON.parse(File.read(journal)).fetch('tmux_identity')
-      retry_runner = VpsfreeDevSession::Runner.new(
+      retry_runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out: StringIO.new,
@@ -3532,11 +3552,11 @@ class DevSessionTest < Minitest::Test
         assert_includes(command, "--worktrees-dir #{File.join(workspace, 'worktrees', slug)}")
         assert_includes(
           command,
-          "--portal-base-url #{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}"
+          "--portal-base-url #{DevSession::DEFAULT_PORTAL_BASE_URL}"
         )
         assert_includes(
           command,
-          "--portal-url #{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/"
+          "--portal-url #{DevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/"
         )
       end
       assert_equal('thread-recovered', File.read(thread_marker).strip)
@@ -3548,10 +3568,10 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume after an early crash.\n")
-      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_runner_class = Class.new(DevSession::Runner) do
         def ensure_tracking_files(slug, **)
           super
-          raise VpsfreeDevSession::Error, 'simulated crash after tracking creation'
+          raise DevSession::Error, 'simulated crash after tracking creation'
         end
       end
       crashing_runner = crashing_runner_class.new(
@@ -3564,7 +3584,7 @@ class DevSessionTest < Minitest::Test
         portal_command: [RbConfig.ruby, '-e', "require 'json'; puts JSON.generate(threadId: 'thread-early')"]
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         crashing_runner.start(
           slug,
           as_is: true,
@@ -3581,7 +3601,7 @@ class DevSessionTest < Minitest::Test
       refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
 
       creation_identity = JSON.parse(File.read(journal)).fetch('tmux_identity')
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(slug, workspace:, identity_token: creation_identity),
         out: StringIO.new,
@@ -3612,9 +3632,9 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume after an early crash.\n")
-      crashing_runner_class = Class.new(VpsfreeDevSession::Runner) do
+      crashing_runner_class = Class.new(DevSession::Runner) do
         def ensure_tracking_files(_slug, **)
-          raise VpsfreeDevSession::Error, 'simulated crash before tracking creation'
+          raise DevSession::Error, 'simulated crash before tracking creation'
         end
       end
       crashing_runner = crashing_runner_class.new(
@@ -3625,7 +3645,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         crashing_runner.start(
           slug,
           as_is: true,
@@ -3645,7 +3665,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(tracking, 'plan.md'), "# #{slug}\n\n## Goal\n")
       File.write(File.join(tracking, 'state.md'), runner.send(:state_skeleton, slug))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -3719,7 +3739,7 @@ class DevSessionTest < Minitest::Test
         "schema: 1\nslug: 2026-09-03-other\n"
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner_for(workspace).validate
       end
     end
@@ -3750,14 +3770,14 @@ class DevSessionTest < Minitest::Test
         File.join(archive, 'portal.yml'),
         "schema: 1\nslug: #{slug}\nfinalized_at: '2026-09-03T12:00:00Z'\nrepositories: []\nartifacts: []\n"
       )
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         validating_runner.validate
       end
       assert_includes(error.message, 'duplicate session')
 
       FileUtils.rm_rf(File.join(workspace, 'work', slug))
       File.write(File.join(archive, 'state.md'), "---\nlifecycle: active\n---\n")
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         validating_runner.validate
       end
       assert_includes(error.message, 'terminal lifecycle')
@@ -3775,7 +3795,7 @@ class DevSessionTest < Minitest::Test
         FileUtils.mkdir_p(directory)
         FileUtils.cp(fixture, File.join(directory, 'portal.yml'))
 
-        assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+        assert_raises(DevSession::Error, File.basename(fixture)) do
           runner_for(workspace).send(
             :load_portal_manifest,
             File.join(directory, 'portal.yml'),
@@ -3796,7 +3816,7 @@ class DevSessionTest < Minitest::Test
     Dir[File.expand_path('fixtures/runtime-authority-invalid-*.json', __dir__)].each do |fixture|
       record = JSON.parse(File.read(fixture))
       record['workspace'] = runner.workspace
-      assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+      assert_raises(DevSession::Error, File.basename(fixture)) do
         runner.send(:validate_session_authority!, record, 'example', fixture)
       end
     end
@@ -3808,7 +3828,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       runner.ensure_tracking_files(slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -3828,7 +3848,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3846,7 +3866,7 @@ class DevSessionTest < Minitest::Test
         File.join(workspace, 'archive', slug)
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3879,7 +3899,7 @@ class DevSessionTest < Minitest::Test
         git_capture_success('git', '-C', workspace, 'ls-files', '--', File.join('archive', slug))
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3907,7 +3927,7 @@ class DevSessionTest < Minitest::Test
         git_capture_success('git', '-C', workspace, 'ls-files', '--', File.join('archive', slug))
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3940,7 +3960,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       File.write(File.join(workspace, '.git'), "not a git directory\n")
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3955,7 +3975,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(directory)
       File.write(File.join(directory, 'plan.md'), '')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace).ensure_tracking_files(slug)
       end
 
@@ -3971,12 +3991,12 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.join(workspace, 'work', short_slug))
       FileUtils.mkdir_p(File.join(workspace, 'work', long_slug))
 
-      worktree = File.join(workspace, 'worktrees', long_slug, 'vpsadmin')
+      worktree = File.join(workspace, 'worktrees', long_slug, 'alpha')
       FileUtils.mkdir_p(worktree)
       File.write(File.join(worktree, '.git'), "gitdir: /tmp/nonexistent\n")
 
       out = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         out:,
@@ -4009,8 +4029,8 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(
         workspace,
         env: {
-          VpsfreeDevSession::ENV_SLUG => slug,
-          VpsfreeDevSession::ENV_WORKSPACE => workspace
+          DevSession::ENV_SLUG => slug,
+          DevSession::ENV_WORKSPACE => workspace
         },
         out:
       )
@@ -4026,12 +4046,12 @@ class DevSessionTest < Minitest::Test
         runner = runner_for(
           workspace,
           env: {
-            VpsfreeDevSession::ENV_SLUG => '2026-06-06-demo',
-            VpsfreeDevSession::ENV_WORKSPACE => foreign_workspace
+            DevSession::ENV_SLUG => '2026-06-06-demo',
+            DevSession::ENV_WORKSPACE => foreign_workspace
           }
         )
 
-        error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+        error = assert_raises(DevSession::Error) { runner.current }
 
         assert_match(/not managed by this workspace/, error.message)
       end
@@ -4064,7 +4084,7 @@ class DevSessionTest < Minitest::Test
           env: { 'TMUX' => 'socket', 'TMUX_PANE' => '%1' }
         )
 
-        error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+        error = assert_raises(DevSession::Error) { runner.current }
 
         assert_match(/not managed by this workspace/, error.message)
       end
@@ -4086,7 +4106,7 @@ class DevSessionTest < Minitest::Test
   def test_current_uses_worktrees_directory_slug
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
-      cwd = File.join(workspace, 'worktrees', slug, 'vpsadmin', 'app')
+      cwd = File.join(workspace, 'worktrees', slug, 'alpha', 'app')
       FileUtils.mkdir_p(cwd)
 
       runner = runner_for(workspace, cwd:)
@@ -4099,7 +4119,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner = runner_for(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.current
       end
 
@@ -4114,7 +4134,7 @@ class DevSessionTest < Minitest::Test
     slug = '2026-06-06-demo'
 
     with_workspace do |workspace|
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
@@ -4126,48 +4146,12 @@ class DevSessionTest < Minitest::Test
       )
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
-      error = assert_raises(VpsfreeDevSession::Error) { runner.current }
+      error = assert_raises(DevSession::Error) { runner.current }
 
       assert_match(/no current dev session/, error.message)
       assert(tmux_session_exists?(socket, slug))
     ensure
       tmux_run(socket, 'kill-server', allow_failure: true)
-    end
-  end
-
-  def test_devcluster_shorthands_use_the_workspace_session_resolver
-    scripts = %w[
-      dev-clusters/vpsadmin/bin/devcluster
-      dev-clusters/vpsadminos/bin/devcluster
-    ]
-
-    Dir.mktmpdir('dev-session-resolver') do |directory|
-      resolver = File.join(directory, 'dev-session')
-      File.write(
-        resolver,
-        "#!/bin/sh\n" \
-        "test \"$1\" = current\n" \
-        "printf 'managed-session\\n'\n"
-      )
-      FileUtils.chmod(0o755, resolver)
-
-      scripts.each do |relative_path|
-        source = File.read(File.expand_path("../#{relative_path}", __dir__))
-        function = source[/^current_slug\(\) \{\n.*?^\}\n/m]
-        refute_nil(function, relative_path)
-
-        stdout, stderr, status = Open3.capture3(
-          { 'VPSFREE_DEV_SESSION_SLUG' => 'foreign-session' },
-          'bash',
-          '-c',
-          "#{function}\nDEV_SESSION_BIN=\"$1\"\ncurrent_slug\n",
-          'devcluster-current-slug-test',
-          resolver
-        )
-
-        assert(status.success?, "#{relative_path}: #{stderr}")
-        assert_equal("managed-session\n", stdout, relative_path)
-      end
     end
   end
 
@@ -4181,18 +4165,18 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(
         workspace,
         env: {
-          VpsfreeDevSession::ENV_SLUG => slug,
-          VpsfreeDevSession::ENV_WORKSPACE => workspace
+          DevSession::ENV_SLUG => slug,
+          DevSession::ENV_WORKSPACE => workspace
         },
         cwd:
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.current
       end
 
       assert_match(/sources disagree/, error.message)
-      assert_match(/#{VpsfreeDevSession::ENV_SLUG}=#{slug}/, error.message)
+      assert_match(/#{DevSession::ENV_SLUG}=#{slug}/, error.message)
       assert_match(/cwd=#{other_slug}/, error.message)
     end
   end
@@ -4243,7 +4227,7 @@ class DevSessionTest < Minitest::Test
         'remote',
         'set-url',
         'origin',
-        'git@github.com:vpsfreecz/sample.git'
+        'git@github.com:example-org/sample.git'
       )
 
       runner_for(workspace).worktree_add(
@@ -4262,7 +4246,7 @@ class DevSessionTest < Minitest::Test
       metadata = manifest.fetch('repositories').fetch(0)
       assert_equal('sample', metadata['name'])
       assert_equal('sample', metadata['project'])
-      assert_equal('vpsfreecz/sample', metadata['github'])
+      assert_equal('example-org/sample', metadata['github'])
       assert_equal('2026-06-06-demo', metadata['branch'])
       assert_equal('master', metadata['default_branch'])
       assert_match(/\A[0-9a-f]{40}\z/, metadata['initial_base_sha'])
@@ -4339,11 +4323,11 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', 'init', '--bare', remote)
       assert_git_success(
         'git', '-C', workspace, 'remote', 'add', 'origin',
-        'git@github.com:vpsfreecz/vpsfree-cz-workspace.git'
+        'git@github.com:example-org/example-workspace-workspace.git'
       )
       assert_git_success(
         'git', '-C', workspace, 'config',
-        "url.#{remote}.insteadOf", 'git@github.com:vpsfreecz/vpsfree-cz-workspace.git'
+        "url.#{remote}.insteadOf", 'git@github.com:example-org/example-workspace-workspace.git'
       )
       assert_git_success('git', '-C', workspace, 'push', 'origin', 'master')
       slug = '2026-06-06-demo'
@@ -4370,7 +4354,7 @@ class DevSessionTest < Minitest::Test
       )
       repository = manifest.fetch('repositories').fetch(0)
       assert_equal('workspace', repository['name'])
-      assert_equal('vpsfreecz/vpsfree-cz-workspace', repository['github'])
+      assert_equal('example-org/example-workspace-workspace', repository['github'])
       assert_match(/\A[0-9a-f]{40}\z/, repository['final_head_sha'])
       assert_git_success(
         'git', '-C', workspace, 'show-ref', '--verify', '--quiet',
@@ -4423,7 +4407,7 @@ class DevSessionTest < Minitest::Test
           out: StringIO.new,
           err: StringIO.new
         ) { |argv| commands << argv }
-        runner = VpsfreeDevSession::Runner.new(
+        runner = DevSession::Runner.new(
           workspace:,
           command_runner:,
           tmux: NullTmux.new,
@@ -4432,7 +4416,7 @@ class DevSessionTest < Minitest::Test
           today: TODAY
         )
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.worktree_add(
             'demo',
             'sample',
@@ -4562,7 +4546,7 @@ class DevSessionTest < Minitest::Test
       )
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
       assert_match(/repository identity does not match/, error.message)
@@ -4612,7 +4596,7 @@ class DevSessionTest < Minitest::Test
   def test_delete_all_is_rejected
     with_workspace do |workspace|
       err = StringIO.new
-      status = VpsfreeDevSession::CLI.new(
+      status = DevSession::CLI.new(
         ['--workspace', workspace, 'delete', 'demo', '--all'],
         out: StringIO.new,
         err:
@@ -4627,7 +4611,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
       err = StringIO.new
-      status = VpsfreeDevSession::CLI.new(
+      status = DevSession::CLI.new(
         ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is', '--yes'],
         input: StringIO.new,
         out: StringIO.new,
@@ -4645,7 +4629,7 @@ class DevSessionTest < Minitest::Test
       runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
       err = StringIO.new
 
-      status = VpsfreeDevSession::CLI.new(
+      status = DevSession::CLI.new(
         ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
         input: StringIO.new,
         out: StringIO.new,
@@ -4663,22 +4647,24 @@ class DevSessionTest < Minitest::Test
       runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
       err = StringIO.new
 
-      status = VpsfreeDevSession::CLI.new(
+      status = DevSession::CLI.new(
         ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
         input: TTYInput.new("no\n"),
         out: StringIO.new,
-        err:
+        err:,
+        env: ENV.to_h.merge('XDG_STATE_HOME' => File.join(workspace, '.xdg-state'))
       ).run
 
       assert_equal(1, status)
       assert_includes(err.string, 'was not confirmed')
       assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
 
-      status = VpsfreeDevSession::CLI.new(
+      status = DevSession::CLI.new(
         ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
         input: TTYInput.new("yes\n"),
         out: StringIO.new,
-        err: StringIO.new
+        err: StringIO.new,
+        env: ENV.to_h.merge('XDG_STATE_HOME' => File.join(workspace, '.xdg-state'))
       ).run
 
       assert_equal(0, status)
@@ -4733,7 +4719,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       File.write(File.join(workspace, 'worktrees', slug, 'unmanaged.txt'), "keep me\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -4755,7 +4741,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(outside)
       FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'linked'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -4779,7 +4765,7 @@ class DevSessionTest < Minitest::Test
         path = File.join(workspace, 'worktrees', slug, 'sample')
         assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.delete(slug, as_is: true, force: true)
         end
 
@@ -4796,7 +4782,7 @@ class DevSessionTest < Minitest::Test
       helpers = File.join(workspace, 'helpers')
       log = File.join(workspace, 'cluster.log')
       FileUtils.mkdir_p(helpers)
-      %w[vpsadmin-devcluster vpsadminos-devcluster].each do |name|
+      %w[alpha-devcluster beta-devcluster].each do |name|
         path = File.join(helpers, name)
         script = <<~'SH'
           #!/bin/sh
@@ -4805,14 +4791,16 @@ class DevSessionTest < Minitest::Test
             exit 0
           fi
           name=${0##*/}
-          printf '%s:%s:%s\n' "$VPSFREE_DEVCLUSTER_WORKSPACE" "$name" "$*" >> "$CLUSTER_LOG"
+          printf '%s:%s:%s\n' "$DEVCLUSTER_WORKSPACE" "$name" "$*" >> "$CLUSTER_LOG"
         SH
         File.write(path, script)
         File.chmod(0o755, path)
       end
       runner = runner_for(
         workspace,
-        env: {'PATH' => helpers, 'CLUSTER_LOG' => log}
+        env: {'PATH' => helpers, 'CLUSTER_LOG' => log},
+        alpha_cluster: File.join(helpers, 'alpha-devcluster'),
+        beta_cluster: File.join(helpers, 'beta-devcluster')
       )
       runner.ensure_tracking_files(slug)
 
@@ -4820,8 +4808,8 @@ class DevSessionTest < Minitest::Test
 
       assert_equal(
         [
-          "#{workspace}:vpsadmin-devcluster:reset #{slug}",
-          "#{workspace}:vpsadminos-devcluster:reset #{slug}"
+          "#{workspace}:alpha-devcluster:reset #{slug}",
+          "#{workspace}:beta-devcluster:reset #{slug}"
         ],
         File.readlines(log, chomp: true)
       )
@@ -4837,7 +4825,7 @@ class DevSessionTest < Minitest::Test
       portal = File.join(workspace, 'portal')
       File.write(portal, "#!/bin/sh\nexit 19\n")
       File.chmod(0o755, portal)
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         portal_command: [portal],
@@ -4865,7 +4853,7 @@ class DevSessionTest < Minitest::Test
       }
       File.write(manifest_path, YAML.dump(manifest))
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -4911,7 +4899,7 @@ class DevSessionTest < Minitest::Test
         'client_version' => '0.153.4'
       }
       File.write(manifest_path, YAML.dump(manifest))
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new,
         portal_command: [RbConfig.ruby, portal],
         codex_socket: '/run/test/codex.sock',
@@ -4957,13 +4945,13 @@ class DevSessionTest < Minitest::Test
         'client_version' => '0.153.4'
       }
       File.write(manifest_path, YAML.dump(manifest))
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new, portal_command: [portal],
         codex_socket: '/run/test/codex.sock',
         out: StringIO.new, err: StringIO.new, today: TODAY,
         env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
       )
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: true)
       end
       added = File.join(workspace, 'worktrees', slug, 'other')
@@ -4973,7 +4961,7 @@ class DevSessionTest < Minitest::Test
       )
       File.write(portal, "#!/bin/sh\nexit 0\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -4994,7 +4982,7 @@ class DevSessionTest < Minitest::Test
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
       )
-      helper = File.join(workspace, 'vpsadmin-devcluster')
+      helper = File.join(workspace, 'alpha-devcluster')
       marker = File.join(workspace, 'cluster-retried')
       File.write(helper, <<~SH)
         #!/bin/sh
@@ -5008,12 +4996,12 @@ class DevSessionTest < Minitest::Test
         fi
       SH
       File.chmod(0o755, helper)
-      runner = VpsfreeDevSession::Runner.new(
-        workspace:, tmux: NullTmux.new, vpsadmin_cluster: helper,
+      runner = DevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, cluster_providers: { 'alpha' => helper },
         out: StringIO.new, err: StringIO.new, today: TODAY,
         env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
       )
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: true)
       end
       worktree = File.join(workspace, 'worktrees', slug, 'sample')
@@ -5025,7 +5013,7 @@ class DevSessionTest < Minitest::Test
         'commit', '-m', 'later change'
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -5054,11 +5042,11 @@ class DevSessionTest < Minitest::Test
         remove.call(*arguments, **options)
         unless interrupted
           interrupted = true
-          raise VpsfreeDevSession::Error, 'simulated interruption after worktree removal'
+          raise DevSession::Error, 'simulated interruption after worktree removal'
         end
       end
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
@@ -5100,7 +5088,7 @@ class DevSessionTest < Minitest::Test
         remove.call(*arguments, **options)
       end
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -5128,7 +5116,7 @@ class DevSessionTest < Minitest::Test
           abort "unexpected portal action: \#{ARGV.join(' ')}"
         end
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         portal_command: [RbConfig.ruby, portal],
@@ -5139,7 +5127,7 @@ class DevSessionTest < Minitest::Test
         env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
       )
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.start(
           slug, as_is: true, new: false, attach: false, run_codex: true,
           goal_file: goal, json: true, exclusive: true
@@ -5170,7 +5158,7 @@ class DevSessionTest < Minitest::Test
           exit 19
         end
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(
           slug,
@@ -5187,7 +5175,7 @@ class DevSessionTest < Minitest::Test
       )
       runner.ensure_tracking_files(slug)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: false)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
@@ -5211,7 +5199,7 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(workspace, env: {'XDG_STATE_HOME' => state_home})
       runner.ensure_tracking_files(slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5241,7 +5229,7 @@ class DevSessionTest < Minitest::Test
       journal = creator.send(:creation_journal_file, slug)
       runner = runner_for(workspace, env: {'XDG_STATE_HOME' => journal})
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5267,7 +5255,7 @@ class DevSessionTest < Minitest::Test
       state_home = File.join(worktree, 'private-state')
       runner = runner_for(workspace, env: {'XDG_STATE_HOME' => state_home})
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: true)
       end
 
@@ -5281,17 +5269,17 @@ class DevSessionTest < Minitest::Test
   def test_remove_rejects_recovery_storage_nested_in_absent_cluster_state
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
-      cluster = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
+      cluster = File.join(workspace, '.dev-clusters', 'alpha', 'clusters', slug)
       state_home = File.join(cluster, 'private-state')
-      helper = cleanup_contract_helper(workspace, 'vpsadmin', [cluster])
+      helper = cleanup_contract_helper(workspace, 'alpha', [cluster])
       runner = runner_for(
         workspace,
         env: {'XDG_STATE_HOME' => state_home},
-        vpsadmin_cluster: helper
+        alpha_cluster: helper
       )
       runner.ensure_tracking_files(slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5305,8 +5293,8 @@ class DevSessionTest < Minitest::Test
   def test_remove_rejects_recovery_storage_nested_in_cluster_socket
     with_workspace do |workspace|
       {
-        'vpsadmin' => 'vpsfree-devcluster',
-        'vpsadminos' => 'vpsadminos-devcluster'
+        'alpha' => 'example-devcluster',
+        'beta' => 'beta-devcluster'
       }.each do |kind, prefix|
         slug = "2026-06-06-demo-#{kind}"
         digest = Digest::SHA256.hexdigest("#{workspace}\0#{slug}")[0, 12]
@@ -5316,12 +5304,12 @@ class DevSessionTest < Minitest::Test
         runner = runner_for(
           workspace,
           env: {'XDG_STATE_HOME' => state_home},
-          vpsadmin_cluster: kind == 'vpsadmin' ? helper : nil,
-          vpsadminos_cluster: kind == 'vpsadminos' ? helper : nil
+          alpha_cluster: kind == 'alpha' ? helper : nil,
+          beta_cluster: kind == 'beta' ? helper : nil
         )
         runner.ensure_tracking_files(slug)
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.delete(slug, as_is: true, force: false)
         end
 
@@ -5334,19 +5322,19 @@ class DevSessionTest < Minitest::Test
 
   def test_remove_rejects_recovery_storage_nested_in_legacy_cluster_socket
     with_workspace do |workspace|
-      slug = '2026-08-18-vpsadmin-password-reset'
+      slug = '2026-08-18-alpha-password-reset'
       digest = Digest::SHA256.hexdigest(slug)[0, 12]
-      socket = File.join('/tmp', "vpsfree-devcluster-#{digest}")
+      socket = File.join('/tmp', "example-devcluster-#{digest}")
       state_home = File.join(socket, 'private-removal-state')
-      helper = cleanup_contract_helper(workspace, 'vpsadmin', [socket])
+      helper = cleanup_contract_helper(workspace, 'alpha', [socket])
       runner = runner_for(
         workspace,
         env: {'XDG_STATE_HOME' => state_home},
-        vpsadmin_cluster: helper
+        alpha_cluster: helper
       )
       runner.ensure_tracking_files(slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5371,7 +5359,7 @@ class DevSessionTest < Minitest::Test
         codex_thread_id: 'thread-1',
         codex_socket_path: '/run/test/codex.sock'
       )
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         portal_command: [RbConfig.ruby, portal],
@@ -5387,12 +5375,12 @@ class DevSessionTest < Minitest::Test
       runner.define_singleton_method(:advance_removal!) do |current_slug, removal, phase|
         if phase == 'thread_retired' && !interrupted
           interrupted = true
-          raise VpsfreeDevSession::Error, 'simulated interruption after thread archive'
+          raise DevSession::Error, 'simulated interruption after thread archive'
         end
         advance.call(current_slug, removal, phase)
       end
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
@@ -5418,7 +5406,7 @@ class DevSessionTest < Minitest::Test
       manifest['codex'] = {'thread_id' => 'thread-1'}
       File.write(manifest_path, YAML.dump(manifest))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5432,7 +5420,7 @@ class DevSessionTest < Minitest::Test
   def test_remove_retries_after_cluster_release_failure
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
-      helper = File.join(workspace, 'vpsadmin-devcluster')
+      helper = File.join(workspace, 'alpha-devcluster')
       marker = File.join(workspace, 'cluster-retried')
       File.write(helper, <<~SH)
         #!/bin/sh
@@ -5446,10 +5434,10 @@ class DevSessionTest < Minitest::Test
         fi
       SH
       File.chmod(0o755, helper)
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(slug, workspace:),
-        vpsadmin_cluster: helper,
+        cluster_providers: { 'alpha' => helper },
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
@@ -5457,7 +5445,7 @@ class DevSessionTest < Minitest::Test
       )
       runner.ensure_tracking_files(slug)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: false)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
@@ -5474,14 +5462,26 @@ class DevSessionTest < Minitest::Test
   def test_remove_passes_its_exclusive_session_lock_to_cluster_reset
     with_workspace do |workspace|
       slug = '2026-06-06-cluster-lock-owner'
+      cluster = File.join(workspace, '.dev-clusters', 'alpha', 'clusters', slug)
+      helper = File.join(workspace, 'alpha-devcluster')
+      File.write(helper, <<~SH)
+        #!/bin/sh
+        if [ "$1" = cleanup-paths ]; then
+          printf '%s\n' #{Shellwords.escape(JSON.generate('schema' => 1, 'paths' => [cluster]))}
+          exit 0
+        fi
+        test "$1" = reset
+        test "$DEV_SESSION_LIFECYCLE_OPERATION" = delete
+        test -n "$DEV_SESSION_LIFECYCLE_LOCK_FD"
+        test -n "$DEV_SESSION_LIFECYCLE_LOCK_PATH"
+        rm -rf -- #{Shellwords.escape(cluster)}
+      SH
+      File.chmod(0o755, helper)
       runner = runner_for(
         workspace,
-        vpsadmin_cluster: File.expand_path(
-          '../dev-clusters/vpsadmin/bin/devcluster', __dir__
-        )
+        alpha_cluster: helper
       )
       runner.ensure_tracking_files(slug)
-      cluster = File.join(workspace, '.dev-clusters', 'vpsadmin', 'clusters', slug)
       FileUtils.mkdir_p(cluster)
 
       runner.delete(slug, as_is: true, force: false)
@@ -5503,7 +5503,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5523,14 +5523,14 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test.sock',
         identity_token: 'a' * 64
       )
       runner.send(:write_session_authority, slug, session, state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5578,7 +5578,7 @@ class DevSessionTest < Minitest::Test
         runner.send(:load_removal_journal, slug).fetch('operation_id')
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(
           :prepare_removal!, slug, force: false, operation_id: 'b' * 64
         )
@@ -5609,7 +5609,7 @@ class DevSessionTest < Minitest::Test
         runner.send(:load_archive_journal, slug).fetch('operation_id')
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(
           slug,
           as_is: true,
@@ -5641,7 +5641,7 @@ class DevSessionTest < Minitest::Test
         runner.send(:load_revive_journal, slug).fetch('operation_id')
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.revive(
           slug,
           as_is: true,
@@ -5663,7 +5663,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
       assert_includes(error.message, 'after tmux removal')
@@ -5688,12 +5688,12 @@ class DevSessionTest < Minitest::Test
       runner.define_singleton_method(:advance_removal!) do |current_slug, removal, phase|
         if phase == 'tracking_preserved' && !interrupted
           interrupted = true
-          raise VpsfreeDevSession::Error, 'simulated interruption after tracking move'
+          raise DevSession::Error, 'simulated interruption after tracking move'
         end
         advance.call(current_slug, removal, phase)
       end
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
       recovery = removal_recovery(workspace, slug)
@@ -5756,7 +5756,7 @@ class DevSessionTest < Minitest::Test
       SH
       File.chmod(0o755, hook)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.delete(slug, as_is: true, force: false)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
@@ -5773,7 +5773,7 @@ class DevSessionTest < Minitest::Test
           )
         }
       ].each do |operation|
-        error = assert_raises(VpsfreeDevSession::Error, &operation)
+        error = assert_raises(DevSession::Error, &operation)
       assert_includes(error.message, 'deletion is unfinished')
       end
 
@@ -5802,7 +5802,7 @@ class DevSessionTest < Minitest::Test
       SH
       File.chmod(0o755, hook)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5814,7 +5814,7 @@ class DevSessionTest < Minitest::Test
         'git', '-C', workspace, 'ls-files', '--', File.join('work', slug)
       ))
 
-      retry_error = assert_raises(VpsfreeDevSession::Error) do
+      retry_error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
       assert_includes(retry_error.message, 'tracking reappeared')
@@ -5849,7 +5849,7 @@ class DevSessionTest < Minitest::Test
         commit.call(current_slug, removal)
       end
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete(slug, as_is: true, force: false)
       end
 
@@ -5953,7 +5953,7 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', '2026-06-06-demo', 'sample')
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete('demo', as_is: false, force: false)
       end
 
@@ -6001,7 +6001,7 @@ class DevSessionTest < Minitest::Test
     slug = '2026-06-06-demo'
 
     with_workspace do |workspace|
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
@@ -6034,18 +6034,18 @@ class DevSessionTest < Minitest::Test
       tmux_run(socket, 'new-session', '-d', '-s', slug, '-c', workspace)
       cluster_helper = cleanup_contract_helper(workspace, 'empty-cluster', [])
 
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
-        vpsadmin_cluster: cluster_helper,
-        vpsadminos_cluster: cluster_helper,
+        cluster_providers: { 'alpha' => cluster_helper, 'beta' => cluster_helper },
         out: StringIO.new,
         err: StringIO.new,
-        today: TODAY
+        today: TODAY,
+        env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.delete('demo', as_is: false, force: false)
       end
 
@@ -6119,7 +6119,7 @@ class DevSessionTest < Minitest::Test
         'refs/heads/2026-06-06-demo'
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.stop(slug, as_is: true)
       end
       assert_match(/must be committed before stopping/, error.message)
@@ -6151,7 +6151,7 @@ class DevSessionTest < Minitest::Test
         finalize_core(runner, slug, as_is: true)
         FileUtils.mkdir_p(File.join(workspace, 'work', slug))
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
@@ -6168,7 +6168,7 @@ class DevSessionTest < Minitest::Test
         tmux = ManagedTmux.new(slug, workspace:)
         runner = runner_for(workspace, tmux:)
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
@@ -6200,7 +6200,7 @@ class DevSessionTest < Minitest::Test
 
         tmux = ManagedTmux.new(slug, workspace:)
         runner = runner_for(workspace, tmux:)
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           if operation == :stop
             runner.stop(slug, as_is: true)
           else
@@ -6246,7 +6246,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'terminal archive only')
 
       tmux = ManagedTmux.new(slug, workspace:)
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace, tmux:).stop(slug, as_is: true)
       end
 
@@ -6279,7 +6279,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'active')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6295,7 +6295,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       FileUtils.rm(File.join(workspace, 'work', slug, 'plan.md'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6311,7 +6311,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       set_lifecycle(workspace, slug, 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6329,7 +6329,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_terminal_tracking_only(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6352,7 +6352,7 @@ class DevSessionTest < Minitest::Test
         state_with_body_lifecycle(File.read(state), 'complete')
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -6372,7 +6372,7 @@ class DevSessionTest < Minitest::Test
       content = File.read(state).sub(/\A---\nlifecycle: active\n---\n\n/, '')
       File.write(state, "#{content}\n- Lifecycle: complete\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -6398,7 +6398,7 @@ class DevSessionTest < Minitest::Test
         "---\nlifecycle: complete\n--- trailing\n"
       ]
       invalid.each do |content|
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.send(:validate_terminal_lifecycle_content!, content)
         end
         assert_match(/must start with lifecycle YAML front matter/, error.message)
@@ -6424,7 +6424,7 @@ class DevSessionTest < Minitest::Test
 
     fixtures.each do |fixture|
       with_workspace do |workspace|
-        assert_raises(VpsfreeDevSession::Error, File.basename(fixture)) do
+        assert_raises(DevSession::Error, File.basename(fixture)) do
           runner_for(workspace).send(:lifecycle_state, File.binread(fixture))
         end
       end
@@ -6434,13 +6434,13 @@ class DevSessionTest < Minitest::Test
   def test_lifecycle_parser_rejects_invalid_utf8_and_oversized_input
     with_workspace do |workspace|
       runner = runner_for(workspace)
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.send(:lifecycle_state, "---\nlifecycle: active\n---\n\xff".b)
       end
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.send(
           :lifecycle_state,
-          "---\nlifecycle: active\n---\n" + ('x' * VpsfreeDevSession::TRACKING_MAX_SIZE)
+          "---\nlifecycle: active\n---\n" + ('x' * DevSession::TRACKING_MAX_SIZE)
         )
       end
     end
@@ -6464,7 +6464,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
       assert_git_success('git', '-C', workspace, 'commit', '-m', 'pseudo active state')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -6489,7 +6489,7 @@ class DevSessionTest < Minitest::Test
       File.write(state, state_with_body_lifecycle(content, 'complete'))
       commit_archive_move(workspace, slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.stop(slug, as_is: true)
       end
 
@@ -6505,7 +6505,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       FileUtils.mkdir_p(File.join(workspace, 'archive', slug))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6528,7 +6528,7 @@ class DevSessionTest < Minitest::Test
         File.join(workspace, 'archive', slug)
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6559,7 +6559,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'dirty.txt'), "dirty\n")
       tmux = ManagedTmux.new(slug, workspace:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner_for(workspace, tmux:), 'demo', as_is: false)
       end
 
@@ -6596,7 +6596,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', path, 'commit', '-m', 'detached work')
       detached_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6630,7 +6630,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', path, 'commit', '-m', 'private worktree commit')
       head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.worktree_remove('demo', 'sample', as_is: false, force: false)
       end
 
@@ -6664,7 +6664,7 @@ class DevSessionTest < Minitest::Test
       )
       FileUtils.ln_s(outside, File.join(workspace, 'worktrees', slug, 'sample'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6688,7 +6688,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mv(work_root, outside_root)
       FileUtils.ln_s(outside_root, work_root)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6723,7 +6723,7 @@ class DevSessionTest < Minitest::Test
             FileUtils.ln_s(File.join(workspace, 'collision-target'), destination)
           end
         end
-        runner = VpsfreeDevSession::Runner.new(
+        runner = DevSession::Runner.new(
           workspace:,
           command_runner:,
           tmux: NullTmux.new,
@@ -6732,7 +6732,7 @@ class DevSessionTest < Minitest::Test
           today: TODAY
         )
 
-        assert_raises(VpsfreeDevSession::Error) do
+        assert_raises(DevSession::Error) do
           finalize_core(runner, 'demo', as_is: false)
         end
 
@@ -6793,9 +6793,9 @@ class DevSessionTest < Minitest::Test
       ) do |argv|
         next unless argv.first == 'mv' && argv.last == '--help'
 
-        raise VpsfreeDevSession::Error, 'atomic move options unavailable'
+        raise DevSession::Error, 'atomic move options unavailable'
       end
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         command_runner:,
         tmux: NullTmux.new,
@@ -6804,7 +6804,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -6828,7 +6828,7 @@ class DevSessionTest < Minitest::Test
       ) do |argv|
         move_commands << argv if argv.first == 'mv'
       end
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         command_runner:,
         tmux: NullTmux.new,
@@ -6842,8 +6842,8 @@ class DevSessionTest < Minitest::Test
       assert_equal(2, move_commands.length)
       move_commands.each do |argv|
         assert_equal(
-          ['mv', *VpsfreeDevSession::ARCHIVE_MOVE_OPTIONS],
-          argv.take(VpsfreeDevSession::ARCHIVE_MOVE_OPTIONS.length + 1)
+          ['mv', *DevSession::ARCHIVE_MOVE_OPTIONS],
+          argv.take(DevSession::ARCHIVE_MOVE_OPTIONS.length + 1)
         )
       end
       assert_equal('--help', move_commands.first.last)
@@ -6865,7 +6865,7 @@ class DevSessionTest < Minitest::Test
       File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
         assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.delete(slug, as_is: true, force: false)
         end
         assert_match(/another dev-session command/, error.message)
@@ -6889,7 +6889,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'complete')
       FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'cache'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, 'demo', as_is: false)
       end
 
@@ -6912,7 +6912,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', "--git-dir=#{repository}", 'worktree', 'add', path, 'master')
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -6938,7 +6938,7 @@ class DevSessionTest < Minitest::Test
         path = File.join(workspace, 'worktrees', slug, 'external')
         assert_git_success('git', "--git-dir=#{bare}", 'worktree', 'add', path, 'master')
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           finalize_core(runner, slug, as_is: true)
         end
 
@@ -6957,7 +6957,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(
           runner_for(workspace, tmux: UnmanagedTmux.new(slug)),
           'demo',
@@ -6979,16 +6979,16 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       tmux_run(socket, 'new-session', '-d', '-s', longer_slug, '-c', workspace)
-      command_runner = VpsfreeDevSession::CommandRunner.new(
+      command_runner = DevSession::CommandRunner.new(
         out: StringIO.new,
         err: StringIO.new
       )
-      tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket:)
+      tmux = DevSession::Tmux.new(runner: command_runner, socket:)
 
       refute(tmux.session(slug))
       assert(tmux.session(longer_slug))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace, tmux:).stop(slug, as_is: true)
       end
 
@@ -7011,18 +7011,18 @@ class DevSessionTest < Minitest::Test
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
-    command_runner = VpsfreeDevSession::CommandRunner.new(
+    command_runner = DevSession::CommandRunner.new(
       out: StringIO.new,
       err: StringIO.new
     )
-    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket:)
+    tmux = DevSession::Tmux.new(runner: command_runner, socket:)
 
     tmux_run(socket, 'new-session', '-d', '-s', slug)
     session = tmux.session(slug)
     token = 'a' * 64
     tmux_run(
       socket, 'set-environment', '-t', "#{session.id}:",
-      VpsfreeDevSession::ENV_TMUX_IDENTITY, token
+      DevSession::ENV_TMUX_IDENTITY, token
     )
 
     refute(tmux.kill_session_if_identity(session.id, 'b' * 64))
@@ -7042,7 +7042,7 @@ class DevSessionTest < Minitest::Test
 
       [" \n", '', status]
     end
-    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+    tmux = DevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
 
     assert_nil(tmux.session('2026-06-06-missing'))
     assert_nil(tmux.session_by_id('$11'))
@@ -7059,7 +7059,7 @@ class DevSessionTest < Minitest::Test
 
       [phantom.join("\t") + "\n", '', status]
     end
-    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+    tmux = DevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
 
     assert_nil(tmux.session('2026-06-06-missing'))
     assert_nil(tmux.session_by_id('$11'))
@@ -7079,7 +7079,7 @@ class DevSessionTest < Minitest::Test
 
       [phantom.join("\t") + "\n", '', status]
     end
-    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+    tmux = DevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
 
     assert_nil(tmux.session('2026-06-06-missing'))
     assert_nil(tmux.session_by_id('$11'))
@@ -7100,9 +7100,9 @@ class DevSessionTest < Minitest::Test
 
         [fields.map(&:to_s).join("\t") + "\n", '', status]
       end
-      tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+      tmux = DevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
 
-      error = assert_raises(VpsfreeDevSession::Error) { tmux.session_by_id('$11') }
+      error = assert_raises(DevSession::Error) { tmux.session_by_id('$11') }
       assert_includes(error.message, 'invalid session identity')
     end
   end
@@ -7120,9 +7120,9 @@ class DevSessionTest < Minitest::Test
 
       [identity, '', status]
     end
-    tmux = VpsfreeDevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
+    tmux = DevSession::Tmux.new(runner: command_runner, socket: '/run/test.sock')
 
-    error = assert_raises(VpsfreeDevSession::Error) { tmux.session_by_id('$11') }
+    error = assert_raises(DevSession::Error) { tmux.session_by_id('$11') }
     assert_includes(error.message, 'session "$12" for exact target $11')
     assert_nil(tmux.session('2026-06-06-missing'))
   end
@@ -7142,7 +7142,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:write_session_authority, slug, session, state: 'ready')
       runner.send(:select_tmux_for_slug!, slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, session)
       end
 
@@ -7157,7 +7157,7 @@ class DevSessionTest < Minitest::Test
       authority_dir = File.join(workspace, 'authority')
       tmux = ReplacedTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:, authority_dir:)
-      stale = VpsfreeDevSession::Tmux::Session.new(
+      stale = DevSession::Tmux::Session.new(
         id: '$11',
         name: slug,
         mark: '1',
@@ -7170,7 +7170,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:write_session_authority, slug, stale, state: 'ready')
       runner.send(:select_tmux_for_slug!, slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, tmux.session(slug))
       end
 
@@ -7199,7 +7199,7 @@ class DevSessionTest < Minitest::Test
       runner.instance_variable_set(:@default_tmux, replacement)
       runner.send(:select_tmux_for_slug!, slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, replacement.session(slug))
       end
 
@@ -7215,7 +7215,7 @@ class DevSessionTest < Minitest::Test
       tmux = ReplacedDuringConditionalKillTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, tmux.session(slug))
       end
 
@@ -7231,7 +7231,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, workspace:, identity_token: nil)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, tmux.session(slug))
       end
 
@@ -7255,7 +7255,7 @@ class DevSessionTest < Minitest::Test
       File.write(authority_path, JSON.generate(authority) + "\n")
       runner.send(:select_tmux_for_slug!, slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, tmux.session(slug))
       end
 
@@ -7274,7 +7274,7 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux: replacement, authority_dir:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:retire_session_runtime!, slug, replacement.session(slug))
       end
 
@@ -7290,7 +7290,7 @@ class DevSessionTest < Minitest::Test
       tmux = ReplacedDuringCreateTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       end
 
@@ -7308,7 +7308,7 @@ class DevSessionTest < Minitest::Test
       tmux = ReplacedBeforeSyncTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       end
 
@@ -7380,7 +7380,7 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(workspace, tmux:)
 
       2.times do
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
         end
         assert_match(/split failed/, error.message)
@@ -7396,7 +7396,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-demo'
       tmux = RecordingTmux.new
       runner = runner_for(workspace, tmux:)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$partial',
         name: slug,
         mark: '',
@@ -7415,7 +7415,7 @@ class DevSessionTest < Minitest::Test
 
       replacement = session.dup
       replacement.identity_token = 'b' * 64
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:reconcile_creation_tmux_session!, slug, replacement, 'a' * 64)
       end
       assert_includes(error.message, 'not recoverable')
@@ -7485,7 +7485,7 @@ class DevSessionTest < Minitest::Test
       tmux = ManagedTmux.new(slug, workspace:, identity_token: nil)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(
           :prepare_creation_journal,
           slug,
@@ -7512,11 +7512,11 @@ class DevSessionTest < Minitest::Test
       tmux = PartialManagedTmux.new(
         slug, workspace:, identity_token: journal.fetch('tmux_identity')
       )
-      created = VpsfreeDevSession::Tmux::Session.new(
+      created = DevSession::Tmux::Session.new(
         id: '$12', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, identity_token: journal.fetch('tmux_identity')
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| created }
         define_method(:sync_slug) { |*_arguments, **_keywords| created }
       end
@@ -7542,7 +7542,7 @@ class DevSessionTest < Minitest::Test
       tmux = PartialManagedTmux.new(slug, workspace:, identity_token: 'b' * 64)
       runner = runner_for(workspace, tmux:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       end
 
@@ -7619,7 +7619,7 @@ class DevSessionTest < Minitest::Test
       File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
         assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
 
-        add_error = assert_raises(VpsfreeDevSession::Error) do
+        add_error = assert_raises(DevSession::Error) do
           runner.worktree_add(
             slug,
             'sample',
@@ -7632,7 +7632,7 @@ class DevSessionTest < Minitest::Test
         end
         assert_match(/another dev-session command/, add_error.message)
 
-        remove_error = assert_raises(VpsfreeDevSession::Error) do
+        remove_error = assert_raises(DevSession::Error) do
           runner.worktree_remove(slug, 'sample', as_is: true, force: false)
         end
         assert_match(/another dev-session command/, remove_error.message)
@@ -7646,7 +7646,7 @@ class DevSessionTest < Minitest::Test
       runner_for(workspace).ensure_tracking_files(slug)
       tmux = ReplacedTmux.new(slug, workspace:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace, tmux:).stop(slug, as_is: true)
       end
 
@@ -7666,7 +7666,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.stop(slug, as_is: true)
       end
 
@@ -7712,7 +7712,7 @@ class DevSessionTest < Minitest::Test
         id: '$7'
       )
       failing_portal = [RbConfig.ruby, '-e', "warn 'thread is active'; exit 1"]
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
@@ -7733,7 +7733,7 @@ class DevSessionTest < Minitest::Test
       }
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.stop(slug, as_is: true)
       end
       assert_includes(error.message, 'unable to restore terminal Codex client')
@@ -7742,7 +7742,7 @@ class DevSessionTest < Minitest::Test
       assert_empty(tmux.sent_commands)
       assert(File.file?(File.join(authority_dir, "#{slug}.json")))
 
-      idle_runner = VpsfreeDevSession::Runner.new(
+      idle_runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
@@ -7768,7 +7768,7 @@ class DevSessionTest < Minitest::Test
       File.write(portal, <<~RUBY)
         File.write(#{log.dump}, ARGV.join(' '))
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new,
         codex_socket: '/run/test/codex.sock', codex_version: '0.152.1',
         portal_command: [RbConfig.ruby, portal], out: StringIO.new,
@@ -7793,7 +7793,7 @@ class DevSessionTest < Minitest::Test
       File.write(portal, <<~RUBY)
         File.write(#{log.dump}, ARGV.join(' '))
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new,
         codex_socket: '/run/test/codex.sock', codex_version: '0.152.1',
         portal_command: [RbConfig.ruby, portal], out: StringIO.new,
@@ -7840,7 +7840,7 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.152.1',
         id: '$7'
       )
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
@@ -7862,7 +7862,7 @@ class DevSessionTest < Minitest::Test
       }
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.stop(slug, as_is: true)
       end
       assert_includes(error.message, 'turn became active')
@@ -7903,7 +7903,7 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.152.1',
         id: '$7'
       )
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
@@ -7916,7 +7916,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.recover_stale(slug, as_is: true)
       end
 
@@ -7936,7 +7936,7 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux: replacement, authority_dir:)
       runner.ensure_tracking_files(slug)
-      original = VpsfreeDevSession::Tmux::Session.new(
+      original = DevSession::Tmux::Session.new(
         id: '$7', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test/tmux.sock',
         identity_token: 'a' * 64
@@ -7956,7 +7956,7 @@ class DevSessionTest < Minitest::Test
       runner_for(workspace).ensure_tracking_files(slug)
       tmux = ReplacedTmux.new(slug, workspace:)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace, tmux:).delete(slug, as_is: true, force: false)
       end
 
@@ -7973,7 +7973,7 @@ class DevSessionTest < Minitest::Test
     slug = '2026-06-06-demo'
 
     with_workspace do |workspace|
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
@@ -7989,7 +7989,7 @@ class DevSessionTest < Minitest::Test
 
       Dir.mktmpdir('other-dev-session-workspace') do |other_workspace|
         other_out = StringIO.new
-        other_runner = VpsfreeDevSession::Runner.new(
+        other_runner = DevSession::Runner.new(
           workspace: other_workspace,
           tmux_socket: socket,
           out: other_out,
@@ -7998,19 +7998,19 @@ class DevSessionTest < Minitest::Test
           env: { 'TMUX' => 'socket', 'TMUX_PANE' => pane }
         )
 
-        current_error = assert_raises(VpsfreeDevSession::Error) do
+        current_error = assert_raises(DevSession::Error) do
           other_runner.current
         end
         assert_match(/not managed by this workspace/, current_error.message)
 
         other_runner.list
         assert_equal('', other_out.string)
-        lookup_error = assert_raises(VpsfreeDevSession::Error) do
+        lookup_error = assert_raises(DevSession::Error) do
           other_runner.lookup_slug('demo', as_is: false)
         end
         assert_match(/no slug found/, lookup_error.message)
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           other_runner.stop(slug, as_is: true)
         end
 
@@ -8029,7 +8029,7 @@ class DevSessionTest < Minitest::Test
       runner_for(workspace).send(:ensure_tracking_files, slug)
       commit_tracking(workspace, slug, lifecycle: 'complete')
       out = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: ManagedTmux.new(slug, workspace:),
         tmux_socket: '/run/workspace-tmux/tmux.sock',
@@ -8038,8 +8038,7 @@ class DevSessionTest < Minitest::Test
         codex_version: '0.152.1',
         codex_command: '/bin/true',
         portal_command: ['/run/current-system/sw/bin/workspace-portal'],
-        vpsadmin_cluster: RbConfig.ruby,
-        vpsadminos_cluster: RbConfig.ruby,
+        cluster_providers: { 'alpha' => RbConfig.ruby, 'beta' => RbConfig.ruby },
         require_runtime: true,
         out:,
         err: StringIO.new,
@@ -8066,7 +8065,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       out = StringIO.new
       authority_dir = File.join(workspace, 'runtime-authority')
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         authority_dir:,
@@ -8078,7 +8077,7 @@ class DevSessionTest < Minitest::Test
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      ordinary_runner = VpsfreeDevSession::Runner.new(
+      ordinary_runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         out:,
@@ -8110,7 +8109,7 @@ class DevSessionTest < Minitest::Test
       codex_probe = File.join(workspace, 'codex-ran.txt')
       shell_probe = File.join(workspace, 'shell-remained.txt')
       codex_command = "printf codex > #{Shellwords.escape(codex_probe)}"
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command:,
@@ -8151,7 +8150,7 @@ class DevSessionTest < Minitest::Test
 
     socket = "dev-session-test-#{Process.pid}-#{object_id}"
     slug = '2026-06-06-demo'
-    codex_socket = '/run/vpsfree-workspace-codex/app-server.sock'
+    codex_socket = '/run/dev-workspace-codex/app-server.sock'
 
     with_workspace do |workspace|
       codex_executable = File.join(workspace, 'codex')
@@ -8175,7 +8174,7 @@ class DevSessionTest < Minitest::Test
           puts JSON.generate(threadId: 'thread-123')
         end
       RUBY
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_socket:,
@@ -8224,10 +8223,10 @@ class DevSessionTest < Minitest::Test
       codex_executable = File.join(workspace, 'codex')
       File.write(codex_executable, "#!/bin/sh\necho 'codex-cli 0.151.0'\n")
       File.chmod(0o755, codex_executable)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$created', name: slug, mark: '1', slug:, workspace:
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_arguments, **_keywords|
           session
         end
@@ -8249,7 +8248,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -8288,7 +8287,7 @@ class DevSessionTest < Minitest::Test
         'git', "--git-dir=#{repository}", 'worktree', 'add', worktree, slug
       )
 
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux_socket: socket,
         codex_command: 'false',
@@ -8300,26 +8299,26 @@ class DevSessionTest < Minitest::Test
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
 
       session_env = tmux_capture(socket, 'show-environment', '-t', slug)
-      assert_includes(session_env, "#{VpsfreeDevSession::ENV_SLUG}=#{slug}\n")
+      assert_includes(session_env, "#{DevSession::ENV_SLUG}=#{slug}\n")
       assert_includes(
         session_env,
-        "#{VpsfreeDevSession::ENV_WORKSPACE}=#{workspace}\n"
+        "#{DevSession::ENV_WORKSPACE}=#{workspace}\n"
       )
       assert_includes(
         session_env,
-        "#{VpsfreeDevSession::ENV_WORK_DIR}=#{File.join(workspace, 'work', slug)}\n"
+        "#{DevSession::ENV_WORK_DIR}=#{File.join(workspace, 'work', slug)}\n"
       )
       assert_includes(
         session_env,
-        "#{VpsfreeDevSession::ENV_WORKTREES_DIR}=#{File.join(workspace, 'worktrees', slug)}\n"
+        "#{DevSession::ENV_WORKTREES_DIR}=#{File.join(workspace, 'worktrees', slug)}\n"
       )
       assert_includes(
         session_env,
-        "#{VpsfreeDevSession::ENV_PORTAL_BASE_URL}=#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}\n"
+        "#{DevSession::ENV_PORTAL_BASE_URL}=#{DevSession::DEFAULT_PORTAL_BASE_URL}\n"
       )
       assert_includes(
         session_env,
-        "#{VpsfreeDevSession::ENV_PORTAL_URL}=#{VpsfreeDevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/\n"
+        "#{DevSession::ENV_PORTAL_URL}=#{DevSession::DEFAULT_PORTAL_BASE_URL}/#{slug}/\n"
       )
 
       panes = tmux_capture(socket, 'list-panes', '-t', "#{slug}:dev", '-F', '#{pane_current_path}')
@@ -8337,13 +8336,13 @@ class DevSessionTest < Minitest::Test
         '-t',
         slug,
         '-F',
-        '#{window_name}:#{@vpsfree_dev_session_window}'
+        '#{window_name}:#{@dev_session_window}'
       ).lines.map(&:chomp)
 
       assert_includes(windows, 'alpha:worktree')
 
       probe = File.join(workspace, 'alpha-env.txt')
-      command = "printf '%s\\n' \"$#{VpsfreeDevSession::ENV_SLUG}\" > #{Shellwords.escape(probe)}"
+      command = "printf '%s\\n' \"$#{DevSession::ENV_SLUG}\" > #{Shellwords.escape(probe)}"
       tmux_run(socket, 'send-keys', '-t', "#{slug}:alpha", command, 'Enter')
       wait_for_file(probe)
       assert_equal(slug, File.read(probe).strip)
@@ -8365,7 +8364,7 @@ class DevSessionTest < Minitest::Test
 
   def test_codex_endpoint_identity_survives_compatible_client_upgrade
     with_workspace do |workspace|
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         codex_socket: '/run/workspace/codex.sock',
         codex_version: '0.153.2',
@@ -8373,7 +8372,7 @@ class DevSessionTest < Minitest::Test
         err: StringIO.new,
         env: {}
       )
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         codex_thread_id: 'thread-1',
         codex_socket_path: '/run/workspace/codex.sock',
         codex_client_version: '0.152.1'
@@ -8400,13 +8399,13 @@ class DevSessionTest < Minitest::Test
       codex = File.join(workspace, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
       File.chmod(0o755, codex)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$migrated', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/new/tmux.sock', codex_thread_id: 'thread-1',
         codex_socket_path: '/run/new/app-server.sock',
         codex_client_version: '0.153.2', codex_pane_id: '%1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:sync_slug) { |*_args, **_options| session }
       end
@@ -8426,7 +8425,7 @@ class DevSessionTest < Minitest::Test
         env: { 'SHELL' => '/bin/sh' }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: true)
       end
 
@@ -8468,7 +8467,7 @@ class DevSessionTest < Minitest::Test
       setup.send(:mark_creation_journal_ready, slug, journal)
       called = File.join(workspace, 'portal-called')
       portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,
         codex_socket: '/run/current/app-server.sock',
@@ -8480,7 +8479,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -8516,7 +8515,7 @@ class DevSessionTest < Minitest::Test
         pane_current_command: 'sh'
       )
       errors = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         codex_socket: '/run/workspace/codex.sock',
@@ -8546,7 +8545,7 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.153.2',
         pane_current_command: '.codex-wrapped'
       )
-      running_runner = VpsfreeDevSession::Runner.new(
+      running_runner = DevSession::Runner.new(
         workspace:,
         tmux: running,
         codex_socket: '/run/workspace/codex.sock',
@@ -8581,7 +8580,7 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.153.2',
         pane_current_command: 'sh'
       )
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         tmux:,
         codex_socket: '/run/workspace/codex.sock',
@@ -8608,7 +8607,7 @@ class DevSessionTest < Minitest::Test
       }
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:reconcile_native_client!, slug, tmux.session(slug))
       end
 
@@ -8634,14 +8633,14 @@ class DevSessionTest < Minitest::Test
       File.chmod(0o755, codex)
       entered_delivery = Queue.new
       release_delivery = Queue.new
-      created_session = VpsfreeDevSession::Tmux::Session.new(
+      created_session = DevSession::Tmux::Session.new(
         id: '$9', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/workspace/tmux.sock',
         codex_thread_id: 'thread-concurrent',
         codex_socket_path: '/run/workspace/codex.sock',
         codex_client_version: '0.153.2', codex_pane_id: '%1'
       )
-      creator_class = Class.new(VpsfreeDevSession::Runner) do
+      creator_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| created_session }
         define_method(:sync_slug) { |*_arguments, **_keywords| created_session }
         define_method(:revalidate_session!) { |_expected| created_session }
@@ -8684,7 +8683,7 @@ class DevSessionTest < Minitest::Test
         pane_current_command: 'sh',
         id: '$9'
       )
-      attacher = VpsfreeDevSession::Runner.new(
+      attacher = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         tmux_socket: '/run/workspace/tmux.sock',
@@ -8699,7 +8698,7 @@ class DevSessionTest < Minitest::Test
         env: { 'SHELL' => '/bin/sh' }
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         attacher.attach(slug, as_is: true)
       end
       assert_includes(error.message, 'session creation is incomplete')
@@ -8734,7 +8733,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
 
@@ -8805,7 +8804,7 @@ class DevSessionTest < Minitest::Test
       File.write(hook, "#!/bin/sh\nexit 1\n")
       File.chmod(0o755, hook)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.archive(slug, as_is: true)
       end
       assert(File.directory?(File.join(workspace, 'archive', slug)))
@@ -8836,12 +8835,12 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       interrupted = false
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:advance_archive!) do |current_slug, journal, phase|
           super(current_slug, journal, phase)
           if phase == 'thread_retired' && !interrupted
             interrupted = true
-            raise VpsfreeDevSession::Error, 'injected pre-runtime interruption'
+            raise DevSession::Error, 'injected pre-runtime interruption'
           end
         end
       end
@@ -8851,7 +8850,7 @@ class DevSessionTest < Minitest::Test
         env: { 'XDG_STATE_HOME' => state_home }
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         first.archive(slug, as_is: true)
       end
       journal_path = first.send(:lifecycle_journal_file, slug, 'archive')
@@ -8864,14 +8863,14 @@ class DevSessionTest < Minitest::Test
         authority_dir:,
         env: { 'XDG_STATE_HOME' => state_home }
       )
-      stale = VpsfreeDevSession::Tmux::Session.new(
+      stale = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test.sock',
         identity_token: 'a' * 64
       )
       second.send(:write_session_authority, slug, stale, state: 'ready')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         second.archive(slug, as_is: true)
       end
 
@@ -8899,7 +8898,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
 
@@ -8922,7 +8921,7 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test.sock',
         identity_token: 'a' * 64
@@ -8931,7 +8930,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
 
@@ -8981,11 +8980,11 @@ class DevSessionTest < Minitest::Test
         commit_tracking(workspace, slug, lifecycle: 'active')
         configure_workspace_origin(workspace)
         fail_once = true
-        runner_class = Class.new(VpsfreeDevSession::Runner) do
+        runner_class = Class.new(DevSession::Runner) do
           define_method(:advance_archive!) do |current_slug, journal, phase|
             if phase == 'tracking_archived' && fail_once
               fail_once = false
-              raise VpsfreeDevSession::Error, 'injected post-move failure'
+              raise DevSession::Error, 'injected post-move failure'
             end
 
             super(current_slug, journal, phase)
@@ -8996,7 +8995,7 @@ class DevSessionTest < Minitest::Test
           today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
         )
 
-        assert_raises(VpsfreeDevSession::Error) do
+        assert_raises(DevSession::Error) do
           runner.archive(slug, as_is: true)
         end
         assert(File.directory?(File.join(workspace, 'archive', slug)))
@@ -9013,7 +9012,7 @@ class DevSessionTest < Minitest::Test
           File.write(portal, YAML.dump(manifest))
         end
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.archive(slug, as_is: true)
         end
         assert_includes(error.message, 'archived tracking changed during recovery')
@@ -9033,9 +9032,9 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       fail_retirement = true
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:retire_portal_thread!) do |*arguments, **options|
-          raise VpsfreeDevSession::Error, 'injected retirement failure' if fail_retirement
+          raise DevSession::Error, 'injected retirement failure' if fail_retirement
 
           super(*arguments, **options)
         end
@@ -9045,7 +9044,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
 
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
@@ -9067,7 +9066,7 @@ class DevSessionTest < Minitest::Test
         end
       ]
       conflicts.each do |operation|
-        error = assert_raises(VpsfreeDevSession::Error, &operation)
+        error = assert_raises(DevSession::Error, &operation)
         assert_includes(error.message, 'session archive is unfinished')
       end
 
@@ -9090,16 +9089,16 @@ class DevSessionTest < Minitest::Test
       base.send(:ensure_portal_manifest, slug)
       commit_tracking(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:retire_portal_thread!) do |*_arguments, **_options|
-          raise VpsfreeDevSession::Error, 'injected retirement failure'
+          raise DevSession::Error, 'injected retirement failure'
         end
       end
       runner = runner_class.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
         today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
-      assert_raises(VpsfreeDevSession::Error) do
+      assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
       journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
@@ -9108,7 +9107,7 @@ class DevSessionTest < Minitest::Test
         file.write("\nUncommitted change.\n")
       end
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
 
@@ -9140,7 +9139,7 @@ class DevSessionTest < Minitest::Test
       File.write(hook, "#!/bin/sh\nexit 1\n")
       File.chmod(0o755, hook)
 
-      assert_raises(VpsfreeDevSession::CommandError) do
+      assert_raises(DevSession::CommandError) do
         runner.archive(slug, as_is: true)
       end
       File.unlink(hook)
@@ -9155,7 +9154,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', '-C', temporary, 'commit', '-m', 'later feature')
       assert_git_success('git', '-C', temporary, 'push', 'origin', slug)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
       end
 
@@ -9200,7 +9199,7 @@ class DevSessionTest < Minitest::Test
         assert_git_success('git', '-C', path, 'push', 'origin', slug)
         assert_git_success('git', '-C', path, 'push', 'origin', "#{slug}:master")
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.archive(slug, as_is: true)
         end
         assert_includes(error.message, 'feature heads changed during archival')
@@ -9286,7 +9285,7 @@ class DevSessionTest < Minitest::Test
       archived_runner(workspace, slug)
       configure_workspace_origin(workspace)
       starts = []
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:start) do |input, **options|
           starts << [input, options]
         end
@@ -9328,7 +9327,7 @@ class DevSessionTest < Minitest::Test
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       starts = []
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:start) { |input, **options| starts << [input, options] }
       end
       runner = runner_class.new(
@@ -9354,7 +9353,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-revive-interrupted'
       archived_runner(workspace, slug)
       configure_workspace_origin(workspace)
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:start) { |_input, **_options| nil }
       end
       runner = runner_class.new(
@@ -9425,7 +9424,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:finish_revive_tracking!, slug, journal)
       File.write(File.join(workspace, 'work', slug, 'unexpected.txt'), "changed\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.revive(slug, as_is: true)
       end
 
@@ -9452,7 +9451,7 @@ class DevSessionTest < Minitest::Test
         file.write("\nUncommitted change.\n")
       end
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.revive(slug, as_is: true)
       end
 
@@ -9485,7 +9484,7 @@ class DevSessionTest < Minitest::Test
       )
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         finalize_core(runner, slug, as_is: true)
       end
 
@@ -9509,7 +9508,7 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.152.1',
         id: '$7'
       )
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:,
         authority_dir:,
         codex_socket: '/run/test/codex.sock',
@@ -9531,7 +9530,7 @@ class DevSessionTest < Minitest::Test
       runner.send(:write_portal_manifest, slug, manifest)
       commit_tracking(workspace, slug, lifecycle: 'complete')
 
-      error = assert_raises(VpsfreeDevSession::CommandError) do
+      error = assert_raises(DevSession::CommandError) do
         runner.archive(slug, as_is: true)
       end
 
@@ -9620,7 +9619,7 @@ class DevSessionTest < Minitest::Test
 
       FileUtils.rm_rf(runtime)
       synced = []
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:fsync_directory) do |path|
           synced << path
           super(path)
@@ -9662,7 +9661,7 @@ class DevSessionTest < Minitest::Test
       )
       File.write(File.join(workspace, 'work', slug, 'plan.md'), "truncated\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         journal = runner.send(:load_revive_journal, slug)
         runner.send(:finish_revive_tracking!, slug, journal)
       end
@@ -9728,13 +9727,13 @@ class DevSessionTest < Minitest::Test
         File.open(#{calls.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
         puts JSON.generate(threadId: 'thread-existing') if ARGV[0, 2] == ['thread', 'create']
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$revived', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-existing',
         codex_socket_path: '/run/current/app-server.sock',
         codex_client_version: '0.152.1', codex_pane_id: '%1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:sync_slug) { |*_args, **_options| session }
         define_method(:revalidate_session!) { |_selected| session }
@@ -9808,19 +9807,19 @@ class DevSessionTest < Minitest::Test
         File.open(#{calls.dump}, 'a') { |file| file.puts(ARGV.join(' ')) }
         puts JSON.generate(threadId: 'thread-existing') if ARGV[0, 2] == ['thread', 'create']
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$revived', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-existing',
         codex_socket_path: '/run/current/app-server.sock',
         codex_client_version: '0.153.4', codex_pane_id: '%1'
       )
       authority_attempts = 0
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:write_session_authority) do |*_args, **_options|
           authority_attempts += 1
           if authority_attempts == 1
-            raise VpsfreeDevSession::Error, 'simulated authority publication failure'
+            raise DevSession::Error, 'simulated authority publication failure'
           end
         end
         define_method(:sync_slug) { |*_args, **_options| session }
@@ -9841,7 +9840,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         starter.start(
           slug,
           as_is: true,
@@ -9956,13 +9955,13 @@ class DevSessionTest < Minitest::Test
         require 'json'
         puts JSON.generate(threadId: 'thread-fresh') if ARGV[0, 2] == ['thread', 'create']
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$fresh', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-fresh',
         codex_socket_path: '/run/current/app-server.sock',
         codex_client_version: '0.152.1', codex_pane_id: '%1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:sync_slug) { |*_args, **_options| session }
         define_method(:revalidate_session!) { |_selected| session }
@@ -10083,13 +10082,13 @@ class DevSessionTest < Minitest::Test
         require 'json'
         puts JSON.generate(threadId: 'thread-retained') if ARGV[0, 2] == ['thread', 'create']
       RUBY
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$retained', name: slug, mark: '1', slug:, workspace:,
         socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-retained',
         codex_socket_path: '/run/current/app-server.sock',
         codex_client_version: '0.152.1', codex_pane_id: '%1'
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:sync_slug) do |selected_slug, **_options|
           sync_portal_repositories(selected_slug, worktree_entries(selected_slug))
@@ -10167,7 +10166,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10197,7 +10196,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10226,7 +10225,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10253,7 +10252,7 @@ class DevSessionTest < Minitest::Test
       runner.ensure_tracking_files(slug)
       commit_tracking(workspace, slug, lifecycle: 'active')
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10282,7 +10281,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       File.unlink(File.join(workspace, 'work', slug, 'portal.yml'))
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10309,10 +10308,10 @@ class DevSessionTest < Minitest::Test
       setup.ensure_tracking_files(slug)
       setup.send(:ensure_portal_manifest, slug)
       commit_tracking(workspace, slug, lifecycle: 'active')
-      session = VpsfreeDevSession::Tmux::Session.new(
+      session = DevSession::Tmux::Session.new(
         id: '$restarted', name: slug, mark: '1', slug:, workspace:
       )
-      runner_class = Class.new(VpsfreeDevSession::Runner) do
+      runner_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) { |*_arguments, **_keywords| session }
         define_method(:sync_slug) { |*_arguments, **_keywords| session }
         define_method(:revalidate_session!) { |expected| expected }
@@ -10356,7 +10355,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10393,7 +10392,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10433,7 +10432,7 @@ class DevSessionTest < Minitest::Test
       manifest['creation']['tracking_state_sha256'] = '0' * 64
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10463,7 +10462,7 @@ class DevSessionTest < Minitest::Test
       plain_marker = File.join(plain_path, 'keep.txt')
       File.write(plain_marker, "keep this too\n")
       err = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err:, today: TODAY
       )
       runner.ensure_tracking_files(slug)
@@ -10506,7 +10505,7 @@ class DevSessionTest < Minitest::Test
       FileUtils.mkdir_p(File.dirname(path))
       assert_git_success('git', "--git-dir=#{repository}", 'worktree', 'add', path, slug)
       err = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err:, today: TODAY
       )
       runner.ensure_tracking_files(slug)
@@ -10542,7 +10541,7 @@ class DevSessionTest < Minitest::Test
       }]
       runner.send(:write_portal_manifest, slug, manifest)
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:sync_portal_repositories, slug, [])
       end
       assert_match(/registered portal worktree is not a canonical attached worktree/, error.message)
@@ -10559,7 +10558,7 @@ class DevSessionTest < Minitest::Test
       assert_git_success('git', 'init', '-b', slug, path)
       tmux = WindowRecordingTmux.new(slug, workspace:)
       err = StringIO.new
-      runner = VpsfreeDevSession::Runner.new(
+      runner = DevSession::Runner.new(
         workspace:, tmux:, out: StringIO.new, err:, today: TODAY, env: {}
       )
       runner.ensure_tracking_files(slug)
@@ -10595,7 +10594,7 @@ class DevSessionTest < Minitest::Test
         goal = File.join(workspace, 'goal.txt')
         File.write(goal, "Resume retained work.\n")
 
-        error = assert_raises(VpsfreeDevSession::Error) do
+        error = assert_raises(DevSession::Error) do
           runner.start(
             slug,
             as_is: true,
@@ -10637,7 +10636,7 @@ class DevSessionTest < Minitest::Test
       assert(journal.fetch('preserve_tracking'))
       File.write(File.join(workspace, 'work', slug, 'plan.md'), "x")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10679,7 +10678,7 @@ class DevSessionTest < Minitest::Test
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume retained work.\n")
 
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.start(
           slug,
           as_is: true,
@@ -10707,7 +10706,7 @@ class DevSessionTest < Minitest::Test
       finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
-      error = assert_raises(VpsfreeDevSession::Error) { runner.revive(slug, as_is: true) }
+      error = assert_raises(DevSession::Error) { runner.revive(slug, as_is: true) }
       assert_includes(error.message, 'without confirmation')
       runner.send(:prepare_revive_journal!, slug, 'abandoned', abandoned_confirmed: true)
       runner.send(:finish_revive_tracking!, slug, runner.send(:load_revive_journal, slug))
@@ -10718,7 +10717,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-dirty'
       runner = archived_runner(workspace, slug)
       File.write(File.join(workspace, 'archive', slug, 'state.md'), "\nchanged\n", mode: 'a')
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:prepare_revive_journal!, slug, 'complete')
       end
       assert_includes(error.message, 'archive move must be committed')
@@ -10728,7 +10727,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-duplicate'
       runner = archived_runner(workspace, slug)
       FileUtils.mkdir_p(File.join(workspace, 'work', slug))
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner.send(:prepare_revive_journal!, slug, 'complete')
       end
       assert_includes(error.message, 'active tracking already exists')
@@ -10738,7 +10737,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-live'
       archived_runner(workspace, slug)
       tmux = ManagedTmux.new(slug, workspace:)
-      error = assert_raises(VpsfreeDevSession::Error) do
+      error = assert_raises(DevSession::Error) do
         runner_for(workspace, tmux:).send(:prepare_revive_journal!, slug, 'complete')
       end
       assert_includes(error.message, 'live tmux session')
@@ -10749,7 +10748,7 @@ class DevSessionTest < Minitest::Test
 
   def removal_recovery(workspace, slug)
     matches = Dir.glob(
-      File.join(workspace, '.xdg-state', 'vpsfree-workspaces', 'removed', '*', "*-#{slug}-*")
+      File.join(workspace, '.xdg-state', 'dev-workspaces', 'removed', '*', "*-#{slug}-*")
     )
     assert_equal(1, matches.length, "expected one recovery directory for #{slug}")
     matches.fetch(0)
@@ -10765,7 +10764,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def profile_link_token(path)
-    VpsfreeWorkspaceProfileIdentity.token(path)
+    DevWorkspaceProfileIdentity.token(path)
   end
 
   def cleanup_contract_helper(workspace, name, paths)
@@ -10787,16 +10786,19 @@ class DevSessionTest < Minitest::Test
     tmux: nil,
     out: nil,
     authority_dir: nil,
-    vpsadmin_cluster: nil,
-    vpsadminos_cluster: nil
+    alpha_cluster: nil,
+    beta_cluster: nil
   )
     out ||= StringIO.new
     tmux ||= NullTmux.new
     resolved_env = {
       'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')
     }.merge(env)
+    cluster_providers = { }
+    cluster_providers['alpha'] = alpha_cluster if alpha_cluster
+    cluster_providers['beta'] = beta_cluster if beta_cluster
 
-    VpsfreeDevSession::Runner.new(
+    DevSession::Runner.new(
       workspace:,
       authority_dir:,
       tmux:,
@@ -10805,8 +10807,7 @@ class DevSessionTest < Minitest::Test
       today: TODAY,
       env: resolved_env,
       cwd: cwd || workspace,
-      vpsadmin_cluster:,
-      vpsadminos_cluster:
+      cluster_providers:
     )
   end
 
@@ -10965,7 +10966,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def tmux_session_exists?(socket, slug)
-    target = VpsfreeDevSession::Tmux.session_target(slug)
+    target = DevSession::Tmux.session_target(slug)
     _stdout, _stderr, status = Open3.capture3('tmux', '-L', socket, 'has-session', '-t', target)
     status.success?
   end
@@ -10987,7 +10988,7 @@ class DevSessionTest < Minitest::Test
   end
 
   def tmux_test_available?
-    return false if ENV['VPSFREE_DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+    return false if ENV['DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
     return @tmux_test_available unless @tmux_test_available.nil?
     return @tmux_test_available = false unless command_available?('tmux')
 

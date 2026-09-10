@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-codex %i
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-codex %i
 Restart=on-failure
 RestartSec=2s
 KillMode=mixed

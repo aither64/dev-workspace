@@ -21,7 +21,7 @@ func TestWorkspaceRouterRoutesCanonicalHostAndRedirectsAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(runtime) })
-	instance := filepath.Join(runtime, "vpsfree-cz")
+	instance := filepath.Join(runtime, "example-workspace")
 	if err := os.MkdirAll(instance, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestWorkspaceRouterRoutesCanonicalHostAndRedirectsAlias(t *testing.T) {
 
 	handler := workspaceRouterHandler(registry, runtime, log.New(io.Discard, "", 0))
 	request := httptest.NewRequest(http.MethodGet, "http://canonical/session", nil)
-	request.Host = "vpsfree-cz.workspace.aitherdev.int.vpsfree.cz"
+	request.Host = "example-workspace.workspace.build-host.int.example.cz"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Body.String() != "portal" {
@@ -47,11 +47,11 @@ func TestWorkspaceRouterRoutesCanonicalHostAndRedirectsAlias(t *testing.T) {
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "http://alias/session?q=1", nil)
-	request.Host = "vpsfree-cz-workspace.aitherdev.int.vpsfree.cz"
+	request.Host = "example-workspace-workspace.build-host.int.example.cz"
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusPermanentRedirect ||
-		response.Header().Get("Location") != "https://vpsfree-cz.workspace.aitherdev.int.vpsfree.cz/session?q=1" {
+		response.Header().Get("Location") != "https://example-workspace.workspace.build-host.int.example.cz/session?q=1" {
 		t.Fatalf("alias response = %d %q", response.Code, response.Header().Get("Location"))
 	}
 }
@@ -91,7 +91,7 @@ func TestWorkspaceRouterRejectsUnknownHostAndUnsafeRegistry(t *testing.T) {
 	writeRegistry(t, registry)
 	handler := workspaceRouterHandler(registry, directory, log.New(io.Discard, "", 0))
 	request := httptest.NewRequest(http.MethodGet, "http://unknown/", nil)
-	request.Host = "unknown.workspace.aitherdev.int.vpsfree.cz"
+	request.Host = "unknown.workspace.build-host.int.example.cz"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
@@ -110,7 +110,7 @@ func TestWorkspaceRouterRejectsUnknownHostAndUnsafeRegistry(t *testing.T) {
 
 func writeRegistry(t *testing.T, path string) {
 	t.Helper()
-	data := []byte(`{"schema":1,"workspaces":[{"name":"vpsfree-cz","root":"/workspace","hostname":"vpsfree-cz.workspace.aitherdev.int.vpsfree.cz","aliases":["vpsfree-cz-workspace.aitherdev.int.vpsfree.cz"]}]}`)
+	data := []byte(`{"schema":1,"workspaces":[{"name":"example-workspace","root":"/workspace","hostname":"example-workspace.workspace.build-host.int.example.cz","aliases":["example-workspace-workspace.build-host.int.example.cz"]}]}`)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}

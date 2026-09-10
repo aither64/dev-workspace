@@ -253,7 +253,7 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	if err := os.WriteFile(helper, []byte(
 		"#!/bin/sh\n"+
-			"[ \"$VPSFREE_WORKSPACE_TRANSITION_LOCK_FD\" = 3 ] || exit 23\n"+
+			"[ \"$DEV_WORKSPACE_TRANSITION_LOCK_FD\" = 3 ] || exit 23\n"+
 			"[ -e /proc/$$/fd/3 ] || exit 24\n",
 	), 0o755); err != nil {
 		t.Fatal(err)
@@ -691,7 +691,7 @@ func TestIndexStatusDoesNotPromoteASessionRepositoryConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	runWebGit(t, "init", "--bare", "--initial-branch=master", repository)
-	runWebGit(t, "--git-dir="+repository, "config", "remote.origin.url", "git@github.com:vpsfreecz/example.git")
+	runWebGit(t, "--git-dir="+repository, "config", "remote.origin.url", "git@github.com:example-org/example.git")
 	seed := t.TempDir()
 	runWebGit(t, "init", "--initial-branch=master", seed)
 	runWebGit(t, "-C", seed, "config", "user.email", "test@example.invalid")
@@ -714,7 +714,7 @@ func TestIndexStatusDoesNotPromoteASessionRepositoryConflict(t *testing.T) {
 	}
 	manifest := "schema: 1\nslug: example\nrepositories:\n" +
 		"  - name: example\n    project: example\n" +
-		"    github: vpsfreecz/example\n    branch: registered\n"
+		"    github: example-org/example\n    branch: registered\n"
 	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1025,7 +1025,7 @@ func TestMessageAcknowledgementSerializesAConcurrentBrowserRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := "schema: 1\nslug: example\ncodex:\n" +
-		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n" +
 		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -1204,7 +1204,7 @@ func TestConversationMessageLimitMatchesTheRuntimeContract(t *testing.T) {
 
 func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testing.T) {
 	server := newTestServer(t)
-	server.config.CodexSocket = "/run/vpsfree-workspace-codex/app-server.sock"
+	server.config.CodexSocket = "/run/dev-workspace-codex/app-server.sock"
 	server.config.CodexVersion = "0.152.1"
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
@@ -1277,7 +1277,7 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 			if err := os.MkdirAll(directory, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
 				"creation:\n  state: ready\n  initial_goal_sent: true\n"
 			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 				t.Fatal(err)
@@ -1340,7 +1340,7 @@ func writeWebRuntimeAuthority(t *testing.T, server *Server, slug string) {
 	t.Helper()
 	authority := session.RuntimeAuthority{
 		Schema: 1, State: "ready", Slug: slug, Workspace: server.config.Workspace,
-		TmuxSocket: "/run/vpsfree-workspace-tmux/tmux.sock", TmuxSessionID: "$1",
+		TmuxSocket: "/run/dev-workspace-tmux/tmux.sock", TmuxSessionID: "$1",
 		TmuxIdentity:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		CodexThreadID: "thread-1", CodexSocketPath: server.config.CodexSocket,
 		CodexClientVersion: "0.152.1",
@@ -1502,7 +1502,7 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 		t.Fatal(err)
 	}
 	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
-		"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
 		"creation:\n  state: ready\n  initial_goal_sent: true\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -1547,7 +1547,7 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 			},
 		}},
 		Clusters: []cluster.Status{{
-			Kind: "vpsadmin", Label: "vpsAdmin", State: "running", Ready: true,
+			Kind: "alpha", Label: "Alpha", State: "running", Ready: true,
 			Services: []cluster.Service{{
 				Label: "Web UI", URL: "https://webui.example.test/",
 				Accounts: []cluster.Account{{Label: "Administrator", Fields: []cluster.Field{
@@ -1867,7 +1867,7 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				t.Fatal(err)
 			}
 			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
-				"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+				"  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
 				"creation:\n  state: ready\n  initial_goal_sent: true\nrepositories: []\nartifacts: []\n"
 			if testCase.finalized {
 				manifest += "finalized_at: '2026-09-03T12:00:00Z'\n"
@@ -1967,7 +1967,7 @@ func TestTerminalUnarchivedSessionRemainsInteractive(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
-		"  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
 		"creation:\n  state: ready\n  initial_goal_sent: true\nrepositories: []\nartifacts: []\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -2016,7 +2016,7 @@ func TestCreatingAuthorityNeverGrantsControls(t *testing.T) {
 			if err := os.MkdirAll(directory, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+			manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
 				"creation:\n  state: creating\n  initial_goal_sent: false\n  goal_sha256: " + strings.Repeat("a", 64) + "\n"
 			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 				t.Fatal(err)
@@ -2050,7 +2050,7 @@ func TestPersistedThreadWithWrongCwdIsNotReadable(t *testing.T) {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n  client_version: 0.152.1\ncreation:\n  state: ready\n"
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\ncreation:\n  state: ready\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3724,7 +3724,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := "schema: 1\nslug: example\ncodex:\n" +
-		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n" +
 		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -3801,7 +3801,7 @@ func TestRepositoryCacheDoesNotCrossArchiveTransition(t *testing.T) {
 	server.repository.GH = gh
 	updated := time.Now()
 	repository := session.Repository{
-		Name: "example", GitHub: "vpsfreecz/example", Branch: "feature", DefaultBranch: "master",
+		Name: "example", GitHub: "example-org/example", Branch: "feature", DefaultBranch: "master",
 		InitialBaseSHA: strings.Repeat("1", 40), FinalHeadSHA: strings.Repeat("2", 40),
 	}
 	active := &session.Summary{Manifest: session.Manifest{Slug: "example", Repositories: []session.Repository{repository}}, UpdatedAt: updated}
@@ -3855,7 +3855,7 @@ func prepareInteractiveConversation(t *testing.T, server *Server, slug string) *
 		t.Fatal(err)
 	}
 	manifest := "schema: 1\nslug: " + slug + "\ncodex:\n" +
-		"  thread_id: thread-1\n  socket_path: /run/vpsfree-workspace-codex/app-server.sock\n" +
+		"  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n" +
 		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -3884,7 +3884,7 @@ func newTestServer(t *testing.T) *Server {
 		DevSession:        "/run/current-system/sw/bin/dev-session",
 		HostProfile:       profile,
 		AuthorityDir:      authorityDir,
-		CodexSocket:       "/run/vpsfree-workspace-codex/app-server.sock",
+		CodexSocket:       "/run/dev-workspace-codex/app-server.sock",
 		CodexVersion:      "0.152.1",
 		OperationStateDir: filepath.Join(t.TempDir(), "operations"),
 		RemovalStateHome:  t.TempDir(),

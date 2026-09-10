@@ -2,7 +2,7 @@ schema: 2
 slug: 2026-09-03-example
 codex:
   thread_id: thread-creating
-  socket_path: /run/vpsfree-workspace-codex/app-server.sock
+  socket_path: /run/dev-workspace-codex/app-server.sock
   client_version: 0.153.0
 creation:
   state: creating

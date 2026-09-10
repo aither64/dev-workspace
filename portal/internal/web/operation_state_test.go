@@ -407,7 +407,7 @@ func writeCompletedRemovalMarker(
 	digest := sha256.Sum256([]byte(server.config.Workspace))
 	workspaceID := filepath.Base(server.config.Workspace) + "-" + hex.EncodeToString(digest[:8])
 	root := filepath.Join(
-		server.config.RemovalStateHome, "vpsfree-workspaces", "removed", workspaceID,
+		server.config.RemovalStateHome, "dev-workspaces", "removed", workspaceID,
 	)
 	directory := filepath.Join(root, "20260909T100613.000000Z-"+slug+"-123")
 	if err := os.MkdirAll(filepath.Join(directory, "work"), 0o700); err != nil {

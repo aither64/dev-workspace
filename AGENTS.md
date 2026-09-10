@@ -4,10 +4,7 @@
 
 - `portal/` contains the Go portal and Codex App Server integration.
 - `libexec/` contains the Ruby session and host-profile commands.
-- `dev-clusters/` contains the optional vpsAdmin and vpsAdminOS providers.
 - `nix/` packages the application and user services.
-- `bin/`, `lib/` and `skills/` contain the optional vpsFree compatibility
-  tools.
 - `test/` contains Ruby and protocol contract tests.
 
 ## Development commands
@@ -38,6 +35,6 @@ Use focused commits with subjects in `area: action` form. Explain the reason
 and compatibility impact in the body when needed. Write commit messages to a
 temporary file and pass it to `git commit -F`. Do not bypass declared hooks.
 
-Run quick local checks before the mandatory vpsFree.cz change review. Run long
+Run quick local checks before the mandatory change review. Run long
 integration and deployment tests only after review findings are resolved or
 explicitly accepted in the initiative state.

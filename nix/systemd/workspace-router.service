@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-router
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-router
 Restart=on-failure
 RestartSec=2s
 

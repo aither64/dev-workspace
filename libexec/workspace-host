@@ -11,21 +11,10 @@ require 'tmpdir'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 
-module VpsfreeWorkspaceHost
+module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
   HOSTNAME_LABEL = /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/
-  CORE_COMMANDS = %w[workspace-host dev-session vpsadmin-devcluster vpsadminos-devcluster].freeze
-  # Keep renamed or retired entries as tombstones until every package
-  # generation that could have installed them is outside the rollback window.
-  COMPATIBILITY_COMMANDS = %w[
-    kb-cleanup kb-contract-build kb-contract-fetch kb-contract-manifest
-    kb-contract-reconcile kb-page kb-release kb-stage
-  ].freeze
-  COMPATIBILITY_SKILLS = %w[
-    dev-session-handoff humanizer-cs humanizer-en mandatory-change-review
-    vpsfree-user-facing-writing
-  ].freeze
-  DEVELOPMENT_CLUSTER_PROVIDERS = %w[vpsadmin vpsadminos].freeze
+  CORE_COMMANDS = %w[workspace-host dev-session].freeze
 
   def self.load_runtime_contract
     candidates = [
@@ -69,6 +58,82 @@ module VpsfreeWorkspaceHost
 
   class Error < StandardError; end
 
+  class ExtensionCatalog
+    attr_reader :commands, :skills, :cluster_providers
+
+    def self.load(package, override: nil)
+      installed = File.join(package, 'share/dev-workspace/extensions.json')
+      source = File.join(package, 'nix/empty-extensions.json')
+      path = override || (File.file?(installed) ? installed : source)
+      raise Error, "workspace extension catalog is missing: #{package}" unless File.file?(path)
+
+      payload = File.binread(path, 64 * 1024 + 1)
+      raise Error, "workspace extension catalog is too large: #{path}" if payload.bytesize > 64 * 1024
+      new(JSON.parse(payload), path:)
+    rescue JSON::ParserError, Errno::ENOENT, Errno::EACCES => e
+      raise Error, "invalid workspace extension catalog for #{package}: #{e.message}"
+    end
+
+    def initialize(data, path:)
+      unless data.is_a?(Hash) && data.keys.sort == %w[clusterProviders commands schema skills] &&
+             data['schema'] == 1
+        raise Error, "invalid workspace extension catalog: #{path}"
+      end
+      @commands = entries(data['commands'], %w[name path], 'name', 'path', path)
+      @skills = entries(data['skills'], %w[name path], 'name', 'path', path)
+      providers = data['clusterProviders']
+      unless providers.is_a?(Array)
+        raise Error, "invalid workspace extension catalog: #{path}"
+      end
+      @cluster_providers = providers.to_h do |provider|
+        unless provider.is_a?(Hash) && provider.keys.sort == %w[command id label] &&
+               valid_name?(provider['id']) && provider['label'].is_a?(String) &&
+               !provider['label'].empty? && provider['label'].bytesize <= 128 &&
+               absolute_path?(provider['command'])
+          raise Error, "invalid workspace extension catalog: #{path}"
+        end
+        [provider.fetch('id'), provider.freeze]
+      end
+      all_names = commands.keys + cluster_providers.keys.map { |name| "#{name}-devcluster" }
+      unless all_names.uniq.length == all_names.length && (all_names & CORE_COMMANDS).empty? &&
+             cluster_providers.length == providers.length
+        raise Error, "duplicate workspace extension name: #{path}"
+      end
+      freeze
+    end
+
+    def provider_programs
+      cluster_providers.transform_keys { |name| "#{name}-devcluster" }
+    end
+
+    private
+
+    def entries(values, keys, name_key, path_key, catalog_path)
+      unless values.is_a?(Array)
+        raise Error, "invalid workspace extension catalog: #{catalog_path}"
+      end
+      result = values.to_h do |entry|
+        unless entry.is_a?(Hash) && entry.keys.sort == keys && valid_name?(entry[name_key]) &&
+               absolute_path?(entry[path_key])
+          raise Error, "invalid workspace extension catalog: #{catalog_path}"
+        end
+        [entry.fetch(name_key), entry.fetch(path_key)]
+      end
+      unless result.length == values.length
+        raise Error, "duplicate workspace extension name: #{catalog_path}"
+      end
+      result.freeze
+    end
+
+    def valid_name?(value)
+      value.is_a?(String) && value.match?(NAME)
+    end
+
+    def absolute_path?(value)
+      value.is_a?(String) && value.start_with?(File::SEPARATOR) && !value.include?("\0")
+    end
+  end
+
   class Registry
     attr_reader :path, :entries
 
@@ -81,7 +146,7 @@ module VpsfreeWorkspaceHost
       entries.find { |entry| entry.fetch('name') == name }
     end
 
-    def select(name: nil, cwd: Dir.pwd, environment_name: ENV['VPSFREE_WORKSPACE_NAME'])
+    def select(name: nil, cwd: Dir.pwd, environment_name: ENV['DEV_WORKSPACE_NAME'])
       explicit = name && find(name)
       raise Error, "workspace is not registered: #{name}" if name && !explicit
 
@@ -249,28 +314,27 @@ module VpsfreeWorkspaceHost
       @out = out
       @err = err
       @home = File.expand_path(env.fetch('HOME'))
-      @config = env.fetch('VPSFREE_WORKSPACES_CONFIG', File.join(@home, '.config/vpsfree-workspaces/registry.json'))
-      @state = env.fetch('VPSFREE_WORKSPACES_STATE', File.join(@home, '.local/state/vpsfree-workspaces'))
-      @runtime = env.fetch('VPSFREE_WORKSPACES_RUNTIME_DIR', File.join(env.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}"), 'vpsfree-workspaces'))
-      @profile = env.fetch('VPSFREE_WORKSPACES_PROFILE', File.join(@state, 'profile'))
-      @skills = env.fetch('VPSFREE_WORKSPACES_SKILLS_DIR', File.join(@home, '.codex/skills'))
-      @system_codex = if env.key?('VPSFREE_WORKSPACES_SYSTEM_CODEX')
-                        env.fetch('VPSFREE_WORKSPACES_SYSTEM_CODEX')
+      @config = env.fetch('DEV_WORKSPACES_CONFIG', File.join(@home, '.config/dev-workspaces/registry.json'))
+      @state = env.fetch('DEV_WORKSPACES_STATE', File.join(@home, '.local/state/dev-workspaces'))
+      @runtime = env.fetch('DEV_WORKSPACES_RUNTIME_DIR', File.join(env.fetch('XDG_RUNTIME_DIR', "/run/user/#{Process.euid}"), 'dev-workspaces'))
+      @profile = env.fetch('DEV_WORKSPACES_PROFILE', File.join(@state, 'profile'))
+      @skills = env.fetch('DEV_WORKSPACES_SKILLS_DIR', File.join(@home, '.codex/skills'))
+      @system_codex = if env.key?('DEV_WORKSPACES_SYSTEM_CODEX')
+                        env.fetch('DEV_WORKSPACES_SYSTEM_CODEX')
                       else
                         File.join(package_root, 'libexec/codex/bin/codex')
                       end
       @router_socket = env.fetch(
-        'VPSFREE_WORKSPACES_ROUTER_SOCKET',
-        '/run/vpsfree-workspace-router/router.sock'
+        'DEV_WORKSPACES_ROUTER_SOCKET',
+        '/run/dev-workspaces/router.sock'
       )
     end
 
     def run(program, argv)
-      case program
-      when 'dev-session'
+      if program == 'dev-session'
         dispatch(argv, 'dev-session')
         0
-      when 'vpsadmin-devcluster', 'vpsadminos-devcluster'
+      elsif program.end_with?('-devcluster')
         dispatch_cluster(argv, program)
         0
       else
@@ -295,7 +359,7 @@ module VpsfreeWorkspaceHost
       when 'check-codex' then check_codex_command(argv)
       when 'reconcile-codex' then with_current_generation_lock { reconcile_codex(argv) }
       when '_activate'
-        raise Error, 'workspace activation is private' unless @env['VPSFREE_WORKSPACE_ACTIVATION'] == '1'
+        raise Error, 'workspace activation is private' unless @env['DEV_WORKSPACE_ACTIVATION'] == '1'
         activate(argv)
       when 'run-router' then run_router(argv)
       when 'run-portal' then run_portal(argv)
@@ -312,7 +376,7 @@ module VpsfreeWorkspaceHost
     def usage
       <<~USAGE
         Usage:
-          workspace-host register NAME ROOT --hostname HOST [--alias HOST] [--replace]
+          workspace-host register NAME ROOT [--hostname HOST] [--alias HOST] [--replace]
           workspace-host unregister NAME
           workspace-host switch --source PATH
           workspace-host rollback
@@ -326,26 +390,38 @@ module VpsfreeWorkspaceHost
       Registry.new(@config)
     end
 
+    def extension_catalog(package = package_root)
+      resolved = File.realpath(package)
+      override = @env['DEV_WORKSPACES_EXTENSION_CATALOG'] if resolved == File.realpath(package_root)
+      ExtensionCatalog.load(resolved, override:)
+    end
+
     def register(argv)
-      options = { aliases: [], replace: false }
+      options = { aliases: nil, replace: false }
       parser = OptionParser.new do |opts|
         opts.on('--hostname HOST') { |value| options[:hostname] = value }
-        opts.on('--alias HOST') { |value| options[:aliases] << value }
+        opts.on('--alias HOST') { |value| (options[:aliases] ||= []) << value }
         opts.on('--replace') { options[:replace] = true }
       end
       parser.parse!(argv)
-      raise Error, 'register requires NAME, ROOT, and --hostname HOST' unless argv.length == 2 && options[:hostname]
+      raise Error, 'register requires NAME and ROOT' unless argv.length == 2
 
       candidate_root = File.realpath(File.expand_path(argv.fetch(1)))
       candidate = { 'name' => argv.fetch(0), 'root' => candidate_root }
+      configuration = workspace_configuration(candidate, registered: false)
+      hostname = options[:hostname] || configuration.dig('portal', 'hostname')
+      aliases = options[:aliases] || configuration.dig('portal', 'aliases') || []
+      if hostname.nil? || hostname.empty?
+        raise Error, 'register requires --hostname HOST or portal.hostname in .dev-workspace.json'
+      end
       require_no_unfinished_lifecycle_operations!(
         (registry.entries + [candidate]).uniq { |entry| entry.fetch('root') },
         operation: 'workspace register'
       )
 
       entry = registry.register(
-        name: argv.fetch(0), root: argv.fetch(1), hostname: options.fetch(:hostname),
-        aliases: options.fetch(:aliases), replace: options.fetch(:replace)
+        name: argv.fetch(0), root: argv.fetch(1), hostname:,
+        aliases:, replace: options.fetch(:replace)
       )
       if File.exist?(@profile)
         activate_installed(File.join(@profile, 'bin/workspace-host'))
@@ -491,7 +567,7 @@ module VpsfreeWorkspaceHost
     end
 
     def activate_installed(command)
-      environment = @env.to_h.merge('VPSFREE_WORKSPACE_ACTIVATION' => '1')
+      environment = @env.to_h.merge('DEV_WORKSPACE_ACTIVATION' => '1')
       system_env!(environment, command, '_activate')
     end
 
@@ -608,6 +684,12 @@ module VpsfreeWorkspaceHost
       units = File.join(@home, '.config/systemd/user')
       selected_package = File.realpath(package)
       retained_packages = retained_package_roots(selected_package)
+      selected_catalog = extension_catalog(selected_package)
+      retained_catalogs = retained_packages.to_h do |retained|
+        [retained, extension_catalog(retained)]
+      rescue Error
+        [retained, nil]
+      end
       FileUtils.mkdir_p(bin)
       FileUtils.mkdir_p(units)
       FileUtils.mkdir_p(@skills)
@@ -615,29 +697,38 @@ module VpsfreeWorkspaceHost
       CORE_COMMANDS.each do |command|
         atomic_symlink(File.join(@profile, 'bin', command), File.join(bin, command))
       end
-      COMPATIBILITY_COMMANDS.each do |command|
-        source = File.join(selected_package, 'bin', command)
-        destination = File.join(bin, command)
-        if File.exist?(source)
-          raise Error, "packaged command is not executable: #{source}" unless File.executable?(source)
-          atomic_symlink(source, destination)
-        else
-          remove_compatibility_link(destination, retained_packages, 'bin', command)
-        end
+      selected_catalog.commands.each do |command, source|
+        raise Error, "packaged command is not executable: #{source}" unless File.executable?(source)
+        atomic_symlink(source, File.join(bin, command))
+      end
+      selected_catalog.provider_programs.each_key do |program|
+        atomic_symlink(File.join(@profile, 'bin', program), File.join(bin, program))
       end
       Dir[File.join(@profile, 'share/systemd/user/workspace-*')].each do |source|
         atomic_symlink(source, File.join(units, File.basename(source)))
       end
-      COMPATIBILITY_SKILLS.each do |skill|
-        source = File.join(selected_package, 'share/codex/skills', skill)
-        destination = File.join(@skills, skill)
-        if File.directory?(source)
-          atomic_symlink(source, destination)
-        else
-          remove_compatibility_link(
-            destination, retained_packages, 'share', 'codex', 'skills', skill
-          )
-        end
+      selected_catalog.skills.each do |skill, source|
+        raise Error, "packaged skill is not a directory: #{source}" unless File.directory?(source)
+        atomic_symlink(source, File.join(@skills, skill))
+      end
+
+      retained_commands = retained_catalogs.values.compact.flat_map { |item| item.commands.keys }.uniq
+      (retained_commands - selected_catalog.commands.keys).each do |command|
+        sources = retained_catalogs.values.compact.filter_map { |item| item.commands[command] }
+        remove_managed_link(File.join(bin, command), sources)
+      end
+      retained_providers = retained_catalogs.flat_map do |retained, item|
+        next [] unless item
+        item.provider_programs.keys.map { |program| File.join(retained, 'bin', program) }
+      end
+      (retained_catalogs.values.compact.flat_map { |item| item.provider_programs.keys }.uniq -
+        selected_catalog.provider_programs.keys).each do |program|
+        remove_managed_link(File.join(bin, program), retained_providers)
+      end
+      retained_skills = retained_catalogs.values.compact.flat_map { |item| item.skills.keys }.uniq
+      (retained_skills - selected_catalog.skills.keys).each do |skill|
+        sources = retained_catalogs.values.compact.filter_map { |item| item.skills[skill] }
+        remove_managed_link(File.join(@skills, skill), sources)
       end
     end
 
@@ -651,13 +742,12 @@ module VpsfreeWorkspaceHost
       end.uniq
     end
 
-    def remove_compatibility_link(destination, packages, *parts)
+    def remove_managed_link(destination, sources)
       return unless File.symlink?(destination)
 
       target = File.expand_path(File.readlink(destination), File.dirname(destination))
       resolved_target = File.realpath(target)
-      managed = packages.any? do |package|
-        source = File.join(package, *parts)
+      managed = sources.any? do |source|
         File.exist?(source) && File.realpath(source) == resolved_target
       end
       File.unlink(destination) if managed
@@ -699,7 +789,7 @@ module VpsfreeWorkspaceHost
       end
 
       name = extract_workspace_option!(argv)
-      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['VPSFREE_WORKSPACE_NAME'])
+      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
       if %w[archive delete revive].include?(argv.first)
         if inherited_exclusive_transition_lock?
           environment, command, arguments = dev_session_invocation(
@@ -734,10 +824,11 @@ module VpsfreeWorkspaceHost
         '--codex-command', active_codex, '--codex-socket', runtime.fetch(:codex),
         '--codex-version', version, '--portal-command', File.join(package, 'bin/workspace-portal'),
         '--portal-base-url', "https://#{entry.fetch('hostname')}",
-        '--vpsadmin-cluster', File.join(package, 'libexec/workspace-portal/vpsadmin-devcluster'),
-        '--vpsadminos-cluster', File.join(package, 'libexec/workspace-portal/vpsadminos-devcluster'),
-        '--', *argv
       ]
+      extension_catalog(package).cluster_providers.each do |provider_id, provider|
+        arguments.concat(['--cluster-provider', "#{provider_id}=#{provider.fetch('command')}"])
+      end
+      arguments.concat(['--', *argv])
       if File.symlink?(@profile)
         token = profile_link_token
         raise Error, 'workspace profile identity cannot be verified; rerun the command' unless token
@@ -748,34 +839,41 @@ module VpsfreeWorkspaceHost
       if transition_lock
         arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file)
       end
-      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
       [environment, private_command, arguments]
     end
 
     def dispatch_cluster(argv, program)
-      private_command = File.join(package_root, 'libexec/workspace-portal', program)
-      exec(private_command, *argv) if %w[-h --help].include?(argv.first)
+      if %w[-h --help].include?(argv.first)
+        provider = extension_catalog.provider_programs.fetch(program) do
+          raise Error, "unknown development cluster command: #{program}"
+        end
+        exec(provider.fetch('command'), *argv)
+      end
 
       name = extract_workspace_option!(argv)
-      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['VPSFREE_WORKSPACE_NAME'])
+      entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
       environment = @env.to_h.merge(
-        'VPSFREE_WORKSPACE_NAME' => entry.fetch('name'),
-        'VPSFREE_DEVCLUSTER_WORKSPACE' => entry.fetch('root')
+        'DEV_WORKSPACE_NAME' => entry.fetch('name'),
+        'DEVCLUSTER_WORKSPACE' => entry.fetch('root')
       )
       %w[
-        VPSFREE_WORKSPACE_TRANSITION_HELD
-        VPSFREE_WORKSPACE_TRANSITION_LOCK_FD
-        VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION
-        VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_FD
-        VPSFREE_DEV_SESSION_LIFECYCLE_LOCK_PATH
+        DEV_WORKSPACE_TRANSITION_HELD
+        DEV_WORKSPACE_TRANSITION_LOCK_FD
+        DEV_SESSION_LIFECYCLE_OPERATION
+        DEV_SESSION_LIFECYCLE_LOCK_FD
+        DEV_SESSION_LIFECYCLE_LOCK_PATH
       ].each { |name_to_remove| environment.delete(name_to_remove) }
       with_current_generation_lock(mode: File::LOCK_SH) do
-        system_env!(environment, private_command, *argv)
+        provider = extension_catalog.provider_programs.fetch(program) do
+          raise Error, "unknown development cluster command: #{program}"
+        end
+        system_env!(environment, provider.fetch('command'), *argv)
       end
     end
 
     def inherited_exclusive_transition_lock?
-      descriptor = Integer(@env.fetch('VPSFREE_WORKSPACE_TRANSITION_LOCK_FD', ''), 10)
+      descriptor = Integer(@env.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD', ''), 10)
       return false if descriptor < 3
       return false if File.symlink?(transition_lock_file)
 
@@ -822,7 +920,7 @@ module VpsfreeWorkspaceHost
       workspace = workspace_configuration(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
-      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
       arguments = [
         'serve',
         '--workspace', entry.fetch('root'), '--base-url', "https://#{entry.fetch('hostname')}",
@@ -836,41 +934,49 @@ module VpsfreeWorkspaceHost
       unless workspace.fetch('sshHost').empty?
         arguments.concat(['--ssh-host', workspace.fetch('sshHost')])
       end
-      if workspace.fetch('developmentClusterProviders').include?('vpsadmin')
+      catalog = extension_catalog
+      workspace.fetch('developmentClusterProviders').each do |provider_id|
+        provider = catalog.cluster_providers.fetch(provider_id)
         arguments.concat([
-          '--vpsadmin-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadmin-devcluster')
-        ])
-      end
-      if workspace.fetch('developmentClusterProviders').include?('vpsadminos')
-        arguments.concat([
-          '--vpsadminos-cluster', File.join(package_root, 'libexec/workspace-portal/vpsadminos-devcluster')
+          '--cluster-provider',
+          "#{provider_id}=#{provider.fetch('label')}=#{provider.fetch('command')}"
         ])
       end
       exec(environment, File.join(package_root, 'bin/workspace-portal'), *arguments)
     end
 
-    def workspace_configuration(entry)
+    def workspace_configuration(entry, registered: true)
       path = File.join(entry.fetch('root'), '.dev-workspace.json')
       return {
         'displayLabel' => 'Development workspace', 'hostLabel' => 'this host',
-        'sshHost' => '', 'developmentClusterProviders' => []
+        'sshHost' => '', 'developmentClusterProviders' => [],
+        'portal' => {
+          'hostname' => registered ? entry.fetch('hostname') : '',
+          'aliases' => registered ? entry.fetch('aliases') : []
+        }
       } unless File.exist?(path)
       raise Error, "workspace configuration is a symlink: #{path}" if File.symlink?(path)
       contents = File.binread(path, 64 * 1024 + 1)
       raise Error, "workspace configuration is too large: #{path}" if contents.bytesize > 64 * 1024
       data = JSON.parse(contents)
-      expected = %w[developmentClusterProviders displayLabel hostLabel schema sshHost]
+      expected = %w[developmentClusterProviders displayLabel hostLabel portal schema sshHost]
       providers = data['developmentClusterProviders']
-      unless data.is_a?(Hash) && data.keys.sort == expected && data['schema'] == 1 &&
+      portal = data['portal']
+      available_providers = extension_catalog.cluster_providers.keys
+      unless data.is_a?(Hash) && data.keys.sort == expected && data['schema'] == 2 &&
              data['displayLabel'].is_a?(String) && !data['displayLabel'].empty? &&
              data['displayLabel'].bytesize <= 128 && data['hostLabel'].is_a?(String) &&
              !data['hostLabel'].empty? && data['hostLabel'].bytesize <= 128 &&
              data['sshHost'].is_a?(String) && data['sshHost'].bytesize <= 253 &&
              providers.is_a?(Array) && providers.uniq == providers &&
-             (providers - DEVELOPMENT_CLUSTER_PROVIDERS).empty?
+             (providers - available_providers).empty? && portal.is_a?(Hash) &&
+             portal.keys.sort == %w[aliases hostname] && portal['hostname'].is_a?(String) &&
+             portal['aliases'].is_a?(Array) && portal['aliases'].uniq == portal['aliases'] &&
+             portal['aliases'].all? { |value| value.is_a?(String) }
         raise Error, "invalid workspace configuration: #{path}"
       end
-      unless data['sshHost'].empty? || data['sshHost'].split('.').all? { |label| label.match?(HOSTNAME_LABEL) }
+      hostnames = [data['sshHost'], portal.fetch('hostname'), *portal.fetch('aliases')].reject(&:empty?)
+      unless hostnames.all? { |hostname| hostname.split('.').all? { |label| label.match?(HOSTNAME_LABEL) } }
         raise Error, "invalid workspace SSH host: #{path}"
       end
       data
@@ -1069,7 +1175,7 @@ module VpsfreeWorkspaceHost
 
     def development_cluster_state(entries = registry.entries)
       entries.flat_map do |entry|
-        %w[vpsadmin vpsadminos].flat_map do |kind|
+        extension_catalog.cluster_providers.keys.flat_map do |kind|
           root = File.join(entry.fetch('root'), '.dev-clusters', kind, 'clusters')
           next [] unless File.exist?(root) || File.symlink?(root)
           unless File.directory?(root) && !File.symlink?(root)
@@ -1109,13 +1215,14 @@ module VpsfreeWorkspaceHost
           raise Error, "workspace package transition is blocked by #{identity}"
         end
         entry = registry.find(workspace_name)
-        command = File.join(package, 'libexec/workspace-portal', "#{kind}-devcluster")
-        unless entry && File.executable?(command)
+        provider = extension_catalog(package).cluster_providers[kind]
+        command = provider && provider.fetch('command')
+        unless entry && command && File.executable?(command)
           raise Error, "target package cannot validate development cluster state: #{identity}"
         end
         environment = @env.to_h.merge(
-          'VPSFREE_WORKSPACE_NAME' => workspace_name,
-          'VPSFREE_DEVCLUSTER_WORKSPACE' => entry.fetch('root')
+          'DEV_WORKSPACE_NAME' => workspace_name,
+          'DEVCLUSTER_WORKSPACE' => entry.fetch('root')
         )
         capture_env!(environment, command, 'transition-adopt', slug)
       end
@@ -1377,7 +1484,7 @@ module VpsfreeWorkspaceHost
     end
 
     def profile_link_token
-      VpsfreeWorkspaceProfileIdentity.token(@profile)
+      DevWorkspaceProfileIdentity.token(@profile)
     end
 
     def require_current_package_generation!
@@ -1595,7 +1702,7 @@ module VpsfreeWorkspaceHost
     end
 
     def exec_with_workspace(entry, command, *argv)
-      environment = @env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name'))
+      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
       exec(environment, command, *argv)
     end
 
@@ -1654,6 +1761,6 @@ module VpsfreeWorkspaceHost
 end
 
 if $PROGRAM_NAME == __FILE__ || File.basename($PROGRAM_NAME).include?('workspace-host')
-  program = ENV.fetch('VPSFREE_WORKSPACE_HOST_MODE', File.basename($PROGRAM_NAME))
-  exit VpsfreeWorkspaceHost::Host.new.run(program, ARGV.dup)
+  program = ENV.fetch('DEV_WORKSPACE_HOST_MODE', File.basename($PROGRAM_NAME))
+  exit DevWorkspaceHost::Host.new.run(program, ARGV.dup)
 end

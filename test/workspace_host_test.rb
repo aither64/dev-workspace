@@ -15,7 +15,7 @@ class WorkspaceHostTest < Minitest::Test
 
     assert_equal(
       contract.fetch('lifecycleJournals'),
-      VpsfreeWorkspaceHost::LIFECYCLE_JOURNALS
+      DevWorkspaceHost::LIFECYCLE_JOURNALS
     )
   end
 
@@ -34,7 +34,7 @@ class WorkspaceHostTest < Minitest::Test
       )
 
       assert_equal('nested', registry.select(cwd: nested).fetch('name'))
-      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+      error = assert_raises(DevWorkspaceHost::Error) do
         registry.select(cwd: directory)
       end
       assert_includes(error.message, '--workspace NAME')
@@ -53,7 +53,7 @@ class WorkspaceHostTest < Minitest::Test
       )
 
       assert_equal(0o600, File.stat(registry.path).mode & 0o777)
-      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+      error = assert_raises(DevWorkspaceHost::Error) do
         registry.register(
           name: 'second', root: second, hostname: 'old.example.test',
           aliases: [], replace: false
@@ -62,8 +62,8 @@ class WorkspaceHostTest < Minitest::Test
       assert_includes(error.message, 'duplicate workspace hostname')
 
       File.chmod(0o644, registry.path)
-      assert_raises(VpsfreeWorkspaceHost::Error) do
-        VpsfreeWorkspaceHost::Registry.new(registry.path)
+      assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::Registry.new(registry.path)
       end
     end
   end
@@ -74,21 +74,21 @@ class WorkspaceHostTest < Minitest::Test
       second = make_workspace(directory, 'second')
       registry = registry_at(directory)
       registry.register(
-        name: 'vpsfree-cz', root: first, hostname: 'old.workspace.example.test',
+        name: 'example-workspace', root: first, hostname: 'old.workspace.example.test',
         aliases: [], replace: false
       )
 
-      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+      error = assert_raises(DevWorkspaceHost::Error) do
         registry.register(
-          name: 'vpsfree-cz', root: second, hostname: 'new.workspace.example.test',
+          name: 'example-workspace', root: second, hostname: 'new.workspace.example.test',
           aliases: [], replace: true
         )
       end
 
-      assert_includes(error.message, 'unregister vpsfree-cz first')
-      assert_equal(first, registry.find('vpsfree-cz').fetch('root'))
+      assert_includes(error.message, 'unregister example-workspace first')
+      assert_equal(first, registry.find('example-workspace').fetch('root'))
       updated = registry.register(
-        name: 'vpsfree-cz', root: first, hostname: 'new.workspace.example.test',
+        name: 'example-workspace', root: first, hostname: 'new.workspace.example.test',
         aliases: ['old.workspace.example.test'], replace: true
       )
       assert_equal(first, updated.fetch('root'))
@@ -96,12 +96,64 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_compatibility_inventory_covers_every_packaged_extension
-    expected_commands = Dir.children(File.expand_path('../bin', __dir__)).sort
-    expected_skills = Dir.children(File.expand_path('../skills', __dir__)).sort
+  def test_register_reads_portal_identity_from_workspace_configuration
+    Dir.mktmpdir('workspace-host-register-config-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      File.write(File.join(root, '.dev-workspace.json'), JSON.generate(
+        'schema' => 2,
+        'displayLabel' => 'Example development',
+        'hostLabel' => 'build-host',
+        'sshHost' => '',
+        'portal' => {
+          'hostname' => 'workspace.example.test',
+          'aliases' => ['legacy-workspace.example.test']
+        },
+        'developmentClusterProviders' => []
+      ))
+      config = File.join(directory, 'config/registry.json')
+      host = DevWorkspaceHost::Host.new(
+        env: host_environment(directory, config:),
+        out: StringIO.new,
+        err: StringIO.new
+      )
 
-    assert_empty(expected_commands - VpsfreeWorkspaceHost::COMPATIBILITY_COMMANDS)
-    assert_empty(expected_skills - VpsfreeWorkspaceHost::COMPATIBILITY_SKILLS)
+      assert_equal(0, host.run('workspace-host', ['register', 'example', root]))
+      entry = DevWorkspaceHost::Registry.new(config).find('example')
+      assert_equal('workspace.example.test', entry.fetch('hostname'))
+      assert_equal(['legacy-workspace.example.test'], entry.fetch('aliases'))
+    end
+  end
+
+  def test_extension_catalog_rejects_duplicate_and_relative_entries
+    Dir.mktmpdir('workspace-host-extension-catalog-test') do |directory|
+      catalog = File.join(directory, 'catalog.json')
+      payload = {
+        'schema' => 1,
+        'commands' => [
+          { 'name' => 'tool', 'path' => '/bin/true' },
+          { 'name' => 'tool', 'path' => '/bin/false' }
+        ],
+        'skills' => [],
+        'clusterProviders' => []
+      }
+      File.write(catalog, JSON.generate(payload))
+      assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::ExtensionCatalog.new(payload, path: catalog)
+      end
+
+      payload['commands'] = [{ 'name' => 'tool', 'path' => 'relative' }]
+      assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::ExtensionCatalog.new(payload, path: catalog)
+      end
+    end
+  end
+
+  def test_core_source_catalog_contains_no_organization_extensions
+    catalog = DevWorkspaceHost::ExtensionCatalog.load(File.expand_path('..', __dir__))
+
+    assert_empty(catalog.commands)
+    assert_empty(catalog.skills)
+    assert_empty(catalog.cluster_providers)
   end
 
   def test_link_install_reconciles_extension_links_across_full_core_and_legacy_rollback
@@ -116,6 +168,11 @@ class WorkspaceHostTest < Minitest::Test
       skill_source = File.join(full, 'share/codex/skills', skill_name)
       FileUtils.mkdir_p(skill_source)
       File.write(File.join(skill_source, 'SKILL.md'), "# Example\n")
+      write_extension_catalog(
+        full,
+        commands: { command => command_source },
+        skills: { skill_name => skill_source }
+      )
 
       state = File.join(directory, 'state')
       profile = File.join(state, 'profile')
@@ -124,8 +181,8 @@ class WorkspaceHostTest < Minitest::Test
       File.symlink(full, "#{profile}-1-link")
       environment = {
         'HOME' => directory, 'PATH' => ENV.fetch('PATH'),
-        'VPSFREE_WORKSPACES_STATE' => state, 'VPSFREE_WORKSPACES_PROFILE' => profile,
-        'VPSFREE_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
+        'DEV_WORKSPACES_STATE' => state, 'DEV_WORKSPACES_PROFILE' => profile,
+        'DEV_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
       }
       full_host = CompatibilityLinkHost.new(
         package_root: full, env: environment, out: StringIO.new, err: StringIO.new
@@ -173,8 +230,13 @@ class WorkspaceHostTest < Minitest::Test
       skill_source = File.join(candidate, 'share/codex/skills', skill_name)
       FileUtils.mkdir_p(skill_source)
       File.write(File.join(skill_source, 'SKILL.md'), "# Example\n")
+      write_extension_catalog(
+        candidate,
+        commands: { command => command_source },
+        skills: { skill_name => skill_source }
+      )
       config = File.join(directory, 'config', 'registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config)
+      DevWorkspaceHost::Registry.new(config)
       state = File.join(directory, 'state')
       profile = File.join(state, 'profile')
       FileUtils.mkdir_p(state)
@@ -182,8 +244,8 @@ class WorkspaceHostTest < Minitest::Test
       host = ActivationGuardHost.new(
         package: candidate,
         env: host_environment(directory, config:).merge(
-          'VPSFREE_WORKSPACES_PROFILE' => profile,
-          'VPSFREE_WORKSPACE_ACTIVATION' => '1'
+          'DEV_WORKSPACES_PROFILE' => profile,
+          'DEV_WORKSPACE_ACTIVATION' => '1'
         ),
         out: StringIO.new,
         err: StringIO.new
@@ -204,30 +266,33 @@ class WorkspaceHostTest < Minitest::Test
       package = make_package(directory, 'package')
       environment = {
         'HOME' => directory, 'PATH' => ENV.fetch('PATH'),
-        'VPSFREE_WORKSPACES_STATE' => File.join(directory, 'state'),
-        'VPSFREE_WORKSPACES_PROFILE' => File.join(directory, 'state/profile'),
-        'VPSFREE_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
+        'DEV_WORKSPACES_STATE' => File.join(directory, 'state'),
+        'DEV_WORKSPACES_PROFILE' => File.join(directory, 'state/profile'),
+        'DEV_WORKSPACES_SYSTEM_CODEX' => make_codex(directory, 'codex-system')
       }
       host = CompatibilityLinkHost.new(
         package_root: package, env: environment, out: StringIO.new, err: StringIO.new
       )
-      entry = {'root' => directory}
+      entry = {
+        'root' => directory, 'hostname' => 'workspace.example.test', 'aliases' => []
+      }
       assert_equal([], host.send(:workspace_configuration, entry).fetch('developmentClusterProviders'))
       config = File.join(directory, '.dev-workspace.json')
       File.write(config, JSON.generate(
-        'schema' => 1, 'displayLabel' => 'vpsFree.cz development',
-        'hostLabel' => 'aitherdev', 'sshHost' => 'aitherdev.int.vpsfree.cz',
-        'developmentClusterProviders' => %w[vpsadmin vpsadminos]
+        'schema' => 2, 'displayLabel' => 'example organization development',
+        'hostLabel' => 'build-host', 'sshHost' => 'build-host.int.example.cz',
+        'developmentClusterProviders' => %w[alpha beta],
+        'portal' => { 'hostname' => 'workspace.example.test', 'aliases' => [] }
       ))
       parsed = host.send(:workspace_configuration, entry)
-      assert_equal('aitherdev', parsed.fetch('hostLabel'))
+      assert_equal('build-host', parsed.fetch('hostLabel'))
       File.write(config, JSON.generate(parsed.merge('developmentClusterProviders' => ['unknown'])))
-      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
-      File.write(config, "{\"schema\":1}" + (' ' * (64 * 1024)))
-      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+      assert_raises(DevWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+      File.write(config, "{\"schema\":2}" + (' ' * (64 * 1024)))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
       File.unlink(config)
       File.symlink('/dev/null', config)
-      assert_raises(VpsfreeWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
+      assert_raises(DevWorkspaceHost::Error) { host.send(:workspace_configuration, entry) }
     end
   end
 
@@ -235,13 +300,14 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-portal-config-test') do |directory|
       root = make_workspace(directory, 'workspace')
       File.write(File.join(root, '.dev-workspace.json'), JSON.generate(
-        'schema' => 1, 'displayLabel' => 'vpsFree.cz development',
-        'hostLabel' => 'aitherdev', 'sshHost' => 'aitherdev.int.vpsfree.cz',
-        'developmentClusterProviders' => %w[vpsadmin]
+        'schema' => 2, 'displayLabel' => 'example organization development',
+        'hostLabel' => 'build-host', 'sshHost' => 'build-host.int.example.cz',
+        'developmentClusterProviders' => %w[alpha],
+        'portal' => { 'hostname' => 'workspace.example.test', 'aliases' => [] }
       ))
       config = File.join(directory, 'config/registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'workspace.example.test', aliases: [], replace: false
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'workspace.example.test', aliases: [], replace: false
       )
       package = make_package(directory, 'package')
       profile = File.join(directory, 'state/profile')
@@ -251,13 +317,15 @@ class WorkspaceHostTest < Minitest::Test
         package_root: package, env: host_environment(directory, config:),
         out: StringIO.new, err: StringIO.new
       )
-      host.send(:run_portal, ['vpsfree-cz'])
+      host.send(:run_portal, ['example-workspace'])
       arguments = host.execution.drop(2)
-      assert_equal('vpsFree.cz development', arguments[arguments.index('--display-label') + 1])
-      assert_equal('aitherdev', arguments[arguments.index('--host-label') + 1])
-      assert_equal('aitherdev.int.vpsfree.cz', arguments[arguments.index('--ssh-host') + 1])
-      assert_includes(arguments, '--vpsadmin-cluster')
-      refute_includes(arguments, '--vpsadminos-cluster')
+      assert_equal('example organization development', arguments[arguments.index('--display-label') + 1])
+      assert_equal('build-host', arguments[arguments.index('--host-label') + 1])
+      assert_equal('build-host.int.example.cz', arguments[arguments.index('--ssh-host') + 1])
+      provider_index = arguments.index('--cluster-provider')
+      refute_nil(provider_index)
+      assert_match(/\Aalpha=Alpha=/, arguments.fetch(provider_index + 1))
+      refute(arguments.any? { |value| value.match?(/\Abeta=Beta=/) })
     end
   end
 
@@ -267,39 +335,39 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       state = File.join(directory, 'state')
       runtime = File.join(directory, 'runtime')
-      authority = File.join(runtime, 'vpsfree-cz', 'authority')
+      authority = File.join(runtime, 'example-workspace', 'authority')
       FileUtils.mkdir_p(authority)
       File.write(File.join(authority, 'old.json'), "old authority\n")
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = UnregisterHost.new(
         env: install_source_profile({
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => runtime
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => runtime
         }),
         out: StringIO.new,
         err: StringIO.new
       )
 
-      assert_equal(0, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      assert_empty(VpsfreeWorkspaceHost::Registry.new(config).entries)
+      assert_equal(0, host.run('workspace-host', ['unregister', 'example-workspace']))
+      assert_empty(DevWorkspaceHost::Registry.new(config).entries)
       disable = host.commands.find do |command|
         command[0, 4] == ['systemctl', '--user', 'disable', '--now']
       end
       refute_nil(disable)
-      assert_includes(disable, 'workspace-portal@vpsfree-cz.service')
-      assert_includes(disable, 'workspace-codex@vpsfree-cz.service')
-      assert_includes(disable, 'workspace-tmux@vpsfree-cz.service')
-      refute(File.exist?(File.join(runtime, 'vpsfree-cz')))
+      assert_includes(disable, 'workspace-portal@example-workspace.service')
+      assert_includes(disable, 'workspace-codex@example-workspace.service')
+      assert_includes(disable, 'workspace-tmux@example-workspace.service')
+      refute(File.exist?(File.join(runtime, 'example-workspace')))
 
       replacement = make_workspace(directory, 'replacement')
-      registered = VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root: replacement,
+      registered = DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root: replacement,
         hostname: 'replacement.workspace.example.test', aliases: [], replace: false
       )
       assert_equal(replacement, registered.fetch('root'))
@@ -313,29 +381,29 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       state = File.join(directory, 'state')
       environment = host_environment(directory, config:).merge(
-        'VPSFREE_WORKSPACES_STATE' => state
+        'DEV_WORKSPACES_STATE' => state
       )
       host = BootstrappingHost.new(
         env: environment, out: StringIO.new, err: StringIO.new
       )
 
       assert_equal(0, host.run('workspace-host', [
-        'register', 'vpsfree-cz', original,
-        '--hostname', 'vpsfree-cz.workspace.example.test'
+        'register', 'example-workspace', original,
+        '--hostname', 'example-workspace.workspace.example.test'
       ]))
       assert_equal(1, host.run('workspace-host', [
         'switch', '--source', File.join(directory, 'missing-source')
       ]))
       refute(File.exist?(File.join(state, 'profile')))
 
-      assert_equal(0, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
+      assert_equal(0, host.run('workspace-host', ['unregister', 'example-workspace']))
       assert_equal(0, host.run('workspace-host', [
-        'register', 'vpsfree-cz', replacement,
+        'register', 'example-workspace', replacement,
         '--hostname', 'replacement.workspace.example.test'
       ]))
       assert_equal(
         replacement,
-        VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz').fetch('root')
+        DevWorkspaceHost::Registry.new(config).find('example-workspace').fetch('root')
       )
     end
   end
@@ -345,23 +413,23 @@ class WorkspaceHostTest < Minitest::Test
       root = make_workspace(directory, 'workspace')
       config = File.join(directory, 'config', 'registry.json')
       state = File.join(directory, 'state')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = FailedUnregisterHost.new(
         env: install_source_profile({
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state
         }),
         out: StringIO.new,
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      refute_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      refute_nil(DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       enable = host.commands.find do |command|
         command[0, 4] == ['systemctl', '--user', 'enable', '--now']
       end
@@ -386,21 +454,21 @@ class WorkspaceHostTest < Minitest::Test
       runtime = File.join(directory, 'runtime')
       state = File.join(directory, 'state')
       entry = PostCommitFailureRegistry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
-      runtime_root = File.join(runtime, 'vpsfree-cz')
+      runtime_root = File.join(runtime, 'example-workspace')
       FileUtils.mkdir_p(runtime_root)
       host = PostCommitFailureUnregisterHost.new(
         env: install_source_profile(host_environment(directory, config:, runtime:).merge(
-          'VPSFREE_WORKSPACES_STATE' => state
+          'DEV_WORKSPACES_STATE' => state
         )),
         out: StringIO.new,
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      assert_equal(entry, VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      assert_equal(entry, DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       assert(File.directory?(runtime_root))
       assert(host.commands.any? do |command|
         command[0, 4] == ['systemctl', '--user', 'enable', '--now']
@@ -425,21 +493,21 @@ class WorkspaceHostTest < Minitest::Test
       replacement = make_workspace(directory, 'replacement')
       config = File.join(directory, 'config', 'registry.json')
       runtime = File.join(directory, 'runtime')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
-      FileUtils.mkdir_p(File.join(runtime, 'vpsfree-cz'))
+      FileUtils.mkdir_p(File.join(runtime, 'example-workspace'))
       host = FailedLateUnregisterHost.new(
         env: install_source_profile(host_environment(directory, config:, runtime:)),
         out: StringIO.new,
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      assert_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
-      refute(File.exist?(File.join(runtime, 'vpsfree-cz')))
-      assert_equal(1, Dir[File.join(runtime, '.retired-vpsfree-cz-*')].length)
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      assert_nil(DevWorkspaceHost::Registry.new(config).find('example-workspace'))
+      refute(File.exist?(File.join(runtime, 'example-workspace')))
+      assert_equal(1, Dir[File.join(runtime, '.retired-example-workspace-*')].length)
       refute(host.runtime_restore_attempted)
       refute(host.commands.any? do |command|
         command[0, 4] == ['systemctl', '--user', 'enable', '--now']
@@ -460,13 +528,13 @@ class WorkspaceHostTest < Minitest::Test
       refute_nil(registration)
       assert_operator(primary, :<, registration)
 
-      registered = VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root: replacement,
+      registered = DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root: replacement,
         hostname: 'replacement.workspace.example.test', aliases: [], replace: false
       )
       assert_equal(replacement, registered.fetch('root'))
-      refute(File.exist?(File.join(runtime, 'vpsfree-cz')))
-      assert_equal(1, Dir[File.join(runtime, '.retired-vpsfree-cz-*')].length)
+      refute(File.exist?(File.join(runtime, 'example-workspace')))
+      assert_equal(1, Dir[File.join(runtime, '.retired-example-workspace-*')].length)
     end
   end
 
@@ -476,11 +544,11 @@ class WorkspaceHostTest < Minitest::Test
       replacement = make_workspace(directory, 'replacement')
       config = File.join(directory, 'config', 'registry.json')
       runtime = File.join(directory, 'runtime')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root: original,
-        hostname: 'vpsfree-cz.workspace.example.test', aliases: [], replace: false
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root: original,
+        hostname: 'example-workspace.workspace.example.test', aliases: [], replace: false
       )
-      runtime_root = File.join(runtime, 'vpsfree-cz')
+      runtime_root = File.join(runtime, 'example-workspace')
       FileUtils.mkdir_p(runtime_root)
       File.write(File.join(runtime_root, 'original-authority'), "original\n")
       host = ReplacementDuringUnregisterHost.new(
@@ -490,11 +558,11 @@ class WorkspaceHostTest < Minitest::Test
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      registered = VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz')
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      registered = DevWorkspaceHost::Registry.new(config).find('example-workspace')
       assert_equal(replacement, registered.fetch('root'))
       refute(File.exist?(runtime_root))
-      retired = Dir[File.join(runtime, '.retired-vpsfree-cz-*')]
+      retired = Dir[File.join(runtime, '.retired-example-workspace-*')]
       assert_equal(1, retired.length)
       assert(File.file?(File.join(retired.fetch(0), 'original-authority')))
       refute(host.commands.any? do |command|
@@ -508,7 +576,7 @@ class WorkspaceHostTest < Minitest::Test
       )
       assert_includes(
         host.instance_variable_get(:@err).string,
-        'workspace registration changed during unregister recovery: vpsfree-cz'
+        'workspace registration changed during unregister recovery: example-workspace'
       )
     end
   end
@@ -519,10 +587,10 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       runtime = File.join(directory, 'runtime')
       entry = PostCommitFailureRegistry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
-      runtime_root = File.join(runtime, 'vpsfree-cz')
+      runtime_root = File.join(runtime, 'example-workspace')
       FileUtils.mkdir_p(runtime_root)
       File.write(File.join(runtime_root, 'original-authority'), "original\n")
       host = AmbiguousRecoveryWriteUnregisterHost.new(
@@ -531,10 +599,10 @@ class WorkspaceHostTest < Minitest::Test
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      assert_equal(entry, VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      assert_equal(entry, DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       refute(File.exist?(runtime_root))
-      retired = Dir[File.join(runtime, '.retired-vpsfree-cz-*')]
+      retired = Dir[File.join(runtime, '.retired-example-workspace-*')]
       assert_equal(1, retired.length)
       assert(File.file?(File.join(retired.fetch(0), 'original-authority')))
       refute(host.commands.any? do |command|
@@ -554,8 +622,8 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
       config = File.join(directory, 'config', 'registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = UnregisterHost.new(
@@ -564,8 +632,8 @@ class WorkspaceHostTest < Minitest::Test
         err: StringIO.new
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      assert_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      assert_nil(DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       refute(host.commands.any? do |command|
         command[0, 4] == ['systemctl', '--user', 'enable', '--now']
       end)
@@ -577,13 +645,13 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
       cluster = File.join(
-        root, '.dev-clusters', 'vpsadmin', 'clusters',
+        root, '.dev-clusters', 'alpha', 'clusters',
         '2026-09-07-active-cluster'
       )
       FileUtils.mkdir_p(cluster)
       config = File.join(directory, 'config', 'registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       error_output = StringIO.new
@@ -593,10 +661,10 @@ class WorkspaceHostTest < Minitest::Test
         err: error_output
       )
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      refute_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      refute_nil(DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       assert_includes(error_output.string, 'workspace unregister is blocked')
-      assert_includes(error_output.string, 'vpsfree-cz/vpsadmin/2026-09-07-active-cluster')
+      assert_includes(error_output.string, 'example-workspace/alpha/2026-09-07-active-cluster')
       assert_empty(host.commands)
     end
   end
@@ -609,29 +677,29 @@ class WorkspaceHostTest < Minitest::Test
       FileUtils.mkdir_p(locks)
       File.write(File.join(locks, '2026-09-07-pending.archive.json'), "{}\n")
       error_output = StringIO.new
-      host = VpsfreeWorkspaceHost::Host.new(
+      host = DevWorkspaceHost::Host.new(
         env: install_source_profile(host_environment(directory, config:)),
         out: StringIO.new, err: error_output
       )
 
       assert_equal(1, host.run('workspace-host', [
-        'register', 'vpsfree-cz', root,
-        '--hostname', 'vpsfree-cz.workspace.example.test'
+        'register', 'example-workspace', root,
+        '--hostname', 'example-workspace.workspace.example.test'
       ]))
-      assert_empty(VpsfreeWorkspaceHost::Registry.new(config).entries)
+      assert_empty(DevWorkspaceHost::Registry.new(config).entries)
       assert_includes(error_output.string, 'workspace register is blocked')
 
       File.unlink(File.join(locks, '2026-09-07-pending.archive.json'))
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       File.write(File.join(locks, '2026-09-07-pending.revive.json'), "{}\n")
       error_output.truncate(0)
       error_output.rewind
 
-      assert_equal(1, host.run('workspace-host', ['unregister', 'vpsfree-cz']))
-      refute_nil(VpsfreeWorkspaceHost::Registry.new(config).find('vpsfree-cz'))
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example-workspace']))
+      refute_nil(DevWorkspaceHost::Registry.new(config).find('example-workspace'))
       assert_includes(error_output.string, 'workspace unregister is blocked')
     end
   end
@@ -649,17 +717,17 @@ class WorkspaceHostTest < Minitest::Test
         File.join(manifest_dir, 'portal.yml'),
         portal_manifest('thread-old', '/run/old/app-server.sock', 'ready')
       )
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = QuiesceHost.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => runtime
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => runtime
         },
         out: StringIO.new,
         err: StringIO.new
@@ -679,31 +747,31 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = CapturingHost.new(
         env: install_source_profile({
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => runtime,
-          'VPSFREE_WORKSPACES_SYSTEM_CODEX' => codex
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => runtime,
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex
         }),
         out: StringIO.new,
         err: StringIO.new
       )
 
       Dir.chdir(directory) do
-        assert_equal(0, host.run('dev-session', ['--workspace', 'vpsfree-cz', 'list']))
+        assert_equal(0, host.run('dev-session', ['--workspace', 'example-workspace', 'list']))
       end
       environment, command, arguments = host.captured
-      assert_equal('vpsfree-cz', environment.fetch('VPSFREE_WORKSPACE_NAME'))
+      assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
       assert_equal('dev-session', File.basename(command))
       assert_includes(arguments, root)
-      assert_includes(arguments, File.join(runtime, 'vpsfree-cz', 'app-server.sock'))
+      assert_includes(arguments, File.join(runtime, 'example-workspace', 'app-server.sock'))
       lock_index = arguments.index('--transition-lock')
       assert_operator(lock_index, :<, arguments.index('--'))
       assert_equal(File.join(state, 'transition.lock'), arguments.fetch(lock_index + 1))
@@ -720,8 +788,8 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       state = File.join(directory, 'state')
       profile = File.join(directory, 'profile')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       FileUtils.mkdir_p(state)
@@ -733,15 +801,16 @@ class WorkspaceHostTest < Minitest::Test
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_PROFILE' => profile
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_PROFILE' => profile,
+          'DEV_WORKSPACES_EXTENSION_CATALOG' => source_extension_catalog(directory)
         },
         out: StringIO.new,
         err: StringIO.new
       )
       result = Thread.new do
-        host.run('vpsadmin-devcluster', ['--workspace', 'vpsfree-cz', 'status', '2026-09-06-test'])
+        host.run('alpha-devcluster', ['--workspace', 'example-workspace', 'status', '2026-09-06-test'])
       end
       sleep 0.05
       assert_nil(host.captured)
@@ -767,8 +836,8 @@ class WorkspaceHostTest < Minitest::Test
         FileUtils.mkdir_p(expected)
         FileUtils.mkdir_p(selected)
         File.symlink(expected, profile)
-        VpsfreeWorkspaceHost::Registry.new(config).register(
-          name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+        DevWorkspaceHost::Registry.new(config).register(
+          name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
           aliases: [], replace: false
         )
         lock_path = File.join(state, 'transition.lock')
@@ -780,16 +849,16 @@ class WorkspaceHostTest < Minitest::Test
           env: {
             'HOME' => directory,
             'PATH' => ENV.fetch('PATH'),
-            'VPSFREE_WORKSPACES_CONFIG' => config,
-            'VPSFREE_WORKSPACES_STATE' => state,
-            'VPSFREE_WORKSPACES_PROFILE' => profile
+            'DEV_WORKSPACES_CONFIG' => config,
+            'DEV_WORKSPACES_STATE' => state,
+            'DEV_WORKSPACES_PROFILE' => profile
           },
           out: StringIO.new,
           err: error_output
         )
         result = Thread.new do
-          host.run('vpsadmin-devcluster', [
-            '--workspace', 'vpsfree-cz', 'status', '2026-09-06-test'
+          host.run('alpha-devcluster', [
+            '--workspace', 'example-workspace', 'status', '2026-09-06-test'
           ])
         end
         sleep 0.05
@@ -830,8 +899,8 @@ class WorkspaceHostTest < Minitest::Test
           env: {
             'HOME' => directory,
             'PATH' => ENV.fetch('PATH'),
-            'VPSFREE_WORKSPACES_STATE' => state,
-            'VPSFREE_WORKSPACES_PROFILE' => profile
+            'DEV_WORKSPACES_STATE' => state,
+            'DEV_WORKSPACES_PROFILE' => profile
           },
           out: StringIO.new,
           err: error_output
@@ -865,8 +934,8 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       state = File.join(directory, 'state')
       profile = File.join(directory, 'profile')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       FileUtils.mkdir_p(state)
@@ -878,11 +947,12 @@ class WorkspaceHostTest < Minitest::Test
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_PROFILE' => profile,
-          'VPSFREE_WORKSPACE_TRANSITION_HELD' => '1',
-          'VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION' => 'archive'
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_PROFILE' => profile,
+          'DEV_WORKSPACES_EXTENSION_CATALOG' => source_extension_catalog(directory),
+          'DEV_WORKSPACE_TRANSITION_HELD' => '1',
+          'DEV_SESSION_LIFECYCLE_OPERATION' => 'archive'
         },
         out: StringIO.new,
         err: StringIO.new
@@ -890,8 +960,8 @@ class WorkspaceHostTest < Minitest::Test
 
       result = Thread.new do
         host.run(
-          'vpsadmin-devcluster',
-          ['--workspace', 'vpsfree-cz', 'reset', '2026-09-06-test']
+          'alpha-devcluster',
+          ['--workspace', 'example-workspace', 'reset', '2026-09-06-test']
         )
       end
       sleep 0.05
@@ -901,8 +971,8 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(0, result.value)
       refute_nil(host.captured)
       environment, = host.captured
-      refute(environment.key?('VPSFREE_WORKSPACE_TRANSITION_HELD'))
-      refute(environment.key?('VPSFREE_DEV_SESSION_LIFECYCLE_OPERATION'))
+      refute(environment.key?('DEV_WORKSPACE_TRANSITION_HELD'))
+      refute(environment.key?('DEV_SESSION_LIFECYCLE_OPERATION'))
     ensure
       owner&.flock(File::LOCK_UN)
       owner&.close
@@ -916,18 +986,18 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = CapturingHost.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => File.join(directory, 'state'),
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
-          'VPSFREE_WORKSPACES_SYSTEM_CODEX' => codex
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => File.join(directory, 'state'),
+          'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex
         },
         out: StringIO.new,
         err: StringIO.new
@@ -937,11 +1007,11 @@ class WorkspaceHostTest < Minitest::Test
         0,
         host.run(
           'dev-session',
-          ['--workspace', 'vpsfree-cz', 'delete', '2026-09-06-test', '--as-is']
+          ['--workspace', 'example-workspace', 'delete', '2026-09-06-test', '--as-is']
         )
       )
       environment, command, arguments = host.captured
-      refute(environment.key?('VPSFREE_WORKSPACE_TRANSITION_HELD'))
+      refute(environment.key?('DEV_WORKSPACE_TRANSITION_HELD'))
       assert_equal('dev-session', File.basename(command))
       lock_index = arguments.index('--transition-lock')
       assert_operator(lock_index, :<, arguments.index('--'))
@@ -961,8 +1031,8 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       FileUtils.mkdir_p(state)
@@ -974,11 +1044,11 @@ class WorkspaceHostTest < Minitest::Test
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
-          'VPSFREE_WORKSPACES_SYSTEM_CODEX' => codex,
-          'VPSFREE_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex,
+          'DEV_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
         },
         out: StringIO.new,
         err: error_output
@@ -986,10 +1056,10 @@ class WorkspaceHostTest < Minitest::Test
 
       assert_equal(0, host.run(
         'dev-session',
-        ['--workspace', 'vpsfree-cz', 'delete', '2026-09-06-test', '--as-is']
+        ['--workspace', 'example-workspace', 'delete', '2026-09-06-test', '--as-is']
       ), error_output.string)
       environment, command, arguments = host.captured
-      assert_equal(owner.fileno.to_s, environment.fetch('VPSFREE_WORKSPACE_TRANSITION_LOCK_FD'))
+      assert_equal(owner.fileno.to_s, environment.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD'))
       assert_equal('dev-session', File.basename(command))
       refute_includes(arguments, '--transition-lock')
     ensure
@@ -1006,12 +1076,12 @@ class WorkspaceHostTest < Minitest::Test
       owner = File.open(lock_path, File::RDWR | File::CREAT, 0o600)
       owner.flock(File::LOCK_EX)
       impostor = File.open(lock_path, File::RDWR)
-      host = VpsfreeWorkspaceHost::Host.new(
+      host = DevWorkspaceHost::Host.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACE_TRANSITION_LOCK_FD' => impostor.fileno.to_s
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACE_TRANSITION_LOCK_FD' => impostor.fileno.to_s
         },
         out: StringIO.new,
         err: StringIO.new
@@ -1019,12 +1089,12 @@ class WorkspaceHostTest < Minitest::Test
 
       refute(host.send(:inherited_exclusive_transition_lock?))
 
-      host = VpsfreeWorkspaceHost::Host.new(
+      host = DevWorkspaceHost::Host.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
         },
         out: StringIO.new,
         err: StringIO.new
@@ -1045,18 +1115,18 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = CapturingHost.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
-          'VPSFREE_WORKSPACES_SYSTEM_CODEX' => codex
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex
         },
         out: StringIO.new,
         err: StringIO.new
@@ -1066,7 +1136,7 @@ class WorkspaceHostTest < Minitest::Test
         0,
         host.run(
           'dev-session',
-          ['--workspace', 'vpsfree-cz', 'archive', '2026-09-06-test', '--as-is']
+          ['--workspace', 'example-workspace', 'archive', '2026-09-06-test', '--as-is']
         )
       )
       _environment, command, arguments = host.captured
@@ -1084,24 +1154,24 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       host = CapturingHost.new(
         env: {
           'HOME' => directory,
           'PATH' => ENV.fetch('PATH'),
-          'VPSFREE_WORKSPACES_CONFIG' => config,
-          'VPSFREE_WORKSPACES_STATE' => state,
-          'VPSFREE_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
-          'VPSFREE_WORKSPACES_SYSTEM_CODEX' => codex
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex
         },
         out: StringIO.new,
         err: StringIO.new
       )
       argv = [
-        '--workspace', 'vpsfree-cz', 'archive', '--abandoned',
+        '--workspace', 'example-workspace', 'archive', '--abandoned',
         '2026-09-06-Foo_bar', '--as-is'
       ]
 
@@ -1143,7 +1213,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_switch_refuses_unfinished_session_lifecycle_operations
-    VpsfreeWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
+    DevWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
       kind = journal.fetch('name')
       with_transition_host do |host, paths|
         host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -1279,7 +1349,7 @@ class WorkspaceHostTest < Minitest::Test
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       FileUtils.mkdir_p(
         File.join(
-          workspace, '.dev-clusters', 'vpsadminos', 'clusters',
+          workspace, '.dev-clusters', 'beta', 'clusters',
           '2026-09-07-active-cluster'
         )
       )
@@ -1310,14 +1380,14 @@ class WorkspaceHostTest < Minitest::Test
       File.write(old_contract, JSON.generate(
         'developmentClusterStateSchema' => 1,
         'developmentClusterTransitionPolicy' =>
-          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+          DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
             'developmentClusterTransitionPolicy'
           ),
         'trackingMaxBytes' => 1024 * 1024
       ))
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       FileUtils.mkdir_p(File.join(
-        workspace, '.dev-clusters', 'vpsadminos', 'clusters',
+        workspace, '.dev-clusters', 'beta', 'clusters',
         '2026-09-07-active-cluster'
       ))
 
@@ -1368,7 +1438,7 @@ class WorkspaceHostTest < Minitest::Test
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       cluster = File.join(
-        workspace, '.dev-clusters', 'vpsadminos', 'clusters',
+        workspace, '.dev-clusters', 'beta', 'clusters',
         '2026-09-07-active-cluster'
       )
       FileUtils.mkdir_p(cluster)
@@ -1376,7 +1446,7 @@ class WorkspaceHostTest < Minitest::Test
       host.candidate = make_package(
         paths.fetch(:root),
         'package-stricter-policy',
-        transition_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+        transition_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
           'developmentClusterTransitionPolicy'
         ) + 1
       )
@@ -1400,14 +1470,14 @@ class WorkspaceHostTest < Minitest::Test
       )
       File.write(old_contract, JSON.generate(
         'developmentClusterStateSchema' =>
-          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('developmentClusterStateSchema'),
+          DevWorkspaceHost::RUNTIME_CONTRACT.fetch('developmentClusterStateSchema'),
         'developmentClusterTransitionPolicy' => 1,
         'trackingMaxBytes' =>
-          VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes')
+          DevWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes')
       ))
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       cluster = File.join(
-        workspace, '.dev-clusters', 'vpsadmin', 'clusters',
+        workspace, '.dev-clusters', 'alpha', 'clusters',
         '2026-09-07-active-cluster'
       )
       FileUtils.mkdir_p(cluster)
@@ -1428,7 +1498,7 @@ class WorkspaceHostTest < Minitest::Test
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       FileUtils.mkdir_p(
         File.join(
-          workspace, '.dev-clusters', 'vpsadmin', 'clusters',
+          workspace, '.dev-clusters', 'alpha', 'clusters',
           '2026-09-07-active-cluster'
         )
       )
@@ -1448,8 +1518,8 @@ class WorkspaceHostTest < Minitest::Test
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       FileUtils.mkdir_p(
         File.join(
-          workspace, '.dev-clusters', 'vpsadmin', 'clusters',
-          '2026-08-18-vpsadmin-password-reset'
+          workspace, '.dev-clusters', 'alpha', 'clusters',
+          '2026-08-18-alpha-password-reset'
         )
       )
 
@@ -1471,7 +1541,7 @@ class WorkspaceHostTest < Minitest::Test
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       FileUtils.mkdir_p(
         File.join(
-          workspace, '.dev-clusters', 'vpsadmin', 'clusters',
+          workspace, '.dev-clusters', 'alpha', 'clusters',
           '2026-09-07-unadoptable'
         )
       )
@@ -1493,7 +1563,7 @@ class WorkspaceHostTest < Minitest::Test
 
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       cluster = File.join(
-        workspace, '.dev-clusters', 'vpsadmin', 'clusters',
+        workspace, '.dev-clusters', 'alpha', 'clusters',
         '2026-09-07-contract-state'
       )
       FileUtils.mkdir_p(cluster)
@@ -1509,20 +1579,20 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-activation-test') do |directory|
       root = make_workspace(directory, 'workspace')
       config = File.join(directory, 'config', 'registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       FileUtils.mkdir_p(
         File.join(
-          root, '.dev-clusters', 'vpsadminos', 'clusters',
+          root, '.dev-clusters', 'beta', 'clusters',
           '2026-09-07-precontract'
         )
       )
       package = make_package(directory, 'candidate')
       error_output = StringIO.new
       environment = host_environment(directory, config:).merge(
-        'VPSFREE_WORKSPACE_ACTIVATION' => '1'
+        'DEV_WORKSPACE_ACTIVATION' => '1'
       )
       host = ActivationGuardHost.new(
         package:, env: environment, out: StringIO.new, err: error_output
@@ -1535,7 +1605,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_busy_switch_keeps_the_old_codex_and_retries_only_the_pending_update
-    with_transition_host(busy: ['vpsfree-cz/active']) do |host, paths|
+    with_transition_host(busy: ['example-workspace/active']) do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
 
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
@@ -1612,7 +1682,7 @@ class WorkspaceHostTest < Minitest::Test
       config = File.join(directory, 'config', 'registry.json')
       target = make_package(directory, 'target-package')
       environment = host_environment(directory, config:)
-      profile = environment.fetch('VPSFREE_WORKSPACES_PROFILE')
+      profile = environment.fetch('DEV_WORKSPACES_PROFILE')
       FileUtils.mkdir_p(File.dirname(profile))
       File.symlink(target, profile)
       host = RestorationHost.new(
@@ -1620,7 +1690,7 @@ class WorkspaceHostTest < Minitest::Test
         out: StringIO.new, err: StringIO.new
       )
 
-      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+      error = assert_raises(DevWorkspaceHost::Error) do
         host.send(
           :restore_quiesced_sessions,
           [[first, 'broken'], [second, 'restored']],
@@ -1637,16 +1707,18 @@ class WorkspaceHostTest < Minitest::Test
           File.join(target, 'bin/workspace-portal'),
           arguments.fetch(arguments.index('--portal-command') + 1)
         )
+        configured = arguments.each_index.filter_map do |index|
+          arguments[index + 1] if arguments[index] == '--cluster-provider'
+        end
         assert_equal(
-          File.join(target, 'libexec/workspace-portal/vpsadmin-devcluster'),
-          arguments.fetch(arguments.index('--vpsadmin-cluster') + 1)
+          [
+            "alpha=#{File.join(target, 'libexec/workspace-portal/alpha-devcluster')}",
+            "beta=#{File.join(target, 'libexec/workspace-portal/beta-devcluster')}"
+          ],
+          configured
         )
         assert_equal(
-          File.join(target, 'libexec/workspace-portal/vpsadminos-devcluster'),
-          arguments.fetch(arguments.index('--vpsadminos-cluster') + 1)
-        )
-        assert_equal(
-          VpsfreeWorkspaceProfileIdentity.token(profile),
+          DevWorkspaceProfileIdentity.token(profile),
           arguments.fetch(arguments.index('--expected-host-profile-token') + 1)
         )
       end
@@ -1665,9 +1737,9 @@ class WorkspaceHostTest < Minitest::Test
         fail_slug: 'broken', env: host_environment(directory, config:),
         out: StringIO.new, err: StringIO.new
       )
-      primary = VpsfreeWorkspaceHost::Error.new('injected primary failure')
+      primary = DevWorkspaceHost::Error.new('injected primary failure')
 
-      error = assert_raises(VpsfreeWorkspaceHost::Error) do
+      error = assert_raises(DevWorkspaceHost::Error) do
         host.send(
           :reraise_after_terminal_restoration,
           primary,
@@ -1685,7 +1757,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_rollback_refuses_unfinished_session_lifecycle_operations
-    VpsfreeWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
+    DevWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
       kind = journal.fetch('name')
       with_transition_host do |host, paths|
         host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -1706,8 +1778,8 @@ class WorkspaceHostTest < Minitest::Test
 
   def test_rollback_refuses_canonical_and_legacy_development_cluster_state
     [
-      ['vpsadminos', '2026-09-07-canonical-cluster'],
-      ['vpsadmin', '2026-08-18-vpsadmin-password-reset']
+      ['beta', '2026-09-07-canonical-cluster'],
+      ['alpha', '2026-08-18-alpha-password-reset']
     ].each do |kind, slug|
       with_transition_host do |host, paths|
         host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -1730,7 +1802,7 @@ class WorkspaceHostTest < Minitest::Test
         assert_equal(1, host.run('workspace-host', ['rollback']))
         assert_equal(2, host.send(:profile_generation))
         error_output = host.instance_variable_get(:@err).string
-        assert_includes(error_output, "vpsfree-cz/#{kind}/#{slug}")
+        assert_includes(error_output, "example-workspace/#{kind}/#{slug}")
         assert_includes(error_output, 'reset these clusters first')
       end
     end
@@ -1848,8 +1920,8 @@ class WorkspaceHostTest < Minitest::Test
       end
       refute_nil(disable)
       assert_includes(disable, '--now')
-      assert_includes(disable, 'workspace-codex@vpsfree-cz.service')
-      assert_includes(disable, 'workspace-tmux@vpsfree-cz.service')
+      assert_includes(disable, 'workspace-codex@example-workspace.service')
+      assert_includes(disable, 'workspace-tmux@example-workspace.service')
     end
   end
 
@@ -1872,17 +1944,17 @@ class WorkspaceHostTest < Minitest::Test
 
   private
 
-  class CapturingHost < VpsfreeWorkspaceHost::Host
+  class CapturingHost < DevWorkspaceHost::Host
     attr_reader :captured
 
     private
 
     def exec_with_workspace(entry, command, *arguments)
-      @captured = [@env.to_h.merge('VPSFREE_WORKSPACE_NAME' => entry.fetch('name')), command, arguments]
+      @captured = [@env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name')), command, arguments]
     end
   end
 
-  class ClusterHost < VpsfreeWorkspaceHost::Host
+  class ClusterHost < DevWorkspaceHost::Host
     attr_reader :captured
 
     private
@@ -1905,7 +1977,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class GenerationMutationHost < VpsfreeWorkspaceHost::Host
+  class GenerationMutationHost < DevWorkspaceHost::Host
     attr_reader :captured
 
     def initialize(package_root:, **options)
@@ -1920,13 +1992,13 @@ class WorkspaceHostTest < Minitest::Test
     end
 
     def suspend(argv)
-      raise VpsfreeWorkspaceHost::Error, 'unexpected arguments' unless argv.empty?
+      raise DevWorkspaceHost::Error, 'unexpected arguments' unless argv.empty?
 
       @captured = :suspended
     end
   end
 
-  class CompatibilityLinkHost < VpsfreeWorkspaceHost::Host
+  class CompatibilityLinkHost < DevWorkspaceHost::Host
     def initialize(package_root:, **options)
       @test_package_root = package_root
       super(**options)
@@ -1961,7 +2033,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class FinalizeHost < VpsfreeWorkspaceHost::Host
+  class FinalizeHost < DevWorkspaceHost::Host
     attr_reader :commands
     attr_accessor :cluster_active
 
@@ -1978,9 +2050,9 @@ class WorkspaceHostTest < Minitest::Test
         separator = arguments.index('--')
         request = arguments.drop(separator + 2)
         slug = request.find { |argument| !argument.start_with?('-') }
-        "https://vpsfree-cz.workspace.example.test/#{slug}/\n"
+        "https://example-workspace.workspace.example.test/#{slug}/\n"
       else
-        found = cluster_active && File.basename(command) == 'vpsadmin-devcluster'
+        found = cluster_active && File.basename(command) == 'alpha-devcluster'
         JSON.generate('schema' => 1, 'found' => found)
       end
     end
@@ -1990,7 +2062,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class UnregisterHost < VpsfreeWorkspaceHost::Host
+  class UnregisterHost < DevWorkspaceHost::Host
     attr_reader :commands
 
     def initialize(**options)
@@ -2014,14 +2086,14 @@ class WorkspaceHostTest < Minitest::Test
 
     def capture!(*argv)
       if argv[0, 2] == ['nix', 'build']
-        raise VpsfreeWorkspaceHost::Error, 'injected first switch failure'
+        raise DevWorkspaceHost::Error, 'injected first switch failure'
       end
 
       super
     end
   end
 
-  class QuiesceHost < VpsfreeWorkspaceHost::Host
+  class QuiesceHost < DevWorkspaceHost::Host
     attr_reader :commands
 
     def initialize(**options)
@@ -2037,7 +2109,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class FailedUnregisterHost < VpsfreeWorkspaceHost::Host
+  class FailedUnregisterHost < DevWorkspaceHost::Host
     attr_reader :commands, :restored
 
     def initialize(**options)
@@ -2053,28 +2125,28 @@ class WorkspaceHostTest < Minitest::Test
 
     def restore_quiesced_sessions(sessions, **)
       @restored = sessions
-      raise VpsfreeWorkspaceHost::Error, 'injected terminal recovery failure'
+      raise DevWorkspaceHost::Error, 'injected terminal recovery failure'
     end
 
     def system!(*argv)
       @commands << argv
       if argv[0, 4] == ['systemctl', '--user', 'disable', '--now']
-        raise VpsfreeWorkspaceHost::Error, 'injected partial disable failure'
+        raise DevWorkspaceHost::Error, 'injected partial disable failure'
       elsif argv[0, 4] == ['systemctl', '--user', 'enable', '--now']
-        raise VpsfreeWorkspaceHost::Error, 'injected unit recovery failure'
+        raise DevWorkspaceHost::Error, 'injected unit recovery failure'
       end
     end
   end
 
-  class PostCommitFailureRegistry < VpsfreeWorkspaceHost::Registry
+  class PostCommitFailureRegistry < DevWorkspaceHost::Registry
     def unregister(name)
       existing = find(name)
-      raise VpsfreeWorkspaceHost::Error, "workspace is not registered: #{name}" unless existing
+      raise DevWorkspaceHost::Error, "workspace is not registered: #{name}" unless existing
 
       # Model a failure after the replacement became visible but before the
       # Registry instance updated its cached entries.
       send(:write, entries.reject { |entry| entry.fetch('name') == name })
-      raise VpsfreeWorkspaceHost::Error,
+      raise DevWorkspaceHost::Error,
             'injected failure after the registry replacement'
     end
   end
@@ -2097,7 +2169,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class FailedLateUnregisterHost < VpsfreeWorkspaceHost::Host
+  class FailedLateUnregisterHost < DevWorkspaceHost::Host
     attr_reader :commands, :restored, :runtime_restore_attempted
 
     def initialize(**options)
@@ -2114,20 +2186,20 @@ class WorkspaceHostTest < Minitest::Test
     def system!(*argv)
       @commands << argv
       if argv == ['systemctl', '--user', 'try-restart', 'workspace-router.service']
-        raise VpsfreeWorkspaceHost::Error, 'injected router failure'
+        raise DevWorkspaceHost::Error, 'injected router failure'
       end
     end
 
     def restore_workspace_registration(_registry_path, _entry)
       {
         state: :absent,
-        error: VpsfreeWorkspaceHost::Error.new('injected registration recovery failure')
+        error: DevWorkspaceHost::Error.new('injected registration recovery failure')
       }
     end
 
     def restore_instance_runtime(_retired, _entry)
       @runtime_restore_attempted = true
-      raise VpsfreeWorkspaceHost::Error, 'injected runtime recovery failure'
+      raise DevWorkspaceHost::Error, 'injected runtime recovery failure'
     end
 
     def restore_quiesced_sessions(sessions, **)
@@ -2135,10 +2207,10 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class AmbiguousRecoveryWriteRegistry < VpsfreeWorkspaceHost::Registry
+  class AmbiguousRecoveryWriteRegistry < DevWorkspaceHost::Registry
     def register(**options)
       super
-      raise VpsfreeWorkspaceHost::Error,
+      raise DevWorkspaceHost::Error,
             'injected failure after the recovery replacement'
     end
   end
@@ -2152,7 +2224,7 @@ class WorkspaceHostTest < Minitest::Test
       if @registry_open_count == 1
         AmbiguousRecoveryWriteRegistry.new(path)
       else
-        VpsfreeWorkspaceHost::Registry.new(path)
+        DevWorkspaceHost::Registry.new(path)
       end
     end
   end
@@ -2172,11 +2244,11 @@ class WorkspaceHostTest < Minitest::Test
       return if @router_failed
 
       @router_failed = true
-      VpsfreeWorkspaceHost::Registry.new(@config).register(
-        name: 'vpsfree-cz', root: @replacement,
+      DevWorkspaceHost::Registry.new(@config).register(
+        name: 'example-workspace', root: @replacement,
         hostname: 'replacement.workspace.example.test', aliases: [], replace: false
       )
-      raise VpsfreeWorkspaceHost::Error, 'injected router failure after replacement'
+      raise DevWorkspaceHost::Error, 'injected router failure after replacement'
     end
   end
 
@@ -2186,7 +2258,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  class TransitionHost < VpsfreeWorkspaceHost::Host
+  class TransitionHost < DevWorkspaceHost::Host
     attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart, :fail_restore
     attr_reader :events
 
@@ -2261,7 +2333,7 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:links_installed]
       if fail_links
         self.fail_links = false
-        raise VpsfreeWorkspaceHost::Error, 'injected link installation failure'
+        raise DevWorkspaceHost::Error, 'injected link installation failure'
       end
     end
 
@@ -2273,13 +2345,13 @@ class WorkspaceHostTest < Minitest::Test
       configure_user_services
       if fail_activation
         self.fail_activation = false
-        raise VpsfreeWorkspaceHost::Error, 'injected activation failure'
+        raise DevWorkspaceHost::Error, 'injected activation failure'
       end
       reconcile_codex_update(defer_busy: true)
     end
 
     def quiesce_sessions
-      raise VpsfreeWorkspaceHost::Error, busy.join(', ') unless busy.empty?
+      raise DevWorkspaceHost::Error, busy.join(', ') unless busy.empty?
       @events << [:sessions_quiesced]
       []
     end
@@ -2292,7 +2364,7 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:sessions_restored, package && File.realpath(package)]
       if fail_restore
         self.fail_restore = false
-        raise VpsfreeWorkspaceHost::Error, 'injected restoration failure'
+        raise DevWorkspaceHost::Error, 'injected restoration failure'
       end
     end
 
@@ -2308,12 +2380,12 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:consumers_restarted]
       if fail_restart
         self.fail_restart = false
-        raise VpsfreeWorkspaceHost::Error, 'injected consumer restart failure'
+        raise DevWorkspaceHost::Error, 'injected consumer restart failure'
       end
     end
   end
 
-  class RestorationHost < VpsfreeWorkspaceHost::Host
+  class RestorationHost < DevWorkspaceHost::Host
     attr_reader :invocations
 
     def initialize(fail_slug:, **options)
@@ -2331,11 +2403,11 @@ class WorkspaceHostTest < Minitest::Test
     def system_env!(environment, command, *arguments)
       @invocations << [environment, command, arguments]
       slug = arguments.fetch(-2)
-      raise VpsfreeWorkspaceHost::Error, 'injected sync failure' if slug == @fail_slug
+      raise DevWorkspaceHost::Error, 'injected sync failure' if slug == @fail_slug
     end
   end
 
-  class ActivationGuardHost < VpsfreeWorkspaceHost::Host
+  class ActivationGuardHost < DevWorkspaceHost::Host
     attr_reader :configured
 
     def initialize(package:, **options)
@@ -2360,7 +2432,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def registry_at(directory)
-    VpsfreeWorkspaceHost::Registry.new(File.join(directory, 'config', 'registry.json'))
+    DevWorkspaceHost::Registry.new(File.join(directory, 'config', 'registry.json'))
   end
 
   def make_workspace(parent, name)
@@ -2380,23 +2452,40 @@ class WorkspaceHostTest < Minitest::Test
 
   def install_source_profile(environment)
     profile = environment.fetch(
-      'VPSFREE_WORKSPACES_PROFILE',
-      File.join(environment.fetch('VPSFREE_WORKSPACES_STATE'), 'profile')
+      'DEV_WORKSPACES_PROFILE',
+      File.join(environment.fetch('DEV_WORKSPACES_STATE'), 'profile')
     )
     FileUtils.mkdir_p(File.dirname(profile))
     File.symlink(File.expand_path('..', __dir__), profile)
-    environment.merge('VPSFREE_WORKSPACES_PROFILE' => profile)
+    catalog = source_extension_catalog(File.dirname(profile))
+    environment.merge(
+      'DEV_WORKSPACES_PROFILE' => profile,
+      'DEV_WORKSPACES_EXTENSION_CATALOG' => catalog
+    )
+  end
+
+  def source_extension_catalog(directory)
+    catalog = File.join(directory, 'source-extensions.json')
+    File.write(catalog, JSON.generate(
+      'schema' => 1,
+      'commands' => [],
+      'skills' => [],
+      'clusterProviders' => %w[alpha beta].map do |provider_id|
+        { 'id' => provider_id, 'label' => provider_id.capitalize, 'command' => '/bin/true' }
+      end
+    ))
+    catalog
   end
 
   def make_package(
     parent,
     name,
     cluster_contract: true,
-    tracking_max: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes'),
-    transition_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+    tracking_max: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes'),
+    transition_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
       'developmentClusterTransitionPolicy'
     ),
-    authority_policy: VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+    authority_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
       'runtimeAuthorityIdentityPolicy'
     )
   )
@@ -2409,7 +2498,7 @@ class WorkspaceHostTest < Minitest::Test
       contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
       FileUtils.mkdir_p(File.dirname(contract))
       contract_data = {
-        'developmentClusterStateSchema' => VpsfreeWorkspaceHost::RUNTIME_CONTRACT.fetch(
+        'developmentClusterStateSchema' => DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
           'developmentClusterStateSchema'
         ),
         'developmentClusterTransitionPolicy' => transition_policy,
@@ -2417,13 +2506,13 @@ class WorkspaceHostTest < Minitest::Test
       }
       contract_data['runtimeAuthorityIdentityPolicy'] = authority_policy if authority_policy
       File.write(contract, JSON.generate(contract_data))
-      %w[vpsadmin vpsadminos].each do |kind|
+      %w[alpha beta].each do |kind|
         helper = File.join(package, 'libexec/workspace-portal', "#{kind}-devcluster")
         FileUtils.mkdir_p(File.dirname(helper))
         File.write(helper, <<~SH)
           #!/bin/sh
           if [ "$1" = transition-adopt ] &&
-             [ -f "$VPSFREE_DEVCLUSTER_WORKSPACE/.dev-clusters/#{kind}/clusters/$2/socket-dir" ]; then
+             [ -f "$DEVCLUSTER_WORKSPACE/.dev-clusters/#{kind}/clusters/$2/socket-dir" ]; then
             exit 0
           fi
           echo 'pre-contract cluster cannot be adopted' >&2
@@ -2432,7 +2521,33 @@ class WorkspaceHostTest < Minitest::Test
         File.chmod(0o755, helper)
       end
     end
+    %w[alpha beta].each do |provider_id|
+      public_helper = File.join(package, 'bin', "#{provider_id}-devcluster")
+      File.write(public_helper, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, public_helper)
+    end
+    write_extension_catalog(package)
     package
+  end
+
+  def write_extension_catalog(package, commands: { }, skills: { })
+    catalog = File.join(package, 'share/dev-workspace/extensions.json')
+    FileUtils.mkdir_p(File.dirname(catalog))
+    providers = %w[alpha beta].map do |provider_id|
+      {
+        'id' => provider_id,
+        'label' => provider_id.capitalize,
+        'command' => File.join(
+          package, 'libexec/workspace-portal', "#{provider_id}-devcluster"
+        )
+      }
+    end
+    File.write(catalog, JSON.generate(
+      'schema' => 1,
+      'commands' => commands.map { |name, path| { 'name' => name, 'path' => path } },
+      'skills' => skills.map { |name, path| { 'name' => name, 'path' => path } },
+      'clusterProviders' => providers
+    ))
   end
 
   def host_environment(directory, config:, runtime: File.join(directory, 'runtime'), system_codex: nil)
@@ -2440,11 +2555,11 @@ class WorkspaceHostTest < Minitest::Test
     {
       'HOME' => directory,
       'PATH' => ENV.fetch('PATH'),
-      'VPSFREE_WORKSPACES_CONFIG' => config,
-      'VPSFREE_WORKSPACES_STATE' => File.join(directory, 'state'),
-      'VPSFREE_WORKSPACES_RUNTIME_DIR' => runtime,
-      'VPSFREE_WORKSPACES_PROFILE' => File.join(directory, 'state', 'profile'),
-      'VPSFREE_WORKSPACES_SYSTEM_CODEX' => system_codex
+      'DEV_WORKSPACES_CONFIG' => config,
+      'DEV_WORKSPACES_STATE' => File.join(directory, 'state'),
+      'DEV_WORKSPACES_RUNTIME_DIR' => runtime,
+      'DEV_WORKSPACES_PROFILE' => File.join(directory, 'state', 'profile'),
+      'DEV_WORKSPACES_SYSTEM_CODEX' => system_codex
     }
   end
 
@@ -2452,8 +2567,8 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-transition-test') do |directory|
       root = make_workspace(directory, 'workspace')
       config = File.join(directory, 'config', 'registry.json')
-      VpsfreeWorkspaceHost::Registry.new(config).register(
-        name: 'vpsfree-cz', root:, hostname: 'vpsfree-cz.workspace.example.test',
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
       )
       source = File.join(directory, 'source')
@@ -2461,7 +2576,9 @@ class WorkspaceHostTest < Minitest::Test
       old_codex = make_codex(directory, 'codex-old')
       system_codex = make_codex(directory, 'codex-system')
       candidate = make_package(directory, 'package-one')
-      environment = host_environment(directory, config:, system_codex:)
+      environment = host_environment(directory, config:, system_codex:).merge(
+        'DEV_WORKSPACES_EXTENSION_CATALOG' => source_extension_catalog(directory)
+      )
       host = TransitionHost.new(
         candidate:, busy:, env: environment, out: StringIO.new, err: StringIO.new
       )

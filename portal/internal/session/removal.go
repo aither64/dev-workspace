@@ -47,7 +47,7 @@ func CompletedRemoval(
 	}
 	digest := sha256.Sum256([]byte(workspace))
 	workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(digest[:8])
-	root := filepath.Join(absoluteStateHome, "vpsfree-workspaces", "removed", workspaceID)
+	root := filepath.Join(absoluteStateHome, "dev-workspaces", "removed", workspaceID)
 	rootInfo, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil

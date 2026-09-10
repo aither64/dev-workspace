@@ -6,7 +6,7 @@ Requires=workspace-tmux@%i.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host run-portal %i
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-portal %i
 Restart=on-failure
 RestartSec=2s
 KillMode=mixed

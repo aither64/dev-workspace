@@ -3,7 +3,7 @@
 require 'digest'
 require 'json'
 
-module VpsfreeWorkspaceProfileIdentity
+module DevWorkspaceProfileIdentity
   def self.token(path)
     stat = File.lstat(path)
     return nil unless stat.symlink?

@@ -3,4 +3,4 @@ Description=Retry a pending compatible workspace Codex update
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/state/vpsfree-workspaces/profile/bin/workspace-host reconcile-codex --pending-only
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host reconcile-codex --pending-only
