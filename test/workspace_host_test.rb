@@ -2530,7 +2530,11 @@ class WorkspaceHostTest < Minitest::Test
     package
   end
 
-  def write_extension_catalog(package, commands: { }, skills: { })
+  def write_extension_catalog(
+    package,
+    commands: { },
+    skills: { }
+  )
     catalog = File.join(package, 'share/dev-workspace/extensions.json')
     FileUtils.mkdir_p(File.dirname(catalog))
     providers = %w[alpha beta].map do |provider_id|

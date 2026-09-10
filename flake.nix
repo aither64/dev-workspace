@@ -34,10 +34,11 @@
           codexWebRev = codex-web.rev;
           inherit extensions;
         };
+      runtimeContract = "${self}/portal/internal/session/runtime-contract.json";
       devWorkspace = mkPackage { inherit pkgs; };
     in
     {
-      lib = { inherit hostPaths mkPackage; };
+      lib = { inherit hostPaths mkPackage runtimeContract; };
       packages.${system} = {
         default = devWorkspace;
         dev-workspace = devWorkspace;
@@ -55,6 +56,9 @@
         };
         host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
           inherit pkgs self;
+        };
+        extension-catalog = import ./nix/tests/extension-catalog.nix {
+          inherit pkgs mkPackage;
         };
         generic-source = pkgs.runCommand "dev-workspace-generic-source" { } ''
           first=vps

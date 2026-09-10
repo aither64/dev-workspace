@@ -75,7 +75,8 @@ module DevWorkspaceHost
     end
 
     def initialize(data, path:)
-      unless data.is_a?(Hash) && data.keys.sort == %w[clusterProviders commands schema skills] &&
+      unless data.is_a?(Hash) &&
+             data.keys.sort == %w[clusterProviders commands schema skills] &&
              data['schema'] == 1
         raise Error, "invalid workspace extension catalog: #{path}"
       end
@@ -366,6 +367,7 @@ module DevWorkspaceHost
       when 'run-codex' then run_codex(argv)
       when 'run-tmux' then run_tmux(argv)
       when '-h', '--help', nil
+        extension_catalog
         @out.puts usage
       else
         raise Error, "unknown workspace-host command: #{command}"

@@ -47,14 +47,28 @@ transition lock reject a generation change and must be run again.
 
 ## Extension catalog
 
-Downstream flakes call `dev-workspace.lib.mkPackage` with three attribute sets:
+Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`
+attribute set containing three fields:
+
+```nix
+extensions = {
+  commands = { };
+  skills = { };
+  clusterProviders = { };
+};
+```
+
+The fields are:
 
 - `commands`, mapping command names to absolute executables;
 - `skills`, mapping skill names to package directories;
 - `clusterProviders`, mapping provider IDs to a label and helper executable.
 
-The resulting package writes `share/dev-workspace/extensions.json`. Activation
-uses only this catalog when linking commands and skills. Cluster helpers receive
+All values that name files or directories must be immutable Nix store
+references. The resulting package writes `share/dev-workspace/extensions.json`.
+Activation uses only this catalog when linking commands and skills. Workspace
+configuration is always read from the registered root's `.dev-workspace.json`.
+Cluster helpers receive
 the selected workspace through `DEVCLUSTER_WORKSPACE` and keep ownership of
 their `status`, `reset`, `cleanup-paths` and `transition-adopt` protocols.
 

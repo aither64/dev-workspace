@@ -27,12 +27,37 @@ let
   extensionCommands = extensions.commands or { };
   extensionSkills = extensions.skills or { };
   clusterProviders = extensions.clusterProviders or { };
-  validName = name: builtins.match "[a-z0-9][a-z0-9-]*" name != null;
+  validName =
+    name: builtins.stringLength name <= 63 && builtins.match "[a-z0-9][a-z0-9-]*" name != null;
+  validTarget =
+    value:
+    (builtins.isString value || builtins.isPath value || lib.isDerivation value)
+    && (
+      let
+        string = toString value;
+      in
+      builtins.hasContext string && lib.hasPrefix "${builtins.storeDir}/" string
+    );
   commandNames = builtins.attrNames extensionCommands;
   skillNames = builtins.attrNames extensionSkills;
   providerNames = builtins.attrNames clusterProviders;
   providerPrograms = map (name: "${name}-devcluster") providerNames;
   allNamesValid = builtins.all validName (commandNames ++ skillNames ++ providerNames);
+  targetsValid = builtins.all validTarget (
+    builtins.attrValues extensionCommands
+    ++ builtins.attrValues extensionSkills
+    ++ map (name: clusterProviders.${name}.command or "") providerNames
+  );
+  programNames = commandNames ++ providerPrograms;
+  programsValid =
+    builtins.length programNames == builtins.length (lib.unique programNames)
+    && builtins.all (
+      name:
+      !(builtins.elem name [
+        "workspace-host"
+        "dev-session"
+      ])
+    ) programNames;
   providersValid = builtins.all (
     name:
     let
@@ -43,6 +68,7 @@ let
     && provider ? command
     && builtins.isString provider.label
     && provider.label != ""
+    && builtins.stringLength provider.label <= 128
   ) providerNames;
   extensionCatalogData = {
     schema = 1;
@@ -63,6 +89,9 @@ let
   extensionCatalog = writeText "dev-workspace-extensions.json" (builtins.toJSON extensionCatalogData);
 in
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
+assert lib.assertMsg targetsValid
+  "dev-workspace extension targets must be immutable Nix store references";
+assert lib.assertMsg programsValid "dev-workspace extension commands must not collide";
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
 buildGoModule {
   pname = "dev-workspace";
@@ -210,6 +239,12 @@ buildGoModule {
         DEVCLUSTER_WORKSPACE="$TMPDIR/workspace" \
         "$out/bin/${name}-devcluster" --help >/dev/null
     '') providerNames}
+    ${lib.concatMapStringsSep "\n" (name: ''
+      test -x "$out/bin/${name}"
+    '') commandNames}
+    ${lib.concatMapStringsSep "\n" (name: ''
+      test -d "$out/share/codex/skills/${name}"
+    '') skillNames}
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/libexec/workspace-portal/dev-session" --help >/dev/null
     ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
