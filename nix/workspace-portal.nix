@@ -303,6 +303,7 @@ buildGoModule {
         "$out/bin/${name}-devcluster" --help >/dev/null
     '') providerNames}
     ${lib.concatMapStringsSep "\n" (name: ''
+      test -f "$out/bin/${name}"
       test -x "$out/bin/${name}"
     '') commandNames}
     ${lib.concatMapStringsSep "\n" (name: ''

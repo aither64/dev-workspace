@@ -145,6 +145,16 @@ class WorkspaceHostTest < Minitest::Test
       assert_raises(DevWorkspaceHost::Error) do
         DevWorkspaceHost::ExtensionCatalog.new(payload, path: catalog)
       end
+
+      payload['commands'] = [{ 'name' => 'tool', 'path' => directory }]
+      assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::ExtensionCatalog.new(payload, path: catalog)
+      end
+
+      payload['commands'] = [{ 'name' => 'workspace-portal', 'path' => RbConfig.ruby }]
+      assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::ExtensionCatalog.new(payload, path: catalog)
+      end
     end
   end
 
@@ -2544,7 +2554,7 @@ class WorkspaceHostTest < Minitest::Test
       'commands' => [],
       'skills' => [],
       'clusterProviders' => %w[alpha beta].map do |provider_id|
-        { 'id' => provider_id, 'label' => provider_id.capitalize, 'command' => '/bin/true' }
+        { 'id' => provider_id, 'label' => provider_id.capitalize, 'command' => RbConfig.ruby }
       end
     ))
     catalog

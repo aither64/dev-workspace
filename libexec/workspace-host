@@ -80,8 +80,8 @@ module DevWorkspaceHost
              data['schema'] == 1
         raise Error, "invalid workspace extension catalog: #{path}"
       end
-      @commands = entries(data['commands'], %w[name path], 'name', 'path', path)
-      @skills = entries(data['skills'], %w[name path], 'name', 'path', path)
+      @commands = entries(data['commands'], %w[name path], 'name', 'path', path, type: :executable)
+      @skills = entries(data['skills'], %w[name path], 'name', 'path', path, type: :directory)
       providers = data['clusterProviders']
       unless providers.is_a?(Array)
         raise Error, "invalid workspace extension catalog: #{path}"
@@ -90,7 +90,7 @@ module DevWorkspaceHost
         unless provider.is_a?(Hash) && provider.keys.sort == %w[command id label] &&
                valid_name?(provider['id']) && provider['label'].is_a?(String) &&
                !provider['label'].empty? && provider['label'].bytesize <= 128 &&
-               absolute_path?(provider['command'])
+               valid_path?(provider['command'], :executable)
           raise Error, "invalid workspace extension catalog: #{path}"
         end
         [provider.fetch('id'), provider.freeze]
@@ -109,13 +109,13 @@ module DevWorkspaceHost
 
     private
 
-    def entries(values, keys, name_key, path_key, catalog_path)
+    def entries(values, keys, name_key, path_key, catalog_path, type:)
       unless values.is_a?(Array)
         raise Error, "invalid workspace extension catalog: #{catalog_path}"
       end
       result = values.to_h do |entry|
         unless entry.is_a?(Hash) && entry.keys.sort == keys && valid_name?(entry[name_key]) &&
-               absolute_path?(entry[path_key])
+               valid_path?(entry[path_key], type)
           raise Error, "invalid workspace extension catalog: #{catalog_path}"
         end
         [entry.fetch(name_key), entry.fetch(path_key)]
@@ -132,6 +132,17 @@ module DevWorkspaceHost
 
     def absolute_path?(value)
       value.is_a?(String) && value.start_with?(File::SEPARATOR) && !value.include?("\0")
+    end
+
+    def valid_path?(value, type)
+      return false unless absolute_path?(value)
+
+      case type
+      when :directory then File.directory?(value)
+      when :executable then File.file?(value) && File.executable?(value)
+      when :file then File.file?(value)
+      else false
+      end
     end
   end
 
