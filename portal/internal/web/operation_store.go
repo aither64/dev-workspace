@@ -32,9 +32,9 @@ type lifecycleOperationStorePayload struct {
 	Operations []lifecycleOperation `json:"operations"`
 }
 
-func newLifecycleOperationStore(workspace, configuredDirectory string) (*lifecycleOperationStore, error) {
-	directory := configuredDirectory
-	if directory == "" {
+func newLifecycleOperationStore(workspace, configuredStateRoot string) (*lifecycleOperationStore, error) {
+	stateRoot := configuredStateRoot
+	if stateRoot == "" {
 		stateHome := os.Getenv("XDG_STATE_HOME")
 		if stateHome == "" {
 			home, err := os.UserHomeDir()
@@ -47,18 +47,17 @@ func newLifecycleOperationStore(workspace, configuredDirectory string) (*lifecyc
 		if err != nil {
 			return nil, fmt.Errorf("resolve lifecycle operation state home: %w", err)
 		}
-		workspaceDigest := sha256.Sum256([]byte(workspace))
-		workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(workspaceDigest[:8])
-		directory = filepath.Join(
-			absoluteStateHome, "dev-workspaces", "portal", workspaceID,
-		)
+		stateRoot = filepath.Join(absoluteStateHome, "dev-workspaces")
 	} else {
-		absoluteDirectory, err := filepath.Abs(directory)
+		absoluteStateRoot, err := filepath.Abs(stateRoot)
 		if err != nil {
-			return nil, fmt.Errorf("resolve lifecycle operation state directory: %w", err)
+			return nil, fmt.Errorf("resolve lifecycle operation state root: %w", err)
 		}
-		directory = absoluteDirectory
+		stateRoot = absoluteStateRoot
 	}
+	workspaceDigest := sha256.Sum256([]byte(workspace))
+	workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(workspaceDigest[:8])
+	directory := filepath.Join(stateRoot, "portal", workspaceID)
 	return &lifecycleOperationStore{
 		workspace: workspace,
 		directory: directory,

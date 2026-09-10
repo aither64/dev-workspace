@@ -17,6 +17,7 @@ func TestCompletedRemovalConsumesDevSessionMarker(t *testing.T) {
 
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	stateHome := filepath.Join(t.TempDir(), "state")
+	stateRoot := filepath.Join(stateHome, "previous-workspaces")
 	if err := os.MkdirAll(filepath.Join(workspace, "work", "example"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +31,10 @@ load ARGV.fetch(0)
 workspace = ARGV.fetch(1)
 state_home = ARGV.fetch(2)
 slug = ARGV.fetch(3)
-env = ENV.to_h.merge('XDG_STATE_HOME' => state_home)
+env = ENV.to_h.merge(
+  'XDG_STATE_HOME' => state_home,
+  'DEV_WORKSPACES_NAMESPACE' => 'previous-workspaces'
+)
 env['PATH'] = File.dirname(env.fetch('SHELL'))
 runner = DevSession::Runner.new(workspace: workspace, env: env)
 operation_id = ARGV.fetch(4)
@@ -51,7 +55,7 @@ runner.send(:finalize_removal!, slug, removal)
 		t.Fatalf("produce terminal removal marker: %v\n%s", err, output)
 	}
 
-	completed, err := CompletedRemoval(workspace, "example", stateHome, operationID, startedAt)
+	completed, err := CompletedRemoval(workspace, "example", stateRoot, operationID, startedAt)
 	if err != nil {
 		t.Fatalf("consume terminal removal marker: %v", err)
 	}
@@ -59,7 +63,7 @@ runner.send(:finalize_removal!, slug, removal)
 		t.Fatal("Ruby-produced terminal removal marker was not recognized")
 	}
 	mismatched, err := CompletedRemoval(
-		workspace, "example", stateHome,
+		workspace, "example", stateRoot,
 		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		startedAt,
 	)

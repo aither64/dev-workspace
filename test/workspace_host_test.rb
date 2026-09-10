@@ -296,6 +296,46 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_user_namespace_selects_compatible_default_paths
+    Dir.mktmpdir('workspace-host-user-namespace-test') do |directory|
+      host = DevWorkspaceHost::Host.new(
+        env: {
+          'HOME' => directory,
+          'PATH' => ENV.fetch('PATH'),
+          'XDG_RUNTIME_DIR' => File.join(directory, 'run'),
+          'DEV_WORKSPACES_NAMESPACE' => 'previous-workspaces'
+        },
+        out: StringIO.new,
+        err: StringIO.new
+      )
+
+      assert_equal(
+        File.join(directory, '.config/previous-workspaces/registry.json'),
+        host.instance_variable_get(:@config)
+      )
+      assert_equal(
+        File.join(directory, '.local/state/previous-workspaces'),
+        host.instance_variable_get(:@state)
+      )
+      assert_equal(
+        File.join(directory, 'run/previous-workspaces'),
+        host.instance_variable_get(:@runtime)
+      )
+    end
+  end
+
+  def test_user_namespace_rejects_unsafe_names
+    error = assert_raises(DevWorkspaceHost::Error) do
+      DevWorkspaceHost::Host.new(
+        env: { 'HOME' => Dir.pwd, 'DEV_WORKSPACES_NAMESPACE' => '../state' },
+        out: StringIO.new,
+        err: StringIO.new
+      )
+    end
+
+    assert_includes(error.message, 'invalid workspace user namespace')
+  end
+
   def test_run_portal_applies_workspace_display_and_provider_configuration
     Dir.mktmpdir('workspace-host-portal-config-test') do |directory|
       root = make_workspace(directory, 'workspace')
@@ -322,6 +362,10 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal('example organization development', arguments[arguments.index('--display-label') + 1])
       assert_equal('build-host', arguments[arguments.index('--host-label') + 1])
       assert_equal('build-host.int.example.cz', arguments[arguments.index('--ssh-host') + 1])
+      assert_equal(
+        File.join(directory, 'state'),
+        arguments[arguments.index('--user-state-root') + 1]
+      )
       provider_index = arguments.index('--cluster-provider')
       refute_nil(provider_index)
       assert_match(/\Aalpha=Alpha=/, arguments.fetch(provider_index + 1))

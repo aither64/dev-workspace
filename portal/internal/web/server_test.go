@@ -3879,16 +3879,15 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	server, err := New(Config{
-		Workspace:         workspace,
-		BaseURL:           "https://workspace.example.test",
-		DevSession:        "/run/current-system/sw/bin/dev-session",
-		HostProfile:       profile,
-		AuthorityDir:      authorityDir,
-		CodexSocket:       "/run/dev-workspace-codex/app-server.sock",
-		CodexVersion:      "0.152.1",
-		OperationStateDir: filepath.Join(t.TempDir(), "operations"),
-		RemovalStateHome:  t.TempDir(),
-		Logger:            log.New(io.Discard, "", 0),
+		Workspace:     workspace,
+		BaseURL:       "https://workspace.example.test",
+		DevSession:    "/run/current-system/sw/bin/dev-session",
+		HostProfile:   profile,
+		AuthorityDir:  authorityDir,
+		CodexSocket:   "/run/dev-workspace-codex/app-server.sock",
+		CodexVersion:  "0.152.1",
+		UserStateRoot: filepath.Join(t.TempDir(), "state"),
+		Logger:        log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)

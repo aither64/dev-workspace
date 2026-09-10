@@ -209,7 +209,7 @@ func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOpe
 			return false, errors.New("deletion operation has an invalid start time")
 		}
 		return session.CompletedRemoval(
-			s.config.Workspace, slug, s.config.RemovalStateHome,
+			s.config.Workspace, slug, s.config.UserStateRoot,
 			operation.Options.JournalID, startedAt,
 		)
 	}

@@ -23,6 +23,9 @@ func TestLifecycleOperationStoreIsPrivateVersionedAndSurvivesRestart(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if filepath.Dir(filepath.Dir(store.directory)) != directory {
+		t.Fatalf("operation state directory = %s, want it below %s", store.directory, directory)
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	operation := lifecycleOperation{
 		Slug: "example", Kind: "archive", State: "running", Phase: "starting",
@@ -58,7 +61,7 @@ func TestLifecycleOperationStoreIsPrivateVersionedAndSurvivesRestart(t *testing.
 	if restarted["example"].State != "paused" {
 		t.Fatalf("restarted operation = %#v", restarted["example"])
 	}
-	if matches, err := filepath.Glob(filepath.Join(directory, ".lifecycle-operations-*.tmp")); err != nil || len(matches) != 0 {
+	if matches, err := filepath.Glob(filepath.Join(store.directory, ".lifecycle-operations-*.tmp")); err != nil || len(matches) != 0 {
 		t.Fatalf("temporary operation states = %v, %v", matches, err)
 	}
 }
@@ -70,7 +73,7 @@ func TestLifecycleOperationStoreRejectsUnsafeOrForeignState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(store.directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(store.path, []byte(`{"schema":1,"workspace":"foreign","operations":[]}`), 0o644); err != nil {
@@ -406,9 +409,7 @@ func writeCompletedRemovalMarker(
 	t.Helper()
 	digest := sha256.Sum256([]byte(server.config.Workspace))
 	workspaceID := filepath.Base(server.config.Workspace) + "-" + hex.EncodeToString(digest[:8])
-	root := filepath.Join(
-		server.config.RemovalStateHome, "dev-workspaces", "removed", workspaceID,
-	)
+	root := filepath.Join(server.config.UserStateRoot, "removed", workspaceID)
 	directory := filepath.Join(root, "20260909T100613.000000Z-"+slug+"-123")
 	if err := os.MkdirAll(filepath.Join(directory, "work"), 0o700); err != nil {
 		t.Fatal(err)

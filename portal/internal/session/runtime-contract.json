@@ -52,6 +52,7 @@
     "--unix-socket",
     "--dev-session",
     "--authority-dir",
+    "--user-state-root",
     "--host-profile",
     "--transition-lock",
     "--codex-socket",

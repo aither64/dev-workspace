@@ -106,6 +106,7 @@ func run(args []string) error {
 
 type serveOptions struct {
 	unixSocket, workspace, baseURL, devSession, authorityDir string
+	userStateRoot                                            string
 	displayLabel, hostLabel, sshHost                         string
 	hostProfile, transitionLock                              string
 	codexSocket, codexVersion                                string
@@ -145,6 +146,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.sshHost, "ssh-host", "", "optional SSH host for remote attach commands")
 	flags.StringVar(&options.devSession, "dev-session", "", "absolute installed dev-session command")
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
+	flags.StringVar(&options.userStateRoot, "user-state-root", "", "absolute package-selected user state root")
 	flags.StringVar(&options.hostProfile, "host-profile", "", "selected workspace host profile")
 	flags.StringVar(&options.transitionLock, "transition-lock", "", "host-wide runtime transition lock")
 	flags.StringVar(&options.codexSocket, "codex-socket", codex.DefaultSocket(), "Codex App Server Unix socket")
@@ -160,6 +162,9 @@ func serve(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if options.userStateRoot != "" && !filepath.IsAbs(options.userStateRoot) {
+		return errors.New("--user-state-root must be absolute")
+	}
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
 	codexClient := newCodexClient(options.codexSocket, options.workspace)
 	defer codexClient.Close()
@@ -167,8 +172,8 @@ func serve(args []string) error {
 		Workspace: options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
 		HostLabel: options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
-		TransitionLock: options.transitionLock,
-		CodexSocket:    options.codexSocket, CodexVersion: options.codexVersion,
+		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
+		CodexSocket: options.codexSocket, CodexVersion: options.codexVersion,
 		ClusterProviders: options.clusterProviders,
 		Logger:           logger, Codex: codexClient,
 	})

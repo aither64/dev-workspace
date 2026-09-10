@@ -501,6 +501,13 @@ module DevSession
       @state_home = File.expand_path(
         env.fetch('XDG_STATE_HOME', File.join(Dir.home, '.local', 'state'))
       )
+      namespace = env.fetch('DEV_WORKSPACES_NAMESPACE', 'dev-workspaces')
+      unless namespace.match?(/\A[a-z0-9][a-z0-9-]{0,62}\z/)
+        raise Error, "invalid workspace user namespace: #{namespace.inspect}"
+      end
+      @workspace_state_root = File.expand_path(
+        env.fetch('DEV_WORKSPACES_STATE', File.join(@state_home, namespace))
+      )
       @out = out
       @err = err
       @today = today
@@ -4151,7 +4158,7 @@ module DevSession
 
     def removal_recovery_root_path
       workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
-      File.join(@state_home, 'dev-workspaces', 'removed', workspace_id)
+      File.join(@workspace_state_root, 'removed', workspace_id)
     end
 
     def development_cluster_cleanup_paths(slug)
@@ -4198,8 +4205,10 @@ module DevSession
     end
 
     def removal_recovery_root
-      reject_symlink_components!(@state_home, 'XDG state home')
-      FileUtils.mkdir_p(@state_home, mode: 0o700)
+      state_parent = File.dirname(@workspace_state_root)
+      reject_symlink_components!(state_parent, 'workspace state parent')
+      FileUtils.mkdir_p(state_parent, mode: 0o700)
+      ensure_directory!(@workspace_state_root, 'workspace state root', create: true)
       root = removal_recovery_root_path
       FileUtils.mkdir_p(root, mode: 0o700)
       File.chmod(0o700, File.dirname(root))

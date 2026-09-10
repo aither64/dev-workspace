@@ -72,6 +72,14 @@ Cluster helpers receive
 the selected workspace through `DEVCLUSTER_WORKSPACE` and keep ownership of
 their `status`, `reset`, `cleanup-paths` and `transition-adopt` protocols.
 
+The package constructor also accepts `userNamespace` and `routerSocket` for a
+deployment-specific compatibility generation. `userNamespace` selects the
+default user config, state, runtime and profile paths, including portal
+lifecycle receipts and deletion recovery, without changing the generic command
+or environment-variable names. Keep the defaults for new deployments; use
+overrides only while an existing installation is moving its state to the
+generic namespace.
+
 ## Host module
 
 `nixosModules.host` configures the privileged nginx and TLS substrate. Its

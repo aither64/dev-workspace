@@ -23,10 +23,26 @@ let
         command = immutableCommand;
       };
     }).success;
+  rejectsUnsafeUserNamespace =
+    !(builtins.tryEval (
+      builtins.deepSeq (mkPackage {
+        inherit pkgs;
+        userNamespace = "../state";
+      }) true
+    )).success;
+  rejectsUnsafeRouterSocket =
+    !(builtins.tryEval (
+      builtins.deepSeq (mkPackage {
+        inherit pkgs;
+        routerSocket = "/tmp/router.sock";
+      }) true
+    )).success;
 in
 assert rejectsLongName;
 assert rejectsMutableTarget;
 assert rejectsProgramCollision;
+assert rejectsUnsafeUserNamespace;
+assert rejectsUnsafeRouterSocket;
 pkgs.runCommand "dev-workspace-extension-catalog-validation" { } ''
   touch "$out"
 ''

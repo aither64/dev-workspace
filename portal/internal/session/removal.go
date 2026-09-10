@@ -22,7 +22,7 @@ const removalRecoveryMaxBytes = 64 * 1024
 // after notBefore. Merely failing to discover a portal manifest is not proof
 // that the session's tracking, runtime, clusters, and worktrees were removed.
 func CompletedRemoval(
-	workspace, slug, configuredStateHome, operationID string, notBefore time.Time,
+	workspace, slug, configuredStateRoot, operationID string, notBefore time.Time,
 ) (bool, error) {
 	if !ValidSlug(slug) {
 		return false, errors.New("invalid session slug")
@@ -30,9 +30,9 @@ func CompletedRemoval(
 	if !validLifecycleJournalID(operationID) {
 		return false, errors.New("invalid removal operation identity")
 	}
-	stateHome := configuredStateHome
-	if stateHome == "" {
-		stateHome = os.Getenv("XDG_STATE_HOME")
+	stateRoot := configuredStateRoot
+	if stateRoot == "" {
+		stateHome := os.Getenv("XDG_STATE_HOME")
 		if stateHome == "" {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -40,14 +40,15 @@ func CompletedRemoval(
 			}
 			stateHome = filepath.Join(home, ".local", "state")
 		}
+		stateRoot = filepath.Join(stateHome, "dev-workspaces")
 	}
-	absoluteStateHome, err := filepath.Abs(stateHome)
+	absoluteStateRoot, err := filepath.Abs(stateRoot)
 	if err != nil {
-		return false, fmt.Errorf("resolve removal recovery state home: %w", err)
+		return false, fmt.Errorf("resolve removal recovery state root: %w", err)
 	}
 	digest := sha256.Sum256([]byte(workspace))
 	workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(digest[:8])
-	root := filepath.Join(absoluteStateHome, "dev-workspaces", "removed", workspaceID)
+	root := filepath.Join(absoluteStateRoot, "removed", workspaceID)
 	rootInfo, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil

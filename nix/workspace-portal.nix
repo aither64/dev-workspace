@@ -15,8 +15,10 @@
   openssl,
   python3,
   ruby,
+  routerSocket,
   systemd,
   tmux,
+  userNamespace ? "dev-workspaces",
   util-linux,
   writeText,
   extensions ? { },
@@ -24,6 +26,17 @@
 }:
 let
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
+  validUserNamespace =
+    builtins.stringLength userNamespace <= 63
+    && builtins.match "[a-z0-9][a-z0-9-]*" userNamespace != null;
+  validRouterSocket =
+    let
+      components = lib.splitString "/" routerSocket;
+    in
+    lib.hasPrefix "/run/" routerSocket
+    && lib.all (component: component != "" && component != "." && component != "..") (
+      builtins.tail components
+    );
   extensionCommands = extensions.commands or { };
   extensionSkills = extensions.skills or { };
   clusterProviders = extensions.clusterProviders or { };
@@ -89,11 +102,13 @@ let
   };
   extensionCatalog = writeText "dev-workspace-extensions.json" (builtins.toJSON extensionCatalogData);
 in
+assert lib.assertMsg validUserNamespace
+  "dev-workspace user namespace must be a lowercase identifier";
+assert lib.assertMsg validRouterSocket
+  "dev-workspace router socket must be an absolute path below /run";
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
 assert lib.assertMsg targetsValid
-  "dev-workspace extension targets must be immutable Nix store references: ${
-    builtins.toJSON (map toString invalidTargets)
-  }";
+  "dev-workspace extension targets must be immutable Nix store references: ${builtins.toJSON (map toString invalidTargets)}";
 assert lib.assertMsg programsValid "dev-workspace extension commands must not collide";
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
 buildGoModule {
@@ -170,6 +185,10 @@ buildGoModule {
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
     install -Dm644 ${src}/nix/systemd/workspace-* \
       -t "$out/share/systemd/user"
+    substituteInPlace "$out/share/systemd/user/"workspace-*.service \
+      --replace-fail '%h/.local/state/dev-workspaces/profile' \
+      '%h/.local/state/${userNamespace}/profile'
+
     ${lib.concatMapStringsSep "\n" (name: ''
       ln -s ${lib.escapeShellArg (toString extensionCommands.${name})} \
         "$out/bin/${name}"
@@ -216,7 +235,9 @@ buildGoModule {
     for command in workspace-host dev-session ${lib.concatStringsSep " " providerPrograms}; do
       makeWrapper "$out/libexec/workspace-host" "$out/bin/$command" \
         --set DEV_WORKSPACE_HOST_MODE "$command" \
-        --set DEV_WORKSPACES_EXTENSION_CATALOG "$out/share/dev-workspace/extensions.json"
+        --set DEV_WORKSPACES_EXTENSION_CATALOG "$out/share/dev-workspace/extensions.json" \
+        --set-default DEV_WORKSPACES_NAMESPACE ${lib.escapeShellArg userNamespace} \
+        --set-default DEV_WORKSPACES_ROUTER_SOCKET ${lib.escapeShellArg routerSocket}
     done
   '';
 

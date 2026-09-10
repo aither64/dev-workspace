@@ -26,13 +26,15 @@
         {
           pkgs,
           extensions ? { },
+          routerSocket ? hostPaths.routerSocket,
+          userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
           src = self;
           codex = llm-agents.packages.${pkgs.system}.codex;
           codexWebSrc = codex-web;
           codexWebRev = codex-web.rev;
-          inherit extensions;
+          inherit extensions routerSocket userNamespace;
         };
       runtimeContract = "${self}/portal/internal/session/runtime-contract.json";
       devWorkspace = mkPackage { inherit pkgs; };
@@ -57,7 +59,13 @@
         host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
           inherit pkgs self;
         };
+        host-package-contract = import ./nix/tests/host-package-contract.nix {
+          inherit devWorkspace hostPaths pkgs;
+        };
         extension-catalog = import ./nix/tests/extension-catalog.nix {
+          inherit pkgs mkPackage;
+        };
+        user-namespace = import ./nix/tests/user-namespace.nix {
           inherit pkgs mkPackage;
         };
         generic-source = pkgs.runCommand "dev-workspace-generic-source" { } ''

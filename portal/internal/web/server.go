@@ -56,26 +56,25 @@ type codexController interface {
 }
 
 type Config struct {
-	Workspace         string
-	BaseURL           string
-	DisplayLabel      string
-	HostLabel         string
-	SSHHost           string
-	DevSession        string
-	HostProfile       string
-	GH                string
-	Tmux              string
-	AuthorityDir      string
-	TransitionLock    string
-	CodexSocket       string
-	CodexVersion      string
-	ClusterProviders  []cluster.Provider
-	OperationStateDir string
-	RemovalStateHome  string
-	Logger            *log.Logger
-	Codex             codexController
-	VerifyThread      func(context.Context, string, string) error
-	ReadThread        func(context.Context, string) (codex.Transcript, error)
+	Workspace        string
+	BaseURL          string
+	DisplayLabel     string
+	HostLabel        string
+	SSHHost          string
+	DevSession       string
+	HostProfile      string
+	GH               string
+	Tmux             string
+	AuthorityDir     string
+	TransitionLock   string
+	CodexSocket      string
+	CodexVersion     string
+	ClusterProviders []cluster.Provider
+	UserStateRoot    string
+	Logger           *log.Logger
+	Codex            codexController
+	VerifyThread     func(context.Context, string, string) error
+	ReadThread       func(context.Context, string) (codex.Transcript, error)
 }
 
 type cachedRepositories struct {
@@ -240,7 +239,7 @@ func New(config Config) (*Server, error) {
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
 	operationContext, cancelOperations := context.WithCancel(context.Background())
-	operationStore, err := newLifecycleOperationStore(workspace, config.OperationStateDir)
+	operationStore, err := newLifecycleOperationStore(workspace, config.UserStateRoot)
 	if err != nil {
 		cancelOperations()
 		return nil, err
