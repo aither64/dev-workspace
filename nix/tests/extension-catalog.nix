@@ -15,6 +15,18 @@ let
     !(evaluate {
       commands.example = "/bin/true";
     }).success;
+  rejectsUnknownSection =
+    !(evaluate {
+      misspelledProviders.example = immutableCommand;
+    }).success;
+  rejectsUnknownProviderField =
+    !(evaluate {
+      clusterProviders.example = {
+        command = immutableCommand;
+        label = "Example";
+        stateDirectory = "example";
+      };
+    }).success;
   rejectsProgramCollision =
     !(evaluate {
       commands.alpha-devcluster = immutableCommand;
@@ -22,6 +34,10 @@ let
         label = "Alpha";
         command = immutableCommand;
       };
+    }).success;
+  rejectsCoreProgramCollision =
+    !(evaluate {
+      commands.workspace-portal = immutableCommand;
     }).success;
   rejectsUnsafeUserNamespace =
     !(builtins.tryEval (
@@ -47,7 +63,10 @@ let
 in
 assert rejectsLongName;
 assert rejectsMutableTarget;
+assert rejectsUnknownSection;
+assert rejectsUnknownProviderField;
 assert rejectsProgramCollision;
+assert rejectsCoreProgramCollision;
 assert rejectsUnsafeUserNamespace;
 assert rejectsUnsafeRouterSocket;
 assert rejectsUnsafeActivationAlias;

@@ -14,7 +14,7 @@ require_relative 'workspace-profile-identity'
 module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
   HOSTNAME_LABEL = /\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/
-  CORE_COMMANDS = %w[workspace-host dev-session].freeze
+  CORE_COMMANDS = %w[workspace-host workspace-portal dev-session].freeze
 
   def self.load_runtime_contract
     candidates = [

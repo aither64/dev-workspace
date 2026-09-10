@@ -52,6 +52,14 @@ let
   extensionCommands = extensions.commands or { };
   extensionSkills = extensions.skills or { };
   clusterProviders = extensions.clusterProviders or { };
+  extensionsValid = builtins.all (
+    name:
+    builtins.elem name [
+      "clusterProviders"
+      "commands"
+      "skills"
+    ]
+  ) (builtins.attrNames extensions);
   validName =
     name: builtins.stringLength name <= 63 && builtins.match "[a-z0-9][a-z0-9-]*" name != null;
   validTarget =
@@ -81,6 +89,7 @@ let
       name:
       !(builtins.elem name [
         "workspace-host"
+        "workspace-portal"
         "dev-session"
       ])
     ) programNames;
@@ -90,6 +99,11 @@ let
       provider = clusterProviders.${name};
     in
     builtins.isAttrs provider
+    &&
+      builtins.attrNames provider == [
+        "command"
+        "label"
+      ]
     && provider ? label
     && provider ? command
     && builtins.isString provider.label
@@ -126,6 +140,7 @@ assert lib.assertMsg validUserNamespace
   "dev-workspace user namespace must be a lowercase identifier";
 assert lib.assertMsg validRouterSocket
   "dev-workspace router socket must be an absolute path below /run";
+assert lib.assertMsg extensionsValid "dev-workspace extensions contain an unknown section";
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
 assert lib.assertMsg targetsValid
   "dev-workspace extension targets must be immutable Nix store references: ${builtins.toJSON (map toString invalidTargets)}";
