@@ -43,11 +43,12 @@ let
   providerNames = builtins.attrNames clusterProviders;
   providerPrograms = map (name: "${name}-devcluster") providerNames;
   allNamesValid = builtins.all validName (commandNames ++ skillNames ++ providerNames);
-  targetsValid = builtins.all validTarget (
+  extensionTargets =
     builtins.attrValues extensionCommands
     ++ builtins.attrValues extensionSkills
-    ++ map (name: clusterProviders.${name}.command or "") providerNames
-  );
+    ++ map (name: clusterProviders.${name}.command or "") providerNames;
+  invalidTargets = builtins.filter (value: !validTarget value) extensionTargets;
+  targetsValid = invalidTargets == [ ];
   programNames = commandNames ++ providerPrograms;
   programsValid =
     builtins.length programNames == builtins.length (lib.unique programNames)
@@ -90,7 +91,9 @@ let
 in
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
 assert lib.assertMsg targetsValid
-  "dev-workspace extension targets must be immutable Nix store references";
+  "dev-workspace extension targets must be immutable Nix store references: ${
+    builtins.toJSON (map toString invalidTargets)
+  }";
 assert lib.assertMsg programsValid "dev-workspace extension commands must not collide";
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
 buildGoModule {
