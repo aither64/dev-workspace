@@ -125,16 +125,33 @@ func TestRuntimeAuthorityRejectsMismatchedAndMalformedLiveTmuxIdentities(t *test
 
 func TestRuntimeAuthoritySharedCorpus(t *testing.T) {
 	fixtures := filepath.Join("..", "..", "..", "test", "fixtures")
-	for _, pattern := range []struct {
-		glob string
-		ok   bool
-	}{{"runtime-authority-valid-*.json", true}, {"runtime-authority-invalid-*.json", false}} {
-		paths, err := filepath.Glob(filepath.Join(fixtures, pattern.glob))
-		if err != nil || len(paths) == 0 {
-			t.Fatalf("fixture glob %q: %v", pattern.glob, err)
-		}
-		for _, fixture := range paths {
-			t.Run(filepath.Base(fixture), func(t *testing.T) {
+	manifestData, err := os.ReadFile(filepath.Join(fixtures, "runtime-authority-corpus.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Schema  int      `json:"schema"`
+		Valid   []string `json:"valid"`
+		Invalid []string `json:"invalid"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Schema != 1 || len(manifest.Valid) == 0 || len(manifest.Invalid) == 0 {
+		t.Fatalf("invalid authority corpus manifest: %#v", manifest)
+	}
+	seen := make(map[string]bool)
+	for _, group := range []struct {
+		names []string
+		ok    bool
+	}{{manifest.Valid, true}, {manifest.Invalid, false}} {
+		for _, name := range group.names {
+			if seen[name] || filepath.Base(name) != name || filepath.Ext(name) != ".json" {
+				t.Fatalf("invalid or duplicate authority corpus entry %q", name)
+			}
+			seen[name] = true
+			fixture := filepath.Join(fixtures, name)
+			t.Run(name, func(t *testing.T) {
 				directory := filepath.Join(t.TempDir(), "authority")
 				if err := os.Mkdir(directory, 0o700); err != nil {
 					t.Fatal(err)
@@ -147,8 +164,8 @@ func TestRuntimeAuthoritySharedCorpus(t *testing.T) {
 					t.Fatal(err)
 				}
 				_, err = LoadRuntimeAuthority(directory, "example", "/srv/workspace")
-				if (err == nil) != pattern.ok {
-					t.Fatalf("accepted = %t, want %t: %v", err == nil, pattern.ok, err)
+				if (err == nil) != group.ok {
+					t.Fatalf("accepted = %t, want %t: %v", err == nil, group.ok, err)
 				}
 			})
 		}

@@ -43,10 +43,18 @@
             ;
         };
       runtimeContract = "${self}/portal/internal/session/runtime-contract.json";
+      runtimeAuthorityCorpus = "${self}/test/fixtures/runtime-authority-corpus.json";
       devWorkspace = mkPackage { inherit pkgs; };
     in
     {
-      lib = { inherit hostPaths mkPackage runtimeContract; };
+      lib = {
+        inherit
+          hostPaths
+          mkPackage
+          runtimeAuthorityCorpus
+          runtimeContract
+          ;
+      };
       packages.${system} = {
         default = devWorkspace;
         dev-workspace = devWorkspace;

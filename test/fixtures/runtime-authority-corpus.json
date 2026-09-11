@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "valid": [
+    "runtime-authority-valid-creating.json",
+    "runtime-authority-valid-ready.json",
+    "runtime-authority-valid-tmux-identity.json"
+  ],
+  "invalid": [
+    "runtime-authority-invalid-empty-codex.json",
+    "runtime-authority-invalid-empty-tmux-identity.json",
+    "runtime-authority-invalid-missing-state.json",
+    "runtime-authority-invalid-null-codex.json",
+    "runtime-authority-invalid-null-tmux-identity.json",
+    "runtime-authority-invalid-partial-codex.json",
+    "runtime-authority-invalid-tmux-identity.json"
+  ]
+}
