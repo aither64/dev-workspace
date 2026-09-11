@@ -96,137 +96,25 @@ let
       managed_directories=(
         ${lib.concatMapStringsSep "\n        " lib.escapeShellArg managedDirectoryInventory}
       )
-      internal_managed_directories=(
-        ${lib.concatMapStringsSep "\n        " lib.escapeShellArg internalManagedDirectories}
-      )
-
-      path_contains() {
-        local parent child
-        parent=$1
-        child=$2
-        [ "$parent" = "$child" ] || [ -z "$parent" ] || [[ "$child" == "$parent/"* ]]
-      }
-
-      path_relation() {
-        local left right
-        left=$1
-        right=$2
-        if [ "$left" = "$right" ]; then
-          relation=equal
-        elif path_contains "$left" "$right"; then
-          relation=left_parent
-        elif path_contains "$right" "$left"; then
-          relation=right_parent
-        else
-          relation=disjoint
+      # The local operator administers this host. Check the configured outputs
+      # for ordinary mistakes; do not try to contain that operator's filesystem.
+      assert_directory_type() {
+        if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+          echo "workspace substrate path must be a directory: $1" >&2
+          return 1
         fi
       }
 
-      preflight_managed_directory() {
-        local target probe metadata owner mode expected_owner
-        target=$1
-        probe=$target
-        while true; do
-          if [ -L "$probe" ]; then
-            echo "unsafe symlink in workspace substrate directory path: $probe" >&2
-            return 1
-          fi
-          if [ -e "$probe" ]; then
-            if [ ! -d "$probe" ]; then
-              echo "non-directory in workspace substrate directory path: $probe" >&2
-              return 1
-            fi
-            metadata=$(stat -c '%u:%a' "$probe") || return 1
-            owner=''${metadata%%:*}
-            mode=''${metadata#*:}
-            expected_owner=0
-            if [ "$probe" = "$router_directory" ]; then
-              expected_owner=$(id -u ${lib.escapeShellArg cfg.owner}) || return 1
-            fi
-            if [ "$owner" != "$expected_owner" ] ||
-               (( (8#$mode & 0002) != 0 )) ||
-               { [ "$probe" != "$router_directory" ] && (( (8#$mode & 0020) != 0 )); }; then
-              echo "unsafe ownership or mode in workspace substrate directory path: $probe" >&2
-              return 1
-            fi
-          fi
-          [ "$probe" = / ] && break
-          probe=''${probe%/*}
-          [ -n "$probe" ] || probe=/
-        done
-      }
-
-      assert_managed_directory_layout() {
-        local directory index target probe suffix part identity record_count
-        local left right left_directory right_directory expected actual
-        local -a record_directories record_identities record_suffixes
-        for directory in "''${managed_directories[@]}"; do
-          preflight_managed_directory "$directory"
-        done
-        for directory in "''${internal_managed_directories[@]}"; do
-          if [ -e "$directory" ] && mountpoint -q "$directory"; then
-            echo "unsafe mount at internal workspace substrate directory: $directory" >&2
-            return 1
-          fi
-        done
-
-        record_count=0
-        for ((index = 0; index < ''${#managed_directories[@]}; index++)); do
-          target=''${managed_directories[$index]}
-          probe=$target
-          suffix=
-          while true; do
-            if [ -e "$probe" ]; then
-              identity=$(stat -c '%d:%i' "$probe") || return 1
-              record_directories[record_count]=$index
-              record_identities[record_count]=$identity
-              record_suffixes[record_count]=$suffix
-              record_count=$((record_count + 1))
-            fi
-            [ "$probe" = / ] && break
-            part=''${probe##*/}
-            suffix="$part''${suffix:+/$suffix}"
-            probe=''${probe%/*}
-            [ -n "$probe" ] || probe=/
-          done
-        done
-
-        for ((left = 0; left < record_count; left++)); do
-          for ((right = left + 1; right < record_count; right++)); do
-            left_directory=''${record_directories[$left]}
-            right_directory=''${record_directories[$right]}
-            [ "''${record_identities[$left]}" != "''${record_identities[$right]}" ] && continue
-            if [ "$left_directory" = "$right_directory" ]; then
-              echo "workspace substrate directory path revisits a physical ancestor: ''${managed_directories[$left_directory]}" >&2
-              return 1
-            fi
-            path_relation \
-              "''${managed_directories[$left_directory]}" \
-              "''${managed_directories[$right_directory]}"
-            expected=$relation
-            path_relation "''${record_suffixes[$left]}" "''${record_suffixes[$right]}"
-            actual=$relation
-            if [ "$actual" != "$expected" ]; then
-              echo "workspace substrate directories have an unexpected physical relationship: ''${managed_directories[$left_directory]} and ''${managed_directories[$right_directory]}" >&2
-              return 1
-            fi
-          done
-        done
+      assert_file_type() {
+        if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then
+          echo "workspace substrate path must be a regular file: $1" >&2
+          return 1
+        fi
       }
 
       install_managed_directory() {
-        local target owner group mode
-        target=$1
-        owner=$2
-        group=$3
-        mode=$4
-        preflight_managed_directory "$target"
-        install -d -o "$owner" -g "$group" -m "$mode" "$target"
-        if [ -L "$target" ] || [ ! -d "$target" ] ||
-           [ "$(stat -c '%U:%G:%a' "$target")" != "$owner:$group:$mode" ]; then
-          echo "could not establish safe workspace substrate directory: $target" >&2
-          return 1
-        fi
+        assert_directory_type "$1"
+        install -d -o "$2" -g "$3" -m "$4" "$1"
       }
 
       assert_existing_ca_state_structure() {
@@ -236,61 +124,41 @@ let
         if [ -L "$authority" ] || [ ! -d "$authority" ] ||
            [ -L "$ca_key" ] || [ -L "$ca_cert" ] ||
            [ ! -f "$ca_key" ] || [ ! -f "$ca_cert" ] ||
-           mountpoint -q "$ca_key" || mountpoint -q "$ca_cert" ||
-           [ "$(stat -c '%u:%g:%a:%h' "$ca_key")" != "0:0:600:1" ] ||
-           [ "$(stat -c '%u:%g:%a:%h' "$ca_cert")" != "0:0:644:1" ]; then
+           [ "$(stat -c '%u:%g:%a' "$ca_key")" != "0:0:600" ] ||
+           [ "$(stat -c '%u:%g:%a' "$ca_cert")" != "0:0:644" ]; then
           echo "incomplete or unsafe workspace CA state" >&2
           return 1
         fi
       }
 
-      assert_managed_directory_layout
       install_managed_directory "$lock_directory" root root 755
-      if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
-        ( set -o noclobber; : > "$lock_file" ) 2>/dev/null || true
-      fi
-      if [ -L "$lock_file" ] || [ ! -f "$lock_file" ] ||
-         [ "$(stat -c '%U:%G:%a' "$lock_file")" != "root:root:600" ]; then
-        echo "unsafe workspace substrate lock file: $lock_file" >&2
-        exit 1
-      fi
+      assert_file_type "$lock_file"
       exec 9<>"$lock_file"
-      if [ ! "$lock_file" -ef /proc/self/fd/9 ]; then
-        echo "workspace substrate lock file changed while opening: $lock_file" >&2
-        exit 1
-      fi
       flock 9
+      chown root:root "$lock_file"
+      chmod 0600 "$lock_file"
+
+      for directory in "''${managed_directories[@]}"; do
+        assert_directory_type "$directory"
+      done
+      for file in "$password_file" "$auth_file" "$public_ca"; do
+        assert_file_type "$file"
+      done
+      assert_existing_ca_state_structure
 
       current="$tls_dir/current"
-      renew=0
-      current_target=
       current_pair=
-      if [ -e "$current" ] && mountpoint -q "$current"; then
-        echo "unsafe mount at workspace TLS current path: $current" >&2
-        exit 1
-      elif [ ! -L "$current" ]; then
-        renew=1
-      elif current_target_marker=$(readlink -n "$current" && printf /); then
-        current_target=''${current_target_marker%/}
+      if [ -L "$current" ]; then
+        current_target=$(readlink "$current")
         if [[ "$current_target" =~ ^pairs/pair-[0-9]+-[0-9]+$ ]]; then
           current_pair="$tls_dir/$current_target"
-          if ! preflight_managed_directory "$current_pair"; then
-            exit 1
-          fi
-          if [ -e "$current_pair" ] && mountpoint -q "$current_pair"; then
-            echo "unsafe mount at selected workspace TLS pair: $current_pair" >&2
-            exit 1
-          fi
-          managed_directories+=("$current_pair")
-        else
-          renew=1
+          assert_directory_type "$current_pair"
         fi
-      else
-        renew=1
+      elif [ -e "$current" ]; then
+        echo "workspace TLS current path must be a generation symlink: $current" >&2
+        exit 1
       fi
 
-      assert_managed_directory_layout
-      assert_existing_ca_state_structure
       install_managed_directory "$router_directory" ${lib.escapeShellArg cfg.owner} ${lib.escapeShellArg cfg.proxyGroup} 2770
       install_managed_directory ${lib.escapeShellArg passwordDirectory} root ${lib.escapeShellArg cfg.ownerGroup} 750
       install_managed_directory ${lib.escapeShellArg authDirectory} root ${lib.escapeShellArg nginxGroup} 750
@@ -298,7 +166,6 @@ let
       install_managed_directory "$tls_dir" root ${lib.escapeShellArg nginxGroup} 750
       install_managed_directory "$tls_dir/pairs" root ${lib.escapeShellArg nginxGroup} 750
       install_managed_directory ${lib.escapeShellArg publicCaDirectory} root root 755
-      assert_managed_directory_layout
 
       # shellcheck disable=SC2016
       auth_pattern='^[^:]+:\$2[aby]\$12\$[./A-Za-z0-9]{53}$'
@@ -418,7 +285,6 @@ let
         mv -T "$authority_tmp" "$authority"
         trap - EXIT INT TERM
       fi
-      assert_managed_directory_layout
       assert_existing_ca_state_structure
       if ! canonical_certificate_file "$ca_cert" "$pki_state"; then
         echo "workspace CA certificate is not one canonical PEM certificate" >&2
@@ -481,22 +347,9 @@ let
         [ "$leaf_key_public" = "$leaf_cert_public" ]
       }
 
-      if [ "$renew" -eq 0 ]; then
-        if ! leaf_pair_valid "$current_pair"; then
-          renew=1
-        elif current_target_after_marker=$(readlink -n "$current" && printf /); then
-          current_target_after=''${current_target_after_marker%/}
-          if [ "$current_target_after" != "$current_target" ] ||
-             [ "$(stat -Lc '%d:%i' "$current")" != "$(stat -c '%d:%i' "$current_pair")" ]; then
-            renew=1
-          fi
-        else
-          renew=1
-        fi
-      fi
-
-      if [ "$renew" -eq 1 ]; then
+      if [ -z "$current_pair" ] || ! leaf_pair_valid "$current_pair"; then
         build=$(mktemp -d "$tls_dir/.pair.XXXXXX")
+        trap 'rm -rf -- "$build"; rm -f -- "$tls_dir/.current.$$"' EXIT INT TERM
         openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
           -out "$build/server-key.pem"
         openssl req -new -key "$build/server-key.pem" -subj "/CN=$canonical" \
@@ -528,6 +381,7 @@ let
         mv -T "$build" "$pair"
         ln -s "pairs/$(basename "$pair")" "$tls_dir/.current.$$"
         mv -Tf "$tls_dir/.current.$$" "$current"
+        trap - EXIT INT TERM
       fi
 
       ca_tmp=$(mktemp "$(dirname "$public_ca")/.ca.XXXXXX")
@@ -555,7 +409,7 @@ in
     enable = lib.mkEnableOption "the shared host substrate for development workspaces";
     owner = lib.mkOption {
       type = lib.types.str;
-      description = "User that owns workspace runtime sockets and generated portal credentials.";
+      description = "User that owns runtime sockets and can read the generated portal password.";
     };
     ownerGroup = lib.mkOption {
       type = lib.types.str;

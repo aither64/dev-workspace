@@ -17,6 +17,24 @@ when their interpreters come from the flake.
 Do not work around a missing ambient tool. Use `nix develop` or a suitable
 `nix shell` command.
 
+## Trusted development host
+
+The local workspace operator is trusted to administer the development host.
+Root ownership of nginx credentials, TLS keys and activation state expresses
+operational responsibility; it does not contain that operator. Do not add
+checks or tests whose only purpose is to resist filesystem manipulation by an
+already compromised local operator, such as bind-mount attacks, hardlink
+attacks, physical ancestor graphs or hostile lock replacement.
+
+Retain checks for ordinary configuration mistakes, concurrent operations,
+wrong session or workspace selection, data integrity, interrupted operations
+and rollback. Remote clients remain untrusted: preserve input validation,
+authentication, authorization and protection of secrets. State the applicable
+trust boundary in review packets and assess findings within that boundary.
+
+This assumption covers dev-workspace itself. It does not apply to the projects
+being developed, their users, containers or virtual machines.
+
 ## Compatibility
 
 This application manages persistent state and destructive session operations.

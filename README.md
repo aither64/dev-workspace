@@ -22,16 +22,22 @@ The flake exports these packages on `x86_64-linux`:
 authentication and a local certificate authority. It does not install or run
 the user application. The firewall remains closed unless
 `services.dev-workspaces.firewall.sourceRanges` contains an allowed network.
-Persistent state paths must remain below root-controlled `/var/lib`; the
-runtime router socket must remain below `/run`, and the reconciliation lock is
-created directly below `/run/lock`. Every configured output has a separate
-owning directory; those directories must be distinct and mutually non-nested.
-Reconciliation rejects unexpected physical path relationships, symlinked
-components and mounts on its internal `authority`, `pairs` and selected-pair
-directories instead of following them. Existing `ca-key.pem` and `ca.pem`
-files must be unmounted, single-link regular files owned by `root:root`, with
-modes `0600` and `0644`, respectively. Leaf validation trusts only that local
-CA, never the host's default trust store.
+
+The local operator is trusted to administer the development host. Root owns
+nginx credentials, TLS keys and activation state for their system lifecycle.
+The application, sessions and repositories belong to the operator. This split
+does not provide a security boundary against that operator; remote clients
+remain untrusted.
+
+Persistent state paths remain below `/var/lib`, the router socket below `/run`,
+and the reconciliation lock directly below `/run/lock`. Configured output
+directories must be distinct and mutually non-nested. Reconciliation checks
+final output types, expected ownership and modes, preserves the CA and shared
+password, and replaces generated files and TLS pairs atomically under one lock.
+It validates leaf certificates against the local CA and configured names.
+Weekly renewal keeps the nginx endpoint usable between deployments. Existing
+PKI state, certificate generations and migration markers remain available for
+rollback.
 See `nixosConfigurations.example` for a minimal configuration.
 
 Install the user-profile application from a checked-out source:
@@ -79,7 +85,7 @@ the configured hostname and aliases; the registry stores the resolved values.
 
 ## Development
 
-Run the complete package checks with:
+Run the package checks and host smoke test with:
 
 ```sh
 nix flake check --print-build-logs
@@ -87,3 +93,10 @@ nix flake check --print-build-logs
 
 The package uses a Go portal, Ruby lifecycle helpers and shell-based cluster
 launchers. The flake supplies their build and test dependencies.
+
+CI runs package and focused checks on every push and pull request. On `master`
+and manual dispatch, it also runs a small NixOS VM test for activation,
+idempotency, nginx authentication, renewal, recovery and rollback. Dispatch
+feature-branch VM tests after mandatory review. The VM job requires KVM
+acceleration. Review cold-run timings when changing these checks; the target for
+a normal dependency update is under 20 minutes.

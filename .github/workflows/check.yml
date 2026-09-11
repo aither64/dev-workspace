@@ -3,14 +3,35 @@ name: Check
 on:
   pull_request:
   push:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  flake:
+  fast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: cachix/install-nix-action@v31.11.1
-      - run: nix flake check --print-build-logs
+      - name: Evaluate all checks
+        run: nix flake check --no-build --print-build-logs
+      - name: Build package and focused checks
+        run: |
+          check_names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
+          mapfile -t checks < <(
+            jq -r '.[] | select(. != "host-module-idempotency") | ".#checks.x86_64-linux." + .' <<< "$check_names"
+          )
+          nix build --no-link --print-build-logs "${checks[@]}"
+  host:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Enable VM acceleration
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+      - uses: cachix/install-nix-action@v31.11.1
+      - name: Activation, renewal and rollback smoke test
+        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.host-module-idempotency

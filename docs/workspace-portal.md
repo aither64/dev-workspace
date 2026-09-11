@@ -96,15 +96,28 @@ defaults use:
 - `/var/lib/dev-workspaces/public/ca.pem`;
 - `/run/lock/dev-workspace-substrate.lock`.
 
-All persistent outputs must remain below root-controlled `/var/lib`. Runtime
-paths must remain below `/run`, and the lock file must sit directly below
-`/run/lock`. Output directories must be distinct and mutually non-nested.
+The local operator is trusted to administer the development host. The
+root/user split assigns nginx and activation files to their system lifecycle;
+it does not contain a compromised operator. Remote requests still require
+input validation, authentication and authorization. This trust assumption does
+not extend to projects developed in the workspace or their guests.
 
-Reconciliation rejects symlinked path components, unsafe ownership or modes,
-unexpected mounts and physical directory aliases. Existing CA files and the
-selected leaf pair must pass their complete metadata and certificate checks
-before any state is changed. The retained leaf is checked against the local CA
-without consulting ambient trust stores.
+Persistent outputs stay below `/var/lib`, runtime paths below `/run`, and the
+lock file directly below `/run/lock`. Configured output directories must be
+distinct and mutually non-nested. Reconciliation refuses malformed or symlinked
+configured files and directories. The `tls/current` generation link is intentional.
+It serializes writers with `flock`, establishes expected owners and modes, and
+publishes generated files and complete TLS pairs atomically. It does not inspect
+physical ancestor relationships or attempt to defend against hostile local
+mounts and hardlinks.
+
+The shared password remains `root:workspace-portal-owner` with mode `0640`,
+and the CA key remains `root:root` with mode `0600`. These defaults keep their
+existing lifecycle and reduce accidental changes. The nginx group can read the
+generated htpasswd and leaf key. Reconciliation preserves the CA and password,
+checks certificate/key pairs and requested names, and verifies leaves using
+only the local CA. A weekly system service renews certificates and reloads
+nginx. Retained PKI state, TLS generations and migration markers are not removed.
 
 The firewall stays closed unless `services.dev-workspaces.firewall.sourceRanges`
 contains an allowed network.
@@ -135,5 +148,10 @@ Run the complete suite with:
 nix flake check --print-build-logs
 ```
 
-The focused NixOS test is defined in
-`nix/tests/host-module-idempotency.nix`, outside the flake output declaration.
+The NixOS smoke test in `nix/tests/host-module-idempotency.nix` covers
+activation, a stable rerun, nginx authentication and proxy access, renewal,
+interrupted publication, malformed state, concurrency and configuration
+rollback. CI runs it with KVM on `master` and manual dispatch. Dispatch feature
+VM tests after mandatory review; package and focused checks run on every push
+and pull request. Keep normal dependency-update CI below the 20-minute target
+and inspect cold-run timings when changing its workload.
