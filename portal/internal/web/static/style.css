@@ -257,8 +257,11 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .codex-work { margin: .5rem 0; }
 .new-output { display: block; margin: .4rem auto; }
 .chat-actions { flex-wrap: wrap; }
-.message-time { display: block; margin-top: .55rem; color: var(--muted); opacity: .8; font-size: .7rem; line-height: 1.2; font-family: inherit; white-space: normal; }
-.message.user .message-time { text-align: right; }
+.message-footer { display: flex; align-items: center; justify-content: flex-end; gap: .65rem; margin-top: .5rem; white-space: normal; }
+.message-time { color: var(--muted); opacity: .8; font-size: .7rem; line-height: 1.2; font-family: inherit; text-align: right; }
+.message-footer .codex-entry-copy { flex: none; padding: .2rem .4rem; border: 0; background: transparent; color: var(--muted); font-size: .7rem; font-weight: 400; }
+.message-footer .codex-entry-copy:hover, .message-footer .codex-entry-copy:focus-visible { background: var(--panel-2); color: var(--text); }
+.message-footer .codex-entry-copy[data-copy-state="error"] { color: var(--danger); }
 .codex-limits { flex: none; min-width: 0; }
 .codex-limits-panel { padding: .75rem .5rem 0; border-top: 1px solid var(--line); color: var(--text); }
 .codex-limits-panel h2 { margin: 0 0 .7rem; color: var(--muted); font-size: .75rem; font-weight: 600; }

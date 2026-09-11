@@ -97,6 +97,14 @@ Each window contains `usedPercent`, `windowDurationMins` and nullable `resetsAt`
 minute while visible and when focused. A failed refresh keeps prior values
 marked with their last update time.
 
+## Transcript controls
+
+Every message and activity entry has a copy button beside its timestamp in
+the bottom-right footer. Messages copy their original Markdown; commands copy
+the command and full available output. File changes include paths and patches.
+Collapsed entries copy all loaded content, and streaming entries copy the
+content available when selected.
+
 ## Development
 
 Run the package checks and host smoke test with:

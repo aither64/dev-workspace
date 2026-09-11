@@ -568,7 +568,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=2");
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   const limitsPanel = document.getElementById("codex-limits-panel");
@@ -1863,7 +1863,10 @@
     time.textContent = timestamp.text;
     if (timestamp.dateTime) time.dateTime = timestamp.dateTime;
     time.title = timestamp.title;
-    element.append(time);
+    const footer = document.createElement("div");
+    footer.className = "message-footer";
+    footer.append(conversationAssets.createTranscriptCopyButton(entry), time);
+    element.append(footer);
     transcript.append(element);
   };
 
