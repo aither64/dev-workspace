@@ -14,6 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
       - name: Evaluate all checks
         run: nix flake check --no-build --print-build-logs
       - name: Build package and focused checks
@@ -33,5 +37,9 @@ jobs:
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
       - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
       - name: Activation, renewal and rollback smoke test
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.host-module-idempotency
