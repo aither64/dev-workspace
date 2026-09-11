@@ -202,19 +202,9 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 	if tmux == "" {
 		tmux = "tmux"
 	}
-	format := strings.Join([]string{
-		"#{session_id}", "#{session_name}", "#{@dev_session}",
-		"#{@dev_session_slug}", "#{E:DEV_SESSION_WORKSPACE}",
-		"#{E:DEV_SESSION_SLUG}", "#{socket_path}",
-		"#{@dev_session_codex_thread}",
-		"#{@dev_session_codex_socket}",
-		"#{@dev_session_codex_version}",
-		"#{@dev_session_codex_pane}",
-		"#{E:DEV_SESSION_TMUX_IDENTITY}",
-	}, "\t")
 	command := exec.CommandContext(
 		ctx, tmux, "-S", a.TmuxSocket, "display-message", "-p",
-		"-t", a.TmuxSessionID+":", format,
+		"-t", a.TmuxSessionID+":", tmuxAuthorityFormat(),
 	)
 	output, err := command.Output()
 	if err != nil {

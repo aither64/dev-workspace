@@ -170,6 +170,23 @@ func TestRuntimeAuthoritySharedCorpus(t *testing.T) {
 			})
 		}
 	}
+	entries, err := filepath.Glob(filepath.Join(fixtures, "runtime-authority-*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := filepath.Base(entry)
+		if name == "runtime-authority-corpus.json" {
+			continue
+		}
+		if !seen[name] {
+			t.Fatalf("authority corpus manifest omits fixture %q", name)
+		}
+		delete(seen, name)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("authority corpus manifest names missing fixtures: %#v", seen)
+	}
 }
 
 func TestRuntimeLockUsesHostOnlySessionFile(t *testing.T) {

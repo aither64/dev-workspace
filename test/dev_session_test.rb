@@ -3152,6 +3152,20 @@ class DevSessionTest < Minitest::Test
       assert(commands.any? { |line| line.start_with?('thread require-materialized ') })
       create = commands.find { |line| line.start_with?('thread create ') }
       assert_includes(create, '--thread-id thread-manifest')
+      {
+        '--session-slug' => slug,
+        '--workspace' => workspace,
+        '--cwd' => File.join(workspace, 'work', slug),
+        '--worktrees-dir' => File.join(workspace, 'worktrees', slug),
+        '--authority-dir' => authority_dir,
+        '--tmux-socket' => '/run/test/tmux.sock',
+        '--codex-command' => codex,
+        '--socket' => '/run/test/codex.sock',
+        '--codex-version' => '0.152.1',
+        '--portal-command' => RbConfig.ruby
+      }.each do |argument, value|
+        assert_includes(create, "#{argument} #{value}")
+      end
       refute_includes(create, 'thread-stale')
       authority = JSON.parse(File.read(File.join(authority_dir, "#{slug}.json")))
       assert_equal('thread-manifest', authority.fetch('codex_thread_id'))

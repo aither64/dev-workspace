@@ -12,6 +12,53 @@
     { "name": "removal", "command": "delete" },
     { "name": "revive", "command": "revive" }
   ],
+  "tmuxMetadata": {
+    "authorityFormat": [
+      "#{session_id}",
+      "#{session_name}",
+      "#{@dev_session}",
+      "#{@dev_session_slug}",
+      "#{E:DEV_SESSION_WORKSPACE}",
+      "#{E:DEV_SESSION_SLUG}",
+      "#{socket_path}",
+      "#{@dev_session_codex_thread}",
+      "#{@dev_session_codex_socket}",
+      "#{@dev_session_codex_version}",
+      "#{@dev_session_codex_pane}",
+      "#{E:DEV_SESSION_TMUX_IDENTITY}"
+    ],
+    "sessionOptions": [
+      { "name": "@dev_session", "path": false },
+      { "name": "@dev_session_slug", "path": false },
+      { "name": "@dev_session_codex_thread", "path": false },
+      { "name": "@dev_session_codex_socket", "path": true },
+      { "name": "@dev_session_codex_version", "path": false },
+      { "name": "@dev_session_codex_pane", "path": false }
+    ],
+    "windowOptions": [
+      { "name": "@dev_session_window", "path": false },
+      { "name": "@dev_session_worktree", "path": false }
+    ],
+    "environment": [
+      { "name": "DEV_SESSION_SLUG", "path": false },
+      { "name": "DEV_SESSION_WORKSPACE", "path": false },
+      { "name": "DEV_SESSION_WORK_DIR", "path": false },
+      { "name": "DEV_SESSION_WORKTREES_DIR", "path": false },
+      { "name": "DEV_SESSION_PORTAL_BASE_URL", "path": false },
+      { "name": "DEV_SESSION_URL", "path": false },
+      { "name": "DEV_SESSION_PORTAL_COMMAND", "path": true },
+      { "name": "DEV_SESSION_AUTHORITY_DIR", "path": true },
+      { "name": "DEV_SESSION_TMUX_SOCKET", "path": true },
+      { "name": "DEV_SESSION_CODEX", "path": true },
+      { "name": "DEV_SESSION_CODEX_SOCKET", "path": true },
+      { "name": "DEV_SESSION_CODEX_VERSION", "path": false },
+      { "name": "DEV_SESSION_REQUIRE_RUNTIME", "path": false },
+      { "name": "DEV_SESSION_TMUX_IDENTITY", "path": false },
+      { "name": "DEV_SESSION_LIFECYCLE_OPERATION", "path": false },
+      { "name": "DEV_SESSION_LIFECYCLE_LOCK_FD", "path": false },
+      { "name": "DEV_SESSION_LIFECYCLE_LOCK_PATH", "path": true }
+    ]
+  },
   "threadEnvironmentKeys": [
     "DEV_SESSION_SLUG",
     "DEV_SESSION_WORKSPACE",

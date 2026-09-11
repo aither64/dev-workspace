@@ -71,6 +71,49 @@ module DevSession
   ENV_REQUIRE_RUNTIME = 'DEV_SESSION_REQUIRE_RUNTIME'
   ENV_TMUX_IDENTITY = 'DEV_SESSION_TMUX_IDENTITY'
 
+  TMUX_METADATA = RUNTIME_CONTRACT.fetch('tmuxMetadata').freeze
+  TMUX_AUTHORITY_FORMAT = TMUX_METADATA.fetch('authorityFormat').freeze
+  EXPECTED_TMUX_AUTHORITY_FORMAT = [
+    '#{session_id}', '#{session_name}', '#{@dev_session}', '#{@dev_session_slug}',
+    '#{E:DEV_SESSION_WORKSPACE}', '#{E:DEV_SESSION_SLUG}', '#{socket_path}',
+    '#{@dev_session_codex_thread}', '#{@dev_session_codex_socket}',
+    '#{@dev_session_codex_version}', '#{@dev_session_codex_pane}',
+    '#{E:DEV_SESSION_TMUX_IDENTITY}'
+  ].freeze
+  unless TMUX_AUTHORITY_FORMAT == EXPECTED_TMUX_AUTHORITY_FORMAT
+    raise 'workspace runtime contract has an invalid tmux authority format'
+  end
+
+  def self.tmux_metadata_values(name)
+    values = TMUX_METADATA.fetch(name)
+    unless values.is_a?(Array) && values.all? do |value|
+             value.is_a?(Hash) && value.keys.sort == %w[name path] &&
+               value.fetch('name').is_a?(String) && [true, false].include?(value.fetch('path'))
+           end
+      raise "workspace runtime contract has invalid tmux #{name}"
+    end
+
+    values
+  end
+
+  TMUX_SESSION_OPTIONS = tmux_metadata_values('sessionOptions').freeze
+  TMUX_WINDOW_OPTIONS = tmux_metadata_values('windowOptions').freeze
+  TMUX_ENVIRONMENT = tmux_metadata_values('environment').freeze
+  unless TMUX_SESSION_OPTIONS.map { |value| value.fetch('name') } == [
+           SESSION_MARK, SESSION_SLUG, SESSION_CODEX_THREAD, SESSION_CODEX_SOCKET,
+           SESSION_CODEX_VERSION, SESSION_CODEX_PANE
+         ] &&
+         TMUX_WINDOW_OPTIONS.map { |value| value.fetch('name') } == [WINDOW_KIND, WINDOW_WORKTREE] &&
+         TMUX_ENVIRONMENT.map { |value| value.fetch('name') } == [
+           ENV_SLUG, ENV_WORKSPACE, ENV_WORK_DIR, ENV_WORKTREES_DIR, ENV_PORTAL_BASE_URL,
+           ENV_PORTAL_URL, ENV_PORTAL_COMMAND, ENV_AUTHORITY_DIR, ENV_TMUX_SOCKET,
+           ENV_CODEX_COMMAND, ENV_CODEX_SOCKET, ENV_CODEX_VERSION, ENV_REQUIRE_RUNTIME,
+           ENV_TMUX_IDENTITY, 'DEV_SESSION_LIFECYCLE_OPERATION',
+           'DEV_SESSION_LIFECYCLE_LOCK_FD', 'DEV_SESSION_LIFECYCLE_LOCK_PATH'
+         ]
+    raise 'workspace runtime contract does not match the dev-session tmux metadata projection'
+  end
+
   THREAD_ENV_ARGUMENTS = {
     ENV_SLUG => '--session-slug',
     ENV_WORKSPACE => '--workspace',
@@ -229,20 +272,7 @@ module DevSession
       end
     end
 
-    SESSION_FORMAT = [
-      "\#{session_id}",
-      "\#{session_name}",
-      "\#{#{SESSION_MARK}}",
-      "\#{#{SESSION_SLUG}}",
-      "\#{E:#{ENV_WORKSPACE}}",
-      "\#{E:#{ENV_SLUG}}",
-      "\#{socket_path}",
-      "\#{#{SESSION_CODEX_THREAD}}",
-      "\#{#{SESSION_CODEX_SOCKET}}",
-      "\#{#{SESSION_CODEX_VERSION}}",
-      "\#{#{SESSION_CODEX_PANE}}",
-      "\#{E:#{ENV_TMUX_IDENTITY}}"
-    ].join("\t")
+    SESSION_FORMAT = TMUX_AUTHORITY_FORMAT.join("\t")
 
     def self.session_target(session)
       session.start_with?('$') ? "#{session}:" : "=#{session}:"
