@@ -8,10 +8,28 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
-  <header class="topbar">
-    <div><p class="eyebrow">{{.DisplayLabel}}</p><h1>Workspace</h1></div>
-  </header>
-  <main class="page">
+  <div class="workspace-shell index-shell">
+  <aside class="workspace-sidebar index-sidebar">
+    <header class="sidebar-heading"><p class="eyebrow">{{.DisplayLabel}}</p><h1>Workspace</h1></header>
+    <section>
+      <div class="section-heading"><h2>Work</h2><span id="active-count">{{len .Active}}</span></div>
+      <div class="session-grid" data-session-list="active">
+        {{range .Active}}
+          {{template "session-card" .}}
+        {{else}}<p class="empty">No portal-enabled work sessions.</p>{{end}}
+      </div>
+    </section>
+
+    <details class="archive-list">
+      <summary>Archive <span id="archive-count">{{len .Archived}}</span></summary>
+      <div class="session-grid" data-session-list="archived">
+        {{range .Archived}}
+          {{template "session-card" .}}
+        {{else}}<p class="empty">No portal-enabled archived sessions.</p>{{end}}
+      </div>
+    </details>
+  </aside>
+  <main class="page index-page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
     <p id="index-status-warning" class="notice warning" hidden></p>
     <section class="panel new-session">
@@ -34,38 +52,22 @@
       <div id="operation-list" class="operation-list" aria-live="polite"></div>
     </section>
 
-    <section>
-      <div class="section-heading"><h2>Work</h2><span>{{len .Active}}</span></div>
-      <div class="session-grid">
-        {{range .Active}}
-          <a class="session-card" href="/{{.Slug}}/" data-session-slug="{{.Slug}}">
-            <span class="status-dot active"></span>
-            <strong>{{.Slug}}</strong>
-            <span class="muted" data-session-updated data-updated-at="{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">Updated {{timeAgo .UpdatedAt}}</span>
-            <span data-session-repositories>{{len .Repositories}} repositories</span>
-            <span class="cluster-summary" data-session-clusters hidden></span>
-            <span class="badge warning" data-session-lifecycle hidden></span>
-          </a>
-        {{else}}<p class="empty">No portal-enabled work sessions.</p>{{end}}
-      </div>
-    </section>
 
-    <section>
-      <div class="section-heading"><h2>Archive</h2><span>{{len .Archived}}</span></div>
-      <div class="session-grid">
-        {{range .Archived}}
-          <a class="session-card archived" href="/{{.Slug}}/" data-session-slug="{{.Slug}}">
-            <span class="status-dot"></span>
-            <strong>{{.Slug}}</strong>
-            <span class="muted" data-session-updated data-updated-at="{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}">Finalized {{timeAgo .UpdatedAt}}</span>
-            <span data-session-repositories>{{len .Repositories}} repositories</span>
-            <span class="badge warning" data-session-lifecycle hidden></span>
-          </a>
-        {{else}}<p class="empty">No portal-enabled archived sessions.</p>{{end}}
-      </div>
-    </section>
   </main>
+  </div>
+  <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/app.js" defer></script>
 </body>
 </html>
+{{end}}
+
+{{define "session-card"}}
+<a class="session-card{{with .}}{{if .Archived}} archived{{end}}{{end}}" href="{{with .}}/{{.Slug}}/{{end}}" data-session-slug="{{with .}}{{.Slug}}{{end}}">
+  <span class="status-dot{{with .}}{{if not .Archived}} active{{end}}{{end}}"></span>
+  <strong>{{with .}}{{.Slug}}{{end}}</strong>
+  <span class="muted" data-session-updated data-updated-at="{{with .}}{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}{{end}}">{{with .}}{{if .Archived}}Finalized{{else}}Updated{{end}} {{timeAgo .UpdatedAt}}{{end}}</span>
+  <span data-session-repositories>{{with .}}{{len .Repositories}} repositories{{end}}</span>
+  <span class="cluster-summary" data-session-clusters hidden></span>
+  <span class="badge warning" data-session-lifecycle hidden></span>
+</a>
 {{end}}

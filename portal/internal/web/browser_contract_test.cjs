@@ -11,12 +11,12 @@ const {
   loadRequestInputDraft, loadSendAttempts, markTranscriptMessagesObserved,
   matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
-  sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript,
+  sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript, transcriptFollowOnScroll,
   shouldSubmitMessage, storeQueueAttempt,
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
-  activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
+  activityAge, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
@@ -58,6 +58,13 @@ assert.equal(shouldSubmitMessage({key: "Enter", shiftKey: false, isComposing: tr
 assert.equal(shouldSubmitMessage({key: "a", shiftKey: false, isComposing: false}), false);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 580}), true);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 300}), false);
+// Composer/receipt resizing must not change following; actual scrolling must.
+const transcriptBeforeResize = {scrollHeight: 1000, clientHeight: 400, scrollTop: 600};
+const transcriptAfterResize = {...transcriptBeforeResize, clientHeight: 250};
+assert.equal(transcriptFollowOnScroll(true, transcriptAfterResize, false), true);
+assert.equal(transcriptFollowOnScroll(true, transcriptAfterResize, true), false);
+assert.equal(transcriptFollowOnScroll(false, transcriptBeforeResize, false), false);
+assert.equal(transcriptFollowOnScroll(false, transcriptBeforeResize, true), true);
 assert.deepEqual(indexStatusOrder([
   {slug: "older", updatedAt: "2026-09-08T10:00:00Z"},
   {slug: "newer-b", updatedAt: "2026-09-09T10:00:00Z"},
@@ -65,20 +72,6 @@ assert.deepEqual(indexStatusOrder([
 ]).map((entry) => entry.slug), ["newer-a", "newer-b", "older"]);
 assert.equal(indexStatusFreshForPage("2026-09-09T10:00:01Z", "2026-09-09T10:00:00Z"), false);
 assert.equal(indexStatusFreshForPage("2026-09-09T10:00:00Z", "2026-09-09T10:00:01Z"), true);
-assert.equal(indexMembershipChanged([], [], true), false);
-assert.equal(indexMembershipChanged([], [{slug: "new", archived: false}], true), true);
-assert.equal(indexMembershipChanged([{slug: "deleted", archived: false}], [], true), true);
-assert.equal(indexMembershipChanged([{slug: "retained", archived: false}], [], false), false);
-assert.equal(indexMembershipChanged(
-  [{slug: "one", archived: false}, {slug: "two", archived: true}],
-  [{slug: "two", archived: true}, {slug: "one", archived: false}], true,
-), false);
-assert.equal(indexMembershipChanged(
-  [{slug: "moved", archived: false}], [{slug: "moved", archived: true}], true,
-), true);
-assert.equal(indexMembershipChanged(
-  [{slug: "moved", archived: true}], [{slug: "moved", archived: false}], true,
-), true);
 assert.equal(activityAge("2026-09-09T09:59:30Z", Date.parse("2026-09-09T10:00:00Z")), "just now");
 assert.equal(activityAge("2026-09-09T09:55:00Z", Date.parse("2026-09-09T10:00:00Z")), "5m ago");
 assert.equal(sessionTabFromHash("#repositories", ["codex", "repositories"], "codex"), "repositories");
@@ -511,6 +504,13 @@ if (!unitOnly) {
   assert.doesNotMatch(sessionHTML, /data-codex-mode=/);
   assert.doesNotMatch(sessionHTML, /codex-settings-dialog|codex-settings-open/);
 
+  const details = await client.details();
+  assert.equal(details.repositoryCount, 0);
+  assert.equal(details.artifactCount, 2);
+  assert.match(details.artifactsHTML, /data-artifact-path="plan.md"/);
+  assert.match(sessionHTML, /aria-orientation="vertical"/);
+  assert.ok(sessionHTML.indexOf('id="transcript"') < sessionHTML.indexOf('id="queue-panel"'));
+  assert.ok(sessionHTML.indexOf('id="queue-panel"') < sessionHTML.indexOf('id="message-form"'));
   const thread = await client.thread();
   assert.equal(thread.threadId, "thread-1");
   assert.equal(thread.status, "idle");

@@ -78,11 +78,12 @@ type Config struct {
 }
 
 type cachedRepositories struct {
-	statuses []repository.Status
-	created  time.Time
-	updated  time.Time
-	terminal bool
-	archived bool
+	repositories string
+	statuses     []repository.Status
+	created      time.Time
+	updated      time.Time
+	terminal     bool
+	archived     bool
 }
 
 type indexSessionStatus struct {
@@ -171,6 +172,7 @@ type pageData struct {
 	Archived          []session.Summary
 	Session           *session.Summary
 	Repositories      []repository.Status
+	RepositoryWarning string
 	Clusters          []cluster.Status
 	Artifacts         []session.Artifact
 	PendingLifecycle  string
@@ -798,9 +800,42 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	s.render(w, "session", data)
 }
 
+// sessionDetails refreshes the existing sections without replacing the conversation.
+func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	var warning string
+	if !summary.Archived {
+		repositories, err := session.ActiveRepositoriesContext(r.Context(), s.config.Workspace, summary.Slug, summary.Repositories)
+		if err != nil {
+			s.config.Logger.Printf("refresh repositories for %s: %v", summary.Slug, err)
+			warning = "Some live worktrees could not be verified: " + err.Error()
+		}
+		summary.Repositories = repositories
+	}
+	data := pageData{Session: summary, Repositories: s.repositories(r.Context(), summary), RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary)}
+	var repositories, artifacts bytes.Buffer
+	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render repositories"})
+		return
+	}
+	if err := s.templates.ExecuteTemplate(&artifacts, "artifact-list", data); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render artifacts"})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
+		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts),
+	})
+}
+
 func (s *Server) repositories(ctx context.Context, summary *session.Summary) []repository.Status {
+	repositoryJSON, _ := json.Marshal(summary.Repositories)
+	cacheDuration := 5 * time.Second
+	if summary.Archived {
+		cacheDuration = time.Minute
+	}
 	s.repositoryMu.Lock()
-	if cached, ok := s.repositoryCache[summary.Slug]; summary.Archived && ok && time.Since(cached.created) < time.Minute &&
+	if cached, ok := s.repositoryCache[summary.Slug]; ok && time.Since(cached.created) < cacheDuration && cached.repositories == string(repositoryJSON) &&
 		cached.updated.Equal(summary.ManifestUpdatedAt) && cached.terminal == summary.Terminal && cached.archived == summary.Archived {
 		result := append([]repository.Status(nil), cached.statuses...)
 		s.repositoryMu.Unlock()
@@ -814,7 +849,7 @@ func (s *Server) repositories(ctx context.Context, summary *session.Summary) []r
 	)
 	s.repositoryMu.Lock()
 	s.repositoryCache[summary.Slug] = cachedRepositories{
-		statuses: append([]repository.Status(nil), statuses...), created: time.Now(),
+		statuses: append([]repository.Status(nil), statuses...), created: time.Now(), repositories: string(repositoryJSON),
 		updated: summary.ManifestUpdatedAt, terminal: summary.Terminal, archived: summary.Archived,
 	}
 	s.repositoryMu.Unlock()
@@ -1259,6 +1294,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "details" {
+		s.sessionDetails(w, r, summary)
+		return
+	}
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
 		s.releaseCluster(w, r, summary)
 		return

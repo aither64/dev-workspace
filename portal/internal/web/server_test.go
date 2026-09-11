@@ -1407,7 +1407,7 @@ func TestTerminalSessionWithoutRuntimeDoesNotRenderMutationControls(t *testing.T
 	}
 }
 
-func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
+func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
@@ -1425,7 +1425,7 @@ func TestSessionPageUsesFullWidthTopLevelTabs(t *testing.T) {
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
-		`class="panel session-tabs"`, `href="#codex"`, `data-session-tab="codex"`,
+		`class="workspace-sidebar"`, `aria-orientation="vertical"`, `class="session-tabs"`, `href="#codex"`, `data-session-tab="codex"`,
 		`data-lifecycle-target-id="` + strings.Repeat("a", 64) + `"`,
 		`href="#handoff"`, `data-session-tab="handoff"`,
 		`href="#repositories"`, `data-session-tab="repositories"`,

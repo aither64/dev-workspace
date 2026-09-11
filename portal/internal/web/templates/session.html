@@ -7,17 +7,30 @@
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
-  <header class="topbar">
-    <div><a href="/" class="eyebrow">← Workspace</a><h1>{{.Session.Slug}}</h1></div>
-    <div class="header-actions">
-      {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet">Fork session</button>{{end}}
-      {{if eq .PendingLifecycle "archive"}}<button id="archive-session-open" type="button">Retry archive</button>{{else if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button">Retry revive</button>{{else if not .PendingLifecycle}}{{if .Session.Archived}}<button id="revive-session-open" type="button">Revive session</button>{{else}}<button id="archive-session-open" type="button">Archive session</button>{{end}}{{end}}
-      <button id="delete-session-open" type="button" class="danger">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</button>
+<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+  <div class="workspace-shell">
+  <aside class="workspace-sidebar">
+  <header class="sidebar-heading">
+    <div><a href="/" class="sidebar-home" title="Workspace" aria-label="Workspace"><span aria-hidden="true" class="rail-icon">⌂</span><span class="rail-label">Workspace</span></a><h1>{{.Session.Slug}}</h1></div>
+  </header>
+    {{if not .LifecycleOnly}}
+      <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
+        {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇</span><span class="rail-label">Codex</span></a>{{end}}
+        <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
+        <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
+        <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
+        <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
+      </nav>
+    {{end}}
+    <div class="sidebar-actions">
+      {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
+      {{if eq .PendingLifecycle "archive"}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Retry archive</span></button>{{else if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{else if not .PendingLifecycle}}{{if .Session.Archived}}<button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>{{else}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Archive session</span></button>{{end}}{{end}}
+      <button id="delete-session-open" type="button" class="danger" title="Delete session" aria-label="Delete session"><span class="rail-icon" aria-hidden="true">×</span><span class="rail-label">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</span></button>
       <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .Session.Interactive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
     </div>
-  </header>
+  </aside>
   <main class="page session-page">
+    <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
     <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
@@ -26,18 +39,18 @@
     {{if .LifecycleOnly}}
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
-    <section class="panel session-tabs">
-      <nav class="tabs" role="tablist" aria-label="Session sections">
-        {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex">Codex</a>{{end}}
-        <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff">Handoff</a>
-        <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories">Repositories</a>
-        <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</a>
-        <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts">Artifacts ({{len .Artifacts}})</a>
-      </nav>
+    <section class="session-tabs">
+
 
       {{if .Session.Codex.ThreadID}}
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel" aria-labelledby="session-tab-codex">
-        <div class="chat-heading"><div><p class="eyebrow">Codex</p><h2>Session</h2></div><div class="chat-heading-actions"><span id="codex-status" class="badge">Connecting</span></div></div>
+        <div class="chat-heading"><h2>Codex</h2><div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
+          <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="all">All</button>
+          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="messages">Messages</button>
+          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
+        </div><span id="codex-status" class="badge">Connecting</span></div>
+        <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
+        <div class="composer-context">
         {{if .Session.Interactive}}
         <div id="pending" class="pending"></div>
         <div id="message-receipts" class="message-receipts" hidden></div>
@@ -46,12 +59,6 @@
           <ol id="queue-list"></ol>
         </section>
         {{end}}
-        <div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
-          <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="all">All</button>
-          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="messages">Messages</button>
-          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
-        </div>
-        <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         <div id="codex-work" class="codex-work" aria-live="polite" hidden><span>Codex is working</span><time id="codex-work-elapsed">0s elapsed</time></div>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
         {{if .Session.Interactive}}
@@ -60,6 +67,7 @@
           <div class="approval-actions"><button id="plan-implement-same" type="button">Implement here</button><button id="plan-implement-new" type="button" class="quiet">New session…</button><button id="plan-keep-planning" type="button" class="quiet">Keep planning</button></div>
         </section>
         {{end}}
+        </div>
         {{if .Session.Interactive}}
         <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
@@ -81,37 +89,7 @@
       </section>
 
       <section id="repositories" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-repositories">
-        <div class="section-heading"><h2>Repositories</h2><span>{{len .Repositories}}</span></div>
-        <div class="repo-grid">
-        {{range .Repositories}}
-          <article class="panel repo-card">
-            <div class="repo-title"><h3>{{.Name}}</h3>{{if not $.Session.Archived}}{{if eq .PushStatus "exactly-pushed"}}<span class="badge active">Pushed</span>{{else if eq .PushStatus "not-pushed"}}<span class="badge warning">Not pushed</span>{{else if eq .PushStatus "remote-ahead"}}<span class="badge warning">GitHub ahead</span>{{else if eq .PushStatus "divergent"}}<span class="badge danger">Diverged</span>{{else}}<span class="badge warning">Unknown</span>{{end}}{{end}}</div>
-            <dl>
-              <dt>Branch</dt><dd><code>{{.Branch}}</code></dd>
-              {{if $.Session.Archived}}
-                {{if .HeadSHA}}<dt>Final HEAD</dt><dd><code>{{shortSHA .HeadSHA}}</code></dd>{{end}}
-              {{else}}
-                {{if .LocalHeadSHA}}<dt>Local HEAD</dt><dd><code>{{shortSHA .LocalHeadSHA}}</code></dd>{{end}}
-                {{if .RemoteHeadSHA}}<dt>GitHub HEAD</dt><dd><code>{{shortSHA .RemoteHeadSHA}}</code></dd>{{end}}
-              {{end}}
-              {{if .DefaultBranch}}<dt>Default branch</dt><dd><code>{{.DefaultBranch}}</code></dd>{{end}}
-            </dl>
-            <nav class="link-row">
-              {{if $.Session.Archived}}
-                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
-                {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Final revision</a>{{end}}
-              {{else if .RemoteHeadSHA}}
-                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
-                {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Branch</a>{{end}}
-              {{end}}
-              {{if .ActionsURL}}<a href="{{.ActionsURL}}" target="_blank" rel="noreferrer">Actions</a>{{end}}
-            </nav>
-            {{if .StatusError}}<p class="notice warning">Repository: {{.StatusError}}</p>{{end}}
-            {{if .GitHubError}}<p class="notice warning">GitHub: {{.GitHubError}}</p>{{end}}
-            {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
-          </article>
-        {{else}}<p class="empty">Codex has not added any repository worktrees yet.</p>{{end}}
-        </div>
+        {{template "repositories" .}}
       </section>
 
       <section id="clusters" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-clusters">
@@ -151,7 +129,7 @@
 
       <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel" aria-labelledby="session-tab-artifacts">
         <div class="artifact-list" role="list" aria-label="Session artifacts">
-          {{range .Artifacts}}<button type="button" class="artifact-select quiet" data-artifact-path="{{.Path}}" data-artifact-label="{{.Label}}">{{.Label}}</button>{{end}}
+          {{template "artifact-list" .}}
         </div>
         <div class="artifact-view">
           <div class="section-heading"><h2 id="artifact-title">Artifacts</h2><a id="artifact-download" class="button-link" href="#" hidden>Download</a></div>
@@ -161,6 +139,7 @@
     </section>
     {{end}}
   </main>
+  </div>
   {{if .Session.Interactive}}
   <dialog id="fork-dialog">
     <form id="fork-form" class="stack">

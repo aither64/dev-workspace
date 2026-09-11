@@ -26,6 +26,7 @@
     releaseCluster: (kind) => request(apiPath(slug, "release-cluster"), {
       method: "POST", body: JSON.stringify({kind}),
     }),
+    details: () => request(apiPath(slug, "details")),
     artifactPreview: (path) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`),
     archive: (mode, targetId) => request(apiPath(slug, "archive"), {
       method: "POST", body: JSON.stringify({mode, targetId}),
@@ -55,6 +56,14 @@
     snooze: conversation?.snooze,
     eventsPath: conversation?.eventsPath,
   });
+  const setControlLabel = (control, label) => {
+    const target = control.querySelector(".rail-label") || control;
+    target.textContent = label;
+    if (target !== control) {
+      control.title = label;
+      control.setAttribute("aria-label", label);
+    }
+  };
   const automaticReasoningLabel = () => "Automatic";
   const messageActionLabel = (active) => active ? "Steer now" : "Send";
   const shouldSubmitMessage = (event) => (
@@ -62,6 +71,9 @@
   );
   const shouldFollowTranscript = (element, threshold = 48) => (
     element.scrollHeight - element.clientHeight - element.scrollTop <= threshold
+  );
+  const transcriptFollowOnScroll = (follow, element, userInitiated) => (
+    userInitiated ? shouldFollowTranscript(element) : follow
   );
   const sendAcknowledgementCandidates = (entries, attempts, excludedIDs = new Set(), limit = 100) => {
     const observed = new Map((entries || []).filter((entry) => (
@@ -196,14 +208,6 @@
     const pageTime = Date.parse(pageGeneratedAt || "");
     const statusTime = Date.parse(statusGeneratedAt || "");
     return Number.isFinite(pageTime) && Number.isFinite(statusTime) && statusTime >= pageTime;
-  };
-  const indexMembershipChanged = (cards, statuses, authoritative) => {
-    if (!authoritative) return false;
-    const identity = (item) => `${String(item?.slug || "")}\u0000${item?.archived === true ? "archived" : "active"}`;
-    const current = new Set((cards || []).map(identity));
-    const updated = new Set((statuses || []).map(identity));
-    if (current.size !== updated.size) return true;
-    return Array.from(current).some((slug) => !updated.has(slug));
   };
   const lifecycleKindLabel = (kind) => ({
     archive: "Archive", delete: "Delete", revive: "Revive",
@@ -522,13 +526,13 @@
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
       markTranscriptMessagesObserved, matchingSendAttempt,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
-      requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript,
+      requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript, transcriptFollowOnScroll,
       renderCollaborationModes,
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
-      activityAge, fileChangeDiffs, formatElapsed, indexMembershipChanged, indexStatusFreshForPage,
+      activityAge, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
@@ -707,19 +711,40 @@
         nextRefresh = 1000;
         return;
       }
-      const cards = Array.from(document.querySelectorAll("[data-session-slug]"));
-      if (indexMembershipChanged(
-        cards.map((card) => ({
-          slug: card.dataset.sessionSlug, archived: card.classList.contains("archived"),
-        })), statuses, payload.authoritative,
-      )) {
-        location.reload();
-        return;
+      const sidebar = document.querySelector(".index-sidebar");
+      const previousSidebarTop = sidebar?.scrollTop || 0;
+      const existing = new Map(Array.from(document.querySelectorAll("[data-session-slug]"))
+        .map((card) => [card.dataset.sessionSlug, card]));
+      const present = new Set(statuses.map((item) => item.slug));
+      if (payload.authoritative) {
+        for (const [slug, card] of existing) if (!present.has(slug)) card.remove();
       }
+      for (const item of statuses) {
+        let card = existing.get(item.slug);
+        if (!card) {
+          card = document.getElementById("session-card-template").content.firstElementChild.cloneNode(true);
+          card.dataset.sessionSlug = item.slug;
+          card.href = `/${encodeURIComponent(item.slug)}/`;
+          card.querySelector("strong").textContent = item.slug;
+        }
+        card.classList.toggle("archived", item.archived);
+        card.querySelector(".status-dot").classList.toggle("active", !item.archived);
+        document.querySelector(`[data-session-list="${item.archived ? "archived" : "active"}"]`).append(card);
+      }
+      for (const [kind, counter] of [["active", "active-count"], ["archived", "archive-count"]]) {
+        const list = document.querySelector(`[data-session-list="${kind}"]`);
+        const count = list.querySelectorAll("[data-session-slug]").length;
+        document.getElementById(counter).textContent = String(count);
+        list.querySelectorAll(".empty").forEach((element) => element.remove());
+        if (!count) {
+          const empty = document.createElement("p");
+          empty.className = "empty";
+          empty.textContent = kind === "active" ? "No work sessions." : "No archived sessions.";
+          list.append(empty);
+        }
+      }
+      const cards = Array.from(document.querySelectorAll("[data-session-slug]"));
       const bySlug = new Map(statuses.map((item) => [item.slug, item]));
-      const visibleAnchor = cards.map((card) => ({card, rect: card.getBoundingClientRect()}))
-        .filter(({rect}) => rect.bottom >= 0 && rect.top <= innerHeight)
-        .sort((left, right) => left.rect.top - right.rect.top)[0];
       for (const card of cards) {
         const item = bySlug.get(card.dataset.sessionSlug);
         if (!item) continue;
@@ -754,10 +779,7 @@
         warning.textContent = payload.warning || "";
         warning.hidden = !warning.textContent;
       }
-      if (visibleAnchor) {
-        const top = visibleAnchor.card.getBoundingClientRect().top;
-        scrollBy(0, top - visibleAnchor.rect.top);
-      }
+      if (sidebar) sidebar.scrollTop = previousSidebarTop;
     } catch (error) {
       if (warning) {
         warning.textContent = `Live session status is temporarily unavailable: ${error.message}`;
@@ -891,7 +913,7 @@
     });
   });
 
-  const sessionTabBar = document.querySelector(".session-tabs > .tabs");
+  const sessionTabBar = document.querySelector('[aria-label="Session sections"]');
   const sessionTabs = Array.from(sessionTabBar?.children || []).filter((element) => (
     element.matches("a[data-session-tab]")
   ));
@@ -907,10 +929,20 @@
       tab.tabIndex = selected ? 0 : -1;
     });
     sessionPanels.forEach((panel) => panel.classList.toggle("active", panel.id === target));
+    document.dispatchEvent(new CustomEvent("session-section-change", {detail: target}));
   };
-  sessionTabs.forEach((tab) => tab.addEventListener("click", () => {
-    activateSessionTab(tab.dataset.sessionTab);
-  }));
+  sessionTabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => activateSessionTab(tab.dataset.sessionTab));
+    tab.addEventListener("keydown", (event) => {
+      const next = event.key === "ArrowDown" ? (index + 1) % sessionTabs.length :
+        event.key === "ArrowUp" ? (index + sessionTabs.length - 1) % sessionTabs.length :
+          event.key === "Home" ? 0 : event.key === "End" ? sessionTabs.length - 1 : -1;
+      if (next < 0) return;
+      event.preventDefault();
+      sessionTabs[next].focus();
+      sessionTabs[next].click();
+    });
+  });
   const activateSessionHash = () => activateSessionTab(sessionTabFromHash(
     location.hash, sessionTabs.map((tab) => tab.dataset.sessionTab), defaultSessionTab,
   ));
@@ -1131,7 +1163,8 @@
     }
   });
 
-  const artifactButtons = Array.from(document.querySelectorAll("[data-artifact-path]"));
+  const artifactList = document.querySelector(".artifact-list");
+  const artifactButtons = () => Array.from(artifactList?.querySelectorAll("[data-artifact-path]") || []);
   const artifactPreview = document.getElementById("artifact-preview");
   const artifactTitle = document.getElementById("artifact-title");
   const artifactDownload = document.getElementById("artifact-download");
@@ -1140,7 +1173,7 @@
     const path = button.dataset.artifactPath;
     if (!path || !artifactPreview) return;
     selectedArtifactPath = path;
-    artifactButtons.forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+    artifactButtons().forEach((candidate) => candidate.classList.toggle("active", candidate === button));
     artifactTitle.textContent = button.dataset.artifactLabel || path;
     artifactDownload.href = `/artifacts/${encodeURIComponent(slug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
     artifactDownload.hidden = false;
@@ -1174,10 +1207,72 @@
       artifactPreview.replaceChildren(notice);
     }
   };
-  artifactButtons.forEach((button) => button.addEventListener("click", () => showArtifact(button)));
-  document.querySelector('[data-session-tab="artifacts"]')?.addEventListener("click", () => {
-    if (!selectedArtifactPath && artifactButtons[0]) showArtifact(artifactButtons[0]);
+  artifactList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-artifact-path]");
+    if (button) showArtifact(button);
   });
+  document.querySelector('[data-session-tab="artifacts"]')?.addEventListener("click", () => {
+    if (!selectedArtifactPath && artifactButtons()[0]) showArtifact(artifactButtons()[0]);
+  });
+
+  let detailsTimer = null;
+  let detailsRunning = false;
+  let lastRepositoriesHTML = "";
+  let lastArtifactsHTML = "";
+  const refreshSessionDetails = async () => {
+    if (detailsRunning || document.hidden || !artifactList) return;
+    if (detailsTimer !== null) clearTimeout(detailsTimer);
+    detailsRunning = true;
+    const warning = document.getElementById("session-details-warning");
+    try {
+      const payload = await client.details();
+      if (payload.repositoriesHTML !== lastRepositoriesHTML) {
+        const repositories = document.getElementById("repositories");
+        const previousTop = repositories.scrollTop;
+        repositories.innerHTML = payload.repositoriesHTML;
+        repositories.scrollTop = previousTop;
+        lastRepositoriesHTML = payload.repositoriesHTML;
+      }
+      if (payload.artifactsHTML !== lastArtifactsHTML) {
+        artifactList.innerHTML = payload.artifactsHTML;
+        lastArtifactsHTML = payload.artifactsHTML;
+        const selected = artifactButtons().find((button) => button.dataset.artifactPath === selectedArtifactPath);
+        if (selected) {
+          selected.classList.add("active");
+          artifactTitle.textContent = selected.dataset.artifactLabel || selectedArtifactPath;
+        } else if (selectedArtifactPath) {
+          selectedArtifactPath = "";
+          artifactTitle.textContent = "Artifacts";
+          artifactDownload.hidden = true;
+          artifactPreview.textContent = "Choose an artifact to preview it.";
+        }
+      }
+      for (const [section, label, count] of [
+        ["repositories", "Repositories", payload.repositoryCount], ["artifacts", "Artifacts", payload.artifactCount],
+      ]) {
+        const tab = document.querySelector(`[data-session-tab="${section}"]`);
+        const title = `${label} (${count})`;
+        if (tab) {
+          tab.querySelector(".rail-label").textContent = title;
+          tab.title = title;
+          tab.setAttribute("aria-label", title);
+        }
+      }
+      warning.hidden = true;
+    } catch (error) {
+      warning.textContent = `Session details could not be refreshed: ${error.message}`;
+      warning.hidden = false;
+    } finally {
+      detailsRunning = false;
+      detailsTimer = setTimeout(refreshSessionDetails, 15_000);
+    }
+  };
+  sessionTabs.forEach((tab) => tab.addEventListener("click", refreshSessionDetails));
+  addEventListener("focus", refreshSessionDetails);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshSessionDetails();
+  });
+  refreshSessionDetails();
 
   const archiveDialog = document.getElementById("archive-session-dialog");
   const archiveForm = document.getElementById("archive-session-form");
@@ -1185,10 +1280,10 @@
   const retryArchive = async () => {
     const resetControl = () => {
       archiveOpen.disabled = false;
-      archiveOpen.textContent = "Retry archive";
+      setControlLabel(archiveOpen, "Retry archive");
     };
     archiveOpen.disabled = true;
-    archiveOpen.textContent = "Archiving…";
+    setControlLabel(archiveOpen, "Archiving…");
     let operation = null;
     try {
       operation = await operationForRetry("archive");
@@ -1269,11 +1364,11 @@
     const resetControl = () => {
       if (!control) return;
       control.disabled = false;
-      control.textContent = "Retry revive";
+      setControlLabel(control, "Retry revive");
     };
     if (control) {
       control.disabled = true;
-      control.textContent = "Reviving…";
+      setControlLabel(control, "Reviving…");
     }
     let operation = null;
     try {
@@ -1375,18 +1470,18 @@
     if (!container) return;
     container.replaceChildren();
     for (const entry of pendingMessages.values()) {
+      if (entry.state === "accepted") continue;
       const item = document.createElement("div");
       item.className = "message-receipt";
       const statusText = document.createElement("strong");
       statusText.textContent = entry.state === "sending" ? "Sending…" :
-        entry.state === "unknown" ? "Outcome unknown — retry to check" :
-          entry.steered ? "Steer accepted" : "Message accepted";
+        "Outcome unknown. Retry to check.";
       const messageText = document.createElement("span");
       messageText.textContent = entry.message;
       item.append(statusText, messageText);
       container.append(item);
     }
-    container.hidden = pendingMessages.size === 0;
+    container.hidden = container.childElementCount === 0;
   };
 
   const acknowledgeTranscriptMessages = (entries) => {
@@ -1462,21 +1557,63 @@
     panel.hidden = digest === dismissedPlanSHA;
   };
 
-  document.getElementById("new-output")?.addEventListener("click", (event) => {
-    transcript.scrollTop = transcript.scrollHeight;
-    event.currentTarget.hidden = true;
-  });
-  transcript.addEventListener("scroll", () => {
+  let transcriptUserScroll = false;
+  let transcriptScrollTimer = null;
+  let transcriptPointerDown = false;
+  let transcriptTouchY = null;
+  const followTranscript = () => {
     const view = transcriptViews.get(transcriptFilter);
-    if (view) {
-      view.follow = shouldFollowTranscript(transcript);
-      view.scrollTop = transcript.scrollTop;
-      view.initialized = true;
+    view.follow = true;
+    transcriptUserScroll = false;
+    if (transcriptScrollTimer !== null) clearTimeout(transcriptScrollTimer);
+    transcript.scrollTop = transcript.scrollHeight;
+    document.getElementById("new-output").hidden = true;
+  };
+  const beginTranscriptScroll = (pause = false) => {
+    transcriptUserScroll = true;
+    if (pause) transcriptViews.get(transcriptFilter).follow = false;
+    if (transcriptScrollTimer !== null) clearTimeout(transcriptScrollTimer);
+    transcriptScrollTimer = setTimeout(() => { transcriptUserScroll = false; }, 800);
+  };
+  transcript.tabIndex = 0;
+  transcript.addEventListener("wheel", (event) => beginTranscriptScroll(event.deltaY < 0), {passive: true});
+  transcript.addEventListener("touchstart", (event) => {
+    transcriptTouchY = event.touches[0]?.clientY ?? null;
+    beginTranscriptScroll();
+  }, {passive: true});
+  transcript.addEventListener("touchmove", (event) => {
+    const position = event.touches[0]?.clientY ?? null;
+    beginTranscriptScroll(position !== null && transcriptTouchY !== null && position > transcriptTouchY);
+    transcriptTouchY = position;
+  }, {passive: true});
+  transcript.addEventListener("pointerdown", () => {
+    transcriptPointerDown = true;
+    beginTranscriptScroll();
+  });
+  addEventListener("pointerup", () => { transcriptPointerDown = false; });
+  addEventListener("pointercancel", () => { transcriptPointerDown = false; });
+  transcript.addEventListener("keydown", (event) => {
+    if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+      beginTranscriptScroll(["ArrowUp", "PageUp", "Home"].includes(event.key));
     }
-    if (shouldFollowTranscript(transcript)) {
-      const button = document.getElementById("new-output");
-      if (button) button.hidden = true;
-    }
+  });
+  document.getElementById("new-output")?.addEventListener("click", followTranscript);
+  transcript.addEventListener("scroll", () => {
+    if (!transcript.clientHeight) return;
+    const view = transcriptViews.get(transcriptFilter);
+    view.follow = transcriptFollowOnScroll(view.follow, transcript, transcriptUserScroll || transcriptPointerDown);
+    view.scrollTop = transcript.scrollTop;
+    view.initialized = true;
+    if (shouldFollowTranscript(transcript)) document.getElementById("new-output").hidden = true;
+  });
+  const transcriptResize = new ResizeObserver(() => {
+    if (transcript.clientHeight && transcriptViews.get(transcriptFilter).follow) transcript.scrollTop = transcript.scrollHeight;
+  });
+  transcriptResize.observe(transcript);
+  document.addEventListener("session-section-change", (event) => {
+    if (event.detail !== "codex") return;
+    const view = transcriptViews.get(transcriptFilter);
+    transcript.scrollTop = view.follow ? transcript.scrollHeight : view.scrollTop;
   });
 
   const updateMessageActions = () => {
@@ -1612,14 +1749,30 @@
     } else {
       element.textContent = text;
     }
+    const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+    const time = document.createElement("time");
+    time.className = "message-time";
+    time.textContent = timestamp.text;
+    if (timestamp.dateTime) time.dateTime = timestamp.dateTime;
+    time.title = timestamp.title;
+    element.append(time);
     transcript.append(element);
   };
 
   const renderTranscriptEntries = (entries, disclosureStates) => {
     transcript.replaceChildren();
     const visibleEntries = transcriptEntriesForFilter(entries, transcriptFilter);
+    let dateKey = "";
     entries.forEach((entry, index) => {
       if (transcriptEntryVisible(entry, transcriptFilter)) {
+        const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+        if (timestamp.dateKey && timestamp.dateKey !== dateKey) {
+          dateKey = timestamp.dateKey;
+          const separator = document.createElement("div");
+          separator.className = "transcript-date";
+          separator.textContent = timestamp.dateLabel;
+          transcript.append(separator);
+        }
         appendMessage(entry, index, entries, disclosureStates);
       }
     });
@@ -1635,7 +1788,7 @@
   const saveTranscriptView = () => {
     const view = transcriptViews.get(transcriptFilter);
     if (!view) return;
-    Object.assign(view, captureTranscriptViewState(transcript), {initialized: true});
+    Object.assign(view, captureTranscriptViewState(transcript), {follow: view.follow, initialized: true});
   };
 
   document.querySelectorAll("[data-transcript-filter]").forEach((button) => {
@@ -1663,8 +1816,8 @@
     if (!payload.threadId) throw new Error("Codex returned no thread");
     currentThreadId = payload.threadId;
     loadMessageReceipts();
-    const follow = !transcriptInitialized || shouldFollowTranscript(transcript);
-    const previousTop = transcript.scrollTop;
+    const follow = !transcriptInitialized || transcriptViews.get(transcriptFilter).follow;
+    const previousTop = transcript.clientHeight ? transcript.scrollTop : transcriptViews.get(transcriptFilter).scrollTop;
     const entries = payload.entries || [];
     const nextSignature = JSON.stringify(entries);
     const transcriptChanged = !transcriptInitialized || nextSignature !== transcriptSignature;
@@ -1701,7 +1854,7 @@
       }
       const view = transcriptViews.get(transcriptFilter);
       view.follow = follow;
-      view.scrollTop = transcript.scrollTop;
+      view.scrollTop = transcript.clientHeight ? transcript.scrollTop : previousTop;
       view.initialized = true;
     }
     transcriptInitialized = true;
@@ -2150,6 +2303,11 @@
           renderMessageReceipts();
         }
         textarea.value = "";
+        if (!queue) followTranscript();
+        else {
+          await refreshQueue();
+          queuePanel.scrollIntoView({block: "nearest"});
+        }
         scheduleRefresh(0);
       } catch (error) {
         for (const [id, entry] of pendingMessages) {
@@ -2193,6 +2351,7 @@
     queueStart.disabled = true;
     try {
       await client.startQueue(queuedSubmissionId);
+      followTranscript();
     } catch (error) {
       alert(error.message);
     } finally {
@@ -2241,6 +2400,7 @@
         id, message, state: "accepted", steered: Boolean(receipt.steered),
       });
       currentMode = "default";
+      followTranscript();
       planActions.hidden = true;
       renderMessageReceipts();
       applyCurrentSettings();
