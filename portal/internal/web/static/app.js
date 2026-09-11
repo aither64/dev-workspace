@@ -517,9 +517,30 @@
       return false;
     }
   };
+  const createCodexLimitsReader = (request, render) => {
+    let snapshot = null;
+    let pending = null;
+    return {
+      refresh() {
+        if (pending) return pending;
+        pending = (async () => {
+          try {
+            snapshot = await request("/api/codex-limits");
+            render(snapshot, false);
+          } catch (_error) {
+            render(snapshot, true);
+          } finally {
+            pending = null;
+          }
+        })();
+        return pending;
+      },
+    };
+  };
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      automaticReasoningLabel, createRequest, createSessionClient,
+      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -549,6 +570,93 @@
   const request = createRequest(fetch.bind(globalThis));
   const conversationAssets = await import("/codex/assets/conversation.js");
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
+
+  const limitsPanel = document.getElementById("codex-limits-panel");
+  if (limitsPanel) {
+    const toggle = document.querySelector(".codex-limits-toggle");
+    const content = limitsPanel.querySelector("[data-limits-content]");
+    const compactLabel = toggle.querySelector("[data-limits-compact-label]");
+    const compactValue = toggle.querySelector("[data-limits-compact-value]");
+    const formatLimitDate = (date) => date.toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+    const renderLimits = (snapshot, failed) => {
+      content.replaceChildren();
+      const summaries = [];
+      const windows = snapshot?.windows || [];
+      for (const window of windows) {
+        const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
+        const label = window.windowDurationMins === 10080 ? "Weekly" : "5h";
+        summaries.push(`${label}: ${remaining}% left`);
+        const item = document.createElement("div");
+        item.className = "limits-window";
+        item.dataset.limitDuration = String(window.windowDurationMins);
+        const heading = document.createElement("div");
+        heading.className = "limits-window-heading";
+        const name = document.createElement("strong");
+        name.textContent = label;
+        const amount = document.createElement("span");
+        amount.textContent = `${remaining}% left`;
+        heading.append(name, amount);
+        const meter = document.createElement("meter");
+        meter.min = 0;
+        meter.max = 100;
+        meter.value = remaining;
+        meter.setAttribute("aria-label", `${label} remaining`);
+        item.append(heading, meter);
+        if (window.resetsAt != null) {
+          const reset = new Date(window.resetsAt * 1000);
+          const resetLine = document.createElement("p");
+          resetLine.className = "limits-reset";
+          const time = document.createElement("time");
+          time.dateTime = reset.toISOString();
+          time.textContent = formatLimitDate(reset);
+          time.title = reset.toLocaleString();
+          resetLine.append("Resets ", time);
+          item.append(resetLine);
+        }
+        content.append(item);
+      }
+      if (!windows.length) {
+        const status = document.createElement("p");
+        status.className = "limits-status";
+        status.textContent = snapshot ? "No limits reported." : "Limits unavailable.";
+        content.append(status);
+      }
+      if (failed && snapshot) {
+        const stale = document.createElement("p");
+        stale.className = "limits-status stale";
+        stale.textContent = `Update failed. Last updated ${formatLimitDate(new Date(snapshot.updatedAt))}.`;
+        content.append(stale);
+      }
+      const compactWindow = windows.find((window) => window.windowDurationMins === 10080) || windows[0];
+      compactLabel.textContent = compactWindow ? (compactWindow.windowDurationMins === 10080 ? "Weekly" : "5h") : "Limits";
+      compactValue.textContent = compactWindow ? `${Math.max(0, Math.min(100, 100 - compactWindow.usedPercent))}%` : "?";
+      toggle.dataset.stale = String(failed);
+      const summary = summaries.length ? summaries.join(". ") : content.textContent;
+      toggle.title = `Codex limits. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
+      toggle.setAttribute("aria-label", toggle.title);
+    };
+    const narrow = globalThis.matchMedia("(max-width: 760px)");
+    const updateLimitsPopover = () => {
+      if (narrow.matches) limitsPanel.setAttribute("popover", "auto");
+      else limitsPanel.removeAttribute("popover");
+      toggle.setAttribute("aria-expanded", "false");
+    };
+    limitsPanel.addEventListener("toggle", (event) => {
+      toggle.setAttribute("aria-expanded", String(event.newState === "open"));
+    });
+    narrow.addEventListener("change", updateLimitsPopover);
+    updateLimitsPopover();
+    const limits = createCodexLimitsReader(request, renderLimits);
+    const refreshVisibleLimits = () => {
+      if (!document.hidden) void limits.refresh();
+    };
+    document.addEventListener("visibilitychange", refreshVisibleLimits);
+    globalThis.addEventListener("focus", refreshVisibleLimits);
+    globalThis.setInterval(refreshVisibleLimits, 60_000);
+    refreshVisibleLimits();
+  }
 
   let indexNavigationPending = false;
   let indexRefreshTimer = null;

@@ -83,6 +83,20 @@ Without this file, the portal uses generic labels, hides the SSH attach command
 and enables no development-cluster providers. Registration flags can override
 the configured hostname and aliases; the registry stores the resolved values.
 
+## Codex limits
+
+The portal sidebar shows the main Codex allowance, with percentage remaining
+and reset times in the browser's local timezone. The weekly and 5-hour windows
+appear only when Codex reports them. Model-specific allowances are excluded.
+On narrow screens, select the compact limit indicator to open the details.
+
+The session-independent `GET /api/codex-limits` endpoint reads the configured
+App Server account and returns `windows` plus an `updatedAt` snapshot time.
+Each window contains `usedPercent`, `windowDurationMins` and nullable `resetsAt`
+(Unix seconds). Reads share a 30-second server cache. Open pages refresh every
+minute while visible and when focused. A failed refresh keeps prior values
+marked with their last update time.
+
 ## Development
 
 Run the package checks and host smoke test with:

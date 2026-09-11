@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
-  automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient,
+  automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
@@ -47,6 +47,44 @@ const compatibilityConversation = (fetchImplementation) => (
   })
 );
 const client = createSessionClient("example", request, compatibilityConversation(fetchRequest));
+
+// An account refresh can fail independently of the conversation. Keep the last
+// successful snapshot, and coalesce refocus and visibility events in one read.
+let limitsReadCount = 0;
+let finishLimitsRead;
+let failLimitsRead;
+const limitsChanges = [];
+const limitsReader = createCodexLimitsReader((path) => {
+  assert.equal(path, "/api/codex-limits");
+  limitsReadCount++;
+  return new Promise((resolve, reject) => {
+    finishLimitsRead = resolve;
+    failLimitsRead = reject;
+  });
+}, (snapshot, failed) => limitsChanges.push({snapshot, failed}));
+const initialLimitsRead = limitsReader.refresh();
+assert.equal(limitsReader.refresh(), initialLimitsRead);
+assert.equal(limitsReadCount, 1);
+failLimitsRead(new Error("temporarily unavailable"));
+await initialLimitsRead;
+assert.deepEqual(limitsChanges.pop(), {snapshot: null, failed: true});
+const weeklyLimits = {
+  windows: [{usedPercent: 23, windowDurationMins: 10080, resetsAt: 1789200000}],
+  updatedAt: "2026-09-11T10:00:00Z",
+};
+const recoveredLimitsRead = limitsReader.refresh();
+finishLimitsRead(weeklyLimits);
+await recoveredLimitsRead;
+assert.deepEqual(limitsChanges.pop(), {snapshot: weeklyLimits, failed: false});
+const staleLimitsRead = limitsReader.refresh();
+failLimitsRead(new Error("connection lost"));
+await staleLimitsRead;
+assert.deepEqual(limitsChanges.pop(), {snapshot: weeklyLimits, failed: true});
+const unreportedLimits = {windows: [], updatedAt: "2026-09-11T10:02:00Z"};
+const unreportedLimitsRead = limitsReader.refresh();
+finishLimitsRead(unreportedLimits);
+await unreportedLimitsRead;
+assert.deepEqual(limitsChanges.pop(), {snapshot: unreportedLimits, failed: false});
 
 assert.equal(automaticReasoningLabel(), "Automatic");
 assert.equal(automaticReasoningLabel({model: "bounded"}), "Automatic");

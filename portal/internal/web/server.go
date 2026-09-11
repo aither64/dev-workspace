@@ -50,6 +50,7 @@ var sessionAPIOperationPattern = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)*$`)
 
 type codexController interface {
 	conversation.Client
+	ReadAccountRateLimits(context.Context) (codex.AccountRateLimits, error)
 	ListThreadActivity(context.Context, []workspacecodex.ThreadActivity) ([]workspacecodex.ThreadActivity, error)
 	PrepareSend(string, string, string, string, bool) error
 	ReconcileThreadInstructions(context.Context, string) error
@@ -137,6 +138,9 @@ type Server struct {
 	indexStatusMu    sync.Mutex
 	indexStatusCache cachedIndexStatus
 	indexStatusWait  chan struct{}
+	codexLimitsMu    sync.Mutex
+	codexLimitsCache codexLimitsSnapshot
+	codexLimitsWait  *codexLimitsCall
 	messageMu        sync.Mutex
 	messageLocks     map[string]conversation.MutationLocker
 	clusters         cluster.Runner
@@ -368,6 +372,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.withPortalMutation(w, r, func() { s.createSession(w, r) })
 	case r.Method == http.MethodGet && r.URL.Path == "/api/models":
 		s.models(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/codex-limits":
+		s.codexLimits(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
 		s.collaborationModes(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/index-status":

@@ -10,6 +10,7 @@
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
+  <div class="sidebar-content">
   <header class="sidebar-heading">
     <div><a href="/" class="sidebar-home" title="Workspace" aria-label="Workspace"><span aria-hidden="true" class="rail-icon">⌂</span><span class="rail-label">Workspace</span></a><h1>{{.Session.Slug}}</h1></div>
   </header>
@@ -22,6 +23,8 @@
         <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
       </nav>
     {{end}}
+    </div>
+    {{template "codex-limits"}}
     <div class="sidebar-actions">
       {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
       {{if eq .PendingLifecycle "archive"}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Retry archive</span></button>{{else if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{else if not .PendingLifecycle}}{{if .Session.Archived}}<button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>{{else}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Archive session</span></button>{{end}}{{end}}

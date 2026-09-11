@@ -11,6 +11,7 @@
   <div class="workspace-shell index-shell">
   <aside class="workspace-sidebar index-sidebar">
     <header class="sidebar-heading"><p class="eyebrow">{{.DisplayLabel}}</p><h1>Workspace</h1></header>
+    <div class="sidebar-content">
     <section>
       <div class="section-heading"><h2>Work</h2><span id="active-count">{{len .Active}}</span></div>
       <div class="session-grid" data-session-list="active">
@@ -28,6 +29,8 @@
         {{else}}<p class="empty">No portal-enabled archived sessions.</p>{{end}}
       </div>
     </details>
+    </div>
+    {{template "codex-limits"}}
   </aside>
   <main class="page index-page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
@@ -59,6 +62,18 @@
   <script src="/static/app.js" defer></script>
 </body>
 </html>
+{{end}}
+
+{{define "codex-limits"}}
+<section class="codex-limits" aria-label="Codex limits">
+  <button class="codex-limits-toggle quiet" type="button" popovertarget="codex-limits-panel" aria-controls="codex-limits-panel" aria-expanded="false" title="Codex limits" aria-label="Codex limits">
+    <span data-limits-compact-label>Limits</span><strong data-limits-compact-value>…</strong>
+  </button>
+  <div id="codex-limits-panel" class="codex-limits-panel">
+    <h2>Codex limits</h2>
+    <div data-limits-content><p class="limits-status">Loading limits…</p></div>
+  </div>
+</section>
 {{end}}
 
 {{define "session-card"}}
