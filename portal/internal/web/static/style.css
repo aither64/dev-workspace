@@ -228,7 +228,17 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .plan-actions { border: 1px solid #704b9d; border-radius: 10px; padding: .75rem; margin-bottom: .7rem; background: var(--plan-bg); display: flex; align-items: center; justify-content: space-between; gap: .8rem; }
 .plan-actions[hidden] { display: none; }
 .plan-actions p { margin: .2rem 0 0; color: #cdb8e6; }
-.wizard-question { font-size: 1rem; color: var(--text); }
+.pending:empty { display: none; }
+.pending { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; max-height: 65%; }
+.pending > .approval { min-height: 0; flex: 0 1 auto; overflow-y: auto; }
+.pending > .question-approval { display: flex; flex-direction: column; overflow: hidden; }
+.question-approval > strong { flex: none; }
+.input-wizard { display: flex; flex-direction: column; min-height: 0; gap: .65rem; }
+.input-wizard > .eyebrow, .input-wizard > .auto-resolution { flex: none; margin: 0; }
+.wizard-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: .3rem; }
+.wizard-content > textarea, .wizard-content > input { margin-top: .65rem; }
+.wizard-actions { flex: none; margin-top: 0; padding-top: .5rem; border-top: 1px solid var(--line); }
+.wizard-question { margin-top: 0; font-size: 1rem; color: var(--text); }
 .wizard-options { display: grid; gap: .5rem; }
 .wizard-option { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .65rem; align-items: start; border: 1px solid var(--line); border-radius: 9px; padding: .65rem; color: var(--text); cursor: pointer; }
 .wizard-option:has(input:checked) { border-color: var(--accent-2); background: #142b23; }
@@ -341,4 +351,11 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
   .index-sidebar .session-card { padding: .5rem .1rem; gap: .2rem .35rem; }
   .index-sidebar .session-card > span:not(.status-dot):not(.badge) { display: none; }
   .index-page { padding: .7rem; }
+}
+
+@media (max-height: 600px) {
+  .chat-panel:has(.question-approval) .chat-form { padding-top: .35rem; padding-bottom: .35rem; }
+  .chat-panel:has(.question-approval) .chat-form textarea { height: 2.5rem; min-height: 2.5rem; margin-bottom: .3rem; }
+  .chat-panel:has(.question-approval) .composer-controls .compact-select,
+  .chat-panel:has(.question-approval) .composer-controls .mode-toggle { display: none; }
 }

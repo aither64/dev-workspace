@@ -2056,7 +2056,9 @@
       }
       const drafts = wizardState.drafts;
       let page = Math.min(wizardState.page, questions.length - 1);
+      box.classList.add("question-approval");
       const questionPanel = document.createElement("div");
+      questionPanel.className = "wizard-content";
       const progress = document.createElement("p");
       progress.className = "eyebrow";
       const autoResolution = document.createElement("p");
@@ -2127,6 +2129,7 @@
         const draft = drafts[page] || {};
         progress.textContent = `${question.header} · ${page + 1} of ${questions.length}`;
         questionPanel.replaceChildren();
+        questionPanel.scrollTop = 0;
         const prompt = document.createElement("p");
         prompt.className = "wizard-question";
         prompt.textContent = question.question;

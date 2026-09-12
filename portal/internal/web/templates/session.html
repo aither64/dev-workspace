@@ -53,9 +53,9 @@
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><span id="codex-status" class="badge">Connecting</span></div>
         <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
+        {{if .Session.Interactive}}<div id="pending" class="pending"></div>{{end}}
         <div class="composer-context">
         {{if .Session.Interactive}}
-        <div id="pending" class="pending"></div>
         <div id="message-receipts" class="message-receipts" hidden></div>
         <section id="queue-panel" class="queue-panel" hidden>
           <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
