@@ -1,11 +1,13 @@
 package web
 
 import (
+	"container/list"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -18,16 +20,14 @@ import (
 )
 
 type repositoryReviewSnapshot struct {
-	ID          string
-	Slug        string
-	Repo        repository.ReviewRepository
-	Pair        repository.ReviewPair
-	Created     time.Time
-	mu          sync.Mutex
-	Commits     map[string]repository.ReviewCommit
-	Files       []repository.ReviewFile
-	FilesLoaded bool
-	Branch      bool
+	ID      string
+	Slug    string
+	Repo    repository.ReviewRepository
+	Pair    repository.ReviewPair
+	Created time.Time
+	mu      sync.Mutex
+	Commits map[string]repository.ReviewCommit
+	Branch  bool
 }
 type repositoryReviewService struct {
 	reader        repository.ReviewReader
@@ -40,11 +40,18 @@ type repositoryReviewService struct {
 	discoveryErr  error
 	discoveryAt   time.Time
 	discoveryWait chan struct{}
+	lifetime      context.Context
+	cacheMu       sync.Mutex
+	cache         map[string]*list.Element
+	cacheLRU      *list.List
+	cacheBytes    int
+	calls         map[string]*reviewCacheCall
 }
 
 func (s *Server) reviews() *repositoryReviewService {
 	s.reviewOnce.Do(func() {
-		s.reviewService = &repositoryReviewService{reader: repository.ReviewReader{Workspace: s.config.Workspace, Jobs: make(chan struct{}, 4)}, directory: filepath.Join(s.operationStore.directory, "repository-comparisons"), snapshots: make(map[string]*repositoryReviewSnapshot), requests: make(chan struct{}, 4)}
+		s.reviewService = &repositoryReviewService{lifetime: s.operationContext, reader: repository.ReviewReader{Workspace: s.config.Workspace, Jobs: make(chan struct{}, 4)}, directory: filepath.Join(s.operationStore.directory, "repository-comparisons"), snapshots: make(map[string]*repositoryReviewSnapshot), requests: make(chan struct{}, 4)}
+		s.reviewService.initializeCache()
 	})
 	return s.reviewService
 }
@@ -171,11 +178,8 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	fail := func(err error) {
 		s.config.Logger.Printf("repository review %s/%s: %v", summary.Slug, registration.Name, err)
-		message := "Local repository review is unavailable. Check that the registered worktree and Git objects are present."
-		if errors.Is(err, repository.ErrReviewLimit) {
-			message = "This comparison exceeds the review limit. Review a smaller commit locally."
-		}
-		s.writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": message})
+		status, message := reviewErrorMessage(err)
+		s.writeJSON(w, status, map[string]string{"error": message})
 	}
 	if operation == "repository-state" {
 		repo, err := service.reader.Resolve(ctx, summary.Slug, registration, summary.Archived)
@@ -227,16 +231,10 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 				return true
 			}
 		}
-		snapshot.mu.Lock()
-		defer snapshot.mu.Unlock()
-		if !snapshot.FilesLoaded {
-			files, err := service.reader.Files(ctx, snapshot.Repo, snapshot.Pair)
-			if err != nil {
-				fail(err)
-				return true
-			}
-			snapshot.Files = files
-			snapshot.FilesLoaded = true
+		files, err := service.comparisonFiles(ctx, snapshot)
+		if err != nil {
+			fail(err)
+			return true
 		}
 		if snapshot.Branch {
 			if err := service.saveComparison(summary.Slug, repoID, snapshot.Pair); err != nil {
@@ -244,7 +242,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 				return true
 			}
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshot.ID, "pair": snapshot.Pair, "files": snapshot.Files, "name": registration.Name})
+		s.writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshot.ID, "pair": snapshot.Pair, "files": files, "name": registration.Name})
 		return true
 	}
 	if operation == "repository-file" {
@@ -252,21 +250,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "This review expired. Reload the repository history to open it again."})
 			return true
 		}
-		snapshot.mu.Lock()
-		var selected *repository.ReviewFile
-		for _, file := range snapshot.Files {
-			if file.ID == r.URL.Query().Get("file") {
-				copy := file
-				selected = &copy
-				break
-			}
-		}
-		snapshot.mu.Unlock()
-		if selected == nil {
-			s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "File is not part of this comparison"})
-			return true
-		}
-		content, err := service.reader.Content(ctx, snapshot.Repo, *selected)
+		content, err := service.fileContent(ctx, snapshot, r.URL.Query().Get("file"))
 		if err != nil {
 			fail(err)
 			return true
@@ -309,7 +293,9 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 			return true
 		}
 	}
-	history, err := service.reader.History(ctx, snapshot.Repo, snapshot.Pair, page)
+	history, err := cachedReview(ctx, service, fmt.Sprintf("history\x00%s\x00%s\x00%s\x00%s\x00%d", snapshot.Repo.Directory, snapshot.Repo.GitHub, snapshot.Pair.Base, snapshot.Pair.Head, page), func(ctx context.Context) (repository.ReviewHistory, error) {
+		return service.reader.History(ctx, snapshot.Repo, snapshot.Pair, page)
+	})
 	if err != nil {
 		fail(err)
 		return true
@@ -330,4 +316,46 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	snapshot.mu.Unlock()
 	s.writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshot.ID, "pair": snapshot.Pair, "history": history})
 	return true
+}
+
+type reviewAPIError struct {
+	status  int
+	message string
+}
+
+func (e *reviewAPIError) Error() string { return e.message }
+func reviewError(status int, message string) error {
+	return &reviewAPIError{status: status, message: message}
+}
+func reviewErrorMessage(err error) (int, string) {
+	var api *reviewAPIError
+	if errors.As(err, &api) {
+		return api.status, api.message
+	}
+	if errors.Is(err, repository.ErrReviewLimit) {
+		return http.StatusUnprocessableEntity, "This comparison exceeds the review limit. Review a smaller commit locally."
+	}
+	return http.StatusUnprocessableEntity, "This comparison is unavailable. Check that its repository and Git objects are still present locally."
+}
+
+func (service *repositoryReviewService) comparisonFiles(ctx context.Context, snapshot *repositoryReviewSnapshot) ([]repository.ReviewFile, error) {
+	return cachedReview(ctx, service, "files\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) ([]repository.ReviewFile, error) {
+		return service.reader.Files(ctx, snapshot.Repo, snapshot.Pair)
+	})
+}
+
+func (service *repositoryReviewService) fileContent(ctx context.Context, snapshot *repositoryReviewSnapshot, id string) (repository.ReviewContent, error) {
+	files, err := service.comparisonFiles(ctx, snapshot)
+	if err != nil {
+		return repository.ReviewContent{}, err
+	}
+	for _, file := range files {
+		if file.ID == id {
+			key := "content\x00" + snapshot.Repo.Directory + "\x00" + file.OldObject + "\x00" + file.NewObject + "\x00" + file.OldMode + "\x00" + file.NewMode
+			return cachedReview(ctx, service, key, func(ctx context.Context) (repository.ReviewContent, error) {
+				return service.reader.Content(ctx, snapshot.Repo, file)
+			})
+		}
+	}
+	return repository.ReviewContent{}, reviewError(404, "File is not part of this comparison")
 }

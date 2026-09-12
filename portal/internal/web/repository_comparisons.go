@@ -71,6 +71,13 @@ func (s *repositoryReviewService) saveComparison(slug, repo string, pair reposit
 	if !repositoryObjectID(pair.Base) || !repositoryObjectID(pair.Head) {
 		return errors.New("invalid repository comparison")
 	}
+	previous, err := s.loadComparison(slug, repo, pair.Head)
+	if err != nil {
+		return err
+	}
+	if previous != nil && *previous == pair {
+		return nil
+	}
 	target := s.comparisonPath(slug, repo, pair.Head)
 	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 		return err
