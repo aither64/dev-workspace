@@ -221,7 +221,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .queue-panel li:not(.notice) { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .7rem; align-items: start; }
 .queue-panel li span { white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-receipts { display: grid; gap: .4rem; margin-top: .7rem; }
-.message-receipt { padding: .4rem .7rem; color: var(--muted); font-size: .8rem; }
+.message-receipt { padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--muted); font-size: .8rem; }
+.message-receipt[data-receipt-state="accepted"] strong { color: var(--accent); }
 .message-receipt strong { display: block; font-weight: 500; }
 .message-receipt span { display: block; margin-top: .2rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .new-output { align-self: center; margin: -.25rem 0 .6rem; padding: .45rem .72rem; font-size: .8rem; box-shadow: 0 6px 22px rgba(0,0,0,.35); }

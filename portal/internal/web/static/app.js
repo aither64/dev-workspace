@@ -86,15 +86,31 @@
       ...attempt, transcriptDigest: observed.get(attempt.id),
     }));
   };
-  const markTranscriptMessagesObserved = (pending, entries) => {
-    for (const entry of entries || []) {
-      if (!entry.clientUserMessageId) continue;
-      const receipt = pending.get(entry.clientUserMessageId);
-      if (receipt && receipt.state !== "sending") {
-        pending.set(entry.clientUserMessageId, {...receipt, state: "accepted"});
-      }
-    }
+  const sha256Hex = async (text) => {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
   };
+  const markTranscriptMessagesObserved = async (pending, entries) => {
+    const changed = [];
+    await Promise.all((entries || []).map(async (entry) => {
+      const receipt = pending.get(entry.clientUserMessageId);
+      if (!receipt || receipt.state === "observed" ||
+          !/^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || "")) return;
+      // The HTTP handler trims Unicode White_Space, as Go strings.TrimSpace
+      // does. JavaScript trim differs for U+0085 and U+FEFF.
+      const digest = await sha256Hex(receipt.message.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, ""));
+      if (digest !== entry.clientUserMessageDigest) return;
+      const current = pending.get(receipt.id);
+      if (!current || current.message !== receipt.message || current.state === "observed") return;
+      const observed = {...current, state: "observed", transcriptDigest: digest};
+      pending.set(receipt.id, observed);
+      changed.push(observed);
+    }));
+    return changed;
+  };
+  const messageReceiptLabel = (entry) => entry.state === "observed" ? "" :
+    entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
+      "Outcome unknown. Retry to check.";
   const transcriptEntryKey = (entry, index, entries = []) => {
     const turnID = entry?.turnId || "";
     const itemID = entry?.itemId || "";
@@ -431,11 +447,15 @@
         return {
           id, message: value.message, steered: Boolean(value.steered),
           context: value.context || "",
+          ...(["accepted", "observed"].includes(value.state) ? {state: value.state} : {}),
+          ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
       },
       encode: (attempt) => ({
         message: attempt.message, steered: Boolean(attempt.steered),
         context: typeof attempt.context === "string" ? attempt.context : "",
+        ...(["accepted", "observed"].includes(attempt.state) ? {state: attempt.state} : {}),
+        ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
       }),
     });
   };
@@ -570,7 +590,7 @@
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
-      markTranscriptMessagesObserved, matchingSendAttempt,
+      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript, transcriptFollowOnScroll,
       renderCollaborationModes,
@@ -1589,6 +1609,7 @@
   let planRenderGeneration = 0;
   let dismissedPlanSHA = "";
   const pendingMessages = new Map();
+  const inFlightMessageIDs = new Set();
   let sendReceiptAcknowledgementActive = false;
   const requestInputDrafts = new Map();
   const codexWork = document.getElementById("codex-work");
@@ -1659,7 +1680,7 @@
     const entries = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
     if (!entries) return;
     for (const entry of entries) {
-      pendingMessages.set(entry.id, {...entry, state: "unknown"});
+      pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
     }
   };
 
@@ -1668,12 +1689,13 @@
     if (!container) return;
     container.replaceChildren();
     for (const entry of pendingMessages.values()) {
-      if (entry.state === "accepted") continue;
+      const label = messageReceiptLabel(entry);
+      if (!label) continue;
       const item = document.createElement("div");
       item.className = "message-receipt";
+      item.dataset.receiptState = entry.state;
       const statusText = document.createElement("strong");
-      statusText.textContent = entry.state === "sending" ? "Sending…" :
-        "Outcome unknown. Retry to check.";
+      statusText.textContent = label;
       const messageText = document.createElement("span");
       messageText.textContent = entry.message;
       item.append(statusText, messageText);
@@ -1681,15 +1703,16 @@
     }
     container.hidden = container.childElementCount === 0;
   };
+  loadMessageReceipts();
+  renderMessageReceipts();
 
   const acknowledgeTranscriptMessages = (entries) => {
     if (sendReceiptAcknowledgementActive) return;
     const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
     if (!attempts?.length) return;
-    const inFlight = new Set(Array.from(pendingMessages).filter(([, entry]) => (
-      entry.state === "sending"
-    )).map(([id]) => id));
-    const candidates = sendAcknowledgementCandidates(entries, attempts, inFlight, attempts.length);
+    const observedAttempts = attempts.filter((attempt) => pendingMessages.get(attempt.id)?.state === "observed");
+    const candidates = sendAcknowledgementCandidates(entries, observedAttempts, inFlightMessageIDs, attempts.length)
+      .filter((attempt) => pendingMessages.get(attempt.id)?.transcriptDigest === attempt.transcriptDigest);
     const batch = candidates.slice(0, 100);
     if (!batch.length) return;
     sendReceiptAcknowledgementActive = true;
@@ -1723,11 +1746,6 @@
       if (continueAcknowledging) queueMicrotask(() => acknowledgeTranscriptMessages(entries));
       if (retryAcknowledgement) setTimeout(() => acknowledgeTranscriptMessages(entries), 2000);
     });
-  };
-
-  const sha256Hex = async (text) => {
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
   };
 
   const renderPlanActions = async (payload) => {
@@ -2019,7 +2037,7 @@
     });
   });
 
-  const renderThread = (payload) => {
+  const renderThread = async (payload) => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
     currentThreadId = payload.threadId;
     loadMessageReceipts();
@@ -2028,7 +2046,9 @@
     const entries = payload.entries || [];
     const nextSignature = JSON.stringify(entries);
     const transcriptChanged = !transcriptInitialized || nextSignature !== transcriptSignature;
-    markTranscriptMessagesObserved(pendingMessages, entries);
+    for (const observed of await markTranscriptMessagesObserved(pendingMessages, entries)) {
+      storeSendAttempt(sendAttemptStorage, slug, currentThreadId, observed);
+    }
     renderMessageReceipts();
     acknowledgeTranscriptMessages(entries);
     if (transcriptChanged) {
@@ -2072,7 +2092,7 @@
 
   const refreshThread = async () => {
     try {
-      renderThread(await client.thread());
+      await renderThread(await client.thread());
     } catch (error) {
       updateCodexWork(false);
       status.textContent = "Offline";
@@ -2454,10 +2474,23 @@
 
   const markMessageOutcomeUnknown = (id) => {
     const entry = pendingMessages.get(id);
-    if (!entry) return;
+    if (!entry || entry.state === "observed" || entry.state === "accepted") return;
     pendingMessages.set(id, {...entry, state: "unknown"});
     renderMessageReceipts();
     scheduleRefresh(0);
+  };
+  const acceptMessageReceipt = (attempt, receipt) => {
+    const current = pendingMessages.get(attempt.id);
+    const accepted = {
+      ...attempt, ...current,
+      state: current?.state === "observed" || attempt.state === "observed" ? "observed" : "accepted",
+      steered: Boolean(receipt.steered),
+    };
+    pendingMessages.set(attempt.id, accepted);
+    // The original retry identity remains durable even when this metadata
+    // update fails. Keep the known acceptance visible for this page lifetime.
+    storeSendAttempt(sendAttemptStorage, slug, currentThreadId, accepted);
+    renderMessageReceipts();
   };
 
   const form = document.getElementById("message-form");
@@ -2504,13 +2537,15 @@
             }
           }
           const id = attempt.id;
-          pendingMessages.set(id, {id, message, state: "sending", steered: attempt.steered});
+          inFlightMessageIDs.add(id);
+          pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
           renderMessageReceipts();
-          const receipt = await client.message(message, id, retry);
-          pendingMessages.set(id, {
-            id, message, state: "accepted", steered: Boolean(receipt.steered),
-          });
-          renderMessageReceipts();
+          try {
+            acceptMessageReceipt(attempt, await client.message(message, id, retry));
+          } finally {
+            inFlightMessageIDs.delete(id);
+            scheduleRefresh(0);
+          }
         }
         textarea.value = "";
         if (!queue) followTranscript();
@@ -2594,9 +2629,8 @@
       }
     }
     const id = attempt.id;
-    pendingMessages.set(id, {
-      id, message, state: "sending", steered: false,
-    });
+    inFlightMessageIDs.add(id);
+    pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
     renderMessageReceipts();
     button.disabled = true;
     try {
@@ -2606,9 +2640,7 @@
         planSha256: planActions.dataset.planSha256,
         clientUserMessageId: id,
       });
-      pendingMessages.set(id, {
-        id, message, state: "accepted", steered: Boolean(receipt.steered),
-      });
+      acceptMessageReceipt(attempt, receipt);
       currentMode = "default";
       followTranscript();
       planActions.hidden = true;
@@ -2619,6 +2651,9 @@
       markMessageOutcomeUnknown(id);
       button.disabled = false;
       alert(error.message);
+    } finally {
+      inFlightMessageIDs.delete(id);
+      scheduleRefresh(0);
     }
   });
 

@@ -9,7 +9,7 @@ const {
   deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
   loadRequestInputDraft, loadSendAttempts, markTranscriptMessagesObserved,
-  matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
+  matchingSendAttempt, messageActionLabel, messageReceiptLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
   sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript, transcriptFollowOnScroll,
   shouldSubmitMessage, storeQueueAttempt,
@@ -431,16 +431,53 @@ assert.deepEqual(sendAcknowledgementCandidates([
 ]), [{
   id: "unicode-space", message: "\u0085message\u0085", transcriptDigest: "a".repeat(64),
 }]);
+// Transport acceptance remains visible through reload; only a canonical ID
+// and digest match retires it, independently of acknowledgement availability.
+const digest = (text) => require("node:crypto").createHash("sha256").update(text).digest("hex");
+const acceptedSteer = {...sendAttempt, state: "accepted"};
+assert.equal(storeSendAttempt(storage, "example", "thread-1", acceptedSteer), true);
+const [reloadedSteer] = loadSendAttempts(storage, "example", "thread-1");
+assert.deepEqual(reloadedSteer, acceptedSteer);
+assert.equal(messageReceiptLabel(reloadedSteer), "Sent to Codex");
+assert.equal(messageReceiptLabel({state: "sending"}), "Sending…");
+assert.equal(messageReceiptLabel({state: "unknown"}), "Outcome unknown. Retry to check.");
 const observedReceipts = new Map([
+  [sendAttempt.id, reloadedSteer],
+  ["same-text", {...acceptedSteer, id: "same-text"}],
   ["sending", {id: "sending", message: "still in flight", state: "sending"}],
   ["unknown", {id: "unknown", message: "response lost", state: "unknown"}],
+  ["unicode-space", {id: "unicode-space", message: "\u0085message\u0085", state: "accepted"}],
 ]);
-markTranscriptMessagesObserved(observedReceipts, [
-  {clientUserMessageId: "sending", text: "still in flight"},
+assert.deepEqual(await markTranscriptMessagesObserved(observedReceipts, [
+  {clientUserMessageId: sendAttempt.id, clientUserMessageDigest: "0".repeat(64)},
   {clientUserMessageId: "unknown", text: "response lost"},
+]), []);
+assert.equal(observedReceipts.get(sendAttempt.id).state, "accepted");
+const observedChanges = await markTranscriptMessagesObserved(observedReceipts, [
+  {clientUserMessageId: sendAttempt.id, clientUserMessageDigest: digest(sendAttempt.message)},
+  {clientUserMessageId: "sending", clientUserMessageDigest: digest("still in flight")},
+  {clientUserMessageId: "unknown", clientUserMessageDigest: digest("response lost")},
+  {clientUserMessageId: "unicode-space", clientUserMessageDigest: digest("message")},
 ]);
-assert.equal(observedReceipts.get("sending").state, "sending");
-assert.equal(observedReceipts.get("unknown").state, "accepted");
+assert.equal(observedChanges.length, 4);
+assert.equal(observedReceipts.get("same-text").state, "accepted");
+assert.equal(observedReceipts.get("sending").state, "observed");
+assert.equal(observedReceipts.get("unknown").state, "observed");
+const observedSteer = observedReceipts.get(sendAttempt.id);
+assert.equal(messageReceiptLabel(observedSteer), "");
+assert.equal(storeSendAttempt(storage, "example", "thread-1", observedSteer), true);
+const [awaitingAcknowledgement] = loadSendAttempts(storage, "example", "thread-1");
+assert.equal(awaitingAcknowledgement.state, "observed");
+assert.equal(awaitingAcknowledgement.transcriptDigest, digest(sendAttempt.message));
+assert.equal(messageReceiptLabel(awaitingAcknowledgement), "");
+// Repeated transcript refreshes, or a reload before an acknowledgement retry,
+// must not resurrect an already observed receipt.
+assert.deepEqual(await markTranscriptMessagesObserved(observedReceipts, [
+  {clientUserMessageId: sendAttempt.id, clientUserMessageDigest: digest(sendAttempt.message)},
+]), []);
+assert.equal(deleteSendAttempt(storage, "example", "thread-1", sendAttempt.id), true);
+assert.deepEqual(loadSendAttempts(storage, "example", "thread-1"), []);
+
 const planAAttempt = {
   message: "Implement the plan.", id: "00000000-0000-4000-8000-000000000006",
   steered: false, context: "plan:aaaaaaaa",
