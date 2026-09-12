@@ -145,6 +145,7 @@ type Server struct {
 	messageLocks     map[string]conversation.MutationLocker
 	clusters         cluster.Runner
 	operationMu      sync.Mutex
+	creations        map[string]creationReceipt
 	operations       map[string]lifecycleOperation
 	operationStore   *lifecycleOperationStore
 	operationContext context.Context
@@ -268,6 +269,10 @@ func New(config Config) (*Server, error) {
 		cancelOperations: cancelOperations,
 		stopping:         make(chan struct{}),
 	}
+	if err := server.loadCreations(); err != nil {
+		cancelOperations()
+		return nil, err
+	}
 	conversationHandler, err := conversation.NewHandler(conversation.Options{
 		AllowedOrigins: []string{config.BaseURL}, BasePath: "/codex", Logger: config.Logger,
 		MaxMessageBytes: session.MaxMessageBytes, Shutdown: server.stopping,
@@ -369,7 +374,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		s.index(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/sessions":
-		s.withPortalMutation(w, r, func() { s.createSession(w, r) })
+		s.withCreationMutation(w, r, func() { s.createSession(w, r) })
 	case r.Method == http.MethodGet && r.URL.Path == "/api/models":
 		s.models(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/codex-limits":
@@ -733,6 +738,9 @@ func (s *Server) listSessions() ([]session.Summary, error) {
 }
 
 func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string) {
+	if s.creationPage(w, r, slug) {
+		return
+	}
 	summary, err := session.Find(s.config.Workspace, slug)
 	if errors.Is(err, fs.ErrNotExist) {
 		progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
@@ -803,6 +811,12 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error += "Some development cluster details are unavailable: " + err.Error()
 	}
 	data.Artifacts = session.AvailableArtifacts(summary)
+	if receipt, ok := s.currentCreation(slug); ok && receipt.State == "conflict" {
+		if data.Error != "" {
+			data.Error += " "
+		}
+		data.Error += receipt.Phase
+	}
 	s.render(w, "session", data)
 }
 
@@ -888,66 +902,18 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "session creation date is invalid")
 		return
 	}
-	if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: model, ReasoningEffort: effort}, true); err != nil {
+	if err := validateCreationSettings(model, effort); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	slug := creationDate + "-" + name
-	goalFile, err := os.CreateTemp("", "workspace-portal-goal-*.txt")
+	receipt, err := s.acceptCreation(creationRequest{
+		Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort,
+	})
 	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, err.Error())
+		s.writeError(w, r, http.StatusConflict, err.Error())
 		return
 	}
-	goalPath := goalFile.Name()
-	defer os.Remove(goalPath)
-	if err := goalFile.Chmod(0o600); err != nil {
-		goalFile.Close()
-		s.writeError(w, r, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if _, err := goalFile.WriteString(goal); err != nil {
-		goalFile.Close()
-		s.writeError(w, r, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := goalFile.Close(); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, err.Error())
-		return
-	}
-	args := []string{"start", slug, "--as-is", "--exclusive", "--no-attach", "--goal-file", goalPath, "--json"}
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	if effort != "" {
-		args = append(args, "--effort", effort)
-	}
-	// Creation is journaled by dev-session and must be allowed to finish even if
-	// the browser disconnects while waiting for the response.
-	stdout, stderr, err := s.runDevSession(context.Background(), 2*time.Minute, args...)
-	if err != nil {
-		message := strings.TrimSpace(stderr)
-		if message == "" {
-			message = strings.TrimSpace(stdout)
-		}
-		if message == "" {
-			message = err.Error()
-		}
-		s.writeError(w, r, http.StatusConflict, message)
-		return
-	}
-	var result struct {
-		Slug     string `json:"slug"`
-		ThreadID string `json:"threadId"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "dev-session returned invalid JSON: "+err.Error())
-		return
-	}
-	if result.Slug != slug {
-		s.writeError(w, r, http.StatusInternalServerError, "dev-session returned the wrong session")
-		return
-	}
-	http.Redirect(w, r, "/"+result.Slug+"/", http.StatusSeeOther)
+	http.Redirect(w, r, receipt.status().URL, http.StatusSeeOther)
 }
 
 func (s *Server) runDevSession(parent context.Context, timeout time.Duration, args ...string) (string, string, error) {
@@ -1175,6 +1141,9 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if s.creationAPI(w, r, parts) || s.earlyCreationRequest(w, r, parts) {
+		return
+	}
 	if conversationPath := legacyConversationPath(parts, r.Method); conversationPath != "" && s.conversation != nil {
 		decodedPath, err := url.PathUnescape(conversationPath)
 		if err != nil {
@@ -1259,7 +1228,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 		}
 	}
 	if len(parts) == 3 && parts[1] != "queue" &&
-		!(parts[1] == "operation" && parts[2] == "retry") {
+		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
 		return nil, false
 	}
 	return parts, true
@@ -1504,8 +1473,11 @@ func planDigest(text string) string {
 }
 
 func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
 	var body struct {
+		PlanText            string `json:"planText"`
+		Model               string `json:"model"`
+		ReasoningEffort     string `json:"reasoningEffort"`
 		Action              string `json:"action"`
 		PlanTurnID          string `json:"planTurnId"`
 		PlanSHA256          string `json:"planSha256"`
@@ -1516,6 +1488,20 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 	if !s.decodeJSON(w, r, &body) {
 		return
 	}
+	if strings.TrimSpace(body.Action) == "new" {
+		destination, err := creationDestination(strings.TrimSpace(body.Name), strings.TrimSpace(body.CreationDate))
+		if err != nil {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.acceptPlanCreation(w, r, summary, creationRequest{
+			Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
+			PlanSHA256: strings.TrimSpace(body.PlanSHA256), PlanText: body.PlanText,
+			Model: strings.TrimSpace(body.Model), Effort: strings.TrimSpace(body.ReasoningEffort),
+		})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	messageLock := s.messageLock(summary.Slug)
@@ -1604,66 +1590,6 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 			return
 		}
 		s.writeJSON(w, http.StatusAccepted, receipt)
-	case "new":
-		body.Name = strings.TrimSpace(body.Name)
-		body.CreationDate = strings.TrimSpace(body.CreationDate)
-		if !session.ValidSlug(body.Name) || len(body.Name) > 48 {
-			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session name is invalid"})
-			return
-		}
-		if parsed, parseErr := time.Parse(time.DateOnly, body.CreationDate); parseErr != nil ||
-			parsed.Format(time.DateOnly) != body.CreationDate {
-			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session creation date is invalid"})
-			return
-		}
-		goal := "Implement the following approved plan from session " + summary.Slug + ".\n\n" + plan.Text
-		if len([]byte(goal)) > session.MaxMessageBytes {
-			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "the approved plan is too large for a new session"})
-			return
-		}
-		goalFile, createErr := os.CreateTemp("", "workspace-portal-plan-*.txt")
-		if createErr != nil {
-			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": createErr.Error()})
-			return
-		}
-		goalPath := goalFile.Name()
-		defer os.Remove(goalPath)
-		if createErr = goalFile.Chmod(0o600); createErr == nil {
-			_, createErr = goalFile.WriteString(goal)
-		}
-		if closeErr := goalFile.Close(); createErr == nil {
-			createErr = closeErr
-		}
-		if createErr != nil {
-			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": createErr.Error()})
-			return
-		}
-		destination := body.CreationDate + "-" + body.Name
-		args := []string{
-			"start", destination, "--as-is", "--exclusive", "--no-attach",
-			"--goal-file", goalPath, "--json",
-		}
-		if transcript.Model != "" {
-			args = append(args, "--model", transcript.Model)
-		}
-		if transcript.ReasoningEffort != "" {
-			args = append(args, "--effort", transcript.ReasoningEffort)
-		}
-		stdout, stderr, runErr := s.runDevSession(context.Background(), 2*time.Minute, args...)
-		if runErr != nil {
-			s.writeJSON(w, http.StatusConflict, map[string]string{
-				"error": commandFailure("create plan session", stdout, stderr, runErr).Error(),
-			})
-			return
-		}
-		var result struct {
-			Slug string `json:"slug"`
-		}
-		if json.Unmarshal([]byte(stdout), &result) != nil || result.Slug != destination {
-			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "dev-session returned invalid plan session metadata"})
-			return
-		}
-		s.writeJSON(w, http.StatusCreated, map[string]string{"slug": destination, "url": "/" + destination + "/"})
 	default:
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select how to implement the plan"})
 	}
@@ -2222,41 +2148,25 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session creation date is invalid"})
 		return
 	}
-	settings := codex.ThreadSettings{Model: body.Model, ReasoningEffort: body.ReasoningEffort}
-	if settings.Model != "" || settings.ReasoningEffort != "" {
-		if err := s.validateModelSettings(r.Context(), settings, false); err != nil {
-			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
+	if err := validateCreationSettings(body.Model, body.ReasoningEffort); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
-	destination := body.CreationDate + "-" + body.Name
-	args := []string{"fork", source.Slug, destination, "--as-is", "--json"}
-	if settings.Model != "" {
-		args = append(args, "--model", settings.Model)
-	}
-	if settings.ReasoningEffort != "" {
-		args = append(args, "--effort", settings.ReasoningEffort)
-	}
-	stdout, stderr, err := s.runDevSession(context.Background(), 2*time.Minute, args...)
+	current, identity, err := s.creationSource(source.Slug)
 	if err != nil {
-		message := strings.TrimSpace(stderr)
-		if message == "" {
-			message = strings.TrimSpace(stdout)
-		}
-		if message == "" {
-			message = err.Error()
-		}
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": message})
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	var result struct {
-		Slug string `json:"slug"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil || result.Slug != destination {
-		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "dev-session returned invalid fork metadata"})
+	receipt, err := s.acceptCreation(creationRequest{
+		Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
+		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity,
+		Model: body.Model, Effort: body.ReasoningEffort,
+	})
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, map[string]string{"slug": result.Slug, "url": "/" + result.Slug + "/"})
+	s.writeJSON(w, http.StatusAccepted, receipt.status())
 }
 
 func (s *Server) normalizeInteractivity(parent context.Context, summary *session.Summary) {
@@ -2327,6 +2237,11 @@ func (s *Server) resolveConversation(
 			release()
 		}
 	}()
+	if request.Mutation {
+		if receipt, ok := s.currentCreation(request.ID); ok && receipt.blocksSession() {
+			return conversation.Target{}, errors.New("session initialization has not finished")
+		}
+	}
 	if request.Mutation {
 		unlock, err := s.lockTransitionContext(ctx)
 		if err != nil {

@@ -1220,6 +1220,343 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def portal_creation_expectation(workspace, source_slug, destination:, id: 'a' * 64)
+    directory = File.join(workspace, '.portal-private')
+    FileUtils.mkdir_p(directory, mode: 0o700)
+    write_portal_creation_acceptance(workspace, destination, id: id, directory: directory)
+    source = File.join(workspace, 'work', source_slug)
+    manifest = YAML.safe_load(File.read(File.join(source, 'portal.yml')))
+    stat = File.lstat(source)
+    identity = Digest::SHA256.hexdigest([
+      source, stat.dev, stat.ino, stat.ctime.to_i, stat.ctime.nsec,
+      manifest.dig('codex', 'thread_id')
+    ].join("\0"))
+    {
+      creation_receipt_id: id, creation_evidence: File.join(directory, "#{id}.complete.json"),
+      expected_source: source_slug, expected_source_thread: manifest.dig('codex', 'thread_id'),
+      expected_source_identity: identity
+    }
+  end
+
+  def write_portal_creation_acceptance(workspace, slug, id:, directory:)
+    # Only the receipt identity and history are inputs to the Ruby boundary;
+    # Go tests own the full accepted request serialization.
+    receipt = {
+      'schema' => 1, 'workspace' => workspace, 'receiptId' => id,
+      'request' => { 'slug' => slug },
+      'deletionHistorySha256' => runner_for(workspace).send(:completed_removal_history, slug)
+    }
+    path = File.join(directory, "#{slug}.json")
+    File.write(path, JSON.generate(receipt))
+    File.chmod(0o600, path)
+    path
+  end
+
+  def test_portal_fork_persists_receipt_evidence_before_removing_its_journal
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination = '2026-06-06-proof'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      manifest = setup.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      options = portal_creation_expectation(workspace, source_slug, destination: destination)
+      session = DevSession::Tmux::Session.new(
+        id: '$fork', name: destination, mark: '1', slug: destination,
+        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+      )
+      observed = []
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:resolve_portal_fork_settings) { |*_args, **_kwargs| ['model-1', 'high'] }
+        define_method(:create_portal_fork) { |*_args, **_kwargs| 'thread-fork' }
+        define_method(:name_portal_thread) { |*_args| nil }
+        define_method(:create_tmux_session) do |*_args, **kwargs|
+          session.identity_token = kwargs.fetch(:identity_token)
+          session
+        end
+        define_method(:sync_slug) { |*_args, **_kwargs| session }
+        define_method(:delete_fork_journal) do |slug|
+          observed << JSON.parse(File.read(options.fetch(:creation_evidence)))
+          raise 'journal removed before evidence' unless File.file?(fork_journal_file(slug))
+          super(slug)
+        end
+      end
+      runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                err: StringIO.new, today: TODAY, env: {})
+      runner.fork(source_slug, destination, as_is: true, json: true,
+                  model: 'model-1', effort: 'high', **options)
+      assert_equal(1, observed.length)
+      evidence = observed.fetch(0)
+      assert_equal(options.fetch(:creation_receipt_id), evidence.fetch('receiptId'))
+      assert_equal('thread-source', evidence.fetch('sourceThreadId'))
+      assert_equal('thread-fork', evidence.fetch('threadId'))
+      assert_equal('model-1', evidence.fetch('model'))
+      assert_equal(File.stat(File.join(workspace, 'work', destination)).ino, evidence.fetch('trackingInode'))
+      refute(File.exist?(setup.send(:fork_journal_file, destination)))
+      assert_equal(0o600, File.stat(options.fetch(:creation_evidence)).mode & 0o777)
+    end
+  end
+
+  def test_portal_fork_retries_an_evidence_failure_without_forking_twice
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination = '2026-06-06-proof'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      manifest = setup.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      options = portal_creation_expectation(workspace, source_slug, destination: destination)
+      session = DevSession::Tmux::Session.new(
+        id: '$fork', name: destination, mark: '1', slug: destination,
+        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+      )
+      observed = []
+      fork_calls = []
+      evidence_attempts = []
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:resolve_portal_fork_settings) { |*_args, **_kwargs| ['model-1', 'high'] }
+        define_method(:create_portal_fork) do |*_args, **_kwargs|
+          fork_calls << true
+          'thread-fork'
+        end
+        define_method(:write_portal_creation_evidence!) do |*args|
+          evidence_attempts << true
+          raise DevSession::Error, 'simulated evidence persistence failure' if evidence_attempts.length == 1
+          super(*args)
+        end
+        define_method(:name_portal_thread) { |*_args| nil }
+        define_method(:create_tmux_session) do |*_args, **kwargs|
+          session.identity_token = kwargs.fetch(:identity_token)
+          session
+        end
+        define_method(:sync_slug) { |*_args, **_kwargs| session }
+        define_method(:delete_fork_journal) do |slug|
+          observed << JSON.parse(File.read(options.fetch(:creation_evidence)))
+          raise 'journal removed before evidence' unless File.file?(fork_journal_file(slug))
+          super(slug)
+        end
+      end
+      runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                err: StringIO.new, today: TODAY, env: {})
+      error = assert_raises(DevSession::Error) do
+        runner.fork(source_slug, destination, as_is: true, json: true,
+                    model: 'model-1', effort: 'high', **options)
+      end
+      assert_includes(error.message, 'evidence persistence failure')
+      assert(File.file?(setup.send(:fork_journal_file, destination)))
+      refute(File.exist?(options.fetch(:creation_evidence)))
+      wrong = options.merge(creation_receipt_id: 'b' * 64)
+      assert_raises(DevSession::Error) do
+        runner.fork(source_slug, destination, as_is: true, json: true,
+                    model: 'model-1', effort: 'high', **wrong)
+      end
+      runner.fork(source_slug, destination, as_is: true, json: true,
+                  model: 'model-1', effort: 'high', **options)
+      assert_equal(1, fork_calls.length)
+      assert_equal(1, observed.length)
+      evidence = observed.fetch(0)
+      assert_equal(options.fetch(:creation_receipt_id), evidence.fetch('receiptId'))
+      assert_equal('thread-source', evidence.fetch('sourceThreadId'))
+      assert_equal('thread-fork', evidence.fetch('threadId'))
+      assert_equal('model-1', evidence.fetch('model'))
+      assert_equal(File.stat(File.join(workspace, 'work', destination)).ino, evidence.fetch('trackingInode'))
+      refute(File.exist?(setup.send(:fork_journal_file, destination)))
+      assert_equal(0o600, File.stat(options.fetch(:creation_evidence)).mode & 0o777)
+    end
+  end
+
+  def test_portal_fork_recovers_its_bound_journal_after_source_archive_or_deletion
+    %w[archive delete].each do |source_action|
+      with_workspace do |workspace|
+        source_slug = '2026-06-05-source'
+        destination = '2026-06-06-recovery'
+        setup = runner_for(workspace)
+        setup.ensure_tracking_files(source_slug)
+        manifest = setup.send(:ensure_portal_manifest, source_slug)
+        manifest['codex'] = { 'thread_id' => 'thread-source' }
+        setup.send(:write_portal_manifest, source_slug, manifest)
+        options = portal_creation_expectation(workspace, source_slug, destination: destination)
+        session = DevSession::Tmux::Session.new(
+          id: '$fork', name: destination, mark: '1', slug: destination,
+          workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+        )
+        forks = []
+        tmux_attempts = []
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:resolve_portal_fork_settings) { |*_args, **_kwargs| ['model-1', 'high'] }
+          define_method(:create_portal_fork) do |*_args, **_kwargs|
+            forks << true
+            'thread-fork'
+          end
+          define_method(:name_portal_thread) { |*_args| nil }
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            tmux_attempts << true
+            raise DevSession::Error, 'interrupted after journal and thread publication' if tmux_attempts.length == 1
+            session.identity_token = kwargs.fetch(:identity_token)
+            session
+          end
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
+        end
+        runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                  err: StringIO.new, today: TODAY, env: {})
+        assert_raises(DevSession::Error) do
+          runner.fork(source_slug, destination, as_is: true, json: true,
+                      model: 'model-1', effort: 'high', **options)
+        end
+        journal_path = setup.send(:fork_journal_file, destination)
+        assert(File.file?(journal_path))
+        assert(File.file?(options.fetch(:creation_evidence) + '.request'))
+        source_path = File.join(workspace, 'work', source_slug)
+        if source_action == 'archive'
+          FileUtils.mkdir_p(File.join(workspace, 'archive'))
+          File.rename(source_path, File.join(workspace, 'archive', source_slug))
+        else
+          FileUtils.rm_r(source_path)
+        end
+        assert_raises(DevSession::Error) do
+          runner.fork(source_slug, destination, as_is: true, json: true,
+                      model: 'model-1', effort: 'high', **options.merge(expected_source_thread: 'other-thread'))
+        end
+        assert_raises(DevSession::Error) do
+          runner.fork(source_slug, destination, as_is: true, json: true,
+                      model: 'model-1', effort: 'high', **options.merge(creation_receipt_id: 'b' * 64))
+        end
+        runner.fork(source_slug, destination, as_is: true, json: true,
+                    model: 'model-1', effort: 'high', **options)
+        proof = JSON.parse(File.read(options.fetch(:creation_evidence)))
+        assert_equal(options.fetch(:creation_receipt_id), proof.fetch('receiptId'))
+        assert_equal('thread-source', proof.fetch('sourceThreadId'))
+        assert_equal('thread-fork', proof.fetch('threadId'))
+        assert_equal(1, forks.length)
+        refute(File.exist?(journal_path))
+      end
+    end
+  end
+
+  def test_portal_fork_refuses_a_replaced_source_before_creating_destination_state
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      manifest = setup.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      options = portal_creation_expectation(workspace, source_slug, destination: '2026-06-06-replaced')
+      manifest['codex']['thread_id'] = 'replacement-thread'
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      error = assert_raises(DevSession::Error) do
+        setup.fork(source_slug, '2026-06-06-replaced', as_is: true, json: true, **options)
+      end
+      assert_includes(error.message, 'source session changed')
+      refute(File.exist?(File.join(workspace, 'work', '2026-06-06-replaced')))
+      refute(File.exist?(options.fetch(:creation_evidence) + '.request'))
+    end
+  end
+
+  def test_portal_creation_binding_preserves_request_and_refuses_an_unrelated_journal
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      directory = File.join(workspace, '.portal-private')
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      receipt = runner.send(:creation_receipt_options, 'a' * 64, File.join(directory, 'complete.json'),
+                            expected_source: nil, expected_source_thread: nil, expected_source_identity: nil)
+      write_portal_creation_acceptance(workspace, '2026-06-06-new', id: 'a' * 64, directory: directory)
+      runner.send(:prepare_portal_creation_receipt!, receipt, '2026-06-06-new', 'start',
+                  goal: 'Accepted request', model: 'model-1', effort: 'high')
+      error = assert_raises(DevSession::Error) do
+        runner.send(:prepare_portal_creation_receipt!, receipt, '2026-06-06-new', 'start',
+                    goal: 'Changed request', model: 'model-1', effort: 'high')
+      end
+      assert_includes(error.message, 'does not match')
+      second = runner.send(:creation_receipt_options, 'b' * 64, File.join(directory, 'other.json'),
+                           expected_source: nil, expected_source_thread: nil, expected_source_identity: nil)
+      write_portal_creation_acceptance(workspace, '2026-06-06-unrelated', id: 'b' * 64, directory: directory)
+      runner.send(:prepare_start_journal!, '2026-06-06-unrelated')
+      assert_raises(DevSession::Error) do
+        runner.send(:prepare_portal_creation_receipt!, second, '2026-06-06-unrelated', 'start',
+                    goal: 'Accepted request', model: 'model-1', effort: 'high')
+      end
+      refute(File.exist?(second.fetch('evidence') + '.request'))
+    end
+  end
+
+  def test_portal_creation_requires_its_exact_current_receipt_even_with_a_binding
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-06-06-current-receipt'
+      directory = File.join(workspace, '.portal-private')
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      path = write_portal_creation_acceptance(workspace, slug, id: 'a' * 64, directory: directory)
+      original = File.read(path)
+      receipt = runner.send(:creation_receipt_options, 'a' * 64, File.join(directory, 'complete.json'),
+                            expected_source: nil, expected_source_thread: nil, expected_source_identity: nil)
+      prepare = lambda do
+        runner.send(:prepare_portal_creation_receipt!, receipt, slug, 'start',
+                    goal: 'Accepted request', model: 'model-1', effort: 'high')
+      end
+      prepare.call
+      binding = File.read(receipt.fetch('evidence') + '.request')
+      %w[missing replaced workspace slug schema missing-history invalid-history].each do |change|
+        current = JSON.parse(original)
+        case change
+        when 'replaced' then current['receiptId'] = 'b' * 64
+        when 'workspace' then current['workspace'] += '-different'
+        when 'slug' then current['request']['slug'] = 'different-slug'
+        when 'schema' then current['schema'] = 99
+        when 'missing-history' then current.delete('deletionHistorySha256')
+        when 'invalid-history' then current['deletionHistorySha256'] = 'not-a-digest'
+        end
+        File.write(path, JSON.generate(current))
+        File.chmod(0o600, path)
+        File.unlink(path) if change == 'missing'
+        error = assert_raises(DevSession::Error, &prepare)
+        assert_includes(error.message, 'no longer current')
+        assert_equal(binding, File.read(receipt.fetch('evidence') + '.request'))
+        refute(File.exist?(runner.send(:creation_journal_file, slug)))
+      end
+      File.write(path, original)
+      File.chmod(0o600, path)
+      prepare.call
+      changed = JSON.parse(original).merge('deletionHistorySha256' => 'c' * 64)
+      File.write(path, JSON.generate(changed))
+      error = assert_raises(DevSession::Error, &prepare)
+      assert_includes(error.message, 'does not match the recorded CLI request')
+      assert_equal(binding, File.read(receipt.fetch('evidence') + '.request'))
+    end
+  end
+
+  def test_portal_fork_rechecks_current_receipt_after_source_validation
+    with_workspace do |workspace|
+      source_slug = '2026-06-05-source'
+      destination = '2026-06-06-queued-fork'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source_slug)
+      manifest = setup.send(:ensure_portal_manifest, source_slug)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source_slug, manifest)
+      options = portal_creation_expectation(workspace, source_slug, destination: destination)
+      current_path = File.join(File.dirname(options.fetch(:creation_evidence)), "#{destination}.json")
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:resolve_portal_fork_settings) do |*_args, **_kwargs|
+          File.unlink(current_path)
+          ['model-1', 'high']
+        end
+        define_method(:create_portal_fork) { |*_args, **_kwargs| raise 'retired fork reached thread creation' }
+      end
+      runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                err: StringIO.new, today: TODAY, env: {})
+      error = assert_raises(DevSession::Error) do
+        runner.fork(source_slug, destination, as_is: true, json: true,
+                    model: 'model-1', effort: 'high', **options)
+      end
+      assert_includes(error.message, 'no longer current')
+      refute(File.exist?(runner.send(:fork_journal_file, destination)))
+      refute(File.exist?(File.join(workspace, 'work', destination)))
+    end
+  end
+
   def test_fork_creates_a_conversation_only_session
     with_workspace do |workspace|
       source_slug = '2026-06-05-source'
@@ -2635,6 +2972,328 @@ class DevSessionTest < Minitest::Test
         YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
             .fetch('creation')
       )
+    end
+  end
+
+  def test_portal_start_persists_receipt_bound_completion_for_the_exact_goal
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      out = StringIO.new
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Implement a useful feature.\n")
+      tmux = ManagedTmux.new(slug, workspace:)
+      portal_command = [
+        RbConfig.ruby,
+        '-e',
+        "require 'json'; puts JSON.generate(threadId: 'thread-123')"
+      ]
+      session = DevSession::Tmux::Session.new(
+        id: '$created',
+        name: slug,
+        mark: '1',
+        slug:,
+        workspace:, codex_thread_id: 'thread-123'
+      )
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:create_tmux_session) do |
+          _slug, run_codex:, thread_id:, launch_codex:, identity_token:
+        |
+          raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
+          raise 'Codex launched before the initial request persisted' if launch_codex
+          raise 'missing journaled tmux identity' unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
+
+          session
+        end
+
+        define_method(:sync_slug) do |_slug, require_session:, session:|
+          raise 'missing created session' unless require_session && session
+
+          session
+        end
+
+        define_method(:revalidate_session!) do |expected|
+          expected
+        end
+
+        define_method(:reconcile_native_client!) do |_slug, expected, **_keywords|
+          expected
+        end
+      end
+      runner = runner_class.new(
+        workspace:,
+        tmux: NullTmux.new,
+        out:,
+        err: StringIO.new,
+        today: TODAY,
+        env: {},
+        portal_command:,
+        portal_url: 'https://workspace.example.test'
+      )
+
+      private_directory = File.join(workspace, '.portal-private')
+      FileUtils.mkdir_p(private_directory, mode: 0o700)
+      evidence_path = File.join(private_directory, 'complete.json')
+      write_portal_creation_acceptance(workspace, slug, id: 'a' * 64, directory: private_directory)
+      runner.start(
+        slug,
+        as_is: true,
+        new: false,
+        attach: false,
+        run_codex: true,
+        goal_file: goal,
+        json: true, creation_receipt_id: "a" * 64, creation_evidence: evidence_path
+      )
+
+      proof = JSON.parse(File.read(evidence_path))
+      assert_equal('a' * 64, proof.fetch('receiptId'))
+      assert_equal('thread-123', proof.fetch('threadId'))
+      assert_equal(Digest::SHA256.hexdigest('Implement a useful feature.'), proof.fetch('goalSha256'))
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      assert_equal(%w[goal_sha256 run_codex schema slug state], journal.keys.sort)
+      result = JSON.parse(out.string)
+      assert_equal(slug, result['slug'])
+      assert_equal('thread-123', result['threadId'])
+      assert_equal("https://workspace.example.test/#{slug}/", result['url'])
+      assert_includes(File.read(File.join(workspace, 'work', slug, 'plan.md')), 'Implement a useful feature.')
+      assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial request')
+      assert_equal(
+        {
+          'state' => 'ready',
+          'initial_goal_sent' => true,
+          'goal_sha256' => Digest::SHA256.hexdigest('Implement a useful feature.')
+        },
+        YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+            .fetch('creation')
+      )
+    end
+  end
+
+  def test_portal_plan_start_recovers_evidence_failure_after_source_archive_or_deletion
+    %w[archive delete].each do |source_action|
+      with_workspace do |workspace|
+        source_slug = '2026-06-05-source'
+        slug = '2026-06-06-plan-recovery'
+        setup = runner_for(workspace)
+        setup.ensure_tracking_files(source_slug)
+        source = setup.send(:ensure_portal_manifest, source_slug)
+        source['codex'] = { 'thread_id' => 'source-thread' }
+        setup.send(:write_portal_manifest, source_slug, source)
+        options = portal_creation_expectation(workspace, source_slug, destination: slug)
+        goal = "Implement the following approved plan from session #{source_slug}.\n\nExact accepted plan."
+        created = []
+        delivered = []
+        evidence_attempts = []
+        session = DevSession::Tmux::Session.new(
+          id: '$plan', name: slug, mark: '1', slug:, workspace:, codex_thread_id: 'plan-thread'
+        )
+        live = false
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_portal_thread) do |*_args, **_kwargs|
+            created << 'plan-thread'
+            'plan-thread'
+          end
+          define_method(:name_portal_thread) { |*_args| nil }
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            session.identity_token = kwargs.fetch(:identity_token)
+            live = true
+            session
+          end
+          define_method(:cleanup_session) { |_slug| live ? session : nil }
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
+          define_method(:revalidate_session!) { |expected| expected }
+          define_method(:reconcile_native_client!) { |_slug, expected, **_kwargs| expected }
+          define_method(:send_portal_goal) do |_slug, _thread_id, goal_file, **_kwargs|
+            delivered << read_goal(goal_file)
+          end
+          define_method(:write_portal_creation_evidence!) do |*args|
+            evidence_attempts << true
+            raise DevSession::Error, 'interrupted before completion evidence' if evidence_attempts.length == 1
+            super(*args)
+          end
+        end
+        runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                  err: StringIO.new, today: TODAY, env: {})
+        arguments = { as_is: true, new: false, attach: false, run_codex: true, json: true,
+                      exclusive: true, model: 'model-1', effort: 'high', goal_text: goal, **options }
+        assert_raises(DevSession::Error) { runner.start(slug, **arguments) }
+        journal_path = runner.send(:creation_journal_file, slug)
+        original_journal = File.read(journal_path)
+        assert_equal('ready', JSON.parse(original_journal).fetch('state'))
+        refute(File.exist?(options.fetch(:creation_evidence)))
+        source_path = File.join(workspace, 'work', source_slug)
+        if source_action == 'archive'
+          FileUtils.mkdir_p(File.join(workspace, 'archive'))
+          File.rename(source_path, File.join(workspace, 'archive', source_slug))
+        else
+          FileUtils.rm_r(source_path)
+        end
+        assert_raises(DevSession::Error) { runner.start(slug, **arguments.merge(goal_text: 'A different plan')) }
+        foreign_journal = JSON.parse(original_journal).merge('goal_sha256' => Digest::SHA256.hexdigest('A different plan'))
+        File.write(journal_path, JSON.generate(foreign_journal))
+        assert_raises(DevSession::Error) { runner.start(slug, **arguments) }
+        File.write(journal_path, original_journal)
+        runner.start(slug, **arguments)
+        proof = JSON.parse(File.read(options.fetch(:creation_evidence)))
+        assert_equal(options.fetch(:creation_receipt_id), proof.fetch('receiptId'))
+        assert_equal('source-thread', proof.fetch('sourceThreadId'))
+        assert_equal('plan-thread', proof.fetch('threadId'))
+        assert_equal(Digest::SHA256.hexdigest(goal), proof.fetch('goalSha256'))
+        assert_equal('model-1', proof.fetch('model'))
+        assert_equal('high', proof.fetch('effort'))
+        assert_equal(['plan-thread'], created)
+        assert_equal([goal], delivered)
+        assert_equal(original_journal, File.read(journal_path))
+      end
+    end
+  end
+
+  def test_portal_plan_start_binding_alone_still_requires_its_source
+    %w[archive delete replace].each do |source_action|
+      with_workspace do |workspace|
+        source_slug = '2026-06-05-source'
+        slug = '2026-06-06-plan-fresh'
+        runner = runner_for(workspace)
+        runner.ensure_tracking_files(source_slug)
+        source = runner.send(:ensure_portal_manifest, source_slug)
+        source['codex'] = { 'thread_id' => 'source-thread' }
+        runner.send(:write_portal_manifest, source_slug, source)
+        options = portal_creation_expectation(workspace, source_slug, destination: slug)
+        receipt = runner.send(:creation_receipt_options, options.fetch(:creation_receipt_id), options.fetch(:creation_evidence),
+                              expected_source: options.fetch(:expected_source), expected_source_thread: options.fetch(:expected_source_thread),
+                              expected_source_identity: options.fetch(:expected_source_identity))
+        runner.send(:prepare_portal_creation_receipt!, receipt, slug, 'start', goal: 'Exact plan', model: 'model-1', effort: 'high')
+        binding = File.read(options.fetch(:creation_evidence) + '.request')
+        source_path = File.join(workspace, 'work', source_slug)
+        if source_action == 'archive'
+          FileUtils.mkdir_p(File.join(workspace, 'archive'))
+          File.rename(source_path, File.join(workspace, 'archive', source_slug))
+        elsif source_action == 'delete'
+          FileUtils.rm_r(source_path)
+        else
+          source['codex']['thread_id'] = 'replacement-thread'
+          runner.send(:write_portal_manifest, source_slug, source)
+        end
+        assert_raises(DevSession::Error) do
+          runner.start(slug, as_is: true, new: false, attach: false, run_codex: true, json: true,
+                       exclusive: true, model: 'model-1', effort: 'high', goal_text: 'Exact plan', **options)
+        end
+        refute(File.exist?(runner.send(:creation_journal_file, slug)))
+        refute(File.exist?(File.join(workspace, 'work', slug)))
+        assert_equal(binding, File.read(options.fetch(:creation_evidence) + '.request'))
+      end
+    end
+  end
+
+  def test_portal_creation_retry_cannot_recreate_a_deleted_destination
+    %w[new plan fork].each do |kind|
+      with_workspace do |workspace|
+        source_slug = '2026-06-05-source'
+        slug = "2026-06-06-deleted-#{kind}"
+        setup = runner_for(workspace)
+        setup.ensure_tracking_files(source_slug)
+        source = setup.send(:ensure_portal_manifest, source_slug)
+        source['codex'] = { 'thread_id' => 'source-thread' }
+        setup.send(:write_portal_manifest, source_slug, source)
+        options = portal_creation_expectation(workspace, source_slug, destination: slug)
+        options = options.reject { |key, _| key.to_s.start_with?('expected_source') } if kind == 'new'
+        created = []
+        delivered = []
+        session = DevSession::Tmux::Session.new(
+          id: '$deleted', name: slug, mark: '1', slug:, workspace:, codex_thread_id: 'deleted-thread'
+        )
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_portal_thread) { |*_args, **_kwargs| created << kind; 'deleted-thread' }
+          define_method(:create_portal_fork) { |*_args, **_kwargs| created << kind; 'deleted-thread' }
+          define_method(:resolve_portal_fork_settings) { |*_args, **_kwargs| ['model-1', 'high'] }
+          define_method(:name_portal_thread) { |*_args| nil }
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            session.identity_token = kwargs.fetch(:identity_token)
+            session
+          end
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
+          define_method(:revalidate_session!) { |expected| expected }
+          define_method(:reconcile_native_client!) { |_slug, expected, **_kwargs| expected }
+          define_method(:send_portal_goal) { |_slug, _thread, path, **_kwargs| delivered << read_goal(path) }
+          define_method(:write_portal_creation_evidence!) { |*_args| raise DevSession::Error, 'interrupted before receipt evidence' }
+        end
+        runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
+                                  err: StringIO.new, today: TODAY,
+                                  env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'), 'PATH' => '' })
+        arguments = { as_is: true, json: true, model: 'model-1', effort: 'high', **options }
+        attempt = lambda do
+          if kind == 'fork'
+            runner.fork(source_slug, slug, **arguments)
+          else
+            runner.start(slug, new: false, attach: false, run_codex: true,
+                         exclusive: true, goal_text: 'Exact accepted goal', **arguments)
+          end
+        end
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'interrupted before receipt evidence')
+        assert_equal('ready', YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml'))).dig('creation', 'state'))
+        refute(File.exist?(options.fetch(:creation_evidence)))
+        binding_path = options.fetch(:creation_evidence) + '.request'
+        original_binding = File.read(binding_path)
+        original_time = File.mtime(binding_path)
+        # The old generation can finish its fork journal without new receipt
+        # evidence, then perform its normal deletion lifecycle.
+        runner.send(:delete_fork_journal, slug) if kind == 'fork'
+        removal = runner.send(:prepare_removal!, slug, force: false)
+        %w[validated thread_retiring thread_retired clusters_released worktrees_removed runtime_retired].each do |phase|
+          runner.send(:advance_removal!, slug, removal, phase)
+        end
+        worktrees = File.join(workspace, 'worktrees', slug)
+        Dir.rmdir(worktrees) if File.directory?(worktrees)
+        runner.send(:preserve_removed_state!, slug, removal, nil)
+        runner.send(:advance_removal!, slug, removal, 'tracking_preserved')
+        runner.send(:advance_removal!, slug, removal, 'tracking_committed')
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'unfinished')
+        assert_equal(original_binding, File.read(binding_path))
+        runner.send(:finalize_removal!, slug, removal)
+        removal['removed_at'] = '2000-01-01T00:00:00Z'
+        runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'session was deleted')
+        assert_equal(original_time, File.mtime(binding_path))
+        assert_equal([kind], created)
+        assert_equal(kind == 'fork' ? [] : ['Exact accepted goal'], delivered)
+        refute(File.exist?(File.join(workspace, 'work', slug)))
+        refute(File.exist?(runner.send(:creation_journal_file, slug)))
+        # Retirement removes the cache. A queued worker cannot reconstruct
+        # acceptance from its binding, the clock, or current deletion history.
+        current_path = File.join(File.dirname(binding_path), "#{slug}.json")
+        File.unlink(current_path)
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'no longer current')
+        File.unlink(binding_path)
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'no longer current')
+        refute(File.exist?(binding_path))
+        assert_equal([kind], created)
+        removal['removed_at'] = '2099-01-01T00:00:00Z'
+        runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
+        fresh_options = portal_creation_expectation(workspace, source_slug, destination: slug, id: 'b' * 64)
+        fresh_options = fresh_options.reject { |key, _| key.to_s.start_with?('expected_source') } if kind == 'new'
+        fresh = runner.send(:creation_receipt_options, fresh_options.fetch(:creation_receipt_id), fresh_options.fetch(:creation_evidence),
+                            expected_source: fresh_options[:expected_source], expected_source_thread: fresh_options[:expected_source_thread],
+                            expected_source_identity: fresh_options[:expected_source_identity])
+        runner.send(:prepare_portal_creation_receipt!, fresh, slug, kind == 'fork' ? 'fork' : 'start',
+                    goal: kind == 'fork' ? nil : 'Fresh goal', model: 'model-1', effort: 'high')
+        fresh_binding = fresh_options.fetch(:creation_evidence) + '.request'
+        assert(File.file?(fresh_binding))
+        original_history = fresh.fetch('binding').fetch('deletion_history_sha256')
+        %w[2000-01-01T00:00:00Z 2099-01-01T00:00:00Z].each do |clock|
+          removal['removed_at'] = clock
+          runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
+          runner.send(:prepare_portal_creation_receipt!, fresh, slug, kind == 'fork' ? 'fork' : 'start',
+                      goal: kind == 'fork' ? nil : 'Fresh goal', model: 'model-1', effort: 'high')
+          assert_equal(original_history, fresh.fetch('binding').fetch('deletion_history_sha256'))
+        end
+        error = assert_raises(DevSession::Error, &attempt)
+        assert_includes(error.message, 'no longer current')
+
+      end
     end
   end
 

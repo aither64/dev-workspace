@@ -595,11 +595,20 @@ module DevSession
       effort: nil,
       allow_empty_thread: false,
       lifecycle_operation: nil,
-      lifecycle_operation_id: nil
+      lifecycle_operation_id: nil,
+      creation_receipt_id: nil,
+      creation_evidence: nil,
+      expected_source: nil,
+      expected_source_thread: nil,
+      expected_source_identity: nil
     )
       if goal_file && goal_text
         raise Error, 'initial request cannot use both a goal file and direct text'
       end
+      receipt = creation_receipt_options(
+        creation_receipt_id, creation_evidence,
+        expected_source:, expected_source_thread:, expected_source_identity:
+      )
       goal_snapshot = nil
       if goal_file || goal_text
         goal = goal_text ? normalize_goal_text(goal_text) : read_goal(goal_file)
@@ -626,6 +635,12 @@ module DevSession
       replayed = false
 
       session = with_creation_lock(slug) do
+        # An existing destination journal owns recovery of the exact accepted
+        # goal. The locked binding and journal checks below must succeed before
+        # any replay; only a fresh creation still needs its live source.
+        if receipt && receipt['source'] && !path_exists?(creation_journal_file(slug))
+          verify_creation_source!(receipt)
+        end
         creation_journal = nil
         manifest = nil
         thread_id = nil
@@ -638,6 +653,9 @@ module DevSession
           if lifecycle_operation == 'revive'
             prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
           end
+          prepare_portal_creation_receipt!(
+            receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:
+          )
           creation_journal = prepare_creation_journal(
             slug,
             goal_file,
@@ -927,6 +945,11 @@ module DevSession
             current
           end
         end
+        if receipt
+          with_slug_lock(slug) do
+            write_portal_creation_evidence!(receipt, slug, selected_session)
+          end
+        end
         selected_session
       end
 
@@ -970,9 +993,29 @@ module DevSession
       attach_to_session(session)
     end
 
-    def fork(source_input, destination_input, as_is:, json:, model: nil, effort: nil)
+    def fork(
+      source_input, destination_input, as_is:, json:, model: nil, effort: nil,
+      creation_receipt_id: nil, creation_evidence: nil,
+      expected_source: nil, expected_source_thread: nil, expected_source_identity: nil
+    )
+      receipt = creation_receipt_options(
+        creation_receipt_id, creation_evidence,
+        expected_source:, expected_source_thread:, expected_source_identity:
+      )
       destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
       journal = load_fork_journal(destination_slug)
+      verify_creation_source!(receipt) if receipt && receipt['source'] && journal.nil?
+      if receipt
+        with_creation_lock(destination_slug) do
+          with_slug_lock(destination_slug) do
+            prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:)
+          end
+        end
+      end
+      journal = load_fork_journal(destination_slug)
+      if receipt && journal && journal['source_thread_id'] != receipt.fetch('source_thread')
+        raise Error, 'fork journal source does not match the accepted conversation'
+      end
       require_fork_journal_options!(journal, destination_slug, model:, effort:) if journal
       source_slug = if journal
         recorded = journal.fetch('source_slug')
@@ -985,13 +1028,17 @@ module DevSession
       else
         lookup_slug(source_input, as_is: false)
       end
+      if receipt && receipt['source'] != source_slug
+        raise Error, 'fork source does not match the accepted creation request'
+      end
       raise Error, 'fork source and destination must be different' if source_slug == destination_slug
 
       if (recovered = recover_completed_fork(
         destination_slug,
         source_slug,
         model:,
-        effort:
+        effort:,
+        receipt:
       ))
         write_fork_result(recovered, destination_slug, source_slug, json:)
         return
@@ -1004,6 +1051,7 @@ module DevSession
                             select_tmux_for_slug!(source_slug)
                             reject_conflicting_lifecycle_journal!(source_slug)
                             manifest = load_portal_manifest(portal_file(source_slug), required: true)
+                            require_expected_creation_source!(receipt, source_slug, manifest)
                             thread_id = manifest.dig('codex', 'thread_id')
                             if thread_id.nil? || thread_id.empty?
                               raise Error,
@@ -1036,8 +1084,12 @@ module DevSession
         with_slug_lock(destination_slug) do
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
+          require_current_portal_creation!(receipt, destination_slug) if receipt
           fork_journal = load_fork_journal(destination_slug, source_slug)
           if fork_journal
+            if receipt && fork_journal['source_thread_id'] != receipt.fetch('source_thread')
+              raise Error, 'fork journal source does not match the accepted conversation'
+            end
             require_fork_journal_options!(
               fork_journal,
               destination_slug,
@@ -1096,6 +1148,7 @@ module DevSession
             selected = ensure_managed_session!(destination_slug, session: selected)
             selected = reconcile_native_client!(destination_slug, selected)
             write_session_authority(destination_slug, selected, state: 'ready')
+            write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
             delete_fork_journal(destination_slug)
             next selected
           end
@@ -1127,6 +1180,7 @@ module DevSession
             raise Error, "created tmux session does not match fork identity for #{destination_slug}"
           end
           write_session_authority(destination_slug, selected, state: 'ready')
+          write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
           delete_fork_journal(destination_slug)
           selected
         end
@@ -1151,7 +1205,7 @@ module DevSession
       end
     end
 
-    def recover_completed_fork(destination_slug, source_slug, model:, effort:)
+    def recover_completed_fork(destination_slug, source_slug, model:, effort:, receipt: nil)
       return nil unless path_exists?(fork_journal_file(destination_slug))
 
       with_creation_lock(destination_slug) do
@@ -1161,6 +1215,9 @@ module DevSession
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
           journal = load_fork_journal(destination_slug, source_slug)
+          if receipt && journal['source_thread_id'] != receipt.fetch('source_thread')
+            raise Error, 'fork journal source does not match the accepted conversation'
+          end
           require_fork_journal_options!(journal, destination_slug, model:, effort:)
           return nil unless path_exists?(portal_file(destination_slug))
 
@@ -1212,6 +1269,7 @@ module DevSession
           selected = reconcile_native_client!(destination_slug, selected)
           selected = sync_slug(destination_slug, require_session: true, session: selected)
           write_session_authority(destination_slug, selected, state: 'ready')
+          write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
           delete_fork_journal(destination_slug)
           selected
         end
@@ -2722,6 +2780,164 @@ module DevSession
       ensure
         File.unlink(temporary) if path_exists?(temporary)
       end
+    end
+
+    # Private receipt metadata is additive: strict runtime and fork journals
+    # remain readable by the preceding package generation.
+    def creation_receipt_options(id, evidence, expected_source:, expected_source_thread:, expected_source_identity:)
+      values = [id, evidence, expected_source, expected_source_thread, expected_source_identity]
+      return nil if values.all?(&:nil?)
+      unless id.is_a?(String) && id.match?(/\A[0-9a-f]{64}\z/) &&
+             evidence.is_a?(String) && evidence.start_with?('/')
+        raise Error, 'creation receipt requires a valid ID and absolute evidence path'
+      end
+      source_values = [expected_source, expected_source_thread, expected_source_identity]
+      unless source_values.all?(&:nil?) ||
+             valid_part?(expected_source) && expected_source_thread.is_a?(String) &&
+               expected_source_thread.match?(/\A[0-9A-Za-z-]+\z/) &&
+               expected_source_identity.is_a?(String) &&
+               expected_source_identity.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'creation source expectation is incomplete'
+      end
+      directory = File.dirname(evidence)
+      unless File.directory?(directory) && !File.symlink?(directory) &&
+             File.stat(directory).mode & 0o777 == 0o700
+        raise Error, 'creation evidence directory must be private'
+      end
+      {
+        'receipt_id' => id, 'evidence' => evidence,
+        'source' => expected_source, 'source_thread' => expected_source_thread,
+        'source_identity' => expected_source_identity
+      }
+    end
+
+    def verify_creation_source!(receipt)
+      slug = receipt.fetch('source')
+      with_slug_lock(slug) do
+        reject_conflicting_lifecycle_journal!(slug)
+        manifest = load_portal_manifest(portal_file(slug), required: true)
+        require_expected_creation_source!(receipt, slug, manifest)
+      end
+    end
+
+    def require_expected_creation_source!(receipt, slug, manifest)
+      return unless receipt
+      stat = File.lstat(work_dir(slug))
+      identity = Digest::SHA256.hexdigest([
+        work_dir(slug), stat.dev, stat.ino, stat.ctime.to_i, stat.ctime.nsec,
+        manifest.dig('codex', 'thread_id')
+      ].join("\0"))
+      unless stat.directory? && receipt['source'] == slug &&
+             manifest.dig('codex', 'thread_id') == receipt.fetch('source_thread') &&
+             identity == receipt.fetch('source_identity') &&
+             manifest.dig('creation', 'state') == 'ready' &&
+             (!manifest.dig('creation', 'goal_sha256') || manifest.dig('creation', 'initial_goal_sent'))
+        raise Error, 'source session changed since creation was accepted'
+      end
+    end
+
+    def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:)
+      return unless receipt
+      path = receipt.fetch('evidence') + '.request'
+      history = require_current_portal_creation!(receipt, slug)
+      binding = {
+        'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'kind' => kind,
+        'receipt_id' => receipt.fetch('receipt_id'), 'deletion_history_sha256' => history,
+        'source_thread' => receipt['source_thread'],
+        'source_identity' => receipt['source_identity'],
+        'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
+        'model' => model, 'effort' => effort
+      }
+      if path_exists?(path)
+        unless File.file?(path) && !File.symlink?(path) && File.size(path) <= 16 * 1024 &&
+               JSON.parse(File.read(path)) == binding
+          raise Error, 'creation receipt does not match the recorded CLI request'
+        end
+      else
+        if slug_state_exists?(slug) || path_exists?(creation_journal_file(slug)) ||
+           path_exists?(fork_journal_file(slug)) || path_exists?(start_journal_file(slug))
+          raise Error, 'existing session creation belongs to another request'
+        end
+      end
+      write_creation_journal(path, binding, create: true) unless path_exists?(path)
+      receipt['binding'] = binding
+    rescue JSON::ParserError => e
+      raise Error, "invalid creation request binding: #{e.message}"
+    end
+
+    # The current receipt is mandatory even after a CLI binding exists. Its
+    # disappearance or replacement ends a worker queued before cache retirement.
+    def require_current_portal_creation!(receipt, slug)
+      path = File.join(File.dirname(receipt.fetch('evidence')), "#{slug}.json")
+      unless File.file?(path) && !File.symlink?(path) && File.stat(path).mode & 0o777 == 0o600
+        raise Error, 'creation request is no longer current; start a new request'
+      end
+      current = JSON.parse(read_bounded_file(path, 'creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384))
+      unless current.is_a?(Hash) && current['schema'] == 1 && current['workspace'] == workspace &&
+             current['receiptId'] == receipt.fetch('receipt_id') && current['request'].is_a?(Hash) &&
+             current['request']['slug'] == slug && current['deletionHistorySha256'].is_a?(String) &&
+             current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'creation request is no longer current; start a new request'
+      end
+      history = current.fetch('deletionHistorySha256')
+      if receipt['binding'] && receipt['binding']['deletion_history_sha256'] != history
+        raise Error, 'creation receipt does not match the recorded CLI request'
+      end
+      if completed_removal_history(slug) != history
+        raise Error, 'this creation request ended when the session was deleted; start a new request'
+      end
+      history
+    rescue JSON::ParserError => e
+      raise Error, "invalid creation receipt: #{e.message}"
+    end
+
+    # Hash only operation identities: wall-clock correction does not change
+    # which completed deletions an accepted request has already observed.
+    def completed_removal_history(slug)
+      root = removal_recovery_root_path
+      return Digest::SHA256.hexdigest('') unless path_exists?(root)
+
+      operations = Dir.children(root).filter_map do |name|
+        next unless name.include?("-#{slug}-")
+        directory = File.join(root, name)
+        metadata = JSON.parse(read_bounded_file(File.join(directory, 'recovery.json'), 'removal recovery marker', max_size: AUTHORITY_MAX_SIZE))
+        next unless metadata.is_a?(Hash) && metadata['schema'] == 1 && metadata['workspace'] == workspace &&
+                    metadata['slug'] == slug && metadata['state'] == 'removed' &&
+                    metadata['phase'] == 'removed' && metadata['recovery'] == directory &&
+                    metadata['operation_id'].is_a?(String) && metadata['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
+                    %w[work archive].include?(metadata['tracking'])
+        validate_removal_recovery!(slug, metadata)
+        Time.iso8601(metadata.fetch('removed_at'))
+        tracking = File.join(directory, metadata.fetch('tracking'))
+        unless File.directory?(tracking) && !File.symlink?(tracking)
+          raise Error, 'completed deletion has no preserved session tracking'
+        end
+        metadata.fetch('operation_id')
+      end
+      Digest::SHA256.hexdigest(operations.uniq.sort.join("\n"))
+    rescue JSON::ParserError, KeyError, ArgumentError => e
+      raise Error, "invalid creation deletion recovery: #{e.message}"
+    end
+
+    def write_portal_creation_evidence!(receipt, slug, selected)
+      manifest = load_portal_manifest(portal_file(slug), required: true)
+      binding = receipt.fetch('binding')
+      unless selected && selected.codex_thread_id == manifest.dig('codex', 'thread_id') &&
+             manifest.dig('creation', 'state') == 'ready' &&
+             (!manifest.dig('creation', 'goal_sha256') || manifest.dig('creation', 'initial_goal_sent'))
+        raise Error, 'cannot prove creation completed for the recorded conversation'
+      end
+      stat = File.lstat(work_dir(slug))
+      evidence = {
+        'schema' => 1, 'workspace' => workspace, 'slug' => slug,
+        'receiptId' => receipt.fetch('receipt_id'),
+        'threadId' => selected.codex_thread_id,
+        'sourceThreadId' => receipt['source_thread'].to_s,
+        'goalSha256' => binding['goal_sha256'].to_s,
+        'model' => binding['model'].to_s, 'effort' => binding['effort'].to_s,
+        'trackingDevice' => stat.dev, 'trackingInode' => stat.ino
+      }
+      write_creation_journal(receipt.fetch('evidence'), evidence, create: false)
     end
 
     def creation_journal_file(slug)
@@ -7147,6 +7363,14 @@ module DevSession
       @cluster_providers[provider_id] = path
     end
 
+    def parse_creation_receipt_options(parser, opts)
+      parser.on('--creation-receipt-id ID') { |value| opts[:creation_receipt_id] = value }
+      parser.on('--creation-evidence FILE') { |value| opts[:creation_evidence] = value }
+      parser.on('--expected-source SLUG') { |value| opts[:expected_source] = value }
+      parser.on('--expected-source-thread ID') { |value| opts[:expected_source_thread] = value }
+      parser.on('--expected-source-identity ID') { |value| opts[:expected_source_identity] = value }
+    end
+
     def run_start
       opts = {
         as_is: false,
@@ -7161,6 +7385,7 @@ module DevSession
         goal_text: nil
       }
       parser = OptionParser.new do |parser_opts|
+        parse_creation_receipt_options(parser_opts, opts)
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--new') { opts[:new] = true }
         parser_opts.on('--attach') { opts[:attach] = true }
@@ -7197,6 +7422,7 @@ module DevSession
     def run_fork
       opts = { as_is: false, json: false, model: nil, effort: nil }
       parser = OptionParser.new do |parser_opts|
+        parse_creation_receipt_options(parser_opts, opts)
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--json') { opts[:json] = true }
         parser_opts.on('--model MODEL') { |value| opts[:model] = value }

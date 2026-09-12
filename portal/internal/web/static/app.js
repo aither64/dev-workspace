@@ -1660,6 +1660,7 @@
     if (generation !== planRenderGeneration) return;
     panel.dataset.planTurnId = plan.turnId;
     panel.dataset.planSha256 = digest;
+    panel.planText = plan.text;
     const sameButton = document.getElementById("plan-implement-same");
     if (sameButton) sameButton.textContent = pendingImplementation ? "Check request" : "Implement here";
     panel.hidden = digest === dismissedPlanSHA;
@@ -2525,7 +2526,17 @@
 
   const planSessionDialog = document.getElementById("plan-session-dialog");
   const planSessionForm = document.getElementById("plan-session-form");
-  document.getElementById("plan-implement-new")?.addEventListener("click", () => planSessionDialog.showModal());
+  let planSessionSnapshot = null;
+  document.getElementById("plan-implement-new")?.addEventListener("click", () => {
+    planSessionSnapshot = {
+      planTurnId: planActions.dataset.planTurnId,
+      planSha256: planActions.dataset.planSha256,
+      planText: planActions.planText,
+      model: currentModel,
+      reasoningEffort: currentEffort,
+    };
+    planSessionDialog.showModal();
+  });
   planSessionDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => planSessionDialog.close());
   planSessionForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2537,8 +2548,7 @@
     try {
       const result = await client.implementPlan({
         action: "new",
-        planTurnId: planActions.dataset.planTurnId,
-        planSha256: planActions.dataset.planSha256,
+        ...planSessionSnapshot,
         name: planSessionForm.elements.name.value,
         creationDate: planSessionForm.elements.creationDate.value,
       });

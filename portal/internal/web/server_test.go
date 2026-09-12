@@ -949,6 +949,8 @@ func TestNewRequiresAnAbsoluteInstalledDevSessionCommand(t *testing.T) {
 
 func TestSessionCreationKeepsStandardOutputSeparateFromWarnings(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
+	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}}
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	script := "#!/bin/sh\nprintf 'diagnostic warning\\n' >&2\nprintf '{\"slug\":\"2026-09-03-example\",\"threadId\":\"thread-1\"}\\n'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
@@ -974,6 +976,8 @@ func TestSessionCreationKeepsStandardOutputSeparateFromWarnings(t *testing.T) {
 
 func TestSessionCreationAcceptsMaximallyEncodedMessageAtPublishedLimit(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
+	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}}
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	script := "#!/bin/sh\nprintf '{\"slug\":\"2026-09-03-example\",\"threadId\":\"thread-1\"}\\n'\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
@@ -1204,6 +1208,8 @@ func TestConversationMessageLimitMatchesTheRuntimeContract(t *testing.T) {
 
 func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
+	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}}
 	server.config.CodexSocket = "/run/dev-workspace-codex/app-server.sock"
 	server.config.CodexVersion = "0.152.1"
 	directory := t.TempDir()
@@ -1239,6 +1245,7 @@ func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testin
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("replay status = %d, body = %q", response.Code, response.Body.String())
 	}
+	awaitCreation(t, server, "2026-09-03-example")
 	data, err := os.ReadFile(arguments)
 	if err != nil {
 		t.Fatal(err)
@@ -1575,6 +1582,9 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 
 func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "source")
+	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{ThreadID: "thread-1", Model: "model-1", ReasoningEffort: "high"}}
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
 	helper := filepath.Join(directory, "dev-session")
@@ -1589,9 +1599,10 @@ func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 	))
 	response := httptest.NewRecorder()
 	server.forkSession(response, request, &session.Summary{Manifest: session.Manifest{Slug: "source"}})
-	if response.Code != http.StatusCreated {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("status/body = %d %q", response.Code, response.Body.String())
 	}
+	awaitCreation(t, server, "2026-09-04-forked")
 	data, err := os.ReadFile(arguments)
 	if err != nil {
 		t.Fatal(err)
@@ -2671,6 +2682,8 @@ func TestImplementPlanRetriesAfterTheModeChangeResponseIsLost(t *testing.T) {
 
 func TestImplementPlanStartsANewSessionWithTheExactPlan(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "example")
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
 	goalCopy := filepath.Join(directory, "goal")
@@ -2710,9 +2723,10 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 		Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
 	}})
 
-	if response.Code != http.StatusCreated {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("new-session plan response = %d %q", response.Code, response.Body.String())
 	}
+	awaitCreation(t, server, "2026-09-07-implement-feature")
 	goal, err := os.ReadFile(goalCopy)
 	if err != nil {
 		t.Fatal(err)
@@ -2726,7 +2740,7 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
-	if len(lines) != 12 || lines[0] != "start" || lines[1] != "2026-09-07-implement-feature" ||
+	if len(lines) != 22 || lines[0] != "start" || lines[1] != "2026-09-07-implement-feature" ||
 		lines[2] != "--as-is" || lines[3] != "--exclusive" || lines[4] != "--no-attach" ||
 		lines[5] != "--goal-file" || lines[7] != "--json" ||
 		lines[8] != "--model" || lines[9] != "model-1" ||

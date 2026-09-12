@@ -97,6 +97,20 @@ Each window contains `usedPercent`, `windowDurationMins` and nullable `resetsAt`
 minute while visible and when focused. A failed refresh keeps prior values
 marked with their last update time.
 
+## Session creation
+
+Creating a session, forking a conversation, or implementing a plan in a new
+session opens the destination page immediately. That page shows initialization
+progress and elapsed time. Initialization continues when the page is closed.
+After an interrupted attempt, use its retry button to continue the recorded
+request. A plan session keeps the exact accepted plan and model settings.
+Conversation controls become available when initialization is complete.
+
+Completed creation receipts are kept in a bounded retry cache. When the cache
+fills, the oldest completed receipts retire; unfinished attempts remain available
+for recovery. An existing destination still prevents a later request from
+replacing that session.
+
 ## Transcript controls
 
 Every message and activity entry has a copy button beside its timestamp in

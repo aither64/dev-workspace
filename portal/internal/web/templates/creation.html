@@ -1,0 +1,27 @@
+{{define "creation"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Session.Slug}} · Workspace</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-creation="{{.Session.Slug}}">
+  <main class="page">
+    <a href="/">Workspace</a>
+    <h1>{{.Session.Slug}}</h1>
+    <section class="panel" aria-labelledby="creation-title">
+      <h2 id="creation-title">Creating session</h2>
+      <p id="creation-phase" role="status" aria-live="polite">Loading initialization status…</p>
+      <p id="creation-elapsed" role="timer"></p>
+      <p id="creation-error" class="notice error" hidden></p>
+      <button id="creation-retry" type="button" hidden>Retry initialization</button>
+      <p><a id="creation-source" hidden>Return to the source session</a></p>
+      <p>You can leave this page while initialization continues.</p>
+    </section>
+  </main>
+  <script src="/static/creation.js" defer></script>
+</body>
+</html>
+{{end}}
