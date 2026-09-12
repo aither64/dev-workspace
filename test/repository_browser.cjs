@@ -20,6 +20,11 @@ const cards = '<div class="section-heading"><h2>Repositories</h2><span>4</span><
 const files = Array.from({length: 30}, (_, index) => ({id: String(index), path: "src/file-" + index + ".nix",
   status: index === 1 ? "A" : index === 2 ? "D" : "M", oldMode: index === 1 ? "000000" : "100644",
   newMode: index === 2 ? "000000" : "100644", additions: index === 2 ? 0 : 1, deletions: index === 1 ? 0 : 1}));
+files[3].path = "docs/deep/space ž.nix";
+files[4].path = "replacement";
+files[5].path = "replacement/child.nix";
+files[6].path = "__proto__/constructor/long-file-name-" + "example-".repeat(12) + ".nix";
+files[7].path = "README.nix";
 const source = Array.from({length: 100}, (_, i) => '  value' + i + ' = "before ' + i + '";').join("\n") + "\n";
 const content = id => {
   const file = files[Number(id)];
@@ -110,6 +115,33 @@ const server = http.createServer((req, res) => {
     });
     assert.equal(await page.locator(".repository-commit-full-message").textContent(), commit.message);
     assert((await page.locator(".repository-comparison-stats").textContent()).includes("30 changed files"));
+    const src = page.locator('.repository-directory[data-directory-path="src"]');
+    const sourceFile = page.locator('.repository-file[data-file-id="0"]');
+    assert.equal(await sourceFile.locator('.repository-file-status').textContent(), "M");
+    assert.equal(await sourceFile.locator('.repository-file-status').getAttribute('aria-label'), "Modified");
+    assert.equal(await sourceFile.locator('.repository-file-path').textContent(), "file-0.nix");
+    assert.equal(await sourceFile.getAttribute('title'), "src/file-0.nix");
+    assert(await page.locator('.repository-directory[data-directory-path="replacement"]').count());
+    assert(await page.locator('.repository-file[data-file-id="4"]').count());
+    assert.equal(await page.locator('.repository-file-list .repository-file-tree').first().locator(':scope > li').last().textContent().then(text => text.includes('replacement')), true);
+    assert.equal(await page.locator('.repository-comparison-stats .repository-additions').evaluate(el => getComputedStyle(el).color), 'rgb(126, 231, 135)');
+    assert.equal(await page.locator('.repository-file-counts .repository-deletions').first().evaluate(el => getComputedStyle(el).color), 'rgb(255, 161, 152)');
+    const originalURL = page.url();
+    await sourceFile.locator('..').getByRole('button', {name: 'Copy file path', exact: true}).click();
+    assert.equal(await page.evaluate(() => window.copiedText), 'src/file-0.nix');
+    assert.equal(page.url(), originalURL, 'tree copy navigated');
+    await page.locator('.repository-file-section[data-file-id="0"]').getByRole('button', {name: 'Copy file path', exact: true}).click();
+    assert.equal(await page.evaluate(() => window.copiedText), 'src/file-0.nix');
+    await src.locator(':scope > summary').click();
+    assert.equal(await src.getAttribute('open'), null);
+    assert.equal(await sourceFile.isVisible(), false);
+    assert(await page.locator('.repository-file-section[data-file-id="0"]').isVisible(), 'directory collapse hid diff');
+    await page.getByRole('button', {name: 'Unified', exact: true}).click();
+    assert.equal(await src.getAttribute('open'), null, 'layout change expanded tree');
+    await src.locator(':scope > summary').focus();
+    await page.keyboard.press('Enter');
+    assert(await sourceFile.isVisible());
+    await page.getByRole('button', {name: 'Split', exact: true}).click();
     assert.equal(calls.filter(call => call.operation === "repository-comparison").length, 1);
     assert(!calls.some(call => call.operation === "repository-files" && call.files.includes("0")), "inline preview was fetched twice");
     await page.locator('.repository-file-section[data-file-id="0"]').getByRole("link", {name: "View file", exact: true}).click();
@@ -127,7 +159,9 @@ const server = http.createServer((req, res) => {
     await page.locator('.repository-file-section[data-file-id="0"] .cm-editor').waitFor();
     await page.waitForFunction(() => document.querySelector('.repository-file-section[data-file-id="0"] .cm-content')?.textContent.includes("before 88"));
     assert.equal(new URL(page.url()).hash, "#old-L90");
-    await page.locator('.repository-file-section[data-file-id="0"]').getByRole("link", {name: "View diff", exact: true}).click();
+    await page.locator('.repository-file-section[data-file-id="0"]').getByRole("link", {name: "Back to diff", exact: true}).click();
+    assert.equal(new URL(page.url()).hash, '');
+    assert.equal(new URL(page.url()).searchParams.has('version'), false);
     await page.getByRole("button", {name: "Unified", exact: true}).click();
     await page.waitForFunction(() => !document.querySelector(".cm-mergeView") && document.querySelector(".cm-editor"));
     const lineLink = new URL(page.url()); lineLink.hash = "old-L90";
@@ -142,6 +176,11 @@ const server = http.createServer((req, res) => {
     assert(await page.locator('.repository-file-section[data-file-id="2"]').getByRole("button", {name: "After", exact: true}).isDisabled());
     await page.goBack();
     await page.waitForFunction(() => new URL(location.href).searchParams.get("view") === "diff");
+    await page.locator('.repository-file[data-file-id="3"]').click();
+    await page.locator('.repository-directory[data-directory-path="src"] > summary').click();
+    await page.goBack();
+    await page.waitForFunction(() => document.querySelector('.repository-directory[data-directory-path="src"]').open);
+    assert(await page.locator('.repository-file[data-file-id="2"]').isVisible());
     await page.locator('.repository-file[data-file-id="29"]').click();
     await page.waitForFunction(() => document.querySelector('.repository-file-section[data-file-id="29"] .cm-editor'));
     head = "c".repeat(40);
@@ -189,6 +228,7 @@ const server = http.createServer((req, res) => {
     assert(await page.locator('.repository-file-section[data-file-id="0"] .review-code-view').count(), "selected file was evicted");
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
-      "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets"]}));
+      "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
+      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation"]}));
   } finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
 })().catch(error => {console.error(error); process.exitCode = 1; server.close();});

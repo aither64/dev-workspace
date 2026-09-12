@@ -51,15 +51,26 @@ export function fileStatus(status) {
   return ({A: ["added", "Added"], M: ["modified", "Modified"], D: ["deleted", "Deleted"],
     R: ["renamed", "Renamed"], C: ["copied", "Copied"], T: ["type", "Type changed"]})[String(status)[0]] || ["other", "Changed"];
 }
-export function changeCounts(stats, total = false) {
-  if (!stats) return "";
-  if (!total && (stats.additions === null || stats.deletions === null)) return "Binary";
+const countParts = (stats, total) => {
+  if (!stats) return [];
+  if (!total && (stats.additions === null || stats.deletions === null)) return [{text: "Binary"}];
   const parts = [];
-  if (total) parts.push(stats.files + " changed " + (stats.files === 1 ? "file" : "files"));
-  parts.push("+" + Number(stats.additions || 0).toLocaleString(), "−" + Number(stats.deletions || 0).toLocaleString());
-  if (total && stats.binaryFiles) parts.push(stats.binaryFiles + " binary " + (stats.binaryFiles === 1 ? "file" : "files"));
-  return parts.join(" · ");
+  if (total) parts.push({text: stats.files + " changed " + (stats.files === 1 ? "file" : "files")});
+  parts.push({text: "+" + Number(stats.additions || 0).toLocaleString(), className: "repository-additions"},
+    {text: "−" + Number(stats.deletions || 0).toLocaleString(), className: "repository-deletions"});
+  if (total && stats.binaryFiles) parts.push({text: stats.binaryFiles + " binary " + (stats.binaryFiles === 1 ? "file" : "files")});
+  return parts;
+};
+export function changeCounts(stats, total = false) {
+  return countParts(stats, total).map(part => part.text).join(" · ");
 }
+const counts = (element, stats, total = false) => {
+  countParts(stats, total).forEach((part, index) => {
+    if (index) element.append(" · ");
+    element.append(part.className ? node("span", part.className, part.text) : document.createTextNode(part.text));
+  });
+  return element;
+};
 export function fullFileVersion(file, requested) {
   if (file.newMode === "000000") return "old";
   if (file.oldMode === "000000") return "new";
@@ -354,7 +365,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     queueMicrotask(() => pumpFiles(selected));
     return record.loadPromise;
   };
-  const applyView = async () => {
+  const applyView = async (revealTree = false) => {
     if (!active) return;
     const selected = active;
     selected.pendingNavigation = true;
@@ -375,6 +386,11 @@ export function mount({slug, nonce, element, createCopyButton}) {
       if (route.file) { selected.lineNotice.hidden = false; selected.lineNotice.textContent = "This file is not part of the comparison."; }
       return;
     }
+    if (revealTree || selected.treeFile !== route.file) {
+      for (const directory of record.directories) directory.open = true;
+      record.nav.scrollIntoView({block: "nearest", inline: "nearest"});
+    }
+    selected.treeFile = route.file;
     const others = [...selected.sections.values()].filter(item => item !== record && !item.section.hidden && item.content);
     void Promise.all(others.map(item => renderFile(selected, item)));
     await loadFile(selected, record, true);
@@ -428,7 +444,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const heading = node("div", "repository-review-heading");
       const title = node("div", "repository-review-title");
       commitHeading(title, state, payload.commit || hint, payload.pair);
-      title.append(node("p", "repository-comparison-stats", changeCounts(payload.stats, true)));
+      title.append(counts(node("p", "repository-comparison-stats"), payload.stats, true));
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
         const option = button(value === "split" ? "Split" : "Unified", () => {
@@ -444,37 +460,70 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const lineNotice = node("p", "notice warning"); lineNotice.hidden = true;
       const body = node("div", "repository-review-body");
       const fileList = node("nav", "repository-file-list"); fileList.setAttribute("aria-label", "Changed files");
-      fileList.append(node("p", "muted", changeCounts(payload.stats, true)));
+      fileList.append(counts(node("p", "muted"), payload.stats, true));
       const scroll = node("section", "repository-file-scroll"); scroll.setAttribute("aria-label", "File comparisons");
       const sections = new Map();
+      const tree = {directories: new Map(), files: []};
       for (const file of payload.files) {
         const [kind, label] = fileStatus(file.status);
         const nav = link("", reviewURL(location.href, fileRoute(file)), () => navigate(fileRoute(file)), "repository-file");
         nav.dataset.fileId = file.id;
+        nav.title = file.oldPath ? file.oldPath + " → " + file.path : file.path;
+        nav.setAttribute("aria-label", file.path + ", " + label);
         const name = node("span", "repository-file-name");
-        name.append(node("span", "repository-file-path", file.path), node("span", "repository-file-counts", changeCounts(file)));
-        nav.append(node("span", "repository-file-status status-" + kind, label), name);
-        if (file.oldPath) nav.title = file.oldPath + " → " + file.path;
-        fileList.append(nav);
+        const path = file.path.split("/");
+        const basename = path.pop();
+        name.append(node("span", "repository-file-path", basename), counts(node("span", "repository-file-counts"), file));
+        const status = node("span", "repository-file-status status-" + kind, kind === "other" ? "?" : String(file.status)[0]);
+        status.title = label; status.setAttribute("aria-label", label);
+        nav.append(status, name);
+        let directory = tree;
+        for (const component of path) {
+          if (!directory.directories.has(component)) directory.directories.set(component, {directories: new Map(), files: []});
+          directory = directory.directories.get(component);
+        }
+        directory.files.push({file, basename});
         const section = node("section", "repository-file-section"); section.dataset.fileId = file.id;
         const fileTitle = node("div", "repository-file-title");
-        fileTitle.append(node("h3", "", file.path), node("span", "repository-file-status status-" + kind, label),
-          node("span", "repository-file-counts", changeCounts(file)));
         const fileLink = link("View file", "", () => navigate(fileRoute(file, {view: "file", version: fullFileVersion(file, route.version)})));
-        const diffLink = link("View diff", "", () => navigate(fileRoute(file, {view: "diff", version: ""})));
+        const diffLink = link("←", "", () => navigate(fileRoute(file, {view: "diff", version: ""})), "repository-back-to-diff");
+        diffLink.title = "Back to diff"; diffLink.setAttribute("aria-label", "Back to diff");
+        const fileName = node("div", "repository-file-heading");
+        fileName.append(diffLink, node("h3", "", file.path), copy(file.path, "Copy file path"));
+        fileTitle.append(fileName, node("span", "repository-file-status status-" + kind, label),
+          counts(node("span", "repository-file-counts"), file));
         const versions = node("div", "repository-mode-controls"); versions.setAttribute("role", "group"); versions.setAttribute("aria-label", "File version");
         for (const [value, label] of [["old", "Before"], ["new", "After"]]) {
           const option = button(label, () => navigate(fileRoute(file, {view: "file", version: value})));
           option.dataset.version = value; option.disabled = (value === "old" ? file.oldMode : file.newMode) === "000000";
           versions.append(option);
         }
-        fileTitle.append(fileLink, diffLink, versions);
+        fileTitle.append(fileLink, versions);
         const fileMetadata = node("div", "repository-file-metadata");
         const host = node("div", "repository-editor repository-editor-placeholder");
         host.append(node("p", "muted", "Scroll here to load this comparison."));
         section.append(fileTitle, fileMetadata, host); scroll.append(section);
         sections.set(file.id, {file, nav, fileLink, diffLink, versions, section, metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, used: 0});
       }
+      const alphabetical = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+      const renderTree = (directory, ancestors, prefix = "") => {
+        const list = node("ul", "repository-file-tree");
+        for (const [name, child] of [...directory.directories].sort(([a], [b]) => alphabetical(a, b))) {
+          const item = node("li");
+          const disclosure = node("details", "repository-directory"); disclosure.open = true;
+          disclosure.dataset.directoryPath = prefix + name;
+          const summary = node("summary", "", name); summary.title = prefix + name;
+          disclosure.append(summary, renderTree(child, [...ancestors, disclosure], prefix + name + "/"));
+          item.append(disclosure); list.append(item);
+        }
+        for (const {file} of directory.files.sort((a, b) => alphabetical(a.basename, b.basename))) {
+          const record = sections.get(file.id); record.directories = ancestors;
+          const item = node("li", "repository-file-row");
+          item.append(record.nav, copy(file.path, "Copy file path")); list.append(item);
+        }
+        return list;
+      };
+      fileList.append(renderTree(tree, []));
       body.append(fileList, scroll);
       review.replaceChildren(heading, changed, lineNotice);
       if (payload.pair.warning) review.append(node("p", "notice warning", payload.pair.warning));
@@ -506,7 +555,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       if (ticket === sequence && error.name !== "AbortError") review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", error.message));
     }
   };
-  const restore = (hint = null) => {
+  const restore = (hint = null, revealTree = false) => {
     if (!route.repository || !route.review) { closeReview(false); return; }
     const state = states.get(route.repository);
     if (!state) {
@@ -515,13 +564,13 @@ export function mount({slug, nonce, element, createCopyButton}) {
       review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", "This repository is not available in this session."));
       return;
     }
-    if (active && active.state === state && active.review === route.review && active.commit === route.commit) void applyView();
+    if (active && active.state === state && active.review === route.review && active.commit === route.commit) void applyView(revealTree);
     else void openComparison(state, hint);
   };
   function navigate(next, hint = null) { setRoute(next); restore(hint); }
   const onURL = () => {
     route = reviewRoute(location.href, readMode());
-    restore();
+    restore(null, true);
   };
   const hydrate = card => {
     const id = card.dataset.repositoryId;

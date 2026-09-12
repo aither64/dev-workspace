@@ -123,16 +123,20 @@ Parent hashes open the parent's full commit page. Merge commits link each parent
 and show their diff against the first parent. Parent navigation can continue
 before the feature branch's base; the feature commit list keeps its original range.
 
-The file list scrolls to each file's diff. Branch and commit comparisons show
-changed-file totals and added/removed line counts, with counts and change-type
-labels for each file. Binary changes have no line counts. Split view is the
-default; the portal remembers the selected layout. Both split and unified
+The file tree scrolls to each file's diff. Directories start expanded and can be
+collapsed individually. Colored letters identify added, modified, deleted and
+other changed files. Copy icons beside filenames copy repository-relative paths.
+Branch and commit comparisons show changed-file totals and line counts, with
+green additions and red deletions for each file. Binary changes have no line
+counts. Split view is the default; the portal remembers the selected layout.
+Both split and unified
 views link their Before and After line numbers. Unchanged sections can be
 expanded. Syntax highlighting uses each version's filename and complete source.
 
 Choose **View file** to read a complete file without diff markers, then switch
-between **Before** and **After** or return to **View diff**. After is the default;
-deleted files open Before. Binary files, submodules, symlinks, mode changes, and
+between **Before** and **After**. The arrow before the filename returns to its
+diff. After is the default; deleted files open Before. Binary files, submodules,
+symlinks, mode changes, and
 missing final newlines retain their metadata. Text previews are limited to
 512 KiB and 12,000 lines per version.
 
