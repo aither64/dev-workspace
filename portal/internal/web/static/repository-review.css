@@ -99,3 +99,6 @@
   .repository-file-status { font-size: .65rem; }
   .repository-review-heading { max-height: 45%; }
 }
+
+.repository-commit-parents { display: flex; align-items: center; flex-wrap: wrap; gap: .3rem; font-size: .8rem; }
+.repository-parent-link { font-family: ui-monospace, monospace; }

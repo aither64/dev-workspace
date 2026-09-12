@@ -241,8 +241,10 @@ export function mount({slug, nonce, element, createCopyButton}) {
     if (next.view === "file") next.version = fullFileVersion(file, next.version);
     return next;
   };
+  const parentRoute = sha => ({repository: route.repository, review: route.review, commit: sha, layout: route.layout});
   const refreshLinks = () => {
     if (!active) return;
+    for (const parent of review.querySelectorAll(".repository-parent-link")) parent.href = reviewURL(location.href, parentRoute(parent.dataset.commit));
     for (const record of active.sections.values()) {
       record.nav.href = reviewURL(location.href, fileRoute(record.file));
       record.nav.setAttribute("aria-current", record.file.id === route.file ? "true" : "false");
@@ -390,8 +392,21 @@ export function mount({slug, nonce, element, createCopyButton}) {
       identity.append(node("code", "", commit.sha), copy(commit.sha, "Copy commit hash"));
       if (commit.author) identity.append(node("span", "muted", commit.author + " · " + new Date(commit.date).toLocaleString()));
       title.append(identity, node("pre", "repository-commit-full-message", commit.message || [commit.subject, commit.body].filter(Boolean).join("\n\n")));
+      if (Array.isArray(commit.parents)) {
+        const parents = node("div", "muted repository-commit-parents");
+        parents.append(commit.parents.length ? (commit.parents.length === 1 ? "Parent " : "Parents ") : "No parent");
+        for (const sha of commit.parents) {
+          const parent = link(short(sha), reviewURL(location.href, parentRoute(sha)), () => navigate(parentRoute(sha)), "repository-parent-link");
+          parent.dataset.commit = sha;
+          parent.title = "View parent commit " + sha;
+          parent.setAttribute("aria-label", "View parent commit " + short(sha));
+          parents.append(parent, copy(sha, "Copy parent hash"));
+        }
+        if (commit.parents.length > 1) parents.append(node("span", "", "Diff against first parent"));
+        title.append(parents);
+      }
     }
-    if (pair) {
+    if (pair && !commit) {
       const identity = node("div", "muted repository-pair");
       identity.append(node("code", "", short(pair.base)), copy(pair.base, "Copy base hash"), document.createTextNode(" → "),
         node("code", "", short(pair.head)), copy(pair.head, "Copy head hash"), document.createTextNode(" · " + pair.baseLabel));

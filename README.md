@@ -119,6 +119,10 @@ the subject to review the commit and full message, or choose **Compare** for the
 whole branch. Copy icons copy full commit hashes. The external arrow opens the
 commit on GitHub.
 
+Parent hashes open the parent's full commit page. Merge commits link each parent
+and show their diff against the first parent. Parent navigation can continue
+before the feature branch's base; the feature commit list keeps its original range.
+
 The file list scrolls to each file's diff. Branch and commit comparisons show
 changed-file totals and added/removed line counts, with counts and change-type
 labels for each file. Binary changes have no line counts. Split view is the

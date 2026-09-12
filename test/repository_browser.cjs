@@ -31,7 +31,11 @@ const content = id => {
 };
 const commit = {id: "commit", sha: originalHead, subject: "Improve repository review", body: "Complete body\n\nSecond paragraph.",
   message: "Improve repository review\n\nComplete body\n\nSecond paragraph.\n", author: "Example Author",
-  date: "2026-09-12T12:00:00Z", url: "https://github.com/example/project/commit/" + originalHead};
+  date: "2026-09-12T12:00:00Z", parents: [base, "d".repeat(40)], url: "https://github.com/example/project/commit/" + originalHead};
+const rootCommit = {...commit, sha: "e".repeat(40), parents: [], message: "Initial repository\n"};
+const parentCommit = {...commit, sha: base, parents: [rootCommit.sha], message: "Previous implementation\n\nParent body.\n"};
+const sideCommit = {...parentCommit, sha: "d".repeat(40), message: "Side branch\n"};
+const commits = new Map([commit, parentCommit, sideCommit, rootCommit].map(item => [item.sha, item]));
 const history = repository => ({repository, review: "frozen", snapshot: "snapshot", pair: {base, head: originalHead, baseLabel: "Merge base"},
   history: {commits: [commit], page: 0, hasMore: false}});
 const server = http.createServer((req, res) => {
@@ -62,8 +66,8 @@ const server = http.createServer((req, res) => {
   if (url.pathname.endsWith("repository-history")) return json(history(url.searchParams.get("repository")));
   if (url.pathname.endsWith("repository-states")) return json({repositories: url.searchParams.getAll("repository").map(repository => ({repository, head}))});
   if (url.pathname.endsWith("repository-comparison")) return json({review: "frozen", snapshot: "snapshot",
-    name: "project", pair: {base, head: originalHead, baseLabel: "Merge base"}, historyHead: originalHead,
-    commit: url.searchParams.get("commit") ? commit : null, files,
+    name: "project", pair: {base, head: url.searchParams.get("commit") || originalHead, baseLabel: "Merge base"}, historyHead: originalHead,
+    commit: commits.get(url.searchParams.get("commit")) || null, files,
     stats: {files: 30, additions: 29, deletions: 29, binaryFiles: 0},
     preview: {file: url.searchParams.get("file") || "0", content: content(url.searchParams.get("file") || "0")}});
   if (url.pathname.endsWith("repository-files")) return json({files: url.searchParams.getAll("file").map(file => ({file, content: content(file)}))});
@@ -143,7 +147,29 @@ const server = http.createServer((req, res) => {
     head = "c".repeat(40);
     await page.evaluate(() => document.dispatchEvent(new CustomEvent("session-section-change", {detail: "repositories"})));
     await page.locator(".repository-comparison-changed:not([hidden])").waitFor();
-    assert((await page.locator(".repository-pair").textContent()).includes("bbbbbbbbbb"));
+    assert((await page.locator(".repository-commit-detail-identity").textContent()).includes(originalHead));
+    const parentLink = page.locator('.repository-parent-link').first();
+    const parentURL = new URL(await parentLink.getAttribute('href'));
+    assert.equal(parentURL.searchParams.get('layout'), 'unified');
+    assert.equal(parentURL.searchParams.get('commit'), base);
+    assert.equal(parentURL.searchParams.has('file'), false);
+    assert.equal(parentURL.searchParams.has('view'), false);
+    assert.equal(parentURL.searchParams.has('version'), false);
+    assert.equal(parentURL.hash, '');
+    await parentLink.click();
+    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
+    await page.reload();
+    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
+    await page.locator('.repository-parent-link').click();
+    await page.waitForFunction(() => document.querySelector('.repository-commit-parents')?.textContent === 'No parent');
+    assert.equal(await page.locator('.repository-parent-link').count(), 0);
+    assert.equal(await page.locator('.repository-pair').count(), 0, 'root empty tree was shown as a commit');
+    await page.goBack();
+    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
+    await page.goBack();
+    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, commit.message);
+    await page.locator('.repository-parent-link').nth(1).click();
+    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, sideCommit.message);
     assert.equal(await page.locator('[contenteditable="true"]').count(), 0);
     await page.setViewportSize({width: 390, height: 844});
     await page.getByRole("button", {name: "← Repositories", exact: true}).click();
