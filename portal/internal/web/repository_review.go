@@ -180,15 +180,21 @@ type reviewHistoryResponse struct {
 	Pair       repository.ReviewPair    `json:"pair"`
 	History    repository.ReviewHistory `json:"history"`
 }
+type reviewPreview struct {
+	File    string                   `json:"file"`
+	Content repository.ReviewContent `json:"content"`
+}
 type reviewComparisonResponse struct {
-	Review      string                   `json:"review"`
-	Snapshot    string                   `json:"snapshot"`
-	HistoryHead string                   `json:"historyHead"`
-	Pair        repository.ReviewPair    `json:"pair"`
-	Name        string                   `json:"name"`
-	Commit      *repository.ReviewCommit `json:"commit"`
-	Stats       repository.ReviewStats   `json:"stats"`
-	Files       []repository.ReviewFile  `json:"files"`
+	Review       string                   `json:"review"`
+	Snapshot     string                   `json:"snapshot"`
+	HistoryHead  string                   `json:"historyHead"`
+	Pair         repository.ReviewPair    `json:"pair"`
+	Name         string                   `json:"name"`
+	Commit       *repository.ReviewCommit `json:"commit"`
+	Stats        repository.ReviewStats   `json:"stats"`
+	Files        []repository.ReviewFile  `json:"files"`
+	Preview      *reviewPreview           `json:"preview"`
+	PreviewError string                   `json:"previewError,omitempty"`
 }
 
 func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, parts []string) bool {
@@ -197,7 +203,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	operation := parts[1]
 	switch operation {
-	case "repository-history", "repository-comparison", "repository-file", "repository-state":
+	case "repository-history", "repository-histories", "repository-comparison", "repository-file", "repository-files", "repository-state", "repository-states":
 	default:
 		return false
 	}
@@ -225,6 +231,10 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 		defer func() { <-s.reviews().requests }()
 	case <-ctx.Done():
 		s.writeReviewError(w, summary, ctx.Err())
+		return true
+	}
+	if operation == "repository-histories" || operation == "repository-states" {
+		s.repositoryReviewBatch(w, r.WithContext(ctx), summary, operation)
 		return true
 	}
 	repoID := r.URL.Query().Get("repository")
@@ -267,9 +277,13 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 		return true
 	}
 	snapshot := service.get(r.URL.Query().Get("snapshot"), summary.Slug, repoID, scope)
-	if operation == "repository-file" {
+	if operation == "repository-file" || operation == "repository-files" {
 		if snapshot == nil {
 			s.writeReviewError(w, summary, reviewError(409, "This review expired. Reopen its comparison link."))
+			return true
+		}
+		if operation == "repository-files" {
+			s.repositoryFilesBatch(w, r.WithContext(ctx), summary, snapshot)
 			return true
 		}
 		content, err := service.fileContent(ctx, snapshot, r.URL.Query().Get("file"))
@@ -458,16 +472,19 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 		}
 	}
 	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files}
+	if fileID == "" && len(files) > 0 {
+		fileID = files[0].ID
+	}
 	if fileID != "" {
-		found := false
-		for _, file := range files {
-			if file.ID == fileID {
-				found = true
-				break
+		content, err := service.fileContent(ctx, snapshot, fileID)
+		if err != nil {
+			var api *reviewAPIError
+			if errors.As(err, &api) {
+				return response, err
 			}
-		}
-		if !found {
-			return response, reviewError(404, "File is not part of this comparison")
+			_, response.PreviewError = reviewErrorMessage(err)
+		} else {
+			response.Preview = &reviewPreview{File: fileID, Content: content}
 		}
 	}
 	return response, nil

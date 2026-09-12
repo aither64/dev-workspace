@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aither64/dev-workspace/portal/internal/repository"
-	"github.com/aither64/dev-workspace/portal/internal/session"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aither64/dev-workspace/portal/internal/repository"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) {
@@ -43,7 +45,7 @@ func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) 
 	response := reviewRequest(t, fresh, "GET", restore, "", 200)
 	var comparison reviewComparisonResponse
 	decodeReview(t, response, &comparison)
-	if comparison.Review != review || comparison.HistoryHead != oldHead || comparison.Pair.Head != oldHead || comparison.Pair.Base != base || comparison.Commit == nil || comparison.Commit.Message != "feature\n\nBody\n" {
+	if comparison.Review != review || comparison.HistoryHead != oldHead || comparison.Pair.Head != oldHead || comparison.Pair.Base != base || comparison.Commit == nil || comparison.Commit.Message != "feature\n\nBody\n" || comparison.Preview == nil || comparison.Preview.Content.After.Text != "after\n" {
 		t.Fatalf("restored=%#v", comparison)
 	}
 	if comparison.Stats.Files != 1 || comparison.Stats.Additions != 1 || comparison.Stats.Deletions != 1 || comparison.Stats.BinaryFiles != 0 {
@@ -56,7 +58,7 @@ func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) 
 	fresh.reviews().mu.Unlock()
 	response = reviewRequest(t, fresh, "GET", restore+"&file="+comparison.Files[0].ID, "", 200)
 	decodeReview(t, response, &comparison)
-	if comparison.Snapshot == firstSnapshot {
+	if comparison.Snapshot == firstSnapshot || comparison.Preview.File != comparison.Files[0].ID {
 		t.Fatal("did not reconstruct the selected file")
 	}
 	// A newer branch commit and the excluded base cannot be injected into an old link.
@@ -88,6 +90,63 @@ func decodeReview(t *testing.T, value any, target any) {
 	}
 	if err := json.Unmarshal(data, target); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRepositoryReviewBatchesAndDirectRegistrationAvoidDiscovery(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := filepath.Join(t.TempDir(), "commands")
+	tools := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tools, "git"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$REVIEW_GIT_LOG\"\nexec \"$REVIEW_REAL_GIT\" \"$@\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REVIEW_REAL_GIT", realGit)
+	t.Setenv("REVIEW_GIT_LOG", commands)
+	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+	id := repository.ReviewID("project")
+	query := "?repository=" + id
+	endpoint := "/api/sessions/example/repository-"
+	history := reviewRequest(t, s, "GET", endpoint+"histories"+query, "", 200)
+	var histories []reviewHistoryResponse
+	decodeReview(t, history["repositories"], &histories)
+	if len(histories) != 1 || histories[0].Repository != id || histories[0].Review == "" {
+		t.Fatalf("histories=%#v", histories)
+	}
+	state := reviewRequest(t, s, "GET", endpoint+"states"+query, "", 200)
+	var states []map[string]string
+	decodeReview(t, state["repositories"], &states)
+	if len(states) != 1 || states[0]["head"] != histories[0].Pair.Head {
+		t.Fatalf("states=%#v", states)
+	}
+	comparison := reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+histories[0].Review, "", 200)
+	var compared reviewComparisonResponse
+	decodeReview(t, comparison, &compared)
+	file := reviewRequest(t, s, "GET", endpoint+"files"+query+"&snapshot="+compared.Snapshot+"&file="+compared.Files[0].ID, "", 200)
+	var content []struct {
+		File    string
+		Content repository.ReviewContent
+	}
+	decodeReview(t, file["files"], &content)
+	if len(content) != 1 || content[0].Content.After.Text != "after\n" {
+		t.Fatalf("file batch=%#v", content)
+	}
+	if data, err := os.ReadFile(commands); err != nil || strings.Contains(string(data), "worktree list") {
+		t.Fatalf("registered reads ran discovery: %s, %v", data, err)
+	}
+	for _, operation := range []string{"histories", "states"} {
+		reviewRequest(t, s, "GET", endpoint+operation+query+"&repository="+id, "", 400)
+	}
+	reviewRequest(t, s, "GET", endpoint+"histories"+query+strings.Repeat("&repository="+id, 8), "", 400)
+	reviewRequest(t, s, "GET", endpoint+"files"+query+"&snapshot="+compared.Snapshot+strings.Repeat("&file="+compared.Files[0].ID, 5), "", 400)
+	reviewRequest(t, s, "GET", endpoint+"files"+query+"&snapshot="+compared.Snapshot+"&file="+repository.ReviewID("foreign"), "", 404)
+	partial := reviewRequest(t, s, "GET", endpoint+"states"+query+"&repository="+repository.ReviewID("missing"), "", 200)
+	decodeReview(t, partial["repositories"], &states)
+	if len(states) != 2 || states[0]["head"] == "" || states[1]["error"] == "" {
+		t.Fatalf("partial batch=%#v", states)
 	}
 }
 
