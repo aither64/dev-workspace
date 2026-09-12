@@ -81,7 +81,10 @@ func TestReviewFileStatsAndFullCommitMessage(t *testing.T) {
 	if err != nil || len(history.Commits) != 1 || history.Commits[0].Message != message {
 		t.Fatalf("full message=%#v, %v", history, err)
 	}
-
+	commit, err := reader.ComparisonCommit(context.Background(), repo, pair, head)
+	if err != nil || commit.Message != message {
+		t.Fatalf("restored full message=%q, %v", commit.Message, err)
+	}
 }
 
 func TestReviewStatsRejectMismatchedAndIncompleteRecords(t *testing.T) {

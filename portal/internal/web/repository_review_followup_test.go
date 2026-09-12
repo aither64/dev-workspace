@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
@@ -15,6 +16,80 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) {
+	s, _, worktree, base := reviewWebFixture(t)
+	query := "?repository=" + repository.ReviewID("project")
+	endpoint := "/api/sessions/example/repository-"
+	history := reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200)
+	review := reviewString(t, history["review"])
+	var original reviewHistoryResponse
+	decodeReview(t, history, &original)
+	if original.History.Commits[0].Message != "feature\n\nBody\n" {
+		t.Fatalf("full message=%q", original.History.Commits[0].Message)
+	}
+	oldHead := original.Pair.Head
+	if err := os.WriteFile(filepath.Join(worktree, "file"), []byte("newer\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "-C", worktree, "commit", "-am", "new branch head")
+	newest := strings.TrimSpace(webGitOutput(t, "-C", worktree, "rev-parse", "HEAD"))
+	fresh, err := New(s.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	restore := endpoint + "comparison" + query + "&review=" + review + "&commit=" + oldHead
+	response := reviewRequest(t, fresh, "GET", restore, "", 200)
+	var comparison reviewComparisonResponse
+	decodeReview(t, response, &comparison)
+	if comparison.Review != review || comparison.HistoryHead != oldHead || comparison.Pair.Head != oldHead || comparison.Pair.Base != base || comparison.Commit == nil || comparison.Commit.Message != "feature\n\nBody\n" {
+		t.Fatalf("restored=%#v", comparison)
+	}
+	if comparison.Stats.Files != 1 || comparison.Stats.Additions != 1 || comparison.Stats.Deletions != 1 || comparison.Stats.BinaryFiles != 0 {
+		t.Fatalf("stats=%#v", comparison.Stats)
+	}
+	firstSnapshot := comparison.Snapshot
+	// Reconstruct the link even after all transient handles were evicted.
+	fresh.reviews().mu.Lock()
+	clear(fresh.reviews().snapshots)
+	fresh.reviews().mu.Unlock()
+	response = reviewRequest(t, fresh, "GET", restore+"&file="+comparison.Files[0].ID, "", 200)
+	decodeReview(t, response, &comparison)
+	if comparison.Snapshot == firstSnapshot {
+		t.Fatal("did not reconstruct the selected file")
+	}
+	// A newer branch commit and the excluded base cannot be injected into an old link.
+	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+newest, "", 422)
+	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+base, "", 422)
+	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit=HEAD", "", 400)
+	reviewRequest(t, fresh, "GET", restore+"&file="+repository.ReviewID("not-issued"), "", 404)
+	reviewRequest(t, fresh, "GET", "/api/sessions/other/repository-comparison"+query+"&review="+review, "", 404)
+	// Removing an active worktree does not remove immutable committed objects.
+	runWebGit(t, "-C", worktree, "worktree", "remove", worktree)
+	reviewRequest(t, fresh, "GET", restore, "", 200)
+	manifest := filepath.Join(s.config.Workspace, "work", "example", "portal.yml")
+	data, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = []byte(strings.Replace(string(data), "branch: feature", "branch: replaced", 1))
+	if err := os.WriteFile(manifest, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	reviewRequest(t, fresh, "GET", restore, "", 404)
+}
+
+func decodeReview(t *testing.T, value any, target any) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, target); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestRepositoryReviewDiscoveredWorktreeCacheAndRemoval(t *testing.T) {
 	s, _, worktree, _ := reviewWebFixture(t)
@@ -40,23 +115,6 @@ func TestRepositoryReviewDiscoveredWorktreeCacheAndRemoval(t *testing.T) {
 	runWebGit(t, "-C", worktree, "worktree", "remove", worktree)
 	if _, ok := s.reviewRegistration(context.Background(), summary, repository.ReviewID("project")); ok {
 		t.Fatal("removed discovered worktree was still authorized")
-	}
-}
-
-func TestRepositoryReviewRequestCancellationIncludesAdmission(t *testing.T) {
-	s, _, _, _ := reviewWebFixture(t)
-	for i := 0; i < cap(s.reviews().requests); i++ {
-		s.reviews().requests <- struct{}{}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	req := httptest.NewRequest("GET", "/api/sessions/example/repository-state?repository="+repository.ReviewID("project"), nil).WithContext(ctx)
-	done := make(chan struct{})
-	go func() { s.Handler().ServeHTTP(httptest.NewRecorder(), req); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("request admission ignored cancellation")
 	}
 }
 
@@ -164,6 +222,23 @@ func TestRepositoryReviewCacheBoundsAndEvicts(t *testing.T) {
 	}
 }
 
+func TestRepositoryReviewRequestCancellationIncludesAdmission(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	for i := 0; i < cap(s.reviews().requests); i++ {
+		s.reviews().requests <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest("GET", "/api/sessions/example/repository-state?repository="+repository.ReviewID("project"), nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() { s.Handler().ServeHTTP(httptest.NewRecorder(), req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("request admission ignored cancellation")
+	}
+}
+
 func TestRepositoryReviewConcurrentCacheCallers(t *testing.T) {
 	service := &repositoryReviewService{}
 	service.initializeCache()
@@ -182,5 +257,78 @@ func TestRepositoryReviewConcurrentCacheCallers(t *testing.T) {
 	wait.Wait()
 	if reads.Load() != 1 {
 		t.Fatalf("duplicate reads=%d", reads.Load())
+	}
+}
+
+func TestRepositoryReviewDescriptorSurvivesArchiveButNotReplacement(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	query := "?repository=" + repository.ReviewID("project")
+	history := reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200)
+	review := reviewString(t, history["review"])
+	var original reviewHistoryResponse
+	decodeReview(t, history, &original)
+	source := filepath.Join(s.config.Workspace, "work", "example")
+	target := filepath.Join(s.config.Workspace, "archive", "example")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(source, target); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf("schema: 1\nslug: example\nfinalized_at: '2026-09-12T12:00:00Z'\nrepositories:\n  - name: project\n    project: project\n    branch: feature\n    default_branch: master\n    initial_base_sha: %s\n    final_head_sha: %s\n", original.Pair.Base, original.Pair.Head)
+	if err := os.WriteFile(filepath.Join(target, "portal.yml"), []byte(manifest), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, target, "complete")
+	if _, err := session.Find(s.config.Workspace, "example"); err != nil {
+		t.Fatal(err)
+	}
+	restore := "/api/sessions/example/repository-comparison" + query + "&review=" + review
+	reviewRequest(t, s, "GET", restore, "", 200)
+	// A replacement directory with identical tracking bytes has a new ownership
+	// identity. Keep the old directory alive so the test cannot reuse its inode.
+	if err := os.Rename(target, target+"-previous"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "portal.yml"), []byte(manifest), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, target, "complete")
+	reviewRequest(t, s, "GET", restore, "", 404)
+}
+
+func TestRepositoryReviewMissingSavedObjectsIsExplicit(t *testing.T) {
+	s, bare, _, _ := reviewWebFixture(t)
+	query := "?repository=" + repository.ReviewID("project")
+	history := reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200)
+	var original reviewHistoryResponse
+	decodeReview(t, history, &original)
+	if err := os.Remove(filepath.Join(bare, "objects", original.Pair.Head[:2], original.Pair.Head[2:])); err != nil {
+		t.Fatal(err)
+	}
+	reviewRequest(t, s, "GET", "/api/sessions/example/repository-comparison"+query+"&review="+original.Review, "", 422)
+}
+
+func TestRepositoryReviewIdenticalPairDoesNotRewriteSavedRecord(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	query := "?repository=" + repository.ReviewID("project")
+	history := reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200)
+	var original reviewHistoryResponse
+	decodeReview(t, history, &original)
+	path := s.reviews().comparisonPath("example", repository.ReviewID("project"), original.Pair.Head)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query+"&snapshot="+original.Snapshot, "", 200)
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("unchanged saved pair was rewritten")
 	}
 }

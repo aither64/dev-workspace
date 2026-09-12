@@ -335,6 +335,64 @@ func parseReviewCommits(out []byte, github string) ([]ReviewCommit, error) {
 	return result, nil
 }
 
+// Restore reads the saved objects from the canonical repository. An old shared
+// view remains usable after its feature branch moves or its worktree is removed.
+func (r ReviewReader) Restore(ctx context.Context, slug string, item session.Repository, pair ReviewPair) (ReviewRepository, error) {
+	if !gitObjectPattern.MatchString(pair.Base) || !gitObjectPattern.MatchString(pair.Head) {
+		return ReviewRepository{}, errors.New("invalid saved comparison")
+	}
+	item.FinalHeadSHA = pair.Head
+	repo, err := r.Resolve(ctx, slug, item, true)
+	if err != nil {
+		return repo, err
+	}
+	if _, err = r.commit(ctx, repo.Directory, pair.Base); err != nil {
+		return repo, errors.New("saved comparison base is unavailable locally")
+	}
+	return repo, nil
+}
+
+// ComparisonCommit accepts only a commit in the exact recorded branch range,
+// including commits that were not on the first history page.
+func (r ReviewReader) ComparisonCommit(ctx context.Context, repo ReviewRepository, pair ReviewPair, sha string) (ReviewCommit, error) {
+	if !gitObjectPattern.MatchString(sha) {
+		return ReviewCommit{}, errors.New("invalid comparison commit")
+	}
+	ancestor := func(head string) (bool, error) {
+		_, err := r.git(ctx, repo.Directory, 1024, "merge-base", "--is-ancestor", sha, head)
+		var failure *exec.ExitError
+		if errors.As(err, &failure) && failure.ExitCode() == 1 {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	reachable, err := ancestor(pair.Head)
+	if err != nil {
+		return ReviewCommit{}, err
+	}
+	if !reachable {
+		return ReviewCommit{}, errors.New("commit is outside this comparison")
+	}
+	inBase, err := ancestor(pair.Base)
+	if err != nil {
+		return ReviewCommit{}, err
+	}
+	if inBase {
+		return ReviewCommit{}, errors.New("commit is outside this comparison")
+	}
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "show", "-s", "-z", "--no-show-signature", "--format="+reviewCommitFormat, sha, "--")
+	if err != nil {
+		return ReviewCommit{}, err
+	}
+	commits, err := parseReviewCommits(out, repo.GitHub)
+	if err != nil {
+		return ReviewCommit{}, err
+	}
+	if len(commits) != 1 || commits[0].SHA != sha {
+		return ReviewCommit{}, errors.New("unexpected comparison commit")
+	}
+	return commits[0], nil
+}
 func validReviewGitHub(value string) bool {
 	owner, name, ok := strings.Cut(value, "/")
 	return ok && githubPartPattern.MatchString(owner) && githubPartPattern.MatchString(name)
