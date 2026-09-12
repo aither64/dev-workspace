@@ -232,6 +232,9 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 		return receipt, ok
 	}
 	if s.proveCreation(receipt) == nil {
+		if err := s.bindCreationUploads(s.operationContext, receipt); err != nil {
+			return receipt, true
+		}
 		receipt.State = "ready"
 		receipt.Phase = "Session is ready."
 		receipt.Error = ""
@@ -457,7 +460,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		return err
 	}
 	if receipt.Validated && s.proveCreation(*receipt) == nil {
-		return nil
+		return s.bindCreationUploads(ctx, *receipt)
 	}
 	request := receipt.Request
 	var unlockSnapshot func()
@@ -592,7 +595,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	stdout, stderr, err := s.runDevSessionWithTransition(ctx, 2*time.Minute, transition, args...)
 	if err != nil {
 		if s.proveCreation(*receipt) == nil {
-			return nil
+			return s.bindCreationUploads(ctx, *receipt)
 		}
 		return commandFailure("initialize session", stdout, stderr, err)
 	}
@@ -602,7 +605,10 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	if json.Unmarshal([]byte(stdout), &result) != nil || result.Slug != request.Slug {
 		return errors.New("dev-session returned invalid session metadata")
 	}
-	return s.proveCreation(*receipt)
+	if err := s.proveCreation(*receipt); err != nil {
+		return err
+	}
+	return s.bindCreationUploads(ctx, *receipt)
 }
 
 // Peek only the bounded action field. The same-session path retains its full

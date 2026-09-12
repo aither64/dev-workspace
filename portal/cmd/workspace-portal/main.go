@@ -170,6 +170,7 @@ func serve(args []string) error {
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		ObserveActivity: true,
+		CollectUploads:  true,
 		Workspace:       options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
 		HostLabel: options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,

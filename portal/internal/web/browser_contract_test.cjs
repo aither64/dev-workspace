@@ -112,6 +112,18 @@ assert.equal(shouldSubmitMessage({key: "Enter", shiftKey: false, isComposing: tr
 assert.equal(shouldSubmitMessage({key: "a", shiftKey: false, isComposing: false}), false);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 580}), true);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 300}), false);
+// An attachment receipt hashes the exact generated prompt while checking the
+// separately trusted original text and IDs before acknowledging it.
+const attachedID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const attachedAttempt = {id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", message: "", attachmentIds: [attachedID], state: "unknown"};
+const attachedPending = new Map([[attachedAttempt.id, attachedAttempt]]);
+const wire = "Attached local files: server-generated path";
+const attachedDigest = require("node:crypto").createHash("sha256").update(wire).digest("hex");
+const attachedEntry = {clientUserMessageId: attachedAttempt.id, clientUserMessageDigest: attachedDigest, text: wire, displayText: "", attachments: [{id: attachedID}]};
+assert.deepEqual(await markTranscriptMessagesObserved(attachedPending, [{...attachedEntry, attachments: []}]), []);
+assert.deepEqual(await markTranscriptMessagesObserved(attachedPending, [{...attachedEntry, displayText: "changed"}]), []);
+assert.equal((await markTranscriptMessagesObserved(attachedPending, [attachedEntry]))[0].transcriptDigest, attachedDigest);
+
 // Composer/receipt resizing must not change following; actual scrolling must.
 const transcriptBeforeResize = {scrollHeight: 1000, clientHeight: 400, scrollTop: 600};
 const transcriptAfterResize = {...transcriptBeforeResize, clientHeight: 250};

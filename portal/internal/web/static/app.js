@@ -6,7 +6,7 @@
       headers: {"Content-Type": "application/json", ...(options.headers || {})},
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
     return data;
   };
   const createSessionClient = (slug, request, conversation) => ({
@@ -98,10 +98,14 @@
           !/^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || "")) return;
       // The HTTP handler trims Unicode White_Space, as Go strings.TrimSpace
       // does. JavaScript trim differs for U+0085 and U+FEFF.
-      const digest = await sha256Hex(receipt.message.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, ""));
+      const text = receipt.message.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+      const ids = receipt.attachmentIds || [];
+      if (ids.length && (entry.displayText !== text ||
+          JSON.stringify((entry.attachments || []).map((file) => file.id)) !== JSON.stringify(ids))) return;
+      const digest = await sha256Hex(ids.length ? entry.text : text);
       if (digest !== entry.clientUserMessageDigest) return;
       const current = pending.get(receipt.id);
-      if (!current || current.message !== receipt.message || current.state === "observed") return;
+      if (!current || current.message !== receipt.message || JSON.stringify(current.attachmentIds || []) !== JSON.stringify(ids) || current.state === "observed") return;
       const observed = {...current, state: "observed", transcriptDigest: digest};
       pending.set(receipt.id, observed);
       changed.push(observed);
@@ -402,6 +406,12 @@
     `${queueAttemptStoragePrefix(slug, threadId)}${id}`
   );
   let durableAttemptStoreFactory = null;
+  const attemptAttachmentFields = (value) => {
+    if (value.attachmentIds === undefined) return {};
+    if (!Array.isArray(value.attachmentIds) || value.attachmentIds.length > 100 || value.attachmentIds.some((id) => typeof id !== "string")) throw new Error("Stored attachment IDs are invalid");
+    return value.attachmentIds.length ? {attachmentIds: [...value.attachmentIds]} : {};
+  };
+  const sameAttemptAttachments = (left, right = []) => JSON.stringify(left || []) === JSON.stringify(right);
   const configureDurableAttemptStore = (factory) => {
     if (typeof factory !== "function") {
       throw new TypeError("durable attempt store factory is required");
@@ -414,10 +424,10 @@
       storage,
       prefix: queueAttemptStoragePrefix(slug, threadId),
       decode: (id, value) => (
-        value && typeof value.message === "string" && value.message ?
-          {id, message: value.message} : null
+        value && typeof value.message === "string" && (value.message || value.attachmentIds?.length) ?
+          {id, message: value.message, ...attemptAttachmentFields(value)} : null
       ),
-      encode: ({message}) => ({message}),
+      encode: (attempt) => ({message: attempt.message, ...attemptAttachmentFields(attempt)}),
     });
   };
   const loadQueueAttempts = (storage, slug, threadId) => {
@@ -446,17 +456,17 @@
       storage,
       prefix: sendAttemptStoragePrefix(slug, threadId),
       decode: (id, value) => {
-        if (!value || typeof value.message !== "string" || !value.message ||
+        if (!value || typeof value.message !== "string" || (!value.message && !value.attachmentIds?.length) ||
             (value.context !== undefined && typeof value.context !== "string")) return null;
         return {
-          id, message: value.message, steered: Boolean(value.steered),
+          id, message: value.message, steered: Boolean(value.steered), ...attemptAttachmentFields(value),
           context: value.context || "",
           ...(["accepted", "observed"].includes(value.state) ? {state: value.state} : {}),
           ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
       },
       encode: (attempt) => ({
-        message: attempt.message, steered: Boolean(attempt.steered),
+        message: attempt.message, steered: Boolean(attempt.steered), ...attemptAttachmentFields(attempt),
         context: typeof attempt.context === "string" ? attempt.context : "",
         ...(["accepted", "observed"].includes(attempt.state) ? {state: attempt.state} : {}),
         ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
@@ -472,9 +482,9 @@
   const deleteSendAttempt = (storage, slug, threadId, id) => {
     return sendAttemptStore(storage, slug, threadId)?.remove(id) === true;
   };
-  const matchingSendAttempt = (attempts, message, context = "") => (
+  const matchingSendAttempt = (attempts, message, context = "", attachments = []) => (
     attempts.find((candidate) => (
-      candidate.message === message && (candidate.context || "") === context
+      candidate.message === message && (candidate.context || "") === context && sameAttemptAttachments(candidate.attachmentIds, attachments)
     ))
   );
   const autoResolutionLabel = (now, visibleAt, dueAt, snoozed) => {
@@ -617,7 +627,9 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=4");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=5");
+  let composerUploads = null;
+  let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   const limitsPanel = document.getElementById("codex-limits-panel");
@@ -948,7 +960,39 @@
   };
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
-    form?.addEventListener("submit", () => {
+    let creationUploads = null;
+    if (form) {
+      const uploadRoot = document.getElementById("creation-uploads");
+      const storage = globalThis.localStorage;
+      const scopeKey = "workspace-portal.creation-upload-scope";
+      const initCreationUploads = async () => {
+        try {
+          let scope = JSON.parse(storage.getItem(scopeKey) || "null");
+          if (scope) {
+            try { await request(scope.url); } catch (error) { if (error.status === 404) scope = null; else throw error; }
+          }
+          if (!scope) {
+            scope = await request("/api/upload-drafts", {method: "POST", body: "{}"});
+            storage.setItem(scopeKey, JSON.stringify(scope));
+          }
+          creationUploads = conversationAssets.mountUploads(uploadRoot, {
+            basePath: scope.url, dropTarget: form, storage,
+            storageKey: `workspace-portal.upload-draft.${scope.id}`,
+            onChange: ({ready, count}) => { form.elements.goal.required = !count; form.querySelector('button[type="submit"]').disabled = !ready; },
+          });
+          form.elements.uploadScope.value = scope.id;
+          await creationUploads.initialized;
+        } catch (error) { uploadRoot.textContent = error.message; }
+      };
+      void initCreationUploads();
+    }
+    form?.addEventListener("submit", (event) => {
+      if (creationUploads && !creationUploads.ready()) { event.preventDefault(); return; }
+      form.querySelectorAll('input[name="attachmentIds"]').forEach((input) => input.remove());
+      for (const id of creationUploads?.ids() || []) {
+        const input = document.createElement("input"); input.type = "hidden"; input.name = "attachmentIds"; input.value = id; form.append(input);
+      }
+      creationUploads?.lock(true);
       indexNavigationPending = true;
       if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
       const button = form.querySelector('button[type="submit"]');
@@ -1737,7 +1781,11 @@
         if (deleteSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt.id)) {
           pendingMessages.delete(attempt.id);
           const composer = document.getElementById("message-form")?.elements.message;
-          if (composer && composer.value.trim() === attempt.message) composer.value = "";
+          if (composer && composer.value.trim() === attempt.message && composerUploads?.ready() &&
+              conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
+            composer.value = "";
+            composerUploads.clear();
+          }
         } else {
           removedAll = false;
         }
@@ -1843,7 +1891,8 @@
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
     const interruptButton = document.getElementById("interrupt");
-    if (sendButton) sendButton.textContent = messageActionLabel(threadActive);
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !composerUploadReady; }
+    if (queueButton) queueButton.disabled = !composerUploadReady;
     if (queueButton) queueButton.hidden = !threadActive;
     if (interruptButton) interruptButton.disabled = !threadActive;
   };
@@ -1945,7 +1994,7 @@
 
   const appendMessage = (entry, index, entries, disclosureStates) => {
     const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
-    const text = entry.text || entry.summary || "Codex event";
+    const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
     const details = entry.details || "";
     const html = entry.html || "";
     const entryKey = transcriptEntryKey(entry, index, entries);
@@ -1977,6 +2026,9 @@
     } else {
       element.textContent = text;
     }
+    if (entry.attachments?.length) element.append(conversationAssets.renderAttachments(entry.attachments, {onRemove: async (file) => {
+      await request(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
+    }}));
     const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
     const time = document.createElement("time");
     time.className = "message-time";
@@ -2414,7 +2466,7 @@
     for (const entry of entries) {
       const item = document.createElement("li");
       const text = document.createElement("span");
-      text.textContent = entry.text || "Queued input";
+      text.textContent = entry.displayText ?? entry.text ?? "Queued input";
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "quiet queue-remove";
@@ -2430,6 +2482,7 @@
         }
       });
       item.append(text, remove);
+      if (entry.attachments?.length) item.append(conversationAssets.renderAttachments(entry.attachments));
       queueList.append(item);
     }
     queuePanel.hidden = entries.length === 0;
@@ -2502,42 +2555,50 @@
   const form = document.getElementById("message-form");
   if (form && interactive) {
     const textarea = form.elements.message;
+    composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
+      basePath: `/uploads/s-${encodeURIComponent(slug)}`, dropTarget: form,
+      storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,
+      onChange: ({ready, count}) => { composerUploadReady = ready; textarea.required = !count; updateMessageActions(); },
+    });
     const queueButton = document.getElementById("message-queue");
     const interruptButton = document.getElementById("interrupt");
     let queueAttemptStorage = null;
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
       const message = textarea.value.trim();
-      if (!message) return;
+      if (!message && !composerUploads.count()) return;
+      let attachments;
+      try { attachments = composerUploads.ids(); } catch (error) { alert(error.message); return; }
+      composerUploads.lock(true);
       const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
       controls.forEach((control) => { control.disabled = true; });
       try {
         if (queue) {
           let queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, currentThreadId);
-          let attempt = queueAttempts.find((candidate) => candidate.message === message);
+          let attempt = queueAttempts.find((candidate) => candidate.message === message && sameAttemptAttachments(candidate.attachmentIds, attachments));
           if (!attempt) {
-            attempt = {message, id: crypto.randomUUID()};
+            attempt = {message, id: crypto.randomUUID(), ...(attachments.length ? {attachmentIds: attachments} : {})};
             if (!storeQueueAttempt(queueAttemptStorage, slug, currentThreadId, attempt)) {
               throw new Error("Browser storage is unavailable; queued messages cannot be submitted safely.");
             }
           }
-          await client.queueMessage(message, attempt.id);
+          await client.queueMessage(message, attempt.id, attachments);
           if (!deleteQueueAttempt(queueAttemptStorage, slug, currentThreadId, attempt.id)) {
             throw new Error("The queued message was accepted, but its retry record could not be cleared.");
           }
         } else {
           const queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, currentThreadId);
-          if (queueAttempts.some((candidate) => candidate.message === message)) {
+          if (queueAttempts.some((candidate) => candidate.message === message && sameAttemptAttachments(candidate.attachmentIds, attachments))) {
             throw new Error("This message has an unresolved queue submission. Use Queue next to reconcile it before sending.");
           }
           const sendAttempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
           if (sendAttempts === null) {
             throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
           }
-          let attempt = matchingSendAttempt(sendAttempts, message);
+          let attempt = matchingSendAttempt(sendAttempts, message, "", attachments);
           const retry = Boolean(attempt);
           if (!attempt) {
-            attempt = {id: crypto.randomUUID(), message, steered: threadActive, context: ""};
+            attempt = {id: crypto.randomUUID(), message, steered: threadActive, context: "", ...(attachments.length ? {attachmentIds: attachments} : {})};
             if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt)) {
               throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
             }
@@ -2547,13 +2608,14 @@
           pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
           renderMessageReceipts();
           try {
-            acceptMessageReceipt(attempt, await client.message(message, id, retry));
+            acceptMessageReceipt(attempt, await client.message(message, id, retry, attachments));
           } finally {
             inFlightMessageIDs.delete(id);
             scheduleRefresh(0);
           }
         }
         textarea.value = "";
+        composerUploads.clear();
         if (!queue) followTranscript();
         else {
           await refreshQueue();
@@ -2570,6 +2632,7 @@
       }
       finally {
         controls.forEach((control) => { control.disabled = false; });
+        composerUploads.lock(false);
         applyCurrentSettings();
         updateMessageActions();
         textarea.focus();
@@ -2578,7 +2641,7 @@
     textarea.addEventListener("keydown", (event) => {
       if (!shouldSubmitMessage(event)) return;
       event.preventDefault();
-      if (!textarea.value.trim()) return;
+      if (!textarea.value.trim() && !composerUploads.count()) return;
       form.requestSubmit();
     });
     form.addEventListener("submit", async (event) => {

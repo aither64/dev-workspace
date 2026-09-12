@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/codex/assets/uploads.css">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
   <div class="workspace-shell index-shell">
@@ -45,6 +46,8 @@
           <label>Reasoning effort<select name="effort" data-effort-select><option value="">Automatic</option></select></label>
         </div>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
+        <input type="hidden" name="uploadScope">
+        <div id="creation-uploads"></div>
         <p id="new-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
         <button type="submit">Create session</button>
       </form>

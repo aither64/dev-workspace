@@ -32,6 +32,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -58,6 +59,7 @@ type codexController interface {
 
 type Config struct {
 	ObserveActivity  bool
+	CollectUploads   bool
 	Workspace        string
 	BaseURL          string
 	DisplayLabel     string
@@ -128,6 +130,9 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	uploadCreationMu conversation.MutationLocker
+	uploadStore      *uploads.Store
+	uploadHandler    http.Handler
 	reviewOnce       sync.Once
 	reviewService    *repositoryReviewService
 	activity         *activityMonitor
@@ -262,7 +267,8 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	server := &Server{
-		config: config, hostProfile: hostProfile, templates: templates,
+		uploadCreationMu: conversation.NewMutationLock(),
+		config:           config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
 		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
 		clusters:         cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders},
@@ -288,6 +294,11 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	server.conversation = conversationHandler
+	if err := server.initUploads(); err != nil {
+		cancelOperations()
+		return nil, err
+	}
+	server.startUploadCollector()
 	server.startActivityMonitor()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
@@ -355,6 +366,9 @@ func (s *Server) Handler() http.Handler {
 	if s.conversation != nil {
 		mux.Handle("/codex/", s.conversation)
 	}
+	if s.uploadHandler != nil {
+		mux.Handle("/uploads/", s.uploadHandler)
+	}
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("/", s.route)
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -379,6 +393,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		s.index(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/upload-drafts":
+		s.withCreationMutation(w, r, func() { s.newUploadDraft(w, r) })
 	case r.Method == http.MethodPost && r.URL.Path == "/sessions":
 		s.withCreationMutation(w, r, func() { s.createSession(w, r) })
 	case r.Method == http.MethodGet && r.URL.Path == "/api/models":
@@ -895,7 +911,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "session name is invalid")
 		return
 	}
-	if goal == "" || len([]byte(goal)) > session.MaxMessageBytes {
+	if (goal == "" && len(r.Form["attachmentIds"]) == 0) || len([]byte(goal)) > session.MaxMessageBytes {
 		s.writeError(w, r, http.StatusBadRequest, fmt.Sprintf(
 			"initial request is required and must be at most %s bytes",
 			session.FormattedMaxMessageBytes(),
@@ -910,11 +926,30 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := s.uploadCreationMu.Lock(r.Context()); err != nil {
+		s.writeError(w, r, 409, "Session creation is busy; retry shortly")
+		return
+	}
+	defer s.uploadCreationMu.Unlock()
+	if err := s.retainCreationUploads(r.Context()); err != nil {
+		s.writeError(w, r, 500, "Unable to reconcile initial uploads")
+		return
+	}
+	preparedGoal, prepareErr := s.prepareCreationAttachments(r.Context(), creationDate+"-"+name, r.FormValue("uploadScope"), goal, r.Form["attachmentIds"])
+	if prepareErr != nil {
+		s.writeError(w, r, http.StatusBadRequest, prepareErr.Error())
+		return
+	}
+	goal = preparedGoal
 	receipt, err := s.acceptCreation(creationRequest{
 		Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort,
 	})
 	if err != nil {
 		s.writeError(w, r, http.StatusConflict, err.Error())
+		return
+	}
+	if err := s.uploadStore.RetainCreations(r.Context(), map[string]uploads.Scope{goal: {Slug: receipt.Request.Slug, Epoch: receipt.DeletionHistorySHA256}}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "Session creation was accepted; reload to check its progress")
 		return
 	}
 	http.Redirect(w, r, receipt.status().URL, http.StatusSeeOther)
@@ -2302,10 +2337,19 @@ func (s *Server) resolveConversation(
 		}
 	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
+	var attachments conversation.AttachmentProvider
+	if s.uploadStore != nil {
+		backend, err := s.sessionUploads(ctx, summary.Slug, summary.Codex.ThreadID, !interactive)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		attachments = backend
+	}
 	var once sync.Once
 	failed = false
 	return conversation.Target{
-		Client: s.config.Codex, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
+		Attachments: attachments,
+		Client:      s.config.Codex, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(summary.Slug),
 		TransformTranscript: s.presentTranscript,
 		Activity:            s.activityProvider(),
