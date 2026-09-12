@@ -18,10 +18,10 @@
             </dl>
             <nav class="link-row">
               {{if $.Session.Archived}}
-                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
+                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer" aria-label="Compare on GitHub">Compare ↗</a>{{end}}
                 {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Final revision</a>{{end}}
               {{else if .RemoteHeadSHA}}
-                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer">Compare</a>{{end}}
+                {{if .CompareURL}}<a href="{{.CompareURL}}" target="_blank" rel="noreferrer" aria-label="Compare on GitHub">Compare ↗</a>{{end}}
                 {{if .BranchURL}}<a href="{{.BranchURL}}" target="_blank" rel="noreferrer">Branch</a>{{end}}
               {{end}}
               {{if .ActionsURL}}<a href="{{.ActionsURL}}" target="_blank" rel="noreferrer">Actions</a>{{end}}
@@ -31,7 +31,7 @@
             {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
             </div>
             <section class="repository-history" aria-label="Local commits">
-              <div class="repository-review-actions"><button type="button" data-review-branch disabled>Review branch</button><button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
+              <div class="repository-review-actions"><button type="button" data-review-branch disabled>Compare</button><button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
               <p class="repository-head-change notice warning" hidden>The branch has changed. Refresh commits to review it.</p>
               <div data-repository-commits><p class="muted">Loading local commits…</p></div>
             </section>

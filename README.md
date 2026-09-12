@@ -114,16 +114,31 @@ replacing that session.
 ## Repository review
 
 The Repositories tab lists local feature commits, including commits that have
-not been pushed. Expand a commit message to read its body, select its subject
-to review the commit, or choose **Review branch** for the whole comparison.
-GitHub links and workflow status remain available separately.
+not been pushed. Use the ellipsis after a subject to expand its message, select
+the subject to review the commit and full message, or choose **Compare** for the
+whole branch. Copy icons copy full commit hashes. The external arrow opens the
+commit on GitHub.
 
-The file list scrolls to each file's diff. Split view is the default; the portal
-remembers the selected layout. Split view numbers both versions. Unified view
-numbers the current file and shows deleted text in separate unnumbered blocks.
-Unchanged sections can be expanded. Binary files, submodules, symlinks, mode
-changes, and missing final newlines retain their metadata. Text previews are
-limited to 512 KiB and 12,000 lines per version.
+The file list scrolls to each file's diff. Branch and commit comparisons show
+changed-file totals and added/removed line counts, with counts and change-type
+labels for each file. Binary changes have no line counts. Split view is the
+default; the portal remembers the selected layout. Both split and unified
+views link their Before and After line numbers. Unchanged sections can be
+expanded. Syntax highlighting uses each version's filename and complete source.
+
+Choose **View file** to read a complete file without diff markers, then switch
+between **Before** and **After** or return to **View diff**. After is the default;
+deleted files open Before. Binary files, submodules, symlinks, mode changes, and
+missing final newlines retain their metadata. Text previews are limited to
+512 KiB and 12,000 lines per version.
+
+The address bar follows repository, commit, file, layout and file-version
+navigation. Copy the address or use the comparison's copy-link icon to share
+exact revisions. Line numbers are links, including lines inside unchanged
+context. Opening a link expands its target context and scrolls to that line;
+Back and Forward restore previous views. Links survive portal restarts and
+branch movement, while the session, repository and required Git objects remain
+available. They do not fetch or retain Git objects.
 
 Active comparisons use the merge base with the locally available default branch.
 Opening a history or branch comparison saves its exact base and head. After
@@ -132,10 +147,11 @@ head. When no saved comparison exists, the original recorded base is labelled
 as a fallback; it can include upstream commits after a rebase. An open review
 keeps its revisions until explicitly refreshed.
 
-Git supplies immutable objects through a bounded local reader. Read-only
-CodeMirror Merge editors are loaded as needed from the portal's own assets.
-The complete npm dependency graph is locked in `portal/review-ui/package-lock.json`;
-Nix builds the bundle and includes dependency versions and license notices.
+Git supplies immutable objects through a bounded local reader. Batched reads
+and shared caches avoid repeated workspace scans and file requests. CodeMirror
+renders the read-only views; Shiki highlights source in a browser worker. All
+assets load from the portal. The dependency graph is locked in
+`portal/review-ui/package-lock.json`; Nix packages versions and license notices.
 
 ## Transcript controls
 
