@@ -149,6 +149,28 @@ the command and full available output. File changes include paths and patches.
 Collapsed entries copy all loaded content, and streaming entries copy the
 content available when selected.
 
+## Working and waiting time
+
+The conversation shows root-thread working time and completed waiting time.
+Blocking questions, approvals, and permission requests pause the working clock;
+nonblocking questions do not. Overlapping requests count once. Waiting totals
+also include gaps between turns, while the current open wait is shown separately.
+Forked conversations count only their own turns. The current turn shows counts
+of distinct assistant messages and tool calls, independent of the selected view.
+
+The portal service observes activity without answering requests, even when no
+browser is open. Timing records contain identities, interval boundaries, and
+coverage, without prompt or answer text. Observation times are approximate.
+Unobserved time, including historical intervals that Codex cannot reconstruct,
+is shown as unclassified. Restart and connection gaps are not assumed to be work.
+The observer limits reads and subscription requests to four concurrent RPCs,
+including reconnects. Reads of one thread queue before taking a portal slot,
+leaving capacity for other conversations. Noninteractive pages keep one
+successful timing snapshot.
+The portal keeps these records, creation receipts, and saved comparisons in
+separate private files; existing session manifests and lifecycle journals retain
+their formats for rollback.
+
 ## Development
 
 Run the package checks and host smoke test with:

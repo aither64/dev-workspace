@@ -57,6 +57,7 @@ type codexController interface {
 }
 
 type Config struct {
+	ObserveActivity  bool
 	Workspace        string
 	BaseURL          string
 	DisplayLabel     string
@@ -129,6 +130,7 @@ type lifecycleOperationOptions struct {
 type Server struct {
 	reviewOnce       sync.Once
 	reviewService    *repositoryReviewService
+	activity         *activityMonitor
 	config           Config
 	hostProfile      hostProfileIdentity
 	templates        *template.Template
@@ -286,6 +288,7 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	server.conversation = conversationHandler
+	server.startActivityMonitor()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
 		go server.reconcileThreadInstructions()
@@ -2307,6 +2310,7 @@ func (s *Server) resolveConversation(
 		Client: s.config.Codex, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(summary.Slug),
 		TransformTranscript: s.presentTranscript,
+		Activity:            s.activityProvider(),
 		Release:             func() { once.Do(release) },
 	}, nil
 }

@@ -16,7 +16,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
-  activityAge, indexStatusFreshForPage, indexStatusOrder,
+  activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
@@ -85,6 +85,22 @@ const unreportedLimitsRead = limitsReader.refresh();
 finishLimitsRead(unreportedLimits);
 await unreportedLimitsRead;
 assert.deepEqual(limitsChanges.pop(), {snapshot: unreportedLimits, failed: false});
+
+// Waiting totals include completed gaps, while the current open wait stays separate.
+const timing = {
+  currentState: "waiting", workingMs: 60_000, waitingMs: 10_000,
+  betweenTurnsMs: 120_000, openWaitingMs: 5_000, stateSinceMs: 1000,
+  startedAtMs: 1000, observedAtMs: 76000, messages: 3, toolCalls: 7,
+};
+const waitingView = activityPresentation(timing, 2000);
+assert.equal(waitingView.working, "1m 00s");
+assert.equal(waitingView.waiting, "2m 10s");
+assert.equal(waitingView.openWait, "7s");
+assert.equal(waitingView.counts, "3 messages · 7 tool calls");
+assert.equal(activityPresentation({...timing,currentState:"working"},2000).working,"1m 02s");
+assert.equal(activityPresentation({...timing,currentState:"working"},16000).working,"1m 00s");
+assert.equal(activityPresentation(timing,16000).stale,true);
+assert.equal(activityPresentation({messages:1,toolCalls:1},0).counts,"1 message · 1 tool call");
 
 assert.equal(automaticReasoningLabel(), "Automatic");
 assert.equal(automaticReasoningLabel({model: "bounded"}), "Automatic");

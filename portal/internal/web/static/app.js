@@ -11,6 +11,7 @@
   };
   const createSessionClient = (slug, request, conversation) => ({
     thread: conversation?.thread,
+    activity: conversation?.activity,
     pending: conversation?.pending,
     modes: () => request("/api/collaboration-modes"),
     queue: conversation?.queue,
@@ -164,6 +165,30 @@
     const hours = Math.floor(minutes / 60);
     return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
   };
+  const activityPresentation = (snapshot, elapsedSinceRead = 0) => {
+    const elapsed = Math.max(0, elapsedSinceRead);
+    const stale = elapsed > 15_000;
+    const extension = stale ? 0 : elapsed;
+    const state = snapshot.currentState || "unclassified";
+    const working = Number(snapshot.workingMs || 0) + (state === "working" ? extension : 0);
+    const waiting = Number(snapshot.waitingMs || 0) + Number(snapshot.betweenTurnsMs || 0);
+    const openWait = Number(snapshot.openWaitingMs || 0) +
+      (["waiting", "idle"].includes(state) && snapshot.stateSinceMs ? extension : 0);
+    const messages = Number(snapshot.messages || 0);
+    const tools = Number(snapshot.toolCalls || 0);
+    return {
+      stale, state,
+      working: formatElapsed(working), waiting: formatElapsed(waiting),
+      unclassified: Number(snapshot.unclassifiedMs || 0),
+      openWait: formatElapsed(openWait),
+      counts: `${messages} ${messages === 1 ? "message" : "messages"} · ${tools} ${tools === 1 ? "tool call" : "tool calls"}`,
+      turnElapsed: snapshot.startedAtMs ? formatElapsed(
+        Math.max(0, Number(snapshot.completedAtMs || snapshot.observedAtMs) - snapshot.startedAtMs) +
+          (!snapshot.completedAtMs ? extension : 0),
+      ) : "",
+    };
+  };
+
   const timedProgress = (element, label) => {
     const startedAt = Date.now();
     const update = () => {
@@ -553,7 +578,7 @@
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
-      activityAge, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
+      activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
@@ -1568,29 +1593,66 @@
   const requestInputDrafts = new Map();
   const codexWork = document.getElementById("codex-work");
   const codexWorkElapsed = document.getElementById("codex-work-elapsed");
-  let codexWorkStartedAt = 0;
-  let codexWorkTimer = null;
+  const codexWorkLabel = document.getElementById("codex-work-label");
+  const codexWorkCounts = document.getElementById("codex-work-counts");
+  const durationSummary = document.getElementById("codex-duration");
+  let activitySnapshot = null;
+  let activityReceivedAt = 0;
+  let activityRead = null;
+  let activityFailed = false;
   let sendAttemptStorage = null;
   try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
   let requestInputDraftStorage = null;
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
-  const updateCodexWork = (active) => {
+  const updateCodexWork = (active = threadActive) => {
     if (!codexWork || !codexWorkElapsed) return;
-    if (!active) {
-      codexWork.hidden = true;
-      codexWorkStartedAt = 0;
-      if (codexWorkTimer !== null) clearInterval(codexWorkTimer);
-      codexWorkTimer = null;
+    if (!activitySnapshot) {
+      codexWork.hidden = !active;
+      codexWorkLabel.textContent = "Codex is working";
+      codexWorkCounts.textContent = "";
+      codexWorkElapsed.textContent = "";
+      durationSummary.textContent = activityFailed ? "Timing unavailable" : "Loading timing…";
       return;
     }
-    if (!codexWorkStartedAt) codexWorkStartedAt = Date.now();
-    codexWork.hidden = false;
-    codexWorkElapsed.textContent = `${formatElapsed(Date.now() - codexWorkStartedAt)} elapsed`;
-    if (codexWorkTimer === null) {
-      codexWorkTimer = setInterval(() => updateCodexWork(true), 1000);
+    const elapsed = interactive ? Date.now() - activityReceivedAt : 0;
+    const view = activityPresentation(activitySnapshot, activityFailed ? 15_001 : elapsed);
+    const stale = view.stale || activityFailed;
+    const waiting = !stale && ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
+    codexWork.hidden = !active && !(waiting && interactive);
+    codexWork.classList.toggle("waiting", Boolean(waiting));
+    codexWorkLabel.textContent = waiting ? "Waiting for you" : active ? "Codex is working" : "";
+    codexWorkCounts.textContent = active ? view.counts : "";
+    codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
+      `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
+    const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
+    durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting}`;
+    if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) {
+      durationSummary.textContent += view.unclassified > 0 ?
+        ` · ${formatElapsed(view.unclassified)} unclassified` : " · Partial timing";
     }
+    if (stale) durationSummary.textContent += " · Update unavailable";
+    durationSummary.title = activitySnapshot.coverageReason ||
+      "Waiting includes answered blocking requests and gaps between turns. The current wait is shown separately.";
   };
+  const refreshActivity = () => {
+    if (!client.activity || document.hidden) return Promise.resolve();
+    if (!interactive && activitySnapshot) return Promise.resolve();
+    if (activityRead) return activityRead;
+    activityRead = client.activity().then((snapshot) => {
+      activitySnapshot = snapshot;
+      activityReceivedAt = Date.now();
+      activityFailed = false;
+    }).catch(() => { activityFailed = true; }).finally(() => {
+      activityRead = null;
+      updateCodexWork();
+    });
+    return activityRead;
+  };
+  setInterval(() => { if (!document.hidden) updateCodexWork(); }, 1000);
+  setInterval(() => { void refreshActivity(); }, 5000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshActivity(); });
+  addEventListener("focus", () => { void refreshActivity(); });
 
   const loadMessageReceipts = () => {
     if (!currentThreadId || pendingMessages.size) return;
@@ -2376,7 +2438,7 @@
     do {
       refreshDirty = false;
       await refreshThread();
-      await Promise.all([refreshPending(), refreshQueue()]);
+      await Promise.all([refreshPending(), refreshQueue(), refreshActivity()]);
     } while (refreshDirty);
     refreshRunning = false;
   };

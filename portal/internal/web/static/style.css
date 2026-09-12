@@ -359,3 +359,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
   .chat-panel:has(.question-approval) .composer-controls .compact-select,
   .chat-panel:has(.question-approval) .composer-controls .mode-toggle { display: none; }
 }
+
+.activity-summary { flex: none; padding: .4rem 0; color: var(--muted); font-size: .75rem; }
+.codex-work { flex-wrap: wrap; }
+.codex-work.waiting { border-color: #66532e; background: #211d14; color: var(--warning); }
+#codex-work-counts { color: var(--muted); }

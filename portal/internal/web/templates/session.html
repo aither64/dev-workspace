@@ -54,6 +54,7 @@
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><span id="codex-status" class="badge">Connecting</span></div>
+        <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
         <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         {{if .Session.Interactive}}<div id="pending" class="pending"></div>{{end}}
         <div class="composer-context">
@@ -64,7 +65,7 @@
           <ol id="queue-list"></ol>
         </section>
         {{end}}
-        <div id="codex-work" class="codex-work" aria-live="polite" hidden><span>Codex is working</span><time id="codex-work-elapsed">0s elapsed</time></div>
+        <div id="codex-work" class="codex-work" aria-live="polite" hidden><span id="codex-work-label">Codex is working</span><span id="codex-work-counts"></span><time id="codex-work-elapsed"></time></div>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
         {{if .Session.Interactive}}
         <section id="plan-actions" class="plan-actions" hidden>
