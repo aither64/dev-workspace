@@ -35,7 +35,7 @@ const content = id => {
     after: {text: after, bytes: after.length, kind: file.newMode === "000000" ? "absent" : "file"}};
 };
 const commit = {id: "commit", sha: originalHead, subject: "Improve repository review", body: "Complete body\n\nSecond paragraph.",
-  message: "Improve repository review\n\nComplete body\n\nSecond paragraph.\n", author: "Example Author",
+  message: "Improve repository review\n\n" + "A complete explanation of the change.\n".repeat(70), author: "Example Author",
   date: "2026-09-12T12:00:00Z", parents: [base, "d".repeat(40)], url: "https://github.com/example/project/commit/" + originalHead};
 const rootCommit = {...commit, sha: "e".repeat(40), parents: [], message: "Initial repository\n"};
 const parentCommit = {...commit, sha: base, parents: [rootCommit.sha], message: "Previous implementation\n\nParent body.\n"};
@@ -114,6 +114,23 @@ const server = http.createServer((req, res) => {
       return new Set(colors).size >= 3;
     });
     assert.equal(await page.locator(".repository-commit-full-message").textContent(), commit.message);
+    const pane = page.locator('.repository-file-scroll');
+    assert.equal(new URL(page.url()).searchParams.has('file'), false, 'implicit first file replaced the commit URL');
+    assert.equal(await pane.evaluate(el => el.scrollTop), 0, 'commit entry skipped its message');
+    assert.equal(await page.locator('.repository-commit-full-message').evaluate(el => el.scrollHeight === el.clientHeight), true, 'message has its own scrollbar');
+    const toolbar = await page.locator('.repository-review-heading').boundingBox();
+    assert(toolbar.height < 70, 'desktop toolbar consumes excessive diff height');
+    const paneBox = await pane.boundingBox();
+    await page.mouse.move(paneBox.x + paneBox.width / 2, paneBox.y + 80);
+    await page.mouse.wheel(0, 3000);
+    await page.waitForFunction(() => document.querySelector('.repository-comparison-details').getBoundingClientRect().bottom <= document.querySelector('.repository-file-scroll').getBoundingClientRect().top);
+    const scrolledToolbar = await page.locator('.repository-review-heading').boundingBox();
+    assert.deepEqual(scrolledToolbar, toolbar, 'diff scrolling moved the toolbar');
+    await page.locator('.repository-file[data-file-id="0"]').click();
+    await page.goBack();
+    await page.waitForFunction(() => !new URL(location.href).searchParams.has('file') && document.querySelector('.repository-file-scroll').scrollTop === 0);
+
+
     assert((await page.locator(".repository-comparison-stats").textContent()).includes("30 changed files"));
     const src = page.locator('.repository-directory[data-directory-path="src"]');
     const sourceFile = page.locator('.repository-file[data-file-id="0"]');
@@ -215,6 +232,10 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator(".repo-grid").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length), 1);
     await page.locator("[data-review-branch]").first().click();
     await page.locator(".cm-editor").first().waitFor();
+    assert.equal(new URL(page.url()).searchParams.has('file'), false, 'branch entry selected an explicit file');
+    assert.equal(await page.locator('.repository-file-scroll').evaluate(el => el.scrollTop), 0, 'branch details were skipped');
+    assert(await page.locator('.repository-review-heading').evaluate(el => el.getBoundingClientRect().height < 110), 'mobile toolbar consumes excessive diff height');
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'mobile page overflows horizontally');
     assert.deepEqual(await page.evaluate(() => window.violations), []);
     assert.deepEqual(errors, []);
     shortFiles = true;
@@ -229,6 +250,6 @@ const server = http.createServer((req, res) => {
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
       "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
-      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation"]}));
+      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry"]}));
   } finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
 })().catch(error => {console.error(error); process.exitCode = 1; server.close();});

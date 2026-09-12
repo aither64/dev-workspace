@@ -251,12 +251,14 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
     return lines;
   };
+  const selectedFile = selected => selected.sections.get(route.file) ||
+    (!route.file ? selected.sections.values().next().value : null);
   const trimEditors = (selected, current = null) => {
     const mounted = [...selected.sections.values()].filter(record => record.editor || record.content).sort((a, b) => a.used - b.used);
     let count = mounted.length;
     for (const record of mounted) {
       if (count <= 8) break;
-      if (record.file.id === route.file || record === current) continue;
+      if (record === selectedFile(selected) || record === current) continue;
       record.host.style.minHeight = Math.max(160, record.host.getBoundingClientRect().height) + "px";
       ++record.generation; record.editor?.destroy(); record.editor = null; record.content = null; count--;
       record.host.replaceChildren(node("p", "muted", "Scroll here to load this comparison."));
@@ -273,13 +275,13 @@ export function mount({slug, nonce, element, createCopyButton}) {
     for (const parent of review.querySelectorAll(".repository-parent-link")) parent.href = reviewURL(location.href, parentRoute(parent.dataset.commit));
     for (const record of active.sections.values()) {
       record.nav.href = reviewURL(location.href, fileRoute(record.file));
-      record.nav.setAttribute("aria-current", record.file.id === route.file ? "true" : "false");
+      record.nav.setAttribute("aria-current", record === selectedFile(active) ? "true" : "false");
       record.fileLink.href = reviewURL(location.href, fileRoute(record.file, {view: "file", version: fullFileVersion(record.file, route.version)}));
       record.diffLink.href = reviewURL(location.href, fileRoute(record.file, {view: "diff", version: ""}));
     }
   };
   const reveal = async (selected, record) => {
-    if (active !== selected || route.file !== record.file.id) return;
+    if (active !== selected || selectedFile(selected) !== record) return;
     selected.scroll.scrollTop += record.section.getBoundingClientRect().top - selected.scroll.getBoundingClientRect().top;
     if (route.line && record.editor) {
       const target = route.line;
@@ -292,7 +294,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
   const renderFile = async (selected, record) => {
     if (!record.content || active !== selected) return;
     trimEditors(selected, record);
-    const fileView = route.view === "file" && record.file.id === route.file;
+    const fileView = route.view === "file" && record === selectedFile(selected);
     const version = fullFileVersion(record.file, route.version);
     const editorMode = fileView ? "file" : route.layout;
     const key = editorMode + ":" + version;
@@ -323,7 +325,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       void record.editor.ready.then(() => {
         if (active !== selected || generation !== record.generation) return;
         trimEditors(selected);
-        const destination = selected.sections.get(route.file);
+        const destination = selectedFile(selected);
         if (selected.pendingNavigation && destination?.editor) {
           requestAnimationFrame(() => { if (active === selected && selected.pendingNavigation) void reveal(selected, destination); });
         }
@@ -383,11 +385,12 @@ export function mount({slug, nonce, element, createCopyButton}) {
   const applyView = async (revealTree = false) => {
     if (!active) return;
     const selected = active;
-    selected.pendingNavigation = true;
+    selected.pendingNavigation = Boolean(route.file);
+    if (revealTree && !route.file) selected.scroll.scrollTop = 0;
     selected.lineNotice.hidden = true;
     for (const item of selected.controls.querySelectorAll("[data-layout]")) item.setAttribute("aria-pressed", String(item.dataset.layout === route.layout));
     selected.controls.hidden = route.view === "file";
-    const record = selected.sections.get(route.file);
+    const record = selectedFile(selected);
     for (const item of selected.sections.values()) {
       item.section.hidden = route.view === "file" && item !== record;
       item.fileLink.hidden = route.view === "file";
@@ -401,23 +404,23 @@ export function mount({slug, nonce, element, createCopyButton}) {
       if (route.file) { selected.lineNotice.hidden = false; selected.lineNotice.textContent = "This file is not part of the comparison."; }
       return;
     }
-    if (revealTree || selected.treeFile !== route.file) {
+    if (revealTree || selected.treeFile !== record.file.id) {
       for (const directory of record.directories) directory.open = true;
       record.nav.scrollIntoView({block: "nearest", inline: "nearest"});
     }
-    selected.treeFile = route.file;
+    selected.treeFile = record.file.id;
     const others = [...selected.sections.values()].filter(item => item !== record && !item.section.hidden && item.content);
     void Promise.all(others.map(item => renderFile(selected, item)));
     await loadFile(selected, record, true);
-    if (active === selected) await reveal(selected, record);
+    if (active === selected && selected.pendingNavigation) await reveal(selected, record);
   };
   const closeReview = (update = true) => {
     ++sequence; destroyEditors(); active = null; review.hidden = true; overview.hidden = false;
     element.classList.remove("repository-review-open");
     if (update) setRoute({layout: readMode()});
   };
-  const commitHeading = (title, state, commit, pair) => {
-    title.append(node("h2", "", state.name + (commit ? " · " + short(commit.sha) : " · Branch comparison")));
+  const comparisonTitle = (state, commit) => state.name + (commit ? " · " + short(commit.sha) : " · Branch comparison");
+  const commitDetails = (title, commit, pair) => {
     if (commit) {
       const identity = node("div", "repository-commit-detail-identity");
       identity.append(node("code", "", commit.sha), copy(commit.sha, "Copy commit hash"));
@@ -451,15 +454,17 @@ export function mount({slug, nonce, element, createCopyButton}) {
     const abort = new AbortController(); opening = abort;
     overview.hidden = true; review.hidden = false; element.classList.add("repository-review-open");
     const initialTitle = node("div", "repository-review-title");
-    if (hint) commitHeading(initialTitle, state, hint);
+    initialTitle.append(node("h2", "", comparisonTitle(state, hint)));
     review.replaceChildren(button("← Repositories", () => closeReview()), initialTitle, node("p", "muted", "Loading comparison…"));
     try {
       const payload = await request(url("comparison", state.id, {review: requested.review, commit: requested.commit, file: requested.file}), {signal: abort.signal});
       if (ticket !== sequence || destroyed) return;
       const heading = node("div", "repository-review-heading");
-      const title = node("div", "repository-review-title");
-      commitHeading(title, state, payload.commit || hint, payload.pair);
-      title.append(counts(node("p", "repository-comparison-stats"), payload.stats, true));
+      const title = node("h2", "repository-review-title", comparisonTitle(state, payload.commit || hint));
+      title.title = title.textContent;
+      const details = node("div", "repository-comparison-details");
+      commitDetails(details, payload.commit || hint, payload.pair);
+      details.append(counts(node("p", "repository-comparison-stats"), payload.stats, true));
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
         const option = button(value === "split" ? "Split" : "Unified", () => {
@@ -476,6 +481,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const body = node("div", "repository-review-body");
       const fileList = node("nav", "repository-file-list"); fileList.setAttribute("aria-label", "Changed files");
       const scroll = node("section", "repository-file-scroll"); scroll.setAttribute("aria-label", "File comparisons");
+      scroll.append(details);
       const sections = new Map();
       const tree = {directories: new Map(), files: []};
       for (const file of payload.files) {
@@ -547,9 +553,6 @@ export function mount({slug, nonce, element, createCopyButton}) {
       opening = null;
       const selected = active;
       if (payload.preview && sections.has(payload.preview.file)) assignContent(sections.get(payload.preview.file), payload.preview.content);
-      if (!route.file && payload.files.length) {
-        setRoute({...route, file: payload.files[0].id, version: route.view === "file" ? fullFileVersion(payload.files[0], route.version) : ""}, true);
-      }
       selected.observer = new IntersectionObserver(entries => {
         for (const entry of entries) {
           const record = sections.get(entry.target.dataset.fileId);

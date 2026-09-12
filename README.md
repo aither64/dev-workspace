@@ -117,7 +117,10 @@ The Repositories tab lists local feature commits, including commits that have
 not been pushed. Use the ellipsis after a subject to expand its message, select
 the subject to review the commit and full message, or choose **Compare** for the
 whole branch. Copy icons copy full commit hashes. The external arrow opens the
-commit on GitHub.
+commit on GitHub. A compact toolbar keeps navigation and layout controls visible.
+The full commit message, metadata, parent links and comparison totals scroll with
+the diffs. Opening a commit starts at its message; a file or line link jumps to
+that target.
 
 Parent hashes open the parent's full commit page. Merge commits link each parent
 and show their diff against the first parent. Parent navigation can continue
