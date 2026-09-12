@@ -1642,7 +1642,7 @@
     const waiting = !stale && ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? "Waiting for you" : active ? "Codex is working" : "";
+    codexWorkLabel.textContent = waiting ? "Waiting for instructions" : active ? "Codex is working" : "";
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
