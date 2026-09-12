@@ -3,7 +3,8 @@
         <div class="section-heading"><h2>Repositories</h2><span>{{len .Repositories}}</span></div>
         <div class="repo-grid">
         {{range .Repositories}}
-          <article class="panel repo-card">
+          <article class="panel repo-card" data-repository-id="{{.ReviewID}}" data-repository-name="{{.Name}}" data-repository-head="{{if $.Session.Archived}}{{.HeadSHA}}{{else}}{{.LocalHeadSHA}}{{end}}">
+            <div data-repository-status>
             <div class="repo-title"><h3>{{.Name}}</h3>{{if not $.Session.Archived}}{{if eq .PushStatus "exactly-pushed"}}<span class="badge active">Pushed</span>{{else if eq .PushStatus "not-pushed"}}<span class="badge warning">Not pushed</span>{{else if eq .PushStatus "remote-ahead"}}<span class="badge warning">GitHub ahead</span>{{else if eq .PushStatus "divergent"}}<span class="badge danger">Diverged</span>{{else}}<span class="badge warning">Unknown</span>{{end}}{{end}}</div>
             <dl>
               <dt>Branch</dt><dd><code>{{.Branch}}</code></dd>
@@ -28,6 +29,12 @@
             {{if .StatusError}}<p class="notice warning">Repository: {{.StatusError}}</p>{{end}}
             {{if .GitHubError}}<p class="notice warning">GitHub: {{.GitHubError}}</p>{{end}}
             {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}<a href="{{.URL}}" target="_blank" rel="noreferrer"><span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code></a>{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .GitHubError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
+            </div>
+            <section class="repository-history" aria-label="Local commits">
+              <div class="repository-review-actions"><button type="button" data-review-branch disabled>Review branch</button><button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
+              <p class="repository-head-change notice warning" hidden>The branch has changed. Refresh commits to review it.</p>
+              <div data-repository-commits><p class="muted">Loading local commits…</p></div>
+            </section>
           </article>
         {{else}}<p class="empty">Codex has not added any repository worktrees yet.</p>{{end}}
         </div>

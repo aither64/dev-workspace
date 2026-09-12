@@ -111,6 +111,32 @@ fills, the oldest completed receipts retire; unfinished attempts remain availabl
 for recovery. An existing destination still prevents a later request from
 replacing that session.
 
+## Repository review
+
+The Repositories tab lists local feature commits, including commits that have
+not been pushed. Expand a commit message to read its body, select its subject
+to review the commit, or choose **Review branch** for the whole comparison.
+GitHub links and workflow status remain available separately.
+
+The file list scrolls to each file's diff. Split view is the default; the portal
+remembers the selected layout. Split view numbers both versions. Unified view
+numbers the current file and shows deleted text in separate unnumbered blocks.
+Unchanged sections can be expanded. Binary files, submodules, symlinks, mode
+changes, and missing final newlines retain their metadata. Text previews are
+limited to 512 KiB and 12,000 lines per version.
+
+Active comparisons use the merge base with the locally available default branch.
+Opening a history or branch comparison saves its exact base and head. After
+integration or archival, the portal reuses the saved comparison for that exact
+head. When no saved comparison exists, the original recorded base is labelled
+as a fallback; it can include upstream commits after a rebase. An open review
+keeps its revisions until explicitly refreshed.
+
+Git supplies immutable objects through a bounded local reader. Read-only
+CodeMirror Merge editors are loaded as needed from the portal's own assets.
+The complete npm dependency graph is locked in `portal/review-ui/package-lock.json`;
+Nix builds the bundle and includes dependency versions and license notices.
+
 ## Transcript controls
 
 Every message and activity entry has a copy button beside its timestamp in

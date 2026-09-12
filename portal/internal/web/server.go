@@ -127,6 +127,8 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	reviewOnce       sync.Once
+	reviewService    *repositoryReviewService
 	config           Config
 	hostProfile      hostProfileIdentity
 	templates        *template.Template
@@ -165,6 +167,7 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
+	StyleNonce        string
 	BaseURL           string
 	DisplayLabel      string
 	HostLabel         string
@@ -802,7 +805,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		}
 		data.Error += "Some live worktrees could not be verified: " + discoveryErr.Error()
 	}
-	data.Repositories = s.repositories(r.Context(), summary)
+	data.Repositories = s.repository.Skeleton(summary.Slug, summary.Repositories, summary.Archived)
 	data.Clusters, err = s.clusters.InspectContext(r.Context(), summary.Slug)
 	if err != nil {
 		if data.Error != "" {
@@ -1269,6 +1272,9 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if s.repositoryReviewAPI(w, r, summary, parts) {
+		return
+	}
 	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "details" {
 		s.sessionDetails(w, r, summary)
 		return
@@ -2338,6 +2344,17 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	s.renderStatus(w, http.StatusOK, name, data)
 }
 func (s *Server) renderStatus(w http.ResponseWriter, status int, name string, data pageData) {
+	if name == "session" {
+		var nonce [24]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			http.Error(w, "Unable to render page", http.StatusInternalServerError)
+			return
+		}
+		data.StyleNonce = hex.EncodeToString(nonce[:])
+		policy := w.Header().Get("Content-Security-Policy")
+		w.Header().Set("Content-Security-Policy", strings.Replace(policy,
+			"style-src 'self'", "style-src 'self' 'nonce-"+data.StyleNonce+"'", 1))
+	}
 	data.DisplayLabel = s.config.DisplayLabel
 	data.HostLabel = s.config.HostLabel
 	data.SSHHost = s.config.SSHHost

@@ -2,6 +2,7 @@
   activationEnvironmentAliases ? [ ],
   bash,
   buildGoModule,
+  buildNpmPackage,
   coreutils,
   codex,
   codexWebSrc,
@@ -26,6 +27,9 @@
   src,
 }:
 let
+  reviewAssets = import ./review-ui.nix {
+    inherit buildNpmPackage lib;
+  };
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
   validActivationEnvironmentAliases =
     builtins.isList activationEnvironmentAliases
@@ -164,6 +168,10 @@ buildGoModule {
     fi
   '';
 
+  preBuild = ''
+    cp ${reviewAssets}/review-editor.* internal/web/static/
+  '';
+
   subPackages = [ "cmd/workspace-portal" ];
   nativeBuildInputs = [ makeWrapper ];
   nativeCheckInputs = [
@@ -192,6 +200,8 @@ buildGoModule {
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
+    node --check internal/web/static/repository-review.js
+    node --check internal/web/static/review-editor.js
     (
       cd ..
       ruby test/dev_session_test.rb

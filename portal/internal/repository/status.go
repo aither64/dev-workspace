@@ -40,6 +40,7 @@ type Run struct {
 }
 
 type Status struct {
+	ReviewID      string `json:"reviewId"`
 	Name          string `json:"name"`
 	Project       string `json:"project"`
 	GitHub        string `json:"github,omitempty"`
@@ -69,11 +70,11 @@ type Runner struct {
 // Inspect derives archived links from immutable manifest records. For active
 // sessions, it also resolves the exact canonical worktree and compares its
 // checked-out feature head with GitHub's authoritative branch head.
-func (r Runner) Inspect(ctx context.Context, slug string, repositories []session.Repository, immutable bool) []Status {
+func (r Runner) Skeleton(slug string, repositories []session.Repository, immutable bool) []Status {
 	statuses := make([]Status, 0, len(repositories))
 	for _, item := range repositories {
 		status := Status{
-			Name: item.Name, Project: item.Project, GitHub: item.GitHub, Branch: item.Branch,
+			ReviewID: ReviewID(item.Name), Name: item.Name, Project: item.Project, GitHub: item.GitHub, Branch: item.Branch,
 			DefaultBranch: item.DefaultBranch, HeadSHA: item.FinalHeadSHA,
 			baseSHA: item.InitialBaseSHA, immutable: immutable,
 		}
@@ -91,6 +92,11 @@ func (r Runner) Inspect(ctx context.Context, slug string, repositories []session
 		statuses = append(statuses, status)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
+	return statuses
+}
+
+func (r Runner) Inspect(ctx context.Context, slug string, repositories []session.Repository, immutable bool) []Status {
+	statuses := r.Skeleton(slug, repositories, immutable)
 	r.EnrichAll(ctx, statuses)
 	return statuses
 }

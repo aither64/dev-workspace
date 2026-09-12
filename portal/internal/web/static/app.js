@@ -1323,6 +1323,29 @@
     if (!selectedArtifactPath && artifactButtons()[0]) showArtifact(artifactButtons()[0]);
   });
 
+  let repositoryReview = null;
+  let repositoryReviewLoading = null;
+  const loadRepositoryReview = async () => {
+    if (repositoryReview || repositoryReviewLoading) return repositoryReviewLoading;
+    const element = document.getElementById("repositories");
+    if (!element) return;
+    repositoryReviewLoading = import("/static/repository-review.js").then((module) => {
+      repositoryReview = module.mount({
+        slug, element, nonce: document.querySelector('meta[name="style-nonce"]')?.content || "",
+      });
+    }).catch((error) => {
+      const notice = document.createElement("p");
+      notice.className = "notice error";
+      notice.textContent = `Unable to load repository review: ${error.message}`;
+      element.prepend(notice);
+    }).finally(() => { repositoryReviewLoading = null; });
+    return repositoryReviewLoading;
+  };
+  document.addEventListener("session-section-change", (event) => {
+    if (event.detail === "repositories") void loadRepositoryReview();
+  });
+  if (document.getElementById("repositories")?.classList.contains("active")) void loadRepositoryReview();
+
   let detailsTimer = null;
   let detailsRunning = false;
   let lastRepositoriesHTML = "";
@@ -1336,9 +1359,14 @@
       const payload = await client.details();
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
-        const previousTop = repositories.scrollTop;
-        repositories.innerHTML = payload.repositoriesHTML;
-        repositories.scrollTop = previousTop;
+        if (repositoryReviewLoading) await repositoryReviewLoading;
+        if (repositoryReview) {
+          repositoryReview.updateHTML(payload.repositoriesHTML);
+        } else {
+          const previousTop = repositories.scrollTop;
+          repositories.innerHTML = payload.repositoriesHTML;
+          repositories.scrollTop = previousTop;
+        }
         lastRepositoriesHTML = payload.repositoriesHTML;
       }
       if (payload.artifactsHTML !== lastArtifactsHTML) {
