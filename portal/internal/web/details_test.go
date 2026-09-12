@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSessionDetailsDiscoversLateWorktreesAndCuratedArtifacts(t *testing.T) {
@@ -25,6 +26,11 @@ func TestSessionDetailsDiscoversLateWorktreesAndCuratedArtifacts(t *testing.T) {
 	}
 	writeManifest(manifest)
 	writeWebTrackingFiles(t, tracking, "active")
+	expireDiscovery := func() {
+		server.reviews().discoveryMu.Lock()
+		server.reviews().discoveryAt = time.Time{}
+		server.reviews().discoveryMu.Unlock()
+	}
 	// Details must work before a session has a Codex thread.
 	readDetails := func() map[string]any {
 		t.Helper()
@@ -72,6 +78,9 @@ func TestSessionDetailsDiscoversLateWorktreesAndCuratedArtifacts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// New worktrees become visible after the shared five-second discovery cache
+	// expires. Advance it explicitly instead of making this test sleep.
+	expireDiscovery()
 	after := readDetails()
 	if after["repositoryCount"] != float64(1) || after["artifactCount"] != float64(3) {
 		t.Fatalf("refreshed details = %#v", after)
@@ -87,6 +96,7 @@ func TestSessionDetailsDiscoversLateWorktreesAndCuratedArtifacts(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(server.config.Workspace, "repos", "broken.git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	expireDiscovery()
 	partial := readDetails()
 	if partial["repositoryCount"] != float64(1) || partial["artifactCount"] != float64(3) ||
 		!strings.Contains(partial["repositoriesHTML"].(string), "Some live worktrees could not be verified") ||

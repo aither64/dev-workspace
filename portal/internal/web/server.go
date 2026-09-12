@@ -606,7 +606,7 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 		s.config.Logger.Printf("list sessions for index status: %v", err)
 		result.warning = "Some session status is unavailable."
 	}
-	discovered, discoveryErr := session.DiscoverActiveRepositoriesContext(ctx, s.config.Workspace)
+	discovered, discoveryErr := s.discoverRepositories(ctx, false)
 	if discoveryErr != nil {
 		s.config.Logger.Printf("discover active repositories for index status: %v", discoveryErr)
 		result.warning = "Some repository status is unavailable."
@@ -782,9 +782,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	var discoveryErr error
 	if !summary.Archived {
 		var repositories []session.Repository
-		repositories, discoveryErr = session.ActiveRepositoriesContext(
-			r.Context(), s.config.Workspace, summary.Slug, summary.Repositories,
-		)
+		repositories, discoveryErr = s.activeRepositories(r.Context(), summary)
 		summary.Repositories = repositories
 		if discoveryErr != nil {
 			s.config.Logger.Printf("discover repositories for %s: %v", summary.Slug, discoveryErr)
@@ -830,7 +828,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	var warning string
 	if !summary.Archived {
-		repositories, err := session.ActiveRepositoriesContext(r.Context(), s.config.Workspace, summary.Slug, summary.Repositories)
+		repositories, err := s.activeRepositories(r.Context(), summary)
 		if err != nil {
 			s.config.Logger.Printf("refresh repositories for %s: %v", summary.Slug, err)
 			warning = "Some live worktrees could not be verified: " + err.Error()

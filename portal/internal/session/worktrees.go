@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ActiveRepositories returns the manifest repositories plus worktrees that Git
@@ -82,9 +83,16 @@ func DiscoverActiveRepositories(workspace string) (map[string][]Repository, erro
 }
 
 func DiscoverActiveRepositoriesContext(ctx context.Context, workspace string) (map[string][]Repository, error) {
+	return DiscoverActiveRepositoriesWithLimitContext(ctx, workspace, nil)
+}
+
+// DiscoverActiveRepositoriesWithLimitContext shares the portal's process budget
+// with targeted review reads. Every command deadline includes queue admission.
+func DiscoverActiveRepositoriesWithLimitContext(ctx context.Context, workspace string, jobs chan struct{}) (map[string][]Repository, error) {
 	result := make(map[string][]Repository)
 	var problems []error
 	for _, source := range repositorySources(workspace) {
+		source.jobs = jobs
 		if err := ctx.Err(); err != nil {
 			problems = append(problems, err)
 			break
@@ -105,6 +113,7 @@ type repositorySource struct {
 	project string
 	path    string
 	bare    bool
+	jobs    chan struct{}
 }
 
 func repositorySources(workspace string) []repositorySource {
@@ -136,8 +145,7 @@ func repositorySources(workspace string) []repositorySource {
 }
 
 func discoverSourceWorktrees(ctx context.Context, workspace string, source repositorySource) (map[string][]Repository, error) {
-	args := source.gitArgs("worktree", "list", "--porcelain", "-z")
-	output, err := exec.CommandContext(ctx, "git", args...).Output()
+	output, err := source.output(ctx, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s worktrees: %w", source.project, err)
 	}
@@ -199,8 +207,22 @@ func (source repositorySource) gitArgs(args ...string) []string {
 }
 
 func gitText(ctx context.Context, source repositorySource, args ...string) (string, error) {
-	output, err := exec.CommandContext(ctx, "git", source.gitArgs(args...)...).Output()
+	output, err := source.output(ctx, args...)
 	return strings.TrimSpace(string(output)), err
+}
+
+func (source repositorySource) output(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	if source.jobs != nil {
+		select {
+		case source.jobs <- struct{}{}:
+			defer func() { <-source.jobs }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return exec.CommandContext(ctx, "git", source.gitArgs(args...)...).Output()
 }
 
 func githubRepository(remote string) string {

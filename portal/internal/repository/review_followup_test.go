@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReviewFileStatsAndFullCommitMessage(t *testing.T) {
@@ -92,5 +94,24 @@ func TestReviewStatsRejectMismatchedAndIncompleteRecords(t *testing.T) {
 	}
 	if files, err := parseReviewFiles(nil); err != nil || len(files) != 0 {
 		t.Fatalf("empty diff=%#v %v", files, err)
+	}
+}
+
+func TestReviewGitBudgetDeadlineIncludesAdmission(t *testing.T) {
+	f, reader, _ := reviewFixture(t)
+	reader.Jobs = make(chan struct{}, 4)
+	for i := 0; i < 4; i++ {
+		reader.Jobs <- struct{}{}
+	}
+	reader.Timeout = 20 * time.Millisecond
+	started := time.Now()
+	_, err := reader.git(context.Background(), f.commonDir, 1024, "rev-parse", "HEAD")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatalf("queued read did not honor deadline: %v", err)
+	}
+	<-reader.Jobs
+	reader.Timeout = time.Second
+	if _, err := reader.git(context.Background(), f.commonDir, 1024, "rev-parse", "HEAD"); err != nil {
+		t.Fatal(err)
 	}
 }

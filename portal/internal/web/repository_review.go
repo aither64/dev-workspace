@@ -30,16 +30,21 @@ type repositoryReviewSnapshot struct {
 	Branch      bool
 }
 type repositoryReviewService struct {
-	reader    repository.ReviewReader
-	directory string
-	mu        sync.Mutex
-	snapshots map[string]*repositoryReviewSnapshot
-	slots     chan struct{}
+	reader        repository.ReviewReader
+	directory     string
+	mu            sync.Mutex
+	snapshots     map[string]*repositoryReviewSnapshot
+	requests      chan struct{}
+	discoveryMu   sync.Mutex
+	discovery     map[string][]session.Repository
+	discoveryErr  error
+	discoveryAt   time.Time
+	discoveryWait chan struct{}
 }
 
 func (s *Server) reviews() *repositoryReviewService {
 	s.reviewOnce.Do(func() {
-		s.reviewService = &repositoryReviewService{reader: repository.ReviewReader{Workspace: s.config.Workspace}, directory: filepath.Join(s.operationStore.directory, "repository-comparisons"), snapshots: make(map[string]*repositoryReviewSnapshot), slots: make(chan struct{}, 4)}
+		s.reviewService = &repositoryReviewService{reader: repository.ReviewReader{Workspace: s.config.Workspace, Jobs: make(chan struct{}, 4)}, directory: filepath.Join(s.operationStore.directory, "repository-comparisons"), snapshots: make(map[string]*repositoryReviewSnapshot), requests: make(chan struct{}, 4)}
 	})
 	return s.reviewService
 }
@@ -76,16 +81,57 @@ func (s *repositoryReviewService) get(id, slug, repo string) *repositoryReviewSn
 	}
 	return snap
 }
-func (s *Server) reviewRegistration(ctx context.Context, summary *session.Summary, id string) (session.Repository, bool) {
-	repositories := summary.Repositories
-	if !summary.Archived {
-		if discovered, err := session.ActiveRepositoriesContext(ctx, s.config.Workspace, summary.Slug, repositories); err == nil {
-			repositories = discovered
+func reviewToken(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
 		}
 	}
-	for _, item := range repositories {
+	return true
+}
+
+func (s *Server) reviewRegistration(ctx context.Context, summary *session.Summary, id string) (session.Repository, bool) {
+	if !reviewToken(id) {
+		return session.Repository{}, false
+	}
+	// Explicit registrations do not depend on unrelated repositories. Resolve
+	// verifies their canonical identity when opening or refreshing a new view.
+	for _, item := range summary.Repositories {
 		if repository.ReviewID(item.Name) == id {
 			return item, true
+		}
+	}
+	if summary.Archived {
+		return session.Repository{}, false
+	}
+	service := s.reviews()
+	service.discoveryMu.Lock()
+	cached := !service.discoveryAt.IsZero() && time.Since(service.discoveryAt) < 5*time.Second
+	service.discoveryMu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		discovered, err := s.discoverRepositories(ctx, attempt > 0)
+		if err != nil {
+			return session.Repository{}, false
+		}
+		merged, err := session.MergeActiveRepositories(summary.Repositories, discovered[summary.Slug])
+		if err != nil {
+			return session.Repository{}, false
+		}
+		for _, item := range merged {
+			if repository.ReviewID(item.Name) == id {
+				// A cached discovery entry is not authorization for a removed or retargeted
+				// worktree. Check only this worktree, preserving discovered-only visibility.
+				if _, err := service.reader.Resolve(ctx, summary.Slug, item, false); err != nil {
+					return session.Repository{}, false
+				}
+				return item, true
+			}
+		}
+		if !cached {
+			break
 		}
 	}
 	return session.Repository{}, false
@@ -109,14 +155,14 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	service := s.reviews()
-	select {
-	case service.slots <- struct{}{}:
-		defer func() { <-service.slots }()
-	case <-r.Context().Done():
-		return true
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	select {
+	case service.requests <- struct{}{}:
+		defer func() { <-service.requests }()
+	case <-ctx.Done():
+		return true
+	}
 	repoID := r.URL.Query().Get("repository")
 	registration, ok := s.reviewRegistration(ctx, summary, repoID)
 	if !ok {

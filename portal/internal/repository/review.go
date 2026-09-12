@@ -34,6 +34,7 @@ var ErrReviewLimit = errors.New("repository data exceeds the review limit")
 type ReviewReader struct {
 	Workspace string
 	Timeout   time.Duration
+	Jobs      chan struct{}
 }
 type ReviewRepository struct {
 	Name, ID, GitHub, Directory, Head, DefaultRef, InitialBase string
@@ -135,6 +136,14 @@ func (r ReviewReader) git(ctx context.Context, dir string, limit int, args ...st
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if r.Jobs != nil {
+		select {
+		case r.Jobs <- struct{}{}:
+			defer func() { <-r.Jobs }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	commandArgs := []string{"--no-pager", "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "diff.external=", "-c", "core.quotePath=false", "-C", dir}
 	cmd := exec.CommandContext(ctx, "git", append(commandArgs, args...)...)
 	cmd.WaitDelay = 250 * time.Millisecond
