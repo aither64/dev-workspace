@@ -61,9 +61,14 @@ func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) 
 	if comparison.Snapshot == firstSnapshot || comparison.Preview.File != comparison.Files[0].ID {
 		t.Fatal("did not reconstruct the selected file")
 	}
-	// A newer branch commit and the excluded base cannot be injected into an old link.
+	// Parents can cross the comparison base, but newer commits cannot enter an old link.
 	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+newest, "", 422)
-	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+base, "", 422)
+	rootResponse := reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+base, "", 200)
+	var root reviewComparisonResponse
+	decodeReview(t, rootResponse, &root)
+	if root.Commit == nil || root.Commit.SHA != base || root.Commit.Parents == nil || len(root.Commit.Parents) != 0 || root.HistoryHead != oldHead || root.Stats.Files != 1 || root.Preview == nil || root.Preview.Content.Before.Kind != "absent" || root.Preview.Content.After.Text != "before\n" {
+		t.Fatalf("root parent comparison=%#v", root)
+	}
 	reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit=HEAD", "", 400)
 	reviewRequest(t, fresh, "GET", restore+"&file="+repository.ReviewID("not-issued"), "", 404)
 	reviewRequest(t, fresh, "GET", "/api/sessions/other/repository-comparison"+query+"&review="+review, "", 404)
