@@ -149,6 +149,10 @@
     }
     return panelIDs.includes(target) ? target : fallback;
   };
+  const sessionTabFromLocation = ({hash, search}, panelIDs, fallback) => {
+    const queryTab = new URLSearchParams(search).get("tab");
+    return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
+  };
   const transcriptEntryVisible = (entry, filter) => {
     if (filter === "all" || entry?.kind === "error") return true;
     const messageKinds = new Set(["userMessage", "agentMessage", "reasoning", "plan"]);
@@ -600,7 +604,7 @@
       encodeQuestionAnswer,
       activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash,
+      sessionTabFromHash, sessionTabFromLocation,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
     };
@@ -613,7 +617,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=3");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=4");
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   const limitsPanel = document.getElementById("codex-limits-panel");
@@ -1096,11 +1100,12 @@
       sessionTabs[next].click();
     });
   });
-  const activateSessionHash = () => activateSessionTab(sessionTabFromHash(
-    location.hash, sessionTabs.map((tab) => tab.dataset.sessionTab), defaultSessionTab,
+  const activateSessionHash = () => activateSessionTab(sessionTabFromLocation(
+    location, sessionTabs.map((tab) => tab.dataset.sessionTab), defaultSessionTab,
   ));
   activateSessionHash();
   addEventListener("hashchange", activateSessionHash);
+  addEventListener("popstate", activateSessionHash);
 
   if (!slug) return;
   const conversation = slug ? conversationAssets.createConversationClient({
@@ -1377,6 +1382,7 @@
     repositoryReviewLoading = import("/static/repository-review.js").then((module) => {
       repositoryReview = module.mount({
         slug, element, nonce: document.querySelector('meta[name="style-nonce"]')?.content || "",
+        createCopyButton: conversationAssets.createCopyButton,
       });
     }).catch((error) => {
       const notice = document.createElement("p");

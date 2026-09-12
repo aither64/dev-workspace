@@ -17,7 +17,7 @@ const {
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
   activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
-  lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
+  lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
 
@@ -131,6 +131,15 @@ assert.equal(activityAge("2026-09-09T09:55:00Z", Date.parse("2026-09-09T10:00:00
 assert.equal(sessionTabFromHash("#repositories", ["codex", "repositories"], "codex"), "repositories");
 assert.equal(sessionTabFromHash("#nested-tab", ["codex", "repositories"], "codex"), "codex");
 assert.equal(sessionTabFromHash("#%E0%A4%A", ["codex"], "codex"), "codex");
+for (const [location, expected] of [
+  [{search: "?tab=repositories", hash: "#new-L42"}, "repositories"],
+  [{search: "?tab=repositories", hash: "#old-L1"}, "repositories"],
+  [{search: "?tab=repositories", hash: ""}, "repositories"],
+  [{search: "?tab=repositories", hash: "#codex"}, "codex"],
+  [{search: "", hash: "#repositories"}, "repositories"],
+  [{search: "?tab=unrecognized", hash: "#new-L42"}, "codex"],
+  [{search: "?tab=repositories", hash: "#%E0%A4%A"}, "repositories"],
+]) assert.equal(sessionTabFromLocation(location, ["codex", "repositories"], "codex"), expected);
 assert.equal(transcriptEntryKey({turnId: "turn-1", itemId: "item-1"}, 7), '["turn-1","item-1"]');
 const fallbackEntry = {turnId: "turn-1", kind: "error"};
 assert.equal(

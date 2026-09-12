@@ -147,7 +147,7 @@ Accepted steers stay above the composer with their text and a `Sent to Codex`
 status until the matching transcript message appears. They survive reloads
 in the same browser tab. Queued messages retain their separate delete control.
 
-Every message and activity entry has a copy button beside its timestamp in
+Every message and activity entry has a copy icon beside its timestamp in
 the bottom-right footer. Messages copy their original Markdown; commands copy
 the command and full available output. File changes include paths and patches.
 Collapsed entries copy all loaded content, and streaming entries copy the
