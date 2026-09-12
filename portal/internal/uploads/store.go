@@ -339,6 +339,18 @@ func (store *Store) AdoptInitial(ctx context.Context, digest, slug, thread, epoc
 			if entry.Kind != "initial" || hex.EncodeToString(hash[:]) != digest {
 				continue
 			}
+			// Forks retain the initial submission as a reference. Only the
+			// scope that owns its files can adopt the original creation draft.
+			ownsFiles := true
+			for _, id := range entry.Files {
+				if data.Files[id].Scope != entry.Scope {
+					ownsFiles = false
+					break
+				}
+			}
+			if !ownsFiles {
+				continue
+			}
 			scope := data.Scopes[entry.Scope]
 			if scope.Deleted || (!scope.Draft && (scope.Slug != slug || scope.Thread != thread || scope.Epoch != epoch)) {
 				return false, problem(409, "Initial attachment ownership changed")
@@ -809,6 +821,9 @@ func (backend *Backend) ObserveTranscript(ctx context.Context, transcript *codex
 			}
 			for key, sub := range data.Submissions {
 				if sub.Scope != backend.ScopeID || sub.Wire != entry.Text || (sub.Kind != "initial" && sub.Attempt != entry.ClientUserMessageID && sub.ItemID != entry.ItemID) {
+					continue
+				}
+				if sub.Kind == "initial" && sub.ItemID != "" && sub.ItemID != entry.ItemID {
 					continue
 				}
 				display := sub.Text

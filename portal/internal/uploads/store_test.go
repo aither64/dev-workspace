@@ -327,6 +327,84 @@ func TestInitialDraftExpiryAcceptanceAndDeletionEpoch(t *testing.T) {
 	}
 }
 
+func TestInitialAdoptionAfterForkAndRestart(t *testing.T) {
+	store, _ := fixture(t)
+	ctx := context.Background()
+	draft, err := store.NewDraft(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &Backend{Store: store, ScopeID: draft.ID}
+	file := create(t, backend, "initial.txt", []byte("input"))
+	wire, err := backend.Prepare(ctx, "initial", "creation", "", []string{file.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCreation(ctx, wire, "source", "source-thread", "epoch"); err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.SessionScope(ctx, "child", "child-thread", "epoch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []codex.TranscriptEntry{{Kind: "userMessage", ItemID: "initial", Text: wire}}
+	if err := store.Fork(ctx, "source-thread", child, entries); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(store.Directory, store.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BindCreation(ctx, wire, "source", "source-thread", "epoch"); err != nil {
+		t.Fatalf("fork reference prevented original adoption after restart: %v", err)
+	}
+	status(t, restarted.BindCreation(ctx, wire, "foreign", "foreign-thread", "epoch"), 409)
+	for _, scopeID := range []string{draft.ID, child.ID} {
+		view := &Backend{Store: restarted, ScopeID: scopeID}
+		transcript := codex.Transcript{Entries: append([]codex.TranscriptEntry{}, entries...)}
+		if err := view.ObserveTranscript(ctx, &transcript); err != nil {
+			t.Fatal(err)
+		}
+		if len(transcript.Entries[0].Attachments) != 1 || transcript.Entries[0].Attachments[0].ID != file.ID {
+			t.Fatal("original or inherited attachment was lost")
+		}
+	}
+}
+
+func TestInitialAttachmentDoesNotRebindToRepeatedText(t *testing.T) {
+	_, backend := fixture(t)
+	ctx := context.Background()
+	file := create(t, backend, "initial.txt", []byte("input"))
+	wire, err := backend.Prepare(ctx, "initial", "creation", "", []string{file.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := codex.TranscriptEntry{Kind: "userMessage", ItemID: "initial", Text: wire}
+	transcript := codex.Transcript{Entries: []codex.TranscriptEntry{initial}}
+	if err := backend.ObserveTranscript(ctx, &transcript); err != nil {
+		t.Fatal(err)
+	}
+	copy := codex.Transcript{Entries: []codex.TranscriptEntry{{Kind: "userMessage", ItemID: "copy", Text: wire}}}
+	if err := backend.ObserveTranscript(ctx, &copy); err != nil {
+		t.Fatal(err)
+	}
+	if len(copy.Entries[0].Attachments) != 0 {
+		t.Fatal("repeated text acquired the initial attachment association")
+	}
+	if _, err := backend.Prepare(ctx, "send", "followup", "", []string{file.ID}); err != nil {
+		t.Fatal(err)
+	}
+	transcript = codex.Transcript{Entries: []codex.TranscriptEntry{
+		initial, {Kind: "userMessage", ItemID: "followup-item", ClientUserMessageID: "followup", Text: wire},
+	}}
+	if err := backend.ObserveTranscript(ctx, &transcript); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Delete(ctx, file.ID, true); err != nil {
+		t.Fatalf("observed repeated input remained unresolved: %v", err)
+	}
+}
+
 func TestForkRecoversUnobservedSourceSubmission(t *testing.T) {
 	store, backend := fixture(t)
 	ctx := context.Background()
