@@ -21,6 +21,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
@@ -94,6 +95,8 @@ func run(args []string) error {
 		return routeWorkspaces(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
+	case "uploads":
+		return uploadCommand(args[1:])
 	case "validate":
 		return validateCommand(args[1:])
 	case "version":
@@ -240,6 +243,7 @@ func threadCommand(args []string) error {
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
+	userStateRoot := flags.String("user-state-root", "", "package-selected user state root")
 	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
 	cwd := flags.String("cwd", "", "thread working directory")
 	workspace := flags.String("workspace", "", "development workspace root")
@@ -362,6 +366,38 @@ func threadCommand(args []string) error {
 		if err != nil {
 			return err
 		}
+		if *userStateRoot != "" {
+			store, err := uploads.ForWorkspace(*workspace, *userStateRoot)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(filepath.Join(store.Directory, "catalog.json")); err == nil {
+				hasFiles, err := store.HasThread(ctx, *threadID)
+				if err != nil {
+					return err
+				}
+				if hasFiles {
+					epoch, err := session.CompletedRemovalHistory(*workspace, *sessionSlug, *userStateRoot)
+					if err != nil {
+						return err
+					}
+					target, err := store.SessionScope(ctx, *sessionSlug, id, epoch)
+					if err != nil {
+						return err
+					}
+					transcript, err := client.ReadThread(ctx, id)
+					if err != nil {
+						return err
+					}
+
+					if err := store.Fork(ctx, *threadID, target, transcript.Entries); err != nil {
+						return err
+					}
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{"threadId": id})
 	case "set-name":
 		if *threadID == "" || *name == "" {
@@ -425,4 +461,39 @@ func validateCommand(args []string) error {
 	}
 	fmt.Printf("validated %d portal manifest(s)\n", len(summaries))
 	return nil
+}
+
+// uploadCommand is used by the session deletion journal after thread retirement
+// and tracking preservation. Repetition completes interrupted file reclamation.
+func uploadCommand(args []string) error {
+	if len(args) == 0 || args[0] != "remove-session" {
+		return errors.New("usage: workspace-portal uploads remove-session")
+	}
+	flags := flag.NewFlagSet("uploads remove-session", flag.ContinueOnError)
+	workspace := flags.String("workspace", "", "workspace root")
+	state := flags.String("user-state-root", "", "user state root")
+	slug := flags.String("session-slug", "", "session slug")
+	thread := flags.String("thread-id", "", "retired thread identity")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !session.ValidSlug(*slug) || flags.NArg() != 0 {
+		return errors.New("session slug and retired thread identity are required")
+	}
+	store, err := uploads.ForWorkspace(*workspace, *state)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(store.Directory, "catalog.json")); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	epoch, err := session.CompletedRemovalHistory(*workspace, *slug, *state)
+	if err != nil {
+		return err
+	}
+	return store.RemoveSession(ctx, *slug, *thread, epoch)
 }

@@ -181,6 +181,50 @@ the command and full available output. File changes include paths and patches.
 Collapsed entries copy all loaded content, and streaming entries copy the
 content available when selected.
 
+## Prompt attachments
+
+Drag files into the prompt area or choose **Attach files**. File cards show
+transfer progress and let you retry or remove a file. Wait for all selected
+files to become ready before creating a session, sending, steering or queuing
+a prompt. A prompt can contain files without text. Codex receives their local
+paths, including for images.
+
+The limits are 1 GiB per file, 10 files and 2 GiB per prompt, 10 GiB per session,
+and 100 GiB per workspace. Uploads use 4 MiB chunks with SHA-256 checksums. The
+browser transfers two files at once; the server admits eight concurrent chunks.
+Reservations account for unfinished transfers and retain 1 GiB of free disk
+space. Metadata is limited to 16 MiB and 10,000 records per catalog category, with
+1 MiB reserved for recovery updates. Expired empty drafts and obsolete records
+are reclaimed. Sent history remains until its session and fork references are
+deleted.
+
+A reload keeps selected files. To resume an unfinished upload, choose the same
+file; the browser verifies its uploaded prefix before continuing. Unsubmitted
+files expire after seven days without upload activity. Accepted initial prompts,
+queued inputs and submissions with an unknown outcome retain their files.
+
+Files are stored under the selected user state root at
+`portal/<workspace-id>/uploads/`, outside the workspace and its Git worktrees.
+Completed files are read-only. The transcript and queue show their names and
+download links. Sent files can be deleted after confirmation while every
+referencing session is idle and has no queued or unresolved input. Deletion
+cannot erase content Codex has already read. Browser mutations are serialized
+with deletion; a separately attached native client must remain idle during it.
+
+Archive and revive retain sent files. Forks share the original files and appear
+in deletion confirmations. Explicit session deletion removes the session's
+owned files, including those referenced by forks; those references then show
+**File removed**. Cleanup is retryable through the existing deletion journal.
+
+Upload metadata uses a separate private catalog. Earlier package generations
+ignore it and retain the files; path references remain ordinary prompt text.
+Restore a package with upload support to resume transfers or manage attachments.
+Finish pending queue deletions before rolling back: an older package may clear
+its deletion receipt without updating attachment metadata. In that case the
+file remains retained after rolling forward, until its owning session is deleted.
+On upgrade, cleanup reconciles completed deletion records before expiring drafts.
+No session manifest, lifecycle journal or Codex receipt migration is required.
+
 ## Working and waiting time
 
 The conversation shows root-thread working time and completed waiting time.

@@ -1589,6 +1589,7 @@ module DevSession
             commit_removed_tracking!(slug, removal)
             advance_removal!(slug, removal, 'tracking_committed')
           end
+          remove_session_uploads!(slug, removal)
           finalize_removal!(slug, removal)
           @out.puts "deleted session: #{slug}"
           @out.puts "recovery: #{removal.fetch('recovery')}"
@@ -3143,7 +3144,7 @@ module DevSession
       }
     end
 
-    def load_portal_manifest(path, required:)
+    def load_portal_manifest(path, required:, expected_slug: nil)
       unless path_exists?(path)
         raise Error, "portal manifest not found: #{path}" if required
 
@@ -3163,7 +3164,7 @@ module DevSession
         permitted_symbols: [],
         aliases: false
       )
-      validate_portal_manifest!(manifest, File.basename(File.dirname(path)), path)
+      validate_portal_manifest!(manifest, expected_slug || File.basename(File.dirname(path)), path)
 
       manifest
     rescue Psych::Exception => e
@@ -3457,7 +3458,8 @@ module DevSession
       end
 
       environment = session_environment(slug)
-      command = [*@portal_command, 'thread', 'fork', '--thread-id', source_thread_id]
+      command = [*@portal_command, 'thread', 'fork', '--thread-id', source_thread_id,
+                 '--user-state-root', @workspace_state_root]
       THREAD_ENV_ARGUMENTS.each do |name, argument|
         command += [argument, environment.fetch(name)] if environment.key?(name)
       end
@@ -4829,6 +4831,21 @@ module DevSession
       unless status.success?
         raise Error, 'workspace master advanced; update the shared checkout and retry the session action'
       end
+    end
+
+    def remove_session_uploads!(slug, removal)
+      # Upload state belongs to workspace-portal. A CLI-only installation cannot
+      # create uploads; configured installations let the owner resolve its state.
+      return unless @portal_command && !@portal_command.empty?
+
+      tracking = File.join(removal.fetch('recovery'), removal.fetch('tracking'), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
+      thread_id = manifest&.dig('codex', 'thread_id').to_s
+      @command_runner.capture([
+        *@portal_command, 'uploads', 'remove-session', '--workspace', workspace,
+        '--user-state-root', @workspace_state_root, '--session-slug', slug,
+        '--thread-id', thread_id
+      ])
     end
 
     def finalize_removal!(slug, removal)

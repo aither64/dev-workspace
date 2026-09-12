@@ -5489,6 +5489,47 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_remove_retries_upload_cleanup_before_finalizing_the_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-upload-cleanup'
+      creator = runner_for(workspace)
+      creator.ensure_tracking_files(slug)
+      manifest = creator.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {'thread_id' => 'thread-inputs'}
+      creator.send(:write_portal_manifest, slug, manifest)
+      log = File.join(workspace, 'upload-cleanup.log')
+      marker = File.join(workspace, 'upload-cleanup-retry')
+      portal = File.join(workspace, 'portal')
+      File.write(portal, <<~SH)
+        #!/bin/sh
+        if [ "$1" = uploads ]; then
+          printf '%s\n' "$*" >> #{Shellwords.escape(log)}
+          if [ ! -e #{Shellwords.escape(marker)} ]; then
+            touch #{Shellwords.escape(marker)}
+            exit 19
+          fi
+        fi
+      SH
+      File.chmod(0o755, portal)
+      runner = DevSession::Runner.new(
+        workspace:, tmux: NullTmux.new, portal_command: [portal],
+        codex_socket: '/run/test/codex.sock', out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')}
+      )
+      assert_raises(DevSession::CommandError) { runner.delete(slug, as_is: true, force: true) }
+      journal_path = runner.send(:lifecycle_journal_file, slug, 'delete')
+      assert_equal('tracking_committed', JSON.parse(File.read(journal_path)).fetch('phase'))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      runner.delete(slug, as_is: true, force: true)
+      refute(File.exist?(journal_path))
+      calls = File.readlines(log, chomp: true)
+      assert_equal(2, calls.length)
+      assert_equal(calls.first, calls.last)
+      assert_includes(calls.first, "--thread-id thread-inputs")
+      assert_includes(calls.first, "--session-slug #{slug}")
+    end
+  end
+
   def test_remove_retains_recovery_without_touching_worktrees_when_thread_retirement_fails
     skip 'git is not available' unless command_available?('git')
 
@@ -5553,6 +5594,7 @@ class DevSessionTest < Minitest::Test
       worktree = File.join(workspace, 'worktrees', slug, 'sample')
       portal = File.join(workspace, 'portal.rb')
       File.write(portal, <<~RUBY)
+        exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         File.write(File.join(#{worktree.dump}, 'from-active-turn'), "changed\n")
         system(
           {'GIT_AUTHOR_NAME' => 'Test', 'GIT_AUTHOR_EMAIL' => 'test@example.invalid',
@@ -5778,6 +5820,7 @@ class DevSessionTest < Minitest::Test
       portal = File.join(workspace, 'portal.rb')
       File.write(goal, "Create the session.\n")
       File.write(portal, <<~RUBY)
+        exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         case ARGV[1]
         when 'create'
           warn 'simulated loss after App Server committed thread/start'
@@ -5825,6 +5868,7 @@ class DevSessionTest < Minitest::Test
       calls = File.join(workspace, 'retire-calls')
       portal = File.join(workspace, 'portal.rb')
       File.write(portal, <<~RUBY)
+        exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         File.open(#{calls.dump}, 'a') { |file| file.puts ARGV.join(' ') }
         unless ARGV.include?('--force')
           warn 'Codex thread still has an active turn'
@@ -6023,6 +6067,7 @@ class DevSessionTest < Minitest::Test
       calls = File.join(workspace, 'retire-calls')
       portal = File.join(workspace, 'portal')
       File.write(portal, <<~RUBY)
+        exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         File.open(#{calls.dump}, 'a') { |file| file.puts ARGV.join(' ') }
         abort 'retirement lost its thread identity' unless ARGV.include?('--thread-id')
       RUBY

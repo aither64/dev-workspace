@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"net"
 	"os"
 	"path/filepath"
@@ -158,5 +162,53 @@ func TestPortalUnixSocketRefusesANonSocketPath(t *testing.T) {
 func TestPortalRequiresAUnixSocket(t *testing.T) {
 	if _, err := portalListener(""); err == nil || !strings.Contains(err.Error(), "required") {
 		t.Fatalf("missing socket result = %v", err)
+	}
+}
+
+func TestUploadRemovalUsesOwnerCatalogAndRequiresThreadEvidence(t *testing.T) {
+	root := t.TempDir()
+	workspace, stateRoot := filepath.Join(root, "workspace"), filepath.Join(root, "state")
+	args := []string{"remove-session", "--workspace", workspace, "--user-state-root", stateRoot, "--session-slug", "example"}
+	if err := uploadCommand(args); err != nil {
+		t.Fatal("missing catalog was not a no-op", err)
+	}
+	if _, err := os.Stat(stateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("missing catalog created state", err)
+	}
+	ctx := context.Background()
+	store, err := uploads.ForWorkspace(workspace, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.MinFreeBytes = 0
+	epoch, err := session.CompletedRemovalHistory(workspace, "example", stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := store.SessionScope(ctx, "example", "thread", epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &uploads.Backend{Store: store, ScopeID: scope.ID}
+	file, err := backend.Create(ctx, conversation.UploadRequest{ClientID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Name: "input", Size: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Complete(ctx, file.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadCommand(args); err == nil {
+		t.Fatal("missing retired thread was accepted")
+	}
+	content, err := backend.Open(ctx, file.ID)
+	if err != nil {
+		t.Fatal("failed cleanup changed file", err)
+	}
+	content.File.Close()
+	if err := uploadCommand(append(args, "--thread-id", "thread")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Open(ctx, file.ID); err == nil {
+		t.Fatal("owner CLI retained deleted bytes")
 	}
 }
