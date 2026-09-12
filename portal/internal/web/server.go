@@ -1244,7 +1244,7 @@ func legacyConversationPath(parts []string, method string) string {
 	if len(parts) == 2 {
 		allowed := map[string]map[string]bool{
 			http.MethodGet: {
-				"events": true, "pending": true, "queue": true, "thread": true,
+				"activity": true, "events": true, "pending": true, "queue": true, "thread": true,
 			},
 			http.MethodPost: {
 				"interrupt": true, "message": true, "message-ack": true,

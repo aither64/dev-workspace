@@ -77,6 +77,7 @@ func TestLegacyConversationPathsRemainAvailableDuringRollbackWindow(t *testing.T
 		path   string
 	}{
 		{http.MethodGet, []string{"example", "thread"}, "/codex/conversations/example/thread"},
+		{http.MethodGet, []string{"example", "activity"}, "/codex/conversations/example/activity"},
 		{http.MethodGet, []string{"example", "events"}, "/codex/conversations/example/events"},
 		{http.MethodGet, []string{"example", "pending"}, "/codex/conversations/example/pending"},
 		{http.MethodGet, []string{"example", "queue"}, "/codex/conversations/example/queue"},
