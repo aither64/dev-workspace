@@ -15,6 +15,7 @@
     pending: conversation?.pending,
     modes: () => request("/api/collaboration-modes"),
     queue: conversation?.queue,
+    reconcileQueue: conversation?.reconcileQueue,
     message: conversation?.message,
     acknowledgeMessages: conversation?.acknowledgeMessages,
     queueMessage: conversation?.queueMessage,

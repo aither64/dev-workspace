@@ -648,6 +648,7 @@ if (!unitOnly) {
   assert.equal(queue[0].id, "queued-1");
   assert.equal(queue[0].text, "queued item");
 
+  await automaticClient.reconcileQueue();
   await automaticClient.settings("model-1", "");
   await automaticClient.acknowledgeMessages([{
     clientUserMessageId: "00000000-0000-4000-8000-000000000004",
@@ -662,6 +663,10 @@ if (!unitOnly) {
   await automaticClient.dismissOperation("receipt-1");
   await automaticClient.artifactPreview("notes/example.md");
   assert.deepEqual(automaticRequests, [
+    {
+      path: "/api/sessions/example/queue/reconcile",
+      body: {},
+    },
     {
       path: "/api/sessions/example/settings",
       body: {model: "model-1", reasoningEffort: ""},
