@@ -1,5 +1,5 @@
-github.com/aither64/codex-web v0.0.0-20260912165458-de83e9c72dec h1:hmUfgG9F3JO+HfSbWg+M3Vhlbwgc6qAloFAZpbemZR0=
-github.com/aither64/codex-web v0.0.0-20260912165458-de83e9c72dec/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20260912213718-39abf28707ac h1:+RS0itcraXzoG53GJCt+ioFGjdtsmMCSRvOLVmUiJrk=
+github.com/aither64/codex-web v0.0.0-20260912213718-39abf28707ac/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

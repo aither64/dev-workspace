@@ -57,6 +57,7 @@ const server = http.createServer((req, res) => {
     "import {createCopyButton} from '/conversation.js';window.cardMarkup=" + JSON.stringify(cards) +
     ";window.review=mount({slug:'example',nonce:'teststyle123',createCopyButton,element:document.getElementById('repositories')});");
   if (url.pathname === "/harness.css") return send("text/css", "html,body{height:100%;margin:0}#repositories{height:100%;}");
+  if (url.pathname === "/uploads.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/uploads.js")));
   if (url.pathname === "/conversation.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/conversation.js")));
   if (url.pathname === "/copy.css") return send("text/css", fs.readFileSync(path.join(provider, "conversation/assets/conversation.css")));
   if (url.pathname.startsWith("/static/")) {

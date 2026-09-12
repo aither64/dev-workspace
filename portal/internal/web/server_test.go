@@ -2411,6 +2411,16 @@ func (client *browserContractCodex) DeleteQueueEntry(_ context.Context, threadID
 	return nil
 }
 
+func (client *browserContractCodex) DeleteQueueEntryWithCompletion(ctx context.Context, threadID, id string, complete func() error) error {
+	if err := client.DeleteQueueEntry(ctx, threadID, id); err != nil {
+		return err
+	}
+	return complete()
+}
+func (client *browserContractCodex) ReconcileQueueDeletionsWithCompletion(context.Context, string, func(string) error) error {
+	return nil
+}
+
 func (client *browserContractCodex) StartQueue(_ context.Context, threadID, queuedSubmissionID string) error {
 	if threadID != "thread-1" {
 		return errors.New("unexpected queue thread")
@@ -3775,6 +3785,18 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
+	uploadsResponse, err := http.Get(httpServer.URL + "/codex/assets/uploads.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAsset, err := io.ReadAll(uploadsResponse.Body)
+	uploadsResponse.Body.Close()
+	if err != nil || uploadsResponse.StatusCode != http.StatusOK {
+		t.Fatal("upload browser asset unavailable", err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(modulePath), "uploads.js"), uploadAsset, 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(modulePath, asset, 0o600); err != nil {
 		t.Fatal(err)
 	}
