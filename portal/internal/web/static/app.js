@@ -1528,7 +1528,7 @@
   let refreshDirty = false;
   let transcriptInitialized = false;
   let transcriptSignature = "";
-  let transcriptFilter = "all";
+  let transcriptFilter = "messages";
   let transcriptEntries = [];
   const transcriptViews = new Map(["all", "messages", "activity"].map((filter) => [filter, {
     disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
