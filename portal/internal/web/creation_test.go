@@ -125,14 +125,22 @@ func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing
 	release := make(chan struct{})
 	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}, entered: entered, release: release}
 	defer close(release)
-	started := time.Now()
-	response := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&goal=Initial+request", "application/x-www-form-urlencoded")
-	if response.Code != http.StatusSeeOther || time.Since(started) > 500*time.Millisecond {
-		t.Fatalf("slow acceptance: %d %s", response.Code, response.Body.String())
+	accepted := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		accepted <- postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&goal=Initial+request", "application/x-www-form-urlencoded")
+	}()
+	// Validation stays blocked until cleanup, so the response proves it is asynchronous.
+	select {
+	case response := <-accepted:
+		if response.Code != http.StatusSeeOther {
+			t.Fatalf("acceptance: %d %s", response.Code, response.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("creation acceptance did not return while validation was blocked")
 	}
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("worker never reached slow validation")
 	}
 	slug := "2026-09-12-latency"
