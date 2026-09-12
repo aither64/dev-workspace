@@ -568,7 +568,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=2");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=3");
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   const limitsPanel = document.getElementById("codex-limits-panel");
@@ -1864,12 +1864,17 @@
     const html = entry.html || "";
     const entryKey = transcriptEntryKey(entry, index, entries);
     const element = document.createElement("div");
+    const activityElement = conversationAssets.createTranscriptActivity(entry);
     element.className = `message ${kind}`;
     element.dataset.transcriptEntryKey = entryKey;
     if (entry.kind === "error") {
       appendError(element, entry, entryKey, disclosureStates);
     } else if (entry.kind === "fileChange") {
       appendFileChanges(element, entry, entryKey, disclosureStates);
+    } else if (activityElement) {
+      const disclosure = activityElement.matches("details") ? activityElement : activityElement.querySelector("details");
+      if (disclosure) disclosure.open = disclosureStates.get(entryKey) === true;
+      element.append(activityElement);
     } else if (details) {
       const disclosure = document.createElement("details");
       disclosure.open = disclosureStates.get(entryKey) === true;

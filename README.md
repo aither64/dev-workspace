@@ -139,6 +139,10 @@ Nix builds the bundle and includes dependency versions and license notices.
 
 ## Transcript controls
 
+Messages is the initial view. Activity and All remain available. Web searches
+show queries and source links; subagent interactions show their action, status,
+and expandable results.
+
 Every message and activity entry has a copy button beside its timestamp in
 the bottom-right footer. Messages copy their original Markdown; commands copy
 the command and full available output. File changes include paths and patches.
