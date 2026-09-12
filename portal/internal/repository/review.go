@@ -50,6 +50,7 @@ type ReviewCommit struct {
 	SHA     string   `json:"sha"`
 	Subject string   `json:"subject"`
 	Body    string   `json:"body,omitempty"`
+	Message string   `json:"message"`
 	Author  string   `json:"author"`
 	Date    string   `json:"date"`
 	URL     string   `json:"url,omitempty"`
@@ -69,7 +70,29 @@ type ReviewFile struct {
 	NewMode   string `json:"newMode"`
 	OldObject string `json:"-"`
 	NewObject string `json:"-"`
+	Additions *int64 `json:"additions"`
+	Deletions *int64 `json:"deletions"`
 }
+type ReviewStats struct {
+	Files       int   `json:"files"`
+	Additions   int64 `json:"additions"`
+	Deletions   int64 `json:"deletions"`
+	BinaryFiles int   `json:"binaryFiles"`
+}
+
+func FileStats(files []ReviewFile) ReviewStats {
+	stats := ReviewStats{Files: len(files)}
+	for _, file := range files {
+		if file.Additions == nil || file.Deletions == nil {
+			stats.BinaryFiles++
+		} else {
+			stats.Additions += *file.Additions
+			stats.Deletions += *file.Deletions
+		}
+	}
+	return stats
+}
+
 type ReviewBlob struct {
 	Text           string `json:"text"`
 	Bytes          int64  `json:"bytes"`
@@ -263,27 +286,16 @@ func (r ReviewReader) History(ctx context.Context, repo ReviewRepository, pair R
 	if page < 0 || page > 2000 {
 		return result, errors.New("invalid history page")
 	}
-	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "log", "-z", "--no-show-signature", "--format=%H%x00%P%x00%an%x00%aI%x00%s%x00%b", "--max-count=51", "--skip="+strconv.Itoa(page*ReviewPageSize), pair.Base+".."+pair.Head, "--")
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "log", "-z", "--no-show-signature", "--format="+reviewCommitFormat, "--max-count=51", "--skip="+strconv.Itoa(page*ReviewPageSize), pair.Base+".."+pair.Head, "--")
 	if err != nil {
 		return result, err
 	}
 	if len(out) == 0 {
 		return result, nil
 	}
-	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
-	if len(fields)%6 != 0 {
-		return result, errors.New("unexpected Git history format")
-	}
-	for i := 0; i < len(fields); i += 6 {
-		sha := string(fields[i])
-		if !gitObjectPattern.MatchString(sha) {
-			return result, errors.New("invalid history commit")
-		}
-		c := ReviewCommit{ID: ReviewID(sha), SHA: sha, Parents: strings.Fields(string(fields[i+1])), Author: string(fields[i+2]), Date: string(fields[i+3]), Subject: string(fields[i+4]), Body: strings.TrimSpace(string(fields[i+5]))}
-		if validReviewGitHub(repo.GitHub) {
-			c.URL = "https://github.com/" + repo.GitHub + "/commit/" + sha
-		}
-		result.Commits = append(result.Commits, c)
+	result.Commits, err = parseReviewCommits(out, repo.GitHub)
+	if err != nil {
+		return result, err
 	}
 	if len(result.Commits) > ReviewPageSize {
 		result.HasMore = true
@@ -291,6 +303,29 @@ func (r ReviewReader) History(ctx context.Context, repo ReviewRepository, pair R
 	}
 	return result, nil
 }
+
+const reviewCommitFormat = "%H%x00%P%x00%an%x00%aI%x00%s%x00%b%x00%B"
+
+func parseReviewCommits(out []byte, github string) ([]ReviewCommit, error) {
+	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
+	if len(fields)%7 != 0 {
+		return nil, errors.New("unexpected Git history format")
+	}
+	result := make([]ReviewCommit, 0, len(fields)/7)
+	for i := 0; i < len(fields); i += 7 {
+		sha := string(fields[i])
+		if !gitObjectPattern.MatchString(sha) {
+			return nil, errors.New("invalid history commit")
+		}
+		c := ReviewCommit{ID: ReviewID(sha), SHA: sha, Parents: strings.Fields(string(fields[i+1])), Author: string(fields[i+2]), Date: string(fields[i+3]), Subject: string(fields[i+4]), Body: strings.TrimSpace(string(fields[i+5])), Message: string(fields[i+6])}
+		if validReviewGitHub(github) {
+			c.URL = "https://github.com/" + github + "/commit/" + sha
+		}
+		result = append(result, c)
+	}
+	return result, nil
+}
+
 func validReviewGitHub(value string) bool {
 	owner, name, ok := strings.Cut(value, "/")
 	return ok && githubPartPattern.MatchString(owner) && githubPartPattern.MatchString(name)
@@ -317,13 +352,18 @@ func (r ReviewReader) CommitPair(ctx context.Context, repo ReviewRepository, com
 func (r ReviewReader) Files(ctx context.Context, repo ReviewRepository, pair ReviewPair) ([]ReviewFile, error) {
 	// Keep rename detection complete for a successful comparison. The Git
 	// deadline bounds expensive comparisons instead of silently losing renames.
-	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--find-renames=50%", "-l0", pair.Base, pair.Head, "--")
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "--numstat", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--find-renames=50%", "-l0", pair.Base, pair.Head, "--")
 	if err != nil {
 		return nil, err
 	}
+	return parseReviewFiles(out)
+}
+
+func parseReviewFiles(out []byte) ([]ReviewFile, error) {
 	fields := bytes.Split(out, []byte{0})
 	result := []ReviewFile{}
-	for i := 0; i < len(fields) && len(fields[i]) > 0; {
+	i := 0
+	for i < len(fields) && bytes.HasPrefix(fields[i], []byte{':'}) {
 		header := strings.Fields(string(fields[i]))
 		i++
 		if len(header) != 5 || !strings.HasPrefix(header[0], ":") || i >= len(fields) {
@@ -347,6 +387,46 @@ func (r ReviewReader) Files(ctx context.Context, repo ReviewRepository, pair Rev
 		if len(result) > maxReviewFiles {
 			return nil, ErrReviewLimit
 		}
+	}
+	byPath := make(map[string]int, len(result))
+	for index, file := range result {
+		byPath[file.OldPath+"\x00"+file.Path] = index
+	}
+	seen := make(map[int]bool, len(result))
+	for i < len(fields) && len(fields[i]) > 0 {
+		stat := bytes.SplitN(fields[i], []byte{'\t'}, 3)
+		i++
+		if len(stat) != 3 {
+			return nil, errors.New("unexpected Git line statistics")
+		}
+		oldPath, path := "", string(stat[2])
+		if path == "" {
+			if i+1 >= len(fields) {
+				return nil, errors.New("incomplete Git rename statistics")
+			}
+			oldPath, path = string(fields[i]), string(fields[i+1])
+			i += 2
+		}
+		index, ok := byPath[oldPath+"\x00"+path]
+		if !ok || seen[index] {
+			return nil, errors.New("Git line statistics do not match changed files")
+		}
+		seen[index] = true
+		if string(stat[0]) == "-" && string(stat[1]) == "-" {
+			continue
+		}
+		added, err := strconv.ParseInt(string(stat[0]), 10, 64)
+		if err != nil || added < 0 {
+			return nil, errors.New("invalid Git addition count")
+		}
+		removed, err := strconv.ParseInt(string(stat[1]), 10, 64)
+		if err != nil || removed < 0 {
+			return nil, errors.New("invalid Git deletion count")
+		}
+		result[index].Additions, result[index].Deletions = &added, &removed
+	}
+	if len(seen) != len(result) || i != len(fields)-1 || len(fields[i]) != 0 {
+		return nil, errors.New("incomplete Git line statistics")
 	}
 	return result, nil
 }
@@ -395,11 +475,16 @@ func (r ReviewReader) blob(ctx context.Context, dir, object, mode string) (Revie
 		b.Binary = true
 		return b, nil
 	}
-	if bytes.Count(out, []byte{'\n'}) > MaxReviewLines {
+	missingNewline := len(out) > 0 && out[len(out)-1] != '\n'
+	lines := bytes.Count(out, []byte{'\n'})
+	if missingNewline {
+		lines++
+	}
+	if lines > MaxReviewLines {
 		b.Limited = true
 		return b, nil
 	}
 	b.Text = string(out)
-	b.MissingNewline = len(out) > 0 && out[len(out)-1] != '\n'
+	b.MissingNewline = missingNewline
 	return b, nil
 }

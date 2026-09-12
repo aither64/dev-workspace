@@ -111,6 +111,9 @@ func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 	renamed := "renamed\twith\nnewlines"
 	runGit(t, "-C", f.worktree, "mv", "README", renamed)
 	files := map[string][]byte{"binary": {0, 1, 2}, "huge": []byte(strings.Repeat("x", MaxReviewBlobBytes+1)), "many-lines": []byte(strings.Repeat("\n", MaxReviewLines+1)), "no-newline": []byte("final line"), "invalid-utf8": {0xff}}
+	files["line-limit-final"] = []byte(strings.Repeat("x\n", MaxReviewLines))
+	files["line-limit-no-final"] = []byte(strings.Repeat("x\n", MaxReviewLines-1) + "x")
+	files["over-limit-no-final"] = []byte(strings.Repeat("x\n", MaxReviewLines) + "x")
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(f.worktree, name), content, 0644); err != nil {
 			t.Fatal(err)
@@ -146,6 +149,14 @@ func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 	}
 	if found[renamed].After.Text != "base\n" || !found["binary"].After.Binary || !found["invalid-utf8"].After.Binary || !found["huge"].After.Limited || !found["many-lines"].After.Limited || !found["no-newline"].After.MissingNewline || found["link"].After.Text != "../a-file-never-read" || found["link"].After.Kind != "symlink" || found["module"].After.Kind != "submodule" {
 		t.Fatalf("unexpected metadata: %#v", found)
+	}
+	for _, name := range []string{"line-limit-final", "line-limit-no-final"} {
+		if found[name].After.Limited || found[name].After.Text != string(files[name]) {
+			t.Fatalf("exact line limit was rejected for %s", name)
+		}
+	}
+	if !found["over-limit-no-final"].After.Limited {
+		t.Fatal("unterminated final line bypassed the logical line limit")
 	}
 	history, err := reader.History(context.Background(), repo, pair, 0)
 	if err != nil || history.Commits[0].Body != "Detailed commit body." {
