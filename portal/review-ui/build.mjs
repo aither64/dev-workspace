@@ -3,9 +3,11 @@ import {readFile, readdir, mkdir, writeFile} from "node:fs/promises";
 import path from "node:path";
 
 await mkdir("dist", {recursive: true});
-await build({entryPoints: ["editor.js"], outfile: "dist/review-editor.js", bundle: true, format: "esm", target: "es2022", minify: true, legalComments: "external", charset: "utf8"});
+const bundled = await build({metafile: true, entryPoints: {"review-editor": "editor.js", "review-highlight-worker": "highlight-worker.js"}, outdir: "dist", bundle: true, format: "esm", target: "es2022", minify: true, legalComments: "external", charset: "utf8"});
+await writeFile("dist/review-build.json", `${JSON.stringify(bundled.metafile)}\n`);
 const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
 const notices = ["Third-party dependencies for workspace repository review.\nThe exact dependency graph and integrity hashes are in package-lock.json."];
+notices.push(await readFile("syntax.NOTICE", "utf8"));
 const manifest = [];
 const esbuildLicense = await readFile("node_modules/esbuild/LICENSE.md", "utf8");
 for (const [location, entry] of Object.entries(lock.packages).sort(([a], [b]) => a.localeCompare(b, "en"))) {

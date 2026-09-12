@@ -169,7 +169,7 @@ buildGoModule {
   '';
 
   preBuild = ''
-    cp ${reviewAssets}/review-editor.* internal/web/static/
+    cp ${reviewAssets}/review-* internal/web/static/
   '';
 
   subPackages = [ "cmd/workspace-portal" ];
