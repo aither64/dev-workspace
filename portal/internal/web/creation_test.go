@@ -411,7 +411,8 @@ func TestCreationWorkerPersistsSuccessAndPlanRetryUsesTheCapturedGoal(t *testing
 	server := newTestServer(t)
 	defer server.Close()
 	prepareInteractiveConversation(t, server, "source")
-	plan := "Accepted plan"
+	plan := "# Accepted plan\n\n1. Preserve indentation.\n   Continue exactly.\n"
+	wantGoal := "Implement the following approved plan from session source.\n\n# Accepted plan\n\n1. Preserve indentation.\n   Continue exactly."
 	controller := &browserContractCodex{transcript: codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan", Model: "model-1", ReasoningEffort: "high",
 		Entries: []codex.TranscriptEntry{{Kind: "plan", TurnID: "approved", TurnStatus: "completed", Text: plan}}}}
 	server.config.Codex = controller
@@ -446,6 +447,9 @@ printf '{"slug":"2026-09-12-plan-retry"}\n'
 	if !failed.Validated || !strings.Contains(failed.Error, "temporary initialization failure") {
 		t.Fatalf("first failure: %#v", failed)
 	}
+	if failed.Goal != wantGoal || failed.Request.PlanText != plan || failed.Request.PlanSHA256 != planDigest(plan) || failed.Request.PlanTurnID != "approved" {
+		t.Fatalf("plan snapshot or normalized goal changed: %#v", failed)
+	}
 	controller.transcript.Entries = []codex.TranscriptEntry{{Kind: "plan", TurnID: "new-plan", TurnStatus: "completed", Text: "A newer unaccepted plan"}}
 	retry := postCreation(t, server, "/api/sessions/2026-09-12-plan-retry/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, failed.ReceiptID), "application/json")
 	if retry.Code != http.StatusAccepted {
@@ -466,7 +470,7 @@ printf '{"slug":"2026-09-12-plan-retry"}\n'
 		t.Fatal(err)
 	}
 	ready := awaitCreation(t, server, "2026-09-12-plan-retry")
-	if ready.State != "ready" || ready.Attempt != 2 || ready.Goal != "Implement the following approved plan from session source.\n\n"+plan {
+	if ready.State != "ready" || ready.Attempt != 2 || ready.Goal != wantGoal || ready.Request != failed.Request {
 		t.Fatalf("retry changed goal or did not complete: %#v", ready)
 	}
 	var stored creationReceipt
@@ -475,6 +479,82 @@ printf '{"slug":"2026-09-12-plan-retry"}\n'
 	}
 	if stored.State != "ready" {
 		t.Fatal("success was not durable")
+	}
+}
+
+func TestCreationGoalNormalizationMatchesCLI(t *testing.T) {
+	inputs := []string{" \tfirst\n  second\r\n\v\f\x00", "\u00a0Plan\u3000\n", " \u3000Plan\u00a0 \n"}
+	want := []string{"first\n  second", "\u00a0Plan\u3000", "\u3000Plan\u00a0"}
+	directory := t.TempDir()
+	args := []string{"-e", `load ARGV.shift; runner = DevSession::Runner.allocate; print JSON.generate(ARGV.map { |path| runner.send(:read_goal, path) })`, "../../../libexec/dev-session"}
+	for index, input := range inputs {
+		path := filepath.Join(directory, fmt.Sprintf("goal-%d", index))
+		if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args = append(args, path)
+	}
+	output, err := exec.Command("ruby", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read goals through the CLI: %v, %s", err, output)
+	}
+	var actual []string
+	if err := json.Unmarshal(output, &actual); err != nil || len(actual) != len(inputs) {
+		t.Fatalf("decode CLI goals: %v, %s", err, output)
+	}
+	for index, input := range inputs {
+		if actual[index] != want[index] || normalizedCreationGoal(input) != actual[index] {
+			t.Fatalf("goal %d differs from CLI strip semantics: Ruby %q, Go %q, expected %q", index, actual[index], normalizedCreationGoal(input), want[index])
+		}
+	}
+}
+
+func TestCreationReconcilesDeployedUntrimmedPlanReceipt(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	plan := "# Approved\n\n1. Keep this content.\n   Keep this indentation.\u00a0\u3000\n"
+	rawGoal := "Implement the following approved plan from session source.\n\n" + plan
+	receipt := creationReceipt{Schema: 1, Workspace: server.config.Workspace, DeletionHistorySHA256: planDigest(""),
+		Request:   creationRequest{Kind: "plan", Slug: "deployed-plan", Source: "source", SourceThreadID: "source-thread", SourceIdentity: "source-identity", PlanText: plan, PlanSHA256: planDigest(plan), PlanTurnID: "approved"},
+		ReceiptID: strings.Repeat("a", 64), Attempt: 2, State: "failed", Error: "creation completion goal changed", Validated: true, Goal: rawGoal, Model: "model-1", Effort: "high"}
+	if err := server.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	// Model the deployed CLI's canonical binding, manifest and evidence while
+	// retaining the older portal receipt's exact frozen goal and plan snapshot.
+	canonical := receipt
+	canonical.Goal = strings.TrimSuffix(rawGoal, "\n")
+	writeCreationProof(t, server, canonical)
+	if bound, err := server.readCreationBinding(receipt); !bound || err != nil {
+		t.Fatalf("canonical CLI binding was rejected: %v, %v", bound, err)
+	}
+	if err := os.Remove(server.creationEvidencePath(receipt)); err != nil {
+		t.Fatal(err)
+	}
+	if message := server.canonicalCreationConflict(receipt); message != "" {
+		t.Fatalf("matching canonical goal was classified as foreign: %s", message)
+	}
+	writeCreationProof(t, server, canonical)
+	changed := receipt
+	changed.Goal = strings.Replace(rawGoal, "Keep this content", "Different content", 1)
+	if err := server.proveCreation(changed); err == nil {
+		t.Fatal("normalization accepted different plan content")
+	}
+	if err := server.loadCreations(); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = filepath.Join(t.TempDir(), "must-not-run")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/deployed-plan/creation", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("read reconciled receipt: %d, %s", response.Code, response.Body.String())
+	}
+	var stored creationReceipt
+	if err := readCreationJSON(server.creationPath(receipt.Request.Slug), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != "ready" || stored.Attempt != receipt.Attempt || stored.ReceiptID != receipt.ReceiptID || stored.Goal != rawGoal || stored.Request != receipt.Request {
+		t.Fatalf("reconciliation changed accepted identity or reran creation: %#v", stored)
 	}
 }
 

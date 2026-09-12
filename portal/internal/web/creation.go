@@ -19,6 +19,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Match dev-session read_goal's Ruby String#strip boundary exactly. Captured
+// plan text keeps its original bytes; only the derived CLI goal is normalized.
+func normalizedCreationGoal(goal string) string {
+	return strings.Trim(goal, " \t\n\v\f\r\x00")
+}
+
+func creationGoalDigest(goal string) string {
+	// Deployed receipts may retain boundary whitespace already stripped by the
+	// CLI. Compare their canonical goal without rewriting the accepted snapshot.
+	return planDigest(normalizedCreationGoal(goal))
+}
+
 // Keep acceptance independent of App Server, tmux, Git and cluster discovery.
 func (s *Server) withCreationMutation(w http.ResponseWriter, r *http.Request, mutate func()) {
 	ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
@@ -196,7 +208,7 @@ func (s *Server) canonicalCreationConflict(receipt creationReceipt) string {
 		}
 		return ""
 	}
-	if summary.Creation.GoalSHA256 != planDigest(receipt.Goal) || summary.ForkedFrom != "" {
+	if summary.Creation.GoalSHA256 != creationGoalDigest(receipt.Goal) || summary.ForkedFrom != "" {
 		return creationConflictMessage
 	}
 	var journal map[string]any
@@ -349,7 +361,7 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 		proof.Model != receipt.Model || proof.Effort != receipt.Effort || !receipt.Validated {
 		return errors.New("creation completion evidence does not match the recorded request")
 	}
-	if receipt.Request.Kind != "fork" && proof.GoalSHA256 != planDigest(receipt.Goal) {
+	if receipt.Request.Kind != "fork" && proof.GoalSHA256 != creationGoalDigest(receipt.Goal) {
 		return errors.New("creation completion goal changed")
 	}
 	summary, err := session.Find(s.config.Workspace, receipt.Request.Slug)
@@ -492,7 +504,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 				if request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
 					return errors.New("source model settings changed; review the plan before implementing it")
 				}
-				receipt.Goal = "Implement the following approved plan from session " + request.Source + ".\n\n" + plan.Text
+				receipt.Goal = normalizedCreationGoal("Implement the following approved plan from session " + request.Source + ".\n\n" + plan.Text)
 				receipt.Model = transcript.Model
 				receipt.Effort = transcript.ReasoningEffort
 			} else {
@@ -681,7 +693,7 @@ func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 	} else if err != nil {
 		return false, err
 	}
-	kind, goalMatches := "start", binding.GoalSHA256 != nil && *binding.GoalSHA256 == planDigest(receipt.Goal)
+	kind, goalMatches := "start", binding.GoalSHA256 != nil && *binding.GoalSHA256 == creationGoalDigest(receipt.Goal)
 	if receipt.Request.Kind == "fork" {
 		kind, goalMatches = "fork", binding.GoalSHA256 == nil
 	}
