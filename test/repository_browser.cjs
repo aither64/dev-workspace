@@ -126,14 +126,14 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('.repository-file-list .repository-file-tree').first().locator(':scope > li').last().textContent().then(text => text.includes('replacement')), true);
     assert.equal(await page.locator('.repository-comparison-stats .repository-additions').evaluate(el => getComputedStyle(el).color), 'rgb(126, 231, 135)');
     assert.equal(await page.locator('.repository-file-counts .repository-deletions').first().evaluate(el => getComputedStyle(el).color), 'rgb(255, 161, 152)');
-    const originalURL = page.url();
-    await sourceFile.locator('..').getByRole('button', {name: 'Copy file path', exact: true}).click();
-    assert.equal(await page.evaluate(() => window.copiedText), 'src/file-0.nix');
-    assert.equal(page.url(), originalURL, 'tree copy navigated');
+    assert.equal(await page.locator('.repository-file-list .repository-file-counts, .repository-file-list .repository-additions, .repository-file-list .repository-deletions, .repository-file-list .codex-copy-button').count(), 0);
+    assert(await src.locator(':scope > summary .repository-folder-open').isVisible());
+    assert.equal(await src.locator(':scope > summary .repository-folder-icon').getAttribute('aria-hidden'), 'true');
     await page.locator('.repository-file-section[data-file-id="0"]').getByRole('button', {name: 'Copy file path', exact: true}).click();
     assert.equal(await page.evaluate(() => window.copiedText), 'src/file-0.nix');
     await src.locator(':scope > summary').click();
     assert.equal(await src.getAttribute('open'), null);
+    assert(await src.locator(':scope > summary .repository-folder-closed').isVisible());
     assert.equal(await sourceFile.isVisible(), false);
     assert(await page.locator('.repository-file-section[data-file-id="0"]').isVisible(), 'directory collapse hid diff');
     await page.getByRole('button', {name: 'Unified', exact: true}).click();

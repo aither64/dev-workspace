@@ -12,6 +12,21 @@ const button = (label, action, className = "quiet") => {
   result.addEventListener("click", action);
   return result;
 };
+const folderIcon = () => {
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.classList.add("repository-folder-icon");
+  icon.setAttribute("viewBox", "0 0 20 20");
+  icon.setAttribute("aria-hidden", "true"); icon.setAttribute("focusable", "false");
+  for (const [state, shape] of [
+    ["closed", "M2.5 5h5l2 2h8v10h-15Z"],
+    ["open", "M2.5 16V5h5l2 2h7v3M2.5 16l2-6h13l-2 6Z"],
+  ]) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.classList.add("repository-folder-" + state); path.setAttribute("d", shape);
+    icon.append(path);
+  }
+  return icon;
+};
 const short = sha => String(sha || "").slice(0, 10);
 const normalClick = event => event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
 const request = async (url, options = {}) => {
@@ -460,7 +475,6 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const lineNotice = node("p", "notice warning"); lineNotice.hidden = true;
       const body = node("div", "repository-review-body");
       const fileList = node("nav", "repository-file-list"); fileList.setAttribute("aria-label", "Changed files");
-      fileList.append(counts(node("p", "muted"), payload.stats, true));
       const scroll = node("section", "repository-file-scroll"); scroll.setAttribute("aria-label", "File comparisons");
       const sections = new Map();
       const tree = {directories: new Map(), files: []};
@@ -470,13 +484,11 @@ export function mount({slug, nonce, element, createCopyButton}) {
         nav.dataset.fileId = file.id;
         nav.title = file.oldPath ? file.oldPath + " → " + file.path : file.path;
         nav.setAttribute("aria-label", file.path + ", " + label);
-        const name = node("span", "repository-file-name");
         const path = file.path.split("/");
         const basename = path.pop();
-        name.append(node("span", "repository-file-path", basename), counts(node("span", "repository-file-counts"), file));
         const status = node("span", "repository-file-status status-" + kind, kind === "other" ? "?" : String(file.status)[0]);
         status.title = label; status.setAttribute("aria-label", label);
-        nav.append(status, name);
+        nav.append(status, node("span", "repository-file-path", basename));
         let directory = tree;
         for (const component of path) {
           if (!directory.directories.has(component)) directory.directories.set(component, {directories: new Map(), files: []});
@@ -512,14 +524,15 @@ export function mount({slug, nonce, element, createCopyButton}) {
           const item = node("li");
           const disclosure = node("details", "repository-directory"); disclosure.open = true;
           disclosure.dataset.directoryPath = prefix + name;
-          const summary = node("summary", "", name); summary.title = prefix + name;
+          const summary = node("summary"); summary.title = prefix + name;
+          summary.append(folderIcon(), node("span", "", name));
           disclosure.append(summary, renderTree(child, [...ancestors, disclosure], prefix + name + "/"));
           item.append(disclosure); list.append(item);
         }
         for (const {file} of directory.files.sort((a, b) => alphabetical(a.basename, b.basename))) {
           const record = sections.get(file.id); record.directories = ancestors;
           const item = node("li", "repository-file-row");
-          item.append(record.nav, copy(file.path, "Copy file path")); list.append(item);
+          item.append(record.nav); list.append(item);
         }
         return list;
       };

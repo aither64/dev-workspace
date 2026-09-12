@@ -124,8 +124,9 @@ and show their diff against the first parent. Parent navigation can continue
 before the feature branch's base; the feature commit list keeps its original range.
 
 The file tree scrolls to each file's diff. Directories start expanded and can be
-collapsed individually. Colored letters identify added, modified, deleted and
-other changed files. Copy icons beside filenames copy repository-relative paths.
+collapsed individually; folder icons show their open or closed state. Each file
+occupies one row with its name and a colored change-status letter. Copy icons in
+the diff headers copy repository-relative paths.
 Branch and commit comparisons show changed-file totals and line counts, with
 green additions and red deletions for each file. Binary changes have no line
 counts. Split view is the default; the portal remembers the selected layout.
