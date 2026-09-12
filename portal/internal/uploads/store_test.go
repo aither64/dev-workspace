@@ -488,3 +488,27 @@ func TestMetadataByteLimitRetainsRecoveryHeadroom(t *testing.T) {
 		t.Fatal("history capacity did not recover", err)
 	}
 }
+
+func TestStaleQueueObservationCannotUndoCancellation(t *testing.T) {
+	_, backend := fixture(t)
+	ctx := context.Background()
+	file := create(t, backend, "input", nil)
+	wire, err := backend.Prepare(ctx, "queue", "attempt", "", []string{file.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := []codex.QueueEntry{{ID: "queued", Text: wire, ClientUserMessageID: "attempt"}}
+	if err := backend.ObserveQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.QueueDeleted(ctx, "queued"); err != nil {
+		t.Fatal(err)
+	}
+	// A GET that read the old App Server queue can finish after cancellation.
+	if err := backend.ObserveQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Delete(ctx, file.ID, false); err != nil {
+		t.Fatal("stale observation pinned cancelled input", err)
+	}
+}

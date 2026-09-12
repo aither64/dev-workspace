@@ -846,7 +846,7 @@ func (backend *Backend) ObserveQueue(ctx context.Context, queue []codex.QueueEnt
 				for _, id := range sub.Files {
 					entry.Attachments = append(entry.Attachments, backend.Store.view(data, data.Files[id], backend.ScopeID, backend.BaseURL).Attachment)
 				}
-				if sub.State != "queued" || sub.QueueID != entry.ID {
+				if (sub.State == "pending" || sub.State == "queued") && (sub.State != "queued" || sub.QueueID != entry.ID) {
 					sub.State = "queued"
 					sub.QueueID = entry.ID
 					data.Submissions[key] = sub

@@ -2496,6 +2496,7 @@
   const refreshQueue = async () => {
     if (!interactive) return;
     try {
+      await client.reconcileQueue();
       renderQueue(await client.queue());
     } catch (error) {
       if (!queuePanel || !queueList) return;
