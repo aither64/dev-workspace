@@ -644,6 +644,7 @@ if (!unitOnly) {
   const modes = await client.modes();
   assert.deepEqual(modes.map((mode) => mode.mode), ["default", "plan"]);
 
+  await client.reconcileQueue();
   const queue = await client.queue();
   assert.equal(queue[0].id, "queued-1");
   assert.equal(queue[0].text, "queued item");

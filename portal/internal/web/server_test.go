@@ -86,6 +86,7 @@ func TestLegacyConversationPathsRemainAvailableDuringRollbackWindow(t *testing.T
 		{http.MethodPost, []string{"example", "queue"}, "/codex/conversations/example/queue"},
 		{http.MethodDelete, []string{"example", "queue", "queued-1"}, "/codex/conversations/example/queue/queued-1"},
 		{http.MethodPost, []string{"example", "queue", "start"}, "/codex/conversations/example/queue/start"},
+		{http.MethodPost, []string{"example", "queue", "reconcile"}, "/codex/conversations/example/queue/reconcile"},
 		{http.MethodPost, []string{"example", "settings"}, "/codex/conversations/example/settings"},
 		{http.MethodPost, []string{"example", "interrupt"}, "/codex/conversations/example/interrupt"},
 		{http.MethodPost, []string{"example", "respond"}, "/codex/conversations/example/respond"},

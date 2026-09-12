@@ -1290,7 +1290,7 @@ func legacyConversationPath(parts []string, method string) string {
 	}
 	if len(parts) == 3 && parts[1] == "queue" &&
 		(method == http.MethodDelete ||
-			(method == http.MethodPost && parts[2] == "start")) {
+			(method == http.MethodPost && (parts[2] == "start" || parts[2] == "reconcile"))) {
 		return "/codex/conversations/" + strings.Join(parts, "/")
 	}
 	return ""
