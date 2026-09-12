@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"io"
 	"os"
 	"path/filepath"
@@ -85,9 +86,7 @@ func completedRemovals(workspace, slug, configuredStateRoot, operationID string,
 	if err != nil {
 		return nil, fmt.Errorf("resolve removal recovery state root: %w", err)
 	}
-	digest := sha256.Sum256([]byte(workspace))
-	workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(digest[:8])
-	root := filepath.Join(absoluteStateRoot, "removed", workspaceID)
+	root := userstate.WorkspaceDirectory(absoluteStateRoot, "removed", workspace)
 	rootInfo, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil

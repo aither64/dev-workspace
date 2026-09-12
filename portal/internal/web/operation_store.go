@@ -1,11 +1,10 @@
 package web
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"io"
 	"os"
 	"path/filepath"
@@ -55,9 +54,7 @@ func newLifecycleOperationStore(workspace, configuredStateRoot string) (*lifecyc
 		}
 		stateRoot = absoluteStateRoot
 	}
-	workspaceDigest := sha256.Sum256([]byte(workspace))
-	workspaceID := filepath.Base(workspace) + "-" + hex.EncodeToString(workspaceDigest[:8])
-	directory := filepath.Join(stateRoot, "portal", workspaceID)
+	directory := userstate.WorkspaceDirectory(stateRoot, "portal", workspace)
 	return &lifecycleOperationStore{
 		workspace: workspace,
 		directory: directory,
