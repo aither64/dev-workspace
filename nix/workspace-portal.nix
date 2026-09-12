@@ -223,8 +223,13 @@ buildGoModule {
       "$out/libexec/workspace-portal/workspace-profile-identity.rb"
     install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
       "$out/share/workspace-portal/codex_protocol_contract.py"
-    install -Dm644 ${codexWebSrc}/codex/client.go \
-      "$out/share/workspace-portal/codex-client.go"
+    mkdir -p "$out/share/workspace-portal/codex"
+    for source in ${codexWebSrc}/codex/*.go; do
+      case "$source" in *_test.go) continue ;; esac
+      install -m644 "$source" "$out/share/workspace-portal/codex/"
+    done
+    ${contractPython}/bin/python3 "$out/share/workspace-portal/codex_protocol_contract.py" \
+      --coverage-only "$out/share/workspace-portal/codex/client.go"
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"

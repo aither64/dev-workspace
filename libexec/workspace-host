@@ -1635,7 +1635,7 @@ module DevWorkspaceHost
           find_command('python3'),
           File.join(package_root, 'share/workspace-portal/codex_protocol_contract.py'),
           schema,
-          File.join(package_root, 'share/workspace-portal/codex-client.go')
+          File.join(package_root, 'share/workspace-portal/codex/client.go')
         )
         socket = File.join(directory, 'app-server.sock')
         pid = Process.spawn(command, 'app-server', '--listen', "unix://#{socket}", pgroup: true, out: File::NULL, err: File::NULL)
