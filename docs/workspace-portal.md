@@ -30,6 +30,37 @@ the next explicit registration update.
 Provider IDs must exist in the immutable package extension catalog. Workspace
 files cannot choose executable paths or labels.
 
+## File links
+
+Absolute file links in conversations and Markdown artifacts open a read-only
+source viewer. The viewer shows line numbers and syntax highlighting. A link
+ending in `:10`, `:10:5` or `#L10` selects line 10. Clicking a line number updates
+the address; **Copy link** copies that address. Links without a line reference
+open the beginning of the file.
+
+Active repository links show the current worktree contents, including
+uncommitted edits and newly staged files. The file must be tracked in a verified
+session repository. After archival, the viewer reads the recorded final commit
+and displays its revision. A link is a live reference, so later edits can move
+the referenced line. The viewer reports a missing line instead of selecting a
+different one.
+
+Tracking files are limited to `plan.md`, `state.md` and artifacts declared in
+`portal.yml`. Their links continue to work when tracking moves into `archive/`.
+Untracked repository files, Git metadata, symlinks and other host files are not
+available. Text previews are limited to 512 KiB and 12,000 lines. Markdown files
+appear as source; binary files receive a notice instead of a text preview.
+
+The viewer route is `/files/<slug>?repository=<id>&path=<relative-path>#L10`,
+or `/files/<slug>?artifact=<relative-path>#L10` for a tracking artifact. The
+repository ID is the same opaque ID used by repository review. The read-only
+`GET /api/sessions/<slug>/file` endpoint accepts the same query parameters and
+returns `path`, `repository` when applicable, `source`, the archived `revision`
+when applicable, and a `content` object with the existing review preview fields.
+Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
+Existing URLs whose website path contains the absolute workspace file path
+redirect to the viewer. The original conversation text remains unchanged.
+
 ## User-profile state
 
 The default paths are:

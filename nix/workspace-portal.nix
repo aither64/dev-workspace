@@ -201,6 +201,7 @@ buildGoModule {
     go test ./...
     node --check internal/web/static/app.js
     node --check internal/web/static/repository-review.js
+    node --check internal/web/static/source-file.js
     node --check internal/web/static/review-editor.js
     (
       cd ..

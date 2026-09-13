@@ -37,6 +37,7 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
+	goldmarktext "github.com/yuin/goldmark/text"
 	"golang.org/x/sys/unix"
 )
 
@@ -374,6 +375,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("/", s.route)
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.invalidSourceRequest(r) {
+			http.NotFound(w, r)
+			return
+		}
 		if looksLikeSessionAPIPath(r.URL) {
 			if _, ok := sessionAPIPath(r.URL); !ok {
 				http.NotFound(w, r)
@@ -411,6 +416,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.artifact(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifact-previews/"):
 		s.artifactImage(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/files/"):
+		s.sourcePage(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, s.config.Workspace+"/"):
+		s.sourceRedirect(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/sessions/"):
 		s.sessionAPI(w, r)
 	case r.Method == http.MethodGet && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 0:
@@ -1310,6 +1319,15 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && parts[1] == "file" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "File viewing is read-only."})
+			return
+		}
+		s.sourceFile(w, r, summary)
+		return
+	}
 	if s.repositoryReviewAPI(w, r, summary, parts) {
 		return
 	}
@@ -2434,7 +2452,10 @@ func (s *Server) messageLock(threadID string) conversation.MutationLocker {
 
 func (s *Server) renderTextMarkdown(text string) template.HTML {
 	var output strings.Builder
-	if err := s.markdown.Convert([]byte(text), &output); err != nil {
+	source := []byte(text)
+	document := s.markdown.Parser().Parse(goldmarktext.NewReader(source))
+	s.rewriteSourceLinks(document)
+	if err := s.markdown.Renderer().Render(&output, source, document); err != nil {
 		return template.HTML("<p class=\"notice error\">Unable to render document.</p>")
 	}
 	return template.HTML(s.sanitizer.Sanitize(output.String())) // #nosec G203 -- sanitized by bluemonday.
@@ -2444,7 +2465,7 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	s.renderStatus(w, http.StatusOK, name, data)
 }
 func (s *Server) renderStatus(w http.ResponseWriter, status int, name string, data pageData) {
-	if name == "session" {
+	if name == "session" || name == "source-file" {
 		var nonce [24]byte
 		if _, err := rand.Read(nonce[:]); err != nil {
 			http.Error(w, "Unable to render page", http.StatusInternalServerError)

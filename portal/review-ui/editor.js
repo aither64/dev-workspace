@@ -25,18 +25,18 @@ const baseTheme = EditorView.theme({
 }, {dark: true});
 
 class LineLink extends GutterMarker {
-  constructor(side, line, url, onSelect, selected = false) {
+  constructor(side, line, url, onSelect, selected = false, label = "") {
     super();
-    Object.assign(this, {side, line, url, onSelect, selected});
+    Object.assign(this, {side, line, url, onSelect, selected, label});
   }
-  eq(other) { return this.side === other.side && this.line === other.line && this.url === other.url && this.selected === other.selected; }
+  eq(other) { return this.side === other.side && this.line === other.line && this.url === other.url && this.selected === other.selected && this.label === other.label; }
   toDOM() {
     const link = document.createElement("a");
     link.textContent = String(this.line);
     link.href = this.url;
     link.dataset.side = this.side;
     link.dataset.line = String(this.line);
-    link.setAttribute("aria-label", `${this.side === "old" ? "Before" : "After"}, line ${this.line}`);
+    link.setAttribute("aria-label", this.label || `${this.side === "old" ? "Before" : "After"}, line ${this.line}`);
     if (this.selected) link.setAttribute("aria-current", "line");
     link.addEventListener("click", event => {
       if (!this.onSelect || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -129,7 +129,7 @@ const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
 
 // A synchronous mount keeps navigation responsive while a same-origin worker
 // highlights complete immutable sources. No editor mutates source content.
-export function createReviewEditor({parent, before, after, oldPath = "", newPath = "", mode = "split", version = "new", nonce = "", lineURL, onLineSelect}) {
+export function createReviewEditor({parent, before, after, oldPath = "", newPath = "", mode = "split", version = "new", nonce = "", fileLabel = "", lineURL, onLineSelect}) {
   before = normalizeSource(before);
   after = normalizeSource(after);
   const abort = new AbortController();
@@ -151,7 +151,8 @@ export function createReviewEditor({parent, before, after, oldPath = "", newPath
         const number = resolveLine(view, line.from);
         if (!number) return null;
         const url = lineURL?.(side, number) ?? `#${side}-L${number}`;
-        return new LineLink(side, number, url, onLineSelect, selected?.side === side && selected.line === number);
+        return new LineLink(side, number, url, onLineSelect, selected?.side === side && selected.line === number,
+          mode === "file" && fileLabel ? `Line ${number}` : "");
       },
       lineMarkerChange: update => update.transactions.some(transaction => transaction.effects.length > 0),
     });
@@ -170,7 +171,7 @@ export function createReviewEditor({parent, before, after, oldPath = "", newPath
   if (mode === "file") {
     const old = version === "old", side = old ? "old" : "new";
     editor = new EditorView({parent: host, doc: old ? before : after,
-      extensions: [...extensions(side, `Read-only file, ${old ? "before" : "after"} changes`), sourceGutter(side, old ? oldLines : newLines)]});
+      extensions: [...extensions(side, fileLabel || `Read-only file, ${old ? "before" : "after"} changes`), sourceGutter(side, old ? oldLines : newLines)]});
   } else if (mode === "unified") {
     projection = unifiedProjection(before, after);
     editor = new EditorView({parent: host, doc: projection.text,
@@ -240,7 +241,17 @@ export function createReviewEditor({parent, before, after, oldPath = "", newPath
     view.dispatch({effects: EditorView.scrollIntoView(position, {y: "center"})});
     return true;
   }
-  return {ready, revealLine, destroy() {
+  function clearLine() {
+    if (destroyed) return;
+    selected = undefined;
+    if (mode === "file" || mode === "unified") {
+      editor.dispatch({effects: selection[mode === "file" ? version : "unified"].reconfigure([])});
+    } else {
+      editor.a.dispatch({effects: selection.old.reconfigure([])});
+      editor.b.dispatch({effects: selection.new.reconfigure([])});
+    }
+  }
+  return {ready, revealLine, clearLine, destroy() {
     if (destroyed) return;
     destroyed = true;
     abort.abort();

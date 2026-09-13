@@ -1,0 +1,30 @@
+{{define "source-file"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="style-nonce" content="{{.StyleNonce}}">
+  <title>File · {{.DisplayLabel}}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/repository-review.css">
+  <link rel="stylesheet" href="/static/source-file.css">
+  <script type="module" src="/static/source-file.js"></script>
+</head>
+<body>
+  <main class="source-file-page">
+    <nav><a href="/">{{.DisplayLabel}}</a>{{if .Session}} · <a href="/{{.Session.Slug}}/">Back to session</a>{{end}}</nav>
+    {{if .Error}}<p class="notice warning" role="alert">{{.Error}}</p>{{else}}
+    <section id="source-file" data-slug="{{.Session.Slug}}" aria-labelledby="source-file-title">
+      <header class="source-file-heading">
+        <div><h1 id="source-file-title">File</h1><p id="source-file-version" class="muted"></p></div>
+        <button id="source-file-copy" type="button" class="quiet">Copy link</button>
+      </header>
+      <p id="source-file-notice" class="notice" role="status">Loading file…</p>
+      <div id="source-file-content"></div>
+    </section>
+    {{end}}
+  </main>
+</body>
+</html>
+{{end}}

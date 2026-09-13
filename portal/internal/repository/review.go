@@ -541,9 +541,13 @@ func (r ReviewReader) blob(ctx context.Context, dir, object, mode string) (Revie
 	if err != nil {
 		return b, err
 	}
+	return previewText(out, b), nil
+}
+
+func previewText(out []byte, b ReviewBlob) ReviewBlob {
 	if bytes.IndexByte(out, 0) >= 0 || !utf8.Valid(out) {
 		b.Binary = true
-		return b, nil
+		return b
 	}
 	missingNewline := len(out) > 0 && out[len(out)-1] != '\n'
 	lines := bytes.Count(out, []byte{'\n'})
@@ -552,9 +556,9 @@ func (r ReviewReader) blob(ctx context.Context, dir, object, mode string) (Revie
 	}
 	if lines > MaxReviewLines {
 		b.Limited = true
-		return b, nil
+		return b
 	}
 	b.Text = string(out)
 	b.MissingNewline = missingNewline
-	return b, nil
+	return b
 }

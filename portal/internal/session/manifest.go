@@ -200,8 +200,8 @@ func (m *Manifest) Validate(expectedSlug string) error {
 		if strings.TrimSpace(artifact.Label) == "" {
 			return errors.New("artifact label is empty")
 		}
-		clean := filepath.Clean(artifact.Path)
-		if artifact.Path == "" || filepath.IsAbs(artifact.Path) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		clean, ok := NormalizeArtifactPath(artifact.Path)
+		if !ok {
 			return fmt.Errorf("artifact path escapes tracking directory: %q", artifact.Path)
 		}
 		if _, ok := seenArtifacts[clean]; ok {
@@ -669,10 +669,22 @@ func scalarTag(node *yaml.Node, tag, name string) error {
 	return nil
 }
 
+// NormalizeArtifactPath defines the relative path contract shared by artifact
+// registration and access. Authorization still requires catalog membership.
+func NormalizeArtifactPath(value string) (string, bool) {
+	clean := filepath.Clean(value)
+	return clean, value != "" && !filepath.IsAbs(value) && clean != "." && clean != ".." &&
+		!strings.HasPrefix(clean, ".."+string(filepath.Separator))
+}
+
 func OpenArtifact(summary *Summary, artifactPath string, maxSize int64) (*os.File, os.FileInfo, error) {
+	clean, ok := NormalizeArtifactPath(artifactPath)
+	if !ok {
+		return nil, nil, fs.ErrPermission
+	}
 	allowed := false
 	for _, artifact := range AvailableArtifacts(summary) {
-		if filepath.Clean(artifact.Path) == filepath.Clean(artifactPath) {
+		if filepath.Clean(artifact.Path) == clean {
 			allowed = true
 			break
 		}
@@ -680,12 +692,23 @@ func OpenArtifact(summary *Summary, artifactPath string, maxSize int64) (*os.Fil
 	if !allowed {
 		return nil, nil, fs.ErrPermission
 	}
-	clean := filepath.Clean(artifactPath)
-	if filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return nil, nil, fs.ErrPermission
-	}
 	relative := filepath.Join(summary.Root, summary.Slug, clean)
-	file, err := openConfined(summary.Workspace, relative, unix.O_RDONLY, 0)
+	file, info, err := OpenRegularFile(summary.Workspace, relative)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Size() > maxSize {
+		file.Close()
+		return nil, nil, fmt.Errorf("artifact exceeds %d bytes", maxSize)
+	}
+	return file, info, nil
+}
+
+// OpenRegularFile opens a read-only file below root without following symlinks.
+// Callers must separately authorize the relative path. Nonblocking open avoids
+// waiting on a FIFO before the regular-file check can reject it.
+func OpenRegularFile(root, relative string) (*os.File, os.FileInfo, error) {
+	file, err := openConfined(root, relative, unix.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -697,10 +720,6 @@ func OpenArtifact(summary *Summary, artifactPath string, maxSize int64) (*os.Fil
 	if !info.Mode().IsRegular() {
 		file.Close()
 		return nil, nil, fs.ErrPermission
-	}
-	if info.Size() > maxSize {
-		file.Close()
-		return nil, nil, fmt.Errorf("artifact exceeds %d bytes", maxSize)
 	}
 	return file, info, nil
 }

@@ -1,0 +1,15 @@
+.source-file-page { max-width: 100rem; margin: 0 auto; padding: 1.25rem; width: 100%; box-sizing: border-box; }
+.source-file-page nav { margin-bottom: 1.25rem; }
+.source-file-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.source-file-heading h1 { font: 600 1.05rem ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; margin-bottom: .5rem; }
+.source-file-heading p { overflow-wrap: anywhere; }
+.source-file-heading button { flex-shrink: 0; }
+#source-file-content { border: 1px solid var(--line); border-radius: .6rem; overflow: hidden; }
+#source-file-content:empty { display: none; }
+#source-file-content .cm-editor { max-height: calc(100dvh - 13rem); min-height: 8rem; }
+#source-file-content .cm-scroller { overflow: auto; }
+@media (max-width: 600px) {
+  .source-file-page { padding: .75rem; }
+  .source-file-heading { flex-direction: column; gap: .5rem; }
+  #source-file-content .cm-editor { max-height: calc(100dvh - 17rem); }
+}
