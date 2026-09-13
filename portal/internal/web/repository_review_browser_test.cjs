@@ -3,7 +3,7 @@ const fs = require("node:fs");
 
 (async () => {
   const source = fs.readFileSync("static/repository-review.js", "utf8");
-  const {reviewRoute, reviewURL, fullFileVersion, fileStatus, changeCounts} =
+  const {reviewRoute, reviewURL, fullFileVersion, fileStatus, changeCounts, historyHasPages} =
     await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
   const original = "https://workspace.example.test/example/?unrelated=kept#codex";
   const route = {
@@ -34,6 +34,12 @@ const fs = require("node:fs");
   assert.deepEqual(fileStatus("R100"), ["renamed", "Renamed"]);
   assert.deepEqual(fileStatus("T"), ["type", "Type changed"]);
   assert.equal(changeCounts({additions: null, deletions: null}), "Binary");
+  for (const total of [0, 1, 50, 51, 101]) {
+    const pages = Math.max(1, Math.ceil(total / 50));
+    for (let page = 0; page < pages; page++) {
+      assert.equal(historyHasPages({page, hasMore: page + 1 < pages}), pages > 1);
+    }
+  }
   assert.equal(changeCounts({files: 3, additions: 7, deletions: 2, binaryFiles: 1}, true),
     "3 changed files · +7 · −2 · 1 binary file");
   console.log("Repository URL, file-version and metadata contracts passed.");

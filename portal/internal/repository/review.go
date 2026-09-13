@@ -313,6 +313,19 @@ func (r ReviewReader) History(ctx context.Context, repo ReviewRepository, pair R
 	return result, nil
 }
 
+// CommitCount uses the same complete range as History, independently of its page.
+func (r ReviewReader) CommitCount(ctx context.Context, repo ReviewRepository, pair ReviewPair) (int64, error) {
+	out, err := r.git(ctx, repo.Directory, 1024, "rev-list", "--count", pair.Base+".."+pair.Head, "--")
+	if err != nil {
+		return 0, err
+	}
+	count, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || count < 0 {
+		return 0, errors.New("invalid Git commit count")
+	}
+	return count, nil
+}
+
 const reviewCommitFormat = "%H%x00%P%x00%an%x00%aI%x00%s%x00%b%x00%B"
 
 func parseReviewCommits(out []byte, github string) ([]ReviewCommit, error) {

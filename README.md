@@ -122,6 +122,13 @@ The full commit message, metadata, parent links and comparison totals scroll wit
 the diffs. Opening a commit starts at its message; a file or line link jumps to
 that target.
 
+Each repository card shows the commit count for its complete comparison and
+the net lines added and deleted, including unpushed commits. These totals use
+the same revisions as the commit list and **Compare**. Binary files contribute
+to the changed-file count without a line count. **Refresh commits** updates the
+list and totals together. Pagination appears only when there is another page
+to visit. If totals are unavailable, the commit list remains usable.
+
 Parent hashes open the parent's full commit page. Merge commits link each parent
 and show their diff against the first parent. Parent navigation can continue
 before the feature branch's base; the feature commit list keeps its original range.

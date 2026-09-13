@@ -105,6 +105,10 @@ func TestReviewMergeBaseFollowsRebaseAndImmutablePair(t *testing.T) {
 	if err != nil || len(currentHistory.Commits) != 1 || currentHistory.Commits[0].Subject != "feature-change" {
 		t.Fatalf("rebased history = %#v, %v", currentHistory, err)
 	}
+	count, err := reader.CommitCount(context.Background(), current, after)
+	if err != nil || count != 1 {
+		t.Fatalf("rebased total=%d, err=%v", count, err)
+	}
 }
 func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 	f, reader, repo := reviewFixture(t)

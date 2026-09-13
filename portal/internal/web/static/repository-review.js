@@ -79,6 +79,9 @@ const countParts = (stats, total) => {
 export function changeCounts(stats, total = false) {
   return countParts(stats, total).map(part => part.text).join(" · ");
 }
+export function historyHasPages(history) {
+  return history.page > 0 || history.hasMore;
+}
 const counts = (element, stats, total = false) => {
   countParts(stats, total).forEach((part, index) => {
     if (index) element.append(" · ");
@@ -188,13 +191,25 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
     target.replaceChildren(node("p", "muted repository-history-base", short(payload.pair.base) + " → " +
       short(payload.pair.head) + " · " + payload.pair.baseLabel));
+    if (payload.summary) {
+      const total = payload.summary.commitCount;
+      const summary = node("p", "repository-history-summary", total.toLocaleString() + (total === 1 ? " commit" : " commits") + " · ");
+      counts(summary, payload.summary.stats, true);
+      target.prepend(summary);
+    } else {
+      const summary = node("p", "muted repository-history-summary", "Totals unavailable.");
+      if (payload.summaryError) summary.append(" " + payload.summaryError);
+      target.prepend(summary);
+    }
     if (payload.pair.warning) target.append(node("p", "notice warning", payload.pair.warning));
     target.append(list);
     if (!payload.history.commits.length) target.append(node("p", "muted", "No commits in this comparison."));
-    const pagination = node("nav", "repository-pagination"); pagination.setAttribute("aria-label", "Commit history pages");
-    const previous = button("Previous", () => loadHistory(state, state.page - 1)); previous.disabled = state.page === 0;
-    const next = button("Next", () => loadHistory(state, state.page + 1)); next.disabled = !payload.history.hasMore;
-    pagination.append(previous, node("span", "muted", "Page " + (state.page + 1)), next); target.append(pagination);
+    if (historyHasPages(payload.history)) {
+      const pagination = node("nav", "repository-pagination"); pagination.setAttribute("aria-label", "Commit history pages");
+      const previous = button("Previous", () => loadHistory(state, state.page - 1)); previous.disabled = state.page === 0;
+      const next = button("Next", () => loadHistory(state, state.page + 1)); next.disabled = !payload.history.hasMore;
+      pagination.append(previous, node("span", "muted", "Page " + (state.page + 1)), next); target.append(pagination);
+    }
     markChanged(state, state.latestHead || payload.pair.head);
   };
   const loadingHistory = (state, value) => {

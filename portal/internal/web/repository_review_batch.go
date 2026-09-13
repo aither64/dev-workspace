@@ -60,7 +60,7 @@ func (s *Server) repositoryReviewBatch(w http.ResponseWriter, r *http.Request, s
 		s.writeReviewError(w, summary, reviewError(400, "Invalid repository batch"))
 		return
 	}
-	result := make([]map[string]any, len(ids))
+	result := make([]any, len(ids))
 	for index, id := range ids {
 		result[index] = map[string]any{"repository": id, "error": "The repository request was cancelled."}
 	}
@@ -76,7 +76,8 @@ func (s *Server) repositoryReviewBatch(w http.ResponseWriter, r *http.Request, s
 			payload, readErr := s.reviewHistory(r.Context(), summary, registration, scope, "", 0)
 			err = readErr
 			if err == nil {
-				result[index] = map[string]any{"repository": id, "review": payload.Review, "snapshot": payload.Snapshot, "pair": payload.Pair, "history": payload.History}
+				payload.Repository = id
+				result[index] = payload
 				return
 			}
 		} else if err == nil {

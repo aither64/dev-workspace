@@ -174,11 +174,17 @@ func (s *Server) writeReviewError(w http.ResponseWriter, summary *session.Summar
 }
 
 type reviewHistoryResponse struct {
-	Repository string                   `json:"repository,omitempty"`
-	Review     string                   `json:"review"`
-	Snapshot   string                   `json:"snapshot"`
-	Pair       repository.ReviewPair    `json:"pair"`
-	History    repository.ReviewHistory `json:"history"`
+	Repository   string                   `json:"repository,omitempty"`
+	Review       string                   `json:"review"`
+	Snapshot     string                   `json:"snapshot"`
+	Pair         repository.ReviewPair    `json:"pair"`
+	History      repository.ReviewHistory `json:"history"`
+	Summary      *reviewHistorySummary    `json:"summary,omitempty"`
+	SummaryError string                   `json:"summaryError,omitempty"`
+}
+type reviewHistorySummary struct {
+	CommitCount int64                  `json:"commitCount"`
+	Stats       repository.ReviewStats `json:"stats"`
 }
 type reviewPreview struct {
 	File    string                   `json:"file"`
@@ -394,7 +400,25 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		snapshot.Commits[commit.ID] = commit.SHA
 	}
 	snapshot.mu.Unlock()
-	return reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history}, nil
+	response := reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history}
+	totals, err := cachedReview(ctx, service, "summary\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) (reviewHistorySummary, error) {
+		count, err := service.reader.CommitCount(ctx, snapshot.Repo, snapshot.Pair)
+		if err != nil {
+			return reviewHistorySummary{}, err
+		}
+		files, err := service.comparisonFiles(ctx, snapshot)
+		if err != nil {
+			return reviewHistorySummary{}, err
+		}
+		return reviewHistorySummary{CommitCount: count, Stats: repository.FileStats(files)}, nil
+	})
+	if err != nil {
+		_, response.SummaryError = reviewErrorMessage(err)
+		s.config.Logger.Printf("repository totals %s/%s: %v", summary.Slug, registration.Name, err)
+	} else {
+		response.Summary = &totals
+	}
+	return response, nil
 }
 
 func (s *Server) restoreReview(ctx context.Context, summary *session.Summary, registration session.Repository, scope, id string) (*repositoryReviewSnapshot, error) {
