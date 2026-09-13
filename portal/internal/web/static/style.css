@@ -206,6 +206,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .codex-work[hidden] { display: none; }
 .codex-work time { color: var(--muted); }
 .chat-form { flex: none; border-top: 1px solid var(--line); padding: .8rem 0 max(.8rem, env(safe-area-inset-bottom)); background: var(--bg); }
+.chat-form[hidden], .chat-panel.plan-decision #codex-work { display: none; }
 .chat-form textarea { margin: 0 0 .7rem; min-height: 3.5rem; max-height: min(25dvh, 14rem); }
 .chat-actions > div { display: flex; gap: .55rem; }
 .chat-actions .composer-controls { display: flex; gap: .55rem; }

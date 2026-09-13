@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
+  currentCompletedPlan, planIdentity, pendingPlanImplementation,
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
@@ -20,6 +21,21 @@ const {
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
+
+const historicalPlan = {turnId: "old", kind: "plan", turnStatus: "completed", text: "Plan"};
+for (const latestTurnId of [undefined, "ordinary", "empty", "failed", "interrupted"]) {
+  assert.equal(currentCompletedPlan({latestTurnId, entries: [historicalPlan]}), undefined);
+}
+assert.equal(currentCompletedPlan({latestTurnId: "old", entries: [historicalPlan]}), historicalPlan);
+for (const turnStatus of ["inProgress", "failed", "interrupted"]) {
+  assert.equal(currentCompletedPlan({latestTurnId: "new", entries: [historicalPlan,
+    {...historicalPlan, turnId: "new", turnStatus}]}), undefined);
+}
+assert.notEqual(planIdentity("old", "same-digest"), planIdentity("new", "same-digest"));
+
+assert.equal(pendingPlanImplementation([{message: "Implement the plan."}], "current"), false);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:older"}], "current"), false);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:current"}], "current"), true);
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("browser contract test requires the server URL");
