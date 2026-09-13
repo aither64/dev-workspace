@@ -68,6 +68,14 @@
   const pendingPlanImplementation = (attempts, turnId, digest) => Boolean(
     matchingSendAttempt([...attempts], "Implement the plan.", planActionContext(turnId, digest))
   );
+  const planRecoveryRequest = (attempt, latestTurnId) => {
+    if (attempt.message !== "Implement the plan.") return null;
+    const legacy = /^plan:([0-9a-f]{64})$/.exec(attempt.context || "");
+    if (legacy) return {action: "recover", planSha256: legacy[1], clientUserMessageId: attempt.id};
+    const current = /^plan:(.+):([0-9a-f]{64})$/.exec(attempt.context || "");
+    if (!current || !latestTurnId || current[1] === latestTurnId) return null;
+    return {action: "recover", planContextVersion: 2, planTurnId: current[1], planSha256: current[2], clientUserMessageId: attempt.id};
+  };
   const setPlanDecisionVisible = (panel, form, visible, focusComposer = false) => {
     if (!panel || !form) return;
     const document = form.ownerDocument;
@@ -624,7 +632,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
-      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, setPlanDecisionVisible,
+      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, setPlanDecisionVisible,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -2130,6 +2138,7 @@
     if (!payload.threadId) throw new Error("Codex returned no thread");
     currentThreadId = payload.threadId;
     loadMessageReceipts();
+    recoverPlanAttempts(payload.latestTurnId);
     const follow = !transcriptInitialized || transcriptViews.get(transcriptFilter).follow;
     const previousTop = transcript.clientHeight ? transcript.scrollTop : transcriptViews.get(transcriptFilter).scrollTop;
     const entries = payload.entries || [];
@@ -2582,6 +2591,29 @@
     // update fails. Keep the known acceptance visible for this page lifetime.
     storeSendAttempt(sendAttemptStorage, slug, currentThreadId, accepted);
     renderMessageReceipts();
+  };
+
+  const recoverPlanAttempts = (latestTurnId) => {
+    for (const attempt of pendingMessages.values()) {
+      if (["accepted", "observed"].includes(attempt.state) || inFlightMessageIDs.has(attempt.id)) continue;
+      const request = planRecoveryRequest(attempt, latestTurnId);
+      if (!request) continue;
+      inFlightMessageIDs.add(attempt.id);
+      void client.implementPlan(request).then((result) => {
+        if (result.clientUserMessageId !== attempt.id) throw new Error("receipt identity changed");
+        if (result.retired === true) {
+          if (deleteSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt.id)) pendingMessages.delete(attempt.id);
+        } else if (result.turnId) {
+          acceptMessageReceipt(attempt, result);
+        }
+      }).catch(() => {
+        // Keep the original retry record visible until recovery is available.
+      }).finally(() => {
+        inFlightMessageIDs.delete(attempt.id);
+        renderMessageReceipts();
+        acknowledgeTranscriptMessages(transcriptEntries);
+      });
+    }
   };
 
   const form = document.getElementById("message-form");

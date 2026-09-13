@@ -55,6 +55,7 @@ type codexController interface {
 	ListThreadActivity(context.Context, []workspacecodex.ThreadActivity) ([]workspacecodex.ThreadActivity, error)
 	PrepareSend(string, string, string, string, bool) error
 	ReconcileSend(context.Context, string, string, string, string) (codex.SendReceipt, bool, error)
+	DiscardPreparedSend(string, string, string, string) (bool, error)
 	ReconcileThreadInstructions(context.Context, string) error
 }
 
@@ -1547,7 +1548,8 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 
-	if strings.TrimSpace(body.Action) != "same" {
+	action := strings.TrimSpace(body.Action)
+	if action != "same" && action != "recover" {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select how to implement the plan"})
 		return
 	}
@@ -1560,6 +1562,16 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 
 	if body.PlanContextVersion != 0 && body.PlanContextVersion != 2 {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported plan request version; reload the page"})
+		return
+	}
+
+	if action == "recover" && (!messageDigestPattern.MatchString(body.PlanSHA256) || (body.PlanContextVersion == 2 && strings.TrimSpace(body.PlanTurnID) == "")) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid plan receipt"})
+		return
+	}
+
+	if action == "same" && body.PlanContextVersion == 0 {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "reload the page before starting plan implementation"})
 		return
 	}
 
@@ -1587,8 +1599,29 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 
-	if body.PlanContextVersion == 0 {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "reload the page before starting plan implementation"})
+	if action == "recover" {
+		if body.PlanContextVersion == 2 {
+			transcript, err := s.config.Codex.ReadThread(ctx, summary.Codex.ThreadID)
+			if err != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
+			if transcript.LatestTurnID == "" || transcript.LatestTurnID == strings.TrimSpace(body.PlanTurnID) {
+				s.writeJSON(w, http.StatusConflict, map[string]string{"error": "review the current plan before retrying implementation"})
+				return
+			}
+		}
+
+		retired, err := s.config.Codex.DiscardPreparedSend(
+			summary.Codex.ThreadID, implementationMessage, body.ClientUserMessageID, actionContext,
+		)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		} else if !retired {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "message state changed; retry receipt recovery"})
+		} else {
+			s.writeJSON(w, http.StatusOK, map[string]any{"retired": true, "clientUserMessageId": body.ClientUserMessageID})
+		}
 		return
 	}
 

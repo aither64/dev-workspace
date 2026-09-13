@@ -72,21 +72,21 @@ func TestImplementPlanRecoversReceiptAfterConversationAdvances(t *testing.T) {
 	}
 }
 
-func TestLegacyPlanRequestsOnlyRecoverSubmittedReceipts(t *testing.T) {
+func TestLegacyPlanImplementationRequiresReloadEvenWithAnExistingReceipt(t *testing.T) {
 	for _, submitted := range []bool{false, true} {
 		t.Run(fmt.Sprint(submitted), func(t *testing.T) {
 			server := newTestServer(t)
 			const clientID = "00000000-0000-4000-8000-000000000001"
 			controller := &browserContractCodex{
-				transcript: codex.Transcript{ThreadID: "thread-1", LatestTurnID: "old", Status: "idle", CollaborationMode: "plan",
-					Entries: []codex.TranscriptEntry{{TurnID: "old", TurnStatus: "completed", Kind: "plan", Text: "Plan"}}},
+				transcript: codex.Transcript{ThreadID: "thread-1", LatestTurnID: "later", Status: "idle", CollaborationMode: "plan",
+					Entries: []codex.TranscriptEntry{{TurnID: "later", TurnStatus: "completed", Kind: "plan", Text: "Plan"}}},
 				message: "Implement the plan.", messageID: clientID, actionContext: "plan:" + planDigest("Plan"),
 			}
 			if submitted {
 				controller.sendCount = 1
 			}
 			server.config.Codex = controller
-			body := fmt.Sprintf(`{"action":"same","planTurnId":"old","planSha256":%q,"clientUserMessageId":%q}`, planDigest("Plan"), clientID)
+			body := fmt.Sprintf(`{"action":"same","planTurnId":"later","planSha256":%q,"clientUserMessageId":%q}`, planDigest("Plan"), clientID)
 			response := httptest.NewRecorder()
 			server.implementPlan(response, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)), &session.Summary{Manifest: session.Manifest{
 				Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
@@ -94,7 +94,6 @@ func TestLegacyPlanRequestsOnlyRecoverSubmittedReceipts(t *testing.T) {
 			expected := http.StatusConflict
 			count := 0
 			if submitted {
-				expected = http.StatusAccepted
 				count = 1
 			}
 			if response.Code != expected || controller.sendCount != count || controller.settings.CollaborationMode != "" {
@@ -131,5 +130,69 @@ func TestIdenticalPlanInLaterTurnUsesANewImplementationIdentity(t *testing.T) {
 	}
 	if r := submit("new", newID); r.Code != http.StatusAccepted || controller.sendCount != 2 || controller.actionContext != "plan:new:"+planDigest("Identical plan") {
 		t.Fatalf("new implementation: %d %s, sends=%d context=%s", r.Code, r.Body.String(), controller.sendCount, controller.actionContext)
+	}
+}
+
+func TestLegacyPlanRecoveryRetiresOnlyUnsubmittedRetryRecords(t *testing.T) {
+	for _, submitted := range []bool{false, true} {
+		t.Run(fmt.Sprint(submitted), func(t *testing.T) {
+			server := newTestServer(t)
+			const id = "00000000-0000-4000-8000-000000000001"
+			controller := &browserContractCodex{message: "Implement the plan.", messageID: id, actionContext: "plan:" + planDigest("Plan")}
+			if submitted {
+				controller.sendCount = 1
+			}
+			server.config.Codex = controller
+			body := fmt.Sprintf(`{"action":"recover","clientUserMessageId":%q,"planSha256":%q}`, id, planDigest("Plan"))
+			response := httptest.NewRecorder()
+			server.implementPlan(response, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)), &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}})
+			if submitted {
+				if response.Code != http.StatusAccepted || controller.sendCount != 1 || controller.messageID != id {
+					t.Fatalf("submitted recovery: %d %s", response.Code, response.Body.String())
+				}
+			} else if response.Code != http.StatusOK || controller.sendCount != 0 || controller.messageID != "" || !strings.Contains(response.Body.String(), `"retired":true`) {
+				t.Fatalf("retirement: %d %s", response.Code, response.Body.String())
+			}
+			if controller.settings.CollaborationMode != "" {
+				t.Fatal("receipt recovery changed mode")
+			}
+		})
+	}
+}
+
+func TestPlanRecoveryRetiresOnlyObsoletePreparedRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name, latest, source string
+		noPlan               bool
+	}{
+		{name: "unknown", source: "plan"},
+		{name: "current", latest: "plan", source: "plan"},
+		{name: "current whitespace", latest: "plan", source: " plan "},
+		{name: "current unproven", latest: "plan", source: "plan", noPlan: true},
+		{name: "newer", latest: "newer", source: "plan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t)
+			const id = "00000000-0000-4000-8000-000000000001"
+			controller := &browserContractCodex{message: "Implement the plan.", messageID: id, actionContext: "plan:plan:" + planDigest("Plan"),
+				transcript: codex.Transcript{ThreadID: "thread-1", LatestTurnID: tc.latest, Status: "idle", Entries: []codex.TranscriptEntry{{TurnID: "plan", TurnStatus: "completed", Kind: "plan", Text: "Plan"}}}}
+			if tc.noPlan {
+				controller.transcript.Entries = nil
+			}
+			server.config.Codex = controller
+			body := fmt.Sprintf(`{"action":"recover","planContextVersion":2,"planTurnId":%q,"clientUserMessageId":%q,"planSha256":%q}`, tc.source, id, planDigest("Plan"))
+			response := httptest.NewRecorder()
+			server.implementPlan(response, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)), &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}})
+			if tc.latest == "newer" {
+				if response.Code != http.StatusOK || controller.messageID != "" {
+					t.Fatalf("obsolete recovery: %d %s", response.Code, response.Body.String())
+				}
+			} else if response.Code != http.StatusConflict || controller.messageID != id {
+				t.Fatalf("current/unknown proposal: %d %s", response.Code, response.Body.String())
+			}
+			if controller.sendCount != 0 || controller.settings.CollaborationMode != "" {
+				t.Fatal("recovery submitted or changed mode")
+			}
+		})
 	}
 }

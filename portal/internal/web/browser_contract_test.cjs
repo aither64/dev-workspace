@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
-  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation,
+  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest,
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
@@ -40,6 +40,16 @@ assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context
 assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: planActionContext("old", "same")}], "new", "same"), false);
 assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:same"}], "new", "same"), false);
 assert.equal(matchingSendAttempt([{id: "old-id", message: "Implement the plan.", context: planActionContext("old", "same"), state: "accepted"}], "Implement the plan.", planActionContext("new", "same")), undefined);
+
+assert.deepEqual(planRecoveryRequest({id: "legacy", message: "Implement the plan.", context: `plan:${"a".repeat(64)}`}), {
+  action: "recover", planSha256: "a".repeat(64), clientUserMessageId: "legacy",
+});
+assert.equal(planRecoveryRequest({id: "new", message: "Implement the plan.", context: planActionContext("turn", "a".repeat(64))}), null);
+
+assert.equal(planRecoveryRequest({id: "new", message: "Implement the plan.", context: planActionContext("turn", "a".repeat(64))}, "turn"), null);
+assert.deepEqual(planRecoveryRequest({id: "old", message: "Implement the plan.", context: planActionContext("old-turn", "a".repeat(64))}, "new-turn"), {
+  action: "recover", planContextVersion: 2, planTurnId: "old-turn", planSha256: "a".repeat(64), clientUserMessageId: "old",
+});
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("browser contract test requires the server URL");

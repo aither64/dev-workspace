@@ -2329,6 +2329,22 @@ func (client *browserContractCodex) ReconcileSend(
 	return codex.SendReceipt{TurnID: "turn-1", ClientUserMessageID: clientID, Steered: true}, true, nil
 }
 
+func (client *browserContractCodex) DiscardPreparedSend(_, message, clientID, actionContext string) (bool, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.messageID != clientID {
+		return true, nil
+	}
+	if client.message != message || client.actionContext != actionContext {
+		return false, errors.New("message identity was reused for another action")
+	}
+	if client.sendCount != 0 {
+		return false, nil
+	}
+	client.messageID = ""
+	return true, nil
+}
+
 func (client *browserContractCodex) PrepareSend(
 	threadID, message, clientID, actionContext string, _ bool,
 ) error {
