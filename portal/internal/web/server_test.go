@@ -1129,7 +1129,7 @@ func TestImplementPlanSerializesAConcurrentConversationMutation(t *testing.T) {
 	implementationDone := make(chan struct{})
 	go func() {
 		body := fmt.Sprintf(
-			`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+			`{"action":"same","planContextVersion":2,"planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 			planDigest(plan),
 		)
 		server.implementPlan(implementation, httptest.NewRequest(
@@ -2532,7 +2532,7 @@ func TestImplementPlanRejectsAStalePlan(t *testing.T) {
 	}}
 	server.config.Codex = controller
 	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(
-		`{"action":"same","planTurnId":"turn-old","planSha256":"bad","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		`{"action":"same","planContextVersion":2,"planTurnId":"turn-old","planSha256":"bad","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 	))
 	response := httptest.NewRecorder()
 
@@ -2561,7 +2561,7 @@ func TestImplementPlanContinuesInTheSameThread(t *testing.T) {
 	}
 	server.config.Codex = controller
 	body := fmt.Sprintf(
-		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		`{"action":"same","planContextVersion":2,"planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 		planDigest(plan),
 	)
 	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -2575,7 +2575,7 @@ func TestImplementPlanContinuesInTheSameThread(t *testing.T) {
 		t.Fatalf("same-thread plan response = %d %q", response.Code, response.Body.String())
 	}
 	if controller.message != "Implement the plan." ||
-		controller.actionContext != "plan:"+planDigest(plan) ||
+		controller.actionContext != "plan:turn-plan:"+planDigest(plan) ||
 		controller.settings.CollaborationMode != "default" {
 		t.Fatalf("plan implementation state = %#v", controller)
 	}
@@ -2598,7 +2598,7 @@ func TestImplementPlanKeepsItsDurableAttemptWhenTheMessageFails(t *testing.T) {
 	}
 	server.config.Codex = controller
 	body := fmt.Sprintf(
-		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		`{"action":"same","planContextVersion":2,"planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 		planDigest(plan),
 	)
 	response := httptest.NewRecorder()
@@ -2633,7 +2633,7 @@ func TestImplementPlanKeepsDefaultModeAndReconcilesAnUnknownSend(t *testing.T) {
 	}
 	server.config.Codex = controller
 	body := fmt.Sprintf(
-		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		`{"action":"same","planContextVersion":2,"planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 		planDigest(plan),
 	)
 	summary := &session.Summary{Manifest: session.Manifest{
@@ -2678,7 +2678,7 @@ func TestImplementPlanRetriesAfterTheModeChangeResponseIsLost(t *testing.T) {
 	}
 	server.config.Codex = controller
 	body := fmt.Sprintf(
-		`{"action":"same","planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
+		`{"action":"same","planContextVersion":2,"planTurnId":"turn-plan","planSha256":"%s","clientUserMessageId":"00000000-0000-4000-8000-000000000001"}`,
 		planDigest(plan),
 	)
 	summary := &session.Summary{Manifest: session.Manifest{

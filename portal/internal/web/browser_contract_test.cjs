@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
-  currentCompletedPlan, planIdentity, pendingPlanImplementation,
+  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation,
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
@@ -33,9 +33,13 @@ for (const turnStatus of ["inProgress", "failed", "interrupted"]) {
 }
 assert.notEqual(planIdentity("old", "same-digest"), planIdentity("new", "same-digest"));
 
-assert.equal(pendingPlanImplementation([{message: "Implement the plan."}], "current"), false);
-assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:older"}], "current"), false);
-assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:current"}], "current"), true);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan."}], "turn", "current"), false);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:turn:older"}], "turn", "current"), false);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:turn:current"}], "turn", "current"), true);
+
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: planActionContext("old", "same")}], "new", "same"), false);
+assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:same"}], "new", "same"), false);
+assert.equal(matchingSendAttempt([{id: "old-id", message: "Implement the plan.", context: planActionContext("old", "same"), state: "accepted"}], "Implement the plan.", planActionContext("new", "same")), undefined);
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("browser contract test requires the server URL");
