@@ -102,38 +102,7 @@
       </section>
 
       <section id="clusters" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-clusters">
-        <div class="section-heading"><h2>Development clusters</h2><span>{{len .Clusters}}</span></div>
-        <div class="repo-grid">
-        {{range .Clusters}}
-          <article class="panel repo-card cluster-card" data-cluster="{{.Kind}}">
-            <div class="repo-title"><h3>{{.Label}}</h3><span class="badge {{if eq .State "running"}}active{{else if eq .State "stale"}}warning{{end}}">{{.State}}</span></div>
-            <dl>{{if .Topology}}<dt>Topology</dt><dd>{{.Topology}}</dd>{{end}}{{if .Network}}<dt>Network</dt><dd>{{.Network}}</dd>{{end}}<dt>Ready</dt><dd>{{if .Ready}}yes{{else}}no{{end}}</dd></dl>
-            {{if .Services}}
-            {{$cluster := .}}
-            <div class="cluster-services">
-              <nav class="cluster-service-tabs" role="tablist" aria-label="{{.Label}} services">
-                {{range $index, $service := .Services}}<button id="cluster-{{$cluster.Kind}}-service-tab-{{$index}}" type="button" class="quiet {{if eq $index 0}}active{{end}}" role="tab" aria-selected="{{if eq $index 0}}true{{else}}false{{end}}" aria-controls="cluster-{{$cluster.Kind}}-service-{{$index}}" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-cluster-service-tab="{{$index}}">{{$service.Label}}</button>{{end}}
-              </nav>
-              {{range $index, $service := .Services}}
-              <section id="cluster-{{$cluster.Kind}}-service-{{$index}}" class="cluster-service-panel {{if eq $index 0}}active{{end}}" role="tabpanel" aria-labelledby="cluster-{{$cluster.Kind}}-service-tab-{{$index}}" data-cluster-service-panel="{{$index}}">
-                {{if $service.URL}}<div class="service-link"><span>Link</span><a href="{{$service.URL}}" target="_blank" rel="noreferrer">{{$service.URL}}</a></div>{{end}}
-                {{range $service.Accounts}}
-                <section class="cluster-account">
-                  <h4>{{.Label}}</h4>
-                  {{range .Fields}}
-                  <label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}" {{if .Secret}}type="password" autocomplete="off" data-secret-field{{end}}><button type="button" data-copy>Copy</button>{{if .Secret}}<button type="button" class="quiet" data-reveal-secret>Reveal</button>{{end}}</div></label>
-                  {{end}}
-                </section>
-                {{end}}
-              </section>
-              {{end}}
-            </div>
-            {{end}}
-            {{if .Commands}}<section class="cluster-commands"><h4>Connect</h4>{{range .Commands}}<label>{{.Label}}<div class="copy-row"><input readonly value="{{.Value}}"><button type="button" data-copy>Copy</button></div></label>{{end}}</section>{{end}}
-            {{if $.Session.Interactive}}<footer class="cluster-footer"><button type="button" class="danger" data-release-cluster="{{.Kind}}">Release cluster</button></footer>{{end}}
-          </article>
-        {{else}}<p class="empty">No development cluster state for this session.</p>{{end}}
-        </div>
+        {{template "clusters" .}}
       </section>
 
       <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel" aria-labelledby="session-tab-artifacts">

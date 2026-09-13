@@ -322,3 +322,39 @@ func statusHelper(t *testing.T, payload string) string {
 	}
 	return helper
 }
+
+func TestBusyStatusRetainsLastObservationAndScopesFailures(t *testing.T) {
+	workspace := t.TempDir()
+	helper := filepath.Join(t.TempDir(), "helper")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+body+"\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := Runner{Workspace: workspace, Providers: []Provider{{Name: "alpha", Label: "Alpha", Helper: helper}}, Cache: &StatusCache{}}
+	write(`echo '{"schema":2,"found":true,"kind":"alpha","state":"running","ready":true,"services":[]}'`)
+	states, err := runner.Inspect("example")
+	if err != nil || len(states) != 1 {
+		t.Fatalf("initial: %v %v", states, err)
+	}
+	write("exit 75")
+	states, err = runner.Inspect("example")
+	if err != nil || len(states) != 1 || states[0].State != "running" || !states[0].Ready || !strings.Contains(states[0].Notice, "changing") {
+		t.Fatalf("busy: %v %v", states, err)
+	}
+	states, err = runner.Inspect("another")
+	if err != nil || states[0].State != "changing" || states[0].Ready {
+		t.Fatalf("other session: %v %v", states, err)
+	}
+	write("echo broken >&2; exit 1")
+	states, err = runner.Inspect("example")
+	if err == nil || len(states) != 1 || states[0].Kind != "alpha" || !strings.Contains(states[0].Notice, "broken") {
+		t.Fatalf("failure: %v %v", states, err)
+	}
+	write(`echo '{"schema":2,"found":true,"kind":"alpha","state":"stopped","ready":false,"services":[]}'`)
+	states, err = runner.Inspect("example")
+	if err != nil || states[0].State != "stopped" || states[0].Notice != "" {
+		t.Fatalf("stopped: %v %v", states, err)
+	}
+}

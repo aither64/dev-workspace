@@ -2,6 +2,7 @@
   "developmentClusterStateSchema": 1,
   "developmentClusterTransitionPolicy": 2,
   "runtimeAuthorityIdentityPolicy": 1,
+  "clusterProvider": { "statusBusyExitCode": 75, "releaseTimeoutSeconds": 180 },
   "trackingMaxBytes": 8388608,
   "maxMessageBytes": 20000,
   "formEncodingExpansion": 3,

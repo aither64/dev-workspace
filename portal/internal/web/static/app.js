@@ -962,7 +962,9 @@
         const clusters = card.querySelector("[data-session-clusters]");
         if (clusters) {
           clusters.textContent = `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}`;
-          clusters.hidden = item.runningClusters === 0;
+          if (item.clusterNotice) clusters.textContent = item.runningClusters ? `${clusters.textContent} · Status updating` : "Cluster status updating";
+          clusters.title = item.clusterNotice || "";
+          clusters.hidden = item.runningClusters === 0 && !item.clusterNotice;
         }
         const lifecycle = card.querySelector("[data-session-lifecycle]");
         if (lifecycle) {
@@ -1194,14 +1196,14 @@
   });
   if (modelSelects.length) loadModels();
 
-  document.querySelectorAll("[data-copy]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const input = button.parentElement.querySelector("input");
-      await navigator.clipboard.writeText(input.value);
-      const old = button.textContent;
-      button.textContent = "Copied";
-      setTimeout(() => { button.textContent = old; }, 1000);
-    });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-copy]");
+    if (!button) return;
+    const input = button.parentElement.querySelector("input");
+    await navigator.clipboard.writeText(input.value);
+    const old = button.textContent;
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = old; }, 1000);
   });
 
   const sessionTabBar = document.querySelector('[aria-label="Session sections"]');
@@ -1535,6 +1537,8 @@
   let detailsRunning = false;
   let lastRepositoriesHTML = "";
   let lastArtifactsHTML = "";
+  let lastClustersHTML = "";
+  let releasingCluster = false;
   const refreshSessionDetails = async () => {
     if (detailsRunning || document.hidden || !artifactList) return;
     if (detailsTimer !== null) clearTimeout(detailsTimer);
@@ -1542,6 +1546,16 @@
     const warning = document.getElementById("session-details-warning");
     try {
       const payload = await client.details();
+      if (!releasingCluster && typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
+        const clusters = document.getElementById("clusters");
+        const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
+        clusters.innerHTML = payload.clustersHTML;
+        lastClustersHTML = payload.clustersHTML;
+        for (const [kind, service] of selected) {
+          const card = Array.from(clusters.querySelectorAll("[data-cluster]")).find(card => card.dataset.cluster === kind);
+          Array.from(card?.querySelectorAll("[data-cluster-service-tab]") || []).find(tab => tab.dataset.clusterServiceTab === service)?.click();
+        }
+      }
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;
@@ -1570,6 +1584,7 @@
       }
       for (const [section, label, count] of [
         ["repositories", "Repositories", payload.repositoryCount], ["artifacts", "Artifacts", payload.artifactCount],
+        ["clusters", "Clusters", payload.clusterCount],
       ]) {
         const tab = document.querySelector(`[data-session-tab="${section}"]`);
         const title = `${label} (${count})`;
@@ -2892,46 +2907,36 @@
     });
   }
 
-  document.querySelectorAll("[data-release-cluster]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const kind = button.dataset.releaseCluster;
-      if (!confirm("Stop this development cluster and remove its temporary state?")) return;
-      button.disabled = true;
-      button.textContent = "Releasing…";
-      try {
-        await client.releaseCluster(kind);
-        location.reload();
-      } catch (error) {
-        alert(error.message);
-        button.disabled = false;
-        button.textContent = "Release cluster";
-      }
-    });
-  });
-
-  document.querySelectorAll("[data-cluster]").forEach((clusterCard) => {
-    const tabs = Array.from(clusterCard.querySelectorAll("[data-cluster-service-tab]"));
-    const panels = Array.from(clusterCard.querySelectorAll("[data-cluster-service-panel]"));
-    tabs.forEach((tab) => tab.addEventListener("click", () => {
-      tabs.forEach((candidate) => {
+  document.getElementById("clusters")?.addEventListener("click", async (event) => {
+    const release = event.target.closest("[data-release-cluster]");
+    if (release) {
+      if (releasingCluster || !confirm("Stop this development cluster and remove its temporary state?")) return;
+      releasingCluster = true;
+      release.disabled = true;
+      release.textContent = "Releasing…";
+      try { await client.releaseCluster(release.dataset.releaseCluster); location.reload(); }
+      catch (error) { alert(error.message); release.disabled = false; release.textContent = "Release cluster"; }
+      finally { releasingCluster = false; }
+      return;
+    }
+    const tab = event.target.closest("[data-cluster-service-tab]");
+    if (tab) {
+      const card = tab.closest("[data-cluster]");
+      card.querySelectorAll("[data-cluster-service-tab]").forEach(candidate => {
         const selected = candidate === tab;
         candidate.classList.toggle("active", selected);
         candidate.setAttribute("aria-selected", selected ? "true" : "false");
         candidate.tabIndex = selected ? 0 : -1;
       });
-      panels.forEach((panel) => panel.classList.toggle(
-        "active", panel.dataset.clusterServicePanel === tab.dataset.clusterServiceTab,
-      ));
-    }));
-  });
-  document.querySelectorAll("[data-reveal-secret]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const input = button.parentElement.querySelector("[data-secret-field]");
-      if (!input) return;
-      const reveal = input.type === "password";
-      input.type = reveal ? "text" : "password";
-      button.textContent = reveal ? "Hide" : "Reveal";
-    });
+      card.querySelectorAll("[data-cluster-service-panel]").forEach(panel => panel.classList.toggle("active", panel.dataset.clusterServicePanel === tab.dataset.clusterServiceTab));
+    }
+    const reveal = event.target.closest("[data-reveal-secret]");
+    if (reveal) {
+      const input = reveal.parentElement.querySelector("[data-secret-field]");
+      const visible = input.type === "password";
+      input.type = visible ? "text" : "password";
+      reveal.textContent = visible ? "Hide" : "Reveal";
+    }
   });
 
   sync = conversationAssets.createConversationSync({

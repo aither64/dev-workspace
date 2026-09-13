@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 type Link struct {
@@ -75,6 +76,7 @@ type Status struct {
 	Kind        string       `json:"kind"`
 	Label       string       `json:"label"`
 	State       string       `json:"state"`
+	Notice      string       `json:"notice,omitempty"`
 	Ready       bool         `json:"ready"`
 	Topology    string       `json:"topology,omitempty"`
 	Network     string       `json:"network,omitempty"`
@@ -87,6 +89,37 @@ type Status struct {
 type Runner struct {
 	Workspace string
 	Providers []Provider
+	Cache     *StatusCache
+}
+
+// StatusCache retains the last successful observation during a provider mutation.
+// It is private to one workspace runner and is never persisted.
+type StatusCache struct {
+	mu     sync.Mutex
+	values map[string]Status
+}
+
+func (c *StatusCache) observe(key string, status Status, found bool, notice string) Status {
+	if c == nil {
+		status.Notice = notice
+		return status
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.values == nil {
+		c.values = make(map[string]Status)
+	}
+	if notice != "" {
+		if previous, ok := c.values[key]; ok {
+			status = previous
+		}
+		status.Notice = notice
+	} else if found {
+		c.values[key] = status
+	} else {
+		delete(c.values, key)
+	}
+	return status
 }
 
 type Provider struct {
@@ -126,10 +159,14 @@ func (r Runner) InspectContext(ctx context.Context, slug string) ([]Status, erro
 	var problems []error
 	for index, provider := range providers {
 		result := results[index]
+		notice := result.status.Notice
 		if result.err != nil {
 			problems = append(problems, fmt.Errorf("inspect %s cluster: %w", provider.Name, result.err))
-			continue
+			result.status = Status{Kind: provider.Name, Label: provider.Label, State: "unavailable"}
+			result.found = true
+			notice = "Status unavailable: " + result.err.Error()
 		}
+		result.status = r.Cache.observe(slug+"\x00"+provider.Name, result.status, result.found, notice)
 		if result.found {
 			statuses = append(statuses, result.status)
 		}
@@ -208,6 +245,10 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace)
 	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
+		var exitError *exec.ExitError
+		if ctx.Err() == nil && errors.As(err, &exitError) && exitError.ExitCode() == session.ClusterProvider().StatusBusyExitCode {
+			return Status{Kind: provider.Name, Label: provider.Label, State: "changing", Notice: "Cluster is changing. Status will update when the operation finishes."}, true, nil
+		}
 		message := strings.TrimSpace(string(output))
 		if message == "" {
 			message = err.Error()
@@ -230,7 +271,7 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 	if (response.Schema != 1 && response.Schema != 2) || response.Kind != provider.Name {
 		return Status{}, false, errors.New("development cluster helper returned an incompatible status")
 	}
-	if response.Label != "" {
+	if response.Label != "" || response.Notice != "" {
 		return Status{}, false, errors.New("development cluster helper returned an invalid status")
 	}
 	if !response.Found {

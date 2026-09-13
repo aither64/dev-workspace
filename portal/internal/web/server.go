@@ -99,6 +99,7 @@ type indexSessionStatus struct {
 	Archived         bool      `json:"archived"`
 	RepositoryCount  int       `json:"repositoryCount"`
 	RunningClusters  int       `json:"runningClusters"`
+	ClusterNotice    string    `json:"clusterNotice,omitempty"`
 	PendingLifecycle string    `json:"pendingLifecycle,omitempty"`
 }
 
@@ -275,7 +276,7 @@ func New(config Config) (*Server, error) {
 		config:           config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
 		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
-		clusters:         cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders},
+		clusters:         cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders, Cache: &cluster.StatusCache{}},
 		repositoryCache:  make(map[string]cachedRepositories),
 		messageLocks:     make(map[string]conversation.MutationLocker),
 		operations:       operations,
@@ -641,9 +642,10 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 	}
 
 	type clusterCount struct {
-		slug  string
-		count int
-		err   error
+		slug   string
+		count  int
+		notice string
+		err    error
 	}
 	clusterResults := make(chan clusterCount, len(summaries))
 	var clusterWait sync.WaitGroup
@@ -676,12 +678,16 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 					}
 					clusters, inspectErr := s.clusters.InspectContext(ctx, slug)
 					count := 0
+					var notices []string
 					for _, item := range clusters {
+						if item.Notice != "" {
+							notices = append(notices, item.Label+": "+item.Notice)
+						}
 						if item.State == "running" {
 							count++
 						}
 					}
-					clusterResults <- clusterCount{slug: slug, count: count, err: inspectErr}
+					clusterResults <- clusterCount{slug: slug, count: count, notice: strings.Join(notices, " "), err: inspectErr}
 				}(summary.Slug)
 			}
 		}
@@ -704,11 +710,15 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 		}
 	}
 	clustersBySlug := make(map[string]int)
+	clusterNotices := make(map[string]string)
 	for item := range clusterResults {
 		clustersBySlug[item.slug] = item.count
+		clusterNotices[item.slug] = item.notice
 		if item.err != nil {
 			s.config.Logger.Printf("inspect clusters for %s: %v", item.slug, item.err)
-			result.warning = "Some development cluster status is unavailable."
+			if item.notice == "" {
+				clusterNotices[item.slug] = "Cluster status is temporarily unavailable."
+			}
 		}
 	}
 	for _, summary := range summaries {
@@ -737,7 +747,7 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 		result.statuses = append(result.statuses, indexSessionStatus{
 			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived,
 			RepositoryCount: len(summary.Repositories),
-			RunningClusters: clustersBySlug[summary.Slug], PendingLifecycle: pending,
+			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pending,
 		})
 	}
 	return result
@@ -837,11 +847,9 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	data.Repositories = s.repository.Skeleton(summary.Slug, summary.Repositories, summary.Archived)
 	data.Clusters, err = s.clusters.InspectContext(r.Context(), summary.Slug)
 	if err != nil {
-		if data.Error != "" {
-			data.Error += "; "
-		}
-		data.Error += "Some development cluster details are unavailable: " + err.Error()
+		s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, err)
 	}
+
 	data.Artifacts = session.AvailableArtifacts(summary)
 	if receipt, ok := s.currentCreation(slug); ok && receipt.State == "conflict" {
 		if data.Error != "" {
@@ -873,10 +881,23 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render artifacts"})
 		return
 	}
+	if !summary.Archived && s.clusters.MayExist(summary.Slug) {
+		var inspectErr error
+		data.Clusters, inspectErr = s.clusters.InspectContext(r.Context(), summary.Slug)
+		if inspectErr != nil {
+			s.config.Logger.Printf("refresh clusters for %s: %v", summary.Slug, inspectErr)
+		}
+	}
+	var clusters bytes.Buffer
+	if err := s.templates.ExecuteTemplate(&clusters, "clusters", data); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render clusters"})
+		return
+	}
+
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
-		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts),
+		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
 	})
 }
 
@@ -1743,7 +1764,7 @@ func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary 
 	if !s.decodeJSON(w, r, &body) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(session.ClusterProvider().ReleaseTimeoutSeconds)*time.Second)
 	defer cancel()
 	if err := s.clusters.Release(ctx, strings.TrimSpace(body.Kind), summary.Slug); err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})

@@ -186,3 +186,20 @@ rollback. CI runs it with KVM on `master` and manual dispatch. Dispatch feature
 VM tests after mandatory review; package and focused checks run on every push
 and pull request. Keep normal dependency-update CI below the 20-minute target
 and inspect cold-run timings when changing its workload.
+
+### Cluster provider status and shutdown contract
+
+`runtime-contract.json` publishes the provider contract. A successful `status`
+command exits zero and prints its validated JSON state. Exit code
+`clusterProvider.statusBusyExitCode` (75) is reserved for a concurrent transition:
+providers return it promptly without a status document. The portal keeps the
+last valid state and displays a local update notice. Other failures indicate
+unavailable status. Readiness and credentials are replaced by the next complete
+status response, including an empty response after reset.
+
+The portal gives a release/reset operation
+`clusterProvider.releaseTimeoutSeconds` (180 seconds). Providers must budget
+guest shutdown, forced reaping, runner cleanup, and command completion within
+that ceiling. Providers own their internal shutdown budgets and test them against
+the runtime contract. These fields are additive package metadata; they do not
+change persisted cluster state or its transition policy.

@@ -3983,3 +3983,52 @@ func webGitOutput(t *testing.T, args ...string) string {
 	}
 	return string(output)
 }
+
+func TestSessionDetailsReplaceClusterStateAfterStopAndReset(t *testing.T) {
+	server := newTestServer(t)
+	helper := filepath.Join(t.TempDir(), "provider")
+	state := filepath.Join(server.config.Workspace, ".dev-clusters", "alpha", "clusters", "example")
+	if err := os.MkdirAll(state, 0755); err != nil {
+		t.Fatal(err)
+	}
+	server.clusters = cluster.Runner{Workspace: server.config.Workspace, Cache: &cluster.StatusCache{}, Providers: []cluster.Provider{{Name: "alpha", Label: "Alpha", Helper: helper}}}
+	summary := &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true}
+	read := func(script string) string {
+		t.Helper()
+		if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+script+"\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		server.sessionDetails(response, httptest.NewRequest("GET", "/api/sessions/example/details", nil), summary)
+		if response.Code != 200 {
+			t.Fatal(response.Body.String())
+		}
+		var payload struct {
+			ClustersHTML string `json:"clustersHTML"`
+			ClusterCount int    `json:"clusterCount"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.ClustersHTML
+	}
+	running := read(`printf '%s' '{"schema":2,"kind":"alpha","found":true,"state":"running","ready":true,"services":[{"label":"Web UI","accounts":[{"label":"Admin","fields":[{"label":"Password","value":"temporary-secret","secret":true}]}]}]}'`)
+	if !strings.Contains(running, "temporary-secret") {
+		t.Fatal("missing running credentials")
+	}
+	busy := read("exit 75")
+	if !strings.Contains(busy, "temporary-secret") || !strings.Contains(busy, "Cluster is changing") {
+		t.Fatalf("lost transition context: %s", busy)
+	}
+	stopped := read(`printf '%s' '{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}'`)
+	if strings.Contains(stopped, "temporary-secret") || !strings.Contains(stopped, ">stopped<") {
+		t.Fatalf("stale stopped state: %s", stopped)
+	}
+	if err := os.RemoveAll(state); err != nil {
+		t.Fatal(err)
+	}
+	absent := read("exit 1")
+	if strings.Contains(absent, "data-cluster=") || !strings.Contains(absent, "No development cluster state") {
+		t.Fatalf("stale reset state: %s", absent)
+	}
+}

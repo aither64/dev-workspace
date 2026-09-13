@@ -29,10 +29,18 @@ type TmuxMetadata struct {
 	Environment     []TmuxMetadataValue `json:"environment"`
 }
 
+type ClusterProviderContract struct {
+	StatusBusyExitCode    int `json:"statusBusyExitCode"`
+	ReleaseTimeoutSeconds int `json:"releaseTimeoutSeconds"`
+}
+
+func ClusterProvider() ClusterProviderContract { return sharedRuntimeContract.ClusterProvider }
+
 type runtimeContract struct {
-	TrackingMaxBytes  int                `json:"trackingMaxBytes"`
-	LifecycleJournals []LifecycleJournal `json:"lifecycleJournals"`
-	TmuxMetadata      TmuxMetadata       `json:"tmuxMetadata"`
+	ClusterProvider   ClusterProviderContract `json:"clusterProvider"`
+	TrackingMaxBytes  int                     `json:"trackingMaxBytes"`
+	LifecycleJournals []LifecycleJournal      `json:"lifecycleJournals"`
+	TmuxMetadata      TmuxMetadata            `json:"tmuxMetadata"`
 }
 
 var sharedRuntimeContract = mustLoadRuntimeContract()
@@ -44,6 +52,9 @@ func mustLoadRuntimeContract() runtimeContract {
 	}
 	if contract.TrackingMaxBytes != TrackingMaxSize {
 		panic("workspace runtime contract has a mismatched tracking limit")
+	}
+	if contract.ClusterProvider.StatusBusyExitCode != 75 || contract.ClusterProvider.ReleaseTimeoutSeconds <= 0 {
+		panic("invalid cluster provider contract")
 	}
 	seenNames := make(map[string]struct{})
 	seenCommands := make(map[string]struct{})
