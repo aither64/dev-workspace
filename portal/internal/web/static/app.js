@@ -58,6 +58,28 @@
     snooze: conversation?.snooze,
     eventsPath: conversation?.eventsPath,
   });
+  const currentCompletedPlan = (payload) => payload.latestTurnId ?
+    [...(payload.entries || [])].reverse().find((entry) => (
+      entry.turnId === payload.latestTurnId && entry.kind === "plan" &&
+      entry.turnStatus === "completed" && (entry.text || "").trim()
+    )) : undefined;
+  const planIdentity = (turnId, digest) => JSON.stringify([turnId, digest]);
+  const pendingPlanImplementation = (attempts, digest) => [...attempts].some((entry) => (
+    entry.message === "Implement the plan." && entry.context === `plan:${digest}`
+  ));
+  const setPlanDecisionVisible = (panel, form, visible, focusComposer = false) => {
+    if (!panel || !form) return;
+    const document = form.ownerDocument;
+    const moveFocus = visible ? form.contains(document.activeElement) : panel.contains(document.activeElement);
+    if (visible) {
+      form.querySelectorAll(":popover-open").forEach((menu) => menu.hidePopover());
+    }
+    panel.hidden = !visible;
+    form.hidden = visible;
+    panel.closest(".chat-panel")?.classList.toggle("plan-decision", visible);
+    if (visible && moveFocus) panel.querySelector("#plan-keep-planning")?.focus();
+    if (!visible && (focusComposer || moveFocus)) form.querySelector("textarea")?.focus();
+  };
   const setControlLabel = (control, label) => {
     const target = control.querySelector(".rail-label") || control;
     target.textContent = label;
@@ -601,6 +623,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
+      currentCompletedPlan, planIdentity, pendingPlanImplementation, setPlanDecisionVisible,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -1659,7 +1682,8 @@
     disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
   }]));
   let planRenderGeneration = 0;
-  let dismissedPlanSHA = "";
+  let dismissedPlanIdentity = "";
+  let planImplementationInFlight = false;
   const pendingMessages = new Map();
   const inFlightMessageIDs = new Set();
   let sendReceiptAcknowledgementActive = false;
@@ -1808,26 +1832,30 @@
     const panel = document.getElementById("plan-actions");
     if (!panel) return;
     const generation = ++planRenderGeneration;
-    const plan = [...(payload.entries || [])].reverse().find((entry) => (
-      entry.kind === "plan" && entry.turnStatus === "completed" && (entry.text || "").trim()
-    ));
-    const pendingImplementation = Array.from(pendingMessages.values()).some((entry) => (
-      entry.message === "Implement the plan."
-    ));
-    const eligibleMode = payload.collaborationMode === "plan" ||
-      (payload.collaborationMode === "default" && pendingImplementation);
-    if (!plan || payload.status === "active" || !eligibleMode) {
-      panel.hidden = true;
+    const plan = currentCompletedPlan(payload);
+    const eligibleMode = ["plan", "default"].includes(payload.collaborationMode);
+    if (!plan || payload.status === "active" || !eligibleMode || planImplementationInFlight) {
+      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
       return;
+    }
+    // Hide an obsolete decision immediately while the new content is hashed.
+    if (panel.dataset.planTurnId !== plan.turnId || panel.planText !== plan.text) {
+      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
     }
     const digest = await sha256Hex(plan.text);
     if (generation !== planRenderGeneration) return;
+    const pendingImplementation = pendingPlanImplementation(pendingMessages.values(), digest);
+    if (payload.collaborationMode === "default" && !pendingImplementation) {
+      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
+      return;
+    }
     panel.dataset.planTurnId = plan.turnId;
     panel.dataset.planSha256 = digest;
     panel.planText = plan.text;
     const sameButton = document.getElementById("plan-implement-same");
     if (sameButton) sameButton.textContent = pendingImplementation ? "Check request" : "Implement here";
-    panel.hidden = digest === dismissedPlanSHA;
+    setPlanDecisionVisible(panel, document.getElementById("message-form"),
+      planIdentity(plan.turnId, digest) !== dismissedPlanIdentity);
   };
 
   let transcriptUserScroll = false;
@@ -2681,8 +2709,9 @@
 
   const planActions = document.getElementById("plan-actions");
   document.getElementById("plan-keep-planning")?.addEventListener("click", () => {
-    dismissedPlanSHA = planActions?.dataset.planSha256 || "";
-    if (planActions) planActions.hidden = true;
+    dismissedPlanIdentity = planIdentity(planActions.dataset.planTurnId, planActions.dataset.planSha256);
+    ++planRenderGeneration;
+    setPlanDecisionVisible(planActions, document.getElementById("message-form"), false, true);
   });
   document.getElementById("plan-implement-same")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
@@ -2706,6 +2735,9 @@
     pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
     renderMessageReceipts();
     button.disabled = true;
+    planImplementationInFlight = true;
+    ++planRenderGeneration;
+    const implementingIdentity = planIdentity(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     try {
       const receipt = await client.implementPlan({
         action: "same",
@@ -2716,7 +2748,9 @@
       acceptMessageReceipt(attempt, receipt);
       currentMode = "default";
       followTranscript();
-      planActions.hidden = true;
+      dismissedPlanIdentity = implementingIdentity;
+      ++planRenderGeneration;
+      setPlanDecisionVisible(planActions, document.getElementById("message-form"), false);
       renderMessageReceipts();
       applyCurrentSettings();
       scheduleRefresh(0);
@@ -2725,6 +2759,8 @@
       button.disabled = false;
       alert(error.message);
     } finally {
+      planImplementationInFlight = false;
+      button.disabled = false;
       inFlightMessageIDs.delete(id);
       scheduleRefresh(0);
     }
