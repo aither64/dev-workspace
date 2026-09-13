@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/codex/assets/uploads.css">
+  <link rel="stylesheet" href="/codex/assets/uploads.css?v=2">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
   <div class="workspace-shell index-shell">
@@ -49,7 +49,7 @@
         <input type="hidden" name="uploadScope">
         <div id="creation-uploads"></div>
         <p id="new-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
-        <button type="submit">Create session</button>
+        <div class="creation-actions"><span id="creation-upload-controls"></span><button type="submit">Create session</button></div>
       </form>
     </section>
 

@@ -8,7 +8,7 @@
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=4">
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/codex/assets/uploads.css">
+  <link rel="stylesheet" href="/codex/assets/uploads.css?v=2">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
@@ -79,7 +79,7 @@
         <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
           <div id="message-uploads"></div>
-          <div class="chat-actions"><div><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button></div><div class="composer-controls"><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><label class="compact-select"><span>Model</span><select id="codex-model" data-model-select data-existing-settings="true" required><option value="">Loading models…</option></select></label><label class="compact-select"><span>Reasoning</span><select id="codex-effort" data-effort-select data-existing-settings="true"><option value="">Loading efforts…</option></select></label><span id="codex-settings-status" class="visually-hidden" aria-live="polite"></span><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
+          <div class="chat-actions"><div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button></div><div class="composer-controls"><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><label class="compact-select"><span>Model</span><select id="codex-model" data-model-select data-existing-settings="true" required><option value="">Loading models…</option></select></label><label class="compact-select"><span>Reasoning</span><select id="codex-effort" data-effort-select data-existing-settings="true"><option value="">Loading efforts…</option></select></label><span id="codex-settings-status" class="visually-hidden" aria-live="polite"></span><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
         </form>
         {{end}}
       </section>

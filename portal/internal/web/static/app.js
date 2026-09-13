@@ -628,7 +628,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=5");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=6");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -978,12 +978,13 @@
           }
           creationUploads = conversationAssets.mountUploads(uploadRoot, {
             basePath: scope.url, dropTarget: form, storage,
+            controlsRoot: document.getElementById("creation-upload-controls"),
             storageKey: `workspace-portal.upload-draft.${scope.id}`,
             onChange: ({ready, count}) => { form.elements.goal.required = !count; form.querySelector('button[type="submit"]').disabled = !ready; },
           });
           form.elements.uploadScope.value = scope.id;
           await creationUploads.initialized;
-        } catch (error) { uploadRoot.textContent = error.message; }
+        } catch (error) { uploadRoot.textContent = error.message; uploadRoot.hidden = false; }
       };
       void initCreationUploads();
     }
@@ -2559,6 +2560,7 @@
     const textarea = form.elements.message;
     composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
       basePath: `/uploads/s-${encodeURIComponent(slug)}`, dropTarget: form,
+      controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,
       onChange: ({ready, count}) => { composerUploadReady = ready; textarea.required = !count; updateMessageActions(); },
     });
