@@ -51,10 +51,11 @@ type creationReceipt struct {
 }
 
 type creationStatus struct {
-	StartedAt    string `json:"startedAt"`
-	UpdatedAt    string `json:"updatedAt"`
-	SourceURL    string `json:"sourceUrl,omitempty"`
-	CanonicalURL string `json:"canonicalUrl,omitempty"`
+	InitialRequest string `json:"initialRequest,omitempty"`
+	StartedAt      string `json:"startedAt"`
+	UpdatedAt      string `json:"updatedAt"`
+	SourceURL      string `json:"sourceUrl,omitempty"`
+	CanonicalURL   string `json:"canonicalUrl,omitempty"`
 
 	Slug      string `json:"slug"`
 	URL       string `json:"url"`
@@ -74,7 +75,14 @@ func (receipt creationReceipt) status() creationStatus {
 	if receipt.State == "conflict" {
 		canonicalURL = "/" + receipt.Request.Slug + "/"
 	}
-	return creationStatus{CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: "/" + receipt.Request.Slug + "/", ReceiptID: receipt.ReceiptID,
+	goal := receipt.Goal
+	if goal == "" {
+		goal = receipt.Request.Goal
+	}
+	if goal == "" && receipt.Request.Kind == "plan" && receipt.Request.PlanText != "" {
+		goal = planCreationGoal(receipt.Request.Source, receipt.Request.PlanText)
+	}
+	return creationStatus{InitialRequest: goal, CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: "/" + receipt.Request.Slug + "/", ReceiptID: receipt.ReceiptID,
 		Attempt: receipt.Attempt, State: receipt.State, Phase: receipt.Phase, Error: receipt.Error,
 		StartedAt: receipt.StartedAt, UpdatedAt: receipt.UpdatedAt, SourceURL: sourceURL}
 }

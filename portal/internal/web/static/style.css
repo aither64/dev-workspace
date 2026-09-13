@@ -371,3 +371,5 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .codex-work { flex-wrap: wrap; }
 .codex-work.waiting { border-color: #66532e; background: #211d14; color: var(--warning); }
 #codex-work-counts { color: var(--muted); }
+
+.creation-request { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }

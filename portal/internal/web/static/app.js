@@ -991,9 +991,34 @@
       if (!indexNavigationPending) indexRefreshTimer = setTimeout(refreshIndexStatus, nextRefresh);
     }
   };
+  let creationDraft = null;
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
     let creationUploads = null;
+    let creationDraftStorage;
+    const creationDraftKey = "workspace-portal.creation-draft";
+    try { creationDraftStorage = globalThis.sessionStorage; } catch (_) {}
+    const saveCreationDraft = () => {
+      try {
+        creationDraftStorage?.setItem(creationDraftKey, JSON.stringify({
+          name: form.elements.name.value, goal: form.elements.goal.value,
+          date: form.elements.creation_date.value,
+          model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
+        }));
+      } catch (_) {}
+    };
+    if (form) {
+      try {
+        const draft = JSON.parse(creationDraftStorage?.getItem(creationDraftKey) || "null");
+        if (draft && typeof draft.name === "string" && typeof draft.goal === "string" &&
+            /^\d{4}-\d{2}-\d{2}$/.test(draft.date)) {
+          creationDraft = draft;
+          form.elements.name.value = draft.name; form.elements.goal.value = draft.goal;
+          form.elements.creation_date.value = draft.date;
+        }
+      } catch (_) {}
+      form.addEventListener("input", saveCreationDraft);
+    }
     if (form) {
       const uploadRoot = document.getElementById("creation-uploads");
       const storage = globalThis.localStorage;
@@ -1020,7 +1045,9 @@
       };
       void initCreationUploads();
     }
-    form?.addEventListener("submit", (event) => {
+    form?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      saveCreationDraft();
       if (creationUploads && !creationUploads.ready()) { event.preventDefault(); return; }
       form.querySelectorAll('input[name="attachmentIds"]').forEach((input) => input.remove());
       for (const id of creationUploads?.ids() || []) {
@@ -1032,7 +1059,28 @@
       const button = form.querySelector('button[type="submit"]');
       if (button) button.disabled = true;
       const progress = document.getElementById("new-session-progress");
-      timedProgress(progress, "Creating session");
+      const creationProgress = timedProgress(progress, "Creating session");
+      try {
+        const response = await fetch("/sessions", {
+          method: "POST", credentials: "same-origin",
+          headers: {Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+          body: new URLSearchParams(new FormData(form)),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `Unable to create session (${response.status}).`);
+        if (!result.receiptId || !/^\/[A-Za-z0-9][A-Za-z0-9_-]*\/$/.test(result.url)) {
+          throw new Error("Unable to confirm session creation. Retry with the saved request.");
+        }
+        try { creationDraftStorage?.removeItem(creationDraftKey); } catch (_) {}
+        creationProgress.stop();
+        window.location.assign(result.url);
+      } catch (failure) {
+        creationProgress.fail(failure.message);
+        indexNavigationPending = false;
+        creationUploads?.lock(false);
+        if (button) button.disabled = false;
+        void refreshIndexStatus();
+      }
     });
     void refreshIndexStatus();
   }
@@ -1120,6 +1168,14 @@
         }
       }
       applyCurrentSettings();
+      if (creationDraft) {
+        const form = document.getElementById("new-session-form");
+        const model = form.elements.model, effort = form.elements.effort;
+        if (typeof creationDraft.model === "string" && Array.from(model.options).some(option => option.value === creationDraft.model)) {
+          model.value = creationDraft.model;
+          populateEfforts(model, effort, typeof creationDraft.effort === "string" ? creationDraft.effort : "");
+        }
+      }
     } catch (_error) {
       for (const modelSelect of modelSelects) {
         modelSelect.replaceChildren();

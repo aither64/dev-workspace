@@ -151,7 +151,7 @@ func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing
 	}
 	status := httptest.NewRecorder()
 	server.Handler().ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/sessions/"+slug+"/creation", nil))
-	if status.Code != http.StatusOK || strings.Contains(status.Body.String(), "Initial request") || !strings.Contains(status.Body.String(), "startedAt") {
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"initialRequest":"Initial request"`) || !strings.Contains(status.Body.String(), "startedAt") {
 		t.Fatalf("private status: %d %s", status.Code, status.Body.String())
 	}
 	var stored creationReceipt
@@ -1537,5 +1537,54 @@ func TestCreationHeadBaseArchiveHeadKeepsCanonicalHistoryAccessible(t *testing.T
 				}
 			})
 		}
+	}
+}
+
+func TestCreationPageRetainsPromptBeforeValidationAndAfterFailure(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	release := make(chan struct{})
+	defer close(release)
+	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}, release: release}
+	goal := "Original <script>alert(1)</script>\nsecond line"
+	receipt, err := server.acceptCreation(creationRequest{Kind: "new", Slug: "saved-prompt", Goal: goal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []string{"running", "failed", "paused"} {
+		receipt.State = state
+		server.operationMu.Lock()
+		server.creations[receipt.Request.Slug] = receipt
+		server.operationMu.Unlock()
+		page := httptest.NewRecorder()
+		server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/saved-prompt/", nil))
+		if page.Code != 200 || !strings.Contains(page.Body.String(), "Original &lt;script&gt;") || strings.Contains(page.Body.String(), "<script>alert") {
+			t.Fatalf("unsafe or missing prompt: %s", page.Body.String())
+		}
+		status := httptest.NewRecorder()
+		server.Handler().ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/sessions/saved-prompt/creation", nil))
+		var result creationStatus
+		if err := json.Unmarshal(status.Body.Bytes(), &result); err != nil || result.InitialRequest != goal {
+			t.Fatalf("status: %s (%v)", status.Body.String(), err)
+		}
+	}
+}
+
+func TestCreationJSONAcceptanceIncludesDurableRequest(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	request := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader("creation_date=2026-09-13&name=saved&goal=Keep+this+request"))
+	request.Header.Set("Origin", server.config.BaseURL)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept", "application/json")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	var status creationStatus
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil || response.Code != 202 || status.InitialRequest != "Keep this request" || status.ReceiptID == "" {
+		t.Fatalf("acceptance: %d %s (%v)", response.Code, response.Body.String(), err)
+	}
+	var saved creationReceipt
+	if err := readCreationJSON(server.creationPath(status.Slug), &saved); err != nil || saved.ReceiptID != status.ReceiptID {
+		t.Fatalf("not durably accepted: %v", err)
 	}
 }

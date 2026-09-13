@@ -1,4 +1,4 @@
-(() => {
+(async () => {
   "use strict";
   const slug = document.body.dataset.creation;
   if (!slug) return;
@@ -9,6 +9,14 @@
   const retry = document.getElementById("creation-retry");
   const elapsed = document.getElementById("creation-elapsed");
   const source = document.getElementById("creation-source");
+  const initialRequest = document.getElementById("creation-request");
+  const requestPanel = document.getElementById("creation-request-panel");
+  // The prompt is server-rendered, so asset or polling failures cannot hide it.
+  void import("/codex/assets/conversation.js").then(({createCopyButton}) => {
+    document.getElementById("creation-request-copy").append(createCopyButton({
+      getText: () => initialRequest.textContent, label: "Copy initial request",
+    }));
+  }).catch(() => {});
   let receipt;
   let retrying = false;
   async function request(url, options) {
@@ -19,6 +27,10 @@
   }
   function render(next) {
     receipt = next;
+    if (next.initialRequest) {
+      if (initialRequest.textContent !== next.initialRequest) initialRequest.textContent = next.initialRequest;
+      requestPanel.hidden = false;
+    }
     if (next.state === "ready" || next.state === "conflict") {
       window.location.replace(`/${encodeURIComponent(slug)}/`);
       return;

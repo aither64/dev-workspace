@@ -177,6 +177,7 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
+	InitialRequest    string
 	StyleNonce        string
 	BaseURL           string
 	DisplayLabel      string
@@ -961,6 +962,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.uploadStore.RetainCreations(r.Context(), map[string]uploads.Scope{goal: {Slug: receipt.Request.Slug, Epoch: receipt.DeletionHistorySHA256}}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "Session creation was accepted; reload to check its progress")
+		return
+	}
+	if r.Header.Get("Accept") == "application/json" {
+		s.writeJSON(w, http.StatusAccepted, receipt.status())
 		return
 	}
 	http.Redirect(w, r, receipt.status().URL, http.StatusSeeOther)
@@ -2491,7 +2496,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, message string) {
-	if strings.HasPrefix(r.URL.Path, "/api/") {
+	if strings.HasPrefix(r.URL.Path, "/api/") || r.Header.Get("Accept") == "application/json" {
 		s.writeJSON(w, status, map[string]string{"error": message})
 		return
 	}

@@ -21,6 +21,10 @@ import (
 
 // Match dev-session read_goal's Ruby String#strip boundary exactly. Captured
 // plan text keeps its original bytes; only the derived CLI goal is normalized.
+func planCreationGoal(source, plan string) string {
+	return normalizedCreationGoal("Implement the following approved plan from session " + source + ".\n\n" + plan)
+}
+
 func normalizedCreationGoal(goal string) string {
 	return strings.Trim(goal, " \t\n\v\f\r\x00")
 }
@@ -264,7 +268,7 @@ func (s *Server) creationPage(w http.ResponseWriter, r *http.Request, slug strin
 	if !ok || !receipt.blocksSession() {
 		return false
 	}
-	s.render(w, "creation", pageData{Session: &session.Summary{Manifest: session.Manifest{Slug: slug}}})
+	s.render(w, "creation", pageData{InitialRequest: receipt.status().InitialRequest, Session: &session.Summary{Manifest: session.Manifest{Slug: slug}}})
 	return true
 }
 
@@ -507,7 +511,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 				if request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
 					return errors.New("source model settings changed; review the plan before implementing it")
 				}
-				receipt.Goal = normalizedCreationGoal("Implement the following approved plan from session " + request.Source + ".\n\n" + plan.Text)
+				receipt.Goal = planCreationGoal(request.Source, plan.Text)
 				receipt.Model = transcript.Model
 				receipt.Effort = transcript.ReasoningEffort
 			} else {
