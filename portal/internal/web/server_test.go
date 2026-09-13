@@ -3819,17 +3819,19 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
-	uploadsResponse, err := http.Get(httpServer.URL + "/codex/assets/uploads.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	uploadAsset, err := io.ReadAll(uploadsResponse.Body)
-	uploadsResponse.Body.Close()
-	if err != nil || uploadsResponse.StatusCode != http.StatusOK {
-		t.Fatal("upload browser asset unavailable", err)
-	}
-	if err := os.WriteFile(filepath.Join(filepath.Dir(modulePath), "uploads.js"), uploadAsset, 0600); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"uploads.js", "sync.js"} {
+		dependency, err := http.Get(httpServer.URL + "/codex/assets/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(dependency.Body)
+		dependency.Body.Close()
+		if err != nil || dependency.StatusCode != http.StatusOK {
+			t.Fatal("browser dependency unavailable", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(modulePath), name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(modulePath, asset, 0o600); err != nil {
 		t.Fatal(err)

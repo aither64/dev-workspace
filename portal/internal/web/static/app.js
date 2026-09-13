@@ -660,7 +660,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=6");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=7");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -1680,9 +1680,7 @@
   const status = document.getElementById("codex-status");
   if (!transcript) return;
 
-  let refreshTimer = null;
-  let refreshRunning = false;
-  let refreshDirty = false;
+  let sync = null;
   let transcriptInitialized = false;
   let transcriptSignature = "";
   let transcriptFilter = "messages";
@@ -2134,7 +2132,7 @@
     });
   });
 
-  const renderThread = async (payload) => {
+  const renderThread = async (payload, isCurrent = () => true) => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
     currentThreadId = payload.threadId;
     loadMessageReceipts();
@@ -2144,7 +2142,9 @@
     const entries = payload.entries || [];
     const nextSignature = JSON.stringify(entries);
     const transcriptChanged = !transcriptInitialized || nextSignature !== transcriptSignature;
-    for (const observed of await markTranscriptMessagesObserved(pendingMessages, entries)) {
+    const observedMessages = await markTranscriptMessagesObserved(pendingMessages, entries);
+    if (!isCurrent()) return;
+    for (const observed of observedMessages) {
       storeSendAttempt(sendAttemptStorage, slug, currentThreadId, observed);
     }
     renderMessageReceipts();
@@ -2186,19 +2186,6 @@
     transcriptSignature = nextSignature;
     renderMessageReceipts();
     renderPlanActions(payload);
-  };
-
-  const refreshThread = async () => {
-    try {
-      await renderThread(await client.thread());
-    } catch (error) {
-      updateCodexWork(false);
-      status.textContent = "Offline";
-      status.className = "badge warning";
-      if (!transcript.children.length || transcript.querySelector(".empty")) transcript.innerHTML = `<p class="notice error"></p>`;
-      const notice = transcript.querySelector(".notice");
-      if (notice) notice.textContent = error.message;
-    }
   };
 
   const respond = async (id, payload, container) => {
@@ -2475,24 +2462,20 @@
     return box;
   };
 
-  const refreshPending = async () => {
+  let pendingSignature = null;
+  const renderPendingEntries = (entries) => {
     if (!interactive) return;
-    try {
-      const entries = await client.pending();
-      const currentInputIDs = new Set(entries.filter((entry) => entry.kind === "userInput").map((entry) => entry.id));
-      for (const id of requestInputDrafts.keys()) {
-        if (!currentInputIDs.has(id)) {
-          requestInputDrafts.delete(id);
-          deleteRequestInputDraft(requestInputDraftStorage, slug, currentThreadId, id);
-        }
+    const signature = JSON.stringify(entries);
+    if (signature === pendingSignature) return;
+    pendingSignature = signature;
+    const currentInputIDs = new Set(entries.filter((entry) => entry.kind === "userInput").map((entry) => entry.id));
+    for (const id of requestInputDrafts.keys()) {
+      if (!currentInputIDs.has(id)) {
+        requestInputDrafts.delete(id);
+        deleteRequestInputDraft(requestInputDraftStorage, slug, currentThreadId, id);
       }
-      pending.replaceChildren(...entries.map(renderApproval));
-    } catch (error) {
-      const notice = document.createElement("p");
-      notice.className = "notice error";
-      notice.textContent = `Unable to load pending requests: ${error.message}`;
-      pending.replaceChildren(notice);
     }
+    pending.replaceChildren(...entries.map(renderApproval));
   };
 
   const queuePanel = document.getElementById("queue-panel");
@@ -2533,43 +2516,10 @@
     }
   };
 
-  const refreshQueue = async () => {
-    if (!interactive) return;
-    try {
-      await client.reconcileQueue();
-      renderQueue(await client.queue());
-    } catch (error) {
-      if (!queuePanel || !queueList) return;
-      const notice = document.createElement("li");
-      notice.className = "notice error";
-      notice.textContent = `Unable to load queued messages: ${error.message}`;
-      queueList.replaceChildren(notice);
-      queuePanel.hidden = false;
-      if (queueStart) queueStart.hidden = true;
-    }
-  };
-
-  const refreshAll = async () => {
-    if (refreshRunning) {
-      refreshDirty = true;
-      return;
-    }
-    refreshRunning = true;
-    do {
-      refreshDirty = false;
-      await refreshThread();
-      await Promise.all([refreshPending(), refreshQueue(), refreshActivity()]);
-    } while (refreshDirty);
-    refreshRunning = false;
-  };
+  const refreshQueue = () => sync.refresh();
 
   function scheduleRefresh(delay = 200) {
-    refreshDirty = true;
-    if (refreshTimer !== null) return;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = null;
-      refreshAll();
-    }, delay);
+    sync?.scheduleRefresh(delay);
   }
 
   const markMessageOutcomeUnknown = (id) => {
@@ -2928,12 +2878,23 @@
     });
   });
 
-  scheduleRefresh(0);
+  sync = conversationAssets.createConversationSync({
+    live: interactive, eventsPath: interactive ? client.eventsPath() : null,
+    read: signal => Promise.all([
+      client.thread({signal}),
+      interactive ? client.pending({signal}) : Promise.resolve([]),
+      interactive ? client.reconcileQueue({signal}).then(() => client.queue({signal})) : Promise.resolve([]),
+    ]),
+    apply: async ([thread, pendingEntries, queuedEntries], {isCurrent}) => {
+      await renderThread(thread, isCurrent);
+      if (!isCurrent()) return;
+      renderPendingEntries(pendingEntries);
+      if (interactive) renderQueue(queuedEntries);
+      void refreshActivity();
+    },
+    onStateChange: state => conversationAssets.renderConnectionStatus(
+      document.getElementById("conversation-connection"), state, () => sync.retry(),
+    ),
+  });
   if (interactive) loadCollaborationModes();
-  if (interactive) {
-    const events = new EventSource(client.eventsPath());
-    events.onopen = () => { scheduleRefresh(0); };
-    events.onmessage = () => { scheduleRefresh(); };
-    events.onerror = () => { status.textContent = "Reconnecting"; status.className = "badge warning"; };
-  }
 })();

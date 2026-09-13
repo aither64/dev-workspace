@@ -779,7 +779,7 @@ if (!unitOnly) {
   const events = await fetchRequest(client.eventsPath());
   assert.equal(events.status, 200);
   assert.match(events.headers.get("content-type"), /^text\/event-stream/);
-  assert.match(await events.text(), /: connected/);
+  assert.match(await events.text(), /event: ready\ndata: \{"heartbeatIntervalMs":20000\}/);
 }
 })().catch((error) => {
   console.error(error);

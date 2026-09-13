@@ -168,6 +168,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 
 .chat-heading { flex: none; min-height: 3.5rem; padding: .65rem 0; border-bottom: 1px solid var(--line); }
 .chat-heading h2 { margin: 0; font-size: 1rem; }
+.conversation-connection { flex: none; font-size: .8rem; margin: .5rem 0 0; }
+.conversation-connection button { margin-left: .5rem; padding: .3rem .5rem; }
 .chat-panel.active { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0 clamp(.7rem, 2.5vw, 2.5rem); overflow: hidden; }
 .transcript-filters { display: flex; gap: .35rem; margin: 0 auto 0 .5rem; }
 .transcript-filters button { padding: .38rem .65rem; font-size: .78rem; }

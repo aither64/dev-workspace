@@ -55,6 +55,7 @@
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><span id="codex-status" class="badge">Connecting</span></div>
+        <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
         <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
         <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         {{if .Session.Interactive}}<div id="pending" class="pending"></div>{{end}}
