@@ -64,9 +64,10 @@
       entry.turnStatus === "completed" && (entry.text || "").trim()
     )) : undefined;
   const planIdentity = (turnId, digest) => JSON.stringify([turnId, digest]);
-  const pendingPlanImplementation = (attempts, digest) => [...attempts].some((entry) => (
-    entry.message === "Implement the plan." && entry.context === `plan:${digest}`
-  ));
+  const planActionContext = (turnId, digest) => `plan:${turnId}:${digest}`;
+  const pendingPlanImplementation = (attempts, turnId, digest) => Boolean(
+    matchingSendAttempt([...attempts], "Implement the plan.", planActionContext(turnId, digest))
+  );
   const setPlanDecisionVisible = (panel, form, visible, focusComposer = false) => {
     if (!panel || !form) return;
     const document = form.ownerDocument;
@@ -623,7 +624,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
-      currentCompletedPlan, planIdentity, pendingPlanImplementation, setPlanDecisionVisible,
+      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, setPlanDecisionVisible,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -1844,7 +1845,7 @@
     }
     const digest = await sha256Hex(plan.text);
     if (generation !== planRenderGeneration) return;
-    const pendingImplementation = pendingPlanImplementation(pendingMessages.values(), digest);
+    const pendingImplementation = pendingPlanImplementation(pendingMessages.values(), plan.turnId, digest);
     if (payload.collaborationMode === "default" && !pendingImplementation) {
       setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
       return;
@@ -2716,7 +2717,7 @@
   document.getElementById("plan-implement-same")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     const message = "Implement the plan.";
-    const context = `plan:${planActions.dataset.planSha256}`;
+    const context = planActionContext(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
     if (attempts === null) {
       alert("Browser storage is unavailable; messages cannot be submitted safely.");
@@ -2741,6 +2742,7 @@
     try {
       const receipt = await client.implementPlan({
         action: "same",
+        planContextVersion: 2,
         planTurnId: planActions.dataset.planTurnId,
         planSha256: planActions.dataset.planSha256,
         clientUserMessageId: id,

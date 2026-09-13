@@ -1519,6 +1519,7 @@ func planDigest(text string) string {
 func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
 	var body struct {
+		PlanContextVersion  int    `json:"planContextVersion"`
 		PlanText            string `json:"planText"`
 		Model               string `json:"model"`
 		ReasoningEffort     string `json:"reasoningEffort"`
@@ -1557,6 +1558,11 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 
+	if body.PlanContextVersion != 0 && body.PlanContextVersion != 2 {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported plan request version; reload the page"})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	messageLock := s.messageLock(summary.Slug)
@@ -1568,6 +1574,9 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 	// Recover a previously submitted request before checking proposal freshness.
 	// This operation cannot start a prepared request or change thread settings.
 	actionContext := "plan:" + strings.TrimSpace(body.PlanSHA256)
+	if body.PlanContextVersion == 2 {
+		actionContext = "plan:" + strings.TrimSpace(body.PlanTurnID) + ":" + strings.TrimSpace(body.PlanSHA256)
+	}
 	if receipt, found, err := s.config.Codex.ReconcileSend(
 		ctx, summary.Codex.ThreadID, implementationMessage, body.ClientUserMessageID, actionContext,
 	); err != nil {
@@ -1575,6 +1584,11 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	} else if found {
 		s.writeJSON(w, http.StatusAccepted, receipt)
+		return
+	}
+
+	if body.PlanContextVersion == 0 {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "reload the page before starting plan implementation"})
 		return
 	}
 
