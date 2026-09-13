@@ -54,6 +54,7 @@ type codexController interface {
 	ReadAccountRateLimits(context.Context) (codex.AccountRateLimits, error)
 	ListThreadActivity(context.Context, []workspacecodex.ThreadActivity) ([]workspacecodex.ThreadActivity, error)
 	PrepareSend(string, string, string, string, bool) error
+	ReconcileSend(context.Context, string, string, string, string) (codex.SendReceipt, bool, error)
 	ReconcileThreadInstructions(context.Context, string) error
 }
 
@@ -1503,7 +1504,8 @@ func (s *Server) resolveDeletionTarget(
 func completedPlan(transcript codex.Transcript) (codex.TranscriptEntry, bool) {
 	for index := len(transcript.Entries) - 1; index >= 0; index-- {
 		entry := transcript.Entries[index]
-		if entry.Kind == "plan" && entry.TurnStatus == "completed" && strings.TrimSpace(entry.Text) != "" {
+		if transcript.LatestTurnID != "" && entry.TurnID == transcript.LatestTurnID &&
+			entry.Kind == "plan" && entry.TurnStatus == "completed" && strings.TrimSpace(entry.Text) != "" {
 			return entry, true
 		}
 	}
@@ -1544,6 +1546,17 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 
+	if strings.TrimSpace(body.Action) != "same" {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select how to implement the plan"})
+		return
+	}
+	const implementationMessage = "Implement the plan."
+	body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
+	if !queueClientMessageIDPattern.MatchString(body.ClientUserMessageID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message has an invalid client identity"})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	messageLock := s.messageLock(summary.Slug)
@@ -1552,6 +1565,19 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 	defer messageLock.Unlock()
+	// Recover a previously submitted request before checking proposal freshness.
+	// This operation cannot start a prepared request or change thread settings.
+	actionContext := "plan:" + strings.TrimSpace(body.PlanSHA256)
+	if receipt, found, err := s.config.Codex.ReconcileSend(
+		ctx, summary.Codex.ThreadID, implementationMessage, body.ClientUserMessageID, actionContext,
+	); err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	} else if found {
+		s.writeJSON(w, http.StatusAccepted, receipt)
+		return
+	}
+
 	transcript, err := s.config.Codex.ReadThread(ctx, summary.Codex.ThreadID)
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -1570,71 +1596,52 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Codex is still working on this plan"})
 		return
 	}
-	if transcript.CollaborationMode != "plan" && strings.TrimSpace(body.Action) != "same" {
-		s.writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "the conversation is no longer in Plan mode",
-		})
-		return
-	}
-
-	switch strings.TrimSpace(body.Action) {
-	case "same":
-		const implementationMessage = "Implement the plan."
-		body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
-		if !queueClientMessageIDPattern.MatchString(body.ClientUserMessageID) {
-			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message has an invalid client identity"})
+	if transcript.CollaborationMode == "plan" {
+		if err := s.config.Codex.PrepareSend(
+			summary.Codex.ThreadID, implementationMessage,
+			body.ClientUserMessageID, actionContext, false,
+		); err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		actionContext := "plan:" + digest
-		if transcript.CollaborationMode == "plan" {
-			if err := s.config.Codex.PrepareSend(
-				summary.Codex.ThreadID, implementationMessage,
-				body.ClientUserMessageID, actionContext, false,
-			); err != nil {
-				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-				return
-			}
-			mode := "default"
-			if _, err := s.config.Codex.UpdateThreadSettings(
-				ctx, summary.Codex.ThreadID,
-				codex.ThreadSettingsUpdate{CollaborationMode: &mode},
-			); err != nil {
-				s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-				return
-			}
-		} else if transcript.CollaborationMode == "default" {
-			attempted, attemptErr := s.config.Codex.SendAttempted(
-				ctx, summary.Codex.ThreadID, implementationMessage,
-				body.ClientUserMessageID, actionContext,
-			)
-			if attemptErr != nil {
-				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": attemptErr.Error()})
-				return
-			}
-			if !attempted {
-				s.writeJSON(w, http.StatusConflict, map[string]string{
-					"error": "the conversation is no longer in Plan mode",
-				})
-				return
-			}
-		} else {
+		mode := "default"
+		if _, err := s.config.Codex.UpdateThreadSettings(
+			ctx, summary.Codex.ThreadID,
+			codex.ThreadSettingsUpdate{CollaborationMode: &mode},
+		); err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+	} else if transcript.CollaborationMode == "default" {
+		attempted, attemptErr := s.config.Codex.SendAttempted(
+			ctx, summary.Codex.ThreadID, implementationMessage,
+			body.ClientUserMessageID, actionContext,
+		)
+		if attemptErr != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": attemptErr.Error()})
+			return
+		}
+		if !attempted {
 			s.writeJSON(w, http.StatusConflict, map[string]string{
 				"error": "the conversation is no longer in Plan mode",
 			})
 			return
 		}
-		receipt, err := s.config.Codex.Send(
-			ctx, summary.Codex.ThreadID, implementationMessage,
-			body.ClientUserMessageID, actionContext,
-		)
-		if err != nil {
-			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-			return
-		}
-		s.writeJSON(w, http.StatusAccepted, receipt)
-	default:
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select how to implement the plan"})
+	} else {
+		s.writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "the conversation is no longer in Plan mode",
+		})
+		return
 	}
+	receipt, err := s.config.Codex.Send(
+		ctx, summary.Codex.ThreadID, implementationMessage,
+		body.ClientUserMessageID, actionContext,
+	)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, receipt)
 }
 
 func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary *session.Summary) {

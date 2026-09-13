@@ -1117,7 +1117,7 @@ func TestImplementPlanSerializesAConcurrentConversationMutation(t *testing.T) {
 	controller := &browserContractCodex{
 		readEntered: readEntered, readRelease: readRelease, queueEntered: queueEntered,
 		settings: codex.ThreadSettings{CollaborationMode: "plan"},
-		transcript: codex.Transcript{
+		transcript: codex.Transcript{LatestTurnID: "turn-plan",
 			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 			Entries: []codex.TranscriptEntry{{
 				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
@@ -2312,6 +2312,23 @@ func (client *browserContractCodex) Send(
 	}, nil
 }
 
+func (client *browserContractCodex) ReconcileSend(
+	_ context.Context, _, message, clientID, actionContext string,
+) (codex.SendReceipt, bool, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.messageID != clientID || client.sendCount == 0 {
+		return codex.SendReceipt{}, false, nil
+	}
+	if client.message != message || client.actionContext != actionContext {
+		return codex.SendReceipt{}, false, errors.New("message identity was reused for another action")
+	}
+	if client.sendErr != nil {
+		return codex.SendReceipt{}, false, client.sendErr
+	}
+	return codex.SendReceipt{TurnID: "turn-1", ClientUserMessageID: clientID, Steered: true}, true, nil
+}
+
 func (client *browserContractCodex) PrepareSend(
 	threadID, message, clientID, actionContext string, _ bool,
 ) error {
@@ -2507,7 +2524,7 @@ func (client *browserContractCodex) RespondDecision(_ context.Context, id, threa
 
 func TestImplementPlanRejectsAStalePlan(t *testing.T) {
 	server := newTestServer(t)
-	controller := &browserContractCodex{transcript: codex.Transcript{
+	controller := &browserContractCodex{transcript: codex.Transcript{LatestTurnID: "turn-new",
 		ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 		Entries: []codex.TranscriptEntry{{
 			TurnID: "turn-new", TurnStatus: "completed", Kind: "plan", Text: "Current plan",
@@ -2535,7 +2552,7 @@ func TestImplementPlanContinuesInTheSameThread(t *testing.T) {
 		settings: codex.ThreadSettings{
 			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
 		},
-		transcript: codex.Transcript{
+		transcript: codex.Transcript{LatestTurnID: "turn-plan",
 			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 			Entries: []codex.TranscriptEntry{{
 				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
@@ -2572,7 +2589,7 @@ func TestImplementPlanKeepsItsDurableAttemptWhenTheMessageFails(t *testing.T) {
 		settings: codex.ThreadSettings{
 			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
 		},
-		transcript: codex.Transcript{
+		transcript: codex.Transcript{LatestTurnID: "turn-plan",
 			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 			Entries: []codex.TranscriptEntry{{
 				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
@@ -2607,7 +2624,7 @@ func TestImplementPlanKeepsDefaultModeAndReconcilesAnUnknownSend(t *testing.T) {
 		settings: codex.ThreadSettings{
 			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
 		},
-		transcript: codex.Transcript{
+		transcript: codex.Transcript{LatestTurnID: "turn-plan",
 			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 			Entries: []codex.TranscriptEntry{{
 				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
@@ -2652,7 +2669,7 @@ func TestImplementPlanRetriesAfterTheModeChangeResponseIsLost(t *testing.T) {
 		settings: codex.ThreadSettings{
 			Model: "model-1", ReasoningEffort: "high", CollaborationMode: "plan",
 		},
-		transcript: codex.Transcript{
+		transcript: codex.Transcript{LatestTurnID: "turn-plan",
 			ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 			Entries: []codex.TranscriptEntry{{
 				TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
@@ -2718,7 +2735,7 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 	t.Setenv("GOAL_COPY", goalCopy)
 	server.config.DevSession = helper
 	plan := "1. Make the change.\n2. Test it."
-	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{
+	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{LatestTurnID: "turn-plan",
 		ThreadID: "thread-1", Status: "idle", Model: "model-1", ReasoningEffort: "high",
 		CollaborationMode: "plan", Entries: []codex.TranscriptEntry{{
 			TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
