@@ -280,7 +280,13 @@ func threadCommand(args []string) error {
 	}
 	client := newCodexClient(*socket, *workspace)
 	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	// Directory discovery can repair a large persisted history. Keep ordinary
+	// metadata commands short, but allow recovery to complete that scan.
+	timeout := time.Minute
+	if command == "create" || command == "fork" || command == "retire" {
+		timeout = 3 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	switch command {
 	case "models":

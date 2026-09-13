@@ -449,7 +449,7 @@ func (s *Server) runCreation(receipt creationReceipt) {
 }
 
 func (s *Server) initializeCreation(receipt *creationReceipt) error {
-	ctx, cancel := context.WithTimeout(s.operationContext, 3*time.Minute)
+	ctx, cancel := context.WithTimeout(s.operationContext, 4*time.Minute)
 	defer cancel()
 	transition, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
@@ -592,7 +592,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	if request.Source != "" {
 		args = append(args, "--expected-source", request.Source, "--expected-source-thread", request.SourceThreadID, "--expected-source-identity", request.SourceIdentity)
 	}
-	stdout, stderr, err := s.runDevSessionWithTransition(ctx, 2*time.Minute, transition, args...)
+	stdout, stderr, err := s.runDevSessionWithTransition(ctx, 210*time.Second, transition, args...)
 	if err != nil {
 		if s.proveCreation(*receipt) == nil {
 			return s.bindCreationUploads(ctx, *receipt)
