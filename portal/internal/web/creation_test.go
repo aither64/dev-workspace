@@ -336,7 +336,7 @@ func TestCreationPlanSnapshotWaitsForMessageLockAndRejectsNewerPlan(t *testing.T
 	defer server.Close()
 	prepareInteractiveConversation(t, server, "source")
 	read := make(chan struct{}, 1)
-	controller := &browserContractCodex{readEntered: read, transcript: codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
+	controller := &browserContractCodex{readEntered: read, transcript: codex.Transcript{LatestTurnID: "new-plan", ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan",
 		Model: "model-1", ReasoningEffort: "high", Entries: []codex.TranscriptEntry{{Kind: "plan", TurnID: "new-plan", TurnStatus: "completed", Text: "New plan"}}}}
 	server.config.Codex = controller
 	lock := server.messageLock("source")
@@ -421,7 +421,7 @@ func TestCreationWorkerPersistsSuccessAndPlanRetryUsesTheCapturedGoal(t *testing
 	prepareInteractiveConversation(t, server, "source")
 	plan := "# Accepted plan\n\n1. Preserve indentation.\n   Continue exactly.\n"
 	wantGoal := "Implement the following approved plan from session source.\n\n# Accepted plan\n\n1. Preserve indentation.\n   Continue exactly."
-	controller := &browserContractCodex{transcript: codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan", Model: "model-1", ReasoningEffort: "high",
+	controller := &browserContractCodex{transcript: codex.Transcript{LatestTurnID: "approved", ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan", Model: "model-1", ReasoningEffort: "high",
 		Entries: []codex.TranscriptEntry{{Kind: "plan", TurnID: "approved", TurnStatus: "completed", Text: plan}}}}
 	server.config.Codex = controller
 	directory := t.TempDir()
