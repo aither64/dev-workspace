@@ -499,3 +499,28 @@ model.
 
 See [Workspace portal](workspace-portal.md) for the browser interface, manifest
 format, security model, private CA, and deployment responsibilities.
+
+## Preserve the final repository comparison
+
+After the final rebase and commit, and before integrating a feature branch, run:
+
+```sh
+dev-session worktree capture-comparison <slug> <repository> --as-is
+```
+
+The command validates the registered repository and saves its current head and
+merge base in private portal state. It does not change Git refs or existing
+shared review links. Capture each repository separately after its final head is
+ready. Status refreshes also capture unmerged heads, but an explicit capture
+ensures that the final comparison exists even if no browser is open.
+
+For an already merged head, supply the exact pre-merge base and feature head:
+
+```sh
+dev-session worktree capture-comparison <slug> <repository> --as-is \
+  --base <full-base-commit> --head <full-feature-commit>
+```
+
+Use recorded integration revisions for this recovery. Both commits must exist
+locally, the base must be an ancestor of the head, and the head must match the
+registered repository. The command refuses to guess a historical base.

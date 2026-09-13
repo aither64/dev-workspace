@@ -47,7 +47,7 @@ func TestReviewKeepsUnpushedHistoryAndSavedComparisonAfterIntegration(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if integrated.Base != pair.Base || !strings.Contains(integrated.BaseLabel, "Last viewed") {
+	if integrated.Base != pair.Base || !strings.Contains(integrated.BaseLabel, "Saved") {
 		t.Fatalf("integrated = %#v", integrated)
 	}
 	fallback, err := reader.Pair(context.Background(), repo, nil)

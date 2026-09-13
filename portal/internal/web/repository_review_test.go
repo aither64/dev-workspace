@@ -1,13 +1,17 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 )
@@ -153,7 +157,7 @@ func TestRepositoryReviewSavedHistorySurvivesRestartAndIntegration(t *testing.T)
 	if err := json.Unmarshal(saved["pair"], &restored); err != nil {
 		t.Fatal(err)
 	}
-	if restored.Base != base || restored.Head != pair.Head || !strings.Contains(restored.BaseLabel, "Last viewed") {
+	if restored.Base != base || restored.Head != pair.Head || !strings.Contains(restored.BaseLabel, "Saved") {
 		t.Fatalf("saved pair = %#v", restored)
 	}
 	file := fresh.reviews().comparisonPath("example", repository.ReviewID("project"), pair.Head)
@@ -171,4 +175,125 @@ func TestRepositoryReviewSavedHistorySurvivesRestartAndIntegration(t *testing.T)
 		t.Fatal(err)
 	}
 	reviewRequest(t, fresh, "GET", endpoint, "", 422)
+}
+
+func TestStatusObservationPreservesComparisonWithoutOpeningHistory(t *testing.T) {
+	s, bare, worktree, base := reviewWebFixture(t)
+	head := strings.TrimSpace(webGitOutput(t, "-C", worktree, "rev-parse", "HEAD"))
+	endpoint := "/api/sessions/example/repository-"
+	query := "?repository=" + repository.ReviewID("project")
+	reviewRequest(t, s, "GET", "/api/sessions/example/details", "", 200)
+	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/remotes/origin/master", head)
+	history := reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200)
+	var pair repository.ReviewPair
+	if err := json.Unmarshal(history["pair"], &pair); err != nil {
+		t.Fatal(err)
+	}
+	if pair.Base != base || pair.Head != head || pair.Warning != "" {
+		t.Fatalf("observed pair: %#v", pair)
+	}
+}
+
+func TestCaptureComparisonRecoversMergedHeadAndRejectsWrongIdentity(t *testing.T) {
+	s, bare, worktree, base := reviewWebFixture(t)
+	head := strings.TrimSpace(webGitOutput(t, "-C", worktree, "rev-parse", "HEAD"))
+	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/remotes/origin/master", head)
+	capture := func(base, head string) (repository.ReviewPair, error) {
+		return CaptureRepositoryComparison(context.Background(), s.config.Workspace, s.config.UserStateRoot, "example", "project", base, head)
+	}
+	if _, err := capture("", ""); err == nil {
+		t.Fatal("guessed historical base")
+	}
+	if _, err := capture(head, base); err == nil {
+		t.Fatal("accepted a different registered head")
+	}
+	if _, err := capture("missing", head); err == nil {
+		t.Fatal("accepted an invalid base")
+	}
+	pair, err := capture(base, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stale browser fallback may finish after the explicit capture.
+	if err := s.reviews().saveComparison(context.Background(), "example", repository.ReviewID("project"), repository.ReviewPair{Base: base, Head: head, Warning: "fallback", BaseLabel: "fallback"}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.reviews().loadComparison("example", repository.ReviewID("project"), head)
+	if err != nil || saved == nil || *saved != pair {
+		t.Fatalf("capture overwritten: %#v %v", saved, err)
+	}
+	history := reviewRequest(t, s, "GET", "/api/sessions/example/repository-history?repository="+repository.ReviewID("project"), "", 200)
+	if err := json.Unmarshal(history["pair"], &pair); err != nil {
+		t.Fatal(err)
+	}
+	if pair.Base != base || pair.Head != head || pair.Warning != "" {
+		t.Fatalf("recovered: %#v", pair)
+	}
+}
+
+func TestComparisonCaptureKeepsFirstExactPairAndWaitsForConcurrentWriter(t *testing.T) {
+	s, _, worktree, base := reviewWebFixture(t)
+	head := strings.TrimSpace(webGitOutput(t, "-C", worktree, "rev-parse", "HEAD"))
+	service := s.reviews()
+	repo := repository.ReviewID("project")
+	pair := repository.ReviewPair{Base: base, Head: head, BaseLabel: "Original exact capture"}
+	if err := service.saveComparison(context.Background(), "example", repo, pair); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(service.comparisonPath("example", repo, head)+".lock", os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := service.saveComparison(ctx, "example", repo, pair); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended save: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- service.saveComparison(context.Background(), "example", repo, pair) }()
+	unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writer did not resume")
+	}
+	relabeled := pair
+	relabeled.BaseLabel = "Later label"
+	if err := service.saveComparison(context.Background(), "example", repo, relabeled); err != nil {
+		t.Fatal(err)
+	}
+	conflict := pair
+	conflict.Base = strings.Repeat("1", 40)
+	if err := service.saveComparison(context.Background(), "example", repo, conflict); err == nil {
+		t.Fatal("replaced an exact pair")
+	}
+	saved, err := service.loadComparison("example", repo, head)
+	if err != nil || saved == nil || *saved != pair {
+		t.Fatalf("changed exact capture: %#v %v", saved, err)
+	}
+}
+
+func TestComparisonObservationFailureDoesNotHideRepositoryStatus(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	service := s.reviews()
+	if err := os.MkdirAll(filepath.Dir(service.directory), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(service.directory, []byte("unavailable store"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	details := reviewRequest(t, s, "GET", "/api/sessions/example/details", "", 200)
+	if !strings.Contains(string(details["repositoriesHTML"]), "project") {
+		t.Fatal("repository status disappeared")
+	}
+	reviewRequest(t, s, "GET", "/api/sessions/example/repository-history?repository="+repository.ReviewID("project"), "", 422)
+	// The readable state endpoint is independent of comparison persistence.
+	reviewRequest(t, s, "GET", "/api/sessions/example/repository-state?repository="+repository.ReviewID("project"), "", 200)
 }

@@ -188,6 +188,8 @@ module DevSession
         <name-or-slug> <project> [--as-is] [--name NAME] [--branch BRANCH]
         [--base REF] [--no-fetch]
       dev-session worktree remove <name-or-slug> <name> [--as-is] [--force]
+      dev-session worktree capture-comparison <name-or-slug> <name> [--as-is]
+        [--base SHA --head SHA]
   USAGE
 
   class Error < StandardError; end
@@ -1870,6 +1872,23 @@ module DevSession
 
         sync_slug(slug, require_session: false)
         @out.puts path
+      end
+    end
+
+    def worktree_capture_comparison(input, name, as_is:, base:, head:)
+      slug = lookup_slug(input, as_is:)
+      validate_part!(name, 'worktree name')
+      raise Error, '--base and --head must be supplied together' if base.nil? != head.nil?
+      with_slug_lock(slug) do
+        select_tmux_for_slug!(slug)
+        reject_conflicting_lifecycle_journal!(slug)
+        raise Error, 'workspace-portal is required to capture a comparison' unless @portal_command && !@portal_command.empty?
+
+        command = [*@portal_command, 'capture-comparison', '--workspace', workspace,
+                   '--user-state-root', @workspace_state_root, '--slug', slug, '--name', name]
+        command += ['--base', base, '--head', head] if base
+        stdout, _stderr, _status = @command_runner.capture(command)
+        @out.puts stdout
       end
     end
 
@@ -7729,6 +7748,8 @@ module DevSession
         run_worktree_add
       when 'remove'
         run_worktree_remove
+      when 'capture-comparison'
+        run_worktree_capture_comparison
       else
         raise Error, "unknown worktree subcommand: #{subcommand}"
       end
@@ -7754,6 +7775,17 @@ module DevSession
       require_arity!(2, @argv, 'worktree add')
 
       runner.worktree_add(@argv.fetch(0), @argv.fetch(1), **opts)
+    end
+
+    def run_worktree_capture_comparison
+      opts = { as_is: false, base: nil, head: nil }
+      OptionParser.new do |parser|
+        parser.on('--as-is') { opts[:as_is] = true }
+        parser.on('--base SHA') { |value| opts[:base] = value }
+        parser.on('--head SHA') { |value| opts[:head] = value }
+      end.parse!(@argv)
+      require_arity!(2, @argv, 'worktree capture-comparison')
+      runner.worktree_capture_comparison(@argv.fetch(0), @argv.fetch(1), **opts)
     end
 
     def run_worktree_remove

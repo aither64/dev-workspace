@@ -388,8 +388,8 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		return reviewHistoryResponse{}, err
 	}
 	if snapshot.Branch {
-		if err := service.saveComparison(summary.Slug, repoID, snapshot.Pair); err != nil {
-			return reviewHistoryResponse{}, err
+		if err := service.saveComparison(ctx, summary.Slug, repoID, snapshot.Pair); err != nil {
+			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, repoID, err)
 		}
 	}
 	snapshot.mu.Lock()
@@ -491,8 +491,8 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 		return reviewComparisonResponse{}, err
 	}
 	if snapshot.Branch {
-		if err := service.saveComparison(summary.Slug, snapshot.Repo.ID, snapshot.Pair); err != nil {
-			return reviewComparisonResponse{}, err
+		if err := service.saveComparison(ctx, summary.Slug, snapshot.Repo.ID, snapshot.Pair); err != nil {
+			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, snapshot.Repo.ID, err)
 		}
 	}
 	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files}

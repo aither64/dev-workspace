@@ -50,7 +50,7 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/remotes/origin/master", current.Pair.Head)
 	var integrated reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200), &integrated)
-	if !reflect.DeepEqual(integrated.Summary, current.Summary) || !strings.Contains(integrated.Pair.BaseLabel, "Last viewed") {
+	if !reflect.DeepEqual(integrated.Summary, current.Summary) || !strings.Contains(integrated.Pair.BaseLabel, "Saved") {
 		t.Fatalf("integrated=%#v", integrated)
 	}
 }

@@ -267,14 +267,14 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 	if integrated && saved != nil && saved.Head == repo.Head {
 		if _, err := r.commit(ctx, repo.Directory, saved.Base); err == nil {
 			pair.Base = saved.Base
-			pair.BaseLabel = "Last viewed comparison for this integrated head"
+			pair.BaseLabel = "Saved comparison for this integrated head"
 			if strings.Contains(saved.BaseLabel, "fallback") {
-				pair.BaseLabel = "Last viewed comparison (original recorded base fallback)"
+				pair.BaseLabel = "Saved comparison (original recorded base fallback)"
 				pair.Warning = saved.Warning
 			}
 			return pair, nil
 		}
-		pair.Warning = "The last viewed comparison base is unavailable locally."
+		pair.Warning = "The saved comparison base is unavailable locally."
 	}
 	if !gitObjectPattern.MatchString(repo.InitialBase) {
 		return pair, errors.New("repository has no recorded comparison base")
@@ -290,6 +290,36 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 	pair.Warning += " The original base may include upstream commits after a rebase."
 	return pair, nil
 }
+
+// CapturePair validates an explicit historical pair or resolves an unmerged head.
+// Explicit pairs must name the current registered head and an ancestor commit.
+func (r ReviewReader) CapturePair(ctx context.Context, repo ReviewRepository, base, head string) (ReviewPair, error) {
+	if base == "" && head == "" {
+		pair, err := r.Pair(ctx, repo, nil)
+		if err != nil {
+			return pair, err
+		}
+		if pair.Warning != "" || pair.Base == pair.Head {
+			return pair, errors.New("comparison base is no longer available; supply the exact pre-merge --base and --head commits")
+		}
+		return pair, nil
+	}
+	pair := ReviewPair{Base: base, Head: head, BaseLabel: "Captured comparison"}
+	if !gitObjectPattern.MatchString(base) || !gitObjectPattern.MatchString(head) || head != repo.Head {
+		return pair, errors.New("explicit comparison requires full commit IDs and the registered head")
+	}
+	if _, err := r.commit(ctx, repo.Directory, base); err != nil {
+		return pair, errors.New("comparison base commit is unavailable")
+	}
+	if _, err := r.git(ctx, repo.Directory, 1024, "merge-base", "--is-ancestor", base, head); err != nil {
+		return pair, errors.New("comparison base is not an ancestor of its head")
+	}
+	if base == head {
+		return pair, errors.New("comparison base and head are identical")
+	}
+	return pair, nil
+}
+
 func (r ReviewReader) History(ctx context.Context, repo ReviewRepository, pair ReviewPair, page int) (ReviewHistory, error) {
 	result := ReviewHistory{Page: page, Commits: []ReviewCommit{}}
 	if page < 0 || page > 2000 {

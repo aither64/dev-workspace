@@ -917,9 +917,24 @@ func (s *Server) repositories(ctx context.Context, summary *session.Summary) []r
 	s.repositoryMu.Unlock()
 	inspectionContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
 	statuses := s.repository.Inspect(
 		inspectionContext, summary.Slug, summary.Repositories, summary.Archived,
 	)
+	observationContext, stopObservation := context.WithTimeout(ctx, time.Second)
+	defer stopObservation()
+	if !summary.Archived {
+		runReviewBatch(observationContext, len(summary.Repositories), func(index int) {
+			service := s.reviews()
+			repo, err := service.reader.Resolve(observationContext, summary.Slug, summary.Repositories[index], false)
+			if err == nil {
+				err = service.observeComparison(observationContext, summary.Slug, repo)
+			}
+			if err != nil {
+				s.config.Logger.Printf("capture comparison for %s/%s: %v", summary.Slug, summary.Repositories[index].Name, err)
+			}
+		})
+	}
 	s.repositoryMu.Lock()
 	s.repositoryCache[summary.Slug] = cachedRepositories{
 		statuses: append([]repository.Status(nil), statuses...), created: time.Now(), repositories: string(repositoryJSON),

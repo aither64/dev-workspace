@@ -95,6 +95,8 @@ func run(args []string) error {
 		return routeWorkspaces(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
+	case "capture-comparison":
+		return captureComparisonCommand(args[1:])
 	case "uploads":
 		return uploadCommand(args[1:])
 	case "validate":
@@ -502,4 +504,27 @@ func uploadCommand(args []string) error {
 		return err
 	}
 	return store.RemoveSession(ctx, *slug, *thread, epoch)
+}
+
+func captureComparisonCommand(args []string) error {
+	flags := flag.NewFlagSet("capture-comparison", flag.ContinueOnError)
+	workspace := flags.String("workspace", "", "workspace root")
+	stateRoot := flags.String("user-state-root", "", "private state root")
+	slug := flags.String("slug", "", "session slug")
+	name := flags.String("name", "", "registered repository name")
+	base := flags.String("base", "", "exact historical base commit")
+	head := flags.String("head", "", "exact historical head commit")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *workspace == "" || *slug == "" || *name == "" || (*base == "") != (*head == "") {
+		return errors.New("capture-comparison requires --workspace, --slug, --name and, optionally, both --base and --head")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pair, err := portalweb.CaptureRepositoryComparison(ctx, *workspace, *stateRoot, *slug, *name, *base, *head)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(pair)
 }

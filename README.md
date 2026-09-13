@@ -160,7 +160,9 @@ branch movement, while the session, repository and required Git objects remain
 available. They do not fetch or retain Git objects.
 
 Active comparisons use the merge base with the locally available default branch.
-Opening a history or branch comparison saves its exact base and head. After
+Repository status refreshes and history views save the exact base and head.
+Before merging, capture the final comparison explicitly with
+`dev-session worktree capture-comparison <slug> <repository> --as-is`. After
 integration or archival, the portal reuses the saved comparison for that exact
 head. When no saved comparison exists, the original recorded base is labelled
 as a fallback; it can include upstream commits after a rebase. An open review

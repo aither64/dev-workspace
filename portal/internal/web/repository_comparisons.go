@@ -2,12 +2,14 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/repository"
@@ -69,20 +71,49 @@ func repositoryObjectID(value string) bool {
 	}
 	return true
 }
-func (s *repositoryReviewService) saveComparison(slug, repo string, pair repository.ReviewPair) error {
+func (s *repositoryReviewService) saveComparison(ctx context.Context, slug, repo string, pair repository.ReviewPair) error {
 	if !repositoryObjectID(pair.Base) || !repositoryObjectID(pair.Head) {
 		return errors.New("invalid repository comparison")
-	}
-	previous, err := s.loadComparison(slug, repo, pair.Head)
-	if err != nil {
-		return err
-	}
-	if previous != nil && *previous == pair {
-		return nil
 	}
 	target := s.comparisonPath(slug, repo, pair.Head)
 	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 		return err
+	}
+	lock, err := os.OpenFile(target+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	for {
+		err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	previous, err := s.loadComparison(slug, repo, pair.Head)
+	if err != nil {
+		return err
+	}
+	// The first exact pair for a head is immutable, including its label.
+	if previous != nil {
+		if *previous == pair {
+			return nil
+		}
+		if previous.Warning == "" {
+			if pair.Warning != "" || previous.Base == pair.Base {
+				return nil
+			}
+			return errors.New("a different comparison is already saved for this head")
+		}
 	}
 	data, err := json.Marshal(savedRepositoryComparison{Schema: 1, Slug: slug, Repository: repo, Pair: pair, SavedAt: time.Now().UTC()})
 	if err != nil {
@@ -247,4 +278,57 @@ func (s *repositoryReviewService) loadReview(slug, repo, scope, id string) (*sav
 		return nil, unavailable
 	}
 	return &record, nil
+}
+
+// CaptureRepositoryComparison is the CLI entry point for the portal-owned store.
+// Both CLI captures and browser observations use the same validation and writer.
+func CaptureRepositoryComparison(ctx context.Context, workspace, stateRoot, slug, name, base, head string) (repository.ReviewPair, error) {
+	summary, err := session.Find(workspace, slug)
+	if err != nil {
+		return repository.ReviewPair{}, err
+	}
+	var registration *session.Repository
+	for _, item := range summary.Repositories {
+		if item.Name == name {
+			copy := item
+			registration = &copy
+			break
+		}
+	}
+	if registration == nil {
+		return repository.ReviewPair{}, errors.New("repository is not registered in this session")
+	}
+	store, err := newLifecycleOperationStore(workspace, stateRoot)
+	if err != nil {
+		return repository.ReviewPair{}, err
+	}
+	service := &repositoryReviewService{directory: filepath.Join(store.directory, "repository-comparisons"), reader: repository.ReviewReader{Workspace: workspace}}
+	repo, err := service.reader.Resolve(ctx, slug, *registration, summary.Archived)
+	if err != nil {
+		return repository.ReviewPair{}, err
+	}
+	pair, err := service.reader.CapturePair(ctx, repo, base, head)
+	if err != nil {
+		return pair, err
+	}
+	// Recheck after resolving the pair so a concurrent rebase cannot label another head.
+	current, err := service.reader.Resolve(ctx, slug, *registration, summary.Archived)
+	if err != nil {
+		return pair, err
+	}
+	if current.Head != repo.Head {
+		return pair, errors.New("repository head changed during comparison capture; retry")
+	}
+	return pair, service.saveComparison(ctx, slug, repo.ID, pair)
+}
+
+func (s *repositoryReviewService) observeComparison(ctx context.Context, slug string, repo repository.ReviewRepository) error {
+	pair, err := s.reader.Pair(ctx, repo, nil)
+	if err != nil {
+		return err
+	}
+	if pair.Warning != "" || strings.Contains(pair.BaseLabel, "fallback") || pair.Base == pair.Head {
+		return nil
+	}
+	return s.saveComparison(ctx, slug, repo.ID, pair)
 }
