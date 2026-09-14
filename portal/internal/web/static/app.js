@@ -28,7 +28,7 @@
     releaseCluster: (kind) => request(apiPath(slug, "release-cluster"), {
       method: "POST", body: JSON.stringify({kind}),
     }),
-    details: () => request(apiPath(slug, "details")),
+    details: (options) => request(apiPath(slug, "details"), options),
     autoArchive: () => request(apiPath(slug, "auto-archive")),
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
@@ -293,6 +293,42 @@
         Math.max(0, Number(snapshot.completedAtMs || snapshot.observedAtMs) - snapshot.startedAtMs) +
           (!snapshot.completedAtMs ? extension : 0),
       ) : "",
+    };
+  };
+
+  // A read may settle after abort (for example from a cache or test transport).
+  // Consumers must check its generation before applying either data or errors.
+  const createReadScope = () => {
+    let paused = false, generation = 0;
+    const reads = new Set();
+    return {
+      get paused() { return paused; },
+      begin(timeout = 10_000) {
+        const abort = new AbortController(), ticket = generation;
+        const timer = setTimeout(() => abort.abort(), timeout);
+        reads.add(abort);
+        if (paused) abort.abort();
+        return {signal: abort.signal, isCurrent: () => !paused && generation === ticket,
+          finish() { clearTimeout(timer); reads.delete(abort); }};
+      },
+      pause() { paused = true; ++generation; for (const abort of reads) abort.abort(); },
+      resume() { paused = false; },
+    };
+  };
+  const createTimingClock = (now = Date.now) => {
+    let received = null, elapsed = 0, paused = false, needsFresh = true, recovery = now();
+    return {
+      received() { received = now(); elapsed = 0; needsFresh = false; recovery = null; },
+      pause() { this.view(); paused = true; needsFresh = true; recovery = null; },
+      resume() { paused = false; recovery = now(); },
+      failed() { needsFresh = true; if (!paused && recovery === null) recovery = now(); },
+      view() {
+        const age = received === null ? Infinity : Math.max(0, now() - received);
+        const stale = needsFresh || age > 15_000;
+        if (!paused && !stale) elapsed = age;
+        if (!paused && stale && recovery === null) recovery = now();
+        return {elapsed, stale, unavailable: !paused && stale && recovery !== null && now() - recovery >= 10_000};
+      },
     };
   };
 
@@ -696,7 +732,7 @@
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
-      activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
+      createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash, sessionTabFromLocation,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
@@ -1593,6 +1629,8 @@
     if (!selectedArtifactPath && artifactButtons()[0]) showArtifact(artifactButtons()[0]);
   });
 
+  const pageReads = createReadScope();
+  let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {};
   let repositoryReview = null;
   let repositoryReviewLoading = null;
   const loadRepositoryReview = async () => {
@@ -1604,7 +1642,9 @@
         slug, element, nonce: document.querySelector('meta[name="style-nonce"]')?.content || "",
         createCopyButton: conversationAssets.createCopyButton,
       });
+      if (pageReads.paused) repositoryReview.suspend();
     }).catch((error) => {
+      if (pageReads.paused) return;
       const notice = document.createElement("p");
       notice.className = "notice error";
       notice.textContent = `Unable to load repository review: ${error.message}`;
@@ -1624,12 +1664,14 @@
   let lastClustersHTML = "";
   let releasingCluster = false;
   const refreshSessionDetails = async () => {
-    if (detailsRunning || document.hidden || !artifactList) return;
+    if (detailsRunning || pageReads.paused || document.hidden || !artifactList) return;
     if (detailsTimer !== null) clearTimeout(detailsTimer);
     detailsRunning = true;
+    const read = pageReads.begin(15_000);
     const warning = document.getElementById("session-details-warning");
     try {
-      const payload = await client.details();
+      const payload = await client.details({signal: read.signal});
+      if (!read.isCurrent()) return;
       if (!releasingCluster && typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
@@ -1643,6 +1685,7 @@
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;
+        if (!read.isCurrent()) return;
         if (repositoryReview) {
           repositoryReview.updateHTML(payload.repositoriesHTML);
         } else {
@@ -1680,19 +1723,45 @@
       }
       warning.hidden = true;
     } catch (error) {
+      if (!read.isCurrent()) return;
       warning.textContent = `Session details could not be refreshed: ${error.message}`;
       warning.hidden = false;
     } finally {
-      detailsRunning = false;
-      detailsTimer = setTimeout(refreshSessionDetails, 15_000);
+      read.finish(); detailsRunning = false;
+      if (!pageReads.paused) detailsTimer = setTimeout(refreshSessionDetails, 15_000);
     }
   };
-  sessionTabs.forEach((tab) => tab.addEventListener("click", refreshSessionDetails));
-  addEventListener("focus", refreshSessionDetails);
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshSessionDetails();
+  const suspendPageReads = (leaving = false) => {
+    pageLeaving ||= leaving;
+    pageReads.pause(); clearTimeout(detailsTimer); detailsTimer = null;
+    repositoryReview?.suspend(); pauseTiming();
+  };
+  const resumePageReads = () => {
+    if (document.hidden || pageLeaving) return;
+    const wasPaused = pageReads.paused;
+    pageReads.resume();
+    if (wasPaused) { resumeTiming(); repositoryReview?.resume(); }
+    void refreshSessionDetails();
+  };
+  // Firefox can reject old-document fetches before pagehide. Stop these reads
+  // as soon as ordinary document navigation starts.
+  document.addEventListener("click", event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const anchor = event.target.closest?.("a[href]");
+    if (!anchor || anchor.hasAttribute("download") || anchor.target && anchor.target !== "_self") return;
+    const destination = new URL(anchor.href, location.href);
+    if (["http:", "https:"].includes(destination.protocol) &&
+        (destination.origin !== location.origin || destination.pathname !== location.pathname || destination.search !== location.search)) suspendPageReads(true);
   });
-  refreshSessionDetails();
+  addEventListener("beforeunload", () => suspendPageReads(true));
+  addEventListener("pagehide", () => suspendPageReads(true));
+  addEventListener("pageshow", () => { pageLeaving = false; resumePageReads(); });
+  sessionTabs.forEach(tab => tab.addEventListener("click", refreshSessionDetails));
+  addEventListener("focus", resumePageReads);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) suspendPageReads(); else resumePageReads();
+  });
+  if (document.hidden) suspendPageReads(); else void refreshSessionDetails();
 
   const archiveDialog = document.getElementById("archive-session-dialog");
   const archiveForm = document.getElementById("archive-session-form");
@@ -1859,9 +1928,9 @@
   const codexWorkCounts = document.getElementById("codex-work-counts");
   const durationSummary = document.getElementById("codex-duration");
   let activitySnapshot = null;
-  let activityReceivedAt = 0;
+  const timingClock = createTimingClock();
   let activityRead = null;
-  let activityFailed = false;
+
   let sendAttemptStorage = null;
   try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
   let requestInputDraftStorage = null;
@@ -1869,18 +1938,18 @@
 
   const updateCodexWork = (active = threadActive) => {
     if (!codexWork || !codexWorkElapsed) return;
+    const timing = timingClock.view();
     if (!activitySnapshot) {
       codexWork.hidden = !active;
       codexWorkLabel.textContent = "Codex is working";
       codexWorkCounts.textContent = "";
       codexWorkElapsed.textContent = "";
-      durationSummary.textContent = activityFailed ? "Timing unavailable" : "Loading timing…";
+      durationSummary.textContent = timing.unavailable ? "Timing unavailable" : "Loading timing…";
       return;
     }
-    const elapsed = interactive ? Date.now() - activityReceivedAt : 0;
-    const view = activityPresentation(activitySnapshot, activityFailed ? 15_001 : elapsed);
-    const stale = view.stale || activityFailed;
-    const waiting = !stale && ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
+    const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
+    const stale = interactive && timing.unavailable;
+    const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
     codexWorkLabel.textContent = waiting ? "Waiting for instructions" : active ? "Codex is working" : "";
@@ -1898,22 +1967,24 @@
       "Waiting includes answered blocking requests and gaps between turns. The current wait is shown separately.";
   };
   const refreshActivity = () => {
-    if (!client.activity || document.hidden) return Promise.resolve();
+    if (!client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead) return activityRead;
-    activityRead = client.activity().then((snapshot) => {
-      activitySnapshot = snapshot;
-      activityReceivedAt = Date.now();
-      activityFailed = false;
-    }).catch(() => { activityFailed = true; }).finally(() => {
-      activityRead = null;
-      updateCodexWork();
+    const read = pageReads.begin();
+    activityRead = client.activity({signal: read.signal}).then(snapshot => {
+      if (!read.isCurrent()) return;
+      activitySnapshot = snapshot; timingClock.received();
+    }).catch(() => { if (read.isCurrent()) timingClock.failed(); }).finally(() => {
+      read.finish(); activityRead = null;
+      if (!pageReads.paused) updateCodexWork();
     });
     return activityRead;
   };
-  setInterval(() => { if (!document.hidden) updateCodexWork(); }, 1000);
+  pauseTiming = () => timingClock.pause();
+  resumeTiming = () => { timingClock.resume(); void refreshActivity(); };
+  if (pageReads.paused) pauseTiming();
+  setInterval(() => { if (!document.hidden && !pageReads.paused) updateCodexWork(); }, 1000);
   setInterval(() => { void refreshActivity(); }, 5000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshActivity(); });
   addEventListener("focus", () => { void refreshActivity(); });
 
   const loadMessageReceipts = () => {

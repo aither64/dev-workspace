@@ -55,6 +55,12 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	handler := server.Handler()
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/download" {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Disposition", `attachment; filename="fixture.txt"`)
+			_, _ = w.Write([]byte("Artifact fixture\n"))
+			return
+		}
 		if r.URL.Path == "/fixture/refresh" {
 			select {
 			case events <- struct{}{}:
@@ -67,10 +73,12 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	command := exec.Command("node", "question_browser_test.cjs", httpServer.URL)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("question browser: %v\n%s", err, output)
-	} else {
-		t.Log(string(output))
+	for _, script := range []string{"question_browser_test.cjs", "page_lifecycle_browser_test.cjs"} {
+		command := exec.Command("node", script, httpServer.URL)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", script, err, output)
+		} else {
+			t.Log(string(output))
+		}
 	}
 }

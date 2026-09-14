@@ -17,7 +17,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
-  activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
+  createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
@@ -617,6 +617,24 @@ assert.deepEqual(loadQueueAttempts(storage, "example", "thread-1"), []);
 assert.deepEqual(loadSendAttempts(storage, "example", "thread-1"), []);
 assert.equal(loadRequestInputDraft(storage, "example", "thread-1", "request-1", inputQuestions), null);
 assert.deepEqual(loadQueueAttempts(storage, "example", "thread-2"), [firstAttempt]);
+
+// Hidden time never extends the last known working state. A stale value stays
+// visible during ten seconds of visible recovery, then reports unavailability.
+let timingNow = 0;
+const clock = createTimingClock(() => timingNow);
+clock.received(); timingNow = 5000;
+assert.equal(clock.view().elapsed, 5000);
+clock.pause(); timingNow = 600_000; clock.resume();
+assert.deepEqual(clock.view(), {elapsed: 5000, stale: true, unavailable: false});
+timingNow += 9999; clock.failed(); assert.equal(clock.view().unavailable, false);
+timingNow += 1; assert.equal(clock.view().unavailable, true);
+clock.pause(); timingNow += 600_000; clock.resume(); assert.equal(clock.view().unavailable, false);
+clock.received(); assert.deepEqual(clock.view(), {elapsed: 0, stale: false, unavailable: false});
+const scope = createReadScope(), abandonedRead = scope.begin();
+scope.pause(); assert.equal(abandonedRead.signal.aborted, true); assert.equal(abandonedRead.isCurrent(), false);
+scope.resume(); const currentRead = scope.begin();
+assert.equal(abandonedRead.isCurrent(), false); assert.equal(currentRead.isCurrent(), true);
+abandonedRead.finish(); currentRead.finish();
 
 const automaticRequests = [];
 const automaticFetch = async (path, options = {}) => {
