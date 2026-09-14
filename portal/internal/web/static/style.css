@@ -239,7 +239,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .pending { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; max-height: 65%; }
 .pending > .approval { min-height: 0; flex: 0 1 auto; overflow-y: auto; }
 .pending > .question-approval { display: flex; flex-direction: column; overflow: hidden; }
-.question-approval > strong { flex: none; }
+.question-heading { display: flex; align-items: center; justify-content: space-between; gap: .7rem; flex: none; }
+.question-heading #interrupt { flex: none; padding: .4rem .6rem; font-size: .8rem; }
 .input-wizard { display: flex; flex-direction: column; min-height: 0; gap: .65rem; }
 .input-wizard > .eyebrow, .input-wizard > .auto-resolution { flex: none; margin: 0; }
 .wizard-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: .3rem; }
@@ -358,13 +359,6 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
   .index-sidebar .session-card { padding: .5rem .1rem; gap: .2rem .35rem; }
   .index-sidebar .session-card > span:not(.status-dot):not(.badge) { display: none; }
   .index-page { padding: .7rem; }
-}
-
-@media (max-height: 600px) {
-  .chat-panel:has(.question-approval) .chat-form { padding-top: .35rem; padding-bottom: .35rem; }
-  .chat-panel:has(.question-approval) .chat-form textarea { height: 2.5rem; min-height: 2.5rem; margin-bottom: .3rem; }
-  .chat-panel:has(.question-approval) .composer-controls .compact-select,
-  .chat-panel:has(.question-approval) .composer-controls .mode-toggle { display: none; }
 }
 
 .activity-summary { flex: none; padding: .4rem 0; color: var(--muted); font-size: .75rem; }

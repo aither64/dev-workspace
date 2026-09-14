@@ -76,18 +76,65 @@
     if (!current || !latestTurnId || current[1] === latestTurnId) return null;
     return {action: "recover", planContextVersion: 2, planTurnId: current[1], planSha256: current[2], clientUserMessageId: attempt.id};
   };
-  const setPlanDecisionVisible = (panel, form, visible, focusComposer = false) => {
-    if (!panel || !form) return;
+  // Plan rendering and pending-request refreshes share one owner for the composer.
+  const createComposerView = (panel, form, pending) => {
     const document = form.ownerDocument;
-    const moveFocus = visible ? form.contains(document.activeElement) : panel.contains(document.activeElement);
-    if (visible) {
-      form.querySelectorAll(":popover-open").forEach((menu) => menu.hidePopover());
-    }
-    panel.hidden = !visible;
-    form.hidden = visible;
-    panel.closest(".chat-panel")?.classList.toggle("plan-decision", visible);
-    if (visible && moveFocus) panel.querySelector("#plan-keep-planning")?.focus();
-    if (!visible && (focusComposer || moveFocus)) form.querySelector("textarea")?.focus();
+    const chat = form.closest(".chat-panel");
+    const interrupt = form.querySelector("#interrupt");
+    const interruptHome = interrupt.parentElement;
+    let planVisible = false;
+
+    const update = ({focusComposer = false, previousQuestion = null, previousFocus = document.activeElement} = {}) => {
+      const question = pending.querySelector(".question-approval");
+      const showPlan = planVisible && !question;
+      const hideComposer = Boolean(question || showPlan);
+      const moveFocus = focusComposer || previousQuestion ||
+        (hideComposer && form.contains(previousFocus)) ||
+        (!showPlan && panel.contains(previousFocus));
+      if (hideComposer && !form.hidden) {
+        form.querySelectorAll(":popover-open").forEach((menu) => menu.hidePopover());
+      }
+      const interruptParent = question ? question.querySelector(".question-heading") : interruptHome;
+      if (interrupt.parentElement !== interruptParent) interruptParent.append(interrupt);
+      panel.hidden = !showPlan;
+      form.hidden = hideComposer;
+      chat.classList.toggle("plan-decision", showPlan);
+      if (previousFocus === interrupt && !interrupt.disabled && (question || !hideComposer)) {
+        if (document.activeElement !== interrupt) interrupt.focus();
+      } else if (moveFocus) {
+        const matchingQuestion = previousQuestion && [...pending.querySelectorAll(".question-approval")]
+          .find((entry) => entry.dataset.requestId === previousQuestion.dataset.requestId);
+        const matchingControl = matchingQuestion && [...matchingQuestion.querySelectorAll("input, textarea, button")]
+          .find((control) => !control.disabled && control.name && control.name === previousFocus.name &&
+            (previousFocus.type !== "radio" || control.value === previousFocus.value));
+        const target = matchingControl || (question ?
+          question.querySelector(".input-wizard input:checked:not(:disabled)") ||
+            question.querySelector(".input-wizard input:not(:disabled), .input-wizard textarea:not(:disabled), .input-wizard button:not(:disabled)") :
+          showPlan ? panel.querySelector("#plan-keep-planning") : form.querySelector("textarea"));
+        target?.focus({preventScroll: true});
+        if (matchingControl && previousFocus.selectionStart !== null && previousFocus.selectionStart !== undefined) {
+          matchingControl.setSelectionRange(previousFocus.selectionStart, previousFocus.selectionEnd);
+        }
+      }
+    };
+
+    return {
+      setInterruptEnabled(enabled) {
+        const wasFocused = document.activeElement === interrupt;
+        interrupt.disabled = !enabled;
+        if (wasFocused && !enabled) update({focusComposer: true});
+      },
+      setPlanVisible(visible, focusComposer = false) {
+        planVisible = visible;
+        update({focusComposer});
+      },
+      replacePending(entries) {
+        const previousFocus = document.activeElement;
+        const previousQuestion = pending.contains(previousFocus) ? previousFocus.closest(".question-approval") : null;
+        pending.replaceChildren(...entries);
+        update({previousFocus, previousQuestion});
+      },
+    };
   };
   const setControlLabel = (control, label) => {
     const target = control.querySelector(".rail-label") || control;
@@ -632,7 +679,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
-      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, setPlanDecisionVisible,
+      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -1751,6 +1798,9 @@
   const status = document.getElementById("codex-status");
   if (!transcript) return;
 
+  const composerView = interactive ? createComposerView(
+    document.getElementById("plan-actions"), document.getElementById("message-form"), pending,
+  ) : null;
   let sync = null;
   let transcriptInitialized = false;
   let transcriptSignature = "";
@@ -1913,18 +1963,18 @@
     const plan = currentCompletedPlan(payload);
     const eligibleMode = ["plan", "default"].includes(payload.collaborationMode);
     if (!plan || payload.status === "active" || !eligibleMode || planImplementationInFlight) {
-      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
+      composerView.setPlanVisible(false);
       return;
     }
     // Hide an obsolete decision immediately while the new content is hashed.
     if (panel.dataset.planTurnId !== plan.turnId || panel.planText !== plan.text) {
-      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
+      composerView.setPlanVisible(false);
     }
     const digest = await sha256Hex(plan.text);
     if (generation !== planRenderGeneration) return;
     const pendingImplementation = pendingPlanImplementation(pendingMessages.values(), plan.turnId, digest);
     if (payload.collaborationMode === "default" && !pendingImplementation) {
-      setPlanDecisionVisible(panel, document.getElementById("message-form"), false);
+      composerView.setPlanVisible(false);
       return;
     }
     panel.dataset.planTurnId = plan.turnId;
@@ -1932,7 +1982,7 @@
     panel.planText = plan.text;
     const sameButton = document.getElementById("plan-implement-same");
     if (sameButton) sameButton.textContent = pendingImplementation ? "Check request" : "Implement here";
-    setPlanDecisionVisible(panel, document.getElementById("message-form"),
+    composerView.setPlanVisible(
       planIdentity(plan.turnId, digest) !== dismissedPlanIdentity);
   };
 
@@ -1998,11 +2048,10 @@
   const updateMessageActions = () => {
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    const interruptButton = document.getElementById("interrupt");
     if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !composerUploadReady; }
     if (queueButton) queueButton.disabled = !composerUploadReady;
     if (queueButton) queueButton.hidden = !threadActive;
-    if (interruptButton) interruptButton.disabled = !threadActive;
+    composerView?.setInterruptEnabled(threadActive);
   };
 
   const saveCollaborationMode = async (mode) => {
@@ -2260,6 +2309,7 @@
   };
 
   const respond = async (id, payload, container) => {
+    const activeElement = document.activeElement;
     const controls = Array.from(container.querySelectorAll("button, input, select, textarea"));
     controls.forEach((control) => { control.disabled = true; });
     try {
@@ -2271,6 +2321,11 @@
       alert(error.message);
     } finally {
       controls.forEach((control) => { control.disabled = false; });
+      // Disabling a focused answer button moves focus to the body. Restore it
+      // before the next snapshot replaces the question, unless the user moved on.
+      if (controls.includes(activeElement) && activeElement.isConnected && document.activeElement === document.body) {
+        activeElement.focus({preventScroll: true});
+      }
     }
   };
 
@@ -2328,6 +2383,11 @@
       const drafts = wizardState.drafts;
       let page = Math.min(wizardState.page, questions.length - 1);
       box.classList.add("question-approval");
+      box.dataset.requestId = entry.id;
+      const heading = document.createElement("div");
+      heading.className = "question-heading";
+      heading.append(title);
+      box.prepend(heading);
       const questionPanel = document.createElement("div");
       questionPanel.className = "wizard-content";
       const progress = document.createElement("p");
@@ -2338,10 +2398,12 @@
       actions.className = "approval-actions wizard-actions";
       const back = document.createElement("button");
       back.type = "button";
+      back.name = "question-back";
       back.className = "quiet";
       back.textContent = "Back";
       const next = document.createElement("button");
       next.type = "button";
+      next.name = "question-next";
       const answerField = (question, rows, placeholder) => {
         const field = document.createElement(question.isSecret ? "input" : "textarea");
         field.name = "answer-note";
@@ -2546,7 +2608,7 @@
         deleteRequestInputDraft(requestInputDraftStorage, slug, currentThreadId, id);
       }
     }
-    pending.replaceChildren(...entries.map(renderApproval));
+    composerView.replacePending(entries.map(renderApproval));
   };
 
   const queuePanel = document.getElementById("queue-panel");
@@ -2765,7 +2827,7 @@
   document.getElementById("plan-keep-planning")?.addEventListener("click", () => {
     dismissedPlanIdentity = planIdentity(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     ++planRenderGeneration;
-    setPlanDecisionVisible(planActions, document.getElementById("message-form"), false, true);
+    composerView.setPlanVisible(false, true);
   });
   document.getElementById("plan-implement-same")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
@@ -2805,7 +2867,7 @@
       followTranscript();
       dismissedPlanIdentity = implementingIdentity;
       ++planRenderGeneration;
-      setPlanDecisionVisible(planActions, document.getElementById("message-form"), false);
+      composerView.setPlanVisible(false);
       renderMessageReceipts();
       applyCurrentSettings();
       scheduleRefresh(0);
