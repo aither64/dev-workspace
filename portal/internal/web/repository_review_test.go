@@ -297,3 +297,38 @@ func TestComparisonObservationFailureDoesNotHideRepositoryStatus(t *testing.T) {
 	// The readable state endpoint is independent of comparison persistence.
 	reviewRequest(t, s, "GET", "/api/sessions/example/repository-state?repository="+repository.ReviewID("project"), "", 200)
 }
+
+func TestLargeComparisonPreviewRequiresExplicitFile(t *testing.T) {
+	s, _, worktree, _ := reviewWebFixture(t)
+	defer s.Close()
+	if err := os.WriteFile(filepath.Join(worktree, "file"), []byte(strings.Repeat("added\n", 2000)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "-C", worktree, "commit", "-am", "large change")
+	endpoint := "/api/sessions/example/repository-"
+	query := "?repository=" + repository.ReviewID("project")
+	history := reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200)
+	query += "&review=" + reviewString(t, history["review"])
+	comparison := reviewRequest(t, s, "GET", endpoint+"comparison"+query, "", 200)
+	if preview, exists := comparison["preview"]; exists && string(preview) != "null" {
+		t.Fatalf("large preview fetched without request: %s", preview)
+	}
+	var files []repository.ReviewFile
+	if err := json.Unmarshal(comparison["files"], &files); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || !files[0].LargeDiff() {
+		t.Fatalf("files=%#v", files)
+	}
+	explicit := reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&file="+files[0].ID, "", 200)
+	var preview struct {
+		File    string
+		Content repository.ReviewContent
+	}
+	if err := json.Unmarshal(explicit["preview"], &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.File != files[0].ID || preview.Content.Diff == nil {
+		t.Fatalf("explicit preview=%#v", preview)
+	}
+}

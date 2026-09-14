@@ -115,3 +115,7 @@
   .repository-file-status { font-size: .65rem; }
   .repository-review-heading > .repository-review-title { order: -1; flex-basis: 100%; }
 }
+
+.review-split-view { display: flex; align-items: stretch; }
+.review-split-pane { flex: 1 1 0; min-width: 0; }
+.review-split-pane + .review-split-pane { border-left: 1px solid #30363d; }

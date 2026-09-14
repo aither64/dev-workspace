@@ -1,10 +1,9 @@
-import {Text} from "@codemirror/state";
-import {Chunk} from "@codemirror/merge";
+import {diff as characterDiff} from "@codemirror/merge";
 
 export const DIFF_CONFIG = {scanLimit: 500, timeout: 100};
 
 export function normalizeSource(text) {
-  return String(text ?? "").replace(/\r\n?/g, "\n");
+  return String(text ?? "").replace(/\r\n/g, "\n");
 }
 
 export function sourceLines(text) {
@@ -44,43 +43,71 @@ export function languageForPath(path, text = "") {
   return null;
 }
 
-// Project the native CodeMirror diff into ordinary read-only editor lines.
-// Source offsets remain separate from display offsets, including for renames,
-// removals, missing final newlines and empty files.
-export function unifiedProjection(before, after) {
+// Git alone classifies changed lines. The bounded character diff is cosmetic
+// and sees only one Git change block at a time, never unchanged source lines.
+export function reviewProjection(before, after, diff, split = false) {
   const oldLines = sourceLines(before), newLines = sourceLines(after);
-  const chunks = Chunk.build(Text.of(before.split("\n")), Text.of(after.split("\n")), DIFF_CONFIG);
-  const rows = [], positions = {old: new Map(), new: new Map()};
-  let a = 0, b = 0, offset = 0;
-  function push(oldLine, newLine, kind, chunk) {
+  if (!Array.isArray(diff?.changes)) throw new Error("Exact Git diff is unavailable. Reload this page to try again.");
+  let oldEnd = 0, newEnd = 0;
+  for (const change of diff.changes) {
+    const {oldStart, oldLines: oldCount, newStart, newLines: newCount} = change;
+    if (![oldStart, oldCount, newStart, newCount].every(n => Number.isSafeInteger(n) && n >= 0) ||
+        oldStart < oldEnd || newStart < newEnd || oldStart - oldEnd !== newStart - newEnd ||
+        oldStart + oldCount > oldLines.length || newStart + newCount > newLines.length || !oldCount && !newCount) {
+      throw new Error("Git diff ranges do not match the file contents.");
+    }
+    oldEnd = oldStart + oldCount; newEnd = newStart + newCount;
+  }
+  if (oldLines.length - oldEnd !== newLines.length - newEnd) throw new Error("Git diff ranges do not match the file contents.");
+  function projection() { return {text: "", rows: [], positions: {old: new Map(), new: new Map()}, offset: 0}; }
+  const unified = projection(), old = projection(), next = projection();
+  function push(target, oldLine, newLine, kind, changes = []) {
     const source = newLine ?? oldLine;
-    const row = {text: source.text, from: offset, oldLine: oldLine?.number, newLine: newLine?.number,
+    const row = {text: source?.text ?? "", from: target.offset, oldLine: oldLine?.number, newLine: newLine?.number,
       oldFrom: oldLine?.from, newFrom: newLine?.from, kind, changes: []};
-    if (chunk && kind !== "context") {
-      const old = kind === "deletion", start = old ? chunk.fromA : chunk.fromB;
-      for (const change of chunk.changes) {
-        const from = Math.max(source.from, start + (old ? change.fromA : change.fromB));
-        const to = Math.min(source.from + source.text.length, start + (old ? change.toA : change.toB));
-        if (to > from) row.changes.push([offset + from - source.from, offset + to - source.from]);
+    if (source) for (const [from, to] of changes) {
+      const lo = Math.max(from, source.from), hi = Math.min(to, source.from + source.text.length);
+      if (hi > lo) row.changes.push([row.from + lo - source.from, row.from + hi - source.from]);
+    }
+    if (oldLine) target.positions.old.set(oldLine.number, row.from);
+    if (newLine) target.positions.new.set(newLine.number, row.from);
+    target.rows.push(row);
+    target.offset += row.text.length + 1;
+  }
+  function context(a, b) {
+    if (a.text !== b.text) throw new Error("Git diff context does not match the file contents.");
+    if (split) { push(old, a, null, "context"); push(next, null, b, "context"); }
+    else push(unified, a, b, "context");
+  }
+  let a = 0, b = 0;
+  for (const change of diff.changes) {
+    while (a < change.oldStart) context(oldLines[a++], newLines[b++]);
+    const removed = oldLines.slice(a, a + change.oldLines), added = newLines.slice(b, b + change.newLines);
+    const oldMarks = [], newMarks = [];
+    if (removed.length && added.length) {
+      const oldText = removed.map(line => line.text).join("\n"), newText = added.map(line => line.text).join("\n");
+      for (const mark of characterDiff(oldText, newText, DIFF_CONFIG)) {
+        oldMarks.push([removed[0].from + mark.fromA, removed[0].from + mark.toA]);
+        newMarks.push([added[0].from + mark.fromB, added[0].from + mark.toB]);
       }
     }
-    if (oldLine) positions.old.set(oldLine.number, offset);
-    if (newLine) positions.new.set(newLine.number, offset);
-    rows.push(row);
-    offset += source.text.length + 1;
-  }
-  for (const chunk of chunks) {
-    while (a < oldLines.length && b < newLines.length && oldLines[a].from < chunk.fromA && newLines[b].from < chunk.fromB) {
-      push(oldLines[a++], newLines[b++], "context");
+    if (split) {
+      for (let i = 0; i < Math.max(removed.length, added.length); i++) {
+        push(old, removed[i], null, removed[i] ? "deletion" : "empty", oldMarks);
+        push(next, null, added[i], added[i] ? "addition" : "empty", newMarks);
+      }
+    } else {
+      for (const line of removed) push(unified, line, null, "deletion", oldMarks);
+      for (const line of added) push(unified, null, line, "addition", newMarks);
     }
-    while (a < oldLines.length && oldLines[a].from < chunk.toA) push(oldLines[a++], null, "deletion", chunk);
-    while (b < newLines.length && newLines[b].from < chunk.toB) push(null, newLines[b++], "addition", chunk);
+    a += change.oldLines; b += change.newLines;
   }
-  while (a < oldLines.length && b < newLines.length) push(oldLines[a++], newLines[b++], "context");
-  while (a < oldLines.length) push(oldLines[a++], null, "deletion");
-  while (b < newLines.length) push(null, newLines[b++], "addition");
-  return {text: rows.map(row => row.text).join("\n"), rows, positions};
+  while (a < oldLines.length) context(oldLines[a++], newLines[b++]);
+  for (const target of [unified, old, next]) target.text = target.rows.map(row => row.text).join("\n");
+  return split ? {old, new: next} : unified;
 }
+export const unifiedProjection = (before, after, diff) => reviewProjection(before, after, diff);
+export const splitProjection = (before, after, diff) => reviewProjection(before, after, diff, true);
 
 export function contextRegions(rows, margin = 3, minimum = 8) {
   const regions = [];
@@ -92,7 +119,7 @@ export function contextRegions(rows, margin = 3, minimum = 8) {
     if (last - first >= minimum) {
       const from = rows[first].from;
       const to = last < rows.length ? rows[last].from : rows[last - 1].from + rows[last - 1].text.length;
-      if (to > from) regions.push({from, to, lines: last - first});
+      if (to > from) regions.push({from, to, lines: last - first, first, last});
     }
     start = end;
   }
@@ -104,6 +131,7 @@ export function contextRegions(rows, margin = 3, minimum = 8) {
 export function projectTokens(projection, oldTokens, newTokens) {
   const output = [], cursor = {old: 0, new: 0};
   for (const row of projection.rows) {
+    if (row.oldLine == null && row.newLine == null) continue;
     const side = row.newLine == null ? "old" : "new";
     const tokens = side === "old" ? oldTokens : newTokens;
     const sourceFrom = side === "old" ? row.oldFrom : row.newFrom;

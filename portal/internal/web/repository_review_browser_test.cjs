@@ -3,7 +3,7 @@ const fs = require("node:fs");
 
 (async () => {
   const source = fs.readFileSync("static/repository-review.js", "utf8");
-  const {reviewRoute, reviewURL, fullFileVersion, fileStatus, changeCounts, historyHasPages} =
+  const {reviewRoute, reviewURL, fullFileVersion, fileStatus, changeCounts, historyHasPages, largeDiff} =
     await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
   const original = "https://workspace.example.test/example/?unrelated=kept#codex";
   const route = {
@@ -17,7 +17,11 @@ const fs = require("node:fs");
   assert.equal(parsed.searchParams.get("tab"), "repositories");
   assert.equal(parsed.hash, "#old-L12000");
   assert.deepEqual(reviewRoute(href), route);
-  assert.equal(reviewRoute(original, "unified").layout, "unified");
+  assert.equal(reviewRoute(original).layout, "unified");
+  assert.equal(reviewRoute(original, "split").layout, "split");
+  assert.equal(largeDiff({additions: 1999, deletions: 1}), false);
+  assert.equal(largeDiff({additions: 2000, deletions: 1}), true);
+  assert.equal(largeDiff({additions: null, deletions: null}), false);
   assert.equal(reviewRoute(original + "-L1").line, null);
   for (const bad of ["#old-L0", "#old-L-1", "#old-L1x", "#new-L9007199254740992"]) {
     assert.equal(reviewRoute("https://workspace.example.test/" + bad).line, null);

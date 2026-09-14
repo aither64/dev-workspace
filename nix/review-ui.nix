@@ -1,4 +1,4 @@
-{ buildNpmPackage, lib }:
+{ buildNpmPackage, lib, git }:
 let src = ../portal/review-ui; in
 buildNpmPackage {
   pname = "workspace-repository-review-assets";
@@ -14,10 +14,12 @@ buildNpmPackage {
       (src + "/highlight-client.js")
       (src + "/highlight-worker.js")
       (src + "/editor.test.mjs")
+      (src + "/fixtures")
       (src + "/syntax.NOTICE")
       (src + "/build.mjs")
     ];
   };
+  nativeBuildInputs = [ git ];
   npmDepsHash = "sha256-1FxpNmLkv0o9MXQG/qbH7f59sYJkHHmsfW1gytAd0VI=";
   npmRebuildFlags = [ "--ignore-scripts" ];
   doCheck = true;

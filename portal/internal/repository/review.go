@@ -103,8 +103,10 @@ type ReviewBlob struct {
 	Kind           string `json:"kind"`
 }
 type ReviewContent struct {
-	Before ReviewBlob `json:"before"`
-	After  ReviewBlob `json:"after"`
+	Before    ReviewBlob  `json:"before"`
+	After     ReviewBlob  `json:"after"`
+	Diff      *ReviewDiff `json:"diff,omitempty"`
+	DiffError string      `json:"diffError,omitempty"`
 }
 
 func ReviewID(value string) string {
@@ -452,7 +454,7 @@ func (r ReviewReader) CommitPair(ctx context.Context, repo ReviewRepository, com
 func (r ReviewReader) Files(ctx context.Context, repo ReviewRepository, pair ReviewPair) ([]ReviewFile, error) {
 	// Keep rename detection complete for a successful comparison. The Git
 	// deadline bounds expensive comparisons instead of silently losing renames.
-	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "--numstat", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "--find-renames=50%", "-l0", pair.Base, pair.Head, "--")
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "--numstat", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--ignore-submodules=none", "--find-renames=50%", "-l0", pair.Base, pair.Head, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +541,14 @@ func (r ReviewReader) Content(ctx context.Context, repo ReviewRepository, file R
 	if err != nil {
 		return ReviewContent{}, err
 	}
-	return ReviewContent{Before: before, After: after}, nil
+	content := ReviewContent{Before: before, After: after}
+	if !before.Binary && !after.Binary && !before.Limited && !after.Limited && before.Kind != "submodule" && after.Kind != "submodule" {
+		content.Diff, err = r.fileDiff(ctx, repo, file, before, after)
+		if err != nil {
+			content.DiffError = "The exact diff is unavailable: " + err.Error()
+		}
+	}
+	return content, nil
 }
 func (r ReviewReader) blob(ctx context.Context, dir, object, mode string) (ReviewBlob, error) {
 	b := ReviewBlob{Kind: "file"}

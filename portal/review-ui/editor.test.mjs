@@ -1,11 +1,37 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import {execFileSync} from "node:child_process";
+import {mkdtempSync, writeFileSync, rmSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {readFile} from "node:fs/promises";
-import {normalizeSource, sourceLines, languageForPath, unifiedProjection, contextRegions, projectTokens} from "./editor-model.js";
+import {normalizeSource, sourceLines, languageForPath, unifiedProjection, splitProjection, contextRegions, projectTokens} from "./editor-model.js";
 import {initializeHighlighter, tokenizeSource} from "./highlight.js";
 
-function validateProjection(before, after) {
-  const projected = unifiedProjection(before, after);
+function gitDiff(before, after) {
+  const dir = mkdtempSync(join(tmpdir(), "review-git-"));
+  try {
+    writeFileSync(join(dir, "old"), before); writeFileSync(join(dir, "new"), after);
+    let patch;
+    try { patch = execFileSync("git", ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--unified=0", "old", "new"], {cwd: dir, encoding: "utf8"}); }
+    catch (error) { if (error.status !== 1) throw error; patch = error.stdout; }
+    const changes = [...patch.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)].map(match => {
+      const oldLines = Number(match[2] ?? 1), newLines = Number(match[4] ?? 1);
+      return {oldStart: Number(match[1]) - (oldLines ? 1 : 0), oldLines, newStart: Number(match[3]) - (newLines ? 1 : 0), newLines};
+    });
+    return {changes};
+  } finally { rmSync(dir, {recursive: true}); }
+}
+function validateProjection(before, after, diff = gitDiff(before, after)) {
+  before = normalizeSource(before); after = normalizeSource(after);
+  const projected = unifiedProjection(before, after, diff);
+  const split = splitProjection(before, after, diff);
+  assert.equal(split.old.rows.length, split.new.rows.length);
+  for (const [side, kind, count] of [["old", "deletion", "oldLines"], ["new", "addition", "newLines"]]) {
+    assert.equal(projected.rows.filter(row => row.kind === kind).length, diff.changes.reduce((sum, change) => sum + change[count], 0));
+    assert.equal(split[side].rows.filter(row => row.kind === kind).length, projected.rows.filter(row => row.kind === kind).length);
+    assert.deepEqual(split[side].rows.filter(row => row.kind !== "empty").map(row => row.text), sourceLines(side === "old" ? before : after).map(line => line.text));
+  }
   for (const [side, source] of [["old", before], ["new", after]]) {
     const key = side === "old" ? "oldLine" : "newLine";
     const rows = projected.rows.filter(row => row[key] != null);
@@ -25,6 +51,7 @@ test("unified projections preserve complete old/new line identities and unusual 
     ["", ""], ["", "new\n"], ["deleted\n", ""], ["same\n", "same\n"],
     ["same", "same\n"], ["same\n", "same"], ["\n", "\n\n"],
     ["a\nb\nc", "before\na\nc\nafter\n"], ["😀 = '<tag>';\n\told\n", "😀 = '&';\n\tnew\n"],
+    ["a\r\nb\rc\n", "a\r\nnew\rc\n"],
     ["dup\ndup\nold\ndup\n", "dup\nnew\ndup\ndup\n"],
   ]) validateProjection(before, after);
   // Exercise insertions/removals/repetition without mirroring the diff algorithm.
@@ -69,7 +96,7 @@ test("language selection recognizes workspace files and every bundled grammar", 
   assert.equal(languageForPath("run", "#!/usr/bin/env ruby\nputs 1"), "ruby");
   assert.equal(languageForPath("notes.unknown"), null);
   assert.notEqual(languageForPath("before.rb"), languageForPath("after.ts"));
-  assert.equal(normalizeSource("a\r\nb\rc\n"), "a\nb\nc\n");
+  assert.equal(normalizeSource("a\r\nb\rc\n"), "a\nb\rc\n");
 });
 
 test("selected maintained grammars highlight complete source with stable palette indices", async () => {
@@ -170,4 +197,23 @@ test("worker client coalesces immutable sources and cancels only abandoned work"
     assert.equal(results.filter(result => result === "ok").length, 17);
     assert.equal(results.filter(result => result === "full").length, 3);
   } finally { globalThis.Worker = original; }
+});
+
+
+test("reported OAuth2 comparison has exactly 116 added and six removed lines in both layouts", async () => {
+  const fixture = JSON.parse(await readFile(new URL("fixtures/oauth2.json", import.meta.url), "utf8"));
+  assert.deepEqual(gitDiff(fixture.before, fixture.after), fixture.diff);
+  const projected = validateProjection(fixture.before, fixture.after, fixture.diff);
+  assert.equal(projected.rows.filter(row => row.kind === "addition").length, 116);
+  assert.equal(projected.rows.filter(row => row.kind === "deletion").length, 6);
+});
+
+test("missing or inconsistent Git ranges fail without falling back to approximate changed lines", () => {
+  assert.throws(() => unifiedProjection("a", "b"), /Exact Git diff/);
+  assert.throws(() => unifiedProjection("a", "b", {changes: []}), /context/);
+  for (const changes of [
+    [{oldStart: -1, oldLines: 1, newStart: 0, newLines: 1}],
+    [{oldStart: 0, oldLines: 2, newStart: 0, newLines: 1}],
+    [{oldStart: 0, oldLines: 0, newStart: 0, newLines: 0}],
+  ]) assert.throws(() => splitProjection("a", "b", {changes}), /ranges/);
 });

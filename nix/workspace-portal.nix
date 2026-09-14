@@ -28,7 +28,7 @@
 }:
 let
   reviewAssets = import ./review-ui.nix {
-    inherit buildNpmPackage lib;
+    inherit buildNpmPackage lib git;
   };
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
   validActivationEnvironmentAliases =

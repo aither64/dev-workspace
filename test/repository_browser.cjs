@@ -9,7 +9,8 @@ const root = process.cwd();
 const bundle = process.env.REVIEW_ASSETS_DIRECTORY || path.join(root, "portal/review-ui/dist");
 const provider = process.env.CODEX_WEB_SOURCE;
 const base = "a".repeat(40), originalHead = "b".repeat(40);
-let head = originalHead, shortFiles = false;
+let head = originalHead, shortFiles = false, fixtureMode = "normal";
+const reported = JSON.parse(fs.readFileSync(path.join(root, "portal/review-ui/fixtures/oauth2.json"), "utf8"));
 const calls = [], assets = [];
 const cards = '<div class="section-heading"><h2>Repositories</h2><span>4</span></div><div class="repo-grid">' +
   ["project", "second", "third", "fourth"].map(name => '<article class="panel repo-card" data-repository-id="' + name +
@@ -26,12 +27,24 @@ files[5].path = "replacement/child.nix";
 files[6].path = "__proto__/constructor/long-file-name-" + "example-".repeat(12) + ".nix";
 files[7].path = "README.nix";
 const source = Array.from({length: 100}, (_, i) => '  value' + i + ' = "before ' + i + '";').join("\n") + "\n";
+const specialFiles = () => fixtureMode === "normal" ? files : [{id: "0", path: fixtureMode === "reported" ? "oauth2_config.rb" : "large.txt",
+  status: fixtureMode === "reported" ? "M" : "A", oldMode: fixtureMode === "reported" ? "100644" : "000000", newMode: "100644",
+  additions: fixtureMode === "reported" ? 116 : fixtureMode === "boundary" ? 2000 : 2001, deletions: fixtureMode === "reported" ? 6 : 0}];
 const content = id => {
+  if (fixtureMode !== "normal") {
+    const count = fixtureMode === "boundary" ? 2000 : 2001;
+    const before = fixtureMode === "reported" ? reported.before : "", after = fixtureMode === "reported" ? reported.after : "new\n".repeat(count);
+    return {before: {text: before, kind: before ? "file" : "absent", bytes: before.length}, after: {text: after, kind: "file", bytes: after.length},
+      diff: fixtureMode === "reported" ? reported.diff : {changes: [{oldStart: 0, oldLines: 0, newStart: 0, newLines: count}]}};
+  }
   const file = files[Number(id)];
   const original = shortFiles ? '  value = "before 35";\n' : source;
   const before = file.oldMode === "000000" ? "" : "{\n" + original + "}\n";
   const after = file.newMode === "000000" ? "" : "{\n" + original.replace("before 35", "after 35") + "}\n";
-  return {before: {text: before, bytes: before.length, kind: file.oldMode === "000000" ? "absent" : "file"},
+  const diff = {changes: before === "" ? [{oldStart: 0, oldLines: 0, newStart: 0, newLines: after.split("\n").length - 1}] :
+    after === "" ? [{oldStart: 0, oldLines: before.split("\n").length - 1, newStart: 0, newLines: 0}] :
+    [{oldStart: shortFiles ? 1 : 36, oldLines: 1, newStart: shortFiles ? 1 : 36, newLines: 1}]};
+  return {diff, before: {text: before, bytes: before.length, kind: file.oldMode === "000000" ? "absent" : "file"},
     after: {text: after, bytes: after.length, kind: file.newMode === "000000" ? "absent" : "file"}};
 };
 const commit = {id: "commit", sha: originalHead, subject: "Improve repository review", body: "Complete body\n\nSecond paragraph.",
@@ -41,7 +54,7 @@ const rootCommit = {...commit, sha: "e".repeat(40), parents: [], message: "Initi
 const parentCommit = {...commit, sha: base, parents: [rootCommit.sha], message: "Previous implementation\n\nParent body.\n"};
 const sideCommit = {...parentCommit, sha: "d".repeat(40), message: "Side branch\n"};
 const commits = new Map([commit, parentCommit, sideCommit, rootCommit].map(item => [item.sha, item]));
-const history = repository => ({repository, review: "frozen", snapshot: "snapshot", pair: {base, head: originalHead, baseLabel: "Merge base"},
+const history = repository => ({repository, review: "frozen", snapshot: "snapshot", pair: {base, head, baseLabel: "Merge base"},
   history: {commits: [commit], page: 0, hasMore: false}});
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://fixture");
@@ -57,6 +70,7 @@ const server = http.createServer((req, res) => {
     "import {createCopyButton} from '/conversation.js';window.cardMarkup=" + JSON.stringify(cards) +
     ";window.review=mount({slug:'example',nonce:'teststyle123',createCopyButton,element:document.getElementById('repositories')});");
   if (url.pathname === "/harness.css") return send("text/css", "html,body{height:100%;margin:0}#repositories{height:100%;}");
+  if (url.pathname === "/sync.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/sync.js")));
   if (url.pathname === "/uploads.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/uploads.js")));
   if (url.pathname === "/conversation.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/conversation.js")));
   if (url.pathname === "/copy.css") return send("text/css", fs.readFileSync(path.join(provider, "conversation/assets/conversation.css")));
@@ -73,9 +87,9 @@ const server = http.createServer((req, res) => {
   if (url.pathname.endsWith("repository-states")) return json({repositories: url.searchParams.getAll("repository").map(repository => ({repository, head}))});
   if (url.pathname.endsWith("repository-comparison")) return json({review: "frozen", snapshot: "snapshot",
     name: "project", pair: {base, head: url.searchParams.get("commit") || originalHead, baseLabel: "Merge base"}, historyHead: originalHead,
-    commit: commits.get(url.searchParams.get("commit")) || null, files,
+    commit: commits.get(url.searchParams.get("commit")) || null, files: specialFiles(),
     stats: {files: 30, additions: 29, deletions: 29, binaryFiles: 0},
-    preview: {file: url.searchParams.get("file") || "0", content: content(url.searchParams.get("file") || "0")}});
+    preview: fixtureMode === "large" && !url.searchParams.get("file") ? null : {file: url.searchParams.get("file") || "0", content: content(url.searchParams.get("file") || "0")}});
   if (url.pathname.endsWith("repository-files")) return json({files: url.searchParams.getAll("file").map(file => ({file, content: content(file)}))});
   res.statusCode = 404; res.end();
 });
@@ -108,7 +122,8 @@ const server = http.createServer((req, res) => {
     const commitLink = await page.locator(".repository-commit-subject").first().getAttribute("href");
     assert(new URL(commitLink).searchParams.get("commit") === originalHead);
     await page.locator(".repository-commit-subject").first().click();
-    await page.locator(".cm-mergeView").first().waitFor();
+    await page.locator(".cm-editor").first().waitFor();
+    assert.equal(await page.getByRole("button", {name: "Unified", exact: true}).getAttribute("aria-pressed"), "true");
     await page.waitForFunction(() => {
       const colors = [...document.querySelectorAll('.repository-file-section[data-file-id="0"] [class*="review-token-"]')]
         .map(element => getComputedStyle(element).color);
@@ -181,7 +196,7 @@ const server = http.createServer((req, res) => {
     assert.equal(new URL(page.url()).hash, '');
     assert.equal(new URL(page.url()).searchParams.has('version'), false);
     await page.getByRole("button", {name: "Unified", exact: true}).click();
-    await page.waitForFunction(() => !document.querySelector(".cm-mergeView") && document.querySelector(".cm-editor"));
+    await page.waitForFunction(() => !document.querySelector(".review-split-view") && document.querySelector(".cm-editor"));
     const lineLink = new URL(page.url()); lineLink.hash = "old-L90";
     await page.goto(lineLink.href);
     await page.waitForFunction(() => document.querySelector('.repository-file-section[data-file-id="0"] .cm-content')?.textContent.includes("before 88"));
@@ -248,9 +263,51 @@ const server = http.createServer((req, res) => {
     assert(retained <= 8, "many short diffs exceeded the eight-file mount bound: " + retained);
     assert.equal(await page.locator(".review-syntax-status").count(), 0, "bounded editors lost syntax highlighting");
     assert(await page.locator('.repository-file-section[data-file-id="0"] .review-code-view').count(), "selected file was evicted");
+    fixtureMode = "large";
+    const largeURL = origin + "/example/?tab=repositories&repository=project&review=frozen&layout=unified";
+    const beforeLargeCalls = calls.length;
+    await page.goto(largeURL);
+    const firstFile = page.locator('.repository-file-section[data-file-id="0"]');
+    await firstFile.locator('.repository-file-toggle').waitFor();
+    await page.waitForLoadState("networkidle");
+    assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "false");
+    assert.equal(await page.locator('.cm-editor').count(), 0);
+    assert(!calls.slice(beforeLargeCalls).some(call => call.operation === "repository-files"), "large diff fetched automatically");
+    await firstFile.locator('.repository-file-toggle').click();
+    await firstFile.locator('.cm-editor').waitFor();
+    await firstFile.locator('.repository-file-toggle').click();
+    assert.equal(await firstFile.locator('.cm-editor').count(), 0, "collapse retained an editor");
+    await page.getByRole("button", {name: "Split", exact: true}).click();
+    assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "false", "layout lost collapsed choice");
+    await page.locator('.repository-file[data-file-id="0"]').click();
+    await firstFile.locator('.review-split-view').waitFor();
+    assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "true", "explicit file link did not expand");
+    await firstFile.locator('.repository-file-toggle').click();
+    await page.getByRole("button", {name: "← Repositories", exact: true}).click();
+    await page.locator("[data-review-branch]").first().click();
+    await firstFile.locator('.repository-file-toggle').waitFor();
+    assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "false", "comparison navigation lost collapsed choice");
+    fixtureMode = "boundary"; await page.goto(largeURL);
+    await firstFile.locator('.cm-editor').waitFor();
+    assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "true", "2000 lines were initially hidden");
+    fixtureMode = "reported";
+    await page.setViewportSize({width: 1600, height: 14000});
+    await page.goto(largeURL);
+    await firstFile.locator('.cm-editor').waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('.review-added-line').length === 116);
+    assert.equal(await firstFile.locator('.review-deleted-line').count(), 6);
+    await page.getByRole("button", {name: "Split", exact: true}).click();
+    await firstFile.locator('.review-split-view').waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('.review-added-line').length === 116);
+    assert.equal(await firstFile.locator('.review-deleted-line').count(), 6);
+    const contexts = firstFile.locator('.review-context-button');
+    await contexts.first().click();
+    assert.equal(await firstFile.locator('.review-split-pane').first().locator('.review-context-button').count(),
+      await firstFile.locator('.review-split-pane').last().locator('.review-context-button').count(), "split context expansion was not shared");
+    assert.deepEqual(errors, []);
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
       "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
-      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry"]}));
+      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry", "large diff 2000/2001 boundary", "collapse and explicit expansion", "Git-exact OAuth2 counts in both layouts", "shared split context expansion"]}));
   } finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
 })().catch(error => {console.error(error); process.exitCode = 1; server.close();});

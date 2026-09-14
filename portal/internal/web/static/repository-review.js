@@ -36,11 +36,11 @@ const request = async (url, options = {}) => {
   return payload;
 };
 const readMode = () => {
-  try { return localStorage.getItem("repository-review-mode") === "unified" ? "unified" : "split"; }
-  catch (_) { return "split"; }
+  try { return localStorage.getItem("repository-review-mode") === "split" ? "split" : "unified"; }
+  catch (_) { return "unified"; }
 };
 const routeKeys = ["repository", "review", "commit", "file", "view", "layout", "version"];
-export function reviewRoute(href, fallbackLayout = "split") {
+export function reviewRoute(href, fallbackLayout = "unified") {
   const url = new URL(href);
   const line = /^#(old|new)-L([1-9][0-9]*)$/.exec(url.hash);
   return {
@@ -95,6 +95,8 @@ export function fullFileVersion(file, requested) {
   return requested === "old" ? "old" : "new";
 }
 
+export const largeDiff = file => Number.isFinite(file.additions) && Number.isFinite(file.deletions) && file.additions + file.deletions > 2000;
+
 export function mount({slug, nonce, element, createCopyButton}) {
   if (!document.querySelector('link[data-repository-review-styles]')) {
     const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css";
@@ -107,7 +109,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
   const overview = node("div", "repository-overview"); overview.append(...element.childNodes);
   const review = node("section", "repository-comparison"); review.hidden = true;
   element.append(overview, review);
-  const states = new Map();
+  const states = new Map(), collapseChoices = new Map();
   let active = null, sequence = 0, checking = false, destroyed = false;
   let opening = null;
   let route = reviewRoute(location.href, readMode());
@@ -307,7 +309,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
   };
   const renderFile = async (selected, record) => {
-    if (!record.content || active !== selected) return;
+    if (!record.content || record.collapsed || active !== selected) return;
     trimEditors(selected, record);
     const fileView = route.view === "file" && record === selectedFile(selected);
     const version = fullFileVersion(record.file, route.version);
@@ -324,13 +326,18 @@ export function mount({slug, nonce, element, createCopyButton}) {
       record.host.append(node("p", "muted", "Text preview is unavailable for this file. Review the metadata above or inspect it locally."));
       return;
     }
+    if (!fileView && !content.diff) {
+      record.host.style.minHeight = "0px";
+      record.host.append(node("p", "notice warning", content.diffError || "The exact diff is unavailable. Reload this page to try again, or use View file."));
+      return;
+    }
     record.host.append(node("p", "muted", "Loading file view…"));
     try {
       const {createReviewEditor} = await preload();
       if (active !== selected || generation !== record.generation) return;
       record.host.replaceChildren(); record.host.style.minHeight = "0px";
       record.editor = createReviewEditor({
-        parent: record.host, before: content.before.text, after: content.after.text,
+        parent: record.host, before: content.before.text, after: content.after.text, diff: content.diff,
         oldPath: record.file.oldPath || record.file.path, newPath: record.file.path,
         mode: editorMode, version, nonce,
         lineURL: (side, number) => reviewURL(location.href, fileRoute(record.file, {line: {side, number}})),
@@ -356,7 +363,8 @@ export function mount({slug, nonce, element, createCopyButton}) {
   const pumpFiles = selected => {
     if (active !== selected) return;
     while (selected.jobs < 2 && selected.fileQueue.size) {
-      const batch = [...selected.fileQueue].slice(0, 4);
+      const batch = [...selected.fileQueue].filter(record => !record.collapsed).slice(0, 4);
+      if (!batch.length) break;
       batch.forEach(record => selected.fileQueue.delete(record));
       selected.jobs++;
       void (async () => {
@@ -367,6 +375,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
           await Promise.all(batch.map(async record => {
             const result = results.get(record.file.id);
             if (!result || result.error) throw Object.assign(new Error(result?.error || "File content is unavailable."), {record});
+            if (record.collapsed) return;
             assignContent(record, result.content);
             if (!record.section.hidden) await renderFile(selected, record);
           }).map(promise => promise.catch(error => {
@@ -374,7 +383,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
             else throw error;
           })));
         } catch (error) {
-          if (active === selected && error.name !== "AbortError") for (const record of batch) if (!record.content) showFailure(record.host, error);
+          if (active === selected && error.name !== "AbortError") for (const record of batch) if (!record.content && !record.collapsed) showFailure(record.host, error);
         } finally {
           selected.jobs--;
           for (const record of batch) { record.loading = false; record.resolveLoad?.(); record.resolveLoad = null; }
@@ -384,6 +393,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
   };
   const loadFile = (selected, record, priority = false) => {
+    if (record.collapsed) return Promise.resolve();
     record.used = performance.now();
     if (record.content) return renderFile(selected, record);
     if (record.loading) {
@@ -396,6 +406,18 @@ export function mount({slug, nonce, element, createCopyButton}) {
     selected.fileQueue = new Set(priority ? [record, ...selected.fileQueue] : [...selected.fileQueue, record]);
     queueMicrotask(() => pumpFiles(selected));
     return record.loadPromise;
+  };
+  const setCollapsed = (selected, record, collapsed, remember = true) => {
+    record.collapsed = collapsed;
+    if (remember) collapseChoices.set(record.choiceKey, collapsed);
+    record.body.hidden = collapsed;
+    record.toggle.setAttribute("aria-expanded", String(!collapsed));
+    record.toggle.textContent = collapsed ? (largeDiff(record.file) ? "Show large diff" : "Show diff") : "Hide diff";
+    if (collapsed) {
+      ++record.generation; record.editor?.destroy(); record.editor = null; record.content = null;
+      if (selected?.fileQueue.delete(record)) { record.loading = false; record.resolveLoad?.(); record.resolveLoad = null; }
+      record.host.replaceChildren(node("p", "muted", "Scroll here to load this comparison."));
+    }
   };
   const applyView = async (revealTree = false) => {
     if (!active) return;
@@ -411,6 +433,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       item.fileLink.hidden = route.view === "file";
       item.diffLink.hidden = route.view !== "file";
       item.versions.hidden = route.view !== "file";
+      item.toggle.hidden = route.view === "file";
       const version = fullFileVersion(item.file, route.version);
       for (const option of item.versions.querySelectorAll("[data-version]")) option.setAttribute("aria-pressed", String(option.dataset.version === version));
     }
@@ -424,6 +447,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       record.nav.scrollIntoView({block: "nearest", inline: "nearest"});
     }
     selected.treeFile = record.file.id;
+    if ((revealTree && (route.file || route.line)) || route.view === "file") setCollapsed(selected, record, false);
     const others = [...selected.sections.values()].filter(item => item !== record && !item.section.hidden && item.content);
     void Promise.all(others.map(item => renderFile(selected, item)));
     await loadFile(selected, record, true);
@@ -483,6 +507,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
         const option = button(value === "split" ? "Split" : "Unified", () => {
+          if (route.layout === value) return;
           try { localStorage.setItem("repository-review-mode", value); } catch (_) {}
           navigate({...route, layout: value});
         });
@@ -522,7 +547,14 @@ export function mount({slug, nonce, element, createCopyButton}) {
         const diffLink = link("←", "", () => navigate(fileRoute(file, {view: "diff", version: ""})), "repository-back-to-diff");
         diffLink.title = "Back to diff"; diffLink.setAttribute("aria-label", "Back to diff");
         const fileName = node("div", "repository-file-heading");
-        fileName.append(diffLink, node("h3", "", file.path), copy(file.path, "Copy file path"));
+        const toggle = button("", () => {
+          const selected = active, record = selected?.sections.get(file.id);
+          if (!record) return;
+          setCollapsed(selected, record, !record.collapsed);
+          if (!record.collapsed) void loadFile(selected, record, true);
+        }, "repository-file-toggle quiet");
+        toggle.setAttribute("aria-label", "Toggle diff for " + file.path);
+        fileName.append(toggle, diffLink, node("h3", "", file.path), copy(file.path, "Copy file path"));
         fileTitle.append(fileName, node("span", "repository-file-status status-" + kind, label),
           counts(node("span", "repository-file-counts"), file));
         const versions = node("div", "repository-mode-controls"); versions.setAttribute("role", "group"); versions.setAttribute("aria-label", "File version");
@@ -535,8 +567,15 @@ export function mount({slug, nonce, element, createCopyButton}) {
         const fileMetadata = node("div", "repository-file-metadata");
         const host = node("div", "repository-editor repository-editor-placeholder");
         host.append(node("p", "muted", "Scroll here to load this comparison."));
-        section.append(fileTitle, fileMetadata, host); scroll.append(section);
-        sections.set(file.id, {file, nav, fileLink, diffLink, versions, section, metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, used: 0});
+        const fileBody = node("div", "repository-file-content"); fileBody.id = "diff-content-" + file.id;
+        toggle.setAttribute("aria-controls", fileBody.id);
+        fileBody.append(fileMetadata, host);
+        section.append(fileTitle, fileBody); scroll.append(section);
+        const choiceKey = [state.id, payload.pair.base, payload.pair.head, file.id].join(":");
+        const record = {file, nav, fileLink, diffLink, versions, section, toggle, body: fileBody, choiceKey,
+          metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, used: 0};
+        sections.set(file.id, record);
+        setCollapsed(null, record, requested.file === file.id ? false : collapseChoices.get(choiceKey) ?? largeDiff(file), false);
       }
       const alphabetical = (a, b) => a < b ? -1 : a > b ? 1 : 0;
       const renderTree = (directory, ancestors, prefix = "") => {
@@ -567,7 +606,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
         fileList, scroll, sections, abort, fileQueue: new Set(), jobs: 0};
       opening = null;
       const selected = active;
-      if (payload.preview && sections.has(payload.preview.file)) assignContent(sections.get(payload.preview.file), payload.preview.content);
+      if (payload.preview && sections.has(payload.preview.file) && !sections.get(payload.preview.file).collapsed) assignContent(sections.get(payload.preview.file), payload.preview.content);
       selected.observer = new IntersectionObserver(entries => {
         for (const entry of entries) {
           const record = sections.get(entry.target.dataset.fileId);
@@ -580,7 +619,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       }
       scroll.addEventListener("scroll", () => { if (active === selected) trimEditors(selected); }, {passive: true});
       markChanged(state, state.latestHead);
-      await applyView();
+      await applyView(true);
       if (!payload.files.length) scroll.append(node("p", "empty", "No changed files between these revisions."));
     } catch (error) {
       if (ticket === sequence && error.name !== "AbortError") review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", error.message));
@@ -598,7 +637,10 @@ export function mount({slug, nonce, element, createCopyButton}) {
     if (active && active.state === state && active.review === route.review && active.commit === route.commit) void applyView(revealTree);
     else void openComparison(state, hint);
   };
-  function navigate(next, hint = null) { setRoute(next); restore(hint); }
+  function navigate(next, hint = null) {
+    const explicitFile = Boolean(next.file) && (next.file !== route.file || next.layout === route.layout);
+    setRoute(next); restore(hint, explicitFile);
+  }
   const onURL = () => {
     route = reviewRoute(location.href, readMode());
     restore(null, true);

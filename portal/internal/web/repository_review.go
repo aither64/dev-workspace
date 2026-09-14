@@ -447,7 +447,7 @@ func (service *repositoryReviewService) fileContent(ctx context.Context, snapsho
 	}
 	for _, file := range files {
 		if file.ID == id {
-			key := "content\x00" + snapshot.Repo.Directory + "\x00" + file.OldObject + "\x00" + file.NewObject + "\x00" + file.OldMode + "\x00" + file.NewMode
+			key := "content\x00" + snapshot.Repo.Directory + "\x00" + snapshot.Pair.Base + "\x00" + snapshot.Pair.Head + "\x00" + file.ID + "\x00" + file.OldObject + "\x00" + file.NewObject + "\x00" + file.OldMode + "\x00" + file.NewMode
 			return cachedReview(ctx, service, key, func(ctx context.Context) (repository.ReviewContent, error) {
 				return service.reader.Content(ctx, snapshot.Repo, file)
 			})
@@ -496,7 +496,7 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 		}
 	}
 	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files}
-	if fileID == "" && len(files) > 0 {
+	if fileID == "" && len(files) > 0 && !files[0].LargeDiff() {
 		fileID = files[0].ID
 	}
 	if fileID != "" {
