@@ -14,6 +14,7 @@ require 'tempfile'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-auto-archive'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -178,6 +179,9 @@ module DevSession
       dev-session stop <name-or-slug> [--as-is]
       dev-session recover-stale <name-or-slug> [--as-is]
       dev-session archive <name-or-slug> [--as-is] [--abandoned]
+      dev-session auto-archive scan [--dry-run] [--json]
+      dev-session auto-archive enable|disable [--json]
+      dev-session auto-archive hold|release|status <name-or-slug> [--as-is] [--json]
       dev-session delete <name-or-slug> [--as-is] [--force]
       dev-session revive <name-or-slug> [--as-is]
       dev-session list [<name-or-slug>] [--as-is]
@@ -193,6 +197,7 @@ module DevSession
   USAGE
 
   class Error < StandardError; end
+  class SupersededGenerationError < Error; end
 
   class CommandError < Error
     attr_reader :argv, :status, :stdout, :stderr
@@ -216,6 +221,22 @@ module DevSession
   end
 
   class CommandRunner
+    def with_output(out)
+      previous = @out
+      @out = out
+      yield
+    ensure
+      @out = previous
+    end
+
+    def with_timeout(seconds)
+      previous = @timeout
+      @timeout = seconds
+      yield
+    ensure
+      @timeout = previous
+    end
+
     def initialize(out:, err:)
       @out = out
       @err = err
@@ -223,6 +244,7 @@ module DevSession
 
     def capture(argv, allow_failure: false, env: nil, pass_fds: [])
       command = argv.map(&:to_s)
+      command = ['timeout', '--signal=TERM', '--kill-after=5s', "#{@timeout}s", *command] if @timeout
       descriptor_options = pass_fds.to_h do |file|
         descriptor = file.fileno
         [descriptor, descriptor]
@@ -501,6 +523,7 @@ module DevSession
   end
 
   class Runner
+    include WorkspaceAutoArchive::Runner
     CleanupPlan = Struct.new(:session, :entries, :unexpected, keyword_init: true)
 
     attr_reader :workspace, :today
@@ -1338,7 +1361,7 @@ module DevSession
       lookup_slug(input, as_is:)
     end
 
-    def archive(input, as_is:, abandoned: false, operation_id: nil)
+    def archive(input, as_is:, abandoned: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
       mode = abandoned ? 'abandoned' : 'complete'
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
@@ -1349,6 +1372,7 @@ module DevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
           journal = load_archive_journal(slug, operation_id:)
+          automatic&.call(journal)
           ensure_retirement_identity!(slug, cleanup_session(slug))
           unless journal
             source = validate_work_directory!(slug)
@@ -1372,6 +1396,7 @@ module DevSession
               raise Error, 'work and archive directories must be on the same filesystem'
             end
             validate_tracking_transition_commit!(slug)
+            automatic&.call(nil)
             journal = prepare_archive_journal!(
               slug, mode, proven_heads, plan, operation_id:
             )
@@ -1395,12 +1420,14 @@ module DevSession
             advance_archive!(slug, journal, 'quiesced')
           end
           if archive_phase_before?(journal, 'clusters_released')
+            automatic&.call(journal)
             plan = prepare_cleanup(slug, force: false)
             reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete'
             release_development_clusters!(slug, operation: 'archive')
             advance_archive!(slug, journal, 'clusters_released')
           end
           if archive_phase_before?(journal, 'tracking_archived')
+            automatic&.call(journal)
             plan = prepare_cleanup(slug, force: false)
             reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete'
             verify_pending_archive_tracking!(slug, journal, plan)
@@ -1519,6 +1546,7 @@ module DevSession
       end
       with_creation_lock(slug) do
         with_slug_lock(slug) do
+          auto_archive_reset(slug)
           finish_revive_journal!(slug, load_revive_journal(slug, operation_id:))
         end
       end
@@ -7168,18 +7196,18 @@ module DevSession
       command = @argv.shift
       raise Error, USAGE unless command
 
-      if @transition_lock && !%w[archive delete revive].include?(command)
+      if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
         with_transition_lock(File::LOCK_SH) do
           validate_host_generation!
           run_command(command)
         end
       else
-        validate_host_generation! unless %w[archive delete revive].include?(command)
+        validate_host_generation! unless %w[archive delete revive auto-archive].include?(command)
         run_command(command)
       end
 
       0
-    rescue OptionParser::ParseError, Error => e
+    rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error => e
       @err.puts "error: #{e.message}"
       1
     end
@@ -7206,6 +7234,8 @@ module DevSession
         run_single_slug { |runner, slug, opts| runner.recover_stale(slug, as_is: opts[:as_is]) }
       when 'archive'
         run_archive
+      when 'auto-archive'
+        run_auto_archive
       when 'delete'
         run_delete
       when 'revive'
@@ -7254,11 +7284,11 @@ module DevSession
              File.symlink?(@host_profile) &&
              File.realpath(@host_profile) == File.realpath(@expected_host_generation) &&
              profile_link_token(@host_profile) == @expected_host_profile_token
-        raise Error,
+        raise SupersededGenerationError,
               'workspace command belongs to a superseded package generation; rerun it'
       end
     rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
-      raise Error, 'workspace package generation cannot be verified; rerun the command'
+      raise SupersededGenerationError, 'workspace package generation cannot be verified; rerun the command'
     end
 
     def profile_link_token(path)
@@ -7567,6 +7597,57 @@ module DevSession
         portal_authorized: opts.fetch(:portal_authorized)
       )
       runner.stop(slug, as_is: true)
+    end
+
+    def run_auto_archive
+      action = @argv.shift
+      opts = { dry_run: false, json: false, as_is: false }
+      parser = OptionParser.new do |flags|
+        flags.on('--dry-run') { opts[:dry_run] = true }
+        flags.on('--json') { opts[:json] = true }
+        flags.on('--as-is') { opts[:as_is] = true }
+      end
+      parser.parse!(@argv)
+      raise Error, '--dry-run is only supported by auto-archive scan' if opts[:dry_run] && action != 'scan'
+      result = case action
+               when 'scan'
+                 require_arity!(0, @argv, 'auto-archive scan')
+                 observe = lambda do |&block|
+                   if @transition_lock
+                     with_transition_lock(File::LOCK_SH) { validate_host_generation!; block.call }
+                   else
+                     validate_host_generation!
+                     block.call
+                   end
+                 end
+                 runner.auto_archive_scan(dry_run: opts[:dry_run], transition: method(:with_lifecycle_transition), observation: observe)
+               when 'enable', 'disable'
+                 require_arity!(0, @argv, "auto-archive #{action}")
+                 with_lifecycle_transition { runner.auto_archive_configure(action == 'enable') }
+               when 'hold', 'release'
+                 require_arity!(1, @argv, "auto-archive #{action}")
+                 with_lifecycle_transition do
+                   runner.auto_archive_hold(@argv.fetch(0), action == 'hold', as_is: opts[:as_is])
+                 end
+               when 'status'
+                 require_arity!(1, @argv, 'auto-archive status')
+                 validate_host_generation!
+                 slug = runner.resolve_slug(@argv.fetch(0), as_is: opts[:as_is])
+                 runner.auto_archive_status(slug)
+               else
+                 raise Error, 'usage: auto-archive scan|enable|disable|hold|release|status [SLUG] [--dry-run] [--json] [--as-is]'
+               end
+      if opts[:json]
+        @out.puts JSON.generate(result)
+      elsif result.is_a?(Array)
+        result.each do |entry|
+          reason = Array(entry['blockers']).join(' ')
+          detail = entry['result'] || (entry['eligible'] ? 'eligible' : 'waiting')
+          @out.puts "#{entry['slug']}: #{detail} #{entry['eligible_at']} #{reason}".strip
+        end
+      else
+        @out.puts JSON.pretty_generate(result)
+      end
     end
 
     def run_archive

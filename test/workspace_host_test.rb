@@ -8,6 +8,130 @@ require 'tmpdir'
 load File.expand_path('../libexec/workspace-host', __dir__)
 
 class WorkspaceHostTest < Minitest::Test
+  def test_auto_archive_units_are_enabled_and_removed_on_rollback
+    Dir.mktmpdir do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'registry.json')
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example', root:, hostname: 'example.test', aliases: [], replace: false
+      )
+      current = make_package(directory, 'current')
+      previous = make_package(directory, 'previous')
+      unit_root = File.join(current, 'share/systemd/user')
+      FileUtils.mkdir_p(unit_root)
+      %w[timer service].each do |suffix|
+        File.write(File.join(unit_root, "workspace-auto-archive@.#{suffix}"), "[Unit]\n")
+      end
+      env = host_environment(directory, config:)
+      profile = env.fetch('DEV_WORKSPACES_PROFILE')
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(current, profile)
+      host = UnregisterHost.new(env:, out: StringIO.new, err: StringIO.new)
+      host.send(:install_links, package: current)
+      refute_includes(host.commands, ['systemctl', '--user', 'enable', '--now', 'workspace-auto-archive@example.timer'])
+      host.send(:configure_auto_archive_services, package: current)
+      assert_includes(host.commands, ['systemctl', '--user', 'enable', '--now', 'workspace-auto-archive@example.timer'])
+      host.send(:stop_auto_archive_services)
+      File.unlink(profile)
+      File.symlink(previous, profile)
+      host.send(:install_links, package: previous)
+      assert_includes(host.commands, ['systemctl', '--user', 'disable', '--now', 'workspace-auto-archive@example.timer'])
+      assert_includes(host.commands, ['systemctl', '--user', 'stop', 'workspace-auto-archive@example.service'])
+      refute(File.symlink?(File.join(directory, '.config/systemd/user/workspace-auto-archive@.timer')))
+      refute(File.symlink?(File.join(directory, '.config/systemd/user/workspace-auto-archive@.service')))
+    end
+  end
+
+  def test_candidate_cleans_auto_archive_units_when_old_initiator_cannot
+    %w[configure timer].each do |failure|
+      Dir.mktmpdir do |directory|
+        root = make_workspace(directory, 'workspace')
+        config = File.join(directory, 'registry.json')
+        DevWorkspaceHost::Registry.new(config).register(
+          name: 'example', root:, hostname: 'example.test', aliases: [], replace: false
+        )
+        candidate = make_package(directory, 'candidate')
+        unit_root = File.join(candidate, 'share/systemd/user')
+        FileUtils.mkdir_p(unit_root)
+        %w[timer service].each do |suffix|
+          File.write(File.join(unit_root, "workspace-auto-archive@.#{suffix}"), "[Unit]\n")
+        end
+        env = host_environment(directory, config:).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+        profile = env.fetch('DEV_WORKSPACES_PROFILE')
+        FileUtils.mkdir_p(File.dirname(profile))
+        File.symlink(candidate, profile)
+        # Model the old initiator's wildcard unit linking, with no timer cleanup.
+        links = File.join(directory, '.config/systemd/user')
+        FileUtils.mkdir_p(links)
+        Dir[File.join(unit_root, '*')].each do |unit|
+          File.symlink(File.join(profile, 'share/systemd/user', File.basename(unit)), File.join(links, File.basename(unit)))
+        end
+        host = UnregisterHost.new(env:, out: StringIO.new, err: StringIO.new)
+        host.define_singleton_method(:package_root) { candidate }
+        host.define_singleton_method(:reconcile_codex_update) { |**| nil }
+        host.define_singleton_method(:configure_user_services) do
+          raise DevWorkspaceHost::Error, 'injected configure failure' if failure == 'configure'
+        end
+        original = host.method(:system!)
+        host.define_singleton_method(:system!) do |*argv|
+          original.call(*argv)
+          if failure == 'timer' && argv == ['systemctl', '--user', 'enable', '--now', 'workspace-auto-archive@example.timer']
+            raise DevWorkspaceHost::Error, 'injected partial timer enable failure'
+          end
+        end
+        assert_equal(1, host.run('workspace-host', ['_activate']))
+        refute(File.symlink?(File.join(links, 'workspace-auto-archive@.timer')))
+        refute(File.symlink?(File.join(links, 'workspace-auto-archive@.service')))
+        assert_includes(host.commands, ['systemctl', '--user', 'stop', 'workspace-auto-archive@example.service'])
+        if failure == 'timer'
+          enable = host.commands.index(['systemctl', '--user', 'enable', '--now', 'workspace-auto-archive@example.timer'])
+          assert_includes(host.commands.drop(enable + 1), ['systemctl', '--user', 'disable', '--now', 'workspace-auto-archive@example.timer'])
+        end
+      end
+    end
+  end
+
+  def test_unregister_restores_clients_and_timer_after_timer_stop_failure
+    Dir.mktmpdir do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'registry.json')
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example', root:, hostname: 'example.test', aliases: [], replace: false
+      )
+      restored = []
+      host = UnregisterHost.new(env: host_environment(directory, config:), out: StringIO.new, err: StringIO.new)
+      host.define_singleton_method(:quiesce_sessions) { |*| [:client] }
+      host.define_singleton_method(:stop_auto_archive_services) { |*| raise DevWorkspaceHost::Error, 'injected timer stop failure' }
+      host.define_singleton_method(:configure_auto_archive_services) { |*| restored << :timer }
+      host.define_singleton_method(:restore_quiesced_sessions) { |sessions, **| restored.concat(sessions) }
+      assert_equal(1, host.run('workspace-host', ['unregister', 'example']))
+      assert_equal([:timer, :client], restored)
+      assert(DevWorkspaceHost::Registry.new(config).find('example'))
+    end
+  end
+
+  def test_rollback_restores_clients_and_timer_after_timer_stop_failure
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      stopped = false
+      host.define_singleton_method(:stop_auto_archive_services) do |*|
+        unless stopped
+          stopped = true
+          raise DevWorkspaceHost::Error, 'injected timer stop failure'
+        end
+      end
+      host.define_singleton_method(:configure_auto_archive_services) { |**| events << [:timer_restored] }
+      host.events.clear
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(2, host.send(:profile_generation))
+      assert_includes(host.events, [:timer_restored])
+      assert(host.events.any? { |event| event.first == :sessions_restored })
+    end
+  end
+
   def test_lifecycle_journals_are_projected_from_the_shared_runtime_contract
     contract = JSON.parse(
       File.read(File.expand_path('../portal/internal/session/runtime-contract.json', __dir__))

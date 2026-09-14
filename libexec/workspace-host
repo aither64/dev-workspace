@@ -387,6 +387,9 @@ module DevWorkspaceHost
       when 'run-portal' then run_portal(argv)
       when 'run-codex' then run_codex(argv)
       when 'run-tmux' then run_tmux(argv)
+      when 'run-auto-archive'
+        entry = instance_argument(argv, 'run-auto-archive')
+        dispatch(['--workspace', entry.fetch('name'), 'auto-archive', 'scan', '--json'], 'dev-session')
       when '-h', '--help', nil
         extension_catalog
         @out.puts usage
@@ -476,6 +479,7 @@ module DevWorkspaceHost
       disable_started = false
       retired_runtime = nil
       begin
+        stop_auto_archive_services([entry])
         disable_started = true
         system! 'systemctl', '--user', 'disable', '--now', *units
         retired_runtime = quarantine_instance_runtime(entry)
@@ -511,6 +515,9 @@ module DevWorkspaceHost
           end
         end
         if registration_ready && runtime_ready
+          capture_recovery_error(recovery_errors, 'failed to restore automatic archival') do
+            configure_auto_archive_services([entry])
+          end
           capture_recovery_error(recovery_errors, 'failed to restore terminal clients') do
             restore_quiesced_sessions(quiesced)
           end
@@ -554,6 +561,7 @@ module DevWorkspaceHost
       original_generation = profile_generation if File.symlink?(@profile)
       original_codex = current_codex
       begin
+        stop_auto_archive_services
         FileUtils.mkdir_p(File.dirname(@profile), mode: 0o700)
         unless File.symlink?(@profile) && File.realpath(@profile) == candidate
           system! 'nix-env', '--profile', @profile, '--set', candidate
@@ -596,6 +604,21 @@ module DevWorkspaceHost
       install_links
       configure_user_services
       reconcile_codex_update(defer_busy: true)
+      configure_auto_archive_services
+    rescue StandardError => primary_error
+      # A pre-feature initiator cannot clean up these units when candidate
+      # activation fails. Undo them here before its profile compensation runs.
+      raise primary_error unless File.symlink?(File.join(@home, '.config/systemd/user/workspace-auto-archive@.timer'))
+
+      recovery_errors = []
+      capture_recovery_error(recovery_errors, 'failed to stop automatic archival') { stop_auto_archive_services }
+      capture_recovery_error(recovery_errors, 'failed to remove automatic archive units') do
+        remove_auto_archive_links
+        system! 'systemctl', '--user', 'daemon-reload'
+      end
+      raise primary_error if recovery_errors.empty?
+
+      raise Error, ([primary_error.message] + recovery_errors).join('; ')
     end
 
     def activate_installed(command)
@@ -621,6 +644,7 @@ module DevWorkspaceHost
       system! target_host, 'check-codex', '--codex', target_codex
       quiesced = quiesce_sessions
       begin
+        stop_auto_archive_services
         system! 'nix-env', '--profile', @profile, '--rollback'
         unless profile_generation == target_generation
           raise Error, "nix-env selected an unexpected workspace profile generation"
@@ -631,6 +655,7 @@ module DevWorkspaceHost
         system! 'systemctl', '--user', 'restart', 'workspace-router.service'
         restart_codex_consumers
         wait_for_codex_sockets
+        configure_auto_archive_services(package: target_profile)
       rescue StandardError => transition_error
         compensation_error = nil
         begin
@@ -666,6 +691,7 @@ module DevWorkspaceHost
     end
 
     def compensate_profile_transition(generation, codex, discard_generation: nil)
+      stop_auto_archive_services
       system! 'nix-env', '--profile', @profile, '--switch-generation', generation.to_s
       adopt_codex(codex)
       retain_codex_for_generation(generation, codex)
@@ -674,6 +700,7 @@ module DevWorkspaceHost
       system! 'systemctl', '--user', 'restart', 'workspace-router.service'
       restart_codex_consumers
       wait_for_codex_sockets
+      configure_auto_archive_services(package: profile_generation_path(generation))
       discard_profile_generation(discard_generation) if discard_generation
     end
 
@@ -690,6 +717,7 @@ module DevWorkspaceHost
       raise Error, 'suspend takes no arguments' unless argv.empty?
       require_no_unfinished_lifecycle_operations!(operation: 'workspace suspension')
       quiesced = quiesce_sessions
+      stop_auto_archive_services
       common = %w[
         workspace-router.service
         workspace-codex-reconcile.service
@@ -712,6 +740,7 @@ module DevWorkspaceHost
     end
 
     def install_links(package: package_root)
+      stop_auto_archive_services
       bin = File.join(@home, 'bin')
       units = File.join(@home, '.config/systemd/user')
       selected_package = File.realpath(package)
@@ -765,6 +794,45 @@ module DevWorkspaceHost
       (retained_skills - selected_catalog.skills.keys).each do |skill|
         sources = retained_catalogs.values.compact.filter_map { |item| item.skills[skill] }
         remove_managed_link(File.join(@skills, skill), sources)
+      end
+      unless File.file?(File.join(selected_package, 'share/systemd/user/workspace-auto-archive@.timer'))
+        remove_auto_archive_links
+      end
+    end
+
+    def stop_auto_archive_services(entries = registry.entries)
+      return if @auto_archive_stopped
+      template = File.join(@home, '.config/systemd/user/workspace-auto-archive@.timer')
+      return unless File.exist?(template) || File.symlink?(template)
+      return if entries.empty?
+
+      timers = entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.timer" }
+      workers = entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.service" }
+      system! 'systemctl', '--user', 'disable', '--now', *timers
+      system! 'systemctl', '--user', 'stop', *workers
+      @auto_archive_stopped = true
+    end
+
+    def configure_auto_archive_services(entries = registry.entries, package: package_root)
+      template = File.join(package, 'share/systemd/user/workspace-auto-archive@.timer')
+      unless File.file?(template)
+        remove_auto_archive_links
+        return
+      end
+      return if entries.empty?
+
+      system! 'systemctl', '--user', 'daemon-reload'
+      @auto_archive_stopped = false
+      system! 'systemctl', '--user', 'enable', '--now',
+              *entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.timer" }
+    end
+
+    def remove_auto_archive_links
+      %w[timer service].each do |suffix|
+        remove_exact_link(
+          File.join(@home, ".config/systemd/user/workspace-auto-archive@.#{suffix}"),
+          File.join(@profile, "share/systemd/user/workspace-auto-archive@.#{suffix}")
+        )
       end
     end
 
@@ -835,7 +903,7 @@ module DevWorkspaceHost
 
       name = extract_workspace_option!(argv)
       entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
-      if %w[archive delete revive].include?(argv.first)
+      if %w[archive delete revive auto-archive].include?(argv.first)
         if inherited_exclusive_transition_lock?
           environment, command, arguments = dev_session_invocation(
             entry, argv, transition_lock: false

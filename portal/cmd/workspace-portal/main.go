@@ -291,6 +291,20 @@ func threadCommand(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	switch command {
+	case "activity":
+		if *threadID == "" || *cwd == "" {
+			return errors.New("thread activity requires --thread-id and --cwd")
+		}
+		activities, err := client.ListThreadActivity(ctx, []workspacecodex.ThreadActivity{{ID: *threadID, Cwd: *cwd}})
+		if err != nil {
+			return err
+		}
+		if len(activities) != 1 || activities[0].ID != *threadID || activities[0].Cwd != *cwd {
+			return errors.New("thread activity returned the wrong conversation")
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"threadId": activities[0].ID, "cwd": activities[0].Cwd, "updatedAt": activities[0].UpdatedAt.Unix(),
+		})
 	case "models":
 		models, err := client.ListModels(ctx)
 		if err != nil {

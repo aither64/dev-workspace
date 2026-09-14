@@ -14,6 +14,264 @@ require 'tmpdir'
 load File.expand_path('../libexec/dev-session', __dir__)
 
 class DevSessionTest < Minitest::Test
+  def automatic_fixture(workspace, slug, lifecycle: 'active', out: nil)
+    portal = File.join(workspace, 'automatic-portal.rb')
+    stamp = Time.now.to_i
+    File.write(portal, <<~RUBY)
+      require 'json'
+      exit 0 unless ARGV.first == 'thread'
+      cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
+      if ARGV[1] == 'activity'
+        puts JSON.generate('threadId' => ARGV.fetch(ARGV.index('--thread-id') + 1),
+                           'cwd' => cwd, 'updatedAt' => #{stamp})
+      elsif ARGV[1] == 'require-idle' && File.exist?(File.join(cwd, 'busy'))
+        warn 'Conversation has a queued message.'
+        exit 1
+      end
+    RUBY
+    runner = runner_for(workspace, out:, env: {
+      DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin,
+      DevSession::ENV_CODEX_SOCKET => '/run/test/codex.sock',
+      DevSession::ENV_CODEX_VERSION => '0.152.1'
+    })
+    runner.ensure_tracking_files(slug)
+    runner.send(:ensure_portal_manifest, slug)
+    path = File.join(workspace, 'work', slug, 'portal.yml')
+    manifest = YAML.safe_load(File.read(path))
+    manifest['codex'] = {
+      'thread_id' => "thread-#{slug}", 'socket_path' => '/run/test/codex.sock', 'client_version' => '0.152.1'
+    }
+    File.write(path, YAML.dump(manifest))
+    commit_tracking(workspace, slug, lifecycle:)
+    configure_workspace_origin(workspace)
+    runner.auto_archive_configure(true)
+    runner
+  end
+
+  def automatic_scan(runner, dry_run: false)
+    runner.auto_archive_scan(dry_run:, transition: ->(&block) { block.call })
+  end
+
+  def age_automatic_session(runner, slug, seconds)
+    store = runner.auto_archive_store
+    store.lock do
+      record = store.session(slug)
+      record['idle_since'] = (Time.now - seconds).utc.iso8601
+      store.write("session-#{slug}", record)
+    end
+  end
+
+  def test_automatic_archive_uses_completed_and_empty_session_modes
+    { 'complete' => [86_400, 'complete'], 'active' => [1_209_600, 'abandoned'] }.each do |lifecycle, (period, outcome)|
+      with_workspace do |workspace|
+        slug = '2026-06-06-automatic'
+        runner = automatic_fixture(workspace, slug, lifecycle:)
+        first = automatic_scan(runner).fetch(0)
+        assert_empty(first['blockers'])
+        refute(first['eligible'])
+        age_automatic_session(runner, slug, period + 1)
+        File.write(File.join(workspace, 'unrelated.txt'), 'preserve')
+        result = automatic_scan(runner).fetch(0)
+        assert_equal('archived', result['result'], result.inspect)
+        assert_equal(outcome, result['archive_mode'])
+        assert_includes(File.read(File.join(workspace, 'archive', slug, 'state.md')), "lifecycle: #{outcome}")
+        assert_equal('preserve', File.read(File.join(workspace, 'unrelated.txt')))
+        assert_empty(automatic_scan(runner))
+      end
+    end
+  end
+
+  def test_automatic_dry_run_does_not_update_sidecars_or_archive
+    with_workspace do |workspace|
+      slug = '2026-06-06-dry-run'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      before = Dir.glob(File.join(runner.auto_archive_store.root, '*.json')).to_h { |path| [path, File.read(path)] }
+      assert(automatic_scan(runner, dry_run: true).fetch(0)['eligible'])
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      assert_equal(before, before.keys.to_h { |path| [path, File.read(path)] })
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_automatic_cli_archive_emits_one_json_value
+    with_workspace do |workspace|
+      slug = '2026-06-06-json'
+      out = StringIO.new
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete', out:)
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      out.truncate(0)
+      out.rewind
+      cli = DevSession::CLI.new(['auto-archive', 'scan', '--json'], out:, err: StringIO.new)
+      cli.define_singleton_method(:runner) { runner }
+      assert_equal(0, cli.run)
+      assert_equal('archived', JSON.parse(out.string).fetch(0)['result'])
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_automatic_activity_reader_failure_restarts_the_period
+    [['complete', 86_400], ['active', 604_800], ['active', 1_209_600]].each do |lifecycle, period|
+      with_workspace do |workspace|
+        slug = '2026-06-06-observation-outage'
+        runner = automatic_fixture(workspace, slug, lifecycle:)
+        if period == 604_800
+          create_bare_repo(workspace, 'sample')
+          runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+          merge_registered_branches(workspace, slug)
+        end
+        automatic_scan(runner)
+        age_automatic_session(runner, slug, period + 1)
+        portal = File.join(workspace, 'automatic-portal.rb')
+        original = File.read(portal)
+        File.write(portal, "abort 'Activity reader unavailable'\n")
+        failed = automatic_scan(runner).fetch(0)
+        assert_equal('deferred', failed['result'])
+        File.write(portal, original)
+        recovered = automatic_scan(runner).fetch(0)
+        refute(recovered['eligible'])
+        assert_empty(recovered['blockers'])
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+      end
+    end
+  end
+
+  def test_automatic_hold_and_results_belong_to_the_conversation_identity
+    [true, false].each do |held|
+      with_workspace do |workspace|
+        slug = '2026-06-06-reused'
+        runner = automatic_fixture(workspace, slug)
+        # Holds set before the first scan must already identify the conversation.
+        runner.auto_archive_hold(slug, held, as_is: true)
+        first = automatic_scan(runner).fetch(0)
+        assert_equal(held, first['hold'])
+        runner.auto_archive_reset(slug)
+        assert_equal(held, runner.auto_archive_status(slug)['hold'])
+        store = runner.auto_archive_store
+        store.write("session-#{slug}", store.session(slug).merge('result' => 'archived', 'archive_mode' => 'complete'))
+        manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+        manifest = YAML.safe_load(File.read(manifest_path))
+        runner.delete(slug, as_is: true, force: false)
+        runner.ensure_tracking_files(slug)
+        manifest['codex']['thread_id'] = 'replacement-thread'
+        File.write(manifest_path, YAML.dump(manifest))
+        current = runner.auto_archive_status(slug)
+        refute(current['hold'])
+        assert_nil(current['result'])
+        assert_nil(current['archive_mode'])
+        observed = automatic_scan(runner).fetch(0)
+        assert_equal('replacement-thread', observed['identity'])
+        refute(observed['hold'])
+        refute(observed['eligible'])
+        runner.auto_archive_hold(slug, true, as_is: true)
+        assert(runner.auto_archive_status(slug)['hold'])
+      end
+    end
+  end
+
+  def test_automatic_archive_completes_the_merged_branch_tier
+    with_workspace do |workspace|
+      slug = '2026-06-06-merged'
+      runner = automatic_fixture(workspace, slug)
+      create_bare_repo(workspace, 'sample')
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+      merge_registered_branches(workspace, slug)
+      assert_equal('merged', automatic_scan(runner).fetch(0)['tier'])
+      age_automatic_session(runner, slug, 604_801)
+      result = automatic_scan(runner).fetch(0)
+      assert_equal('archived', result['result'], result.inspect)
+      assert_equal('complete', result['archive_mode'])
+      refute(File.exist?(File.join(workspace, 'worktrees', slug, 'sample')))
+      assert_git_success('git', "--git-dir=#{workspace}/repos/sample.git", 'show-ref', '--verify', "refs/heads/#{slug}")
+    end
+  end
+
+  def test_automatic_snapshot_ignores_touches_and_resets_after_content_or_queue_changes
+    with_workspace do |workspace|
+      slug = '2026-06-06-activity'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      first = automatic_scan(runner).fetch(0)
+      path = File.join(workspace, 'work', slug, 'plan.md')
+      File.utime(Time.now + 100, Time.now + 100, path)
+      assert_equal(first['fingerprint'], automatic_scan(runner).fetch(0)['fingerprint'])
+      age_automatic_session(runner, slug, 86_401)
+      File.write(path, File.read(path) + "\nMore work.\n")
+      changed = automatic_scan(runner).fetch(0)
+      refute(changed['eligible'])
+      refute_equal(first['fingerprint'], changed['fingerprint'])
+      busy = File.join(workspace, 'work', slug, 'busy')
+      File.write(busy, 'queued')
+      age_automatic_session(runner, slug, 86_401)
+      assert_includes(automatic_scan(runner).fetch(0)['blockers'].join, 'queued message')
+      File.unlink(busy)
+      resumed = automatic_scan(runner).fetch(0)
+      assert_empty(resumed['blockers'])
+      refute(resumed['eligible'])
+    end
+  end
+
+  def test_automatic_hold_is_rechecked_before_preparing_the_archive
+    with_workspace do |workspace|
+      slug = '2026-06-06-hold-race'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      original = runner.method(:archive)
+      runner.define_singleton_method(:archive) do |input, **keywords|
+        auto_archive_hold(input, true, as_is: true)
+        original.call(input, **keywords)
+      end
+      result = automatic_scan(runner).fetch(0)
+      assert_equal('deferred', result['result'])
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_nil(runner.auto_archive_store.session(slug)['operation'])
+      runner.auto_archive_hold(slug, false, as_is: true)
+      refute(automatic_scan(runner, dry_run: true).fetch(0)['eligible'])
+    end
+  end
+
+  def test_automatic_archive_resumes_its_exact_journal_after_disable
+    with_workspace do |workspace|
+      slug = '2026-06-06-automatic-retry'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      hook = File.join(workspace, '.git/hooks/pre-commit')
+      File.write(hook, "#!/bin/sh\nexit 1\n")
+      File.chmod(0o755, hook)
+      assert_equal('deferred', automatic_scan(runner).fetch(0)['result'])
+      journal = runner.send(:lifecycle_journal_file, slug, 'archive')
+      assert_equal('tracking_archived', JSON.parse(File.read(journal))['phase'])
+      receipt = runner.auto_archive_store.session(slug)['operation']
+      assert_equal(receipt['id'], JSON.parse(File.read(journal))['operation_id'])
+      runner.auto_archive_configure(false)
+      File.unlink(hook)
+      assert_equal('archived', automatic_scan(runner).fetch(0)['result'])
+      refute(File.exist?(journal))
+    end
+  end
+
+  def test_automatic_archive_keeps_registered_branches_after_worktree_removal
+    with_workspace do |workspace|
+      slug = '2026-06-06-retained'
+      runner = automatic_fixture(workspace, slug)
+      create_bare_repo(workspace, 'sample')
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      assert_git_success('git', '-C', path, 'worktree', 'remove', path)
+      first = automatic_scan(runner).fetch(0)
+      assert_equal('merged', first['tier'])
+      age_automatic_session(runner, slug, 1_209_601)
+      result = automatic_scan(runner).fetch(0)
+      refute(result['eligible'])
+      assert_includes(result['blockers'].join, 'cannot be completed')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
   class TTYInput < StringIO
     def tty?
       true
@@ -10053,6 +10311,29 @@ class DevSessionTest < Minitest::Test
         git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
       )
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+    end
+  end
+
+  def test_revive_retains_its_journal_until_the_automatic_archive_reset_succeeds
+    with_workspace do |workspace|
+      slug = '2026-06-06-revive-sidecar'
+      archived_runner(workspace, slug)
+      configure_workspace_origin(workspace)
+      runner = runner_for(workspace)
+      runner.define_singleton_method(:start) { |*, **| nil }
+      store = runner.auto_archive_store
+      previous = { 'slug' => slug, 'identity' => 'retained-thread', 'hold' => true }
+      store.write("session-#{slug}", previous)
+      path = File.join(store.root, "session-#{slug}.json")
+      File.write(path, 'invalid JSON')
+      assert_raises(WorkspaceAutoArchive::Error) { runner.revive(slug, as_is: true) }
+      journal = runner.send(:lifecycle_journal_file, slug, 'revive')
+      assert_equal('runtime_started', JSON.parse(File.read(journal))['phase'])
+      store.write("session-#{slug}", previous)
+      runner.revive(slug, as_is: true)
+      refute(File.exist?(journal))
+      assert(store.session(slug)['hold'])
+      assert(store.session(slug)['reset_at'])
     end
   end
 

@@ -206,6 +206,7 @@ buildGoModule {
     (
       cd ..
       ruby test/dev_session_test.rb
+      ruby test/auto_archive_test.rb
       ruby test/workspace_host_test.rb
     )
     runHook postCheck
@@ -222,6 +223,10 @@ buildGoModule {
       "$out/libexec/workspace-profile-identity.rb"
     ln -s ../workspace-profile-identity.rb \
       "$out/libexec/workspace-portal/workspace-profile-identity.rb"
+    install -Dm644 ${src}/libexec/workspace-auto-archive.rb \
+      "$out/libexec/workspace-auto-archive.rb"
+    ln -s ../workspace-auto-archive.rb \
+      "$out/libexec/workspace-portal/workspace-auto-archive.rb"
     install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
       "$out/share/workspace-portal/codex_protocol_contract.py"
     mkdir -p "$out/share/workspace-portal/codex"
