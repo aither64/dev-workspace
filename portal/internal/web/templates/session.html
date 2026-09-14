@@ -24,6 +24,7 @@
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
+        <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Session settings" aria-label="Session settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Session settings</span></a>
       </nav>
     {{end}}
     </div>
@@ -37,12 +38,6 @@
   </aside>
   <main class="page session-page">
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
-    {{if not .LifecycleOnly}}<details id="auto-archive-panel" class="notice full">
-      <summary>Automatic archival</summary>
-      <p id="auto-archive-status" role="status">Loading archival policy…</p>
-      {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
-      <p>Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
-    </details>{{end}}
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
     <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
@@ -52,6 +47,15 @@
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
     <section class="session-tabs">
+      <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
+        <div class="section-heading"><h2>Session settings</h2></div>
+        <section id="auto-archive-panel" class="panel">
+      <h3>Automatic archival</h3>
+      <p id="auto-archive-status" role="status">Loading archival policy…</p>
+      {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
+      <p>Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
+        </section>
+      </section>
 
 
       {{if .Session.Codex.ThreadID}}

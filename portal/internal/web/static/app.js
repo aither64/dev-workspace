@@ -1319,9 +1319,9 @@
     catch (error) { autoArchiveStatus.textContent = error.message; }
   };
   if (autoArchiveStatus) {
-    void loadAutoArchive();
-    document.getElementById("auto-archive-panel")?.addEventListener("toggle", (event) => {
-      if (event.target.open) void loadAutoArchive();
+    if (document.getElementById("settings")?.classList.contains("active")) void loadAutoArchive();
+    document.addEventListener("session-section-change", event => {
+      if (event.detail === "settings") void loadAutoArchive();
     });
     autoArchiveHold?.addEventListener("change", async () => {
       const held = autoArchiveHold.checked;
