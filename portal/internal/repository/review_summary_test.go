@@ -13,6 +13,9 @@ import (
 
 func TestReviewTotalMatchesFullHistoryAcrossPageBoundaries(t *testing.T) {
 	f, reader, repo := reviewFixture(t)
+	// Keep background commit-graph maintenance out of this pagination fixture.
+	runGit(t, "-C", f.worktree, "config", "gc.auto", "0")
+	runGit(t, "-C", f.worktree, "config", "maintenance.auto", "false")
 	wanted := map[int]bool{0: true, 1: true, 50: true, 51: true, 101: true}
 	for count := 0; count <= 101; count++ {
 		if count > 0 {
@@ -28,6 +31,7 @@ func TestReviewTotalMatchesFullHistoryAcrossPageBoundaries(t *testing.T) {
 			var exitError *exec.ExitError
 			if errors.As(err, &exitError) {
 				t.Logf("Git stderr: %s", exitError.Stderr)
+				t.Logf("pair: %#v", pair)
 			}
 			t.Fatalf("count %d: total=%d, err=%v", count, total, err)
 		}
