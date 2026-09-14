@@ -329,6 +329,16 @@ export function mount({slug, nonce, element, createCopyButton}) {
       const target = route.line;
       const found = await record.editor.revealLine(target.side, target.number);
       if (active !== selected || route.line !== target) return;
+      if (found) {
+        // CodeMirror finishes its second scroll measurement on the next frame.
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (active !== selected || route.line !== target) return;
+        const line = record.host.querySelector(".review-linked-line");
+        if (line) {
+          const covered = record.fileTitle.getBoundingClientRect().bottom + 4 - line.getBoundingClientRect().top;
+          if (covered > 0) selected.scroll.scrollTop -= covered;
+        }
+      }
       selected.lineNotice.hidden = found;
       if (!found) selected.lineNotice.textContent = "This line is not available in the selected file version.";
     }
@@ -579,7 +589,11 @@ export function mount({slug, nonce, element, createCopyButton}) {
           if (!record.collapsed) void loadFile(selected, record, true);
         }, "repository-file-toggle quiet");
         toggle.setAttribute("aria-label", "Toggle diff for " + file.path);
-        fileName.append(toggle, diffLink, node("h3", "", file.path), copy(file.path, "Copy file path"));
+        const pathHeading = node("h3"); pathHeading.title = file.path;
+        pathHeading.setAttribute("aria-label", file.path);
+        if (path.length) pathHeading.append(node("span", "repository-file-directory", path.join("/") + "/"));
+        pathHeading.append(node("span", "repository-file-basename", basename));
+        fileName.append(toggle, diffLink, pathHeading, copy(file.path, "Copy file path"));
         fileTitle.append(fileName, node("span", "repository-file-status status-" + kind, label),
           counts(node("span", "repository-file-counts"), file));
         const versions = node("div", "repository-mode-controls"); versions.setAttribute("role", "group"); versions.setAttribute("aria-label", "File version");
@@ -597,7 +611,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
         fileBody.append(fileMetadata, host);
         section.append(fileTitle, fileBody); scroll.append(section);
         const choiceKey = [state.id, payload.pair.base, payload.pair.head, file.id].join(":");
-        const record = {file, nav, fileLink, diffLink, versions, section, toggle, body: fileBody, choiceKey,
+        const record = {file, nav, fileLink, diffLink, versions, section, fileTitle, toggle, body: fileBody, choiceKey,
           metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, used: 0};
         sections.set(file.id, record);
         setCollapsed(null, record, requested.file === file.id ? false : collapseChoices.get(choiceKey) ?? largeDiff(file), false);

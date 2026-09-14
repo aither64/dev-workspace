@@ -1,6 +1,6 @@
 // Component acceptance against bounded fixture APIs. Run using Nix Node,
 // playwright-driver and Chromium; point REVIEW_ASSETS_DIRECTORY at the built assets.
-const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
+const engines = require(process.env.PLAYWRIGHT_MODULE);
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -101,7 +101,7 @@ const server = http.createServer((req, res) => {
 (async () => {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const origin = "http://127.0.0.1:" + server.address().port;
-  const browser = await chromium.launch({executablePath: process.env.CHROMIUM_EXECUTABLE, headless: true, args: ["--no-sandbox"]});
+  const browser = await engines[process.env.REVIEW_BROWSER || "chromium"].launch({executablePath: process.env.CHROMIUM_EXECUTABLE, headless: true, args: ["--no-sandbox"]});
   try {
     const page = await browser.newPage({viewport: {width: 1440, height: 900}});
     const errors = [];
@@ -141,9 +141,8 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator('.repository-commit-full-message').evaluate(el => el.scrollHeight === el.clientHeight), true, 'message has its own scrollbar');
     const toolbar = await page.locator('.repository-review-heading').boundingBox();
     assert(toolbar.height < 70, 'desktop toolbar consumes excessive diff height');
-    const paneBox = await pane.boundingBox();
-    await page.mouse.move(paneBox.x + paneBox.width / 2, paneBox.y + 80);
-    await page.mouse.wheel(0, 3000);
+    // Firefox caps large wheel deltas. Choose the same review position in both engines.
+    await pane.evaluate(el => { el.scrollTop = el.querySelector('.repository-comparison-details').offsetHeight + 2; });
     await page.waitForFunction(() => document.querySelector('.repository-comparison-details').getBoundingClientRect().bottom <= document.querySelector('.repository-file-scroll').getBoundingClientRect().top);
     const scrolledToolbar = await page.locator('.repository-review-heading').boundingBox();
     assert.deepEqual(scrolledToolbar, toolbar, 'diff scrolling moved the toolbar');
@@ -235,8 +234,13 @@ const server = http.createServer((req, res) => {
     assert.equal(parentURL.hash, '');
     await parentLink.click();
     await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
-    await page.reload();
-    await page.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
+    // Check reload in a separate tab: Firefox retains an extra same-URL history
+    // entry when reloading after pushState, even without the review application.
+    const reloaded = await browser.newPage();
+    await reloaded.goto(page.url());
+    await reloaded.reload();
+    await reloaded.waitForFunction(message => document.querySelector('.repository-commit-full-message')?.textContent === message, parentCommit.message);
+    await reloaded.close();
     await page.locator('.repository-parent-link').click();
     await page.waitForFunction(() => document.querySelector('.repository-commit-parents')?.textContent === 'No parent');
     assert.equal(await page.locator('.repository-parent-link').count(), 0);
@@ -327,10 +331,45 @@ const server = http.createServer((req, res) => {
     await page.evaluate(() => window.review.updateHTML(window.cardMarkup));
     await page.waitForLoadState("networkidle");
     assert((await page.locator(".repository-history-base").first().textContent()).includes("eeeeeeeeee"), "old details replaced the refreshed history");
+    // Headers follow their file until the next section pushes them away.
+    await page.setViewportSize({width: 1440, height: 600});
+    for (const layout of ["unified", "split"]) {
+      await page.goto(origin + "/example/?tab=repositories&repository=project&review=frozen&file=1&layout=" + layout);
+      await page.locator('.repository-file-section[data-file-id="1"] .cm-editor').first().waitFor();
+      for (const id of ["1", "2"]) {
+        await page.locator('.repository-file[data-file-id="' + id + '"]').click();
+        await page.locator('.repository-file-section[data-file-id="' + id + '"] .cm-editor').first().waitFor();
+        await page.evaluate(id => {
+          const section = document.querySelector('.repository-file-section[data-file-id="' + id + '"]');
+          const pane = document.querySelector('.repository-file-scroll');
+          pane.scrollTop += section.getBoundingClientRect().top - pane.getBoundingClientRect().top + 150;
+        }, id);
+        await page.waitForFunction(id => {
+          const header = document.querySelector('.repository-file-section[data-file-id="' + id + '"] .repository-file-title');
+          return Math.abs(header.getBoundingClientRect().top - document.querySelector('.repository-file-scroll').getBoundingClientRect().top) < 2;
+        }, id);
+      }
+    }
+    for (const [view, layout] of [["diff", "unified"], ["diff", "split"], ["file", "unified"]]) {
+      await page.setViewportSize({width: 390, height: 600});
+      await page.goto(origin + "/example/?tab=repositories&repository=project&review=frozen&file=6&view=" + view + "&layout=" + layout + "#new-L1");
+      await page.waitForFunction(() => {
+        const line = document.querySelector('.review-linked-line');
+        const title = document.querySelector('.repository-file-section[data-file-id="6"] .repository-file-title');
+        const pane = document.querySelector('.repository-file-scroll');
+        return line && line.getBoundingClientRect().top >= title.getBoundingClientRect().bottom - 1 &&
+          line.getBoundingClientRect().bottom <= pane.getBoundingClientRect().bottom;
+      });
+      const heading = page.locator('.repository-file-section[data-file-id="6"] h3');
+      assert.equal(await heading.getAttribute("title"), files[6].path);
+      assert.equal(await heading.getAttribute("aria-label"), files[6].path);
+      assert((await heading.boundingBox()).height < 40, "long filename inflated the sticky heading");
+      assert(await heading.locator('.repository-file-basename').isVisible());
+    }
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "automatic refresh with stale responses", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
       "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
-      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry", "large diff 2000/2001 boundary", "collapse and explicit expansion", "Git-exact OAuth2 counts in both layouts", "shared split context expansion"]}));
+      "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry", "large diff 2000/2001 boundary", "collapse and explicit expansion", "Git-exact OAuth2 counts in both layouts", "shared split context expansion", "sticky file transitions in both layouts", "mobile long paths and visible linked lines in all views"]}));
   } finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
 })().catch(error => {console.error(error); process.exitCode = 1; server.close();});
