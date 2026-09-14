@@ -327,20 +327,21 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
   .artifacts-panel.active { grid-template-columns: 1fr; }
 }
 
+.compact-sidebar .workspace-shell { grid-template-columns: 58px minmax(0, 1fr); }
+.compact-sidebar .workspace-sidebar { padding: .8rem .35rem; gap: 1rem; }
+.compact-sidebar .sidebar-content { gap: 1rem; }
+.compact-sidebar .codex-limits-toggle { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .2rem; width: 100%; padding: .45rem .1rem; font-size: .62rem; font-weight: 400; }
+.compact-sidebar .codex-limits-toggle strong { font-size: .75rem; font-weight: 600; }
+.compact-sidebar .codex-limits-toggle[data-stale="true"] { color: var(--warning); }
+.compact-sidebar .codex-limits-panel:not([popover]) { display: none; }
+.compact-sidebar .codex-limits-panel[popover] { position: fixed; inset: auto auto 1rem 68px; width: min(260px, calc(100vw - 80px)); max-height: calc(100dvh - 2rem); overflow-y: auto; margin: 0; padding: 1rem; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 8px 32px #0008; }
+.session-body.compact-sidebar .sidebar-heading h1, .session-body.compact-sidebar .rail-label, .session-body.compact-sidebar .sidebar-actions > .badge { display: none; }
+.session-body.compact-sidebar .sidebar-heading { padding: 0; }
+.compact-sidebar .sidebar-home, .compact-sidebar .tab, .compact-sidebar .sidebar-actions button { justify-content: center; padding: .7rem .35rem; }
+.session-body.compact-sidebar .sidebar-actions { gap: .45rem; }
+
 @media (max-width: 760px) {
-  .workspace-shell { grid-template-columns: 58px minmax(0, 1fr); }
-  .workspace-sidebar { padding: .8rem .35rem; gap: 1rem; }
-  .sidebar-content { gap: 1rem; }
-  .codex-limits-toggle { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .2rem; width: 100%; padding: .45rem .1rem; font-size: .62rem; font-weight: 400; }
-  .codex-limits-toggle strong { font-size: .75rem; font-weight: 600; }
-  .codex-limits-toggle[data-stale="true"] { color: var(--warning); }
-  .codex-limits-panel:not([popover]) { display: none; }
-  .codex-limits-panel[popover] { position: fixed; inset: auto auto 1rem 68px; width: min(260px, calc(100vw - 80px)); max-height: calc(100dvh - 2rem); overflow-y: auto; margin: 0; padding: 1rem; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 8px 32px #0008; }
   .index-sidebar .codex-limits-panel[popover] { left: max(125px, calc(30vw + 10px)); right: .75rem; width: auto; max-width: 260px; }
-  .session-body .sidebar-heading h1, .session-body .rail-label, .session-body .sidebar-actions > .badge { display: none; }
-  .session-body .sidebar-heading { padding: 0; }
-  .sidebar-home, .tab, .sidebar-actions button { justify-content: center; padding: .7rem .35rem; }
-  .session-body .sidebar-actions { gap: .45rem; }
   .chat-heading { gap: .4rem; }
   .chat-heading h2 { display: none; }
   .transcript-filters { margin-left: 0; gap: .2rem; }
@@ -353,7 +354,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
   .chat-form textarea { max-height: 18dvh; }
   .message.user { margin-left: 6%; }
   .message.agent { margin-right: 0; }
-  .index-shell { grid-template-columns: minmax(115px, 30%) minmax(0, 1fr); }
+  .compact-sidebar .index-shell { grid-template-columns: minmax(115px, 30%) minmax(0, 1fr); }
   .index-sidebar .sidebar-heading { padding: .3rem; }
   .index-sidebar .eyebrow { font-size: .6rem; }
   .index-sidebar .session-card { padding: .5rem .1rem; gap: .2rem .35rem; }

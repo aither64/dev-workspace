@@ -97,7 +97,7 @@ export function fullFileVersion(file, requested) {
 
 export const largeDiff = file => Number.isFinite(file.additions) && Number.isFinite(file.deletions) && file.additions + file.deletions > 2000;
 
-export function mount({slug, nonce, element, createCopyButton}) {
+export function mount({slug, nonce, element, createCopyButton, onComparisonChange = () => {}}) {
   if (!document.querySelector('link[data-repository-review-styles]')) {
     const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css";
     sheet.dataset.repositoryReviewStyles = "true"; document.head.append(sheet);
@@ -490,7 +490,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
   };
   const closeReview = (update = true) => {
     ++sequence; destroyEditors(); active = null; review.hidden = true; overview.hidden = false;
-    element.classList.remove("repository-review-open");
+    element.classList.remove("repository-review-open"); onComparisonChange(false);
     if (update) setRoute({layout: readMode()});
   };
   const comparisonTitle = (state, commit) => state.name + (commit ? " · " + short(commit.sha) : " · Branch comparison");
@@ -526,7 +526,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     destroyEditors(); active = null;
     const requested = {...route};
     const abort = new AbortController(); opening = abort;
-    overview.hidden = true; review.hidden = false; element.classList.add("repository-review-open");
+    overview.hidden = true; review.hidden = false; element.classList.add("repository-review-open"); onComparisonChange(true);
     const initialTitle = node("div", "repository-review-title");
     initialTitle.append(node("h2", "", comparisonTitle(state, hint)));
     review.replaceChildren(button("← Repositories", () => closeReview()), initialTitle, node("p", "muted", "Loading comparison…"));
@@ -669,7 +669,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     const state = states.get(route.repository);
     if (!state) {
       ++sequence; destroyEditors(); active = null; overview.hidden = true; review.hidden = false;
-      element.classList.add("repository-review-open");
+      element.classList.add("repository-review-open"); onComparisonChange(true);
       review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", "This repository is not available in this session."));
       return;
     }
@@ -759,7 +759,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     },
     destroy() {
       paused = true; ++readGeneration; for (const abort of reads) abort.abort();
-      destroyed = true; ++sequence; clearInterval(interval);
+      destroyed = true; ++sequence; clearInterval(interval); onComparisonChange(false);
       document.removeEventListener("session-section-change", onSection);
       removeEventListener("popstate", onURL); removeEventListener("hashchange", onURL); destroyEditors();
     },

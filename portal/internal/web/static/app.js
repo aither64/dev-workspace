@@ -787,6 +787,16 @@
   }
 
   const body = document.body;
+  const narrowSidebar = globalThis.matchMedia("(max-width: 760px)");
+  let comparisonOpen = false, updateLimitsPopover = () => {};
+  const updateSidebar = () => {
+    const reviewing = comparisonOpen && document.getElementById("repositories")?.classList.contains("active");
+    body.classList.toggle("compact-sidebar", narrowSidebar.matches || Boolean(reviewing));
+    updateLimitsPopover();
+  };
+  narrowSidebar.addEventListener("change", updateSidebar);
+  document.addEventListener("session-section-change", updateSidebar);
+  updateSidebar();
   document.querySelectorAll(".document").forEach(wrapMarkdownTables);
   const slug = body.dataset.session;
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
@@ -863,16 +873,19 @@
       toggle.title = `Codex limits. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
       toggle.setAttribute("aria-label", toggle.title);
     };
-    const narrow = globalThis.matchMedia("(max-width: 760px)");
-    const updateLimitsPopover = () => {
-      if (narrow.matches) limitsPanel.setAttribute("popover", "auto");
-      else limitsPanel.removeAttribute("popover");
+    updateLimitsPopover = () => {
+      const compact = body.classList.contains("compact-sidebar");
+      if (compact === limitsPanel.hasAttribute("popover")) return;
+      if (compact) limitsPanel.setAttribute("popover", "auto");
+      else {
+        if (limitsPanel.matches(":popover-open")) limitsPanel.hidePopover();
+        limitsPanel.removeAttribute("popover");
+      }
       toggle.setAttribute("aria-expanded", "false");
     };
     limitsPanel.addEventListener("toggle", (event) => {
       toggle.setAttribute("aria-expanded", String(event.newState === "open"));
     });
-    narrow.addEventListener("change", updateLimitsPopover);
     updateLimitsPopover();
     const limits = createCodexLimitsReader(request, renderLimits);
     const refreshVisibleLimits = () => {
@@ -1364,8 +1377,11 @@
           event.key === "Home" ? 0 : event.key === "End" ? sessionTabs.length - 1 : -1;
       if (next < 0) return;
       event.preventDefault();
+      // Native fragment navigation can move focus away after the key handler.
+      const oldURL = location.href;
+      if (oldURL !== sessionTabs[next].href) history.pushState(null, "", sessionTabs[next].href);
+      dispatchEvent(new HashChangeEvent("hashchange", {oldURL, newURL: location.href}));
       sessionTabs[next].focus();
-      sessionTabs[next].click();
     });
   });
   const activateSessionHash = () => activateSessionTab(sessionTabFromLocation(
@@ -1686,6 +1702,7 @@
       repositoryReview = module.mount({
         slug, element, nonce: document.querySelector('meta[name="style-nonce"]')?.content || "",
         createCopyButton: conversationAssets.createCopyButton,
+        onComparisonChange(open) { comparisonOpen = open; updateSidebar(); },
       });
       if (pageReads.paused) repositoryReview.suspend();
     }).catch((error) => {

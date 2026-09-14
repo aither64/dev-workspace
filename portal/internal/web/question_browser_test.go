@@ -73,12 +73,14 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"question_browser_test.cjs", "page_lifecycle_browser_test.cjs"} {
-		command := exec.Command("node", script, httpServer.URL)
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("%s: %v\n%s", script, err, output)
-		} else {
-			t.Log(string(output))
-		}
+	for _, script := range []string{"question_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs"} {
+		t.Run(script, func(t *testing.T) {
+			command := exec.Command("node", script, httpServer.URL)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("%s: %v\n%s", script, err, output)
+			} else {
+				t.Log(string(output))
+			}
+		})
 	}
 }
