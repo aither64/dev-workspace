@@ -17,7 +17,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
-  createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
+  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
@@ -585,6 +585,12 @@ assert.match(
   /^workspace-portal\.request-input\./,
 );
 assert.equal(deleteRequestInputDraft(storage, "example", "thread-1", "request-1"), true);
+storeRequestInputDraft(storage, "example", "thread-1", "unselected", inputQuestions, {
+  page: 0, drafts: [{note: "Choose an option later"}, {note: "Secret before choosing"}],
+});
+assert.deepEqual(loadRequestInputDraft(storage, "example", "thread-1", "unselected", inputQuestions).drafts,
+  [{kind: "", choice: "", note: "Choose an option later"}, {}]);
+deleteRequestInputDraft(storage, "example", "thread-1", "unselected");
 
 storeQueueAttempt(storage, "deleted", "thread-1", firstAttempt);
 storeSendAttempt(storage, "deleted", "thread-1", sendAttempt);
@@ -646,6 +652,47 @@ const automaticClient = createSessionClient(
 );
 
 if (!unitOnly) {
+  let rejectOldSnooze, snoozeCalls = 0;
+  const oldSnooze = createPromptSnooze("offer-A", () => new Promise((_resolve, reject) => { rejectOldSnooze = reject; }));
+  const oldOperation = oldSnooze.pause(); await Promise.resolve();
+  const newSnooze = createPromptSnooze("offer-B", async () => { snoozeCalls++; });
+  await newSnooze.pause();
+  rejectOldSnooze(new Error("late failure")); await oldOperation;
+  assert.equal(oldSnooze.failed, true);
+  assert.equal(newSnooze.failed, false); assert.equal(newSnooze.paused, true);
+  assert.equal(snoozeCalls, 1, "old failure must not poison the replacement offer");
+  let attempts = 0;
+  const retrySnooze = createPromptSnooze("same-offer", async () => { if (++attempts === 1) throw new Error("temporary failure"); });
+  assert.equal(await retrySnooze.pause(), false);
+  assert.equal(await retrySnooze.pause(), false); assert.equal(attempts, 1, "editing alone must not repeatedly retry a failed request");
+  assert.equal(await retrySnooze.pause(true), true); assert.equal(attempts, 2, "explicit refresh must retry the same valid offer");
+  const offer = {id: "first", token: "offer-1", threadId: "thread", turnId: "turn", itemId: "item",
+    method: "item/tool/requestUserInput", kind: "userInput", authorityAvailable: true, questions: [{id: "q", question: "Choose"}]};
+  const replacement = {...offer, id: "second", token: "offer-2"};
+  assert.equal(promptIdentity(offer), promptIdentity(replacement));
+  for (const [error, restored, expected] of [
+    [{code: "prompt_transport", notSent: true}, replacement, 2],
+    [{code: "prompt_changed", notSent: true}, replacement, 2],
+    [{code: "prompt_transport", notSent: false}, replacement, 1],
+    [new Error("Network error"), replacement, 1],
+    [{code: "invalid_response", notSent: true}, replacement, 1],
+    [{code: "prompt_transport", notSent: true}, {...replacement, turnId: "another"}, 1],
+    [{code: "prompt_transport", notSent: true}, {...replacement, itemId: "another"}, 1],
+    [{code: "prompt_transport", notSent: true}, {...replacement, questions: [{id: "q", question: "Changed"}]}, 1],
+    [{code: "prompt_transport", notSent: true}, {...replacement, authorityAvailable: false}, 1],
+    [{code: "prompt_transport", notSent: true}, null, 1],
+  ]) {
+    let sends = 0;
+    try { await respondWithRecovery(offer, {answers: {}}, async entry => {
+      sends++; if (sends === 1) throw error; assert.equal(entry.token, "offer-2");
+    }, async () => restored); } catch (_) {}
+    assert.equal(sends, expected);
+  }
+  let repeatedSends = 0;
+  await assert.rejects(respondWithRecovery(offer, {}, async () => {
+    repeatedSends++; throw Object.assign(new Error("definitely unsent"), {code: "prompt_transport", notSent: true});
+  }, async () => replacement));
+  assert.equal(repeatedSends, 2, "a failed automatic retry never starts another retry");
   let snoozedBeforeWizardAction = false;
   await beforeRequestInputAction(async () => { snoozedBeforeWizardAction = true; });
   assert.equal(snoozedBeforeWizardAction, true);

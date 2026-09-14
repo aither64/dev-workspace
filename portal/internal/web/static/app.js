@@ -107,7 +107,8 @@
         if (document.activeElement !== interrupt) interrupt.focus();
       } else if (moveFocus) {
         const matchingQuestion = previousQuestion && [...pending.querySelectorAll(".question-approval")]
-          .find((entry) => entry.dataset.requestId === previousQuestion.dataset.requestId);
+          .find((entry) => previousQuestion.dataset.promptKey ? entry.dataset.promptKey === previousQuestion.dataset.promptKey :
+            entry.dataset.requestId === previousQuestion.dataset.requestId);
         const matchingControl = matchingQuestion && [...matchingQuestion.querySelectorAll("input, textarea, button")]
           .find((control) => !control.disabled && control.name && control.name === previousFocus.name &&
             (previousFocus.type !== "radio" || control.value === previousFocus.value));
@@ -123,6 +124,9 @@
     };
 
     return {
+      restoreFocus(previousFocus, previousQuestion) {
+        if (document.activeElement === document.body) update({previousFocus, previousQuestion});
+      },
       setInterruptEnabled(enabled) {
         const wasFocused = document.activeElement === interrupt;
         interrupt.disabled = !enabled;
@@ -615,6 +619,47 @@
   const beforeRequestInputAction = async (snooze) => {
     await snooze();
   };
+  const createPromptSnooze = (token, send) => {
+    const state = {token, paused: false, failed: false, pending: null, onChange: null,
+      pause(retry = false) {
+        if (state.pending) return state.pending;
+        if (state.paused || state.failed && !retry) return Promise.resolve(state.paused);
+        state.failed = false; state.paused = true;
+        state.onChange?.();
+        state.pending = Promise.resolve().then(send).then(() => true, () => {
+          state.paused = false; state.failed = true; return false;
+        }).finally(() => { state.pending = null; state.onChange?.(); });
+        return state.pending;
+      },
+    };
+    return state;
+  };
+  const promptIdentity = entry => {
+    const turn = entry.turnId || entry.params?.turnId;
+    if (!entry.threadId || !turn || !entry.itemId) return null;
+    return JSON.stringify([entry.threadId, turn, entry.itemId, entry.method, entry.kind,
+      entry.isBlocking, entry.questions || [], entry.availableDecisions || []]);
+  };
+  const promptDraftKey = entry => promptIdentity(entry) || JSON.stringify([entry.threadId, entry.id, entry.token || ""]);
+  const respondWithRecovery = async (entry, payload, send, recover, onRecovery = () => {}) => {
+    try { await send(entry, payload); return entry; }
+    catch (error) {
+      if (["invalid_response", "reload_required"].includes(error.code)) throw error;
+      onRecovery(error);
+      let restored;
+      try { restored = await recover(entry); } catch (_) { /* Preserve the original delivery outcome. */ }
+      const identity = promptIdentity(entry);
+      if (error.notSent === true && ["prompt_changed", "prompt_transport"].includes(error.code) &&
+          entry.kind === "userInput" && identity && restored?.token && restored.authorityAvailable &&
+          promptIdentity(restored) === identity) {
+        // Exactly one resend, only after an authoritative restoration. A second
+        // failure escapes to the caller even when it was also definitely unsent.
+        await send(restored, payload);
+        return restored;
+      }
+      throw error;
+    }
+  };
   const requestInputDraftStorageKey = (slug, threadId, requestId) => (
     `workspace-portal.request-input.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.${encodeURIComponent(requestId)}`
   );
@@ -652,11 +697,11 @@
       const encoded = storage.getItem(requestInputDraftStorageKey(slug, threadId, requestId));
       if (encoded === null) return null;
       const value = JSON.parse(encoded);
-      if (!value || !Number.isInteger(value.page) || value.page < 0 ||
+      if (!value || value.questions !== JSON.stringify(questions) || !Number.isInteger(value.page) || value.page < 0 ||
           !Array.isArray(value.drafts) || value.drafts.length !== questions.length) return null;
       const drafts = value.drafts.map((draft, index) => {
         if (questions[index]?.isSecret) return {};
-        if (!draft || !["option", "other", "freeform"].includes(draft.kind)) return {};
+        if (!draft || !["", "option", "other", "freeform"].includes(draft.kind)) return {};
         if (typeof draft.choice !== "string" || typeof draft.note !== "string") return {};
         return {kind: draft.kind, choice: draft.choice, note: draft.note};
       });
@@ -679,7 +724,7 @@
       });
       storage.setItem(
         requestInputDraftStorageKey(slug, threadId, requestId),
-        JSON.stringify({page: state.page, drafts}),
+        JSON.stringify({page: state.page, drafts, questions: JSON.stringify(questions)}),
       );
       return true;
     } catch (_error) {
@@ -720,7 +765,7 @@
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
       currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
-      autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
+      createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
@@ -747,7 +792,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=7");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=8");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -1921,7 +1966,8 @@
   const pendingMessages = new Map();
   const inFlightMessageIDs = new Set();
   let sendReceiptAcknowledgementActive = false;
-  const requestInputDrafts = new Map();
+  const requestInputDrafts = new Map(), promptStatuses = new Map(), respondingPrompts = new Set(), answeredOffers = new Set();
+  let currentPrompts = [];
   const codexWork = document.getElementById("codex-work");
   const codexWorkElapsed = document.getElementById("codex-work-elapsed");
   const codexWorkLabel = document.getElementById("codex-work-label");
@@ -2362,6 +2408,9 @@
 
   const renderThread = async (payload, isCurrent = () => true) => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
+    if (currentThreadId && currentThreadId !== payload.threadId) {
+      requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
+    }
     currentThreadId = payload.threadId;
     loadMessageReceipts();
     recoverPlanAttempts(payload.latestTurnId);
@@ -2416,30 +2465,78 @@
     renderPlanActions(payload);
   };
 
-  const respond = async (id, payload, container) => {
+  const showPromptStatus = (entry, message) => {
+    const key = promptDraftKey(entry);
+    if (message) promptStatuses.set(key, {entry, message}); else promptStatuses.delete(key);
+    for (const box of document.querySelectorAll(".approval")) if (box.dataset.promptKey === key) {
+      const notice = box.querySelector(".prompt-response-status");
+      if (notice) { notice.textContent = message; notice.hidden = !message; }
+    }
+  };
+  const recoverPrompt = async entry => {
+    if (pageReads.paused) return null;
+    sync?.retry();
+    const read = pageReads.begin(), deadline = Date.now() + 9000;
+    try {
+      do {
+        const thread = await client.thread({signal: read.signal});
+        const pending = await client.pending({signal: read.signal});
+        if (!read.isCurrent() || read.signal.aborted || thread.threadId !== entry.threadId ||
+            thread.latestTurnId !== (entry.turnId || entry.params?.turnId)) return null;
+        renderPendingEntries(pending);
+        const restored = pending.find(candidate => promptIdentity(candidate) === promptIdentity(entry));
+        if (restored || pending.some(candidate => candidate.kind === "userInput") || thread.status !== "active") return restored;
+        await new Promise(resolve => {
+          const done = () => { clearTimeout(timer); read.signal.removeEventListener("abort", done); resolve(); };
+          const timer = setTimeout(done, 400); read.signal.addEventListener("abort", done, {once: true});
+        });
+      } while (Date.now() < deadline && !read.signal.aborted);
+      return null;
+    } finally { read.finish(); scheduleRefresh(0); }
+  };
+  const respond = async (entry, payload, container) => {
+    const key = promptDraftKey(entry);
+    if (respondingPrompts.has(key)) return;
+    if (!entry.token) { showPromptStatus(entry, "Reload this page to update the question controls."); return; }
+    respondingPrompts.add(key);
     const activeElement = document.activeElement;
     const controls = Array.from(container.querySelectorAll("button, input, select, textarea"));
-    controls.forEach((control) => { control.disabled = true; });
+    controls.forEach(control => { control.disabled = true; });
+    showPromptStatus(entry, entry.kind === "userInput" ? "Submitting answers…" : "Submitting response…");
     try {
-      await client.respond(id, payload);
-      requestInputDrafts.delete(id);
-      deleteRequestInputDraft(requestInputDraftStorage, slug, currentThreadId, id);
-      scheduleRefresh(0);
+      const accepted = await respondWithRecovery(entry, payload,
+        (offer, answer) => client.respond(offer.id, {...answer, token: offer.token}), recoverPrompt,
+        () => showPromptStatus(entry, entry.kind === "userInput" ? "Reconnecting to Codex. Your answers are saved." : "Reconnecting to Codex…"));
+      answeredOffers.add(entry.token); answeredOffers.add(accepted.token);
+      if (answeredOffers.size > 100) answeredOffers.delete(answeredOffers.values().next().value);
+      requestInputDrafts.delete(key); promptStatuses.delete(key);
+      deleteRequestInputDraft(requestInputDraftStorage, slug, entry.threadId, key);
+      pendingSignature = null; renderPendingEntries(currentPrompts); scheduleRefresh(0);
     } catch (error) {
-      alert(error.message);
+      const message = entry.kind !== "userInput" ? (error.notSent ? "Your response was not sent. Refresh the request and try again." : "Delivery could not be confirmed. Check the conversation before responding again.") :
+        error.code === "invalid_response" || error.code === "reload_required" ? error.message :
+        error.notSent ? "Your answers were not sent. They are saved here; refresh the question and try again." :
+          "Delivery could not be confirmed. Your answers are saved. Check the conversation before submitting again.";
+      showPromptStatus(entry, message);
     } finally {
-      controls.forEach((control) => { control.disabled = false; });
-      // Disabling a focused answer button moves focus to the body. Restore it
-      // before the next snapshot replaces the question, unless the user moved on.
-      if (controls.includes(activeElement) && activeElement.isConnected && document.activeElement === document.body) {
-        activeElement.focus({preventScroll: true});
-      }
+      respondingPrompts.delete(key);
+      pendingSignature = null; renderPendingEntries(currentPrompts);
+      controls.forEach(control => { control.disabled = false; });
+      if (controls.includes(activeElement)) composerView.restoreFocus(activeElement, activeElement.closest(".question-approval"));
     }
   };
 
   const renderApproval = (entry) => {
     const box = document.createElement("article");
     box.className = "approval";
+    const draftKey = promptDraftKey(entry);
+    box.dataset.promptKey = draftKey;
+    const responseStatus = document.createElement("p");
+    responseStatus.className = "notice warning prompt-response-status";
+    responseStatus.setAttribute("role", "status");
+    responseStatus.textContent = promptStatuses.get(draftKey)?.message || "";
+    responseStatus.hidden = !responseStatus.textContent;
+    box.append(responseStatus);
     const title = document.createElement("strong");
     title.textContent = entry.kind === "userInput" ? "Codex needs your input" : entry.method.split("/").slice(-2).join(" · ");
     box.append(title);
@@ -2478,16 +2575,23 @@
       const form = document.createElement("form");
       form.className = "input-wizard stack";
       const questions = entry.questions || [];
-      let wizardState = requestInputDrafts.get(entry.id);
+      let wizardState = requestInputDrafts.get(draftKey);
       if (!wizardState || wizardState.drafts.length !== questions.length) {
         const saved = loadRequestInputDraft(
-          requestInputDraftStorage, slug, currentThreadId, entry.id, questions,
+          requestInputDraftStorage, slug, currentThreadId, draftKey, questions,
         );
-        wizardState = saved ? {...saved, snoozed: false} : {
-          drafts: questions.map(() => ({})), page: 0, snoozed: false,
+        wizardState = saved || {
+          drafts: questions.map(() => ({})), page: 0,
         };
-        requestInputDrafts.set(entry.id, wizardState);
+        requestInputDrafts.set(draftKey, wizardState);
       }
+      if (!wizardState.snooze || wizardState.snooze.token !== entry.token) {
+        wizardState.snooze = createPromptSnooze(entry.token, () => {
+          if (!entry.token) throw new Error("Reload this page to update the question controls.");
+          return client.snooze(entry.id, entry.token);
+        });
+      }
+      const snoozeState = wizardState.snooze;
       const drafts = wizardState.drafts;
       let page = Math.min(wizardState.page, questions.length - 1);
       box.classList.add("question-approval");
@@ -2535,35 +2639,36 @@
             kind: selected.value === "__other__" ? "other" : "option",
             choice: selected.value === "__other__" ? "" : selected.value,
             note,
-          } : {};
+          } : {note};
         } else {
           drafts[page] = {kind: "freeform", note};
         }
         wizardState.page = page;
         storeRequestInputDraft(
-          requestInputDraftStorage, slug, currentThreadId, entry.id, questions, wizardState,
+          requestInputDraftStorage, slug, currentThreadId, draftKey, questions, wizardState,
         );
       };
       const renderAutoResolution = () => {
         const dueAt = Number(entry.autoResolutionAtMs || 0);
         autoResolution.textContent = autoResolutionLabel(
           Date.now(), Number(entry.autoResolutionVisibleAtMs || 0), dueAt,
-          wizardState.snoozed || Boolean(entry.autoResolveSnoozed),
+          snoozeState.paused || Boolean(entry.autoResolveSnoozed),
         );
         autoResolution.hidden = !autoResolution.textContent;
       };
-      const snoozeAutoResolution = async () => {
-        if (entry.isBlocking || wizardState.snoozed || entry.autoResolveSnoozed) return;
-        wizardState.snoozed = true;
+      snoozeState.onChange = () => {
+        // A pending operation belongs to its captured offer, even when the
+        // same logical question retains its draft on a replacement offer.
+        if (wizardState.snooze !== snoozeState) return;
         renderAutoResolution();
-        try {
-          await client.snooze(entry.id);
-        } catch (error) {
-          wizardState.snoozed = false;
-          renderAutoResolution();
-          alert(`Unable to pause automatic resolution: ${error.message}`);
-          scheduleRefresh(0);
+        if (snoozeState.failed) {
+          showPromptStatus(entry, "Automatic resolution could not be paused. Your answers are saved; refresh the question to try again.");
+          sync?.retry(); scheduleRefresh(0);
         }
+      };
+      const snoozeAutoResolution = async () => {
+        if (entry.isBlocking || entry.recovering || entry.autoResolveSnoozed) return;
+        await snoozeState.pause();
       };
       const renderQuestion = () => {
         const question = questions[page];
@@ -2629,7 +2734,7 @@
         page -= 1;
         wizardState.page = page;
         storeRequestInputDraft(
-          requestInputDraftStorage, slug, currentThreadId, entry.id, questions, wizardState,
+          requestInputDraftStorage, slug, currentThreadId, draftKey, questions, wizardState,
         );
         renderQuestion();
       });
@@ -2656,7 +2761,7 @@
           page += 1;
           wizardState.page = page;
           storeRequestInputDraft(
-            requestInputDraftStorage, slug, currentThreadId, entry.id, questions, wizardState,
+            requestInputDraftStorage, slug, currentThreadId, draftKey, questions, wizardState,
           );
           renderQuestion();
           return;
@@ -2673,11 +2778,11 @@
         )) {
           return;
         }
-        await respond(entry.id, {answers}, form);
+        await respond(entry, {answers}, form);
       });
       renderQuestion();
       renderAutoResolution();
-      if (!entry.isBlocking && !wizardState.snoozed && !entry.autoResolveSnoozed) {
+      if (!entry.isBlocking && !snoozeState.paused && !entry.autoResolveSnoozed) {
         const timer = setInterval(() => {
           if (!box.isConnected) {
             clearInterval(timer);
@@ -2695,10 +2800,33 @@
         button.type = "button";
         button.textContent = decision === "acceptForSession" ? "Approve for session" : decision[0].toUpperCase() + decision.slice(1);
         if (decision === "decline" || decision === "cancel") button.className = "danger";
-        button.addEventListener("click", () => respond(entry.id, {decision}, actions));
+        button.addEventListener("click", () => respond(entry, {decision}, actions));
         actions.append(button);
       }
       box.append(actions);
+    }
+    if (respondingPrompts.has(draftKey)) box.querySelectorAll("button, input, select, textarea").forEach(control => { control.disabled = true; });
+    if (entry.recovering) {
+      box.querySelectorAll("button").forEach(control => { control.disabled = true; });
+      responseStatus.hidden = false;
+      responseStatus.textContent = promptStatuses.get(draftKey)?.message || "Refreshing this question. Your answers are saved.";
+    }
+    if (promptStatuses.has(draftKey) && !respondingPrompts.has(draftKey)) {
+      const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "quiet"; refresh.textContent = entry.kind === "userInput" ? "Refresh question" : "Refresh request";
+      refresh.addEventListener("click", async () => {
+        refresh.disabled = true;
+        try {
+          const restored = await recoverPrompt(entry);
+          const state = restored && requestInputDrafts.get(promptDraftKey(restored))?.snooze;
+          if (restored && !restored.isBlocking && state?.token === restored.token && await state.pause(true)) showPromptStatus(restored, "");
+        } catch (_) {} finally { refresh.disabled = false; }
+      });
+      box.append(refresh);
+      if (entry.recovering) {
+        const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "quiet"; dismiss.textContent = "Hide saved question";
+        dismiss.addEventListener("click", () => { promptStatuses.delete(draftKey); pendingSignature = null; renderPendingEntries(currentPrompts); });
+        box.append(dismiss);
+      }
     }
     return box;
   };
@@ -2706,16 +2834,16 @@
   let pendingSignature = null;
   const renderPendingEntries = (entries) => {
     if (!interactive) return;
-    const signature = JSON.stringify(entries);
+    currentPrompts = entries;
+    entries = entries.filter(entry => !answeredOffers.has(entry.token));
+    const keys = new Set(entries.map(promptDraftKey));
+    // An empty transient snapshot cannot prove that saved answers are obsolete.
+    // Keep recovery controls until the question returns or the user hides them.
+    for (const [key, status] of promptStatuses) if (!keys.has(key) && status.entry.threadId === currentThreadId &&
+        !entries.some(entry => entry.kind === status.entry.kind)) entries = [...entries, {...status.entry, recovering: true}];
+    const signature = JSON.stringify([entries, [...promptStatuses].map(([key, status]) => [key, status.message]), [...respondingPrompts]]);
     if (signature === pendingSignature) return;
     pendingSignature = signature;
-    const currentInputIDs = new Set(entries.filter((entry) => entry.kind === "userInput").map((entry) => entry.id));
-    for (const id of requestInputDrafts.keys()) {
-      if (!currentInputIDs.has(id)) {
-        requestInputDrafts.delete(id);
-        deleteRequestInputDraft(requestInputDraftStorage, slug, currentThreadId, id);
-      }
-    }
     composerView.replacePending(entries.map(renderApproval));
   };
 

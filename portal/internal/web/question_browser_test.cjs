@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const {chromium, expect} = require("@playwright/test");
 const baseURL = process.argv[2];
 const question = (id, isBlocking = true) => ({
-  id, kind: "userInput", authorityAvailable: true, isBlocking,
+  id, token: "offer-" + id, threadId: "thread-1", turnId: "turn-1", itemId: id, method: "item/tool/requestUserInput", kind: "userInput", authorityAvailable: true, isBlocking,
   questions: [{id: "approach", header: "Approach", question: "Which approach should I use?",
     options: [{label: "First", description: "The first approach."}, {label: "Second", description: "The second approach."}], isOther: true}],
 });
@@ -15,7 +15,8 @@ const question = (id, isBlocking = true) => ({
     page.on("pageerror", error => errors.push(error.message));
     page.on("dialog", async dialog => { dialogs.push(dialog.message()); await dialog.accept(); });
     let entries = [], offline = false, failAnswer = false, blockUpload = false, releaseUpload;
-    let thread = {threadId: "thread-1", status: "active", collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []};
+    let failSnooze = false, holdSnooze = false, releaseSnooze;
+    let thread = {threadId: "thread-1", latestTurnId: "turn-1", status: "active", collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []};
     let reads = 0;
     await page.route("**/api/sessions/example/**", async route => {
       const operation = new URL(route.request().url()).pathname.split("/").at(-1);
@@ -29,10 +30,24 @@ const question = (id, isBlocking = true) => ({
         case "events": return route.continue();
         case "respond":
           if (route.request().postDataJSON().snooze) {
-            requests.push({operation: "snooze"});
+            requests.push({operation: "snooze", token: route.request().postDataJSON().token});
+            if (holdSnooze) {
+              holdSnooze = false;
+              await new Promise(resolve => { releaseSnooze = resolve; });
+              return json({error: "Retired offer"}, 503);
+            }
+            if (failSnooze) { failSnooze = false; return json({error: "Temporary snooze failure"}, 503); }
             return json({ok: true});
           }
           requests.push({operation, body: route.request().postDataJSON()});
+          if (typeof failAnswer === "string") {
+            const changed = failAnswer === "changed";
+            const restored = {...entries[0], id: "restored-" + entries[0].id, token: "restored-" + entries[0].token,
+              ...(changed ? {questions: [{...entries[0].questions[0], question: "A different question"}]} : {})};
+            failAnswer = false; entries = [];
+            setTimeout(() => { entries = [restored]; }, 300);
+            return json({error: "Connection changed", code: "prompt_transport", notSent: true}, 503);
+          }
           if (failAnswer) return json({error: "Fixture answer failed"}, 503);
           entries = entries.filter(entry => entry.id !== route.request().postDataJSON().id);
           return json({ok: true});
@@ -59,6 +74,11 @@ const question = (id, isBlocking = true) => ({
     const interrupt = page.locator("#interrupt");
     await page.goto(baseURL + "/example/");
     await expect(page.locator("#codex-model")).toHaveValue("model-1");
+    await expect(page.locator("#auto-archive-panel")).toBeHidden();
+    await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+    await expect(page.locator("#auto-archive-panel")).toBeVisible();
+    await page.getByRole("tab", {name: "Codex", exact: true}).click();
+    await expect(page.locator("#auto-archive-panel")).toBeHidden();
     await expect(page.locator(".codex-upload-toggle")).toBeEnabled();
     await prompt.fill("Keep my prompt draft");
     await prompt.focus();
@@ -83,8 +103,9 @@ const question = (id, isBlocking = true) => ({
     assert.deepEqual(await wizard().locator("textarea").evaluate(input => [input.selectionStart, input.selectionEnd]), [4, 9]);
     failAnswer = true;
     await wizard().getByRole("button", {name: "Submit answers"}).click();
-    await expect.poll(() => dialogs.length).toBe(1);
-    assert.equal(dialogs[0], "Fixture answer failed");
+    await expect(wizard().locator(".prompt-response-status")).toContainText("Delivery could not be confirmed");
+    assert.equal(dialogs.length, 0);
+    assert.equal(requests.filter(request => request.operation === "respond").length, 1, "uncertain answer was retried automatically");
     await expect(composer).toBeHidden();
     await expect(wizard().locator("textarea")).toHaveValue("Keep this answer");
     offline = true;
@@ -102,6 +123,58 @@ const question = (id, isBlocking = true) => ({
     await expect(prompt).toBeFocused();
     await expect(composer.locator("#interrupt")).toHaveCount(1);
     results.push("failed answers and disconnected snapshots preserve drafts and visibility; successful answer restores focus");
+
+    const beforeRecovery = requests.filter(request => request.operation === "respond").length;
+    entries = [question("recover-question")]; await refresh();
+    await wizard().locator("input[value=Second]").check();
+    await wizard().locator("textarea").fill("Survives reconnection");
+    failAnswer = "unsent";
+    await wizard().getByRole("button", {name: "Submit answers"}).click();
+    await expect(wizard()).toHaveCount(0, {timeout: 15000});
+    const recoveredSends = requests.filter(request => request.operation === "respond").slice(beforeRecovery);
+    assert.equal(recoveredSends.length, 2);
+    assert.notEqual(recoveredSends[0].body.token, recoveredSends[1].body.token);
+    assert.deepEqual(recoveredSends[0].body.answers, recoveredSends[1].body.answers);
+    assert.equal(dialogs.length, 0);
+    results.push("one retry restores the exact question and answers after a temporary missing prompt");
+
+    entries = [question("changed-question")]; await refresh();
+    await wizard().locator("input[value=First]").check();
+    await wizard().locator("textarea").fill("Answer only the original question");
+    const beforeChanged = requests.filter(request => request.operation === "respond").length;
+    failAnswer = "changed";
+    await wizard().getByRole("button", {name: "Submit answers"}).click();
+    await expect(wizard().locator(".wizard-question")).toHaveText("A different question", {timeout: 15000});
+    await expect(wizard().locator("textarea")).toHaveValue("");
+    assert.equal(requests.filter(request => request.operation === "respond").length - beforeChanged, 1);
+    entries = []; await refresh();
+    await page.getByRole("button", {name: "Hide saved question"}).click();
+    results.push("changed questions never receive an automatic answer or an old draft");
+
+    entries = [question("snooze-retry", false)]; await refresh();
+    failSnooze = true;
+    await wizard().locator("textarea").fill("Keep answering");
+    await expect(wizard().locator(".prompt-response-status")).toContainText("Automatic resolution could not be paused");
+    const beforeSnoozeRetry = requests.filter(request => request.operation === "snooze").length;
+    await wizard().getByRole("button", {name: "Refresh question"}).click();
+    await expect.poll(() => requests.filter(request => request.operation === "snooze").length).toBe(beforeSnoozeRetry + 1);
+    await expect(wizard().locator(".auto-resolution")).toContainText("paused while you answer");
+    await expect(wizard().locator("textarea")).toHaveValue("Keep answering");
+    results.push("Refresh question retries a failed snooze with the unchanged token");
+
+    entries = [question("snooze-replaced", false)]; await refresh();
+    holdSnooze = true;
+    await wizard().locator("textarea").fill("Survive the old snooze");
+    await expect.poll(() => Boolean(releaseSnooze)).toBe(true);
+    entries = [{...entries[0], token: "replacement-snooze-token"}]; await refresh();
+    releaseSnooze();
+    await wizard().locator("textarea").fill("Still answering the current offer");
+    await expect.poll(() => requests.filter(request => request.operation === "snooze" && request.token === "replacement-snooze-token").length).toBe(1);
+    await expect(wizard().locator(".auto-resolution")).toContainText("paused while you answer");
+    await expect(wizard().locator(".prompt-response-status")).toBeHidden();
+    entries = []; await refresh();
+    results.push("a late snooze failure cannot disable the replacement offer");
+
 
     thread.status = "active"; thread.collaborationMode = "default";
     await page.locator("#transcript").focus();
