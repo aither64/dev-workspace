@@ -1275,6 +1275,10 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		s.startArchive(w, r, summary)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "auto-archive" {
+		s.autoArchiveAPI(w, r, parts[0])
+		return
+	}
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "revive" {
 		summary, err := session.Find(s.config.Workspace, parts[0])
 		if err != nil {

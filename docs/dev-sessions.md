@@ -275,6 +275,62 @@ record in the portal.
 
 ## Archiving and reviving an initiative
 
+### Automatic archival
+
+Automatic archival is disabled by default for each workspace. Enable it with
+`dev-session auto-archive enable`. The hourly user timer applies these rules in
+order:
+
+| Session | Inactivity | Outcome |
+| --- | --- | --- |
+| Explicit `lifecycle: complete` | 1 day | Complete |
+| Active, with all registered branches merged | 7 days | Complete |
+| Active, with no registered repositories or owned worktrees | 14 days | Abandoned |
+
+The completed outcomes require the same exact local/remote merge proofs as
+manual archival. Removing a worktree does not remove its registered branch or
+qualify the session for the 14-day rule. Already abandoned sessions require
+manual archival. The archive retains the conversation, tracking and branches.
+
+New conversation activity, content changes to plan/state or declared artifacts,
+repository registrations and feature-head changes restart inactivity. Dirty
+worktrees block archival; returning to clean starts a fresh period. Portal
+visits, polling, file touches and routine runtime metadata updates do not count.
+Unknown conversation activity, active turns, pending requests, queued messages
+and incomplete lifecycle operations prevent a new automatic archive.
+
+The first scan after enabling starts a fresh period for existing sessions.
+Observations survive service restarts. Re-enabling, reviving a session or
+releasing a hold also starts a fresh period. Changes made and reverted entirely
+between scans cannot be observed.
+
+Use **Automatic archival** on the session page to inspect its rule, earliest
+eligibility, blockers and last result. **Keep open** prevents automatic archival
+while leaving manual archival available. The equivalent commands are:
+
+```sh
+dev-session auto-archive hold api-token-rotation
+dev-session auto-archive release api-token-rotation
+dev-session auto-archive status api-token-rotation --json
+dev-session auto-archive scan --dry-run --json
+dev-session auto-archive disable
+```
+
+A dry run reports current eligibility without updating observations or starting
+an archive. It may fetch Git refs to verify merge status. Disabling prevents new
+automatic archives; an archive already recorded in its lifecycle journal can
+still finish through the normal recovery workflow. The worker resumes only its
+own recorded operation IDs and leaves manual operations for their existing
+retry actions.
+
+The service is `workspace-auto-archive@WORKSPACE.service`; its timer runs hourly.
+Inspect results with `journalctl --user -u workspace-auto-archive@WORKSPACE.service`.
+Policy, holds and observations live beneath the user state directory in
+`auto-archive/`, separately from session manifests. Package rollback stops the
+worker and removes its timer when the target generation lacks this feature.
+
+### Manual archival
+
 Use `archive` only after the initiative is fully integrated and has no
 session-owned work, or after the user explicitly abandons it:
 

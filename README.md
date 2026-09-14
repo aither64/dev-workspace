@@ -256,6 +256,13 @@ The portal keeps these records, creation receipts, and saved comparisons in
 separate private files; existing session manifests and lifecycle journals retain
 their formats for rollback.
 
+## Automatic archival
+
+The user package includes optional hourly session archival. Enable it per
+workspace with `dev-session auto-archive enable`; use the portal's **Keep open**
+control to retain an individual session. See [session archival](docs/dev-sessions.md#automatic-archival)
+for the 1-, 7-, and 14-day rules and recovery behavior.
+
 ## Development
 
 Run the package checks and host smoke test with:

@@ -29,6 +29,10 @@
       method: "POST", body: JSON.stringify({kind}),
     }),
     details: () => request(apiPath(slug, "details")),
+    autoArchive: () => request(apiPath(slug, "auto-archive")),
+    autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
+      method: "POST", body: JSON.stringify({hold, targetId}),
+    }),
     artifactPreview: (path) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`),
     archive: (mode, targetId) => request(apiPath(slug, "archive"), {
       method: "POST", body: JSON.stringify({mode, targetId}),
@@ -1297,6 +1301,39 @@
     conversationPath: `/api/sessions/${encodeURIComponent(slug)}`,
   }) : null;
   const client = createSessionClient(slug, request, conversation);
+  const autoArchiveStatus = document.getElementById("auto-archive-status");
+  const autoArchiveHold = document.getElementById("auto-archive-hold");
+  const renderAutoArchive = (state) => {
+    const rules = {complete: "Complete: 1 inactive day.", merged: "Merged branches: 7 inactive days.", empty: "No repositories: abandoned after 14 inactive days."};
+    const parts = [state.enabled ? "Enabled." : "Disabled for this workspace."];
+    if (rules[state.tier]) parts.push(rules[state.tier]);
+    if (state.eligible_at) parts.push(`Earliest archival: ${new Date(state.eligible_at).toLocaleString()}.`);
+    if (state.result) parts.push(`Last result: ${state.result}.`);
+    if (state.blockers?.length) parts.push(state.blockers.join(" "));
+    if (!state.checked_at) parts.push("Waiting for the first scan.");
+    autoArchiveStatus.textContent = parts.join(" ");
+    if (autoArchiveHold) { autoArchiveHold.checked = state.hold; autoArchiveHold.disabled = false; }
+  };
+  const loadAutoArchive = async () => {
+    try { renderAutoArchive(await client.autoArchive()); }
+    catch (error) { autoArchiveStatus.textContent = error.message; }
+  };
+  if (autoArchiveStatus) {
+    void loadAutoArchive();
+    document.getElementById("auto-archive-panel")?.addEventListener("toggle", (event) => {
+      if (event.target.open) void loadAutoArchive();
+    });
+    autoArchiveHold?.addEventListener("change", async () => {
+      const held = autoArchiveHold.checked;
+      autoArchiveHold.disabled = true;
+      try { await client.autoArchiveHold(held, lifecycleTargetId); await loadAutoArchive(); }
+      catch (error) {
+        autoArchiveHold.checked = !held;
+        autoArchiveHold.disabled = false;
+        autoArchiveStatus.textContent = error.message;
+      }
+    });
+  }
   const lifecycleStatus = document.getElementById("lifecycle-operation-status");
   const lifecycleTitle = document.getElementById("lifecycle-operation-title");
   const lifecycleDetail = document.getElementById("lifecycle-operation-detail");

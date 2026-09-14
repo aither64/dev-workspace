@@ -37,6 +37,12 @@
   </aside>
   <main class="page session-page">
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
+    {{if not .LifecycleOnly}}<details id="auto-archive-panel" class="notice full">
+      <summary>Automatic archival</summary>
+      <p id="auto-archive-status" role="status">Loading archival policy…</p>
+      {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
+      <p>Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
+    </details>{{end}}
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
     <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
