@@ -10,6 +10,7 @@ const bundle = process.env.REVIEW_ASSETS_DIRECTORY || path.join(root, "portal/re
 const provider = process.env.CODEX_WEB_SOURCE;
 const base = "a".repeat(40), originalHead = "b".repeat(40);
 let head = originalHead, shortFiles = false, fixtureMode = "normal";
+let holdNextHistory = false, releaseHistory;
 const reported = JSON.parse(fs.readFileSync(path.join(root, "portal/review-ui/fixtures/oauth2.json"), "utf8"));
 const calls = [], assets = [];
 const cards = '<div class="section-heading"><h2>Repositories</h2><span>4</span></div><div class="repo-grid">' +
@@ -82,7 +83,11 @@ const server = http.createServer((req, res) => {
     return send(name.endsWith(".css") ? "text/css" : "text/javascript", fs.readFileSync(file));
   }
   calls.push({operation: url.pathname.split("/").at(-1), files: url.searchParams.getAll("file")});
-  if (url.pathname.endsWith("repository-histories")) return json({repositories: url.searchParams.getAll("repository").map(history)});
+  if (url.pathname.endsWith("repository-histories")) {
+    const payload = {repositories: url.searchParams.getAll("repository").map(history)};
+    if (holdNextHistory) { holdNextHistory = false; releaseHistory = () => json(payload); return; }
+    return json(payload);
+  }
   if (url.pathname.endsWith("repository-history")) return json(history(url.searchParams.get("repository")));
   if (url.pathname.endsWith("repository-states")) return json({repositories: url.searchParams.getAll("repository").map(repository => ({repository, head}))});
   if (url.pathname.endsWith("repository-comparison")) return json({review: "frozen", snapshot: "snapshot",
@@ -304,8 +309,26 @@ const server = http.createServer((req, res) => {
     await contexts.first().click();
     assert.equal(await firstFile.locator('.review-split-pane').first().locator('.review-context-button').count(),
       await firstFile.locator('.review-split-pane').last().locator('.review-context-button').count(), "split context expansion was not shared");
+    // A newer head observation must win over an in-flight older history batch.
+    fixtureMode = "normal"; shortFiles = false;
+    await page.goto(origin + "/example/");
+    await page.locator(".repository-commit").first().waitFor();
+    holdNextHistory = true; head = "d".repeat(40);
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent("session-section-change", {detail: "repositories"})));
+    while (!releaseHistory) await new Promise(resolve => setTimeout(resolve, 10));
+    head = "e".repeat(40);
+    const beforeNewObservation = calls.filter(call => call.operation === "repository-states").length;
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent("session-section-change", {detail: "repositories"})));
+    while (calls.filter(call => call.operation === "repository-states").length === beforeNewObservation) await new Promise(resolve => setTimeout(resolve, 10));
+    await page.waitForLoadState("domcontentloaded");
+    releaseHistory();
+    await page.waitForFunction(() => [...document.querySelectorAll(".repository-history-base")].every(el => el.textContent.includes("eeeeeeeeee")));
+    assert.equal(await page.locator(".repository-head-change:not([hidden])").count(), 0);
+    await page.evaluate(() => window.review.updateHTML(window.cardMarkup));
+    await page.waitForLoadState("networkidle");
+    assert((await page.locator(".repository-history-base").first().textContent()).includes("eeeeeeeeee"), "old details replaced the refreshed history");
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "message and copy controls",
+    console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "automatic refresh with stale responses", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
       "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
       "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry", "large diff 2000/2001 boundary", "collapse and explicit expansion", "Git-exact OAuth2 counts in both layouts", "shared split context expansion"]}));

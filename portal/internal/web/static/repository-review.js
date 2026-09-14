@@ -109,7 +109,17 @@ export function mount({slug, nonce, element, createCopyButton}) {
   const overview = node("div", "repository-overview"); overview.append(...element.childNodes);
   const review = node("section", "repository-comparison"); review.hidden = true;
   element.append(overview, review);
-  const states = new Map(), collapseChoices = new Map();
+  const states = new Map(), collapseChoices = new Map(), reads = new Set();
+  let paused = false, readGeneration = 0, observation = 0;
+  const read = async (path, options = {}) => {
+    const abort = new AbortController(); reads.add(abort);
+    const cancel = () => abort.abort();
+    options.signal?.addEventListener("abort", cancel, {once: true});
+    if (paused || destroyed || options.signal?.aborted) abort.abort();
+    const timer = setTimeout(cancel, 15000);
+    try { return await request(path, {...options, signal: abort.signal}); }
+    finally { clearTimeout(timer); reads.delete(abort); options.signal?.removeEventListener("abort", cancel); }
+  };
   let active = null, sequence = 0, checking = false, destroyed = false;
   let opening = null;
   let route = reviewRoute(location.href, readMode());
@@ -150,8 +160,12 @@ export function mount({slug, nonce, element, createCopyButton}) {
   };
   const markChanged = (state, head) => {
     state.latestHead = head;
-    state.card.querySelector(".repository-head-change").hidden = !state.pair || !head || state.pair.head === head;
+    state.card.querySelector(".repository-head-change").hidden = true;
     if (active?.state === state) active.changed.hidden = !head || active.historyHead === head;
+  };
+  const observeHead = (state, head, ticket) => {
+    if (!head || ticket < (state.observedAt || 0)) return;
+    state.observedAt = ticket; markChanged(state, head);
   };
   const renderHistory = (state, payload) => {
     state.snapshot = payload.snapshot; state.review = payload.review;
@@ -216,43 +230,54 @@ export function mount({slug, nonce, element, createCopyButton}) {
   };
   const loadingHistory = (state, value) => {
     state.loading = value; state.card.querySelector("[data-review-refresh]").disabled = value;
+    if (!value && state.refreshAgain) { state.refreshAgain = false; queueHistory(state); }
   };
   const loadHistory = async (state, page = 0, refresh = false) => {
-    if (state.loading || destroyed) return false;
+    if (state.loading || destroyed || paused) return false;
+    const generation = readGeneration, ticket = ++observation;
     loadingHistory(state, true);
     try {
-      const payload = await request(url("history", state.id, {page, snapshot: refresh ? "" : state.snapshot}));
-      if (!states.has(state.id) || destroyed) return false;
+      const payload = await read(url("history", state.id, {page, snapshot: refresh ? "" : state.snapshot}));
+      if (!states.has(state.id) || destroyed || paused || generation !== readGeneration) return false;
+      if (refresh) observeHead(state, payload.pair.head, ticket);
+      if (refresh && state.latestHead !== payload.pair.head) { state.refreshAgain = true; return false; }
       renderHistory(state, payload);
-      if (refresh) markChanged(state, payload.pair.head);
       return true;
-    } catch (error) { showFailure(state.card.querySelector("[data-repository-commits]"), error); return false; }
+    } catch (error) { if (!paused && !destroyed && generation === readGeneration) showFailure(state.card.querySelector("[data-repository-commits]"), error); return false; }
     finally { loadingHistory(state, false); }
   };
   const flushHistories = async () => {
     historyScheduled = false;
+    if (paused || destroyed) return;
+    const generation = readGeneration;
     const items = [...historyQueue]; historyQueue.clear();
-    for (let offset = 0; offset < items.length && !destroyed; offset += 8) {
+    for (let offset = 0; offset < items.length && !destroyed && !paused && generation === readGeneration; offset += 8) {
       const batch = items.slice(offset, offset + 8).filter(state => states.has(state.id) && !state.loading);
       if (!batch.length) continue;
+      const ticket = ++observation;
       batch.forEach(state => loadingHistory(state, true));
       try {
-        const payload = await request(url("histories", null, {repository: batch.map(state => state.id)}));
+        const payload = await read(url("histories", null, {repository: batch.map(state => state.id)}));
         const results = new Map(payload.repositories.map(result => [result.repository, result]));
         for (const state of batch) {
-          if (!states.has(state.id) || destroyed) continue;
+          if (!states.has(state.id) || destroyed || paused || generation !== readGeneration) continue;
           const result = results.get(state.id);
           if (!result || result.error) showFailure(state.card.querySelector("[data-repository-commits]"), new Error(result?.error || "Repository history is unavailable."));
-          else renderHistory(state, result);
+          else {
+            observeHead(state, result.pair.head, ticket);
+            if (state.latestHead === result.pair.head) renderHistory(state, result);
+            else state.refreshAgain = true;
+          }
         }
       } catch (error) {
-        for (const state of batch) showFailure(state.card.querySelector("[data-repository-commits]"), error);
+        if (!paused && !destroyed && generation === readGeneration) for (const state of batch) showFailure(state.card.querySelector("[data-repository-commits]"), error);
       } finally { batch.forEach(state => loadingHistory(state, false)); }
     }
   };
   const queueHistory = state => {
+    if (state.loading) { state.refreshAgain = true; return; }
     historyQueue.add(state);
-    if (!historyScheduled) { historyScheduled = true; queueMicrotask(flushHistories); }
+    if (!historyScheduled && !paused && !destroyed) { historyScheduled = true; queueMicrotask(flushHistories); }
   };
   const metadata = (file, content) => {
     const lines = [];
@@ -309,7 +334,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
   };
   const renderFile = async (selected, record) => {
-    if (!record.content || record.collapsed || active !== selected) return;
+    if (!record.content || record.collapsed || active !== selected || paused) return;
     trimEditors(selected, record);
     const fileView = route.view === "file" && record === selectedFile(selected);
     const version = fullFileVersion(record.file, route.version);
@@ -361,7 +386,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     for (const line of metadata(record.file, content)) record.metadata.append(node("p", "", line));
   };
   const pumpFiles = selected => {
-    if (active !== selected) return;
+    if (active !== selected || paused) return;
     while (selected.jobs < 2 && selected.fileQueue.size) {
       const batch = [...selected.fileQueue].filter(record => !record.collapsed).slice(0, 4);
       if (!batch.length) break;
@@ -369,7 +394,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
       selected.jobs++;
       void (async () => {
         try {
-          const payload = await request(url("files", selected.state.id, {snapshot: selected.snapshot, file: batch.map(record => record.file.id)}), {signal: selected.abort.signal});
+          const payload = await read(url("files", selected.state.id, {snapshot: selected.snapshot, file: batch.map(record => record.file.id)}), {signal: selected.abort.signal});
           if (active !== selected) return;
           const results = new Map(payload.files.map(result => [result.file, result]));
           await Promise.all(batch.map(async record => {
@@ -383,7 +408,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
             else throw error;
           })));
         } catch (error) {
-          if (active === selected && error.name !== "AbortError") for (const record of batch) if (!record.content && !record.collapsed) showFailure(record.host, error);
+          if (active === selected && !paused && error.name !== "AbortError") for (const record of batch) if (!record.content && !record.collapsed) showFailure(record.host, error);
         } finally {
           selected.jobs--;
           for (const record of batch) { record.loading = false; record.resolveLoad?.(); record.resolveLoad = null; }
@@ -393,7 +418,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     }
   };
   const loadFile = (selected, record, priority = false) => {
-    if (record.collapsed) return Promise.resolve();
+    if (record.collapsed || paused) return Promise.resolve();
     record.used = performance.now();
     if (record.content) return renderFile(selected, record);
     if (record.loading) {
@@ -496,7 +521,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
     initialTitle.append(node("h2", "", comparisonTitle(state, hint)));
     review.replaceChildren(button("← Repositories", () => closeReview()), initialTitle, node("p", "muted", "Loading comparison…"));
     try {
-      const payload = await request(url("comparison", state.id, {review: requested.review, commit: requested.commit, file: requested.file}), {signal: abort.signal});
+      const payload = await read(url("comparison", state.id, {review: requested.review, commit: requested.commit, file: requested.file}), {signal: abort.signal});
       if (ticket !== sequence || destroyed) return;
       const heading = node("div", "repository-review-heading");
       const title = node("h2", "repository-review-title", comparisonTitle(state, payload.commit || hint));
@@ -660,13 +685,20 @@ export function mount({slug, nonce, element, createCopyButton}) {
   };
   for (const card of overview.querySelectorAll("[data-repository-id]")) hydrate(card);
   const checkHeads = async () => {
-    if (checking || destroyed || document.hidden || !element.classList.contains("active")) return;
+    if (checking || destroyed || paused || document.hidden || !element.classList.contains("active")) return;
     checking = true;
+    const generation = readGeneration;
     try {
       const items = [...states.values()];
       for (let offset = 0; offset < items.length; offset += 32) {
-        const payload = await request(url("states", null, {repository: items.slice(offset, offset + 32).map(state => state.id)}));
-        for (const result of payload.repositories) if (result.head && states.has(result.repository)) markChanged(states.get(result.repository), result.head);
+        const ticket = ++observation;
+        const payload = await read(url("states", null, {repository: items.slice(offset, offset + 32).map(state => state.id)}));
+        if (paused || destroyed || generation !== readGeneration) return;
+        for (const result of payload.repositories) if (result.head && states.has(result.repository)) {
+          const state = states.get(result.repository);
+          observeHead(state, result.head, ticket);
+          if (state.pair?.head !== state.latestHead) queueHistory(state);
+        }
       }
     } catch (_) { /* Explicit refresh reports unavailable repositories. */ }
     finally { checking = false; }
@@ -686,7 +718,7 @@ export function mount({slug, nonce, element, createCopyButton}) {
         const oldStatus = state.card.querySelector("[data-repository-status]");
         const newStatus = fresh.querySelector("[data-repository-status]");
         if (oldStatus && newStatus && oldStatus.innerHTML !== newStatus.innerHTML) oldStatus.replaceChildren(...newStatus.childNodes);
-        if (fresh.dataset.repositoryHead) markChanged(state, fresh.dataset.repositoryHead);
+        // Details HTML can predate the latest history read. Poll heads separately.
         incoming.delete(id);
       }
       let grid = overview.querySelector(".repo-grid");
@@ -694,8 +726,25 @@ export function mount({slug, nonce, element, createCopyButton}) {
       for (const card of incoming.values()) { grid?.append(card); hydrate(card); }
       const heading = overview.querySelector(".section-heading span"); if (heading) heading.textContent = String(states.size);
       if (states.size) grid?.querySelector(":scope > .empty")?.remove();
+      void checkHeads();
+    },
+    suspend() {
+      paused = true; ++readGeneration; ++sequence;
+      for (const abort of reads) abort.abort();
+    },
+    resume() {
+      paused = false;
+      for (const state of states.values()) if (!state.pair || state.pair.head !== state.latestHead) queueHistory(state);
+      if (historyQueue.size && !historyScheduled) { historyScheduled = true; queueMicrotask(flushHistories); }
+      void checkHeads();
+      if (active) {
+        active.observer?.disconnect();
+        for (const record of active.sections.values()) active.observer?.observe(record.section);
+        pumpFiles(active); void applyView();
+      } else restore();
     },
     destroy() {
+      paused = true; ++readGeneration; for (const abort of reads) abort.abort();
       destroyed = true; ++sequence; clearInterval(interval);
       document.removeEventListener("session-section-change", onSection);
       removeEventListener("popstate", onURL); removeEventListener("hashchange", onURL); destroyEditors();
