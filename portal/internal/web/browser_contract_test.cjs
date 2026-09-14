@@ -16,11 +16,31 @@ const {
   shouldSubmitMessage, storeQueueAttempt,
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
-  fileChangeDiffs, formatElapsed,
+  fileChangeDiffs, formatElapsed, autoArchivePresentation,
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
 } = require("./static/app.js");
+
+const archivalDiagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
+const archivalState = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z",
+  eligible_at: "2026-09-21T18:01:59Z", blockers: ["Session has uncommitted worktree changes.", archivalDiagnostic]};
+const archivalView = autoArchivePresentation(archivalState);
+assert(archivalView.fields.find(([label]) => label === "Rule")[1].includes("once all registered branches are merged"));
+assert(archivalView.fields.some(([label]) => label === "Not before"));
+assert.deepEqual(archivalView.blockers, ["The session has uncommitted worktree changes.", "Codex has an active turn."]);
+assert.deepEqual(archivalView.diagnostics, [archivalDiagnostic]);
+for (const changes of [{enabled: false}, {hold: true}, {eligible_at: "invalid"}]) {
+  assert(!autoArchivePresentation({...archivalState, ...changes}).fields.some(([label]) => label === "Not before"));
+}
+assert.equal(autoArchivePresentation({}).fields.find(([label]) => label === "Last check")[1], "Waiting for the first scan.");
+for (const tier of ["complete", "empty"]) assert(!autoArchivePresentation({tier}).fields[1][1].startsWith("No automatic"));
+const unknownArchivalError = "command failed with exit 1: <script>unexpected</script>";
+assert.deepEqual(autoArchivePresentation({blockers: [unknownArchivalError]}).diagnostics, [unknownArchivalError]);
+assert(!autoArchivePresentation({blockers: [unknownArchivalError]}).blockers[0].includes("script"));
+assert.deepEqual(autoArchivePresentation({blockers: ["Automatic archival is disabled.", "Keep open is enabled."]}).blockers, []);
+assert.deepEqual(autoArchivePresentation({blockers: ["Codex thread thread-1 has 2 pending request(s)", "Codex thread thread-1 has 1 queued message(s)"]}).blockers,
+  ["Codex has pending requests.", "Codex has queued messages."]);
 
 const historicalPlan = {turnId: "old", kind: "plan", turnStatus: "completed", text: "Plan"};
 for (const latestTurnId of [undefined, "ordinary", "empty", "failed", "interrupted"]) {

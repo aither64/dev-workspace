@@ -50,10 +50,12 @@
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Session settings</h2></div>
         <section id="auto-archive-panel" class="panel">
-      <h3>Automatic archival</h3>
-      <p id="auto-archive-status" role="status">Loading archival policy…</p>
-      {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
-      <p>Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
+          <h3>Automatic archival</h3>
+          <p id="auto-archive-status" role="status">Loading archival settings…</p>
+          <div id="auto-archive-values" hidden></div>
+          <details id="auto-archive-details" hidden><summary>Technical details</summary><pre></pre></details>
+          {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
+          <p class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
         </section>
       </section>
 

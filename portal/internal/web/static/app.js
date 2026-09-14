@@ -740,6 +740,36 @@
       return false;
     }
   };
+  const autoArchivePresentation = (state) => {
+    const date = value => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : "";
+    const rules = {
+      complete: "After 1 inactive day for completed sessions.",
+      merged: "After 7 inactive days, once all registered branches are merged.",
+      empty: "After 14 inactive days without registered repositories or owned worktrees; archived as abandoned.",
+    };
+    const fields = [["Workspace policy", state.enabled ? "Enabled" : "Disabled"],
+      ["Rule", rules[state.tier] || "No automatic archival rule applies."],
+      ["Last check", date(state.checked_at) || "Waiting for the first scan."]];
+    if (state.enabled && !state.hold && date(state.eligible_at)) fields.push(["Not before", date(state.eligible_at)]);
+    if (state.result) fields.push(["Last result", ({archived: "Archived", deferred: "Deferred", error: "Check failed"})[state.result] || "Unknown result"]);
+    const blockers = [], diagnostics = [];
+    const plain = {
+      "Session has uncommitted worktree changes.": "The session has uncommitted worktree changes.",
+      "Abandoned sessions require manual archival.": "Abandoned sessions must be archived manually.",
+      "Session has no automatic archive rule.": "No automatic archival rule applies to this session.",
+    };
+    for (const raw of state.blockers || []) {
+      if (raw === "Automatic archival is disabled." || raw === "Keep open is enabled.") continue;
+      if (Object.hasOwn(plain, raw)) { blockers.push(plain[raw]); continue; }
+      let message = "An archival check could not be completed. See Technical details.";
+      if (/Codex thread \S+ is not idle \(latest turn \S+ has status "inProgress"\)/.test(raw)) message = "Codex has an active turn.";
+      else if (/Codex thread \S+ has \d+ pending request\(s\)/.test(raw)) message = "Codex has pending requests.";
+      else if (/Codex thread \S+ has \d+ queued message\(s\)/.test(raw)) message = "Codex has queued messages.";
+      blockers.push(message); diagnostics.push(raw);
+    }
+    return {fields, blockers: [...new Set(blockers)], diagnostics};
+  };
+
   const createCodexLimitsReader = (request, render) => {
     let snapshot = null;
     let pending = null;
@@ -763,7 +793,7 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader,
+      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation,
       currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
@@ -1400,20 +1430,50 @@
   const client = createSessionClient(slug, request, conversation);
   const autoArchiveStatus = document.getElementById("auto-archive-status");
   const autoArchiveHold = document.getElementById("auto-archive-hold");
+  const autoArchiveValues = document.getElementById("auto-archive-values");
+  const autoArchiveDetails = document.getElementById("auto-archive-details");
+  let lastAutoArchive = null, autoArchiveRead = 0, autoArchiveSaving = false;
+  const showAutoArchiveDetails = (diagnostics) => {
+    autoArchiveDetails.hidden = !diagnostics.length;
+    autoArchiveDetails.querySelector("pre").textContent = diagnostics.join("\n\n");
+  };
   const renderAutoArchive = (state) => {
-    const rules = {complete: "Complete: 1 inactive day.", merged: "Merged branches: 7 inactive days.", empty: "No repositories: abandoned after 14 inactive days."};
-    const parts = [state.enabled ? "Enabled." : "Disabled for this workspace."];
-    if (rules[state.tier]) parts.push(rules[state.tier]);
-    if (state.eligible_at) parts.push(`Earliest archival: ${new Date(state.eligible_at).toLocaleString()}.`);
-    if (state.result) parts.push(`Last result: ${state.result}.`);
-    if (state.blockers?.length) parts.push(state.blockers.join(" "));
-    if (!state.checked_at) parts.push("Waiting for the first scan.");
-    autoArchiveStatus.textContent = parts.join(" ");
-    if (autoArchiveHold) { autoArchiveHold.checked = state.hold; autoArchiveHold.disabled = false; }
+    lastAutoArchive = state;
+    const presentation = autoArchivePresentation(state);
+    const fields = document.createElement("dl"); fields.className = "auto-archive-fields";
+    for (const [label, value] of presentation.fields) {
+      const term = document.createElement("dt"); term.textContent = label;
+      const description = document.createElement("dd"); description.textContent = value;
+      fields.append(term, description);
+    }
+    autoArchiveValues.replaceChildren(fields); autoArchiveValues.hidden = false;
+    if (presentation.blockers.length) {
+      const heading = document.createElement("h4"); heading.textContent = "Blockers at last check";
+      const list = document.createElement("ul");
+      for (const text of presentation.blockers) {
+        const item = document.createElement("li"); item.textContent = text; list.append(item);
+      }
+      autoArchiveValues.append(heading, list);
+    }
+    showAutoArchiveDetails(presentation.diagnostics);
+    autoArchiveStatus.textContent = ""; autoArchiveStatus.hidden = true;
+    if (autoArchiveHold) { autoArchiveHold.checked = state.hold; autoArchiveHold.disabled = autoArchiveSaving; }
+  };
+  const failAutoArchive = (error, message) => {
+    autoArchiveStatus.textContent = message;
+    autoArchiveStatus.hidden = false;
+    showAutoArchiveDetails([...(lastAutoArchive ? autoArchivePresentation(lastAutoArchive).diagnostics : []), error.message]);
   };
   const loadAutoArchive = async () => {
-    try { renderAutoArchive(await client.autoArchive()); }
-    catch (error) { autoArchiveStatus.textContent = error.message; }
+    if (autoArchiveSaving) return;
+    const read = ++autoArchiveRead;
+    try {
+      const state = await client.autoArchive();
+      if (read === autoArchiveRead) renderAutoArchive(state);
+    } catch (error) {
+      if (read === autoArchiveRead) failAutoArchive(error, lastAutoArchive ?
+        "Could not refresh archival settings. Showing the last available settings." : "Could not load archival settings.");
+    }
   };
   if (autoArchiveStatus) {
     if (document.getElementById("settings")?.classList.contains("active")) void loadAutoArchive();
@@ -1422,13 +1482,20 @@
     });
     autoArchiveHold?.addEventListener("change", async () => {
       const held = autoArchiveHold.checked;
+      let saveError = null;
+      autoArchiveSaving = true; ++autoArchiveRead;
       autoArchiveHold.disabled = true;
-      try { await client.autoArchiveHold(held, lifecycleTargetId); await loadAutoArchive(); }
-      catch (error) {
-        autoArchiveHold.checked = !held;
-        autoArchiveHold.disabled = false;
-        autoArchiveStatus.textContent = error.message;
+      try {
+        const saved = await client.autoArchiveHold(held, lifecycleTargetId);
+        renderAutoArchive({...lastAutoArchive, ...saved});
+      } catch (error) {
+        autoArchiveHold.checked = lastAutoArchive?.hold || false;
+        saveError = error;
+      } finally {
+        autoArchiveSaving = false; autoArchiveHold.disabled = false;
       }
+      await loadAutoArchive();
+      if (saveError) failAutoArchive(saveError, "Could not confirm the Keep open change. The checkbox shows the last confirmed setting.");
     });
   }
   const lifecycleStatus = document.getElementById("lifecycle-operation-status");

@@ -368,3 +368,16 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 #codex-work-counts { color: var(--muted); }
 
 .creation-request { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+
+.auto-archive-fields { display: grid; grid-template-columns: minmax(7rem, auto) minmax(0, 1fr); gap: .65rem 1.25rem; }
+.auto-archive-fields dt { color: var(--muted); }
+.auto-archive-fields dd { margin: 0; overflow-wrap: anywhere; }
+#auto-archive-values h4 { margin-bottom: .5rem; }
+#auto-archive-values li { margin: .5rem 0; }
+#auto-archive-details { margin: 1rem 0; }
+#auto-archive-details summary { cursor: pointer; color: var(--muted); }
+#auto-archive-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto; padding: .75rem; background: var(--bg); font-size: .8rem; }
+@media (max-width: 480px) {
+  .auto-archive-fields { grid-template-columns: minmax(0, 1fr); gap: .3rem; }
+  .auto-archive-fields dd { margin-bottom: .5rem; }
+}

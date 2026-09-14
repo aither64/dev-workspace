@@ -10,12 +10,23 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
     try {
       const page = await browser.newPage({ignoreHTTPSErrors: true, viewport: {width: 1440, height: 720}});
       const errors = [];
+      const diagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
+      let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
+        blockers: ["Session has uncommitted worktree changes.", diagnostic]};
+      let failArchive = false, failHold = false;
       page.on("pageerror", error => errors.push(error.message));
       await page.route("**/api/codex-limits", route => route.fulfill({json: {windows: [{windowDurationMins: 10080, usedPercent: 20}], updatedAt: Date.now()}}));
       await page.route("**/api/sessions/example/**", async route => {
         const operation = new URL(route.request().url()).pathname.split("/").at(-1);
         const pair = {base, head, baseLabel: "Merge base"};
         switch (operation) {
+          case "auto-archive":
+            if (route.request().method() === "POST") {
+              if (failHold) return route.fulfill({status: 503, json: {error: "Fixture hold failure"}});
+              archive = {...archive, hold: route.request().postDataJSON().hold, eligible_at: null, blockers: []};
+              return route.fulfill({json: archive});
+            }
+            return route.fulfill(failArchive ? {status: 503, json: {error: "Fixture read failure"}} : {json: archive});
           case "details": return route.fulfill({json: {repositoriesHTML: cards, artifactsHTML: "", repositoryCount: 1, artifactCount: 0, clusterCount: 0}});
           case "repository-histories": return route.fulfill({json: {repositories: [{repository: "project", pair, review: "frozen", history: {commits: [], page: 0, hasMore: false}}]}});
           case "repository-states": return route.fulfill({json: {repositories: [{repository: "project", head}]}});
@@ -58,6 +69,38 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.keyboard.press("End");
       assert.equal(await page.evaluate(() => history.length), historyLength, "same-tab key added a history entry");
       await width(250);
+      await expect(page.locator("#auto-archive-values")).toContainText("once all registered branches are merged");
+      await expect(page.locator("#auto-archive-values li")).toHaveText(["The session has uncommitted worktree changes.", "Codex has an active turn."]);
+      const technical = page.locator("#auto-archive-details");
+      await expect(technical).not.toHaveAttribute("open");
+      await expect(technical.locator("pre")).toBeHidden();
+      await technical.locator("summary").click();
+      await expect(technical.locator("pre")).toHaveText(diagnostic);
+      failArchive = true;
+      await page.getByRole("tab", {name: "Codex", exact: true}).click();
+      await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+      await expect(page.locator("#auto-archive-status")).toContainText("Showing the last available settings");
+      await expect(page.locator("#auto-archive-values")).toContainText("Not before");
+      await expect(technical.locator("pre")).toContainText("Fixture read failure");
+      failArchive = false;
+      await page.getByRole("checkbox", {name: "Keep open", exact: true}).check();
+      await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeEnabled();
+      await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
+      await expect(technical).toBeHidden();
+      failHold = true;
+      await page.getByRole("checkbox", {name: "Keep open", exact: true}).uncheck();
+      await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeChecked();
+      await expect(page.locator("#auto-archive-status")).toContainText("Could not confirm the Keep open change");
+      await expect(technical.locator("pre")).toContainText("Fixture hold failure");
+      for (const fixture of [{enabled: false, eligible_at: "2026-09-21T18:01:59Z"}, {}, {enabled: true, tier: "complete", result: "deferred", blockers: ["unknown <script>diagnostic</script>"]}]) {
+        archive = fixture;
+        await page.getByRole("tab", {name: "Codex", exact: true}).click();
+        await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+        await expect(page.locator("#auto-archive-values")).toContainText("Waiting for the first scan");
+        await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
+      }
+      await expect(technical.locator("pre")).toHaveText("unknown <script>diagnostic</script>");
+      await expect(page.locator("#auto-archive-values")).toContainText("An archival check could not be completed.");
       await page.goto(baseURL + "/");
       await width(310);
       await page.setViewportSize({width: 600, height: 720}); await width(180);
@@ -70,7 +113,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.setViewportSize({width: 1440, height: 720}); await width(310);
       await expect(page.locator("#codex-limits-panel")).toBeVisible();
       assert.deepEqual(errors, []);
-      console.log(engine.name() + ": comparison-only compact sidebar, limits and keyboard navigation passed");
+      console.log(engine.name() + ": comparison-only compact sidebar, limits, keyboard navigation and archival presentation passed");
     } finally { await browser.close(); }
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
