@@ -4020,15 +4020,23 @@ func TestSessionDetailsReplaceClusterStateAfterStopAndReset(t *testing.T) {
 	if !strings.Contains(busy, "temporary-secret") || !strings.Contains(busy, "Cluster is changing") {
 		t.Fatalf("lost transition context: %s", busy)
 	}
-	stopped := read(`printf '%s' '{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}'`)
-	if strings.Contains(stopped, "temporary-secret") || !strings.Contains(stopped, ">stopped<") {
-		t.Fatalf("stale stopped state: %s", stopped)
-	}
+
 	if err := os.RemoveAll(state); err != nil {
 		t.Fatal(err)
 	}
 	absent := read("exit 1")
 	if strings.Contains(absent, "data-cluster=") || !strings.Contains(absent, "No development cluster state") {
 		t.Fatalf("stale reset state: %s", absent)
+	}
+	if err := os.MkdirAll(state, 0755); err != nil {
+		t.Fatal(err)
+	}
+	restarting := read("exit 75")
+	if strings.Contains(restarting, "temporary-secret") || strings.Contains(restarting, ">running<") || strings.Contains(restarting, ">yes<") || !strings.Contains(restarting, ">changing<") {
+		t.Fatalf("resurrected previous cluster: %s", restarting)
+	}
+	stopped := read(`printf '%s' '{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}'`)
+	if strings.Contains(stopped, "temporary-secret") || !strings.Contains(stopped, ">stopped<") {
+		t.Fatalf("stale stopped state: %s", stopped)
 	}
 }

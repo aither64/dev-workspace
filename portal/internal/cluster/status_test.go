@@ -358,3 +358,20 @@ func TestBusyStatusRetainsLastObservationAndScopesFailures(t *testing.T) {
 		t.Fatalf("stopped: %v %v", states, err)
 	}
 }
+
+func TestMayExistEvictsEachAbsentProvider(t *testing.T) {
+	cache := &StatusCache{}
+	cache.observe("example\x00alpha", Status{State: "running", Ready: true}, true, "")
+	cache.observe("example\x00beta", Status{State: "running", Ready: true}, true, "")
+	runner := Runner{Workspace: t.TempDir(), Providers: []Provider{{Name: "alpha"}, {Name: "beta"}}, Cache: cache}
+	if err := os.MkdirAll(filepath.Join(runner.Workspace, ".dev-clusters", "alpha", "clusters", "example"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.MayExist("example") {
+		t.Fatal("hid existing provider")
+	}
+	status := cache.observe("example\x00beta", Status{State: "changing"}, true, "busy")
+	if status.State != "changing" || status.Ready {
+		t.Fatalf("retained absent provider: %#v", status)
+	}
+}

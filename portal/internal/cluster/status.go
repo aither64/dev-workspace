@@ -99,6 +99,15 @@ type StatusCache struct {
 	values map[string]Status
 }
 
+func (c *StatusCache) forget(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.values, key)
+}
+
 func (c *StatusCache) observe(key string, status Status, found bool, notice string) Status {
 	if c == nil {
 		status.Notice = notice
@@ -181,13 +190,16 @@ func (r Runner) MayExist(slug string) bool {
 	if !validSlug(slug) {
 		return false
 	}
+	found := false
 	for _, provider := range r.Providers {
 		path := filepath.Join(r.Workspace, ".dev-clusters", provider.Name, "clusters", slug)
 		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
-			return true
+			found = true
+		} else {
+			r.Cache.forget(slug + "\x00" + provider.Name)
 		}
 	}
-	return false
+	return found
 }
 
 // ReleaseAll invokes every provider unconditionally. Each helper serializes
@@ -229,6 +241,7 @@ func (r Runner) releaseProvider(ctx context.Context, provider Provider, slug str
 		}
 		return errors.New(message)
 	}
+	r.Cache.forget(slug + "\x00" + provider.Name)
 	return nil
 }
 
