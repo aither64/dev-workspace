@@ -79,8 +79,12 @@ const baseURL = process.argv[2];
 
       // Firefox can reject an in-flight read while the next document is loading.
       holdDetails = true;
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
-      await expect.poll(() => Boolean(releaseDetails)).toBe(true);
+      // A preceding focus refresh may still be in flight and coalesce this
+      // event. Ask again once it finishes so the held read is actually started.
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        return Boolean(releaseDetails);
+      }).toBe(true);
       await page.evaluate(() => {
         const link = document.createElement("a"); link.id = "fixture-next";
         link.href = "/fixture/next"; link.textContent = "Next page"; document.body.append(link);
