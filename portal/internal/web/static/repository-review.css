@@ -90,6 +90,7 @@
 .repository-file[aria-current="true"] { background: #203349; color: #f0f6fc; }
 .repository-file-title { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem .55rem; z-index: 5; border-bottom: 1px solid var(--line); }
 .repository-file-heading { display: flex; align-items: center; gap: .4rem; flex: 1; min-width: min(100%, 12rem); }
+.repository-file-toggle { flex: none; white-space: nowrap; }
 .repository-file-title h3 { display: flex; margin: 0; font-size: .9rem; min-width: 0; white-space: nowrap; }
 .repository-file-directory { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
 .repository-file-basename { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
@@ -112,6 +113,8 @@
 .repository-file-list .repository-file-path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 600px) {
   .repository-commit-row { flex-wrap: wrap; }
+  .repository-file-heading { flex-basis: 100%; }
+  .repository-file-directory { display: none; }
   .repository-commit-subject-group { flex-basis: 100%; }
   .repository-commit-identity { justify-content: flex-start; }
   .repository-file-status { font-size: .65rem; }

@@ -365,6 +365,10 @@ const server = http.createServer((req, res) => {
       assert.equal(await heading.getAttribute("aria-label"), files[6].path);
       assert((await heading.boundingBox()).height < 40, "long filename inflated the sticky heading");
       assert(await heading.locator('.repository-file-basename').isVisible());
+      if (view === "diff") {
+        const toggle = page.locator('.repository-file-section[data-file-id="6"] .repository-file-toggle');
+        assert((await toggle.boundingBox()).height < 44, "diff toggle wraps on a narrow screen");
+      }
     }
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "automatic refresh with stale responses", "message and copy controls",
