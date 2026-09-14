@@ -167,6 +167,10 @@ func (r ReviewReader) git(ctx context.Context, dir string, limit int, args ...st
 		return nil, fmt.Errorf("Git review timed out or was cancelled: %w", ctx.Err())
 	}
 	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			exitError.Stderr = append([]byte(nil), stderr.buffer.Bytes()...)
+		}
 		return nil, err
 	}
 	return out.buffer.Bytes(), nil

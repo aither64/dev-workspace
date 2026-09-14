@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +25,10 @@ func TestReviewTotalMatchesFullHistoryAcrossPageBoundaries(t *testing.T) {
 		pair := ReviewPair{Base: f.baseHead, Head: head}
 		total, err := reader.CommitCount(context.Background(), repo, pair)
 		if err != nil || total != int64(count) {
+			var exitError *exec.ExitError
+			if errors.As(err, &exitError) {
+				t.Logf("Git stderr: %s", exitError.Stderr)
+			}
 			t.Fatalf("count %d: total=%d, err=%v", count, total, err)
 		}
 		for page := 0; page <= count/ReviewPageSize; page++ {
@@ -63,5 +69,17 @@ func TestReviewTotalsDescribeNetTreesIncludingRenamesAndBinaryFiles(t *testing.T
 	count, err := reader.CommitCount(context.Background(), repo, pair)
 	if err != nil || count != 2 {
 		t.Fatalf("count=%d, err=%v", count, err)
+	}
+}
+
+func TestReviewGitFailureRetainsDiagnostic(t *testing.T) {
+	_, reader, repo := reviewFixture(t)
+	_, err := reader.git(context.Background(), repo.Directory, 1024, "rev-parse", "--verify", "refs/heads/missing")
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || len(exitError.Stderr) == 0 {
+		t.Fatalf("missing Git exit diagnostic: %#v", err)
+	}
+	if err.Error() != "exit status 128" {
+		t.Fatalf("changed public error text: %v", err)
 	}
 }
