@@ -79,6 +79,36 @@ test("collapse regions keep change context and locate links within hidden lines"
   assert.deepEqual(contextRegions(validateProjection("a\nb\nc", "a\nnew\nc").rows), []);
 });
 
+for (const layout of ["unified", "split"]) {
+  function changedRows(before, after) {
+    const ranges = gitDiff(before, after);
+    validateProjection(before, after, ranges);
+    const model = layout === "unified" ? unifiedProjection(before, after, ranges) : splitProjection(before, after, ranges);
+    const rows = layout === "unified" ? model.rows : [...model.old.rows, ...model.new.rows];
+    return rows.filter(row => ["deletion", "addition"].includes(row.kind));
+  }
+
+  test(`${layout} character highlights keep replaced identifiers together`, () => {
+    const rows = changedRows("keep\n    old_name = 123\nend\n", "keep\n    new_value = true\nend\n");
+    assert.deepEqual(rows.map(row => row.changes.map(([from, to]) => row.text.slice(from - row.from, to - row.from))),
+      [["old_name", "123"], ["new_value", "true"]]);
+  });
+
+  test(`${layout} character highlights do not scatter through an unrelated replacement block`, () => {
+    const before = "keep\n      return [] if addr_str.nil? || time.nil?\nend\n";
+    const after = "keep\n      body_ips = entries.map { |entry| entry[:ip] }.compact.uniq\n" +
+      "      conflict = subject_ip && body_ips.any? && !body_ips.include?(subject_ip)\n" +
+      "      log(\"subject IP #{subject_ip} contradicts body entries\") if conflict\nend\n";
+    const rows = changedRows(before, after);
+    assert.equal(rows.length, 4);
+    for (const row of rows) {
+      assert.equal(row.changes.length, 1);
+      const [[from, to]] = row.changes;
+      assert.equal(row.text.slice(from - row.from, to - row.from).trim(), row.text.trim());
+    }
+  });
+}
+
 test("language selection recognizes workspace files and every bundled grammar", async () => {
   const fixtures = [["flake.nix", "nix"], ["Gemfile.lock", "ruby"], ["Rakefile", "ruby"],
     ["server.go", "go"], ["page.tsx", "tsx"], ["test.sh", "shellscript"], ["Dockerfile.dev", "dockerfile"],

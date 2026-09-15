@@ -1,4 +1,4 @@
-import {diff as characterDiff} from "@codemirror/merge";
+import {presentableDiff as characterDiff} from "@codemirror/merge";
 
 export const DIFF_CONFIG = {scanLimit: 500, timeout: 100};
 
@@ -45,6 +45,8 @@ export function languageForPath(path, text = "") {
 
 // Git alone classifies changed lines. The bounded character diff is cosmetic
 // and sees only one Git change block at a time, never unchanged source lines.
+// Keep presentation cleanup: raw diffs leave incidental matching letters and
+// spaces unmarked inside otherwise replaced words and unrelated statements.
 export function reviewProjection(before, after, diff, split = false) {
   const oldLines = sourceLines(before), newLines = sourceLines(after);
   if (!Array.isArray(diff?.changes)) throw new Error("Exact Git diff is unavailable. Reload this page to try again.");
