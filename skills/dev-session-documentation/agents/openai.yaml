@@ -1,0 +1,4 @@
+interface:
+  display_name: "Development Documentation"
+  short_description: "Preserve useful design and operational knowledge."
+  default_prompt: "Use $dev-session-documentation to maintain the documentation and decision rationale for this development task."

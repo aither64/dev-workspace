@@ -55,6 +55,11 @@ let
     );
   extensionCommands = extensions.commands or { };
   extensionSkills = extensions.skills or { };
+  coreSkills = {
+    dev-session-documentation = "${src}/skills/dev-session-documentation";
+  };
+  skills = coreSkills // extensionSkills;
+  skillNamesUnique = builtins.intersectAttrs coreSkills extensionSkills == { };
   clusterProviders = extensions.clusterProviders or { };
   extensionsValid = builtins.all (
     name:
@@ -76,13 +81,13 @@ let
       builtins.hasContext string && lib.hasPrefix "${builtins.storeDir}/" string
     );
   commandNames = builtins.attrNames extensionCommands;
-  skillNames = builtins.attrNames extensionSkills;
+  skillNames = builtins.attrNames skills;
   providerNames = builtins.attrNames clusterProviders;
   providerPrograms = map (name: "${name}-devcluster") providerNames;
   allNamesValid = builtins.all validName (commandNames ++ skillNames ++ providerNames);
   extensionTargets =
     builtins.attrValues extensionCommands
-    ++ builtins.attrValues extensionSkills
+    ++ builtins.attrValues skills
     ++ map (name: clusterProviders.${name}.command or "") providerNames;
   invalidTargets = builtins.filter (value: !validTarget value) extensionTargets;
   targetsValid = invalidTargets == [ ];
@@ -122,7 +127,7 @@ let
     }) commandNames;
     skills = map (name: {
       inherit name;
-      path = toString extensionSkills.${name};
+      path = toString skills.${name};
     }) skillNames;
     clusterProviders = map (name: {
       id = name;
@@ -145,6 +150,8 @@ assert lib.assertMsg validUserNamespace
 assert lib.assertMsg validRouterSocket
   "dev-workspace router socket must be an absolute path below /run";
 assert lib.assertMsg extensionsValid "dev-workspace extensions contain an unknown section";
+assert lib.assertMsg skillNamesUnique
+  "dev-workspace extension skills must not replace a built-in skill";
 assert lib.assertMsg allNamesValid "dev-workspace extension names must be lowercase identifiers";
 assert lib.assertMsg targetsValid
   "dev-workspace extension targets must be immutable Nix store references: ${builtins.toJSON (map toString invalidTargets)}";
@@ -252,7 +259,7 @@ buildGoModule {
     '') commandNames}
     mkdir -p "$out/share/codex/skills"
     ${lib.concatMapStringsSep "\n" (name: ''
-      ln -s ${lib.escapeShellArg (toString extensionSkills.${name})} \
+      ln -s ${lib.escapeShellArg (toString skills.${name})} \
         "$out/share/codex/skills/${name}"
     '') skillNames}
     ${lib.concatMapStringsSep "\n" (name: ''

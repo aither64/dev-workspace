@@ -147,6 +147,78 @@ an explicit user request. A pause until a future working day can justify that
 day's consolidated checkpoint, but not a second one. Ordinary functional
 commits are not tracking-only checkpoints.
 
+## Documentation during development
+
+The package includes the `dev-session-documentation` skill. It is available for
+normal automatic skill selection and can be requested explicitly with
+`$dev-session-documentation`. Workspace instructions can require it for
+substantive development and operational work. The agent performing the task owns
+the documentation while it has the relevant context.
+
+Read the project's documentation entry point and the relevant subsystem pages
+at the start. Add or update useful explanations as decisions are made and the
+implementation settles. Choose the smallest useful form: a comment or paragraph
+may explain a local fix; a consequential choice may need a decision record; an
+ordered migration needs deployment and recovery guidance. Routine authoring is
+part of development and follows the task's existing scope and permissions.
+
+### Where information belongs
+
+| Information | Location |
+| --- | --- |
+| Current goal, approach, unresolved choices | Session `plan.md` |
+| Current status, next actions, verification evidence | Session `state.md` and linked artifacts |
+| Supported behavior, accepted rationale, design constraints | Owning project's documentation |
+| Repeatable deployment, operation, diagnosis, recovery | Project operations docs, or the site configuration repository for site-specific steps |
+| Exact rollout revisions and execution results | Session rollout record or a versioned release runbook |
+| Reusable development-environment lessons | Workspace notes under local conventions |
+
+Give each cross-project contract one authoritative home and link its consumers
+to it. Project documentation should make sense without access to a private
+session archive. Follow the project's existing layout, including its generated
+manuals or external documentation contracts, and link new pages from its README
+or documentation index.
+
+A decision record explains the context, choice, actual alternatives considered,
+consequences, and conditions for reconsideration. Capture the reasons while they
+are known; source code alone cannot establish a past author's intent. Identify
+inferred explanations and unresolved questions. Mark proposed and superseded
+decisions, and link to the accepted replacement when there is one.
+
+Current documentation describes supported behavior. A release runbook identifies
+its applicable versions. Session state distinguishes a prepared rollout from an
+executed and verified deployment. Operational instructions include prerequisites,
+ordering, expected results, and recovery limits, with unverified steps identified.
+
+### Plans, state, and handoff
+
+Keep the current summary easy to scan. Summarize superseded checkpoints and link
+detailed commands, failures, and review evidence. Link project documentation
+from the session instead of copying it. Register useful session files as portal
+artifacts using the existing manifest format. Repository documents stay in their
+repositories and can be linked from the plan or state.
+
+Before review, reconcile the documentation with the final code, tests, and
+observed deployment behavior. Include relevant documentation paths in the review
+packet. At handoff, summarize the documentation changes or briefly explain why
+none were useful. Preserve the workspace's tracking commit cadence and finish
+this work before archival. Improve older documentation when related work touches
+it; historical backfills are separate tasks.
+
+### Design and package compatibility
+
+Documentation depends on task context and judgment, so its quality is assessed
+through the normal development review. A required collection of empty files
+would not demonstrate that a design or deployment is explained. Ordinary
+Markdown and the existing artifact catalog keep the documents readable by
+projects and sessions using earlier package generations.
+
+The built-in skill travels in the existing schema-1 skill catalog. Extensions
+can add other skills but cannot replace `dev-session-documentation`. Activation
+installs the selected catalog's links; rolling back to a preceding package
+removes this managed skill link while preserving authored documents and other
+unrelated files.
+
 ## Attaching and syncing
 
 ```sh

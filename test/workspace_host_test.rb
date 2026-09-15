@@ -294,6 +294,15 @@ class WorkspaceHostTest < Minitest::Test
     Dir.mktmpdir('workspace-host-link-test') do |directory|
       full = make_package(directory, 'package-full')
       core = make_package(directory, 'package-core')
+      previous = make_package(directory, 'package-previous')
+      documentation = 'dev-session-documentation'
+      documentation_sources = [full, core].to_h do |package|
+        source = File.join(package, 'share/codex/skills', documentation)
+        FileUtils.mkdir_p(source)
+        File.write(File.join(source, 'SKILL.md'), "# Documentation\n")
+        [package, source]
+      end
+      write_extension_catalog(core, skills: { documentation => documentation_sources.fetch(core) })
       command = 'kb-page'
       command_source = File.join(full, 'bin', command)
       File.write(command_source, "#!/bin/sh\nexit 0\n")
@@ -305,7 +314,7 @@ class WorkspaceHostTest < Minitest::Test
       write_extension_catalog(
         full,
         commands: { command => command_source },
-        skills: { skill_name => skill_source }
+        skills: { skill_name => skill_source, documentation => documentation_sources.fetch(full) }
       )
 
       state = File.join(directory, 'state')
@@ -324,8 +333,12 @@ class WorkspaceHostTest < Minitest::Test
       core_host = CompatibilityLinkHost.new(
         package_root: core, env: environment, out: StringIO.new, err: StringIO.new
       )
+      previous_host = CompatibilityLinkHost.new(
+        package_root: previous, env: environment, out: StringIO.new, err: StringIO.new
+      )
       command_link = File.join(directory, 'bin', command)
       skill_link = File.join(directory, '.codex/skills', skill_name)
+      documentation_link = File.join(directory, '.codex/skills', documentation)
       portal_target = File.join(directory, 'unrelated-workspace-portal')
       portal_link = File.join(directory, 'bin', 'workspace-portal')
       File.write(portal_target, "#!/bin/sh\nexit 0\n")
@@ -344,10 +357,18 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(portal_target, File.readlink(portal_link))
       assert_equal(command_source, File.readlink(command_link))
       assert_equal(skill_source, File.readlink(skill_link))
+      assert_equal(documentation_sources.fetch(full), File.readlink(documentation_link))
 
       core_host.send(:install_links)
       refute(File.exist?(command_link))
       refute(File.exist?(skill_link))
+      assert_equal(documentation_sources.fetch(core), File.readlink(documentation_link))
+
+      previous_host.send(:install_links)
+      refute(File.symlink?(documentation_link))
+      assert(File.file?(File.join(documentation_sources.fetch(core), 'SKILL.md')))
+      core_host.send(:install_links)
+      assert_equal(documentation_sources.fetch(core), File.readlink(documentation_link))
 
       unrelated = File.join(directory, 'unrelated-command')
       File.write(unrelated, "#!/bin/sh\nexit 0\n")

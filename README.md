@@ -9,6 +9,15 @@ and App Server pair.
 The repository was extracted from a larger development-workspace application.
 Session records and local worktrees remain in each configured workspace.
 
+## Documentation
+
+Start with [development sessions](docs/dev-sessions.md) for lifecycle commands
+and [documentation during development](docs/dev-sessions.md#documentation-during-development)
+for plans, decision rationale, project docs, and handoffs. The
+[portal guide](docs/workspace-portal.md) covers file links, extensions, and host
+deployment responsibilities. The package includes the automatically discoverable
+`dev-session-documentation` skill.
+
 ## Nix interfaces
 
 The flake exports these packages on `x86_64-linux`:

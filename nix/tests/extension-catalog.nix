@@ -46,6 +46,19 @@ let
         userNamespace = "../state";
       }) true
     )).success;
+  rejectsCoreSkillCollision =
+    !(evaluate {
+      skills.dev-session-documentation = "${pkgs.hello}";
+    }).success;
+  corePackage = mkPackage { inherit pkgs; };
+  extraSkill = pkgs.runCommand "example-workspace-skill" { } ''
+    mkdir -p "$out"
+    echo '# Example skill' > "$out/SKILL.md"
+  '';
+  extendedPackage = mkPackage {
+    inherit pkgs;
+    extensions.skills.example = extraSkill;
+  };
   rejectsUnsafeRouterSocket =
     !(builtins.tryEval (
       builtins.deepSeq (mkPackage {
@@ -67,9 +80,21 @@ assert rejectsUnknownSection;
 assert rejectsUnknownProviderField;
 assert rejectsProgramCollision;
 assert rejectsCoreProgramCollision;
+assert rejectsCoreSkillCollision;
 assert rejectsUnsafeUserNamespace;
 assert rejectsUnsafeRouterSocket;
 assert rejectsUnsafeActivationAlias;
-pkgs.runCommand "dev-workspace-extension-catalog-validation" { } ''
+pkgs.runCommand "dev-workspace-extension-catalog-validation" { nativeBuildInputs = [ pkgs.jq ]; } ''
+  for package in ${corePackage} ${extendedPackage}; do
+    skill=$(jq -er '.skills[] | select(.name == "dev-session-documentation") | .path' \
+      "$package/share/dev-workspace/extensions.json")
+    test -f "$skill/SKILL.md"
+    test -f "$package/share/codex/skills/dev-session-documentation/SKILL.md"
+  done
+  jq -e '[.skills[].name] == ["dev-session-documentation"]' \
+    ${corePackage}/share/dev-workspace/extensions.json >/dev/null
+  jq -e '[.skills[].name] == ["dev-session-documentation", "example"]' \
+    ${extendedPackage}/share/dev-workspace/extensions.json >/dev/null
+  test -f ${extendedPackage}/share/codex/skills/example/SKILL.md
   touch "$out"
 ''

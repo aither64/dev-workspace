@@ -7,6 +7,13 @@
 - `nix/` packages the application and user services.
 - `test/` contains Ruby and protocol contract tests.
 
+## Documentation
+
+Use `skills/dev-session-documentation/SKILL.md` for substantive development and
+operational work. Start from the README's documentation links. The session guide
+owns lifecycle and authoring guidance; the portal guide owns browser, extension,
+and host-deployment contracts. Keep those explanations current with the code.
+
 ## Development commands
 
 Use the repository's Nix environment. Run `nix flake check --print-build-logs`
