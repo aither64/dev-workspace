@@ -3631,29 +3631,27 @@ module DevSession
 
     def seed_goal(slug, goal_file)
       goal = read_goal(goal_file)
-
-      plan_path = plan_file(slug)
-      plan = File.read(plan_path)
-      empty_plan = plan_skeleton(slug)
-      seeded_plan = empty_plan.sub("## Goal\n\n", "## Goal\n\n#{goal}\n\n")
-      if plan == empty_plan
-        atomic_replace(plan_path, seeded_plan)
-      elsif plan != seeded_plan
-        raise Error, "plan cannot be reconciled with the creation journal: #{plan_path}"
-      end
-
-      state_path = state_file(slug)
-      state = File.read(state_path)
-      empty_state = state_skeleton(slug)
-      seeded_state = empty_state.sub(
-        "## Status\n\n",
-        "## Status\n\n- Session created with an initial request.\n\n"
+      seed_tracking_file(
+        plan_file(slug), [plan_skeleton(slug), previous_plan_skeleton(slug)],
+        "## Goal\n\n", "#{goal}\n\n", 'plan'
       )
-      if state == empty_state
-        atomic_replace(state_path, seeded_state)
-      elsif state != seeded_state
-        raise Error, "state cannot be reconciled with the creation journal: #{state_path}"
+      seed_tracking_file(
+        state_file(slug), [state_skeleton(slug), previous_state_skeleton(slug)],
+        "## Status\n\n", "- Session created with an initial request.\n\n", 'state'
+      )
+    end
+
+    def seed_tracking_file(path, templates, marker, insertion, label)
+      content = File.read(path)
+      templates.each do |empty|
+        seeded = empty.sub(marker, "#{marker}#{insertion}")
+        return if content == seeded
+        next unless content == empty
+
+        atomic_replace(path, seeded)
+        return
       end
+      raise Error, "#{label} cannot be reconciled with the creation journal: #{path}"
     end
 
     def read_goal(goal_file)
@@ -6729,6 +6727,21 @@ module DevSession
     end
 
     def plan_skeleton(slug)
+      previous_plan_skeleton(slug)
+        .sub("## Compatibility and deployment", "## Decisions\n\n## Compatibility and deployment")
+        .sub("## Testing plan", "## Documentation\n\n## Testing plan")
+    end
+
+    def state_skeleton(slug)
+      previous_state_skeleton(slug).sub(
+        "## Repositories\n\n## Status",
+        "## Status\n\n## Next actions\n\n## Documentation\n\n## Repositories"
+      )
+    end
+
+    # Pre-documentation templates can remain in an interrupted creation. Preserve
+    # their bytes when seeding the recorded request; do not rewrite active records.
+    def previous_plan_skeleton(slug)
       <<~PLAN
         # #{slug}
 
@@ -6744,7 +6757,7 @@ module DevSession
       PLAN
     end
 
-    def state_skeleton(slug)
+    def previous_state_skeleton(slug)
       <<~STATE
         ---
         lifecycle: active

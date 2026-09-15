@@ -192,6 +192,12 @@ ordering, expected results, and recovery limits, with unverified steps identifie
 
 ### Plans, state, and handoff
 
+New plans include Decisions and Documentation sections. New state files start
+with Status, Next actions, and Documentation before repository and verification
+information. These prompts guide authoring; they do not impose a document count,
+line limit, or new completion gate. Existing required lifecycle front matter and
+creation markers retain their meaning.
+
 Keep the current summary easy to scan. Summarize superseded checkpoints and link
 detailed commands, failures, and review evidence. Link project documentation
 from the session instead of copying it. Register useful session files as portal
@@ -218,6 +224,13 @@ can add other skills but cannot replace `dev-session-documentation`. Activation
 installs the selected catalog's links; rolling back to a preceding package
 removes this managed skill link while preserving authored documents and other
 unrelated files.
+
+Session restart and revival preserve existing plan and state content. Creation
+recovery accepts the current generated templates and the immediately preceding
+ones, including already seeded requests, without converting old records to the
+new layout. It continues to reject modified partial drafts. Unfinished forks
+and current creation operations retain their existing package-transition gate;
+complete them with their originating generation before switching packages.
 
 ## Attaching and syncing
 

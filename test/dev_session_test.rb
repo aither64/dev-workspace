@@ -3815,6 +3815,112 @@ class DevSessionTest < Minitest::Test
       assert_equal(first_plan, File.binread(File.join(workspace, 'work', slug, 'plan.md')))
       assert_equal(first_state, File.binread(File.join(workspace, 'work', slug, 'state.md')))
       assert_equal(1, first_plan.scan('Keep this literal text:').length)
+      assert_includes(first_plan, "## Decisions\n")
+      assert_includes(first_plan, "## Documentation\n")
+      assert_operator(first_state.index('## Status'), :<, first_state.index('## Repositories'))
+      assert_includes(first_state, "## Next actions\n")
+      assert_includes(first_state, "## Documentation\n")
+    end
+  end
+
+  def previous_tracking_template(kind, slug)
+    File.read(File.join(__dir__, 'fixtures', "session-#{kind}-before-documentation.md"))
+      .sub('{{slug}}', slug)
+  end
+
+  def test_goal_seeding_resumes_previous_templates_without_rewriting_them
+    [false, true].repeated_permutation(2) do |plan_seeded, state_seeded|
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        runner = runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        goal = File.join(workspace, 'goal.txt')
+        File.write(goal, "Preserve this request.\n")
+        plan = previous_tracking_template('plan', slug)
+        state = previous_tracking_template('state', slug)
+        seeded_plan = plan.sub("## Goal\n\n", "## Goal\n\nPreserve this request.\n\n")
+        seeded_state = state.sub("## Status\n\n", "## Status\n\n- Session created with an initial request.\n\n")
+        plan_path = File.join(workspace, 'work', slug, 'plan.md')
+        state_path = File.join(workspace, 'work', slug, 'state.md')
+        File.write(plan_path, plan_seeded ? seeded_plan : plan)
+        File.write(state_path, state_seeded ? seeded_state : state)
+
+        runner.send(:validate_creation_tracking_files!, slug)
+        2.times { runner.send(:seed_goal, slug, goal) }
+
+        assert_equal(seeded_plan, File.read(plan_path))
+        assert_equal(seeded_state, File.read(state_path))
+      end
+    end
+  end
+
+  def test_goal_seeding_rejects_edited_current_and_previous_templates
+    [false, true].product(%w[plan state]).each do |previous, kind|
+      with_workspace do |workspace|
+        slug = '2026-06-06-demo'
+        runner = runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        goal = File.join(workspace, 'goal.txt')
+        File.write(goal, "Keep operator edits.\n")
+        path = File.join(workspace, 'work', slug, "#{kind}.md")
+        content = previous ? previous_tracking_template(kind, slug) : File.read(path)
+        edited = content + "\nOperator notes.\n"
+        File.write(path, edited)
+
+        assert_raises(DevSession::Error) { runner.send(:seed_goal, slug, goal) }
+        assert_equal(edited, File.read(path))
+      end
+    end
+  end
+
+  def test_creation_retry_preserves_previous_tracking
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Resume the recorded request.\n")
+      crashing_class = Class.new(DevSession::Runner) do
+        def ensure_tracking_files(_slug, **)
+          raise DevSession::Error, 'simulated crash before tracking creation'
+        end
+      end
+      crashing = crashing_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      assert_raises(DevSession::Error) do
+        crashing.start(slug, as_is: true, new: false, attach: false,
+                       run_codex: false, goal_file: goal, json: true, exclusive: true)
+      end
+      directory = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(directory)
+      previous_plan = previous_tracking_template('plan', slug)
+      File.write(File.join(directory, 'plan.md'), previous_plan)
+      previous_state = previous_tracking_template('state', slug)
+      File.write(File.join(directory, 'state.md'), previous_state)
+
+      retry_class = Class.new(DevSession::Runner) do
+        def create_tmux_session(*, **)
+          raise DevSession::Error, 'reached tmux creation'
+        end
+      end
+      runner = retry_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new,
+        err: StringIO.new, today: TODAY, env: {}
+      )
+      error = assert_raises(DevSession::Error) do
+        runner.start(slug, as_is: true, new: false, attach: false,
+                     run_codex: false, goal_file: goal, json: true, exclusive: true)
+      end
+      assert_equal('reached tmux creation', error.message)
+
+      assert_equal(
+        previous_plan.sub("## Goal\n\n", "## Goal\n\nResume the recorded request.\n\n"),
+        File.read(File.join(directory, 'plan.md'))
+      )
+      assert_equal(
+        previous_state.sub("## Status\n\n", "## Status\n\n- Session created with an initial request.\n\n"),
+        File.read(File.join(directory, 'state.md'))
+      )
     end
   end
 
