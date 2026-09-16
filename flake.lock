@@ -37,17 +37,17 @@
     "codex-web": {
       "flake": false,
       "locked": {
-        "lastModified": 1789409103,
-        "narHash": "sha256-I9GuvxQhJJ07h/NUbnP8+4GRug6XAt1qeZiM7lO4tLo=",
+        "lastModified": 1789541022,
+        "narHash": "sha256-xd8YemfxAe3RQYLyafIWPVd8EVuf0TBLbmMAJzuRi1o=",
         "owner": "aither64",
         "repo": "codex-web",
-        "rev": "882c88ccfbebfb646fb2cafbe9bc6790141b2d13",
+        "rev": "7429ff29d3ae35c43b155a99b1bd34c6a33ae187",
         "type": "github"
       },
       "original": {
         "owner": "aither64",
         "repo": "codex-web",
-        "rev": "882c88ccfbebfb646fb2cafbe9bc6790141b2d13",
+        "rev": "7429ff29d3ae35c43b155a99b1bd34c6a33ae187",
         "type": "github"
       }
     },

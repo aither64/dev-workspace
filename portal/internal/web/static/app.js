@@ -832,7 +832,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=8");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=9");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
