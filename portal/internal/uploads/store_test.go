@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -588,5 +589,131 @@ func TestStaleQueueObservationCannotUndoCancellation(t *testing.T) {
 	}
 	if err := backend.Delete(ctx, file.ID, false); err != nil {
 		t.Fatal("stale observation pinned cancelled input", err)
+	}
+}
+
+func TestFilenameMetadataCannotSelectStoragePaths(t *testing.T) {
+	for _, name := range []string{
+		"mail\\' OR 1=1; --.eml", "../../outside.eml", "/absolute/path.eml",
+		`<img src=x onerror="alert(1)">.eml`, "Příliš žluťoučký 📨.eml",
+		strings.Repeat("a", 251) + ".eml", "no-extension", "file.unsafe-extension!",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, backend := fixture(t)
+			ctx := context.Background()
+			file := create(t, backend, name, []byte("mail body"))
+			path := store.filePath(fileRecord{ID: file.ID, Name: file.Name}, false)
+			if filepath.Dir(path) != filepath.Join(store.Directory, "files", file.ID) || !strings.HasPrefix(filepath.Base(path), "file") {
+				t.Fatalf("filename escaped generated storage path: %q", path)
+			}
+			if file.Name != name {
+				t.Fatalf("metadata changed: %q", file.Name)
+			}
+			wire, err := backend.Prepare(ctx, "message", "filename-test", "Read the attachment", []string{file.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, encoded, ok := strings.Cut(wire, "Attached local files (inputs; keep these files outside version control):\n")
+			var refs []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+				Path string `json:"path"`
+			}
+			if !ok || json.Unmarshal([]byte(encoded), &refs) != nil || len(refs) != 1 || refs[0].Name != name || refs[0].Path != path || refs[0].Size != 9 {
+				t.Fatalf("invalid JSON prompt reference: %q", wire)
+			}
+			// Reopen the unchanged catalog format; no migration or filename-derived
+			// path changes are needed to read newly accepted metadata.
+			reopened, err := New(store.Directory, store.Workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.Store = reopened
+			content, err := backend.Open(ctx, file.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer content.File.Close()
+			data, err := io.ReadAll(content.File)
+			if err != nil || string(data) != "mail body" || content.Name != name {
+				t.Fatalf("reopened content: %q, %q, %v", content.Name, data, err)
+			}
+		})
+	}
+}
+
+func TestFilenameAndUploadValidationErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		size     int64
+		identity string
+		status   int
+		message  string
+	}{
+		{name: "", message: "Filename must not be empty"},
+		{name: "bad\xff.eml", message: "Filename must be valid UTF-8"},
+		{name: strings.Repeat("a", 256), message: "Filename exceeds 255 UTF-8 bytes"},
+		{name: strings.Repeat("é", 128), message: "Filename exceeds 255 UTF-8 bytes"},
+		{name: "null\x00.eml", message: "Filename contains control characters"},
+		{name: "line\n.eml", message: "Filename contains control characters"},
+		{name: "header\r.eml", message: "Filename contains control characters"},
+		{name: "tab\t.eml", message: "Filename contains control characters"},
+		{name: "del\x7f.eml", message: "Filename contains control characters"},
+		{name: "c1\u0085.eml", message: "Filename contains control characters"},
+		{name: "input.eml", size: -1, message: "File size must not be negative"},
+		{name: "input.eml", size: 65, status: 413, message: "File exceeds the upload size limit"},
+		{name: "input.eml", identity: "bad", message: "Invalid upload identity"},
+	} {
+		t.Run(tc.message+tc.name, func(t *testing.T) {
+			_, backend := fixture(t)
+			identity := tc.identity
+			if identity == "" {
+				identity, _ = newID()
+			}
+			_, err := backend.Create(context.Background(), conversation.UploadRequest{ClientID: identity, Name: tc.name, Size: tc.size})
+			wantStatus := tc.status
+			if wantStatus == 0 {
+				wantStatus = 400
+			}
+			status(t, err, wantStatus)
+			if !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("unexpected message: %v", err)
+			}
+			files, err := backend.List(context.Background())
+			if err != nil || len(files) != 0 {
+				t.Fatalf("rejected creation left a file: %v, %v", files, err)
+			}
+		})
+	}
+}
+
+func TestExistingUploadRecoversBeforeNewFilenamePolicy(t *testing.T) {
+	ctx := context.Background()
+	store, backend := fixture(t)
+	file := create(t, backend, "legacy.eml", []byte("legacy"))
+	legacyName := "legacy\u0085.eml" // C1 control was allowed by the previous validator.
+	var clientID string
+	err := store.transaction(ctx, func(data *catalog) (bool, error) {
+		record := data.Files[file.ID]
+		clientID = record.ClientID
+		record.Name = legacyName
+		data.Files[file.ID] = record
+		return true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := backend.Create(ctx, conversation.UploadRequest{ClientID: clientID, Name: legacyName, Size: 6})
+	if err != nil || recovered.ID != file.ID || recovered.State != "ready" {
+		t.Fatalf("legacy acknowledgement did not recover: %#v, %v", recovered, err)
+	}
+	otherID, _ := newID()
+	_, err = backend.Create(ctx, conversation.UploadRequest{ClientID: otherID, Name: legacyName, Size: 6})
+	status(t, err, 400)
+	if err = backend.Delete(ctx, recovered.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(store.filePath(fileRecord{ID: file.ID, Name: legacyName}, false)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered legacy upload not deleted: %v", err)
 	}
 }

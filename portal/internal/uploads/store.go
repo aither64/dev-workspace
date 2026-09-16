@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
@@ -468,8 +469,8 @@ func (backend *Backend) Status(ctx context.Context, id string) (conversation.Upl
 func (backend *Backend) Create(ctx context.Context, request conversation.UploadRequest) (conversation.Upload, error) {
 	var result conversation.Upload
 	store := backend.Store
-	if !idPattern.MatchString(request.ClientID) || request.Name == "" || len(request.Name) > 255 || !utf8.ValidString(request.Name) || request.Name == "." || request.Name == ".." || strings.ContainsAny(request.Name, "/\\") || strings.IndexFunc(request.Name, func(r rune) bool { return r < 32 || r == 127 }) >= 0 || request.Size < 0 || request.Size > store.UploadLimits.FileBytes {
-		return result, problem(400, "Invalid filename, size or upload identity")
+	if !idPattern.MatchString(request.ClientID) {
+		return result, problem(400, "Invalid upload identity; remove the file and select it again")
 	}
 	err := store.transaction(ctx, func(data *catalog) (bool, error) {
 		scope, ok := data.Scopes[backend.ScopeID]
@@ -494,6 +495,28 @@ func (backend *Backend) Create(ctx context.Context, request conversation.UploadR
 				scopeBytes += record.Size
 				count++
 			}
+		}
+		// Recover an existing client identity before applying current admission
+		// rules: older versions may have accepted names we now reject.
+		// Names are display metadata. filePath derives storage paths from a generated
+		// ID and a restricted extension, even when a name contains path separators.
+		if request.Name == "" {
+			return false, problem(400, "Filename must not be empty")
+		}
+		if !utf8.ValidString(request.Name) {
+			return false, problem(400, "Filename must be valid UTF-8")
+		}
+		if len(request.Name) > 255 {
+			return false, problem(400, "Filename exceeds 255 UTF-8 bytes; shorten it and select the file again")
+		}
+		if strings.IndexFunc(request.Name, unicode.IsControl) >= 0 {
+			return false, problem(400, "Filename contains control characters; rename the file and select it again")
+		}
+		if request.Size < 0 {
+			return false, problem(400, "File size must not be negative")
+		}
+		if request.Size > store.UploadLimits.FileBytes {
+			return false, problem(413, "File exceeds the upload size limit")
 		}
 		limit := store.UploadLimits.SessionBytes
 		if scope.Draft {

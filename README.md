@@ -221,6 +221,19 @@ file; the browser verifies its uploaded prefix before continuing. Unsubmitted
 files expire after seven days without upload activity. Accepted initial prompts,
 queued inputs and submissions with an unknown outcome retain their files.
 
+Use **Remove** to discard a rejected or expired selection, including after a
+reload. Rejected files do not need to be selected again for removal. If an
+upload's creation response was lost, removal first recovers its server identity
+so it can delete the unfinished upload. A connection or permission error leaves
+the card available for another removal attempt.
+
+Filenames may contain Unicode and punctuation, including quotes and backslashes.
+Names must be nonempty, valid UTF-8, at most 255 UTF-8 bytes, and contain no control
+characters. Validation errors identify the rule that failed. The original name
+is display metadata: storage uses a generated UUID directory and a fixed basename
+with an optional restricted extension. Names are rendered as text, serialized in
+JSON prompt references and encoded in download headers.
+
 Files are stored under the selected user state root at
 `portal/<workspace-id>/uploads/`, outside the workspace and its Git worktrees.
 Completed files are read-only. The transcript and queue show their names and
