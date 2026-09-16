@@ -140,6 +140,8 @@ module DevSession
   raise 'workspace runtime contract has an invalid tracking limit' unless TRACKING_MAX_SIZE == 8 * 1024 * 1024
   PORTAL_MANIFEST_MAX_SIZE = 1024 * 1024
   AUTHORITY_MAX_SIZE = 64 * 1024
+  # The thread command allows 180 seconds for authoritative history discovery.
+  THREAD_RETIRE_TIMEOUT = 210
   MAX_MESSAGE_BYTES = 20_000
   REMOVAL_PHASES = %w[
     prepared validated thread_retiring thread_retired clusters_released
@@ -4965,7 +4967,9 @@ module DevSession
       ]
       command += ['--thread-id', known_thread] unless known_thread.empty?
       command << '--force' if force
-      @command_runner.capture(command)
+      @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) do
+        @command_runner.capture(command)
+      end
     end
 
     def retire_session_runtime!(slug, session)

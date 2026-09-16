@@ -210,7 +210,13 @@ func (c *Client) RecoverArchivedThread(
 	return c.ResumeThread(ctx, threadID, cwd, environment)
 }
 
-func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force bool) error {
+func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force bool) (retireErr error) {
+	stage := "find session conversation"
+	defer func() {
+		if retireErr != nil {
+			retireErr = fmt.Errorf("%s: %w", stage, retireErr)
+		}
+	}()
 	var candidate codex.ThreadMetadata
 	var found bool
 	var err error
@@ -246,10 +252,12 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 			return err
 		}
 		if archivedFound {
+			stage = "clear retired conversation attempts"
 			return c.ClearConversationAttempts(threadID, cwd)
 		}
 		return errors.New("the expected Codex thread is neither active nor archived")
 	}
+	stage = "verify session conversation"
 	metadata, err := c.ReadThreadMetadata(ctx, threadID, true)
 	if err != nil {
 		return err
@@ -261,6 +269,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 	if err != nil {
 		return err
 	}
+	stage = "interrupt session conversation"
 	if force && materialized {
 		turnID, err := c.ActiveTurnID(ctx, threadID)
 		if err != nil {
@@ -272,6 +281,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 			}
 		}
 	}
+	stage = "verify conversation is idle"
 	for materialized {
 		err := c.RequireThreadTurnsIdle(ctx, threadID)
 		if err == nil {
@@ -286,9 +296,11 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+	stage = "archive session conversation"
 	if err := c.ArchiveThread(ctx, threadID); err != nil {
 		return err
 	}
+	stage = "clear retired conversation attempts"
 	return c.ClearConversationAttempts(threadID, cwd)
 }
 

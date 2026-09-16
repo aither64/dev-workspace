@@ -113,6 +113,59 @@ func TestListThreadActivityAcceptsOnlyWorkspaceThreads(t *testing.T) {
 	}
 }
 
+func TestRetireThreadReportsFailingStage(t *testing.T) {
+	for failAt, stage := range []string{
+		"find session conversation", "verify session conversation", "verify session conversation",
+		"verify conversation is idle", "archive session conversation",
+	} {
+		t.Run(fmt.Sprintf("%d", failAt), func(t *testing.T) {
+			rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+			if err := os.WriteFile(rollout, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for i, method := range []string{"thread/list", "thread/read", "thread/read", "thread/turns/list", "thread/archive"} {
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					if request["method"] != method {
+						return fmt.Errorf("method = %v, want %s", request["method"], method)
+					}
+					if i == failAt {
+						return writeObject(connection, map[string]any{"id": request["id"], "error": map[string]any{"code": -32000, "message": "fixture failure"}})
+					}
+					thread := map[string]any{"id": "thread-1", "cwd": "/workspace/work/example", "source": "vscode", "path": rollout}
+					var result any
+					switch i {
+					case 0:
+						result = map[string]any{"data": []any{thread}}
+					case 1, 2:
+						result = map[string]any{"thread": thread}
+					case 3:
+						result = map[string]any{"data": []any{map[string]any{"id": "turn-1", "status": "completed"}}}
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.RetireThread(ctx, "thread-1", "/workspace/work/example", false)
+			if err == nil || !strings.Contains(err.Error(), stage+":") || !strings.Contains(err.Error(), "fixture failure") {
+				t.Fatalf("retirement error = %v, want stage %s and cause", err, stage)
+			}
+		})
+	}
+}
+
 func TestRetireThreadInterruptsAnActiveTurnBeforeArchiving(t *testing.T) {
 	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	if err := os.WriteFile(rollout, []byte("{}\n"), 0o600); err != nil {

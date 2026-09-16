@@ -272,6 +272,65 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_retirement_uses_its_own_deadline_and_restores_the_scan_deadline
+    assert_equal(210, DevSession::THREAD_RETIRE_TIMEOUT)
+    [0.5, 3].each do |retirement_delay|
+      with_workspace do |workspace|
+        slug = '2026-06-06-retirement-deadline'
+        runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+        portal = File.join(workspace, 'automatic-portal.rb')
+        File.write(portal, "sleep #{retirement_delay} if ARGV[1] == 'retire'\n")
+        command_runner = runner.instance_variable_get(:@command_runner)
+        # Scale deadlines, not subprocess behavior: use the real timeout command.
+        real_with_timeout = command_runner.method(:with_timeout)
+        seen = []
+        command_runner.define_singleton_method(:with_timeout) do |seconds, &block|
+          seen << seconds
+          real_with_timeout.call(seconds == DevSession::THREAD_RETIRE_TIMEOUT ? 1 : 0.1, &block)
+        end
+        command_runner.with_timeout(60) do
+          if retirement_delay < 1
+            runner.send(:retire_portal_thread!, slug, force: false)
+          else
+            error = assert_raises(DevSession::CommandError) do
+              runner.send(:retire_portal_thread!, slug, force: false)
+            end
+            assert_equal(124, error.status.exitstatus)
+          end
+          error = assert_raises(DevSession::CommandError) do
+            command_runner.capture([RbConfig.ruby, '-e', 'sleep 0.5'])
+          end
+          assert_equal(124, error.status.exitstatus, 'ordinary command deadline was not restored')
+        end
+        assert_equal([60, 210], seen)
+        command_runner.capture([RbConfig.ruby, '-e', 'sleep 0.2'])
+      end
+    end
+  end
+
+  def test_automatic_retirement_failure_resumes_committed_tracking_without_another_commit
+    with_workspace do |workspace|
+      slug = '2026-06-06-retirement-retry'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      portal = File.join(workspace, 'automatic-portal.rb')
+      original = File.read(portal)
+      File.write(portal, original + "\nif ARGV[1] == 'retire'; warn 'find session conversation: context deadline exceeded'; exit 1; end\n")
+      failure = automatic_scan(runner).fetch(0)
+      assert_equal('deferred', failure['result'])
+      assert_includes(failure['blockers'].join, 'find session conversation: context deadline exceeded')
+      journal = runner.send(:lifecycle_journal_file, slug, 'archive')
+      assert_equal('tracking_committed', JSON.parse(File.read(journal))['phase'])
+      head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD')
+      File.write(portal, original)
+      assert_equal('archived', automatic_scan(runner).fetch(0)['result'])
+      assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD'))
+      refute(File.exist?(journal))
+      assert_empty(runner.auto_archive_status(slug)['blockers'])
+    end
+  end
+
   class TTYInput < StringIO
     def tty?
       true
@@ -1031,6 +1090,10 @@ class DevSessionTest < Minitest::Test
     def initialize(out:, err:, &callback)
       @delegate = DevSession::CommandRunner.new(out:, err:)
       @callback = callback
+    end
+
+    def with_timeout(seconds, &block)
+      @delegate.with_timeout(seconds, &block)
     end
 
     def capture(argv, allow_failure: false, **options)
