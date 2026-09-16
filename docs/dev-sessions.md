@@ -470,6 +470,24 @@ deployment interruption stops the operation, run the same `archive` command
 again with the same mode. It resumes completed phases without repeating them.
 The CLI prints phases as they are persisted. The browser exposes the same phase
 and offers Retry when an archive, delete, or revive operation fails or pauses.
+For an automatic archive, the session banner also shows the last failed worker
+attempt and its timestamp. This is separate from the last completed journal
+step. Technical details remain in Settings. A pending archive keeps the
+conversation read-only; completion retains the conversation in archived history.
+
+Ordinary commands in the automatic worker have a 60-second timeout. Conversation
+retirement has a 210-second subprocess timeout around the App Server client's
+180-second deadline. Directory-filtered history discovery can take longer than
+a minute on a large history. Keep the outer retirement limit longer than the
+client deadline so errors can return before the process is killed. These limits
+apply on the first attempt and when resuming a journal.
+
+If an automatic archive stops after committing tracking, retry the same archive
+with the installed `dev-session archive <slug> --as-is` command. Add `--abandoned`
+when retrying an empty-session archive, matching its recorded abandoned mode.
+Manual retries use the same journal checks and retirement deadline. Finish pending
+operations before switching packages; do not remove their journals to unblock activation.
+
 The journal binds the exact projected archive tree and retained Codex thread;
 retry refuses changed lifecycle, manifest, artifacts, or conversation identity
 before it commits tracking or retires the runtime.

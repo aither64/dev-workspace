@@ -409,7 +409,7 @@
     }
     if (operation.state === "paused") {
       return {
-        detail: `Paused · ${formatElapsed(elapsedMilliseconds)} since the last recorded update`,
+        detail: `Paused · ${formatElapsed(elapsedMilliseconds)} since the last completed step`,
         retry: true,
         title: `${label}: ${lifecyclePhaseLabel(operation.phase)}`,
         tone: "pending",
@@ -765,9 +765,21 @@
       if (/Codex thread \S+ is not idle \(latest turn \S+ has status "inProgress"\)/.test(raw)) message = "Codex has an active turn.";
       else if (/Codex thread \S+ has \d+ pending request\(s\)/.test(raw)) message = "Codex has pending requests.";
       else if (/Codex thread \S+ has \d+ queued message\(s\)/.test(raw)) message = "Codex has queued messages.";
+      else if (/thread retire/.test(raw) && /exit 124|context deadline exceeded/.test(raw)) message = "Closing the conversation timed out.";
+      else if (/thread retire/.test(raw)) message = "The conversation could not be closed.";
       blockers.push(message); diagnostics.push(raw);
     }
     return {fields, blockers: [...new Set(blockers)], diagnostics};
+  };
+
+  const archiveFailurePresentation = (operation, state, threadId) => {
+    if (operation?.kind !== "archive" || !["paused", "failed", "running"].includes(operation.state) ||
+        !operation.options?.journalId || operation.options.journalId !== state?.operation?.id ||
+        !threadId || state.identity !== threadId || state.operation.identity !== threadId ||
+        !["deferred", "error"].includes(state.result) || !Number.isFinite(Date.parse(state.checked_at))) return null;
+    const presentation = autoArchivePresentation(state);
+    if (!presentation.blockers.length) return null;
+    return {message: presentation.blockers.join(" "), attemptedAt: state.checked_at};
   };
 
   const createCodexLimitsReader = (request, render) => {
@@ -793,7 +805,7 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation,
+      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
       currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
@@ -1433,12 +1445,14 @@
   const autoArchiveValues = document.getElementById("auto-archive-values");
   const autoArchiveDetails = document.getElementById("auto-archive-details");
   let lastAutoArchive = null, autoArchiveRead = 0, autoArchiveSaving = false;
+  let autoArchiveLoading = null, autoArchiveReadAt = -Infinity;
   const showAutoArchiveDetails = (diagnostics) => {
     autoArchiveDetails.hidden = !diagnostics.length;
     autoArchiveDetails.querySelector("pre").textContent = diagnostics.join("\n\n");
   };
   const renderAutoArchive = (state) => {
     lastAutoArchive = state;
+    renderArchiveFailure();
     const presentation = autoArchivePresentation(state);
     const fields = document.createElement("dl"); fields.className = "auto-archive-fields";
     for (const [label, value] of presentation.fields) {
@@ -1464,16 +1478,21 @@
     autoArchiveStatus.hidden = false;
     showAutoArchiveDetails([...(lastAutoArchive ? autoArchivePresentation(lastAutoArchive).diagnostics : []), error.message]);
   };
-  const loadAutoArchive = async () => {
-    if (autoArchiveSaving) return;
+  const loadAutoArchive = (force = false) => {
+    if (autoArchiveLoading) return autoArchiveLoading;
+    if (autoArchiveSaving || (!force && Date.now() - autoArchiveReadAt < 30_000)) return Promise.resolve();
+    autoArchiveReadAt = Date.now();
     const read = ++autoArchiveRead;
-    try {
-      const state = await client.autoArchive();
-      if (read === autoArchiveRead) renderAutoArchive(state);
-    } catch (error) {
-      if (read === autoArchiveRead) failAutoArchive(error, lastAutoArchive ?
-        "Could not refresh archival settings. Showing the last available settings." : "Could not load archival settings.");
-    }
+    autoArchiveLoading = (async () => {
+      try {
+        const state = await client.autoArchive();
+        if (read === autoArchiveRead) renderAutoArchive(state);
+      } catch (error) {
+        if (read === autoArchiveRead) failAutoArchive(error, lastAutoArchive ?
+          "Could not refresh archival settings. Showing the last available settings." : "Could not load archival settings.");
+      } finally { autoArchiveLoading = null; }
+    })();
+    return autoArchiveLoading;
   };
   if (autoArchiveStatus) {
     if (document.getElementById("settings")?.classList.contains("active")) void loadAutoArchive();
@@ -1494,7 +1513,8 @@
       } finally {
         autoArchiveSaving = false; autoArchiveHold.disabled = false;
       }
-      await loadAutoArchive();
+      await autoArchiveLoading;
+      await loadAutoArchive(true);
       if (saveError) failAutoArchive(saveError, "Could not confirm the Keep open change. The checkbox shows the last confirmed setting.");
     });
   }
@@ -1540,14 +1560,24 @@
     clearThreadStorage(localStorage, slug, deletedThreadId);
     clearThreadStorage(sessionStorage, slug, deletedThreadId);
   };
+  const archiveFailure = document.getElementById("archive-last-failure");
+  function renderArchiveFailure() {
+    if (!archiveFailure) return;
+    const failure = archiveFailurePresentation(lastLifecycleOperation, lastAutoArchive, body.dataset.threadId);
+    archiveFailure.hidden = !failure;
+    archiveFailure.querySelector("span").textContent = failure ?
+      `Last automatic attempt failed (${new Date(failure.attemptedAt).toLocaleString()}): ${failure.message}` : "";
+  }
   const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
     if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
     lastLifecycleOperation = operation;
+    renderArchiveFailure();
     if (!lifecycleObservedAt && operation.startedAt) {
       const startedAt = Date.parse(operation.startedAt);
       if (Number.isFinite(startedAt)) lifecycleObservedAt = startedAt;
     }
-    const elapsed = lifecycleObservedAt ? Date.now() - lifecycleObservedAt : 0;
+    const observedAt = operation.state === "paused" ? Date.parse(operation.updatedAt) : lifecycleObservedAt;
+    const elapsed = Number.isFinite(observedAt) && observedAt ? Math.max(0, Date.now() - observedAt) : 0;
     const presentation = lifecyclePresentation(operation, pendingKind, elapsed);
     lifecycleStatus.hidden = presentation.tone === "idle";
     lifecycleStatus.className = `operation-status notice full ${presentation.tone}`;
@@ -2017,6 +2047,36 @@
     else if (lifecycleKind === "revive" && needsOptions) reviveDialog.showModal();
     else if (lifecycleKind === "revive") void retryRevive(lifecycleRetry);
   });
+  // Worker diagnostics are historical evidence; they never replace a live retry.
+  let archiveRefreshRunning = false, archiveRefreshAt = -Infinity;
+  const refreshPendingArchive = async () => {
+    if (pendingLifecycle !== "archive" || document.hidden || archiveRefreshRunning ||
+        Date.now() - archiveRefreshAt < 30_000 || lastLifecycleOperation.state === "complete") return;
+    archiveRefreshRunning = true;
+    archiveRefreshAt = Date.now();
+    const observedOperation = lastLifecycleOperation;
+    try {
+      await Promise.all([loadAutoArchive(), (async () => {
+        const operation = await client.operation();
+        if (lastLifecycleOperation === observedOperation && observedOperation.state !== "running") {
+          if (operation.state === "running") monitorLifecycle("archive", operation);
+          else showLifecycle(operation, operation.state === "complete" ? "" : pendingLifecycle);
+          if (operation.state === "complete") location.reload();
+        }
+      })()]);
+    } catch (_error) {
+      // Keep the last confirmed attempt and its timestamp when a read fails.
+    } finally { archiveRefreshRunning = false; }
+  };
+  if (pendingLifecycle === "archive") {
+    let timer = setInterval(() => void refreshPendingArchive(), 30_000);
+    document.addEventListener("visibilitychange", () => void refreshPendingArchive());
+    window.addEventListener("pageshow", () => {
+      if (timer === null) timer = setInterval(() => void refreshPendingArchive(), 30_000);
+      void refreshPendingArchive();
+    });
+    window.addEventListener("pagehide", () => { clearInterval(timer); timer = null; });
+  }
   client.operation().then((operation) => {
     if (!pendingLifecycle && !lifecycleOperationBelongsToPage(operation.kind, operation)) return;
     if (operation.state === "running") {
@@ -2025,6 +2085,7 @@
       lifecycleKind = operation.kind || pendingLifecycle;
       showLifecycle(operation, pendingLifecycle);
     }
+    void refreshPendingArchive();
   }).catch((error) => {
     if (pendingLifecycle) failLifecycle(pendingLifecycle, error.message);
   });

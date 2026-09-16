@@ -43,6 +43,8 @@
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
       <button id="lifecycle-operation-retry" type="button" class="quiet" hidden>Retry</button>
     </section>
+    <p id="archive-last-failure" class="notice warning full" role="status" hidden><span></span> <a href="#settings">Technical details</a></p>
+    {{if eq .PendingLifecycle "archive"}}<p class="notice full">Archiving is unfinished. This conversation is read-only until it finishes.</p>{{end}}
     {{if .LifecycleOnly}}
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}

@@ -16,7 +16,7 @@ const {
   shouldSubmitMessage, storeQueueAttempt,
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
-  fileChangeDiffs, formatElapsed, autoArchivePresentation,
+  fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, renderCollaborationModes,
@@ -41,6 +41,26 @@ assert(!autoArchivePresentation({blockers: [unknownArchivalError]}).blockers[0].
 assert.deepEqual(autoArchivePresentation({blockers: ["Automatic archival is disabled.", "Keep open is enabled."]}).blockers, []);
 assert.deepEqual(autoArchivePresentation({blockers: ["Codex thread thread-1 has 2 pending request(s)", "Codex thread thread-1 has 1 queued message(s)"]}).blockers,
   ["Codex has pending requests.", "Codex has queued messages."]);
+
+const archiveOperation = {kind: "archive", state: "paused", options: {journalId: "journal-1"}};
+const failedArchive = {identity: "thread-1", operation: {id: "journal-1", identity: "thread-1"},
+  result: "deferred", checked_at: "2026-09-16T20:02:12Z",
+  blockers: ["command failed with exit 124: /nix/store/example/bin/workspace-portal thread retire"]};
+const lastArchiveFailure = {message: "Closing the conversation timed out.", attemptedAt: failedArchive.checked_at};
+assert.deepEqual(archiveFailurePresentation(archiveOperation, failedArchive, "thread-1"), lastArchiveFailure);
+assert.deepEqual(archiveFailurePresentation({...archiveOperation, state: "running"}, failedArchive, "thread-1"), lastArchiveFailure);
+assert.deepEqual(archiveFailurePresentation(archiveOperation, {...failedArchive,
+  blockers: ["command failed with exit 1: workspace-portal thread retire\nfind session conversation: context deadline exceeded"]}, "thread-1"), lastArchiveFailure);
+for (const changes of [{state: "complete"}, {kind: "delete"}, {options: {journalId: "another"}}, {options: {}}]) {
+  assert.equal(archiveFailurePresentation({...archiveOperation, ...changes}, failedArchive, "thread-1"), null);
+}
+for (const changes of [{identity: "another"}, {operation: {id: "journal-1", identity: "another"}},
+  {result: "archived"}, {checked_at: "invalid"}, {blockers: []}, {operation: null}]) {
+  assert.equal(archiveFailurePresentation(archiveOperation, {...failedArchive, ...changes}, "thread-1"), null);
+}
+assert.equal(archiveFailurePresentation(archiveOperation, failedArchive, ""), null);
+assert.equal(archiveFailurePresentation(archiveOperation, null, "thread-1"), null);
+assert(!archiveFailurePresentation(archiveOperation, {...failedArchive, blockers: [unknownArchivalError]}, "thread-1").message.includes("script"));
 
 const historicalPlan = {turnId: "old", kind: "plan", turnStatus: "completed", text: "Plan"};
 for (const latestTurnId of [undefined, "ordinary", "empty", "failed", "interrupted"]) {
@@ -287,7 +307,7 @@ assert.deepEqual(lifecyclePresentation(
 assert.deepEqual(lifecyclePresentation(
   {kind: "archive", state: "paused", phase: "tracking_committed"}, "archive", 4_000,
 ), {
-  detail: "Paused · 4s since the last recorded update",
+  detail: "Paused · 4s since the last completed step",
   retry: true,
   title: "Archive: Tracking committed",
   tone: "pending",
