@@ -50,6 +50,10 @@ let
     !(evaluate {
       skills.dev-session-documentation = "${pkgs.hello}";
     }).success;
+  rejectsMonitorSkillCollision =
+    !(evaluate {
+      skills.dev-session-monitor = "${pkgs.hello}";
+    }).success;
   corePackage = mkPackage { inherit pkgs; };
   extraSkill = pkgs.runCommand "example-workspace-skill" { } ''
     mkdir -p "$out"
@@ -81,19 +85,23 @@ assert rejectsUnknownProviderField;
 assert rejectsProgramCollision;
 assert rejectsCoreProgramCollision;
 assert rejectsCoreSkillCollision;
+assert rejectsMonitorSkillCollision;
 assert rejectsUnsafeUserNamespace;
 assert rejectsUnsafeRouterSocket;
 assert rejectsUnsafeActivationAlias;
 pkgs.runCommand "dev-workspace-extension-catalog-validation" { nativeBuildInputs = [ pkgs.jq ]; } ''
   for package in ${corePackage} ${extendedPackage}; do
-    skill=$(jq -er '.skills[] | select(.name == "dev-session-documentation") | .path' \
-      "$package/share/dev-workspace/extensions.json")
-    test -f "$skill/SKILL.md"
-    test -f "$package/share/codex/skills/dev-session-documentation/SKILL.md"
+    for name in dev-session-documentation dev-session-monitor; do
+      skill=$(jq -er --arg name "$name" '.skills[] | select(.name == $name) | .path' \
+        "$package/share/dev-workspace/extensions.json")
+      test -f "$skill/SKILL.md"
+      test -f "$package/share/codex/skills/$name/SKILL.md"
+      test -f "$package/share/codex/skills/$name/agents/openai.yaml"
+    done
   done
-  jq -e '[.skills[].name] == ["dev-session-documentation"]' \
+  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor"]' \
     ${corePackage}/share/dev-workspace/extensions.json >/dev/null
-  jq -e '[.skills[].name] == ["dev-session-documentation", "example"]' \
+  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor", "example"]' \
     ${extendedPackage}/share/dev-workspace/extensions.json >/dev/null
   test -f ${extendedPackage}/share/codex/skills/example/SKILL.md
   touch "$out"

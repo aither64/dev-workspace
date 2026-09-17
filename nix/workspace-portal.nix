@@ -57,6 +57,7 @@ let
   extensionSkills = extensions.skills or { };
   coreSkills = {
     dev-session-documentation = "${src}/skills/dev-session-documentation";
+    dev-session-monitor = "${src}/skills/dev-session-monitor";
   };
   skills = coreSkills // extensionSkills;
   skillNamesUnique = builtins.intersectAttrs coreSkills extensionSkills == { };

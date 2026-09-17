@@ -147,6 +147,42 @@ an explicit user request. A pause until a future working day can justify that
 day's consolidated checkpoint, but not a second one. Ordinary functional
 commits are not tracking-only checkpoints.
 
+## Monitor long verification
+
+The built-in `dev-session-monitor` skill delegates long tests, CI checks and
+builds to a fresh `gpt-5.6-luna` subagent with `low` reasoning. The parent keeps
+its model, reasoning effort and development context, then continues when the
+watcher returns. Planning, diagnosis, code changes, review and acceptance remain
+with the parent. The skill does not initiate deployments or unwanted CI waits.
+
+Automatic skill selection is enabled. To require this workflow, add a brief rule
+to the consuming workspace's instructions:
+
+> Use `dev-session-monitor` and its monitoring subagent for authorized tests,
+> CI checks and builds expected to exceed one minute. Delegate uncertain-duration
+> integration tests and builds before launching them; keep known quick checks
+> inline. Preserve the parent model and reasoning effort.
+
+It can also be requested explicitly with `$dev-session-monitor`. The
+[skill](../skills/dev-session-monitor/SKILL.md) defines the brief, watcher
+boundaries, result format and visible fallback when delegation is unavailable.
+Callers supply any project-specific deadlines and escalation rules. A watcher
+owns newly launched commands; an existing run needs independently accessible
+status and logs rather than an assumed transferable parent tool handle.
+
+This is agent-directed delegation, not a persistent job supervisor or a model
+change inside an executing turn. Parent waiting still has tool/runtime overhead.
+Fresh briefs, blocking waits and compact results reduce repeated model work;
+actual allowance savings depend on the workload and must be measured. Full logs
+remain available for the parent to investigate failures.
+
+The skill uses the existing schema-1 package catalog and managed skill links.
+Profile activation installs it; rollback to a package without it removes its
+managed link. No conversation, manifest or process-state migration is needed.
+Verify discovery in a fresh turn after activation; already-running turns may
+retain their earlier instructions. When the skill is absent, perform the same
+operation with minimal-output parent monitoring and report that fallback once.
+
 ## Documentation during development
 
 The package includes the `dev-session-documentation` skill. It is available for

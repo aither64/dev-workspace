@@ -16,7 +16,8 @@ and [documentation during development](docs/dev-sessions.md#documentation-during
 for plans, decision rationale, project docs, and handoffs. The
 [portal guide](docs/workspace-portal.md) covers file links, extensions, and host
 deployment responsibilities. The package includes the automatically discoverable
-`dev-session-documentation` skill.
+`dev-session-documentation` skill and the
+[`dev-session-monitor` skill](docs/dev-sessions.md#monitor-long-verification).
 
 ## Nix interfaces
 
