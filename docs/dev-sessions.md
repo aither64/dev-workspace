@@ -164,14 +164,45 @@ part of development and follows the task's existing scope and permissions.
 
 ### Where information belongs
 
+The [authoring skill](../skills/dev-session-documentation/SKILL.md) chooses
+destinations by applicability, useful lifetime and owner. Feature explanations
+describe the system at the documented revision. A rollout record describes one
+deployment and becomes historical evidence when that deployment finishes.
+
 | Information | Location |
 | --- | --- |
 | Current goal, approach, unresolved choices | Session `plan.md` |
 | Current status, next actions, verification evidence | Session `state.md` and linked artifacts |
-| Supported behavior, accepted rationale, design constraints | Owning project's documentation |
-| Repeatable deployment, operation, diagnosis, recovery | Project operations docs, or the site configuration repository for site-specific steps |
-| Exact rollout revisions and execution results | Session rollout record or a versioned release runbook |
+| Supported behavior, accepted rationale, invariants, failure semantics | Owning project's documentation |
+| Repeatable deployment, operation, diagnosis, recovery | Separate project operations documentation, or the site configuration repository for site-specific steps |
+| Instructions for a supported upgrade path | Project upgrade guide with source and target versions or schema boundaries |
+| An individual rollout's plan, revisions, results and rollback preparation | Session rollout record or a dated record in the deployment repository |
+| Temporary branch state, review fixtures, disposable database resets | Session records |
 | Reusable development-environment lessons | Workspace notes under local conventions |
+
+These categories do not prescribe a directory tree, a file per category or a
+deployment section for every feature. Use the smallest useful explanation in
+the project's existing layout. A one-time checklist remains rollout material
+even without dates or commit hashes.
+
+Keep lasting compatibility constraints with the component and reference them
+from operational procedures. Separate mixed passages by meaning. For example:
+
+- A transaction's promise to retain ownership on rollback belongs with its
+  feature behavior. Steps for reverting deployed software belong in operations
+  or upgrade guidance.
+- A recovery procedure that operators can repeat belongs in operations docs.
+  A particular recovery's commands, affected machines and observed results
+  belong in its operational record.
+- A supported schema transition needs an upgrade guide that other upgraders
+  can find. Resetting a disposable database from an earlier unmerged branch
+  revision belongs in that session's records.
+
+Maintain reusable procedures as supported operations change. Keep upgrade
+guidance while the upgrade path needs support, and identify its applicability
+without inventing release versions. Historical deployment records retain what
+happened; they do not serve as the current operating procedure. Preserve any
+still-needed upgrade or recovery instructions when reorganizing older material.
 
 Give each cross-project contract one authoritative home and link its consumers
 to it. Project documentation should make sense without access to a private
@@ -185,10 +216,9 @@ are known; source code alone cannot establish a past author's intent. Identify
 inferred explanations and unresolved questions. Mark proposed and superseded
 decisions, and link to the accepted replacement when there is one.
 
-Current documentation describes supported behavior. A release runbook identifies
-its applicable versions. Session state distinguishes a prepared rollout from an
-executed and verified deployment. Operational instructions include prerequisites,
-ordering, expected results, and recovery limits, with unverified steps identified.
+Session state distinguishes a prepared rollout from an executed and verified
+deployment. Operational instructions include prerequisites, ordering, expected
+results, and recovery limits, with unverified steps identified.
 
 ### Plans, state, and handoff
 
@@ -206,8 +236,10 @@ repositories and can be linked from the plan or state.
 
 Before review, reconcile the documentation with the final code, tests, and
 observed deployment behavior. Include relevant documentation paths in the review
-packet. At handoff, summarize the documentation changes or briefly explain why
-none were useful. Preserve the workspace's tracking commit cadence and finish
+packet and check placement as well as completeness. Feature docs should remain
+understandable without knowing a branch's rollout status. At handoff, summarize
+the documentation changes or briefly explain why none were useful. Preserve the
+workspace's tracking commit cadence and finish
 this work before archival. Improve older documentation when related work touches
 it; historical backfills are separate tasks.
 
