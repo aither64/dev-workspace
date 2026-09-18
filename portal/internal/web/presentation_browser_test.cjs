@@ -35,6 +35,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
             return route.fulfill(failArchive ? {status: 503, json: {error: "Fixture read failure"}} : {json: archive});
           case "thread": return route.fulfill({json: {threadId: "thread-1", latestTurnId: "turn-1", status: threadStatus, collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []}});
           case "pending": return route.fulfill({json: pending});
+          case "respond": return route.fulfill({json: {ok: true}});
           case "queue": return route.fulfill({json: []});
           case "reconcile": return route.fulfill({json: {ok: true}});
           case "activity": return route.fulfill(failActivity ? {status: 503, json: {error: "Fixture timing failure"}} : {json: {
@@ -50,6 +51,10 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       });
       const sidebar = page.locator(".workspace-sidebar");
       const width = async value => expect.poll(async () => Math.round((await sidebar.boundingBox()).width)).toBe(value);
+      const expireAutoArchiveCache = () => page.evaluate(() => {
+        const wallNow = Date.now;
+        Date.now = () => wallNow() + 31_000;
+      });
       await page.goto(baseURL + "/example/");
       const codexTab = page.locator("#session-tab-codex");
       const waitingIndicator = page.locator("#codex-waiting-indicator");
@@ -66,6 +71,14 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.reload();
       await expect(waitingIndicator).toBeVisible();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex: waiting for instructions");
+      await codexTab.click();
+      await page.locator(".wizard-option").filter({hasText: "Continue"}).click();
+      await page.getByRole("button", {name: "Submit answers"}).click();
+      await expect(waitingIndicator).toBeHidden();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      // The pending endpoint intentionally remains stale. A confirmed response
+      // must still remove the attention signal in this page immediately.
+      await expect(page.locator('input[type="radio"][value="Continue"]')).toHaveCount(0);
       failActivity = true;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(waitingIndicator).toBeHidden();
@@ -79,6 +92,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.reload();
       await expect(waitingIndicator).toBeHidden();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await page.locator("[data-review-branch]").click();
       await expect(page.locator(".repository-review-heading")).toBeVisible();
       await width(58);
@@ -116,6 +130,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await technical.locator("summary").click();
       await expect(technical.locator("pre")).toHaveText(diagnostic);
       failArchive = true;
+      await expireAutoArchiveCache();
       await page.getByRole("tab", {name: "Codex", exact: true}).click();
       await page.getByRole("tab", {name: "Session settings", exact: true}).click();
       await expect(page.locator("#auto-archive-status")).toContainText("Showing the last available settings");
@@ -133,6 +148,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await expect(technical.locator("pre")).toContainText("Fixture hold failure");
       for (const fixture of [{enabled: false, eligible_at: "2026-09-21T18:01:59Z"}, {}, {enabled: true, tier: "complete", result: "deferred", blockers: ["unknown <script>diagnostic</script>"]}]) {
         archive = fixture;
+        await expireAutoArchiveCache();
         await page.getByRole("tab", {name: "Codex", exact: true}).click();
         await page.getByRole("tab", {name: "Session settings", exact: true}).click();
         await expect(page.locator("#auto-archive-values")).toContainText("Waiting for the first scan");

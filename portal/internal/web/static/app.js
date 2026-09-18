@@ -2130,9 +2130,10 @@
   let requestInputDraftStorage = null;
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
+  const actionablePrompts = () => currentPrompts.filter(entry => !answeredOffers.has(entry.token));
   const updateCodexWaitingIndicator = () => {
     const state = activitySnapshot?.currentState;
-    const blockingRequest = currentPrompts.some((entry) => entry.isBlocking);
+    const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
     const timing = timingClock.view();
     const waiting = interactive && activityAvailable && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
       ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
@@ -2997,8 +2998,8 @@
   const renderPendingEntries = (entries) => {
     if (!interactive) return;
     currentPrompts = entries;
+    entries = actionablePrompts();
     updateCodexWaitingIndicator();
-    entries = entries.filter(entry => !answeredOffers.has(entry.token));
     const keys = new Set(entries.map(promptDraftKey));
     // An empty transient snapshot cannot prove that saved answers are obsolete.
     // Keep recovery controls until the question returns or the user hides them.
