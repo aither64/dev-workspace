@@ -265,6 +265,9 @@ nonblocking questions do not. Overlapping requests count once. Waiting totals
 also include gaps between turns, while the current open wait is shown separately.
 Forked conversations count only their own turns. The current turn shows counts
 of distinct assistant messages and tool calls, independent of the selected view.
+When Codex is idle after a turn or has a blocking request, its sidebar tab shows
+an amber dot while another session section is open. The dot clears when timing
+data is unavailable.
 
 The portal service observes activity without answering requests, even when no
 browser is open. Timing records contain identities, interval boundaries, and

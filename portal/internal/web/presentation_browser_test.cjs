@@ -13,7 +13,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       const diagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
       let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
-      let failArchive = false, failHold = false;
+      let failArchive = false, failHold = false, failActivity = false;
       page.on("pageerror", error => errors.push(error.message));
       await page.route("**/api/codex-limits", route => route.fulfill({json: {windows: [{windowDurationMins: 10080, usedPercent: 20}], updatedAt: Date.now()}}));
       await page.route("**/api/sessions/example/**", async route => {
@@ -27,6 +27,14 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
               return route.fulfill({json: archive});
             }
             return route.fulfill(failArchive ? {status: 503, json: {error: "Fixture read failure"}} : {json: archive});
+          case "thread": return route.fulfill({json: {threadId: "thread-1", latestTurnId: "turn-1", status: "idle", collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []}});
+          case "pending": return route.fulfill({json: []});
+          case "queue": return route.fulfill({json: []});
+          case "reconcile": return route.fulfill({json: {ok: true}});
+          case "activity": return route.fulfill(failActivity ? {status: 503, json: {error: "Fixture timing failure"}} : {json: {
+            currentState: "idle", workingMs: 30000, waitingMs: 10000,
+            stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
+          }});
           case "details": return route.fulfill({json: {repositoriesHTML: cards, artifactsHTML: "", repositoryCount: 1, artifactCount: 0, clusterCount: 0}});
           case "repository-histories": return route.fulfill({json: {repositories: [{repository: "project", pair, review: "frozen", history: {commits: [], page: 0, hasMore: false}}]}});
           case "repository-states": return route.fulfill({json: {repositories: [{repository: "project", head}]}});
@@ -37,9 +45,19 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       const sidebar = page.locator(".workspace-sidebar");
       const width = async value => expect.poll(async () => Math.round((await sidebar.boundingBox()).width)).toBe(value);
       await page.goto(baseURL + "/example/");
+      const codexTab = page.locator("#session-tab-codex");
+      const waitingIndicator = page.locator("#codex-waiting-indicator");
+      await expect(waitingIndicator).toBeVisible();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex: waiting for instructions");
       await width(250);
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
+      await expect(waitingIndicator).toBeVisible();
       await width(250);
+      failActivity = true;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(waitingIndicator).toBeHidden();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      failActivity = false;
       await page.locator("[data-review-branch]").click();
       await expect(page.locator(".repository-review-heading")).toBeVisible();
       await width(58);

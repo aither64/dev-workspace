@@ -2118,7 +2118,10 @@
   const codexWorkLabel = document.getElementById("codex-work-label");
   const codexWorkCounts = document.getElementById("codex-work-counts");
   const durationSummary = document.getElementById("codex-duration");
+  const codexTab = document.getElementById("session-tab-codex");
+  const codexWaitingIndicator = document.getElementById("codex-waiting-indicator");
   let activitySnapshot = null;
+  let activityAvailable = false;
   const timingClock = createTimingClock();
   let activityRead = null;
 
@@ -2127,6 +2130,18 @@
   let requestInputDraftStorage = null;
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
+  const updateCodexWaitingIndicator = () => {
+    const state = activitySnapshot?.currentState;
+    const blockingRequest = currentPrompts.some((entry) => entry.isBlocking ||
+      ["command", "fileChange", "terminalOnly"].includes(entry.kind));
+    const waiting = interactive && activityAvailable && Boolean(activitySnapshot?.stateSinceMs) &&
+      ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
+    codexTab?.classList.toggle("waiting", waiting);
+    if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
+    const label = waiting ? "Codex: waiting for instructions" : "Codex";
+    codexTab?.setAttribute("aria-label", label);
+    codexTab?.setAttribute("title", label);
+  };
   const updateCodexWork = (active = threadActive) => {
     if (!codexWork || !codexWorkElapsed) return;
     const timing = timingClock.view();
@@ -2136,6 +2151,7 @@
       codexWorkCounts.textContent = "";
       codexWorkElapsed.textContent = "";
       durationSummary.textContent = timing.unavailable ? "Timing unavailable" : "Loading timing…";
+      updateCodexWaitingIndicator();
       return;
     }
     const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
@@ -2156,6 +2172,7 @@
     if (stale) durationSummary.textContent += " · Update unavailable";
     durationSummary.title = activitySnapshot.coverageReason ||
       "Waiting includes answered blocking requests and gaps between turns. The current wait is shown separately.";
+    updateCodexWaitingIndicator();
   };
   const refreshActivity = () => {
     if (!client.activity || document.hidden || pageReads.paused) return Promise.resolve();
@@ -2164,8 +2181,8 @@
     const read = pageReads.begin();
     activityRead = client.activity({signal: read.signal}).then(snapshot => {
       if (!read.isCurrent()) return;
-      activitySnapshot = snapshot; timingClock.received();
-    }).catch(() => { if (read.isCurrent()) timingClock.failed(); }).finally(() => {
+      activitySnapshot = snapshot; activityAvailable = true; timingClock.received();
+    }).catch(() => { if (read.isCurrent()) { activityAvailable = false; timingClock.failed(); } }).finally(() => {
       read.finish(); activityRead = null;
       if (!pageReads.paused) updateCodexWork();
     });
@@ -2980,6 +2997,7 @@
   const renderPendingEntries = (entries) => {
     if (!interactive) return;
     currentPrompts = entries;
+    updateCodexWaitingIndicator();
     entries = entries.filter(entry => !answeredOffers.has(entry.token));
     const keys = new Set(entries.map(promptDraftKey));
     // An empty transient snapshot cannot prove that saved answers are obsolete.

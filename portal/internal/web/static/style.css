@@ -264,7 +264,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .sidebar-heading { padding: 0 .5rem; min-width: 0; }
 .sidebar-heading h1 { margin: .9rem 0 0; font-size: .95rem; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
 .sidebar-home { display: flex; align-items: center; gap: .7rem; }
-.rail-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; flex: none; font-size: 1.2rem; }
+.rail-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; flex: none; font-size: 1.2rem; }
+.codex-waiting-indicator { position: absolute; top: -.08rem; right: -.12rem; width: .42rem; height: .42rem; border: 1px solid #10151d; border-radius: 999px; background: var(--warning); box-shadow: 0 0 0 1px color-mix(in srgb, var(--warning) 28%, transparent); }
 .sidebar-actions { display: flex; flex: none; flex-direction: column; gap: .5rem; }
 .sidebar-actions button { display: flex; align-items: center; gap: .7rem; text-align: left; font-size: .8rem; }
 .sidebar-actions > .badge { align-self: start; margin: .3rem .5rem; }
