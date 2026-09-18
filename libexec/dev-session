@@ -3812,16 +3812,15 @@ module DevSession
             raise Error, "origin identity is #{actual_github || raw_remote.inspect}"
           end
 
-          refspecs = [branch, default_branch].uniq.map do |ref|
-            "+refs/heads/#{ref}:refs/remotes/origin/#{ref}"
+          proof = archive_branch_proof(
+            repository, common_dir, branch, default_branch, allow_unpushed: !entry.nil?
+          )
+          local_head = proof.fetch(:local_head)
+          default_head = proof.fetch(:default_head)
+          if proof.fetch(:feature_remote)
+            remote_head = proof.fetch(:remote_head)
+            raise Error, "local head #{local_head} differs from remote head #{remote_head}" unless local_head == remote_head
           end
-          @command_runner.capture([
-            'git', "--git-dir=#{common_dir}", 'fetch', '--no-tags', 'origin', *refspecs
-          ])
-          local_head = resolve_commit(common_dir, "refs/heads/#{branch}")
-          remote_head = resolve_commit(common_dir, "refs/remotes/origin/#{branch}")
-          default_head = resolve_commit(common_dir, "refs/remotes/origin/#{default_branch}")
-          raise Error, "local head #{local_head} differs from remote head #{remote_head}" unless local_head == remote_head
 
           if entry
             worktree_head = git_capture(['git', '-C', entry.fetch(:path), 'rev-parse', 'HEAD']).strip
@@ -3915,18 +3914,21 @@ module DevSession
           if recorded_github && actual_github != recorded_github
             raise Error, "origin identity is #{actual_github || raw_remote.inspect}"
           end
-          refspecs = [branch, default_branch].uniq.map do |ref|
-            "+refs/heads/#{ref}:refs/remotes/origin/#{ref}"
-          end
-          @command_runner.capture([
-            'git', "--git-dir=#{common_dir}", 'fetch', '--no-tags', 'origin', *refspecs
-          ])
-          local_head = resolve_commit(common_dir, "refs/heads/#{branch}")
-          remote_head = resolve_commit(common_dir, "refs/remotes/origin/#{branch}")
-          default_head = resolve_commit(common_dir, "refs/remotes/origin/#{default_branch}")
-          unless local_head == expected && remote_head == expected
+          proof = archive_branch_proof(
+            repository, common_dir, branch, default_branch, allow_unpushed: true
+          )
+          local_head = proof.fetch(:local_head)
+          default_head = proof.fetch(:default_head)
+          unless local_head == expected
             raise Error,
                   "feature branch changed after merge proof (#{expected} -> #{local_head})"
+          end
+          if proof.fetch(:feature_remote)
+            remote_head = proof.fetch(:remote_head)
+            unless remote_head == expected
+              raise Error,
+                    "feature branch changed after merge proof (#{expected} -> #{remote_head})"
+            end
           end
           _stdout, stderr, status = @command_runner.capture(
             ['git', "--git-dir=#{common_dir}", 'merge-base', '--is-ancestor', expected, default_head],
@@ -4007,6 +4009,57 @@ module DevSession
 
       detail = stderr.strip
       raise Error, detail.empty? ? "cannot resolve #{ref}" : detail
+    end
+
+    def archive_branch_proof(repository, common_dir, branch, default_branch, allow_unpushed:)
+      local_head = resolve_commit(common_dir, "refs/heads/#{branch}")
+      feature_remote = remote_branch_exists_on_origin?(common_dir, branch)
+      unless feature_remote ||
+             allow_unpushed && unchanged_feature_branch?(repository, local_head)
+        raise Error, 'feature branch is not present on origin'
+      end
+
+      fetch_archive_refs!(
+        common_dir, feature_remote ? [branch, default_branch] : [default_branch]
+      )
+
+      unless feature_remote
+        feature_remote = remote_branch_exists_on_origin?(common_dir, branch)
+        fetch_archive_refs!(common_dir, [branch]) if feature_remote
+      end
+
+      {
+        local_head:,
+        default_head: resolve_commit(common_dir, "refs/remotes/origin/#{default_branch}"),
+        feature_remote:,
+        remote_head: feature_remote ? resolve_commit(common_dir, "refs/remotes/origin/#{branch}") : nil
+      }
+    end
+
+    def fetch_archive_refs!(repository, refs)
+      refspecs = refs.uniq.map do |ref|
+        "+refs/heads/#{ref}:refs/remotes/origin/#{ref}"
+      end
+      @command_runner.capture([
+        'git', "--git-dir=#{repository}", 'fetch', '--no-tags', 'origin', *refspecs
+      ])
+    end
+
+    def remote_branch_exists_on_origin?(repository, branch)
+      argv = [
+        'git', "--git-dir=#{repository}", 'ls-remote', '--exit-code', '--heads',
+        'origin', "refs/heads/#{branch}"
+      ]
+      stdout, stderr, status = @command_runner.capture(argv, allow_failure: true)
+      return true if status.success?
+      return false if status.exitstatus == 2
+
+      raise CommandError.new(argv, status, stdout, stderr)
+    end
+
+    def unchanged_feature_branch?(repository, head)
+      base = repository['initial_base_sha']
+      base.is_a?(String) && base.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/) && base == head
     end
 
     def existing_branch_base(repository, branch, requested_base, default_branch)

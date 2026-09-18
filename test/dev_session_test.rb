@@ -9918,6 +9918,98 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_archive_accepts_an_unchanged_unpushed_feature_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-unchanged-unpushed'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      repository = File.join(workspace, 'repos', 'sample.git')
+      base = git_capture_success(
+        'git', "--git-dir=#{repository}", 'rev-parse', 'refs/heads/master'
+      ).strip
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      runner.archive(slug, as_is: true)
+
+      manifest = YAML.safe_load(
+        File.read(File.join(workspace, 'archive', slug, 'portal.yml'))
+      )
+      repository_entry = manifest.fetch('repositories').fetch(0)
+      assert_equal(base, repository_entry.fetch('initial_base_sha'))
+      assert_equal(base, repository_entry.fetch('final_head_sha'))
+      refute_git_success(
+        'git', "--git-dir=#{repository}", 'ls-remote', '--exit-code', '--heads',
+        'origin', "refs/heads/#{slug}"
+      )
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_archive_retry_accepts_an_unchanged_unpushed_feature_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-retry-unchanged-unpushed'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      File.write(hook, "#!/bin/sh\nexit 1\n")
+      File.chmod(0o755, hook)
+
+      assert_raises(DevSession::CommandError) do
+        runner.archive(slug, as_is: true)
+      end
+      File.unlink(hook)
+
+      runner.archive(slug, as_is: true)
+
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_archive_rejects_a_changed_unpushed_feature_branch
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      slug = '2026-06-06-changed-unpushed'
+      runner = runner_for(workspace)
+      runner.worktree_add(
+        slug, 'sample', as_is: true, name: nil, branch: nil,
+        base: 'master', fetch: false
+      )
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      File.write(File.join(path, 'feature.txt'), "unpushed\n")
+      assert_git_success('git', '-C', path, 'add', 'feature.txt')
+      assert_git_success('git', '-C', path, 'commit', '-m', 'unpushed feature')
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+
+      error = assert_raises(DevSession::Error) do
+        runner.archive(slug, as_is: true)
+      end
+
+      assert_includes(error.message, 'feature branch is not present on origin')
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
   def test_archive_closes_and_commits_a_coordination_only_session
     skip 'git is not available' unless command_available?('git')
 

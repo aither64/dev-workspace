@@ -495,7 +495,9 @@ dev-session archive api-token-rotation --abandoned
 Before archiving completed work:
 
 - merge every registered feature branch's exact final head into its configured
-  remote default branch;
+  remote default branch; a branch that is still exactly at its recorded
+  `initial_base_sha` may remain unpushed, because there is no feature commit to
+  merge;
 - make sure plan and state have an earlier commit under `work/<slug>/` whose
   state front matter has `lifecycle: active`;
 - resolve all review, CI, merge, approval, deployment, and cleanup work owned by
@@ -511,11 +513,14 @@ needed. The browser offers the same two modes with one confirmation dialog.
 Agents must not treat a completed response, a handoff, "finish the work", or
 "implement the plan" as permission to archive a session.
 
-For completed work, `archive` fetches every registered feature branch and
-default branch. The local and remote feature tips must be identical, and that
-exact commit must be an ancestor of `origin/<default_branch>`. The command
-reports every branch whose merge status cannot be proven. A squash merge or
-partial cherry-pick does not satisfy this rule. Coordination-only initiatives
+For completed work, `archive` fetches every registered default branch and fetches
+a feature branch when its remote ref exists. The local and remote feature tips
+must be identical when that ref exists. A branch whose local tip is exactly its
+recorded `initial_base_sha` may have no remote feature ref; that base commit
+must still be an ancestor of `origin/<default_branch>`. The command reports
+every branch whose merge status cannot be proven. A squash merge or partial
+cherry-pick does not satisfy this rule, and a branch with feature commits still
+requires a matching remote ref. Coordination-only initiatives
 with no registered branches remain valid. Legacy live worktrees without
 `portal.yml` are inferred from their canonical bare repository and checked as
 branches. `--abandoned` skips only this merge proof. A retry fetches and
