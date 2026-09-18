@@ -2132,9 +2132,9 @@
 
   const updateCodexWaitingIndicator = () => {
     const state = activitySnapshot?.currentState;
-    const blockingRequest = currentPrompts.some((entry) => entry.isBlocking ||
-      ["command", "fileChange", "terminalOnly"].includes(entry.kind));
-    const waiting = interactive && activityAvailable && Boolean(activitySnapshot?.stateSinceMs) &&
+    const blockingRequest = currentPrompts.some((entry) => entry.isBlocking);
+    const timing = timingClock.view();
+    const waiting = interactive && activityAvailable && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
       ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
@@ -2188,8 +2188,8 @@
     });
     return activityRead;
   };
-  pauseTiming = () => timingClock.pause();
-  resumeTiming = () => { timingClock.resume(); void refreshActivity(); };
+  pauseTiming = () => { timingClock.pause(); updateCodexWaitingIndicator(); };
+  resumeTiming = () => { timingClock.resume(); updateCodexWaitingIndicator(); void refreshActivity(); };
   if (pageReads.paused) pauseTiming();
   setInterval(() => { if (!document.hidden && !pageReads.paused) updateCodexWork(); }, 1000);
   setInterval(() => { void refreshActivity(); }, 5000);

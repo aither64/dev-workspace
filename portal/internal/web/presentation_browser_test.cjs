@@ -14,6 +14,12 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
       let failArchive = false, failHold = false, failActivity = false;
+      let threadStatus = "idle", activityState = "idle", pending = [];
+      const blockingPrompt = {
+        id: "request-1", token: "token-1", method: "item/tool/requestUserInput", kind: "userInput",
+        threadId: "thread-1", turnId: "turn-1", itemId: "item-1", authorityAvailable: true,
+        isBlocking: true, questions: [{id: "question", header: "Question", question: "Continue?", options: [{label: "Continue"}]}],
+      };
       page.on("pageerror", error => errors.push(error.message));
       await page.route("**/api/codex-limits", route => route.fulfill({json: {windows: [{windowDurationMins: 10080, usedPercent: 20}], updatedAt: Date.now()}}));
       await page.route("**/api/sessions/example/**", async route => {
@@ -27,12 +33,12 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
               return route.fulfill({json: archive});
             }
             return route.fulfill(failArchive ? {status: 503, json: {error: "Fixture read failure"}} : {json: archive});
-          case "thread": return route.fulfill({json: {threadId: "thread-1", latestTurnId: "turn-1", status: "idle", collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []}});
-          case "pending": return route.fulfill({json: []});
+          case "thread": return route.fulfill({json: {threadId: "thread-1", latestTurnId: "turn-1", status: threadStatus, collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []}});
+          case "pending": return route.fulfill({json: pending});
           case "queue": return route.fulfill({json: []});
           case "reconcile": return route.fulfill({json: {ok: true}});
           case "activity": return route.fulfill(failActivity ? {status: 503, json: {error: "Fixture timing failure"}} : {json: {
-            currentState: "idle", workingMs: 30000, waitingMs: 10000,
+            currentState: activityState, workingMs: 30000, waitingMs: 10000,
             stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
           }});
           case "details": return route.fulfill({json: {repositoriesHTML: cards, artifactsHTML: "", repositoryCount: 1, artifactCount: 0, clusterCount: 0}});
@@ -53,11 +59,26 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await expect(waitingIndicator).toBeVisible();
       await width(250);
+      await page.evaluate(() => dispatchEvent(new Event("pagehide")));
+      await expect(waitingIndicator).toBeHidden();
+      await page.reload();
+      threadStatus = "active"; activityState = "waiting"; pending = [blockingPrompt];
+      await page.reload();
+      await expect(waitingIndicator).toBeVisible();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex: waiting for instructions");
       failActivity = true;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(waitingIndicator).toBeHidden();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex");
       failActivity = false;
+      pending = [{...blockingPrompt, isBlocking: false}];
+      await page.reload();
+      await expect(waitingIndicator).toBeHidden();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      activityState = "working"; pending = [];
+      await page.reload();
+      await expect(waitingIndicator).toBeHidden();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
       await page.locator("[data-review-branch]").click();
       await expect(page.locator(".repository-review-heading")).toBeVisible();
       await width(58);
