@@ -803,6 +803,61 @@
     };
   };
 
+  // Creation drafts are deliberately small browser-local retry records. The
+  // catalog digest binds their team policy to the catalog that rendered it.
+  // A later catalog is never combined with a saved team or lead override.
+  const normalizeCreationDraft = (value, kind) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        typeof value.name !== "string" || typeof value.date !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(value.date) ||
+        (kind === "new" && typeof value.goal !== "string")) return null;
+    const draft = {
+      name: value.name, date: value.date,
+      model: typeof value.model === "string" ? value.model : "",
+      effort: typeof value.effort === "string" ? value.effort : "",
+      team: typeof value.team === "string" ? value.team : "",
+      catalogDigest: typeof value.catalogDigest === "string" ? value.catalogDigest : "",
+    };
+    if (kind === "new") draft.goal = value.goal;
+    return draft;
+  };
+  const loadCreationDraft = (storage, key, kind) => {
+    try { return normalizeCreationDraft(JSON.parse(storage?.getItem(key) || "null"), kind); }
+    catch (_error) { return null; }
+  };
+  const storeCreationDraft = (storage, key, value, kind) => {
+    const draft = normalizeCreationDraft(value, kind);
+    if (!draft) return false;
+    try { storage?.setItem(key, JSON.stringify(draft)); return true; }
+    catch (_error) { return false; }
+  };
+  const planSessionDraftKey = (slug, snapshot) => (
+    `workspace-portal.plan-session-draft.${slug}.${snapshot.planTurnId}.${snapshot.planSha256}`
+  );
+  const creationDraftCatalogRecovery = (draft, currentCatalogDigest, acknowledged = false) => {
+    const current = typeof currentCatalogDigest === "string" ? currentCatalogDigest : "";
+    const changed = Boolean(draft && current && draft.catalogDigest !== current);
+    return {
+      catalogChanged: changed,
+      requiresAcknowledgement: changed && !acknowledged,
+      persistedCatalogDigest: changed && !acknowledged ? draft.catalogDigest : (current || draft?.catalogDigest || ""),
+    };
+  };
+  const planSessionCreationSettings = (managed, snapshot, draft) => (
+    managed ? {
+      team: draft.team, catalogDigest: draft.catalogDigest,
+      model: draft.model, reasoningEffort: draft.effort,
+    } : {
+      model: snapshot.model, reasoningEffort: snapshot.reasoningEffort,
+    }
+  );
+  const effortSelectionForModelRefresh = (managedOverride, selectedEffort, currentEffort) => (
+    managedOverride ? selectedEffort : currentEffort
+  );
+  const creationSubmitEligible = ({uploadReady = true, recoveryPending = false, inFlight = false} = {}) => (
+    Boolean(uploadReady) && !recoveryPending && !inFlight
+  );
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
@@ -824,6 +879,8 @@
       sessionTabFromHash, sessionTabFromLocation,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
+      creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
+      creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
     };
     return;
   }
@@ -1181,32 +1238,62 @@
     }
   };
   let creationDraft = null;
+  let planSessionDraft = null;
+  let persistCreationDraft = null;
+  let persistPlanSessionDraft = null;
+  const managedDraftRecoveries = new WeakMap();
+  const managedFormSubmissionState = new WeakMap();
+  const managedFormSubmitButtons = (form) => Array.from(form.querySelectorAll("button")).filter((button) => (
+    (button.type || "submit") === "submit"
+  ));
+  const managedFormRecoveryPending = (form) => Boolean(
+    managedDraftRecoveries.get(form)?.requiresAcknowledgement,
+  );
+  const updateManagedFormSubmitEligibility = (form, changes = {}) => {
+    if (!form) return false;
+    const state = managedFormSubmissionState.get(form) || {uploadReady: true, inFlight: false};
+    Object.assign(state, changes);
+    managedFormSubmissionState.set(form, state);
+    const eligible = creationSubmitEligible({
+      uploadReady: state.uploadReady,
+      recoveryPending: managedFormRecoveryPending(form),
+      inFlight: state.inFlight,
+    });
+    managedFormSubmitButtons(form).forEach((button) => { button.disabled = !eligible; });
+    return eligible;
+  };
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
     let creationUploads = null;
+    const updateCreationSubmitEligibility = (changes = {}) => updateManagedFormSubmitEligibility(form, changes);
     let creationDraftStorage;
     const creationDraftKey = "workspace-portal.creation-draft";
     try { creationDraftStorage = globalThis.sessionStorage; } catch (_) {}
     const saveCreationDraft = () => {
-      try {
-        creationDraftStorage?.setItem(creationDraftKey, JSON.stringify({
-          name: form.elements.name.value, goal: form.elements.goal.value,
-          date: form.elements.creation_date.value,
-          model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
-        }));
-      } catch (_) {}
+      const policy = managedDraftPolicyForStorage(form, {
+        model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
+        team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
+      });
+      const draft = normalizeCreationDraft({
+        name: form.elements.name.value, goal: form.elements.goal.value,
+        date: form.elements.creation_date.value,
+        ...policy,
+      }, "new");
+      if (draft) {
+        creationDraft = draft;
+        storeCreationDraft(creationDraftStorage, creationDraftKey, draft, "new");
+      }
     };
     if (form) {
-      try {
-        const draft = JSON.parse(creationDraftStorage?.getItem(creationDraftKey) || "null");
-        if (draft && typeof draft.name === "string" && typeof draft.goal === "string" &&
-            /^\d{4}-\d{2}-\d{2}$/.test(draft.date)) {
-          creationDraft = draft;
-          form.elements.name.value = draft.name; form.elements.goal.value = draft.goal;
-          form.elements.creation_date.value = draft.date;
-        }
-      } catch (_) {}
+      persistCreationDraft = saveCreationDraft;
+      creationDraft = loadCreationDraft(creationDraftStorage, creationDraftKey, "new");
+      if (creationDraft) {
+        form.elements.name.value = creationDraft.name;
+        form.elements.goal.value = creationDraft.goal;
+        form.elements.creation_date.value = creationDraft.date;
+      }
       form.addEventListener("input", saveCreationDraft);
+      form.addEventListener("change", saveCreationDraft);
     }
     if (form) {
       const uploadRoot = document.getElementById("creation-uploads");
@@ -1226,18 +1313,23 @@
             basePath: scope.url, dropTarget: form, storage,
             controlsRoot: document.getElementById("creation-upload-controls"),
             storageKey: `workspace-portal.upload-draft.${scope.id}`,
-            onChange: ({ready, count}) => { form.elements.goal.required = !count; form.querySelector('button[type="submit"]').disabled = !ready; },
+            onChange: ({ready, count}) => {
+              form.elements.goal.required = !count;
+              updateCreationSubmitEligibility({uploadReady: ready});
+            },
           });
           form.elements.uploadScope.value = scope.id;
           await creationUploads.initialized;
+          updateCreationSubmitEligibility({uploadReady: creationUploads.ready()});
         } catch (error) { uploadRoot.textContent = error.message; uploadRoot.hidden = false; }
       };
       void initCreationUploads();
     }
     form?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (managedFormRecoveryPending(form)) return;
       saveCreationDraft();
-      if (creationUploads && !creationUploads.ready()) { event.preventDefault(); return; }
+      if (!updateCreationSubmitEligibility({uploadReady: !creationUploads || creationUploads.ready()})) return;
       form.querySelectorAll('input[name="attachmentIds"]').forEach((input) => input.remove());
       for (const id of creationUploads?.ids() || []) {
         const input = document.createElement("input"); input.type = "hidden"; input.name = "attachmentIds"; input.value = id; form.append(input);
@@ -1245,8 +1337,7 @@
       creationUploads?.lock(true);
       indexNavigationPending = true;
       if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
-      const button = form.querySelector('button[type="submit"]');
-      if (button) button.disabled = true;
+      updateCreationSubmitEligibility({inFlight: true});
       const progress = document.getElementById("new-session-progress");
       const creationProgress = timedProgress(progress, "Creating session");
       try {
@@ -1267,7 +1358,9 @@
         creationProgress.fail(failure.message);
         indexNavigationPending = false;
         creationUploads?.lock(false);
-        if (button) button.disabled = false;
+        updateCreationSubmitEligibility({
+          inFlight: false, uploadReady: !creationUploads || creationUploads.ready(),
+        });
         void refreshIndexStatus();
       }
     });
@@ -1283,13 +1376,153 @@
   let threadActive = false;
   const modelSelects = Array.from(document.querySelectorAll("[data-model-select]"));
   const effortSelects = Array.from(document.querySelectorAll("[data-effort-select]"));
+  const teamSelects = Array.from(document.querySelectorAll("[data-team-select]"));
+
+  const updateTeamDescription = (teamSelect) => {
+    const description = teamSelect.closest("form")?.querySelector("[data-team-description]");
+    const selected = teamSelect.selectedOptions[0];
+    if (!description || !selected) return;
+    const roles = selected.dataset.roles ? ` Roles: ${selected.dataset.roles}.` : "";
+    const lead = selected.dataset.leadModel && selected.dataset.leadEffort ?
+      ` Lead: ${selected.dataset.leadModel} / ${selected.dataset.leadEffort}.` : "";
+    description.textContent = `${selected.dataset.description || ""}${roles}${lead}`;
+  };
+
+  const applyTeamLeadSettings = (teamSelect) => {
+    const form = teamSelect.closest("form");
+    const selected = teamSelect.selectedOptions[0];
+    const modelSelect = form?.elements.model;
+    const effortSelect = form?.elements.effort;
+    if (!selected || !modelSelect || !effortSelect || !models.length) return;
+    const model = selected.dataset.leadModel || "";
+    if (Array.from(modelSelect.options).some((option) => option.value === model)) modelSelect.value = model;
+    else modelSelect.selectedIndex = -1;
+    populateEfforts(modelSelect, effortSelect, selected.dataset.leadEffort || "");
+    modelSelect.dataset.userEdited = "false";
+    effortSelect.dataset.userEdited = "false";
+  };
+
+  const restoreDraftSelect = (select, value, unavailableLabel) => {
+    if (!select || typeof value !== "string") return;
+    if (!Array.from(select.options).some((option) => option.value === value) && value !== "") {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = unavailableLabel;
+      option.dataset.savedDraftValue = "true";
+      select.append(option);
+    }
+    if (Array.from(select.options).some((option) => option.value === value)) select.value = value;
+  };
+
+  const managedCatalogDigest = (form) => (
+    typeof form?.elements?.catalogDigest?.value === "string" ? form.elements.catalogDigest.value : ""
+  );
+  const managedDraftPolicyForStorage = (form, policy) => {
+    const recovery = managedDraftRecoveries.get(form);
+    if (!recovery?.requiresAcknowledgement) return policy;
+    return {...policy, ...recovery.savedPolicy};
+  };
+  const updateManagedCatalogRecoveryUI = (form, recovery) => {
+    const notice = form.querySelector("[data-team-catalog-changed]");
+    const acknowledgement = form.querySelector("[data-team-catalog-acknowledgement]");
+    const checkbox = form.querySelector("[data-team-catalog-acknowledge]");
+    const pending = recovery.requiresAcknowledgement;
+    if (notice) notice.hidden = !pending;
+    if (acknowledgement) acknowledgement.hidden = !pending;
+    // A newly pending recovery must start unacknowledged.  Do not clear an
+    // acknowledgement while its change handler is completing: that would
+    // immediately undo the user's explicit confirmation.
+    if (checkbox && pending) checkbox.checked = false;
+    updateManagedFormSubmitEligibility(form);
+  };
+  const resetManagedDraftPolicy = (form) => {
+    const team = form.elements.team;
+    if (team) {
+      team.querySelectorAll("[data-saved-draft-value]").forEach((option) => option.remove());
+      const defaultTeam = Array.from(team.options).find((option) => option.defaultSelected) || team.options[0];
+      if (defaultTeam) team.value = defaultTeam.value;
+      updateTeamDescription(team);
+      applyTeamLeadSettings(team);
+    }
+    const model = form.elements.model;
+    const effort = form.elements.effort;
+    if (model) {
+      model.querySelectorAll("[data-saved-draft-value]").forEach((option) => option.remove());
+      if (!form.elements.team && Array.from(model.options).some((option) => option.value === "")) model.value = "";
+    }
+    if (effort) {
+      effort.querySelectorAll("[data-saved-draft-value]").forEach((option) => option.remove());
+      if (!form.elements.team && Array.from(effort.options).some((option) => option.value === "")) effort.value = "";
+    }
+  };
+  const restoreManagedCatalogRecovery = (form, draft) => {
+    if (!form?.elements.team || !form?.elements.catalogDigest || !draft) return null;
+    const currentDigest = managedCatalogDigest(form);
+    const key = `${draft.catalogDigest}\n${currentDigest}`;
+    let recovery = managedDraftRecoveries.get(form);
+    if (!recovery || recovery.key !== key) {
+      const decision = creationDraftCatalogRecovery(draft, currentDigest);
+      recovery = {
+        ...decision, key, acknowledged: false, reset: false,
+        savedPolicy: {
+          team: draft.team, catalogDigest: draft.catalogDigest,
+          model: draft.model, effort: draft.effort,
+        },
+      };
+      managedDraftRecoveries.set(form, recovery);
+    }
+    recovery.requiresAcknowledgement = recovery.catalogChanged && !recovery.acknowledged;
+    if (recovery.requiresAcknowledgement && !recovery.reset) {
+      resetManagedDraftPolicy(form);
+      recovery.reset = true;
+    }
+    updateManagedCatalogRecoveryUI(form, recovery);
+    return recovery;
+  };
+  const acknowledgeManagedCatalogRecovery = (form) => {
+    const recovery = managedDraftRecoveries.get(form);
+    if (!recovery?.requiresAcknowledgement) return;
+    recovery.acknowledged = true;
+    recovery.requiresAcknowledgement = false;
+    updateManagedCatalogRecoveryUI(form, recovery);
+    if (form.id === "new-session-form") persistCreationDraft?.();
+    if (form.id === "plan-session-form") persistPlanSessionDraft?.();
+  };
+
+  const restoreManagedCreationDraft = (form, draft) => {
+    if (!form || !draft) return;
+    const catalogDigest = form.elements.catalogDigest;
+    const recovery = restoreManagedCatalogRecovery(form, draft);
+    if (recovery?.catalogChanged) return;
+    if (catalogDigest && typeof draft.catalogDigest === "string") catalogDigest.value = draft.catalogDigest;
+    restoreDraftSelect(form.elements.team, draft.team, "Saved team is unavailable");
+    if (form.elements.team) updateTeamDescription(form.elements.team);
+    if (!models.length) return;
+    const model = form.elements.model;
+    const effort = form.elements.effort;
+    if (!draft.model || !draft.effort) {
+      applyTeamLeadSettings(form.elements.team);
+      return;
+    }
+    restoreDraftSelect(model, draft.model, "Saved lead model is unavailable");
+    populateEfforts(model, effort, draft.effort);
+    restoreDraftSelect(effort, draft.effort, "Saved lead reasoning effort is unavailable");
+    const selected = form.elements.team?.selectedOptions?.[0];
+    model.dataset.userEdited = String(draft.model !== (selected?.dataset.leadModel || ""));
+    effort.dataset.userEdited = String(draft.effort !== (selected?.dataset.leadEffort || ""));
+  };
+
+  const restoreManagedCreationDrafts = () => {
+    if (creationDraft) restoreManagedCreationDraft(document.getElementById("new-session-form"), creationDraft);
+    if (planSessionDraft) restoreManagedCreationDraft(document.getElementById("plan-session-form"), planSessionDraft);
+  };
 
   const populateEfforts = (modelSelect, effortSelect, selected = "") => {
     if (!effortSelect) return;
     const model = models.find((candidate) => candidate.model === modelSelect.value);
     const existingSettings = modelSelect.dataset.existingSettings === "true";
     effortSelect.replaceChildren();
-    if (!existingSettings) {
+    if (!existingSettings && !effortSelect.required) {
       const fallback = document.createElement("option");
       fallback.value = "";
       fallback.textContent = automaticReasoningLabel(model);
@@ -1302,20 +1535,33 @@
       if (option.description) element.title = option.description;
       effortSelect.append(element);
     }
-    const desired = selected || (existingSettings ? model?.defaultReasoningEffort : "") || "";
+    const desired = selected || effortSelect.dataset.currentValue || model?.defaultReasoningEffort || "";
     if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
       effortSelect.value = desired;
     }
-    effortSelect.disabled = !model || threadActive;
+    effortSelect.disabled = !model || (threadActive && existingSettings);
   };
 
   const applyCurrentSettings = () => {
     modelSelects.forEach((modelSelect, index) => {
       const effortSelect = effortSelects[index];
-      if (currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
+      const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
+      const retainedValue = modelSelect.dataset.currentValue || "";
+      if (retainedValue && Array.from(modelSelect.options).some((option) => option.value === retainedValue)) {
+        modelSelect.value = retainedValue;
+      }
+      if (team && modelSelect.dataset.userEdited !== "true") {
+        if (Array.from(modelSelect.options).some((option) => option.value === team.dataset.leadModel)) {
+          modelSelect.value = team.dataset.leadModel;
+        } else modelSelect.selectedIndex = -1;
+      } else if (!team && currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
         modelSelect.value = currentModel;
       }
-      populateEfforts(modelSelect, effortSelect, currentEffort);
+      // A plan/new-session override is a pending creation choice, not a view
+      // of the source conversation. Preserve both its explicit value and its
+      // intentional empty default across background settings refreshes.
+      populateEfforts(modelSelect, effortSelect, team && effortSelect.dataset.userEdited !== "true" ?
+        team.dataset.leadEffort : effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
       if (modelSelect.dataset.existingSettings === "true") {
         modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
       }
@@ -1330,6 +1576,7 @@
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
+    restoreManagedCreationDrafts();
   };
 
   const loadModels = async () => {
@@ -1341,7 +1588,7 @@
         if (allowDefault) {
           const fallback = document.createElement("option");
           fallback.value = "";
-          fallback.textContent = "GPT-6 Astra (default)";
+          fallback.textContent = "Configured default";
           modelSelect.append(fallback);
         }
         for (const model of models) {
@@ -1357,14 +1604,8 @@
         }
       }
       applyCurrentSettings();
-      if (creationDraft) {
-        const form = document.getElementById("new-session-form");
-        const model = form.elements.model, effort = form.elements.effort;
-        if (typeof creationDraft.model === "string" && Array.from(model.options).some(option => option.value === creationDraft.model)) {
-          model.value = creationDraft.model;
-          populateEfforts(model, effort, typeof creationDraft.effort === "string" ? creationDraft.effort : "");
-        }
-      }
+      applyMemberDefaults();
+      restoreManagedCreationDrafts();
     } catch (_error) {
       for (const modelSelect of modelSelects) {
         modelSelect.replaceChildren();
@@ -1379,8 +1620,49 @@
   };
 
   modelSelects.forEach((modelSelect, index) => {
-    modelSelect.addEventListener("change", () => populateEfforts(modelSelect, effortSelects[index]));
+    modelSelect.addEventListener("change", () => {
+      modelSelect.dataset.userEdited = "true";
+      populateEfforts(modelSelect, effortSelects[index]);
+    });
+    effortSelects[index]?.addEventListener("change", () => {
+      effortSelects[index].dataset.userEdited = "true";
+    });
   });
+  teamSelects.forEach((teamSelect) => {
+    updateTeamDescription(teamSelect);
+    teamSelect.addEventListener("change", () => {
+      updateTeamDescription(teamSelect);
+      applyTeamLeadSettings(teamSelect);
+    });
+  });
+  const memberDefaults = document.getElementById("team-role-defaults");
+  const addMemberForm = document.querySelector('[data-direct-team-form][data-action="add"]');
+  const applyMemberDefaults = () => {
+    if (!memberDefaults || !addMemberForm || !models.length) return;
+    const preset = memberDefaults.dataset.currentPreset || memberDefaults.dataset.defaultPreset;
+    const role = addMemberForm.elements.role.value.trim();
+    const defaults = Array.from(memberDefaults.querySelectorAll("[data-preset][data-role]"))
+      .find((entry) => entry.dataset.preset === preset && entry.dataset.role === role);
+    const modelSelect = addMemberForm.elements.model;
+    const effortSelect = addMemberForm.elements.effort;
+    if (defaults && Array.from(modelSelect.options).some((option) => option.value === defaults.dataset.model)) {
+      modelSelect.value = defaults.dataset.model;
+      populateEfforts(modelSelect, effortSelect, defaults.dataset.effort);
+      return;
+    }
+    // A role absent from this preset has no preset settings: require an explicit
+    // model choice instead of silently taking Codex's global default.
+    modelSelect.selectedIndex = -1;
+    populateEfforts(modelSelect, effortSelect);
+  };
+  addMemberForm?.elements.role?.addEventListener("change", applyMemberDefaults);
+  addMemberForm?.elements.role?.addEventListener("input", applyMemberDefaults);
+  document.querySelectorAll("[data-team-catalog-acknowledge]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) acknowledgeManagedCatalogRecovery(checkbox.closest("form"));
+    });
+  });
+  restoreManagedCreationDrafts();
   if (modelSelects.length) loadModels();
 
   document.addEventListener("click", async (event) => {
@@ -1440,6 +1722,125 @@
     conversationPath: `/api/sessions/${encodeURIComponent(slug)}`,
   }) : null;
   const client = createSessionClient(slug, request, conversation);
+  const directTeamRequest = async (body, method = "POST") => request(
+    `/api/sessions/${encodeURIComponent(slug)}/team`, {
+      method, headers: {"content-type": "application/json"}, body: JSON.stringify(body),
+    },
+  );
+  const teamActionStatus = document.getElementById("team-action-status");
+  const showTeamActionStatus = (message) => {
+    if (!teamActionStatus) return;
+    teamActionStatus.textContent = message;
+    teamActionStatus.hidden = false;
+  };
+  const assignmentStorageKey = (fingerprint) => `direct-team-assignment:${slug}:${fingerprint}`;
+  let assignmentStorage = null;
+  try { assignmentStorage = globalThis.sessionStorage; } catch (_error) {}
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("[data-direct-team-form]");
+    if (!form || !interactive) return;
+    event.preventDefault();
+    const action = form.dataset.action;
+    const status = form.querySelector("[role=status]");
+    const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
+    const value = name => form.elements[name]?.value?.trim() || "";
+    const body = {action, model: value("model"), reasoningEffort: value("effort")};
+    let assignmentFingerprint = "";
+    if (action === "preset") body.preset = value("preset");
+    if (action === "add") body.role = value("role");
+    if (action === "configure") body.address = form.dataset.address;
+    if (action === "assign") {
+      Object.assign(body, {from: "lead", to: value("to"), message: value("message")});
+      assignmentFingerprint = await sha256Hex(JSON.stringify(body));
+      try {
+        if (!assignmentStorage) throw new Error("Session storage is unavailable");
+        const key = assignmentStorageKey(assignmentFingerprint);
+        let messageId = assignmentStorage.getItem(key) || "";
+        if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(messageId)) {
+          messageId = crypto.randomUUID();
+          assignmentStorage.setItem(key, messageId);
+          if (assignmentStorage.getItem(key) !== messageId) throw new Error("Session storage did not retain the assignment ID");
+        }
+        body.messageId = messageId;
+      } catch (_error) {
+        if (status) {
+          status.textContent = "Browser session storage is unavailable; the assignment cannot be submitted safely.";
+          status.hidden = false;
+        }
+        return;
+      }
+    }
+    controls.forEach(control => { control.disabled = true; });
+    if (status) { status.textContent = action === "assign" ? "Sending assignment…" : "Saving team…"; status.hidden = false; }
+    try {
+      await directTeamRequest(body);
+      if (action === "assign") {
+        try {
+          const key = assignmentStorageKey(assignmentFingerprint);
+          assignmentStorage.removeItem(key);
+          if (assignmentStorage.getItem(key) !== null) throw new Error("Session storage retained the assignment ID");
+        } catch (_error) {
+          if (status) status.textContent = "Assignment sent, but its browser retry record could not be cleared.";
+          setTimeout(() => location.reload(), 250);
+          return;
+        }
+      }
+      if (status) status.textContent = action === "assign" ? "Assignment sent." : "Saved.";
+      setTimeout(() => location.reload(), 250);
+    } catch (error) {
+      if (status) status.textContent = error.message;
+      controls.forEach(control => { control.disabled = false; });
+    }
+  });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-team-thread]");
+    if (!button) return;
+    const panel = document.getElementById("team-transcript");
+    const output = panel?.querySelector(".transcript");
+    if (!panel || !output) return;
+    button.disabled = true;
+    output.replaceChildren();
+    const loading = document.createElement("p"); loading.className = "empty"; loading.textContent = "Loading member messages…";
+    output.append(loading); panel.hidden = false;
+    try {
+      const result = await request(`/api/sessions/${encodeURIComponent(slug)}/team-thread?member=${encodeURIComponent(button.dataset.teamThread)}`);
+      output.replaceChildren();
+      for (const entry of result.transcript.entries || []) {
+        if (!entry.text && !entry.displayText) continue;
+        const item = document.createElement("article"); item.className = "message";
+        const heading = document.createElement("strong"); heading.textContent = entry.kind || "message";
+        const text = document.createElement("pre"); text.textContent = entry.text || entry.displayText || "";
+        item.append(heading, text); output.append(item);
+      }
+      if (!output.childElementCount) output.append(Object.assign(document.createElement("p"), {className: "empty", textContent: "This member has no visible messages yet."}));
+    } catch (error) {
+      output.replaceChildren(Object.assign(document.createElement("p"), {className: "notice error", textContent: error.message}));
+    } finally { button.disabled = false; }
+  });
+  document.querySelector("[data-team-transcript-close]")?.addEventListener("click", () => {
+    document.getElementById("team-transcript").hidden = true;
+  });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-team-retry]");
+    if (!button || !interactive) return;
+    button.disabled = true;
+    showTeamActionStatus(`Retrying ${button.dataset.teamRetry}…`);
+    try {
+      await directTeamRequest({action: "retry", address: button.dataset.teamRetry});
+      location.reload();
+    } catch (error) {
+      showTeamActionStatus(error.message);
+      button.disabled = false;
+    }
+  });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-team-remove]");
+    if (!button || !interactive) return;
+    if (!confirm(`Archive ${button.dataset.teamRemove}'s Codex thread and remove it from the active team?`)) return;
+    button.disabled = true;
+    try { await directTeamRequest({action: "remove", address: button.dataset.teamRemove}, "DELETE"); location.reload(); }
+    catch (error) { showTeamActionStatus(error.message); button.disabled = false; }
+  });
   const autoArchiveStatus = document.getElementById("auto-archive-status");
   const autoArchiveHold = document.getElementById("auto-archive-hold");
   const autoArchiveValues = document.getElementById("auto-archive-values");
@@ -1821,6 +2222,7 @@
   let lastRepositoriesHTML = "";
   let lastArtifactsHTML = "";
   let lastClustersHTML = "";
+  let lastTeamHTML = "";
   let releasingCluster = false;
   const refreshSessionDetails = async () => {
     if (detailsRunning || pageReads.paused || document.hidden || !artifactList) return;
@@ -1866,6 +2268,13 @@
           artifactTitle.textContent = "Artifacts";
           artifactDownload.hidden = true;
           artifactPreview.textContent = "Choose an artifact to preview it.";
+        }
+      }
+      if (typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
+        const teamStatus = document.getElementById("team-member-status");
+        if (teamStatus) {
+          teamStatus.innerHTML = payload.teamHTML;
+          lastTeamHTML = payload.teamHTML;
         }
       }
       for (const [section, label, count] of [
@@ -3196,7 +3605,7 @@
       event.preventDefault();
       await submitMessage(false);
     });
-    queueButton.addEventListener("click", () => submitMessage(true));
+    queueButton?.addEventListener("click", () => submitMessage(true));
     interruptButton.addEventListener("click", async () => {
       try {
         await client.interrupt();
@@ -3286,36 +3695,92 @@
   const planSessionDialog = document.getElementById("plan-session-dialog");
   const planSessionForm = document.getElementById("plan-session-form");
   let planSessionSnapshot = null;
+  let planSessionDraftStorage = null;
+  let planSessionCreationInFlight = false;
+  try { planSessionDraftStorage = globalThis.sessionStorage; } catch (_) {}
+  const planSessionIsManaged = () => Boolean(planSessionForm?.elements.team);
+  const updatePlanSessionSubmitEligibility = () => updateManagedFormSubmitEligibility(
+    planSessionForm, {uploadReady: true, inFlight: planSessionCreationInFlight},
+  );
+  const savePlanSessionDraft = () => {
+    if (!planSessionForm || !planSessionSnapshot) return;
+    const policy = managedDraftPolicyForStorage(planSessionForm, {
+      model: planSessionForm.elements.model?.value || "",
+      effort: planSessionForm.elements.effort?.value || "",
+      team: planSessionForm.elements.team?.value || "",
+      catalogDigest: planSessionForm.elements.catalogDigest?.value || "",
+    });
+    const draft = normalizeCreationDraft({
+      name: planSessionForm.elements.name.value,
+      date: planSessionForm.elements.creationDate.value,
+      ...policy,
+    }, "plan");
+    if (draft) {
+      planSessionDraft = draft;
+      storeCreationDraft(planSessionDraftStorage, planSessionDraftKey(slug, planSessionSnapshot), draft, "plan");
+    }
+  };
+  persistPlanSessionDraft = savePlanSessionDraft;
   document.getElementById("plan-implement-new")?.addEventListener("click", () => {
     planSessionSnapshot = {
       planTurnId: planActions.dataset.planTurnId,
       planSha256: planActions.dataset.planSha256,
       planText: planActions.planText,
-      model: currentModel,
-      reasoningEffort: currentEffort,
     };
+    if (!planSessionIsManaged()) {
+      planSessionSnapshot.model = currentModel;
+      planSessionSnapshot.reasoningEffort = currentEffort;
+    }
+    planSessionDraft = loadCreationDraft(
+      planSessionDraftStorage, planSessionDraftKey(slug, planSessionSnapshot), "plan",
+    );
+    managedDraftRecoveries.delete(planSessionForm);
+    if (planSessionDraft) {
+      planSessionForm.elements.name.value = planSessionDraft.name;
+      planSessionForm.elements.creationDate.value = planSessionDraft.date;
+      restoreManagedCreationDrafts();
+    }
+    updatePlanSessionSubmitEligibility();
     planSessionDialog.showModal();
   });
   planSessionDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => planSessionDialog.close());
+  planSessionForm?.addEventListener("input", savePlanSessionDraft);
+  planSessionForm?.addEventListener("change", savePlanSessionDraft);
   planSessionForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const controls = Array.from(planSessionForm.querySelectorAll("button, input"));
+    if (managedFormRecoveryPending(planSessionForm)) return;
+    savePlanSessionDraft();
+    if (!updatePlanSessionSubmitEligibility()) return;
+    const controls = Array.from(planSessionForm.querySelectorAll("button, input, select"));
     controls.forEach((control) => { control.disabled = true; });
+    planSessionCreationInFlight = true;
+    updatePlanSessionSubmitEligibility();
     const progress = timedProgress(
       document.getElementById("plan-session-progress"), "Creating session",
     );
     try {
+      const managed = planSessionIsManaged();
+      const settings = planSessionCreationSettings(managed, planSessionSnapshot, {
+        team: planSessionForm.elements.team?.value || "",
+        catalogDigest: planSessionForm.elements.catalogDigest?.value || "",
+        model: planSessionForm.elements.model?.value || "",
+        effort: planSessionForm.elements.effort?.value || "",
+      });
       const result = await client.implementPlan({
         action: "new",
         ...planSessionSnapshot,
         name: planSessionForm.elements.name.value,
         creationDate: planSessionForm.elements.creationDate.value,
+        ...settings,
       });
+      try { planSessionDraftStorage?.removeItem(planSessionDraftKey(slug, planSessionSnapshot)); } catch (_) {}
       progress.stop();
       location.assign(result.url);
     } catch (error) {
       progress.fail(error.message);
       controls.forEach((control) => { control.disabled = false; });
+      planSessionCreationInFlight = false;
+      updatePlanSessionSubmitEligibility();
     }
   });
 

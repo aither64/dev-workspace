@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'dev_session/automatic_archive_test'
+require_relative 'dev_session/agent_team_creation_test'
 require_relative 'dev_session/lifecycle_commands_test'
 require_relative 'dev_session/fork_receipts_test'
 require_relative 'dev_session/fork_recovery_test'

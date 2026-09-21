@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'digest'
 require 'json'
 require 'open3'
 require 'optparse'
@@ -58,7 +59,45 @@ module DevWorkspaceHost
     raise 'workspace runtime contract must map each lifecycle command to one unique journal'
   end
 
+  AGENT_TEAM_REGISTRATION = RUNTIME_CONTRACT.fetch('agentTeamRegistration')
+  unless AGENT_TEAM_REGISTRATION.is_a?(Hash) &&
+         AGENT_TEAM_REGISTRATION.keys.sort == %w[
+           helperSchema markerSchema maxOutputBytes maxPersistedScalarBytes migrationJournalSuffix pendingSchema policy
+         ] &&
+         AGENT_TEAM_REGISTRATION.fetch('helperSchema') == 1 &&
+         AGENT_TEAM_REGISTRATION.fetch('policy') == 1 &&
+         AGENT_TEAM_REGISTRATION.fetch('markerSchema') == 1 &&
+         AGENT_TEAM_REGISTRATION.fetch('pendingSchema') == 1 &&
+         AGENT_TEAM_REGISTRATION.fetch('maxPersistedScalarBytes').is_a?(Integer) &&
+         AGENT_TEAM_REGISTRATION.fetch('maxPersistedScalarBytes').positive? &&
+         AGENT_TEAM_REGISTRATION.fetch('maxOutputBytes') == 4 * 1024 * 1024 &&
+         AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix') == '.agent-teams-migration.json'
+    raise 'workspace runtime contract has an invalid agent team registration contract'
+  end
+  AGENT_TEAM_REGISTRATION.freeze
+  AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES = AGENT_TEAM_REGISTRATION.fetch('maxPersistedScalarBytes')
+  REGISTRATION_OUTPUT_MAX_BYTES = AGENT_TEAM_REGISTRATION.fetch('maxOutputBytes')
+  REGISTRATION_ARGV_MAX_BYTES = 256 * 1024
+  REGISTRATION_MAX_STATES = 512
+  REGISTRATION_MAX_ID_BYTES = 512
+  SHA256_HEX = /\A[0-9a-f]{64}\z/
+  PORTAL_CREATION_RECEIPT_NAME = /\A([A-Za-z0-9][A-Za-z0-9_-]*)\.json\z/
+  PORTAL_CREATION_EVIDENCE_NAME = /\A[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{64}\.complete\.json\z/
+
   class Error < StandardError; end
+
+  class StrictJSONHash < Hash
+    def []=(key, value)
+      raise JSON::ParserError, "JSON object contains a duplicate key: #{key}" if key?(key)
+
+      super
+    end
+  end
+
+  RegistrationPlan = Struct.new(
+    :package_root, :argv, :digest, :policy, :required_native_child_threads,
+    :states, keyword_init: true
+  )
 
   class ExtensionCatalog
     attr_reader :commands, :skills, :cluster_providers
@@ -547,7 +586,7 @@ module DevWorkspaceHost
       )
       candidates = output.lines.map(&:strip).reject(&:empty?).uniq
       raise Error, "workspace build returned #{candidates.length} package paths" unless candidates.length == 1
-      candidate = candidates.fetch(0)
+      candidate = File.realpath(candidates.fetch(0))
       candidate_host = File.join(candidate, 'bin/workspace-host')
       raise Error, "workspace package has no workspace-host command: #{candidate}" unless File.executable?(candidate_host)
       require_compatible_development_cluster_helpers!(candidate)
@@ -558,10 +597,18 @@ module DevWorkspaceHost
         system! candidate_host, 'check-codex', '--codex', @system_codex
       end
 
-      original_generation = profile_generation if File.symlink?(@profile)
-      original_codex = current_codex
+      candidate_plans = registration_plans(package: candidate)
+      probe_registration_plans!(File.realpath(@system_codex), candidate_plans)
+      quiesced = []
+      begin
+        quiesced = quiesce_sessions
+      rescue Error
+        write_pending_codex_update(candidate, File.realpath(@system_codex), candidate_plans)
+        raise
+      end
       begin
         stop_auto_archive_services
+        write_pending_codex_update(candidate, File.realpath(@system_codex), candidate_plans)
         FileUtils.mkdir_p(File.dirname(@profile), mode: 0o700)
         unless File.symlink?(@profile) && File.realpath(@profile) == candidate
           system! 'nix-env', '--profile', @profile, '--set', candidate
@@ -572,22 +619,29 @@ module DevWorkspaceHost
         install_links(package: candidate)
         activate_installed(candidate_host)
       rescue StandardError => transition_error
-        if original_generation
-          failed_generation = profile_generation
-          failed_generation = nil if failed_generation == original_generation
-          begin
-            compensate_profile_transition(
-              original_generation,
-              original_codex,
-              discard_generation: failed_generation
-            )
-          rescue StandardError => compensation_error
-            raise Error,
-                  "#{transition_error.message}; failed to restore workspace generation " \
-                  "#{original_generation}: #{compensation_error.message}"
-          end
+        if profile_selects_package?(candidate)
+          # The selected generation, its retained roots, and the pending JSON
+          # record are the only safe recovery target. Do not revive an older
+          # package after a forward transition has selected it. This verifies
+          # the profile link after the failing operation instead of trusting a
+          # local flag: nix-env can replace the link before reporting failure,
+          # and a retry may already be running from that selected package.
+          raise Error,
+                "workspace package transition remains on the selected forward package: " \
+                "#{transition_error.message}"
         end
-        raise
+        clear_pending_codex_update
+        reraise_after_terminal_restoration(transition_error, quiesced)
+      end
+      wait_for_codex_sockets
+      verify_registration_semantics!(candidate_plans, File.realpath(@system_codex))
+      clear_pending_codex_update
+      begin
+        restore_quiesced_sessions(quiesced, package: candidate)
+      rescue StandardError => restore_error
+        raise Error,
+              "workspace package transition completed, but terminal clients need dev-session sync: " \
+              "#{restore_error.message}"
       end
       @out.puts "workspace package: #{candidate}"
     end
@@ -606,8 +660,9 @@ module DevWorkspaceHost
       reconcile_codex_update(defer_busy: true)
       configure_auto_archive_services
     rescue StandardError => primary_error
-      # A pre-feature initiator cannot clean up these units when candidate
-      # activation fails. Undo them here before its profile compensation runs.
+      # The initiator cannot clean up units installed by the selected package
+      # when activation fails. Remove only those units; profile rollback is
+      # deliberately unavailable once a forward transition has selected it.
       raise primary_error unless File.symlink?(File.join(@home, '.config/systemd/user/workspace-auto-archive@.timer'))
 
       recovery_errors = []
@@ -628,89 +683,9 @@ module DevWorkspaceHost
 
     def rollback(argv)
       raise Error, 'rollback takes no arguments' unless argv.empty?
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package rollback')
-      original_generation = profile_generation
-      original_codex = File.realpath(active_codex)
-      target_generation = previous_profile_generation
-      target_profile = profile_generation_path(target_generation)
-      require_compatible_development_cluster_helpers!(target_profile)
-      require_compatible_runtime_authorities!(target_profile)
-      target_codex = generation_codex(target_generation)
-      target_host = File.join(target_profile, 'bin/workspace-host')
-      unless File.executable?(target_host)
-        raise Error, "workspace profile generation has no workspace-host command: #{target_generation}"
-      end
-      raise Error, "workspace profile generation has no retained Codex: #{target_generation}" unless target_codex
-      system! target_host, 'check-codex', '--codex', target_codex
-      quiesced = quiesce_sessions
-      begin
-        stop_auto_archive_services
-        system! 'nix-env', '--profile', @profile, '--rollback'
-        unless profile_generation == target_generation
-          raise Error, "nix-env selected an unexpected workspace profile generation"
-        end
-        adopt_codex(target_codex)
-        install_links(package: target_profile)
-        system! 'systemctl', '--user', 'daemon-reload'
-        system! 'systemctl', '--user', 'restart', 'workspace-router.service'
-        restart_codex_consumers
-        wait_for_codex_sockets
-        configure_auto_archive_services(package: target_profile)
-      rescue StandardError => transition_error
-        compensation_error = nil
-        begin
-          compensate_profile_transition(original_generation, original_codex)
-        rescue StandardError => error
-          compensation_error = error
-        end
-        restoration_error = nil
-        begin
-          restore_quiesced_sessions(quiesced, package: package_root)
-        rescue StandardError => error
-          restoration_error = error
-        end
-        if compensation_error || restoration_error
-          details = [transition_error.message]
-          if compensation_error
-            details << "failed to restore workspace generation " \
-                       "#{original_generation}: #{compensation_error.message}"
-          end
-          details << restoration_error.message if restoration_error
-          raise Error, details.join('; ')
-        end
-        raise
-      end
-      begin
-        restore_quiesced_sessions(quiesced, package: target_profile)
-      rescue StandardError => restore_error
-        raise Error,
-              "workspace package rollback completed, but terminal clients need " \
-              "dev-session sync: #{restore_error.message}"
-      end
-      @out.puts "workspace package: #{File.realpath(@profile)}"
-    end
-
-    def compensate_profile_transition(generation, codex, discard_generation: nil)
-      stop_auto_archive_services
-      system! 'nix-env', '--profile', @profile, '--switch-generation', generation.to_s
-      adopt_codex(codex)
-      retain_codex_for_generation(generation, codex)
-      install_links(package: profile_generation_path(generation))
-      system! 'systemctl', '--user', 'daemon-reload'
-      system! 'systemctl', '--user', 'restart', 'workspace-router.service'
-      restart_codex_consumers
-      wait_for_codex_sockets
-      configure_auto_archive_services(package: profile_generation_path(generation))
-      discard_profile_generation(discard_generation) if discard_generation
-    end
-
-    def discard_profile_generation(generation)
-      codex_root = File.join(@state, 'codex/generations', generation.to_s)
-      if File.exist?(codex_root) && !File.symlink?(codex_root)
-        raise Error, "Codex generation root is not a symlink: #{codex_root}"
-      end
-      system! 'nix-env', '--profile', @profile, '--delete-generations', generation.to_s
-      File.unlink(codex_root) if File.symlink?(codex_root)
+      raise Error,
+            'workspace package rollback is unavailable: pinned agent-team registration is forward-only; ' \
+            'switch to a newer package to recover'
     end
 
     def suspend(argv)
@@ -1041,10 +1016,15 @@ module DevWorkspaceHost
         '--host-label', workspace.fetch('hostLabel'),
         '--unix-socket', runtime.fetch(:portal), '--dev-session', File.join(package_root, 'bin/dev-session'),
         '--authority-dir', runtime.fetch(:authority), '--user-state-root', @state,
+        '--package-root', package_root, '--workspace-name', entry.fetch('name'),
+        '--registration-marker', registration_marker_path(entry),
         '--codex-socket', runtime.fetch(:codex),
         '--host-profile', @profile, '--transition-lock', transition_lock_file,
         '--codex-version', codex_version(active_codex), '--tmux', find_command('tmux')
       ]
+      entry.fetch('aliases').each do |hostname|
+        arguments.concat(['--trusted-origin', "https://#{hostname}"])
+      end
       unless workspace.fetch('sshHost').empty?
         arguments.concat(['--ssh-host', workspace.fetch('sshHost')])
       end
@@ -1102,7 +1082,378 @@ module DevWorkspaceHost
       entry = instance_argument(argv, 'run-codex')
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
-      exec(active_codex, 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+      codex = File.realpath(active_codex)
+      plan = registration_plan_for(entry, package: package_root)
+      write_registration_marker(entry, codex, plan)
+      exec(codex, *plan.argv, 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+    end
+
+    # The package helper is the sole catalog, retained-root, and state reader.
+    # This boundary only validates its bounded transport result before it is
+    # ever appended to a Codex argv.
+    def registration_plan_for(entry, package: package_root)
+      package = File.realpath(package)
+      data = run_registration_helper(package, entry)
+      decode_registration_plan(data, entry, package)
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+      raise Error, "cannot resolve agent team registration: #{e.message}"
+    end
+
+    def registration_plans(package: package_root, entries: registry.entries)
+      entries.sort_by { |entry| entry.fetch('name') }.map do |entry|
+        [entry, registration_plan_for(entry, package:)]
+      end
+    end
+
+    def run_registration_helper(package, entry)
+      command = [
+        File.join(package, 'bin/workspace-portal'), 'agent-teams', 'registration',
+        '--package-root', package, '--state-root', @state, '--workspace', entry.fetch('root')
+      ]
+      raise Error, "workspace package has no registration helper: #{command.first}" unless File.executable?(command.first)
+
+      stdin, stdout, stderr, waiter = Open3.popen3(*command)
+      stdin.binmode
+      stdin.write("{\"schema\":1}\n")
+      stdin.close
+      output_reader = Thread.new { stdout.read(REGISTRATION_OUTPUT_MAX_BYTES + 1) }
+      error_reader = Thread.new do
+        captured = +''
+        loop do
+          chunk = stderr.readpartial(16 * 1024)
+          remaining = 64 * 1024 - captured.bytesize
+          captured << chunk.byteslice(0, remaining) if remaining.positive?
+        end
+      rescue EOFError
+        captured
+      end
+      output = output_reader.value
+      if output.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
+        begin
+          Process.kill('TERM', waiter.pid)
+        rescue Errno::ESRCH
+          nil
+        end
+      end
+      status = waiter.value
+      error = error_reader.value
+      if output.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
+        raise Error, "agent team registration helper exceeded #{REGISTRATION_OUTPUT_MAX_BYTES} bytes"
+      end
+      unless status.success?
+        detail = error.strip
+        detail = output.strip if detail.empty?
+        raise Error,
+              "agent team registration helper failed: #{command.map(&:shellescape).join(' ')}" \
+              "#{detail.empty? ? '' : "\n#{detail}"}"
+      end
+      output
+    ensure
+      stdin&.close unless stdin&.closed?
+      stdout&.close unless stdout&.closed?
+      stderr&.close unless stderr&.closed?
+    end
+
+    def decode_registration_plan(data, entry, package)
+      object = parse_strict_json_object(data, 'agent team registration helper output', REGISTRATION_OUTPUT_MAX_BYTES)
+      expected = %w[argv digest policy required_native_child_threads schema states]
+      unless object.keys.sort == expected && object['schema'] == AGENT_TEAM_REGISTRATION.fetch('helperSchema')
+        raise Error, 'agent team registration helper returned an invalid schema'
+      end
+      argv = object.fetch('argv')
+      digest = object.fetch('digest')
+      policy = object.fetch('policy')
+      capacity = object.fetch('required_native_child_threads')
+      states = object.fetch('states')
+      validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:)
+      RegistrationPlan.new(
+        package_root: package, argv:, digest:, policy:, required_native_child_threads: capacity, states:
+      )
+    end
+
+    def validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:)
+      unless digest.is_a?(String) && digest.match?(SHA256_HEX) &&
+             policy == AGENT_TEAM_REGISTRATION.fetch('policy') &&
+             capacity.is_a?(Integer) && capacity.between?(0, 64)
+        raise Error, 'agent team registration helper returned invalid semantic metadata'
+      end
+      unless argv.is_a?(Array) && argv.length.even? && argv.each_slice(2).all? do |flag, value|
+               flag == '-c' && valid_registration_argv_value?(value)
+             end && argv.sum { |value| value.bytesize + 1 } <= REGISTRATION_ARGV_MAX_BYTES
+        raise Error, 'agent team registration helper returned an invalid argv'
+      end
+      validate_registration_inventory!(states, entry)
+    end
+
+    def valid_registration_argv_value?(value)
+      value.is_a?(String) && !value.empty? && !value.include?("\0") && value.start_with?('agents.')
+    end
+
+    def validate_registration_inventory!(states, entry)
+      unless states.is_a?(Array) && states.length <= REGISTRATION_MAX_STATES
+        raise Error, 'agent team registration helper returned an invalid state inventory'
+      end
+      prior = nil
+      slugs = {}
+      states.each do |state|
+        unless valid_registered_state?(state, entry)
+          raise Error, 'agent team registration helper returned an invalid state inventory'
+        end
+        key = [state.fetch('slug'), state.fetch('creation_identity')]
+        if prior && (key <=> prior) <= 0 || slugs[key.first]
+          raise Error, 'agent team registration helper returned an unsorted or duplicate state inventory'
+        end
+        prior = key
+        slugs[key.first] = true
+      end
+    end
+
+    def valid_registered_state?(state, entry)
+      return false unless state.is_a?(Hash) && state.keys.sort == %w[
+        catalog creation_identity removal_epoch root_thread_id selection_revision slug state_revision workspace
+      ]
+      return false unless state.fetch('workspace') == entry.fetch('root') &&
+                          state.fetch('state_revision').is_a?(Integer) && state.fetch('state_revision').positive? &&
+                          state.fetch('selection_revision').is_a?(Integer) && state.fetch('selection_revision').positive? &&
+                          state.fetch('selection_revision') <= state.fetch('state_revision') &&
+                          valid_session_identity?(state.fetch('slug')) && valid_opaque_registration_id?(state.fetch('root_thread_id')) &&
+                          state.fetch('removal_epoch').is_a?(String) && state.fetch('removal_epoch').match?(SHA256_HEX) &&
+                          state.fetch('creation_identity').is_a?(String) && state.fetch('creation_identity').match?(SHA256_HEX)
+
+      valid_registration_catalog_pin?(state.fetch('catalog'))
+    end
+
+    def valid_registration_catalog_pin?(pin)
+      return false unless pin.is_a?(Hash) && pin.keys.sort == %w[
+        capacity catalog_digest catalog_path generator metadata_schema native_adapter package_path schema_version
+      ]
+      capacity = pin.fetch('capacity')
+      generator = pin.fetch('generator')
+      adapter = pin.fetch('native_adapter')
+      pin.fetch('package_path').is_a?(String) && canonical_absolute_path?(pin.fetch('package_path')) &&
+        pin.fetch('catalog_path').is_a?(String) && !pin.fetch('catalog_path').empty? && !pin.fetch('catalog_path').include?("\0") &&
+        pin.fetch('catalog_digest').is_a?(String) && pin.fetch('catalog_digest').match?(SHA256_HEX) &&
+        pin.fetch('schema_version').is_a?(Integer) && pin.fetch('schema_version').positive? &&
+        pin.fetch('metadata_schema').is_a?(Integer) && pin.fetch('metadata_schema').positive? &&
+        capacity.is_a?(Hash) && capacity.keys == ['required_native_child_threads'] &&
+        capacity.fetch('required_native_child_threads').is_a?(Integer) && capacity.fetch('required_native_child_threads').between?(1, 64) &&
+        valid_registration_generator?(generator) && valid_registration_adapter?(adapter)
+    end
+
+    def valid_registration_generator?(generator)
+      generator.is_a?(Hash) && generator.keys.sort == %w[canonicalization identity version] &&
+        valid_bounded_registration_string?(generator.fetch('identity'), 256) &&
+        generator.fetch('version').is_a?(Integer) && generator.fetch('version').positive? &&
+        valid_bounded_registration_string?(generator.fetch('canonicalization'), 256)
+    end
+
+    def valid_registration_adapter?(adapter)
+      adapter.is_a?(Hash) && adapter.keys.sort == %w[identity version] &&
+        valid_bounded_registration_string?(adapter.fetch('identity'), 256) &&
+        adapter.fetch('version').is_a?(Integer) && adapter.fetch('version').positive?
+    end
+
+    def valid_session_identity?(value)
+      value.is_a?(String) && value.bytesize <= 256 && value.match?(/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/)
+    end
+
+    def valid_opaque_registration_id?(value)
+      return false unless valid_bounded_registration_string?(value, REGISTRATION_MAX_ID_BYTES)
+
+      value.each_codepoint.none? { |codepoint| codepoint <= 0x1f || codepoint == 0x7f }
+    end
+
+    def valid_bounded_registration_string?(value, maximum)
+      value.is_a?(String) && !value.empty? && value.valid_encoding? && value.bytesize <= maximum && !value.include?("\0")
+    end
+
+    def canonical_absolute_path?(value)
+      value.is_a?(String) && !value.include?("\0") && Pathname.new(value).absolute? && File.expand_path(value) == value
+    end
+
+    def registration_marker_path(entry)
+      File.join(instance_runtime(entry).fetch(:root), 'registration.json')
+    end
+
+    def registration_inventory_path(entry)
+      File.join(instance_runtime(entry).fetch(:root), 'registration-inventory.json')
+    end
+
+    def write_registration_marker(entry, codex, plan)
+      unless canonical_absolute_path?(codex) && canonical_absolute_path?(plan.package_root)
+        raise Error, 'cannot write an invalid agent team registration marker'
+      end
+      validate_registration_values!(
+        argv: plan.argv, digest: plan.digest, policy: plan.policy,
+        capacity: plan.required_native_child_threads, states: plan.states, entry:
+      )
+      ensure_private_instance_runtime!(entry)
+      path = registration_marker_path(entry)
+      require_safe_private_file_or_absent!(path, 'agent team registration marker')
+      marker = registration_marker(entry, codex, plan)
+      atomic_private_file(path, JSON.generate(marker) + "\n")
+      write_registration_inventory(entry, plan)
+    end
+
+    def registration_marker(entry, codex, plan)
+      {
+        'schema' => AGENT_TEAM_REGISTRATION.fetch('markerSchema'),
+        'workspace' => { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') },
+        'launch' => {
+          'codex_path' => codex, 'package_root' => plan.package_root, 'policy' => plan.policy,
+          'digest' => plan.digest, 'argv' => plan.argv,
+          'required_native_child_threads' => plan.required_native_child_threads
+        },
+      }
+    end
+
+    def registration_inventory(entry, plan)
+      {
+        'schema' => AGENT_TEAM_REGISTRATION.fetch('markerSchema'),
+        'workspace' => { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') },
+        'package_root' => plan.package_root,
+        'states' => plan.states
+      }
+    end
+
+    # The launch marker is immutable evidence of the exact App Server argv.
+    # Inventory changes do not rewrite it: a later refresh cannot erase a
+    # concurrently published launch record.
+    def write_registration_inventory(entry, plan)
+      ensure_private_instance_runtime!(entry)
+      validate_registration_inventory!(plan.states, entry)
+      path = registration_inventory_path(entry)
+      require_safe_private_file_or_absent!(path, 'agent team registration inventory')
+      atomic_private_file(path, JSON.generate(registration_inventory(entry, plan)) + "\n")
+    end
+
+    def load_registration_marker(entry)
+      return nil unless private_instance_runtime_exists?(entry)
+
+      path = registration_marker_path(entry)
+      return nil unless File.exist?(path) || File.symlink?(path)
+
+      require_safe_private_file!(path, 'agent team registration marker')
+      data = File.binread(path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
+      return :malformed if data.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
+
+      decode_registration_marker(data, entry)
+    end
+
+    def decode_registration_marker(data, entry)
+      marker = parse_strict_json_object(data, 'agent team registration marker', REGISTRATION_OUTPUT_MAX_BYTES)
+      return :malformed unless marker.keys.sort == %w[launch schema workspace] &&
+                               marker['schema'] == AGENT_TEAM_REGISTRATION.fetch('markerSchema') &&
+                               marker['workspace'].is_a?(Hash) &&
+                               marker['workspace'] == { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') }
+      launch = marker['launch']
+      return :malformed unless launch.is_a?(Hash) && launch.keys.sort == %w[
+        argv codex_path digest package_root policy required_native_child_threads
+      ] && canonical_absolute_path?(launch['codex_path']) && canonical_absolute_path?(launch['package_root'])
+      validate_registration_values!(
+        argv: launch['argv'], digest: launch['digest'], policy: launch['policy'],
+        capacity: launch['required_native_child_threads'], states: [], entry:
+      )
+      marker
+    rescue Error
+      :malformed
+    end
+
+    def marker_has_semantics?(marker, codex, plan)
+      marker.is_a?(Hash) && marker.dig('launch', 'codex_path') == codex &&
+        marker.dig('launch', 'digest') == plan.digest
+    end
+
+    def marker_matches_plan?(entry, marker, codex, plan)
+      marker_has_semantics?(marker, codex, plan) &&
+        marker.dig('launch', 'package_root') == plan.package_root &&
+        marker.dig('launch', 'policy') == plan.policy && marker.dig('launch', 'argv') == plan.argv &&
+        marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads &&
+        registration_inventory_matches?(entry, plan)
+    end
+
+    def load_registration_inventory(entry)
+      return nil unless private_instance_runtime_exists?(entry)
+
+      path = registration_inventory_path(entry)
+      return nil unless File.exist?(path) || File.symlink?(path)
+
+      require_safe_private_file!(path, 'agent team registration inventory')
+      data = File.binread(path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
+      return :malformed if data.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
+
+      decode_registration_inventory(data, entry)
+    end
+
+    def decode_registration_inventory(data, entry)
+      inventory = parse_strict_json_object(data, 'agent team registration inventory', REGISTRATION_OUTPUT_MAX_BYTES)
+      return :malformed unless inventory.keys.sort == %w[package_root schema states workspace] &&
+                               inventory['schema'] == AGENT_TEAM_REGISTRATION.fetch('markerSchema') &&
+                               inventory['workspace'] == { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') } &&
+                               canonical_absolute_path?(inventory['package_root'])
+      validate_registration_inventory!(inventory['states'], entry)
+      inventory
+    rescue Error
+      :malformed
+    end
+
+    def registration_inventory_matches?(entry, plan)
+      inventory = load_registration_inventory(entry)
+      inventory.is_a?(Hash) && inventory['package_root'] == plan.package_root && inventory['states'] == plan.states
+    end
+
+    def refresh_registration_inventory(entry, plan)
+      write_registration_inventory(entry, plan)
+    end
+
+    def parse_strict_json_object(data, label, maximum)
+      raise Error, "#{label} exceeds #{maximum} bytes" if data.bytesize > maximum
+
+      parsed = JSON.parse(data, create_additions: false, object_class: StrictJSONHash)
+      raise Error, "#{label} must be a JSON object" unless parsed.is_a?(Hash)
+
+      parsed
+    rescue JSON::ParserError => e
+      raise Error, "invalid #{label}: #{e.message}"
+    end
+
+    def require_safe_private_file_or_absent!(path, label)
+      return unless File.exist?(path) || File.symlink?(path)
+
+      require_safe_private_file!(path, label)
+    end
+
+    def require_safe_private_file!(path, label)
+      raise Error, "#{label} is a symlink: #{path}" if File.symlink?(path)
+
+      stat = File.lstat(path)
+      unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o600
+        raise Error, "#{label} is not an owned mode-0600 regular file: #{path}"
+      end
+    end
+
+    def ensure_private_instance_runtime!(entry)
+      root = instance_runtime(entry).fetch(:root)
+      FileUtils.mkdir_p(root, mode: 0o700)
+      require_private_instance_runtime!(root)
+      root
+    end
+
+    def private_instance_runtime_exists?(entry)
+      root = instance_runtime(entry).fetch(:root)
+      return false unless File.exist?(root) || File.symlink?(root)
+
+      require_private_instance_runtime!(root)
+      true
+    end
+
+    def require_private_instance_runtime!(root)
+      raise Error, "workspace runtime is a symlink: #{root}" if File.symlink?(root)
+
+      stat = File.lstat(root)
+      unless stat.directory? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
+        raise Error, "workspace runtime is not an owned mode-0700 directory: #{root}"
+      end
     end
 
     def run_tmux(argv)
@@ -1174,7 +1525,7 @@ module DevWorkspaceHost
       end
       parser.parse!(argv)
       raise Error, 'reconcile-codex takes only --pending-only' unless argv.empty?
-      return if pending_only && !pending_codex_update?
+      return if pending_only && pending_codex_update.nil?
 
       require_no_unfinished_lifecycle_operations!(operation: 'Codex reconciliation')
 
@@ -1183,19 +1534,31 @@ module DevWorkspaceHost
 
     def reconcile_codex_update(defer_busy:)
       adopted = File.realpath(@system_codex)
-      previous = File.realpath(active_codex)
-      if previous == adopted
+      active = File.realpath(active_codex)
+      package = File.realpath(package_root)
+      pending = pending_codex_update
+      if pending && pending.fetch('package_root') != package
+        raise Error,
+              'Codex reconciliation pending record targets a different package; ' \
+              'complete the selected forward package transition first'
+      end
+      plans = registration_plans(package:)
+      restart_required = active != adopted || registration_restart_required?(plans, adopted)
+      unless restart_required
+        plans.each do |entry, plan|
+          refresh_registration_inventory(entry, plan)
+        end
         clear_pending_codex_update
         return true
       end
 
-      clear_pending_codex_update unless pending_codex_update?(adopted)
       check_codex(adopted)
+      probe_registration_plans!(adopted, plans)
       quiesced = []
       begin
         quiesced = quiesce_sessions
       rescue Error => e
-        write_pending_codex_update(adopted)
+        write_pending_codex_update(package, adopted, plans)
         message = "Codex update is waiting for idle sessions: #{e.message.lines.first.to_s.strip}"
         if defer_busy
           @out.puts message
@@ -1205,34 +1568,16 @@ module DevWorkspaceHost
       end
 
       begin
+        write_pending_codex_update(package, adopted, plans)
         adopt_codex(adopted)
         restart_codex_consumers
         wait_for_codex_sockets
+        verify_registration_markers!(plans, adopted)
         retain_codex_for_generation(profile_generation, adopted)
       rescue StandardError => transition_error
-        compensation_error = nil
-        begin
-          adopt_codex(previous)
-          retain_codex_for_generation(profile_generation, previous)
-          restart_codex_consumers
-          wait_for_codex_sockets
-        rescue StandardError => error
-          compensation_error = error
-        end
-        restoration_error = nil
-        begin
-          restore_quiesced_sessions(quiesced)
-        rescue StandardError => error
-          restoration_error = error
-        end
-        details = [transition_error.message]
-        if compensation_error
-          details << "failed to restore the previous Codex: #{compensation_error.message}"
-        end
-        if restoration_error
-          details << "failed to restore terminal clients: #{restoration_error.message}"
-        end
-        raise Error, details.join('; ')
+        # The selected package and its pending target are durable forward
+        # recovery evidence. Never start an older package after a mutation.
+        raise Error, "Codex reconciliation remains pending forward recovery: #{transition_error.message}"
       end
       clear_pending_codex_update
       begin
@@ -1246,6 +1591,64 @@ module DevWorkspaceHost
               "#{restore_error.message}"
       end
       true
+    end
+
+    def registration_restart_required?(plans, codex)
+      plans.any? do |entry, plan|
+        !marker_has_semantics?(load_registration_marker(entry), codex, plan)
+      end
+    end
+
+    def verify_registration_markers!(plans, codex)
+      invalid = plans.filter_map do |entry, plan|
+        entry.fetch('name') unless marker_matches_plan?(entry, load_registration_marker(entry), codex, plan)
+      end
+      return if invalid.empty?
+
+      raise Error, "Codex registration markers do not match the restarted services: #{invalid.join(', ')}"
+    end
+
+    def verify_registration_semantics!(plans, codex)
+      invalid = plans.filter_map do |entry, plan|
+        entry.fetch('name') unless marker_has_semantics?(load_registration_marker(entry), codex, plan)
+      end
+      return if invalid.empty?
+
+      raise Error, "Codex registration markers do not match the selected services: #{invalid.join(', ')}"
+    end
+
+    def probe_registration_plans!(codex, plans)
+      probed = {}
+      plans.each do |_entry, plan|
+        next if probed[plan.digest]
+
+        probe_codex_registration(codex, plan)
+        probed[plan.digest] = true
+      end
+    end
+
+    def probe_codex_registration(codex, plan)
+      Dir.mktmpdir('workspace-codex-registration-') do |directory|
+        socket = File.join(directory, 'app-server.sock')
+        command = [codex, *plan.argv, 'app-server', '--listen', "unix://#{socket}"]
+        unless command.index('app-server') == plan.argv.length + 1 &&
+               plan.argv.each_slice(2).all? { |flag, value| flag == '-c' && valid_registration_argv_value?(value) }
+          raise Error, 'agent team registration argv cannot be placed before Codex app-server'
+        end
+        pid = Process.spawn(*command, pgroup: true, out: File::NULL, err: File::NULL)
+        begin
+          150.times do
+            break if File.socket?(socket)
+            sleep 0.1
+          end
+          raise Error, 'Codex App Server registration probe did not create its socket' unless File.socket?(socket)
+        ensure
+          Process.kill('TERM', -pid) rescue nil
+          Process.wait(pid) rescue nil
+        end
+      end
+    rescue Errno::ENOENT, Errno::EACCES => e
+      raise Error, "cannot execute Codex registration probe: #{e.message}"
     end
 
     def quiesce_sessions(entries = registry.entries)
@@ -1290,28 +1693,12 @@ module DevWorkspaceHost
         end
         creation = Dir.glob(File.join(root, '*.creation.json')).sort.filter_map do |path|
           slug = File.basename(path, '.creation.json')
-          raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
-          stat = File.stat(path)
-          unless stat.file? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o600
-            raise Error, "creation journal is not a private regular file: #{path}"
-          end
-          data = File.binread(path, 64 * 1024 + 1)
-          raise Error, "creation journal exceeds 64 KiB: #{path}" if data.bytesize > 64 * 1024
-          journal = JSON.parse(data)
-          unless journal.is_a?(Hash) && journal['schema'] == 1 &&
-                 journal['slug'] == slug && %w[creating ready].include?(journal['state'])
-            raise Error, "creation journal has an invalid state: #{path}"
-          end
-          if journal['state'] == 'ready'
-            if journal.key?('tmux_identity')
-              raise Error, "completed creation journal retains a tmux identity: #{path}"
-            end
-            next
-          end
-          next unless journal.key?('tmux_identity')
+          journal = read_private_creation_journal!(path, slug)
+          next if journal.fetch('state') == 'ready'
 
           "#{entry.fetch('name')}/#{slug} (creation)"
         end
+		portal_creations = unfinished_portal_managed_creations(entry)
         forks = Dir.glob(File.join(root, '*.fork.json')).sort.map do |path|
           slug = File.basename(path, '.fork.json')
           "#{entry.fetch('name')}/#{slug} (fork)"
@@ -1320,7 +1707,13 @@ module DevWorkspaceHost
           slug = File.basename(path, '.start.json')
           "#{entry.fetch('name')}/#{slug} (start)"
         end
-        lifecycle + creation + forks + starts
+        migrations = Dir.glob(
+          File.join(root, "*#{AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix')}")
+        ).sort.map do |path|
+          slug = File.basename(path, AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix'))
+          "#{entry.fetch('name')}/#{slug} (agent-teams migration)"
+        end
+		lifecycle + creation + forks + starts + migrations + portal_creations
       end
       return if operations.empty?
 
@@ -1330,6 +1723,313 @@ module DevWorkspaceHost
     rescue JSON::ParserError, SystemCallError => e
       raise Error, "cannot inspect session operation state: #{e.message}"
     end
+
+    def read_private_creation_journal!(path, slug)
+      data = read_private_json_file!(path, 'creation journal', maximum: 64 * 1024)
+      journal = parse_strict_json_object(data, 'creation journal', 64 * 1024)
+      schema = journal['schema']
+      state = journal['state']
+		unless [1, 2, 3].include?(schema) && %w[creating ready].include?(state) && journal['slug'] == slug
+        raise Error, "creation journal has an invalid state: #{path}"
+      end
+
+      common = %w[schema slug goal_sha256 run_codex state]
+      managed = %w[model effort agent_team_binding agent_team_binding_digest]
+		allowed = if schema == 2
+                  common + managed
+				elsif schema == 3
+				  common + %w[model effort direct_team]
+                else
+                  # Schema-1 stores model and effort only when the caller
+                  # requested them.  In particular, a model-only request
+                  # still leaves effort absent for the App Server default.
+                  common + %w[model effort].select { |key| journal.key?(key) }
+                end
+      if schema == 1 && journal['preserve_tracking'] == true
+        allowed.concat(%w[preserve_tracking tracking_origin tracking_plan_sha256 tracking_state_sha256])
+      end
+      allowed << 'tmux_identity' if state == 'creating'
+      unless journal.keys.sort == allowed.sort && [true, false].include?(journal['run_codex']) &&
+             (journal['goal_sha256'].nil? || journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(SHA256_HEX))
+        raise Error, "creation journal has an invalid shape: #{path}"
+      end
+		if schema == 2
+        binding = journal['agent_team_binding']
+        binding_match = binding.is_a?(String) && /\Av1\.[A-Za-z0-9_-]+\.([0-9a-f]{64})\z/.match(binding)
+        unless journal['run_codex'] == true && journal['goal_sha256'].is_a?(String) &&
+               binding_match && binding.bytesize <= 32 * 1024 &&
+               journal['agent_team_binding_digest'] == binding_match[1] &&
+               %w[model effort].all? { |key| bounded_portal_receipt_string?(journal[key], AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) }
+          raise Error, "managed creation journal has invalid binding values: #{path}"
+        end
+		elsif schema == 3
+			unless journal['run_codex'] == true && journal['goal_sha256'].is_a?(String) &&
+				   %w[model effort].all? { |key| bounded_portal_receipt_string?(journal[key], AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) } &&
+				   valid_direct_portal_preset?(journal['direct_team']) &&
+				   journal['model'] == journal.dig('direct_team', 'leadModel') &&
+				   journal['effort'] == journal.dig('direct_team', 'leadEffort')
+			  raise Error, "direct creation journal has invalid preset values: #{path}"
+			end
+		elsif %w[model effort].any? { |key| journal.key?(key) && !bounded_portal_receipt_string?(journal[key], AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) }
+        raise Error, "legacy creation journal has invalid settings: #{path}"
+      elsif journal['preserve_tracking'] == true &&
+            (!journal['run_codex'] || !%w[revived retained].include?(journal['tracking_origin']) ||
+             !%w[tracking_plan_sha256 tracking_state_sha256].all? { |key| journal[key].is_a?(String) && journal[key].match?(SHA256_HEX) })
+        raise Error, "legacy creation journal has invalid preserved tracking: #{path}"
+      end
+      if state == 'creating'
+        unless journal['tmux_identity'].is_a?(String) && journal['tmux_identity'].match?(SHA256_HEX)
+          raise Error, "creation journal has an invalid tmux identity: #{path}"
+        end
+      end
+      journal
+    end
+
+    def read_private_json_file!(path, label, maximum:)
+      stat = File.stat(path)
+      unless stat.file? && stat.uid == Process.euid &&
+             (stat.mode & 0o777) == 0o600 && stat.size <= maximum
+        raise Error, "#{label} is not a private bounded regular file: #{path}"
+      end
+      data = File.binread(path, maximum + 1)
+      raise Error, "#{label} exceeds its size limit: #{path}" if data.bytesize > maximum
+
+      data
+    end
+
+	# Browser acceptance persists a schema-2 receipt before the Ruby creation
+	# journal exists. Inspect that private receipt namespace during package and
+	# Codex transitions so a scheduler gap cannot strand a selected binding.
+	def unfinished_portal_managed_creations(entry)
+	  workspace = entry.fetch('root')
+	  identifier = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+	  directory = File.join(@state, 'portal', identifier, 'creations')
+	  return [] unless File.exist?(directory)
+
+	  stat = File.stat(directory)
+	  unless stat.directory? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
+		raise Error, "portal creation directory is not private and owned: #{directory}"
+	  end
+	  Dir.children(directory).sort.filter_map do |name|
+		  # Completion evidence is terminal, companion data. It is deliberately
+		  # not a creation receipt and cannot block a package transition.
+		  next if PORTAL_CREATION_EVIDENCE_NAME.match?(name)
+		  next unless name.end_with?('.json')
+
+		  match = PORTAL_CREATION_RECEIPT_NAME.match(name)
+		  unless match && valid_session_identity?(match[1])
+			raise Error, "portal creation receipt has an invalid filename: #{name}"
+		  end
+		  slug = match[1]
+		  path = File.join(directory, name)
+		  # Schema-1 belongs to the legacy creation workflow. It has no managed
+		  # binding to protect, so do not make a package transition depend on its
+		  # shape or state. Parse once with duplicate-key detection before choosing
+		  # that legacy branch: permissive JSON parsing could otherwise classify a
+		  # duplicate schema key as schema 1 and bypass the managed guard.
+		  data = read_portal_creation_receipt_probe!(path)
+		  receipt = parse_strict_json_object(data, 'portal creation receipt', 12 * 20_000 + 16_384)
+		  schema = receipt['schema']
+		  next if schema.is_a?(Integer) && schema == 1
+
+		  unless schema.is_a?(Integer) && [2, 3].include?(schema)
+			raise Error, "portal creation receipt has an unsupported schema: #{path}"
+		  end
+		  require_private_portal_creation_receipt!(path)
+		  if schema == 2
+			validate_portal_managed_creation_receipt!(receipt, workspace, slug, path)
+		  else
+			validate_portal_direct_creation_receipt!(receipt, workspace, slug, path)
+		  end
+		  if receipt['state'] == 'cancelled'
+			require_cancelled_portal_managed_creation_without_effects!(receipt, workspace, slug, path)
+			next
+		  end
+		  next if %w[ready conflict].include?(receipt['state'])
+		  "#{entry.fetch('name')}/#{slug} (portal #{schema == 2 ? 'managed' : 'direct'} creation)"
+	  end
+	rescue Errno::ENOENT
+	  []
+	end
+
+	def read_portal_creation_receipt_probe!(path)
+	  data = File.binread(path, 12 * 20_000 + 16_385)
+	  raise Error, "portal creation receipt exceeds bounds: #{path}" if data.bytesize > 12 * 20_000 + 16_384
+
+	  data
+	end
+
+	def require_private_portal_creation_receipt!(path)
+	  stat = File.stat(path)
+	  unless stat.file? && stat.uid == Process.euid &&
+		     (stat.mode & 0o777) == 0o600 && stat.size.positive? &&
+		     stat.size <= 12 * 20_000 + 16_384
+		raise Error, "portal creation receipt is not a private bounded regular file: #{path}"
+	  end
+	end
+
+	def validate_portal_managed_creation_receipt!(receipt, workspace, slug, path)
+	  allowed = %w[
+		agentTeamBinding agentTeamBindingDigest attempt deletionHistorySha256 effort error goal model phase receiptId request schema startedAt state updatedAt validated workspace
+	  ]
+	  required = %w[
+		agentTeamBinding agentTeamBindingDigest attempt deletionHistorySha256 effort model phase receiptId request schema startedAt state updatedAt validated workspace
+	  ]
+		  request = receipt['request']
+	  binding = receipt['agentTeamBinding']
+	  binding_match = binding.is_a?(String) && /\Av1\.[A-Za-z0-9_-]+\.([0-9a-f]{64})\z/.match(binding)
+	  unless (receipt.keys - allowed).empty? && (required - receipt.keys).empty? &&
+		     receipt['schema'] == 2 && receipt['workspace'] == workspace &&
+		     receipt['receiptId'].is_a?(String) && receipt['receiptId'].match?(SHA256_HEX) &&
+		     receipt['deletionHistorySha256'].is_a?(String) && receipt['deletionHistorySha256'].match?(SHA256_HEX) &&
+		     receipt['attempt'].is_a?(Integer) && receipt['attempt'].positive? &&
+		     %w[phase startedAt updatedAt].all? { |key| bounded_portal_receipt_string?(receipt[key], 16_384) } &&
+		     [true, false].include?(receipt['validated']) &&
+		     (!receipt.key?('goal') || bounded_portal_receipt_string?(receipt['goal'], 12 * 20_000)) &&
+		     (!receipt.key?('error') || bounded_portal_receipt_string?(receipt['error'], 16_384)) &&
+			     valid_portal_managed_creation_request?(request, slug) &&
+		     binding_match && binding.bytesize <= 32 * 1024 &&
+		     receipt['agentTeamBindingDigest'] == binding_match[1] &&
+		     receipt['agentTeamBindingDigest'].match?(SHA256_HEX) &&
+             bounded_portal_setting?(receipt['model']) &&
+             bounded_portal_setting?(receipt['effort']) &&
+		     %w[running paused failed ready conflict cancelled].include?(receipt['state'])
+		raise Error, "portal managed creation receipt is invalid: #{path}"
+	  end
+	end
+
+	# Schema-3 receipts contain only direct-thread roster policy. They do not
+	# carry or decode the retired opaque virtual-team binding. A profile switch
+	# blocks on an unfinished direct creation so its immutable member snapshot
+	# remains retryable under the same package generation.
+	def validate_portal_direct_creation_receipt!(receipt, workspace, slug, path)
+	  allowed = %w[
+		attempt deletionHistorySha256 directTeam effort error goal model phase receiptId request schema startedAt state updatedAt validated workspace
+	  ]
+	  required = %w[
+		attempt deletionHistorySha256 directTeam effort model phase receiptId request schema startedAt state updatedAt validated workspace
+	  ]
+	  request = receipt['request']
+	  direct_team = receipt['directTeam']
+	  unless (receipt.keys - allowed).empty? && (required - receipt.keys).empty? &&
+		 receipt['schema'] == 3 && receipt['workspace'] == workspace &&
+		 receipt['receiptId'].is_a?(String) && receipt['receiptId'].match?(SHA256_HEX) &&
+		 receipt['deletionHistorySha256'].is_a?(String) && receipt['deletionHistorySha256'].match?(SHA256_HEX) &&
+		 receipt['attempt'].is_a?(Integer) && receipt['attempt'].positive? &&
+		 %w[phase startedAt updatedAt].all? { |key| bounded_portal_receipt_string?(receipt[key], 16_384) } &&
+		 [true, false].include?(receipt['validated']) &&
+		 (!receipt.key?('goal') || bounded_portal_receipt_string?(receipt['goal'], 12 * 20_000)) &&
+		 (!receipt.key?('error') || bounded_portal_receipt_string?(receipt['error'], 16_384)) &&
+		 valid_portal_managed_creation_request?(request, slug) &&
+		 valid_direct_portal_preset?(direct_team) &&
+		 request['team'] == direct_team['id'] && request['catalogDigest'] == direct_team['catalogDigest'] &&
+		 receipt['model'] == direct_team['leadModel'] && receipt['effort'] == direct_team['leadEffort'] &&
+		 %w[running paused failed ready conflict].include?(receipt['state'])
+		raise Error, "portal direct creation receipt is invalid: #{path}"
+	  end
+	end
+
+	def valid_direct_portal_preset?(preset)
+	  return false unless preset.is_a?(Hash) &&
+		preset.keys.sort == %w[catalogDigest description id leadEffort leadModel members name roles teamDigest] &&
+		valid_portal_team_identifier?(preset['id']) &&
+		%w[catalogDigest teamDigest].all? { |key| preset[key].is_a?(String) && preset[key].match?(SHA256_HEX) } &&
+		%w[name description leadModel leadEffort].all? { |key| bounded_portal_receipt_string?(preset[key], key == 'description' ? 4096 : AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) } &&
+		preset['roles'].is_a?(Array) && preset['members'].is_a?(Array) &&
+		preset['roles'].length <= 64 && preset['members'].length <= 64
+	  addresses = []
+	  return false unless preset['members'].all? do |member|
+		member.is_a?(Hash) && member.keys.sort == %w[access address behavior model reasoningEffort role] &&
+		  valid_portal_team_identifier?(member['role']) && member['role'] != 'lead' &&
+		  member['address'].is_a?(String) && member['address'] == "#{member['role']}0" &&
+		  bounded_portal_setting?(member['model']) && bounded_portal_setting?(member['reasoningEffort']) &&
+		  { 'architect' => ['designer', 'read_only'],
+		    'implementer' => ['implementer', 'workspace_write'],
+		    'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
+		    [member['behavior'], member['access']] &&
+		  addresses << member['address']
+	  end
+	  addresses.uniq.length == addresses.length && preset['roles'] == ['lead'] + addresses
+	end
+
+	def valid_portal_managed_creation_request?(request, slug)
+	  return false unless request.is_a?(Hash) && %w[new plan].include?(request['kind'])
+
+	  common = %w[kind slug team catalogDigest]
+	  optional = %w[model effort]
+	  required, allowed = if request['kind'] == 'new'
+							  [common + ['goal'], common + ['goal'] + optional]
+							elsif request['kind'] == 'plan'
+							  plan = %w[source sourceThreadId sourceIdentity planTurnId planSha256]
+							  [common + plan, common + plan + %w[planText] + optional]
+							end
+    return false unless (request.keys - allowed).empty? && (required - request.keys).empty?
+	  return false unless request['slug'] == slug && valid_session_identity?(request['slug']) &&
+						  valid_portal_team_identifier?(request['team']) &&
+						  request['catalogDigest'].is_a?(String) && request['catalogDigest'].match?(SHA256_HEX)
+	  return false unless optional.all? { |key| !request.key?(key) || bounded_portal_setting?(request[key]) }
+
+	  if request['kind'] == 'new'
+		return bounded_portal_receipt_string?(request['goal'], 20_000)
+	  end
+
+	  return false unless valid_session_identity?(request['source']) &&
+						  %w[sourceThreadId planTurnId].all? { |key| valid_portal_opaque_id?(request[key], 256) } &&
+						  request['sourceIdentity'].is_a?(String) && request['sourceIdentity'].match?(SHA256_HEX) &&
+						  request['planSha256'].is_a?(String) && request['planSha256'].match?(SHA256_HEX)
+
+	  !request.key?('planText') || bounded_portal_receipt_string?(request['planText'], 20_000)
+	end
+
+	# Go only terminalizes a managed plan after proving that neither a destination
+	# nor retained state/evidence exists. Mirror that narrow exception before a
+	# host switch ignores the receipt; every other cancelled shape fails closed.
+	def require_cancelled_portal_managed_creation_without_effects!(receipt, workspace, slug, path)
+	  unless receipt['validated'] == false && receipt.fetch('request').fetch('kind') == 'plan'
+		raise Error, "cancelled portal managed creation receipt is invalid: #{path}"
+	  end
+	  workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+	  state_path = File.join(
+		@state, 'agent-teams', workspace_id, "#{Digest::SHA256.hexdigest(slug)}.json"
+	  )
+	  evidence = File.join(File.dirname(path), "#{slug}.#{receipt.fetch('receiptId')}.complete.json")
+	  effects = %w[work archive worktrees].map { |root| File.join(workspace, root, slug) }
+	  effects.concat([
+		File.join(workspace, 'worktrees', '.locks', "#{slug}.creation.json"),
+		state_path, evidence, "#{evidence}.request"
+	  ])
+	  effects.each do |effect|
+		begin
+		  File.lstat(effect)
+		rescue Errno::ENOENT
+		  next
+		rescue SystemCallError => e
+		  raise Error, "cannot inspect cancelled portal managed creation effect #{effect}: #{e.message}"
+		end
+		raise Error, "cancelled portal managed creation has a destination effect: #{effect}"
+	  end
+	end
+
+
+	def valid_portal_team_identifier?(value)
+	  value.is_a?(String) && value.bytesize.between?(1, 63) &&
+		value.match?(/\A[a-z][a-z0-9_]*\z/)
+	end
+
+	def bounded_portal_setting?(value)
+	  bounded_portal_receipt_string?(value, AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) && !value.match?(/[\r\n]/)
+	end
+
+	def valid_portal_opaque_id?(value, maximum)
+	  bounded_portal_receipt_string?(value, maximum) &&
+		value.each_codepoint.none? { |codepoint| codepoint <= 0x1f || codepoint == 0x7f }
+	end
+
+	def bounded_portal_receipt_string?(value, maximum)
+	  value.is_a?(String) && !value.empty? && value.valid_encoding? && value.bytesize <= maximum &&
+		!value.include?("\0")
+	end
+
 
     def development_cluster_state(entries = registry.entries)
       entries.flat_map do |entry|
@@ -1594,24 +2294,82 @@ module DevWorkspaceHost
       File.join(@state, 'codex/pending')
     end
 
-    def pending_codex_update?(expected = nil)
+    # A pending record is only evidence of the forward retry target. Its argv
+    # and inventory are intentionally not persisted: every reconciliation
+    # resolves the selected package and durable roots again through Go.
+    def pending_codex_update
       path = pending_codex_file
-      return false unless File.file?(path) && !File.symlink?(path)
+      return nil unless File.exist?(path) || File.symlink?(path)
 
-      value = File.binread(path, 4097).strip
-      return false if value.empty? || value.bytesize > 4096
-      expected.nil? || value == expected
+      require_safe_private_file!(path, 'Codex reconciliation pending record')
+      data = File.binread(path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
+      raise Error, 'Codex reconciliation pending record exceeds bounds' if data.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
+
+      record = parse_strict_json_object(data, 'Codex reconciliation pending record', REGISTRATION_OUTPUT_MAX_BYTES)
+      unless record.keys.sort == %w[codex_path package_root schema workspaces] &&
+             record['schema'] == AGENT_TEAM_REGISTRATION.fetch('pendingSchema') &&
+             canonical_absolute_path?(record['package_root']) && canonical_absolute_path?(record['codex_path']) &&
+             valid_pending_workspaces?(record['workspaces'])
+        raise Error, 'Codex reconciliation pending record is invalid; forward migration is required before retrying'
+      end
+      record
+    rescue Error => e
+      raise e if e.message.start_with?('Codex reconciliation pending record is') ||
+                   e.message.include?('forward migration') || e.message.include?('is a symlink') ||
+                   e.message.include?('owned mode-0600')
+
+      raise Error, "Codex reconciliation pending record is invalid; forward migration is required before retrying: #{e.message}"
     end
 
-    def write_pending_codex_update(command)
+    def valid_pending_workspaces?(workspaces)
+      return false unless workspaces.is_a?(Array) && workspaces.length <= REGISTRATION_MAX_STATES
+
+      prior = nil
+      workspaces.each do |workspace|
+        return false unless workspace.is_a?(Hash) && workspace.keys.sort == %w[name registration_digest root] &&
+                            workspace['name'].is_a?(String) && workspace['name'].match?(NAME) &&
+                            canonical_absolute_path?(workspace['root']) &&
+                            workspace['registration_digest'].is_a?(String) && workspace['registration_digest'].match?(SHA256_HEX)
+        return false if prior && workspace['name'] <= prior
+
+        prior = workspace['name']
+      end
+      true
+    end
+
+    def write_pending_codex_update(package, codex, plans)
+      unless canonical_absolute_path?(package) && canonical_absolute_path?(codex) &&
+             plans.all? { |_entry, plan| plan.package_root == package }
+        raise Error, 'cannot write an invalid Codex reconciliation pending record'
+      end
       path = pending_codex_file
       FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
-      atomic_private_file(path, "#{command}\n")
+      File.chmod(0o700, File.dirname(path))
+      require_safe_private_file_or_absent!(path, 'Codex reconciliation pending record')
+      workspaces = plans.map do |entry, plan|
+        {
+          'name' => entry.fetch('name'), 'root' => entry.fetch('root'),
+          'registration_digest' => plan.digest
+        }
+      end.sort_by { |workspace| workspace.fetch('name') }
+      raise Error, 'cannot write duplicate Codex reconciliation pending workspaces' unless valid_pending_workspaces?(workspaces)
+
+      atomic_private_file(
+        path,
+        JSON.generate(
+          'schema' => AGENT_TEAM_REGISTRATION.fetch('pendingSchema'),
+          'package_root' => package, 'codex_path' => codex, 'workspaces' => workspaces
+        ) + "\n"
+      )
     end
 
     def clear_pending_codex_update
       path = pending_codex_file
-      File.unlink(path) if File.exist?(path) && !File.symlink?(path)
+      return unless File.exist?(path) || File.symlink?(path)
+
+      require_safe_private_file!(path, 'Codex reconciliation pending record')
+      File.unlink(path)
+      File.open(File.dirname(path), File::RDONLY) { |directory| directory.fsync }
     end
 
     def transition_lock_file
@@ -1643,6 +2401,20 @@ module DevWorkspaceHost
 
     def profile_link_token
       DevWorkspaceProfileIdentity.token(@profile)
+    end
+
+    # A failed nix-env invocation can have committed the profile replacement
+    # before it reports an error. Read both the profile identity token and its
+    # resolved target twice so a retry preserves the only selected authority
+    # without accepting a concurrently replaced link.
+    def profile_selects_package?(package)
+      first_token = profile_link_token
+      return false unless first_token && File.symlink?(@profile)
+
+      selected = File.realpath(@profile) == package
+      selected && profile_link_token == first_token
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+      false
     end
 
     def require_current_package_generation!
@@ -1713,20 +2485,6 @@ module DevWorkspaceHost
             sleep 0.1
           end
           raise Error, 'Codex App Server did not create its probe socket' unless File.socket?(socket)
-          output = capture!(File.join(package_root, 'bin/workspace-portal'), 'thread', 'models', '--socket', socket)
-          models = JSON.parse(output)
-          defaults = JSON.parse(
-            capture!(File.join(package_root, 'bin/workspace-portal'), 'thread', 'defaults')
-          )
-          default_model = defaults.fetch('model')
-          default_effort = defaults.fetch('reasoningEffort')
-          default = models.select { |model| model['model'] == default_model }
-          unless default.length == 1 && default.first.fetch('supportedReasoningEfforts', []).any? do |effort|
-            effort['reasoningEffort'] == default_effort
-          end
-            raise Error,
-                  "default model #{default_model} does not advertise #{default_effort} reasoning"
-          end
         ensure
           Process.kill('TERM', -pid) rescue nil
           Process.wait(pid) rescue nil

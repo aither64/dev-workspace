@@ -76,11 +76,15 @@ class WorkspaceHostTest < Minitest::Test
         'schema' => 2, 'displayLabel' => 'example organization development',
         'hostLabel' => 'build-host', 'sshHost' => 'build-host.int.example.cz',
         'developmentClusterProviders' => %w[alpha],
-        'portal' => { 'hostname' => 'workspace.example.test', 'aliases' => [] }
+        'portal' => {
+          'hostname' => 'workspace.example.test',
+          'aliases' => ['workspace-file-alias.example.test']
+        }
       ))
       config = File.join(directory, 'config/registry.json')
       DevWorkspaceHost::Registry.new(config).register(
-        name: 'example-workspace', root:, hostname: 'workspace.example.test', aliases: [], replace: false
+        name: 'example-workspace', root:, hostname: 'workspace.example.test',
+        aliases: ['registered-alias.example.test'], replace: false
       )
       package = make_package(directory, 'package')
       profile = File.join(directory, 'state/profile')
@@ -99,6 +103,10 @@ class WorkspaceHostTest < Minitest::Test
         File.join(directory, 'state'),
         arguments[arguments.index('--user-state-root') + 1]
       )
+      trusted_origin = arguments.index('--trusted-origin')
+      refute_nil(trusted_origin)
+      assert_equal('https://registered-alias.example.test', arguments[trusted_origin + 1])
+      refute_includes(arguments, 'https://workspace-file-alias.example.test')
       provider_index = arguments.index('--cluster-provider')
       refute_nil(provider_index)
       assert_match(/\Aalpha=Alpha=/, arguments.fetch(provider_index + 1))

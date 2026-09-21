@@ -6,15 +6,22 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
@@ -65,14 +72,131 @@ func creationDestination(name, date string) (string, error) {
 
 func validateCreationSettings(model, effort string) error {
 	for _, value := range []string{model, effort} {
-		if len(value) > 256 || strings.ContainsAny(value, "\x00\r\n") {
-			return errors.New("Codex model settings are invalid")
+		if err := validateCreationSettingValue(value); err != nil {
+			return err
 		}
 	}
 	if model == "" && effort != "" {
 		return errors.New("select a Codex model before choosing a reasoning effort")
 	}
 	return nil
+}
+
+// Submitted managed lead overrides are independently optional. The resolver
+// combines them with the selected lead, while resolved settings still require
+// a model before an effort through validateCreationSettings above.
+func validateCreationSettingValue(value string) error {
+	if len(value) > session.MaxAgentTeamPersistedScalarBytes || strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New("Codex model settings are invalid")
+	}
+	return nil
+}
+
+// resolveManagedCreation is the browser's one policy-bearing acceptance gate.
+// It runs before a creation receipt, root thread, worktree, or retained state
+// exists. The rendered catalog is only a hint; this function resolves the
+// submitted selection from the installed catalog and current launch evidence.
+func (s *Server) resolveManagedCreation(_ context.Context, request creationRequest, input agentteams.CreationSelectionInput) (creationRequest, error) {
+	if !input.Team.Present && !input.CatalogDigest.Present {
+		return request, nil
+	}
+	if !input.Team.Present || !input.CatalogDigest.Present || input.Team.Value == "" || input.CatalogDigest.Value == "" {
+		return creationRequest{}, errors.New("select a starting team and reload the form")
+	}
+	if input.Model.Present != input.ReasoningEffort.Present {
+		return creationRequest{}, errors.New("select a Codex model and reasoning effort together")
+	}
+	if s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
+		return creationRequest{}, errors.New("direct team selection is unavailable in this workspace package")
+	}
+	preset, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, input.Team.Value)
+	if err != nil {
+		return creationRequest{}, errors.New("selected starting team is unavailable")
+	}
+	if input.CatalogDigest.Value != preset.CatalogDigest {
+		return creationRequest{}, errors.New("catalog digest is stale; reload the form")
+	}
+	if input.Model.Present {
+		if s.config.Codex == nil {
+			return creationRequest{}, errors.New("Codex model catalog is unavailable")
+		}
+		models, err := s.config.Codex.ListModels(context.Background())
+		if err != nil {
+			return creationRequest{}, fmt.Errorf("load Codex models: %w", err)
+		}
+		settings, err := workspacecodex.ResolveNewThreadSettings(models, codex.ThreadSettings{
+			Model: input.Model.Value, ReasoningEffort: input.ReasoningEffort.Value,
+		})
+		if err != nil {
+			return creationRequest{}, err
+		}
+		preset.LeadModel, preset.LeadEffort = settings.Model, settings.ReasoningEffort
+	}
+	if err := validDirectTeamPreset(preset); err != nil {
+		return creationRequest{}, fmt.Errorf("resolve direct team preset: %w", err)
+	}
+	request.Team, request.CatalogDigest = preset.ID, preset.CatalogDigest
+	request.directTeam = &preset
+	return request, nil
+}
+
+func validDirectTeamPreset(preset teamruntime.Preset) error {
+	if !validManagedCreationTeam(preset.ID) || preset.Name == "" || len(preset.Name) > 256 ||
+		preset.Description == "" || len(preset.Description) > 4096 ||
+		!utf8.ValidString(preset.Name) || !utf8.ValidString(preset.Description) ||
+		strings.ContainsAny(preset.Name+preset.Description, "\x00\r\n") ||
+		!messageDigestPattern.MatchString(preset.CatalogDigest) ||
+		!messageDigestPattern.MatchString(preset.TeamDigest) ||
+		validateCreationSettingValue(preset.LeadModel) != nil || validateCreationSettingValue(preset.LeadEffort) != nil ||
+		preset.LeadModel == "" || preset.LeadEffort == "" || len(preset.Roles) > 64 || len(preset.Members) > 64 {
+		return errors.New("direct team preset is malformed")
+	}
+	addresses := make(map[string]struct{}, len(preset.Members))
+	expectedRoles := make([]string, 0, len(preset.Members)+1)
+	expectedRoles = append(expectedRoles, "lead")
+	for _, member := range preset.Members {
+		if !validManagedCreationTeam(member.Role) || member.Role == "lead" ||
+			member.Address != member.Role+"0" || member.Model == "" || member.Effort == "" ||
+			!validDirectMemberPolicy(member.Role, member.Behavior, member.Access) ||
+			validateCreationSettingValue(member.Model) != nil || validateCreationSettingValue(member.Effort) != nil {
+			return errors.New("direct team preset has an invalid member")
+		}
+		if _, duplicate := addresses[member.Address]; duplicate {
+			return errors.New("direct team preset has duplicate member addresses")
+		}
+		addresses[member.Address] = struct{}{}
+		expectedRoles = append(expectedRoles, member.Address)
+	}
+	if len(preset.Roles) != len(expectedRoles) {
+		return errors.New("direct team preset has an invalid role summary")
+	}
+	for index, role := range expectedRoles {
+		if preset.Roles[index] != role {
+			return errors.New("direct team preset has an invalid role summary")
+		}
+	}
+	return nil
+}
+
+func validDirectMemberPolicy(role, behavior, access string) bool {
+	switch role {
+	case "architect":
+		return behavior == "designer" && access == "read_only"
+	case "implementer":
+		return behavior == "implementer" && access == "workspace_write"
+	case "reviewer":
+		return behavior == "reviewer" && access == "read_only"
+	default:
+		return false
+	}
+}
+
+func requireLiveUnixSocket(path string) error {
+	connection, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		return err
+	}
+	return connection.Close()
 }
 
 func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
@@ -86,23 +210,32 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 	defer lock.Close()
 	source, err := session.Find(s.config.Workspace, slug)
 	if err != nil {
+		// A missing manifest means the immutable session selected at acceptance
+		// no longer exists. Do not generalize this to other ENOENT values below:
+		// runtime-authority files can disappear briefly during a healthy restart.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("%w: source session no longer exists", errSourceIdentityChanged)
+		}
 		return nil, "", err
 	}
 	owner, err := session.PendingLifecycle(s.config.Workspace, slug)
 	if err != nil {
 		return nil, "", err
 	}
-	if owner != "" || source.Archived || source.Creation.State != "ready" ||
+	if owner != "" {
+		return nil, "", errors.New("source session is not ready for browser changes")
+	}
+	if source.Archived || source.Creation.State != "ready" ||
 		(source.Creation.GoalSHA256 != "" && !source.Creation.InitialGoalSent) || source.Codex.ThreadID == "" ||
 		source.Codex.SocketPath != s.config.CodexSocket {
-		return nil, "", errors.New("source session is not ready for browser changes")
+		return nil, "", fmt.Errorf("%w: source session is not ready for browser changes", errSourceIdentityChanged)
 	}
 	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, slug, s.config.Workspace)
 	if err != nil {
 		return nil, "", err
 	}
 	if authority.State != "ready" || authority.CodexThreadID != source.Codex.ThreadID || authority.CodexSocketPath != s.config.CodexSocket {
-		return nil, "", errors.New("source session runtime identity changed")
+		return nil, "", fmt.Errorf("%w: source session runtime identity changed", errSourceIdentityChanged)
 	}
 	identity, err := lifecycleTargetIdentity(source)
 	return source, identity, err
@@ -118,10 +251,14 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 		return creationReceipt{}, err
 	}
 	if previous, ok := s.creations[request.Slug]; ok {
-		if previous.Request != request {
-			return creationReceipt{}, errors.New("this session name belongs to a different creation request")
+		same := sameCreationRequest(previous.Request, request) &&
+			previous.Schema != 2 &&
+			(previous.Schema != 3 || (request.directTeam != nil && previous.DirectTeam != nil && reflect.DeepEqual(*previous.DirectTeam, *request.directTeam) &&
+				previous.Model == request.directTeam.LeadModel && previous.Effort == request.directTeam.LeadEffort))
+		if same {
+			return previous, nil
 		}
-		return previous, nil
+		return creationReceipt{}, errors.New("this session name belongs to a different creation request")
 	}
 	lock, err := session.LockRuntimeShared(s.config.AuthorityDir, request.Slug)
 	if err != nil {
@@ -154,8 +291,24 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 		return creationReceipt{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	receipt := creationReceipt{Schema: 1, Workspace: s.config.Workspace, Request: request, ReceiptID: hex.EncodeToString(id),
+	schema := 1
+	if request.directTeam != nil {
+		if request.Kind == "fork" ||
+			request.Team != request.directTeam.ID || request.CatalogDigest != request.directTeam.CatalogDigest {
+			return creationReceipt{}, errors.New("direct team preset is incomplete")
+		}
+		if err := validDirectTeamPreset(*request.directTeam); err != nil {
+			return creationReceipt{}, err
+		}
+		schema = 3
+	}
+	receipt := creationReceipt{Schema: schema, Workspace: s.config.Workspace, Request: request, ReceiptID: hex.EncodeToString(id),
 		DeletionHistorySHA256: history, Attempt: 1, State: "running", Phase: "Checking session settings…", StartedAt: now, UpdatedAt: now}
+	if schema == 3 {
+		preset := *request.directTeam
+		receipt.DirectTeam = &preset
+		receipt.Model, receipt.Effort = preset.LeadModel, preset.LeadEffort
+	}
 	if err := s.saveCreation(receipt); err != nil {
 		return creationReceipt{}, err
 	}
@@ -165,11 +318,29 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 	return receipt, nil
 }
 
+func sameCreationRequest(left, right creationRequest) bool {
+	left.directTeam = nil
+	right.directTeam = nil
+	left.teamSubmitted, left.digestSubmitted, left.modelSubmitted, left.effortSubmitted = false, false, false, false
+	right.teamSubmitted, right.digestSubmitted, right.modelSubmitted, right.effortSubmitted = false, false, false, false
+	return left == right
+}
+
 const creationConflictMessage = "This session was created separately. The earlier creation request could not use this name."
 const creationArchivedMessage = "This session was archived. The earlier creation request cannot be retried."
 
+// Source snapshot failures require the user to review the plan again before
+// retrying. Transport and model lookup failures leave the accepted request
+// unchanged so it can be retried.
+var errStaleSourcePlan = errors.New("source plan selection is stale")
+
+// errSourceIdentityChanged marks durable source provenance which contradicts
+// an accepted plan. It is deliberately separate from temporary runtime and
+// App Server failures.
+var errSourceIdentityChanged = errors.New("source session identity changed")
+
 func (receipt creationReceipt) blocksSession() bool {
-	return receipt.State != "ready" && receipt.State != "conflict"
+	return receipt.State != "ready" && receipt.State != "conflict" && receipt.State != "cancelled"
 }
 
 func (s *Server) canonicalCreationConflict(receipt creationReceipt) string {
@@ -189,6 +360,13 @@ func (s *Server) canonicalCreationConflict(receipt creationReceipt) string {
 	}
 	if summary.Archived {
 		return creationArchivedMessage
+	}
+	// A cancelled managed plan is deliberately unvalidated: it proved only that
+	// it never reached a destination effect. If a later direct CLI start has
+	// created the canonical destination at the same slug, reconcile that fact
+	// rather than leaving the obsolete terminal receipt visible forever.
+	if receipt.State == "cancelled" {
+		return creationConflictMessage
 	}
 	bound, err := s.readCreationBinding(receipt)
 	if err != nil {
@@ -235,7 +413,15 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 	if !ok || receipt.State == "running" || receipt.State == "ready" || receipt.State == "conflict" {
 		return receipt, ok
 	}
-	if s.proveCreation(receipt) == nil {
+	if receipt.State == "cancelled" {
+		if message := s.canonicalCreationConflict(receipt); message != "" {
+			receipt.State = "conflict"
+			receipt.Phase = message
+			receipt.Error = "Choose another name to start the earlier request."
+		} else {
+			return receipt, true
+		}
+	} else if s.proveCreation(receipt) == nil {
 		if err := s.bindCreationUploads(s.operationContext, receipt); err != nil {
 			return receipt, true
 		}
@@ -265,7 +451,7 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 
 func (s *Server) creationPage(w http.ResponseWriter, r *http.Request, slug string) bool {
 	receipt, ok := s.currentCreation(slug)
-	if !ok || !receipt.blocksSession() {
+	if !ok || (!receipt.blocksSession() && receipt.State != "cancelled") {
 		return false
 	}
 	s.render(w, "creation", pageData{InitialRequest: receipt.status().InitialRequest, Session: &session.Summary{Manifest: session.Manifest{Slug: slug}}})
@@ -314,7 +500,7 @@ func (s *Server) retryCreation(w http.ResponseWriter, r *http.Request, slug stri
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Creation status changed. Reload before retrying."})
 		return
 	}
-	if current.State == "conflict" {
+	if current.State == "conflict" || current.State == "cancelled" {
 		s.writeJSON(w, http.StatusConflict, current.status())
 		return
 	}
@@ -345,17 +531,23 @@ func (s *Server) retryCreation(w http.ResponseWriter, r *http.Request, slug stri
 // writes this exact receipt-bound evidence under its existing creation lock,
 // before deleting a fork journal or returning successful start metadata.
 type creationEvidence struct {
-	Schema         int    `json:"schema"`
-	Workspace      string `json:"workspace"`
-	Slug           string `json:"slug"`
-	ReceiptID      string `json:"receiptId"`
-	ThreadID       string `json:"threadId"`
-	SourceThreadID string `json:"sourceThreadId"`
-	GoalSHA256     string `json:"goalSha256"`
-	Model          string `json:"model"`
-	Effort         string `json:"effort"`
-	TrackingDevice uint64 `json:"trackingDevice"`
-	TrackingInode  uint64 `json:"trackingInode"`
+	Schema                 int    `json:"schema"`
+	Workspace              string `json:"workspace"`
+	Slug                   string `json:"slug"`
+	ReceiptID              string `json:"receiptId"`
+	ThreadID               string `json:"threadId"`
+	SourceThreadID         string `json:"sourceThreadId"`
+	GoalSHA256             string `json:"goalSha256"`
+	Model                  string `json:"model"`
+	Effort                 string `json:"effort"`
+	TrackingDevice         uint64 `json:"trackingDevice"`
+	TrackingInode          uint64 `json:"trackingInode"`
+	AgentTeamBindingDigest string `json:"agentTeamBindingDigest,omitempty"`
+	CatalogDigest          string `json:"catalogDigest,omitempty"`
+	TeamDigest             string `json:"teamDigest,omitempty"`
+	Team                   string `json:"team,omitempty"`
+	CreationIdentity       string `json:"creationIdentity,omitempty"`
+	RemovalEpoch           string `json:"removalEpoch,omitempty"`
 }
 
 func (s *Server) proveCreation(receipt creationReceipt) error {
@@ -363,7 +555,7 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 	if err := readCreationJSON(s.creationEvidencePath(receipt), &proof); err != nil {
 		return err
 	}
-	if proof.Schema != 1 || proof.Workspace != s.config.Workspace || proof.Slug != receipt.Request.Slug ||
+	if proof.Schema != receipt.Schema || (proof.Schema != 1 && proof.Schema != 2 && proof.Schema != 3) || proof.Workspace != s.config.Workspace || proof.Slug != receipt.Request.Slug ||
 		proof.ReceiptID != receipt.ReceiptID || proof.ThreadID == "" || proof.SourceThreadID != receipt.Request.SourceThreadID ||
 		proof.Model != receipt.Model || proof.Effort != receipt.Effort || !receipt.Validated {
 		return errors.New("creation completion evidence does not match the recorded request")
@@ -397,7 +589,47 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 	if pending {
 		return errors.New("creation completion is recorded; retry to finish its journal")
 	}
+	if receipt.Schema == 2 {
+		return errors.New("virtual team creation cannot resume after the direct-team cutover")
+	}
+	if receipt.Schema == 3 {
+		if receipt.DirectTeam == nil || proof.CatalogDigest != receipt.DirectTeam.CatalogDigest ||
+			proof.TeamDigest != receipt.DirectTeam.TeamDigest || proof.Team != receipt.DirectTeam.ID {
+			return errors.New("direct team creation completion evidence does not match the recorded request")
+		}
+		store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return err
+		}
+		roster, err := store.Load(receipt.Request.Slug, proof.ThreadID)
+		if err != nil {
+			return fmt.Errorf("load direct team roster: %w", err)
+		}
+		if err := rosterMatchesDirectTeam(*roster, *receipt.DirectTeam); err != nil {
+			return err
+		}
+	}
 
+	return nil
+}
+
+func rosterMatchesDirectTeam(roster teamruntime.Roster, preset teamruntime.Preset) error {
+	if roster.PresetID != preset.ID || roster.CatalogDigest != preset.CatalogDigest || roster.TeamDigest != preset.TeamDigest ||
+		roster.LeadModel != preset.LeadModel || roster.LeadEffort != preset.LeadEffort || len(roster.Members) != len(preset.Members) {
+		return errors.New("direct team roster does not match the creation snapshot")
+	}
+	members := make(map[string]teamruntime.Member, len(roster.Members))
+	for _, member := range roster.Members {
+		members[member.Address] = member
+	}
+	for _, expected := range preset.Members {
+		member, ok := members[expected.Address]
+		if !ok || member.Role != expected.Role || member.Model != expected.Model || member.Effort != expected.Effort ||
+			member.Behavior != expected.Behavior || member.Access != expected.Access ||
+			member.Thread == "" || member.State != "ready" {
+			return errors.New("direct team roster does not prove all configured member threads")
+		}
+	}
 	return nil
 }
 
@@ -453,6 +685,9 @@ func (s *Server) runCreation(receipt creationReceipt) {
 }
 
 func (s *Server) initializeCreation(receipt *creationReceipt) error {
+	if receipt.Schema == 2 {
+		return errors.New("virtual team creation cannot resume after the direct-team cutover")
+	}
 	ctx, cancel := context.WithTimeout(s.operationContext, 4*time.Minute)
 	defer cancel()
 	transition, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
@@ -483,10 +718,13 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	if request.Source != "" && !receipt.Validated {
 		source, identity, err := s.creationSource(request.Source)
 		if err != nil {
+			if errors.Is(err, errSourceIdentityChanged) {
+				return fmt.Errorf("%w: %v", errStaleSourcePlan, err)
+			}
 			return err
 		}
 		if identity != request.SourceIdentity || source.Codex.ThreadID != request.SourceThreadID {
-			return errors.New("source session changed; the recorded request cannot use its replacement")
+			return fmt.Errorf("%w: source session changed; the recorded request cannot use its replacement", errStaleSourcePlan)
 		}
 		s.normalizeInteractivity(ctx, source)
 		if !source.Interactive {
@@ -503,17 +741,19 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 			if request.Kind == "plan" {
 				plan, ok := completedPlan(transcript)
 				if !ok || plan.TurnID != request.PlanTurnID || planDigest(plan.Text) != request.PlanSHA256 || (request.PlanText != "" && plan.Text != request.PlanText) {
-					return errors.New("the displayed plan is stale; review the latest plan before implementing it")
+					return fmt.Errorf("%w: the displayed plan is stale; review the latest plan before implementing it", errStaleSourcePlan)
 				}
 				if transcript.Status == "active" || transcript.CollaborationMode != "plan" {
-					return errors.New("the source conversation is no longer ready to implement this plan")
+					return fmt.Errorf("%w: the source conversation is no longer ready to implement this plan", errStaleSourcePlan)
 				}
-				if request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
+				if receipt.Schema == 1 && request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
 					return errors.New("source model settings changed; review the plan before implementing it")
 				}
 				receipt.Goal = planCreationGoal(request.Source, plan.Text)
-				receipt.Model = transcript.Model
-				receipt.Effort = transcript.ReasoningEffort
+				if receipt.Schema == 1 {
+					receipt.Model = transcript.Model
+					receipt.Effort = transcript.ReasoningEffort
+				}
 			} else {
 				models, err := s.config.Codex.ListModels(ctx)
 				if err != nil {
@@ -533,20 +773,27 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	if !receipt.Validated {
 		if request.Kind == "new" {
 			receipt.Goal = request.Goal
-			if s.config.Codex == nil {
-				return errors.New("Codex model catalog is unavailable")
+			settings := codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}
+			if receipt.Schema == 2 || receipt.Schema == 3 {
+				settings = codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}
 			}
-			models, err := s.config.Codex.ListModels(ctx)
-			if err != nil {
-				return err
+			if receipt.Schema == 1 && settings.Model != "" {
+				if s.config.Codex == nil {
+					return errors.New("Codex model catalog is unavailable")
+				}
+				models, err := s.config.Codex.ListModels(ctx)
+				if err != nil {
+					return err
+				}
+				settings, err = workspacecodex.ResolveNewThreadSettings(models, settings)
+				if err != nil {
+					return err
+				}
 			}
-			settings, err := workspacecodex.ResolveNewThreadSettings(models,
-				codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort})
-			if err != nil {
-				return err
+			if receipt.Schema == 1 {
+				receipt.Model = settings.Model
+				receipt.Effort = settings.ReasoningEffort
 			}
-			receipt.Model = settings.Model
-			receipt.Effort = settings.ReasoningEffort
 		}
 		if request.Kind != "fork" && (receipt.Goal == "" || len(receipt.Goal) > session.MaxMessageBytes) {
 			return errors.New("initial request is too large or empty")
@@ -565,7 +812,10 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		unlockSnapshot = nil
 	}
 	// Revalidate availability on retries without changing the captured settings.
-	if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, false); err != nil {
+	allowCapturedDefault := request.Kind == "new" &&
+		request.Model == "" && request.Effort == "" &&
+		receipt.Model == "" && receipt.Effort == ""
+	if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, allowCapturedDefault); err != nil {
 		return err
 	}
 	args := []string{}
@@ -585,6 +835,17 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 			return err
 		}
 		args = []string{"start", request.Slug, "--as-is", "--exclusive", "--no-attach", "--goal-file", file.Name(), "--json"}
+	}
+	if receipt.Schema == 3 {
+		if receipt.DirectTeam == nil {
+			return errors.New("direct creation receipt has no team snapshot")
+		}
+		presetPath, err := writeDirectTeamPreset(s.creationDirectory(), *receipt.DirectTeam)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(presetPath)
+		args = append(args, "--team-preset", presetPath)
 	}
 	if receipt.Model != "" {
 		args = append(args, "--model", receipt.Model)
@@ -613,6 +874,35 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		return err
 	}
 	return s.bindCreationUploads(ctx, *receipt)
+}
+
+func writeDirectTeamPreset(directory string, preset teamruntime.Preset) (string, error) {
+	if err := validDirectTeamPreset(preset); err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(preset)
+	if err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(directory, ".direct-team-*.json")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if err := file.Chmod(0o600); err == nil {
+		_, err = file.Write(append(data, '\n'))
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 // Peek only the bounded action field. The same-session path retains its full
@@ -672,7 +962,29 @@ func (s *Server) acceptPlanCreation(w http.ResponseWriter, r *http.Request, sour
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the approved plan is too large for a new session"})
 		return
 	}
-	if err := validateCreationSettings(request.Model, request.Effort); err != nil {
+	input := agentteams.CreationSelectionInput{
+		Team:            agentteams.StringPresence{Present: request.teamSubmitted, Value: request.Team},
+		CatalogDigest:   agentteams.StringPresence{Present: request.digestSubmitted, Value: request.CatalogDigest},
+		Model:           agentteams.StringPresence{Present: request.modelSubmitted && request.Model != "", Value: request.Model},
+		ReasoningEffort: agentteams.StringPresence{Present: request.effortSubmitted && request.Effort != "", Value: request.Effort},
+	}
+	resolved, resolveErr := s.resolveManagedCreation(r.Context(), request, input)
+	if resolveErr != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(resolveErr.Error(), "catalog digest is stale") {
+			status = http.StatusConflict
+		} else if strings.Contains(resolveErr.Error(), "launch evidence") || strings.Contains(resolveErr.Error(), "Codex socket") {
+			status = http.StatusServiceUnavailable
+		}
+		s.writeJSON(w, status, map[string]string{"error": resolveErr.Error()})
+		return
+	}
+	request = resolved
+	settingsModel, settingsEffort := request.Model, request.Effort
+	if request.directTeam != nil {
+		settingsModel, settingsEffort = request.directTeam.LeadModel, request.directTeam.LeadEffort
+	}
+	if err := validateCreationSettings(settingsModel, settingsEffort); err != nil {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -686,17 +998,20 @@ func (s *Server) acceptPlanCreation(w http.ResponseWriter, r *http.Request, sour
 
 func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 	var binding struct {
-		Schema                int     `json:"schema"`
-		Workspace             string  `json:"workspace"`
-		Slug                  string  `json:"slug"`
-		Kind                  string  `json:"kind"`
-		ReceiptID             string  `json:"receipt_id"`
-		DeletionHistorySHA256 string  `json:"deletion_history_sha256"`
-		SourceThread          string  `json:"source_thread"`
-		SourceIdentity        string  `json:"source_identity"`
-		GoalSHA256            *string `json:"goal_sha256"`
-		Model                 string  `json:"model"`
-		Effort                string  `json:"effort"`
+		Schema                 int                 `json:"schema"`
+		Workspace              string              `json:"workspace"`
+		Slug                   string              `json:"slug"`
+		Kind                   string              `json:"kind"`
+		ReceiptID              string              `json:"receipt_id"`
+		DeletionHistorySHA256  string              `json:"deletion_history_sha256"`
+		SourceThread           string              `json:"source_thread"`
+		SourceIdentity         string              `json:"source_identity"`
+		GoalSHA256             *string             `json:"goal_sha256"`
+		Model                  string              `json:"model"`
+		Effort                 string              `json:"effort"`
+		AgentTeamBinding       string              `json:"agent_team_binding,omitempty"`
+		AgentTeamBindingDigest string              `json:"agent_team_binding_digest,omitempty"`
+		DirectTeam             *teamruntime.Preset `json:"direct_team,omitempty"`
 	}
 	if err := readCreationJSON(s.creationEvidencePath(receipt)+".request", &binding); errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -707,10 +1022,21 @@ func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 	if receipt.Request.Kind == "fork" {
 		kind, goalMatches = "fork", binding.GoalSHA256 == nil
 	}
-	if !receipt.Validated || binding.Schema != 1 || binding.Workspace != s.config.Workspace || binding.Slug != receipt.Request.Slug || binding.Kind != kind ||
+	if !receipt.Validated || binding.Schema != receipt.Schema || binding.Workspace != s.config.Workspace || binding.Slug != receipt.Request.Slug || binding.Kind != kind ||
 		binding.ReceiptID != receipt.ReceiptID || binding.SourceThread != receipt.Request.SourceThreadID || binding.SourceIdentity != receipt.Request.SourceIdentity ||
 		!goalMatches || binding.Model != receipt.Model || binding.Effort != receipt.Effort || binding.DeletionHistorySHA256 != receipt.DeletionHistorySHA256 {
 		return false, errors.New("creation binding does not match the recorded request")
+	}
+	if receipt.Schema == 2 {
+		if binding.AgentTeamBinding != receipt.AgentTeamBinding ||
+			binding.AgentTeamBindingDigest != receipt.AgentTeamBindingDigest {
+			return false, errors.New("managed creation binding does not match the recorded request")
+		}
+	}
+	if receipt.Schema == 3 {
+		if receipt.DirectTeam == nil || binding.DirectTeam == nil || !reflect.DeepEqual(*binding.DirectTeam, *receipt.DirectTeam) {
+			return false, errors.New("direct creation binding does not match the recorded request")
+		}
 	}
 	return true, nil
 }

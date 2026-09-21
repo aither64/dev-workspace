@@ -1,0 +1,1015 @@
+package teamruntime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+)
+
+type testClient struct {
+	mu                 sync.Mutex
+	next               int
+	sends              []string
+	messageIDs         []string
+	options            []codex.TurnOptions
+	starts             []codex.ThreadSettings
+	resumes            []codex.ThreadSettings
+	forkEnvs           []map[string]string
+	threads            []codex.ThreadMetadata
+	archived           map[string]bool
+	archiveAfter       func()
+	archiveResultError error
+	listPageSize       int
+	emptyNextCursor    bool
+	ignoreListCwd      bool
+	lostStart          bool
+	lostFork           bool
+	hideThreads        bool
+	nameFailure        bool
+	idleError          error
+	idleChecks         []string
+	verifyError        error
+	verified           []string
+	activeTurn         string
+	interrupts         []string
+	turnChecks         int
+	busyChecks         int
+	archives           []string
+	sendEntered        chan struct{}
+	releaseSend        chan struct{}
+}
+
+func (client *testClient) StartThreadWithSettings(_ context.Context, cwd string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.next++
+	client.starts = append(client.starts, settings)
+	id := fmt.Sprintf("thread-%d", client.next)
+	client.threads = append(client.threads, codex.ThreadMetadata{ID: id, Cwd: cwd, ProjectID: &settings.ProjectID})
+	if client.lostStart {
+		return "", errors.New("lost response")
+	}
+	return id, nil
+}
+func (client *testClient) ListThreads(_ context.Context, options codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.hideThreads {
+		return nil, nil, nil
+	}
+	var found []codex.ThreadMetadata
+	for _, thread := range client.threads {
+		if !client.ignoreListCwd && options.Cwd != "" && thread.Cwd != options.Cwd {
+			continue
+		}
+		if options.ProjectID != "" && (thread.ProjectID == nil || *thread.ProjectID != options.ProjectID) {
+			continue
+		}
+		if options.Archived != nil && client.archived[thread.ID] != *options.Archived {
+			continue
+		}
+		found = append(found, thread)
+	}
+	if client.listPageSize > 0 {
+		start := 0
+		if options.Cursor != "" {
+			var err error
+			start, err = strconv.Atoi(options.Cursor)
+			if err != nil || start < 0 || start > len(found) {
+				return nil, nil, errors.New("invalid test cursor")
+			}
+		}
+		end := min(start+client.listPageSize, len(found))
+		if end < len(found) {
+			if client.emptyNextCursor {
+				empty := ""
+				return found[start:end], &empty, nil
+			}
+			next := strconv.Itoa(end)
+			return found[start:end], &next, nil
+		}
+		return found[start:end], nil, nil
+	}
+	return found, nil, nil
+}
+func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
+	client.resumes = append(client.resumes, settings)
+	return thread, nil
+}
+func (client *testClient) ForkThread(_ context.Context, source, cwd string, environment map[string]string, _ codex.ThreadSettings) (string, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.next++
+	client.forkEnvs = append(client.forkEnvs, environment)
+	id := fmt.Sprintf("thread-%d", client.next)
+	client.threads = append(client.threads, codex.ThreadMetadata{ID: id, Cwd: cwd, ForkedFromID: source})
+	if client.lostFork {
+		return "", errors.New("lost response")
+	}
+	return id, nil
+}
+func (client *testClient) ArchiveThread(_ context.Context, thread string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.archived[thread] {
+		return errors.New("thread is already archived")
+	}
+	if client.archived == nil {
+		client.archived = make(map[string]bool)
+	}
+	client.archived[thread] = true
+	client.archives = append(client.archives, thread)
+	if client.archiveAfter != nil {
+		client.archiveAfter()
+	}
+	return client.archiveResultError
+}
+func (client *testClient) RequireThreadIdle(_ context.Context, thread, cwd string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.idleChecks = append(client.idleChecks, thread+":"+cwd)
+	return client.idleError
+}
+func (client *testClient) VerifyThread(_ context.Context, thread, cwd string) error {
+	client.verified = append(client.verified, thread+":"+cwd)
+	return client.verifyError
+}
+func (client *testClient) ActiveTurnID(_ context.Context, _ string) (string, error) {
+	return client.activeTurn, nil
+}
+func (client *testClient) Interrupt(_ context.Context, thread string) error {
+	client.interrupts = append(client.interrupts, thread)
+	client.activeTurn = ""
+	return nil
+}
+func (client *testClient) RequireThreadTurnsIdle(_ context.Context, _ string) error {
+	client.turnChecks++
+	if client.busyChecks > 0 {
+		client.busyChecks--
+		return errors.New("turn still active")
+	}
+	return nil
+}
+func (client *testClient) UnarchiveThread(context.Context, string) (codex.ThreadMetadata, error) {
+	return codex.ThreadMetadata{}, nil
+}
+func (client *testClient) SetName(context.Context, string, string) error {
+	if client.nameFailure {
+		client.nameFailure = false
+		return errors.New("temporary name failure")
+	}
+	return nil
+}
+func (client *testClient) SendWithOptions(_ context.Context, thread, text, messageID string, _ string, options codex.TurnOptions) (codex.SendReceipt, error) {
+	if client.sendEntered != nil {
+		close(client.sendEntered)
+		<-client.releaseSend
+	}
+	client.sends = append(client.sends, thread+"\n"+text)
+	client.messageIDs = append(client.messageIDs, messageID)
+	client.options = append(client.options, options)
+	return codex.SendReceipt{TurnID: "turn"}, nil
+}
+
+func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-5.6-sol", "xhigh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "implementer0", "work", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.options) != 1 || client.options[0].Model != "gpt-5.6-sol" || client.options[0].ReasoningEffort != "xhigh" {
+		t.Fatalf("assignment settings = %#v", client.options)
+	}
+	if client.starts[0].Policy.Sandbox != "workspace-write" ||
+		client.options[0].ThreadPolicy != client.starts[0].Policy {
+		t.Fatalf("member policy changed between start and assignment: %#v, %#v", client.starts, client.options)
+	}
+}
+
+func TestMemberLifecycleRefusesBusyThreadBeforeArchiving(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	client.idleError = errors.New("pending request")
+	if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err == nil || !strings.Contains(err.Error(), "implementer0") {
+		t.Fatalf("idle check = %v", err)
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("busy member was archived")
+	}
+	if len(client.archives) != 0 {
+		t.Fatalf("archived busy threads: %#v", client.archives)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" {
+		t.Fatalf("busy roster = %#v, %v", roster, err)
+	}
+	client.idleError = nil
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.archives) != 1 {
+		t.Fatalf("archives = %#v", client.archives)
+	}
+}
+
+func TestMemberArchiveRecoversWhenRosterUpdateWasLost(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		name := "ordinary"
+		if force {
+			name = "forced"
+		}
+		t.Run(name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &testClient{listPageSize: 1}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			cwd := filepath.Join(workspace, "work", "one")
+			if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "high"); err != nil {
+				t.Fatal(err)
+			}
+			// The unrelated archived thread fills the first page. A forked member
+			// may have no project ID in App Server metadata.
+			client.threads[0].ProjectID = nil
+			client.threads = append([]codex.ThreadMetadata{{ID: "other", Cwd: cwd}}, client.threads...)
+			client.archived = map[string]bool{"other": true}
+			original, err := os.ReadFile(store.path("one"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.archiveAfter = func() {
+				if err := os.WriteFile(store.path("one"), []byte("{"), 0o600); err != nil {
+					t.Errorf("simulate failed roster update: %v", err)
+				}
+			}
+			archive := service.ArchiveAll
+			if force {
+				archive = service.RetireAll
+			}
+			if err := archive(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("roster update unexpectedly succeeded")
+			}
+			if len(client.archives) != 1 || !client.archived["thread-1"] {
+				t.Fatalf("App Server archive did not succeed: %#v", client.archives)
+			}
+			if err := os.WriteFile(store.path("one"), original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			client.archiveAfter = nil
+			client.idleError = errors.New("archived thread has no pending-request interface")
+			if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err != nil {
+				t.Fatalf("already archived member should pass idle gate: %v", err)
+			}
+			idleChecks, verified, turnChecks := len(client.idleChecks), len(client.verified), client.turnChecks
+			if err := archive(context.Background(), "one", "root-one"); err != nil {
+				t.Fatalf("archive retry = %v", err)
+			}
+			if len(client.archives) != 1 || len(client.idleChecks) != idleChecks || len(client.verified) != verified || client.turnChecks != turnChecks {
+				t.Fatalf("already archived thread was reprocessed: archives=%#v idle=%#v verified=%#v turnChecks=%d", client.archives, client.idleChecks, client.verified, client.turnChecks)
+			}
+			roster, err := store.Load("one", "root-one")
+			if err != nil || roster.Members[0].State != "archived" {
+				t.Fatalf("reconciled roster = %#v, %v", roster, err)
+			}
+		})
+	}
+}
+
+func TestMemberArchiveReconcilesLostAppServerResponse(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{archiveResultError: errors.New("archive response lost")}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("lost archive response was not reconciled: %v", err)
+	}
+	if len(client.archives) != 1 {
+		t.Fatalf("archive was repeated: %#v", client.archives)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "archived" {
+		t.Fatalf("reconciled roster = %#v, %v", roster, err)
+	}
+}
+
+func TestArchivedMemberReconciliationRejectsWrongOrDuplicateIdentity(t *testing.T) {
+	for _, wrongCwd := range []bool{false, true} {
+		name := "duplicate"
+		if wrongCwd {
+			name = "wrong directory"
+		}
+		t.Run(name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &testClient{listPageSize: 1, ignoreListCwd: true}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			cwd := filepath.Join(workspace, "work", "one")
+			if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "high"); err != nil {
+				t.Fatal(err)
+			}
+			client.archived = map[string]bool{"thread-1": true}
+			if wrongCwd {
+				client.threads[0].Cwd = filepath.Join(workspace, "work", "other")
+			} else {
+				client.threads = append(client.threads, client.threads[0])
+			}
+			if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("invalid archived identity passed the idle gate")
+			}
+			if err := service.RetireAll(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("invalid archived identity passed forced retirement")
+			}
+			if len(client.archives) != 0 || len(client.interrupts) != 0 {
+				t.Fatalf("invalid identity was touched: archives=%#v interrupts=%#v", client.archives, client.interrupts)
+			}
+		})
+	}
+}
+
+func TestArchivedMemberReconciliationRejectsEmptyCursor(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{listPageSize: 1, emptyNextCursor: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	client.threads = append(client.threads, codex.ThreadMetadata{ID: "other", Cwd: cwd})
+	client.archived = map[string]bool{"thread-1": true, "other": true}
+	if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err == nil || !strings.Contains(err.Error(), "empty cursor") {
+		t.Fatalf("empty archived cursor = %v", err)
+	}
+}
+
+func TestForcedMemberRetirementInterruptsAndWaitsBeforeArchiving(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{idleError: errors.New("pending request"), activeTurn: "turn-1", busyChecks: 2}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RetireAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.interrupts) != 1 || client.interrupts[0] != "thread-1" || client.turnChecks != 3 || len(client.archives) != 1 || client.archives[0] != "thread-1" {
+		t.Fatalf("retirement: interrupts=%#v checks=%d archives=%#v", client.interrupts, client.turnChecks, client.archives)
+	}
+	if len(client.idleChecks) != 0 || len(client.verified) != 1 || client.verified[0] != "thread-1:"+filepath.Join(workspace, "work", "one") {
+		t.Fatalf("forced retirement identity checks: idle=%#v verified=%#v", client.idleChecks, client.verified)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "archived" {
+		t.Fatalf("retired roster = %#v, %v", roster, err)
+	}
+	if err := service.RetireAll(context.Background(), "one", "root-one"); err != nil || len(client.archives) != 1 {
+		t.Fatalf("retirement retry = %v, archives %#v", err, client.archives)
+	}
+}
+
+func TestForcedMemberRetirementStopsAtContextDeadline(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{activeTurn: "turn-1", busyChecks: 100}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if err := service.RetireAll(ctx, "one", "root-one"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retirement deadline = %v", err)
+	}
+	if len(client.interrupts) != 1 || len(client.archives) != 0 {
+		t.Fatalf("retirement after deadline: interrupts=%#v archives=%#v", client.interrupts, client.archives)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" {
+		t.Fatalf("unretired roster = %#v, %v", roster, err)
+	}
+}
+
+func TestForcedMemberRetirementArchivesConfirmedCreatingThread(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err == nil {
+		t.Fatal("member creation should stop after recording the confirmed thread")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "creating" || roster.Members[0].Thread != "thread-1" {
+		t.Fatalf("confirmed creating thread = %#v, %v", roster, err)
+	}
+	if err := service.RetireAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.archives) != 1 || client.archives[0] != "thread-1" {
+		t.Fatalf("archives = %#v", client.archives)
+	}
+}
+
+func TestForcedMemberRetirementRejectsThreadFromAnotherDirectory(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{activeTurn: "turn-1", verifyError: errors.New("Codex thread does not match the trusted working directory")}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RetireAll(context.Background(), "one", "root-one"); err == nil || !strings.Contains(err.Error(), "verify member implementer0 thread") {
+		t.Fatalf("wrong-directory retirement = %v", err)
+	}
+	if len(client.interrupts) != 0 || len(client.archives) != 0 {
+		t.Fatalf("wrong-directory thread was touched: interrupts=%#v archives=%#v", client.interrupts, client.archives)
+	}
+}
+
+func TestAssignmentSerializesWithMemberRemoval(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	client.sendEntered, client.releaseSend = make(chan struct{}), make(chan struct{})
+	assigned := make(chan error, 1)
+	go func() {
+		_, err := service.Assign(context.Background(), "one", "root-one", "lead", "implementer0", "work", "", "", "0123456789abcdef0123456789abcdef")
+		assigned <- err
+	}()
+	<-client.sendEntered
+	removed := make(chan error, 1)
+	go func() { removed <- service.Remove(context.Background(), "one", "root-one", "implementer0") }()
+	select {
+	case err := <-removed:
+		t.Fatalf("removal raced active assignment: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	close(client.releaseSend)
+	if err := <-assigned; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	if len(client.archives) != 1 {
+		t.Fatalf("archives = %#v", client.archives)
+	}
+}
+
+func TestRosterAddressesAndAssignmentsAreSessionScoped(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	environment := map[string]string{"DEV_SESSION_SLUG": "one"}
+	first, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), environment, "implementer", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Add(context.Background(), "two", "root-two", filepath.Join(workspace, "work", "two"), environment, "implementer", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Address != "implementer0" || second.Address != "implementer0" || first.Thread == second.Thread {
+		t.Fatalf("session-scoped member identities = %#v, %#v", first, second)
+	}
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "implementer0", "work", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.sends) != 1 || client.sends[0][:len(first.Thread)] != first.Thread {
+		t.Fatalf("assignment did not resolve the current session member: %#v", client.sends)
+	}
+	if _, err := service.Assign(context.Background(), "one", "root-one", "implementer9", "implementer0", "work", "", "", "0123456789abcdef0123456789abcdef"); err == nil {
+		t.Fatal("outside sender was accepted")
+	}
+}
+
+func TestRemovedMemberStaysRemovedAcrossLifecycleAndFork(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "implementer", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Remove(context.Background(), "source", "root-source", "implementer0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ArchiveAll(context.Background(), "source", "root-source"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ReviveAll(context.Background(), "source", "root-source"); err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.Load("source", "root-source")
+	if err != nil || source.Members[0].State != "removed" {
+		t.Fatalf("removed source member = %#v, %v", source, err)
+	}
+	destination, err := service.Fork(context.Background(), source, "target", "root-target", filepath.Join(workspace, "work", "target"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(destination.Members) != 1 || destination.Members[0].State != "removed" || destination.Members[0].Thread != "" {
+		t.Fatalf("removed destination member = %#v", destination.Members)
+	}
+	if _, err := service.Add(context.Background(), "target", "root-target", filepath.Join(workspace, "work", "target"), nil, "implementer", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.Load("target", "root-target")
+	if err != nil || updated.Members[1].Address != "implementer1" {
+		t.Fatalf("replacement address = %#v, %v", updated, err)
+	}
+}
+
+func TestPresetDoesNotAppendMembersToExistingTeam(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Store: store, Client: &testClient{}, Workspace: workspace}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "delivery", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "full", "", ""); err == nil {
+		t.Fatal("preset appended to an existing team")
+	}
+}
+
+func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"delegated": {Description: "Separate design and review", TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead":   {Model: "gpt-6-sol", Effort: "high"},
+			"designer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "designer", Access: "read_only"},
+			"implementer": {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write"},
+			"reviewer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only"},
+		}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "delegated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.Name != "Full team" || preset.LeadModel != "gpt-6-sol" || preset.LeadEffort != "high" ||
+		len(preset.Members) != 3 || preset.Members[0].Address != "architect0" ||
+		preset.Members[0].Model != "gpt-6-sol" || preset.Members[0].Effort != "xhigh" {
+		t.Fatalf("catalog projection = %#v", preset)
+	}
+}
+
+func TestSoloCatalogPresetSerializesEmptyMembers(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"solo": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead": {Model: "gpt-6-sol", Effort: "high"},
+		}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "solo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if members, ok := payload["members"].([]any); !ok || len(members) != 0 {
+		t.Fatalf("solo preset members = %#v", payload["members"])
+	}
+}
+
+func TestCatalogPresetRejectsInstructionDigestDrift(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"delegated": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead": {Model: "gpt-6-sol", Effort: "high"},
+			"reviewer":  {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only"},
+		}},
+	}, NativeAgentConfigs: agentteams.NativeAgentConfigs{Roles: []agentteams.NativeRoleConfig{
+		{Team: "delegated", Role: "reviewer", Effort: "xhigh", Identity: agentteams.NativeIdentity{BehaviorDigest: fmt.Sprintf("%064x", 9)}},
+	}}}
+	if _, err := FindCatalogPreset(catalog, "delegated"); err == nil {
+		t.Fatal("catalog with different generated role instructions was accepted")
+	}
+}
+
+func TestSoloCanAddCatalogSpecialistAfterCatalogUpdate(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	oldDigest := fmt.Sprintf("%064x", 1)
+	preset := Preset{ID: "solo", CatalogDigest: oldDigest, TeamDigest: fmt.Sprintf("%064x", 2),
+		LeadModel: "gpt-6-sol", LeadEffort: "high"}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset); err != nil {
+		t.Fatal(err)
+	}
+	currentDigest := fmt.Sprintf("%064x", 3)
+	service.Catalog = &agentteams.Catalog{CatalogDigest: currentDigest, Teams: map[string]agentteams.Team{
+		"delegated": {Roles: map[string]agentteams.Role{
+			"implementer": {Behavior: "implementer", Access: "workspace_write"},
+		}},
+	}}
+	member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "xhigh")
+	if err != nil || member.PolicyCatalogDigest != currentDigest || member.Behavior != "implementer" ||
+		client.starts[0].Policy.Sandbox != "workspace-write" {
+		t.Fatalf("added specialist = %#v, settings %#v, error %v", member, client.starts, err)
+	}
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "custom", "gpt-6-sol", "xhigh"); err == nil {
+		t.Fatal("custom role without pinned catalog policy was accepted")
+	}
+}
+
+func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	preset := Preset{ID: "delivery", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
+		LeadModel: "gpt-6-sol", LeadEffort: "xhigh", Members: []MemberSpec{
+			{Role: "implementer", Address: "implementer0", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write"},
+		}}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset); err == nil {
+		t.Fatal("expected injected name failure")
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || len(partial.Members) != 1 || partial.Members[0].State != "creating" || partial.Members[0].Thread != "thread-1" {
+		t.Fatalf("retained partial member = %#v, %v", partial, err)
+	}
+	ready, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset)
+	if err != nil || len(ready.Members) != 1 || ready.Members[0].State != "ready" || client.next != 1 {
+		t.Fatalf("resumed preset = %#v, starts %d, error %v", ready, client.next, err)
+	}
+	if len(client.starts) != 1 || client.starts[0].Model != "gpt-6-sol" || client.starts[0].ReasoningEffort != "xhigh" {
+		t.Fatalf("member settings = %#v", client.starts)
+	}
+	if len(client.resumes) != 1 || client.resumes[0].Policy != client.starts[0].Policy {
+		t.Fatalf("retry did not restore retained policy: starts %#v, resumes %#v", client.starts, client.resumes)
+	}
+	service.Catalog = &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 3), Teams: map[string]agentteams.Team{
+		"delegated": {Roles: map[string]agentteams.Role{
+			"implementer": {Behavior: "implementer", Access: "workspace_write"},
+		}},
+	}}
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "xhigh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset); err == nil {
+		t.Fatal("reapplication changed an edited team")
+	}
+}
+
+func TestSoloPresetRetainsSelectionWithoutSpecialistThread(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	preset := Preset{ID: "solo", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
+		LeadModel: "gpt-6-sol", LeadEffort: "high"}
+	roster, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, preset)
+	if err != nil || roster.PresetID != "solo" || len(roster.Members) != 0 || client.next != 0 {
+		t.Fatalf("solo roster = %#v, starts %d, error %v", roster, client.next, err)
+	}
+}
+
+func TestRetryCreatingReconcilesLostResponseWithoutSecondStart(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{lostStart: true, hideThreads: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "xhigh"); err == nil || !strings.Contains(err.Error(), "uncertain") {
+		t.Fatalf("lost start response = %v", err)
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || partial.Members[0].Thread != "" || !partial.Members[0].CreateAttempted || partial.Members[0].ProjectID == "" {
+		t.Fatalf("durable start attempt = %#v, %v", partial, err)
+	}
+	if err := service.Remove(context.Background(), "one", "root-one", "implementer0"); err == nil {
+		t.Fatal("removed member with an unresolved start")
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("archived member with an unresolved start")
+	}
+	if _, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "implementer0"); err == nil {
+		t.Fatal("zero-result reconciliation allocated or accepted another start")
+	}
+	client.hideThreads = false
+	member, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "implementer0")
+	if err != nil || member.Thread != "thread-1" || member.State != "ready" || client.next != 1 {
+		t.Fatalf("reconciled member = %#v, starts %d, error %v", member, client.next, err)
+	}
+	if client.starts[0].ProjectID != member.ProjectID ||
+		member.ProjectID == memberProjectID(workspace, "one", "different-root", "implementer0") {
+		t.Fatalf("project identity was not bound to the root: %#v", member)
+	}
+}
+
+func TestRetryCreatingRejectsAmbiguousProjectIdentity(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{lostStart: true, hideThreads: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	_, _ = service.Add(context.Background(), "one", "root-one", cwd, nil, "reviewer", "gpt-6-sol", "xhigh")
+	client.hideThreads = false
+	client.threads = append(client.threads, codex.ThreadMetadata{ID: "duplicate", Cwd: cwd, ProjectID: client.threads[0].ProjectID})
+	if _, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "reviewer0"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous start recovery = %v", err)
+	}
+	if client.next != 1 {
+		t.Fatalf("started %d threads", client.next)
+	}
+}
+
+func TestConcurrentRetryCreatingStartsOnce(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	_, err = store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		roster.Members = append(roster.Members, Member{Address: "reviewer0", Role: "reviewer", State: "creating",
+			Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only",
+			ProjectID: memberProjectID(workspace, "one", "root-one", "reviewer0"), AddedAt: time.Now().UTC()})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "reviewer0")
+			results <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if client.next != 1 {
+		t.Fatalf("concurrent retries started %d threads", client.next)
+	}
+}
+
+func TestAssignRequiresStableCallerMessageID(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	_, err = service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "reviewer", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", "random", "ABCDEF0123456789ABCDEF0123456789"} {
+		if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "reviewer0", "check", "", "", bad); err == nil {
+			t.Fatalf("accepted invalid message ID %q", bad)
+		}
+	}
+	id := "12345678-1234-1234-1234-123456789abc"
+	for i := 0; i < 2; i++ {
+		if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "reviewer0", "check", "", "", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(client.messageIDs) != 2 || client.messageIDs[0] != id || client.messageIDs[1] != id {
+		t.Fatalf("assignment IDs = %#v", client.messageIDs)
+	}
+}
+
+func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	sourceCwd := filepath.Join(workspace, "work", "source")
+	for _, role := range []string{"architect", "reviewer"} {
+		if _, err := service.Add(context.Background(), "source", "root-source", sourceCwd, nil, role, "gpt-6-sol", "xhigh"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := store.Load("source", "root-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]string{"DEV_SESSION_SLUG": "target", "DEV_SESSION_MEMBER_ADDRESS": "lead"}
+	if _, err := service.Fork(context.Background(), source, "target", "root-target", filepath.Join(workspace, "work", "target"), environment); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.forkEnvs) != 2 || client.forkEnvs[0]["DEV_SESSION_MEMBER_ADDRESS"] != "architect0" ||
+		client.forkEnvs[1]["DEV_SESSION_MEMBER_ADDRESS"] != "reviewer0" {
+		t.Fatalf("fork member environments = %#v", client.forkEnvs)
+	}
+	for _, forkEnvironment := range client.forkEnvs {
+		if forkEnvironment["DEV_SESSION_SLUG"] != "target" {
+			t.Fatalf("fork lost shared destination environment: %#v", forkEnvironment)
+		}
+	}
+	if environment["DEV_SESSION_MEMBER_ADDRESS"] != "lead" {
+		t.Fatalf("fork changed caller environment: %#v", environment)
+	}
+}
+
+func TestForkRejectsCreatingSourceBeforeDestinationRosterOrThread(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil,
+		"architect", "gpt-6-sol", "xhigh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "source", "root-source", false, func(roster *Roster) error {
+		roster.Members = append(roster.Members, Member{Address: "reviewer0", Role: "reviewer", State: "creating",
+			Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only", AddedAt: time.Now().UTC()})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.Load("source", "root-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Fork(context.Background(), source, "target", "root-target", filepath.Join(workspace, "work", "target"), nil)
+	if err == nil || !strings.Contains(err.Error(), "reviewer0 is still creating") {
+		t.Fatalf("creating source member was forked: %v", err)
+	}
+	if _, err := store.Load("target", "root-target"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fork reserved a destination roster: %v", err)
+	}
+	if client.next != 1 || len(client.forkEnvs) != 0 {
+		t.Fatalf("fork created destination threads: starts=%d forks=%d", client.next, len(client.forkEnvs))
+	}
+}
+
+func TestForkRetryUsesFrozenSourceAndRejectsMutation(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	_, err = service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "reviewer", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.Load("source", "root-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(workspace, "work", "target")
+	client.lostFork, client.hideThreads = true, true
+	if _, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil); err == nil {
+		t.Fatal("accepted uncertain fork")
+	}
+	partial, err := store.Load("target", "root-target")
+	if err != nil || partial.ForkSource == nil || partial.ForkSource.Members[0].Thread != source.Members[0].Thread || !partial.Members[0].CreateAttempted {
+		t.Fatalf("frozen fork = %#v, %v", partial, err)
+	}
+	client.hideThreads = false // Even a plausible list match is not unique across slug recreation.
+	if _, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("uncertain fork retry was not refused: %v", err)
+	}
+	if _, err := store.Update(context.Background(), "source", "root-source", false, func(roster *Roster) error {
+		roster.Members[0].Model = "changed"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client.hideThreads = false
+	if _, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("source mutation was not refused: %v", err)
+	}
+	if client.next != 2 {
+		t.Fatalf("fork retry made another thread: %d", client.next)
+	}
+}
+
+func TestForkKnownThreadRetryUsesFrozenSnapshot(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	_, err = service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "reviewer", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.nameFailure = true
+	source, err := store.Load("source", "root-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(workspace, "work", "target")
+	if _, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil); err == nil {
+		t.Fatal("expected name failure")
+	}
+	partial, err := store.Load("target", "root-target")
+	if err != nil || partial.Members[0].Thread != "thread-2" || partial.Members[0].State != "creating" {
+		t.Fatalf("partial fork = %#v, %v", partial, err)
+	}
+	ready, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil)
+	if err != nil || ready.Members[0].State != "ready" || client.next != 2 || ready.ForkSource.Members[0].Model != "gpt-6-sol" {
+		t.Fatalf("known-thread fork retry = %#v, starts %d, error %v", ready, client.next, err)
+	}
+}

@@ -607,7 +607,9 @@ class DevSessionTest < Minitest::Test
       File.write(goal, "Deliver the initial request.\n")
       File.write(portal, <<~RUBY)
         require 'json'
-        puts JSON.generate(threadId: 'thread-concurrent') if ARGV[1] == 'create'
+        if ARGV[0, 2] == ['thread', 'create']
+          puts JSON.generate(threadId: 'thread-concurrent')
+        end
       RUBY
       File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
       File.chmod(0o755, codex)

@@ -169,6 +169,8 @@ func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 }
 func TestReviewCommitPaginationAndRootDiff(t *testing.T) {
 	f, reader, repo := reviewFixture(t)
+	runGit(t, "-C", f.worktree, "config", "gc.auto", "0")
+	runGit(t, "-C", f.worktree, "config", "maintenance.auto", "false")
 	for i := 0; i < 52; i++ {
 		runGit(t, "-C", f.worktree, "commit", "--allow-empty", "-m", "commit")
 	}

@@ -36,11 +36,32 @@ type ClusterProviderContract struct {
 
 func ClusterProvider() ClusterProviderContract { return sharedRuntimeContract.ClusterProvider }
 
+// AgentTeamRegistrationContract is the host/helper boundary for pinned-team
+// registration. The host owns marker and retry records while
+// the package helper remains the authority for catalog and retained-state
+// validation.
+type AgentTeamRegistrationContract struct {
+	HelperSchema            int    `json:"helperSchema"`
+	Policy                  int    `json:"policy"`
+	MarkerSchema            int    `json:"markerSchema"`
+	PendingSchema           int    `json:"pendingSchema"`
+	MaxPersistedScalarBytes int    `json:"maxPersistedScalarBytes"`
+	MaxOutputBytes          int    `json:"maxOutputBytes"`
+	MigrationJournalSuffix  string `json:"migrationJournalSuffix"`
+}
+
+// AgentTeamRegistration returns the immutable host/helper contract.
+func AgentTeamRegistration() AgentTeamRegistrationContract {
+	return sharedRuntimeContract.AgentTeamRegistration
+}
+
 type runtimeContract struct {
-	ClusterProvider   ClusterProviderContract `json:"clusterProvider"`
-	TrackingMaxBytes  int                     `json:"trackingMaxBytes"`
-	LifecycleJournals []LifecycleJournal      `json:"lifecycleJournals"`
-	TmuxMetadata      TmuxMetadata            `json:"tmuxMetadata"`
+	ClusterProvider       ClusterProviderContract       `json:"clusterProvider"`
+	AgentTeamRegistration AgentTeamRegistrationContract `json:"agentTeamRegistration"`
+	PortalServeFlags      []string                      `json:"portalServeFlags"`
+	TrackingMaxBytes      int                           `json:"trackingMaxBytes"`
+	LifecycleJournals     []LifecycleJournal            `json:"lifecycleJournals"`
+	TmuxMetadata          TmuxMetadata                  `json:"tmuxMetadata"`
 }
 
 var sharedRuntimeContract = mustLoadRuntimeContract()
@@ -55,6 +76,24 @@ func mustLoadRuntimeContract() runtimeContract {
 	}
 	if contract.ClusterProvider.StatusBusyExitCode != 75 || contract.ClusterProvider.ReleaseTimeoutSeconds <= 0 {
 		panic("invalid cluster provider contract")
+	}
+	registration := contract.AgentTeamRegistration
+	if registration.HelperSchema != 1 || registration.Policy != 1 || registration.MarkerSchema != 1 ||
+		registration.PendingSchema != 1 || registration.MaxPersistedScalarBytes != MaxAgentTeamPersistedScalarBytes || registration.MaxOutputBytes != 4*1024*1024 ||
+		registration.MigrationJournalSuffix != ".agent-teams-migration.json" {
+		panic("invalid agent team registration contract")
+	}
+	portalFlags := make(map[string]bool, len(contract.PortalServeFlags))
+	for _, flag := range contract.PortalServeFlags {
+		if flag == "" || portalFlags[flag] {
+			panic("invalid portal serve flag contract")
+		}
+		portalFlags[flag] = true
+	}
+	for _, required := range []string{"--package-root", "--workspace-name", "--registration-marker"} {
+		if !portalFlags[required] {
+			panic("portal serve contract lacks agent team authority")
+		}
 	}
 	seenNames := make(map[string]struct{})
 	seenCommands := make(map[string]struct{})
@@ -131,12 +170,15 @@ func tmuxAuthorityFormat() string {
 // These values project the shared request boundary and worst-case transport
 // encoding overhead published in runtime-contract.json.
 const (
-	MaxMessageBytes         = 20_000
-	FormEncodingExpansion   = 3
-	JSONEncodingExpansion   = 6
-	TransportEnvelopeBytes  = 1_024
-	MaxFormRequestBodyBytes = MaxMessageBytes*FormEncodingExpansion + TransportEnvelopeBytes
-	MaxJSONRequestBodyBytes = MaxMessageBytes*JSONEncodingExpansion + TransportEnvelopeBytes
+	MaxMessageBytes = 20_000
+	// MaxAgentTeamPersistedScalarBytes bounds model and reasoning-effort values
+	// that cross the agent-team receipt, journal, catalog, and state boundary.
+	MaxAgentTeamPersistedScalarBytes = 4_096
+	FormEncodingExpansion            = 3
+	JSONEncodingExpansion            = 6
+	TransportEnvelopeBytes           = 1_024
+	MaxFormRequestBodyBytes          = MaxMessageBytes*FormEncodingExpansion + TransportEnvelopeBytes
+	MaxJSONRequestBodyBytes          = MaxMessageBytes*JSONEncodingExpansion + TransportEnvelopeBytes
 )
 
 // FormattedMaxMessageBytes returns the published limit for user-visible text.

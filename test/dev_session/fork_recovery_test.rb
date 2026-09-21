@@ -128,7 +128,7 @@ class DevSessionTest < Minitest::Test
       }
       setup.send(:write_portal_manifest, source_slug, manifest)
       called = File.join(workspace, 'portal-called')
-      portal = [RbConfig.ruby, '-e', "File.write(#{called.dump}, 'called'); exit 1"]
+      portal = [RbConfig.ruby, '-e', "exit 0 if ARGV[0, 2] == ['agent-teams', 'require-unmanaged']; File.write(#{called.dump}, 'called'); exit 1"]
       runner = DevSession::Runner.new(
         workspace:,
         tmux: NullTmux.new,

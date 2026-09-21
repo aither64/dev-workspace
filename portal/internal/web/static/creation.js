@@ -9,6 +9,7 @@
   const retry = document.getElementById("creation-retry");
   const elapsed = document.getElementById("creation-elapsed");
   const source = document.getElementById("creation-source");
+  const leaveNote = document.getElementById("creation-leave-note");
   const initialRequest = document.getElementById("creation-request");
   const requestPanel = document.getElementById("creation-request-panel");
   // The prompt is server-rendered, so asset or polling failures cannot hide it.
@@ -35,7 +36,9 @@
       window.location.replace(`/${encodeURIComponent(slug)}/`);
       return;
     }
-    title.textContent = next.state === "running" ? "Creating session" : "Initialization stopped";
+    title.textContent = next.state === "running" ? "Creating session" :
+      next.state === "cancelled" ? "Session was not created" : "Initialization stopped";
+    leaveNote.hidden = next.state === "cancelled";
     phase.textContent = next.phase;
     const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(next.startedAt)) / 1000));
     elapsed.textContent = Number.isFinite(seconds) ? `Elapsed: ${Math.floor(seconds / 60)}m ${seconds % 60}s` : "";

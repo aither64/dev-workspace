@@ -278,4 +278,31 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_portal_creation_keeps_a_non_directory_receipt_parent_fatal
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-06-06-current-receipt'
+      directory = File.join(workspace, '.portal-private')
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      write_portal_creation_acceptance(workspace, slug, id: 'a' * 64, directory:)
+      receipt = runner.send(
+        :creation_receipt_options, 'a' * 64, File.join(directory, 'complete.json'),
+        expected_source: nil, expected_source_thread: nil, expected_source_identity: nil
+      )
+
+      FileUtils.rm_r(directory)
+      File.write(directory, "not a directory\n")
+
+      error = assert_raises(DevSession::Error) do
+        runner.send(
+          :prepare_portal_creation_receipt!, receipt, slug, 'start',
+          goal: 'Accepted request', model: 'model-1', effort: 'high'
+        )
+      end
+
+      assert_includes(error.message, 'cannot read creation receipt')
+      refute_includes(error.message, 'no longer current')
+    end
+  end
+
 end

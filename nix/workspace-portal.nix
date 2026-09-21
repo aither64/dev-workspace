@@ -19,6 +19,7 @@
   ruby,
   routerSocket,
   systemd,
+  teamConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
   util-linux,
@@ -58,6 +59,13 @@ let
   coreSkills = {
     dev-session-documentation = "${src}/skills/dev-session-documentation";
     dev-session-monitor = "${src}/skills/dev-session-monitor";
+  };
+  agentTeams = import ./agent-teams.nix {
+    inherit
+      lib
+      teamConfig
+      writeText
+      ;
   };
   skills = coreSkills // extensionSkills;
   skillNamesUnique = builtins.intersectAttrs coreSkills extensionSkills == { };
@@ -141,6 +149,30 @@ let
     builtins.toJSON {
       schema = 1;
       inherit activationEnvironmentAliases routerSocket userNamespace;
+      agent_teams =
+        if agentTeams.configured then
+          {
+            managed = true;
+            metadata_schema = 1;
+            catalog = {
+              path = agentTeams.catalogPath;
+              digest = agentTeams.catalogDigest;
+              schema_version = teamConfig.schema_version;
+            };
+            capacity = teamConfig.capacity;
+            native_capacity = {
+              config_key = "agents.max_concurrent_threads_per_session";
+              required_value = teamConfig.capacity.required_native_child_threads;
+            };
+            generator = agentTeams.generator;
+            native_adapter = agentTeams.nativeAdapter;
+            native_role_configs = agentTeams.nativeRoleConfigs;
+            native_utility_configs = agentTeams.nativeUtilityConfigs;
+          }
+        else
+          {
+            managed = false;
+          };
     }
   );
 in
@@ -150,6 +182,8 @@ assert lib.assertMsg validUserNamespace
   "dev-workspace user namespace must be a lowercase identifier";
 assert lib.assertMsg validRouterSocket
   "dev-workspace router socket must be an absolute path below /run";
+assert lib.assertMsg agentTeams.valid
+  "dev-workspace teamConfig must satisfy the version 3 agent-team catalog schema";
 assert lib.assertMsg extensionsValid "dev-workspace extensions contain an unknown section";
 assert lib.assertMsg skillNamesUnique
   "dev-workspace extension skills must not replace a built-in skill";
@@ -164,7 +198,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-8Z6/cgM5VTFaHVGgGSqkPTIJre0KDyqV6sGPxpPnGIw=";
+  vendorHash = "sha256-bVA9K6lra8HSuOu4pks48ZGhTDMyYjn+qLCpJyWPKOw=";
 
   postPatch = ''
     expected=${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
@@ -248,6 +282,16 @@ buildGoModule {
       "$out/share/workspace-portal/runtime-contract.json"
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
     install -Dm644 ${packageConfiguration} "$out/share/dev-workspace/package.json"
+    ${lib.optionalString agentTeams.configured ''
+      install -Dm644 ${agentTeams.catalog} "$out/${agentTeams.catalogPath}"
+    ''}
+    ${lib.concatMapStringsSep "\n" (variant: ''
+      install -Dm644 ${variant.source} "$out/${variant.path}"
+    '') agentTeams.roleVariants}
+    ${lib.optionalString (agentTeams.utilityVariant != null) ''
+      install -Dm644 ${agentTeams.utilityVariant.source} \
+        "$out/${agentTeams.utilityVariant.path}"
+    ''}
     install -Dm644 ${src}/nix/systemd/workspace-* \
       -t "$out/share/systemd/user"
     substituteInPlace "$out/share/systemd/user/"workspace-*.service \
@@ -315,6 +359,40 @@ buildGoModule {
     test -f "$out/share/workspace-portal/runtime-contract.json"
     test -f "$out/share/dev-workspace/extensions.json"
     test -f "$out/share/dev-workspace/package.json"
+    test -x "$out/bin/workspace-portal"
+    mkdir -p "$TMPDIR/agent-team-state" "$TMPDIR/agent-team-workspace"
+    printf '{"schema":1}\n' | ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
+      "$out/bin/workspace-portal" agent-teams registration \
+      --package-root "$out" \
+      --state-root "$TMPDIR/agent-team-state" \
+      --workspace "$TMPDIR/agent-team-workspace" \
+      >"$TMPDIR/agent-team-registration.json"
+    ${contractPython}/bin/python3 - "$TMPDIR/agent-team-registration.json" <<'PY'
+    import json
+    import re
+    import sys
+
+    with open(sys.argv[1], encoding="utf-8") as source:
+        registration = json.load(source)
+    assert set(registration) == {
+        "argv", "digest", "policy", "required_native_child_threads", "schema", "states"
+    }
+    assert registration["schema"] == 1
+    assert registration["policy"] == 1
+    assert re.fullmatch(r"[0-9a-f]{64}", registration["digest"])
+    assert isinstance(registration["argv"], list)
+    assert isinstance(registration["states"], list) and registration["states"] == []
+    assert 0 <= registration["required_native_child_threads"] <= 64
+    PY
+    ${lib.optionalString agentTeams.configured ''
+      test -f "$out/${agentTeams.catalogPath}"
+    ''}
+    ${lib.concatMapStringsSep "\n" (variant: ''
+      test -f "$out/${variant.path}"
+    '') agentTeams.roleVariants}
+    ${lib.optionalString (agentTeams.utilityVariant != null) ''
+      test -f "$out/${agentTeams.utilityVariant.path}"
+    ''}
     wrapped="$out/libexec/workspace-portal/.dev-session-wrapped"
     if ! head -n 1 "$wrapped" | grep -Eq '^#! */nix/store/'; then
       echo "wrapped helper has a non-store interpreter: $wrapped" >&2

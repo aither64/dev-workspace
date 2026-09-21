@@ -152,6 +152,17 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .tab.active { color: var(--accent); background: #142b23; }
 .tab-panel { display: none; padding: 1.35rem; min-width: 0; height: 100%; overflow-y: auto; }
 .tab-panel.active { display: block; }
+.team-table-scroll { max-width: 100%; overflow-x: auto; }
+.team-table { width: max-content; min-width: 100%; border-collapse: collapse; }
+.team-table th, .team-table td { padding: .65rem; border: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.team-table th { color: var(--muted); font-size: .76rem; text-transform: uppercase; letter-spacing: .06em; }
+.team-table td { font-size: .85rem; }
+.team-table .badge { white-space: nowrap; }
+.team-state-active, .team-state-completed { color: var(--accent); border-color: #2b6652; }
+.team-state-submitting, .team-state-accepted-awaiting-observation { color: var(--warning); border-color: #66532e; }
+.team-state-unknown, .team-state-blocked { color: var(--danger); border-color: #713b46; }
+.managed-team-form { margin: 1rem 0; }
+.managed-team-form h3 { margin-top: 0; }
 .artifacts-panel.active { display: grid; grid-template-columns: minmax(180px, 260px) minmax(0, 1fr); gap: 1.25rem; }
 .artifact-list { display: grid; align-content: start; gap: .45rem; }
 .artifact-list button { text-align: left; overflow-wrap: anywhere; }

@@ -19,7 +19,8 @@ const {
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
-  configureDurableAttemptStore, renderCollaborationModes,
+  configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
+  renderCollaborationModes, storeCreationDraft,
 } = require("./static/app.js");
 
 const archivalDiagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
@@ -456,6 +457,63 @@ const storage = {
   removeItem: (key) => stored.delete(key),
   setItem: (key, value) => stored.set(key, value),
 };
+const creationDraftKey = "workspace-portal.creation-draft";
+const managedCreationDraft = {
+  name: "managed-draft", goal: "Keep this request", date: "2026-09-22",
+  team: "development", catalogDigest: "a".repeat(64), model: "model-lead", effort: "",
+};
+assert.equal(storeCreationDraft(storage, creationDraftKey, managedCreationDraft, "new"), true);
+assert.deepEqual(loadCreationDraft(storage, creationDraftKey, "new"), managedCreationDraft);
+stored.set(creationDraftKey, JSON.stringify({...managedCreationDraft, catalogDigest: "b".repeat(64), model: "retired-model", effort: "xhigh"}));
+assert.deepEqual(loadCreationDraft(storage, creationDraftKey, "new"), {
+  ...managedCreationDraft, catalogDigest: "b".repeat(64), model: "retired-model", effort: "xhigh",
+});
+assert.deepEqual(
+  creationDraftCatalogRecovery(managedCreationDraft, managedCreationDraft.catalogDigest),
+  {catalogChanged: false, requiresAcknowledgement: false, persistedCatalogDigest: managedCreationDraft.catalogDigest},
+);
+assert.deepEqual(
+  creationDraftCatalogRecovery(managedCreationDraft, "b".repeat(64)),
+  {catalogChanged: true, requiresAcknowledgement: true, persistedCatalogDigest: managedCreationDraft.catalogDigest},
+);
+assert.deepEqual(
+  creationDraftCatalogRecovery(managedCreationDraft, "b".repeat(64), true),
+  {catalogChanged: true, requiresAcknowledgement: false, persistedCatalogDigest: "b".repeat(64)},
+);
+assert.equal(storeCreationDraft(storage, creationDraftKey, {name: "broken", date: "not-a-date"}, "new"), false);
+const planDraftSnapshot = {planTurnId: "plan-turn", planSha256: "c".repeat(64)};
+const planDraftKey = planSessionDraftKey("example", planDraftSnapshot);
+assert.notEqual(planDraftKey, planSessionDraftKey("example", {...planDraftSnapshot, planTurnId: "next-turn"}));
+const planDraft = {name: "implementation", date: "2026-09-22", team: "development", catalogDigest: "d".repeat(64), model: "model-lead", effort: ""};
+assert.equal(storeCreationDraft(storage, planDraftKey, planDraft, "plan"), true);
+assert.deepEqual(loadCreationDraft(storage, planDraftKey, "plan"), planDraft);
+assert.deepEqual(
+  creationDraftCatalogRecovery(planDraft, planDraft.catalogDigest),
+  {catalogChanged: false, requiresAcknowledgement: false, persistedCatalogDigest: planDraft.catalogDigest},
+);
+assert.deepEqual(
+  creationDraftCatalogRecovery(planDraft, "e".repeat(64)),
+  {catalogChanged: true, requiresAcknowledgement: true, persistedCatalogDigest: planDraft.catalogDigest},
+);
+assert.deepEqual(
+  creationDraftCatalogRecovery(planDraft, "e".repeat(64), true),
+  {catalogChanged: true, requiresAcknowledgement: false, persistedCatalogDigest: "e".repeat(64)},
+);
+assert.deepEqual(
+  planSessionCreationSettings(true, {model: "source-model", reasoningEffort: "high"}, planDraft),
+  {team: "development", catalogDigest: "d".repeat(64), model: "model-lead", reasoningEffort: ""},
+);
+assert.deepEqual(
+  planSessionCreationSettings(false, {model: "source-model", reasoningEffort: "high"}, planDraft),
+  {model: "source-model", reasoningEffort: "high"},
+);
+assert.equal(effortSelectionForModelRefresh(true, "", "high"), "");
+assert.equal(effortSelectionForModelRefresh(true, "xhigh", "high"), "xhigh");
+assert.equal(effortSelectionForModelRefresh(false, "xhigh", "high"), "high");
+assert.equal(creationSubmitEligible({uploadReady: true, recoveryPending: false, inFlight: false}), true);
+assert.equal(creationSubmitEligible({uploadReady: false, recoveryPending: false, inFlight: false}), false);
+assert.equal(creationSubmitEligible({uploadReady: true, recoveryPending: true, inFlight: false}), false);
+assert.equal(creationSubmitEligible({uploadReady: true, recoveryPending: false, inFlight: true}), false);
 const firstAttempt = {
   message: "retry after reload", id: "00000000-0000-4000-8000-000000000002",
 };

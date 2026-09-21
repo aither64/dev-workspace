@@ -420,7 +420,7 @@ class DevSessionTest < Minitest::Test
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-demo'
       portal = File.join(workspace, 'portal')
-      File.write(portal, "#!/bin/sh\nexit 19\n")
+      File.write(portal, "#!/bin/sh\n[ \"$1\" = agent-teams ] && [ \"$2\" = require-unmanaged ] && exit 0\nexit 19\n")
       File.chmod(0o755, portal)
       runner = DevSession::Runner.new(
         workspace:,
@@ -477,6 +477,7 @@ class DevSessionTest < Minitest::Test
       worktree = File.join(workspace, 'worktrees', slug, 'sample')
       portal = File.join(workspace, 'portal.rb')
       File.write(portal, <<~RUBY)
+        exit 0 if ARGV[0, 2] == ['agent-teams', 'require-unmanaged']
         exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         File.write(File.join(#{worktree.dump}, 'from-active-turn'), "changed\n")
         system(
@@ -534,7 +535,7 @@ class DevSessionTest < Minitest::Test
         base: 'master', fetch: false
       )
       portal = File.join(workspace, 'portal')
-      File.write(portal, "#!/bin/sh\nexit 19\n")
+      File.write(portal, "#!/bin/sh\n[ \"$1\" = agent-teams ] && [ \"$2\" = require-unmanaged ] && exit 0\nexit 19\n")
       File.chmod(0o755, portal)
       manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
       manifest = YAML.safe_load(File.read(manifest_path))

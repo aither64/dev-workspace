@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
@@ -67,6 +69,48 @@ func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
 		t.Fatal(err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("portal did not acquire the released transition lock")
+	}
+}
+
+func TestDirectThreadPageShowsLifecycleAndTeamControls(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "example")
+	server.config.VerifyThread = func(_ context.Context, id, cwd string) error {
+		if id != "thread-1" || cwd != filepath.Join(server.config.Workspace, "work", "example") {
+			return fmt.Errorf("unexpected interactive fixture %q in %q", id, cwd)
+		}
+		return nil
+	}
+	tmux := filepath.Join(t.TempDir(), "tmux")
+	tmuxLine := strings.Join([]string{
+		"$1", "example", "1", "example", server.config.Workspace, "example",
+		"/run/dev-workspace-tmux/tmux.sock", "thread-1", server.config.CodexSocket, "0.152.1",
+		"%1", strings.Repeat("a", 64),
+	}, "\t")
+	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+tmuxLine+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.Tmux = tmux
+
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("session page = %d %q", page.Code, page.Body.String())
+	}
+	body := page.Body.String()
+	for _, available := range []string{
+		`id="fork-open"`, `id="archive-session-open"`,
+		`id="delete-session-open"`, `id="auto-archive-hold"`, `id="session-tab-team"`,
+	} {
+		if !strings.Contains(body, available) {
+			t.Fatalf("direct-thread page omitted lifecycle or team control %s", available)
+		}
+	}
+	for _, available := range []string{`id="plan-implement-new"`, `id="plan-session-dialog"`} {
+		if !strings.Contains(body, available) {
+			t.Fatalf("session page lost plan-to-new control %s", available)
+		}
 	}
 }
 
@@ -905,6 +949,75 @@ func TestNewRejectsAnHTTPBaseURL(t *testing.T) {
 	}
 }
 
+func TestPortalTrustedOriginsRequireDistinctHTTPSOrigins(t *testing.T) {
+	base := "https://workspace.example.test"
+	origins, err := portalTrustedOrigins(base, []string{"https://alias.workspace.example.test"})
+	if err != nil || !slices.Equal(origins, []string{base, "https://alias.workspace.example.test"}) {
+		t.Fatalf("trusted origins = %#v, %v", origins, err)
+	}
+	for _, aliases := range [][]string{
+		{base},
+		{"http://alias.workspace.example.test"},
+		{"https://alias.workspace.example.test/path"},
+		{"https://alias.workspace.example.test?query=1"},
+	} {
+		if _, err := portalTrustedOrigins(base, aliases); err == nil {
+			t.Fatalf("aliases %#v were accepted", aliases)
+		}
+	}
+}
+
+func TestRegisteredAliasOriginReachesConversationUploadsAndPortalMutations(t *testing.T) {
+	const alias = "https://alias.workspace.example.test"
+	server := newTestServerWithTrustedOrigins(t, []string{alias})
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "example")
+	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{
+		ThreadID: "thread-1", Status: "idle", CollaborationMode: "default",
+	}}
+	handler := server.Handler()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil)
+	request.Header.Set("Origin", alias)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("alias conversation = %d: %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/sessions/example/thread", nil)
+	request.Header.Set("Origin", "https://attacker.example.test")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unregistered conversation origin = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/upload-drafts", nil)
+	request.Header.Set("Origin", alias)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("alias portal mutation = %d: %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/uploads/d-missing/file", nil)
+	request.Header.Set("Origin", alias)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("alias upload request = %d: %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/uploads/d-missing/file", nil)
+	request.Header.Set("Origin", "https://attacker.example.test")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unregistered upload origin = %d", response.Code)
+	}
+}
+
 func TestPortalLabelsAndSSHAttachHostAreConfigurable(t *testing.T) {
 	server := newTestServer(t)
 	server.config.DisplayLabel = "Example development"
@@ -1257,6 +1370,9 @@ func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testin
 	if !strings.Contains(joined, "start 2026-09-03-example --as-is --exclusive") || strings.Contains(joined, "--new") {
 		t.Fatalf("dev-session arguments = %q", argv)
 	}
+	if strings.Contains(joined, "--model") || strings.Contains(joined, "--effort") {
+		t.Fatalf("unmanaged creation synthesized settings in %q", argv)
+	}
 	for _, privateFlag := range []string{
 		"--require-runtime", "--workspace", "--tmux-socket", "--authority-dir",
 		"--codex-socket", "--codex-version", "--codex-command",
@@ -1476,6 +1592,64 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 	}
 }
 
+func TestDirectTeamStatusProvidesControls(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		BaseURL: server.config.BaseURL,
+		Session: &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{
+		`id="session-tab-team"`, `id="team-member-status"`, `Independent threads`, `<code>lead</code>`,
+		`data-direct-team-form`, `Start from a preset`, `Add member`,
+		`<option value="architect">Architect</option>`, `<option value="reviewer">Reviewer</option>`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("direct team page omitted %q: %q", marker, body)
+		}
+	}
+	teamStart := strings.Index(body, `<section id="team"`)
+	teamEnd := strings.Index(body, `<section id="repositories"`)
+	if teamStart < 0 || teamEnd < teamStart {
+		t.Fatalf("direct team section is malformed: %q", body)
+	}
+	if !strings.Contains(body[teamStart:teamEnd], "<button") || !strings.Contains(body[teamStart:teamEnd], "<form") {
+		t.Fatalf("direct team status omitted its controls: %q", body[teamStart:teamEnd])
+	}
+	javascript, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{`directTeamRequest`, `data-direct-team-form`, `data-team-remove`, `action === "assign"`, `body.messageId = messageId`, `assignmentStorage.setItem`, `assignmentStorage.getItem(key) !== messageId`, `assignmentStorage.removeItem`} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("direct team controls do not handle %q", marker)
+		}
+	}
+}
+
+func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "index", pageData{
+		BaseURL: "https://workspace.example.test", CreationDate: "2026-09-22",
+		AgentTeams: &agentTeamsPage{Managed: true, DefaultTeam: "delegated", CatalogDigest: strings.Repeat("a", 64),
+			Teams: []agentTeamRow{{Name: "delegated", Label: "Full team", Description: "Separate design and review",
+				RoleSummary: "lead · architect0 · implementer0 · reviewer0", LeadModel: "gpt-6-sol", LeadEffort: "high"}}},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{`Full team: lead · architect0 · implementer0 · reviewer0</option>`, `data-roles="lead · architect0 · implementer0 · reviewer0"`,
+		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required`,
+		`Lead reasoning effort<select name="effort" data-effort-select required`} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("new session omitted %q", marker)
+		}
+	}
+	if strings.Contains(body, `Advanced lead override`) || strings.Contains(body, `Configured default`) {
+		t.Fatal("new session still exposes an ambiguous lead override")
+	}
+}
+
 func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	javascript, err := assets.ReadFile("static/app.js")
 	if err != nil {
@@ -1504,7 +1678,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	}
 }
 
-func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.T) {
+func TestCreationAndMemberReasoningSelectorsRequireExplicitValues(t *testing.T) {
 	server := newTestServer(t)
 	directory := filepath.Join(server.config.Workspace, "work", "example")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
@@ -1524,11 +1698,11 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	if count := strings.Count(body, `data-effort-select`); count != 2 {
+	if count := strings.Count(body, `data-effort-select`); count != 4 {
 		t.Fatalf("reasoning effort selects = %d", count)
 	}
-	if strings.Contains(body, `name="effort" data-effort-select required`) {
-		t.Fatal("fork reasoning is blocked by native required validation")
+	if !strings.Contains(body, `name="effort" data-effort-select required`) {
+		t.Fatal("creation and member settings do not require an explicit effort")
 	}
 	javascript, err := assets.ReadFile("static/app.js")
 	if err != nil {
@@ -1536,7 +1710,7 @@ func TestReasoningSelectorsAllowAutomaticOnlyOutsideExistingSettings(t *testing.
 	}
 	if !strings.Contains(string(javascript),
 		`const existingSettings = modelSelect.dataset.existingSettings === "true"`) ||
-		!strings.Contains(string(javascript), `if (!existingSettings)`) {
+		!strings.Contains(string(javascript), `if (!existingSettings && !effortSelect.required)`) {
 		t.Fatal("existing-thread settings still offer unsupported automatic reasoning")
 	}
 }
@@ -2758,7 +2932,7 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 		}},
 	}}
 	body := fmt.Sprintf(
-		`{"action":"new","planTurnId":"turn-plan","planSha256":"%s","name":"implement-feature","creationDate":"2026-09-07"}`,
+		`{"action":"new","planTurnId":"turn-plan","planSha256":"%s","name":"implement-feature","creationDate":"2026-09-07","model":"model-1","reasoningEffort":"high"}`,
 		planDigest(plan),
 	)
 	response := httptest.NewRecorder()
@@ -3941,6 +4115,10 @@ func prepareInteractiveConversation(t *testing.T, server *Server, slug string) *
 }
 
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithTrustedOrigins(t, nil)
+}
+
+func newTestServerWithTrustedOrigins(t *testing.T, trustedOrigins []string) *Server {
 	t.Helper()
 	workspace := t.TempDir()
 	authorityDir := filepath.Join(t.TempDir(), "authority")
@@ -3952,15 +4130,16 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	server, err := New(Config{
-		Workspace:     workspace,
-		BaseURL:       "https://workspace.example.test",
-		DevSession:    "/run/current-system/sw/bin/dev-session",
-		HostProfile:   profile,
-		AuthorityDir:  authorityDir,
-		CodexSocket:   "/run/dev-workspace-codex/app-server.sock",
-		CodexVersion:  "0.152.1",
-		UserStateRoot: filepath.Join(t.TempDir(), "state"),
-		Logger:        log.New(io.Discard, "", 0),
+		Workspace:      workspace,
+		BaseURL:        "https://workspace.example.test",
+		TrustedOrigins: trustedOrigins,
+		DevSession:     "/run/current-system/sw/bin/dev-session",
+		HostProfile:    profile,
+		AuthorityDir:   authorityDir,
+		CodexSocket:    "/run/dev-workspace-codex/app-server.sock",
+		CodexVersion:   "0.152.1",
+		UserStateRoot:  filepath.Join(t.TempDir(), "state"),
+		Logger:         log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -4038,5 +4217,36 @@ func TestSessionDetailsReplaceClusterStateAfterStopAndReset(t *testing.T) {
 	stopped := read(`printf '%s' '{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}'`)
 	if strings.Contains(stopped, "temporary-secret") || !strings.Contains(stopped, ">stopped<") {
 		t.Fatalf("stale stopped state: %s", stopped)
+	}
+}
+
+func TestSessionDetailsRetainsDirectTeamRoster(t *testing.T) {
+	server := newTestServer(t)
+	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "root-example", true, func(roster *teamruntime.Roster) error {
+		roster.Members = append(roster.Members, teamruntime.Member{
+			Address: "implementer0", Role: "implementer", Thread: "member-thread", State: "ready", AddedAt: time.Now().UTC(),
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary := &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "root-example"}}, Interactive: true}
+	response := httptest.NewRecorder()
+	server.sessionDetails(response, httptest.NewRequest("GET", "/api/sessions/example/details", nil), summary)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	var payload struct {
+		TeamHTML string `json:"teamHTML"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload.TeamHTML, "implementer0") || strings.Contains(payload.TeamHTML, "No team roster yet") {
+		t.Fatalf("direct roster disappeared during refresh: %s", payload.TeamHTML)
 	}
 }

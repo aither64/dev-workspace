@@ -1,6 +1,6 @@
 ---
 name: dev-session-monitor
-description: Delegate long test, CI, and build monitoring to a fresh Luna subagent, then continue in the parent conversation. Use for authorized verification expected to exceed one minute and integration tests or builds of uncertain duration; keep known quick checks inline.
+description: Delegate long test, CI, and build monitoring to a fresh session-policy watcher, then continue in the parent conversation. Use for authorized verification expected to exceed one minute and integration tests or builds of uncertain duration; keep known quick checks inline.
 ---
 
 # Development monitoring
@@ -14,10 +14,18 @@ watcher instructions below; do not delegate again.
 
 ## Parent handoff
 
-Delegate before launching an eligible command. Use `gpt-5.6-luna` with `low`
-reasoning and fresh context (`fork_turns: "none"`), explicitly selecting both
-settings rather than inheriting the parent or changing global agent defaults.
-Keep known quick checks inline. Do not start or wait for CI the user has excluded.
+Resolve the watcher policy before delegating. For a managed session, read its
+pinned catalog and select the exact model and reasoning effort from the separate
+`utilities.verification_watcher` record, together with the matching native
+utility configuration from that same catalog digest. The watcher is a utility,
+not a team member. Create its first native operation with fresh context
+(`fork_turns: "none"`). Its lifetime is one operation: every later long or
+uncertain operation receives a fresh watcher and never reuses this identity.
+
+For an unmanaged session, use only an explicit applicable caller or site policy.
+If none supplies the watcher lineup, visibly fall back to parent monitoring; do
+not infer a model, effort, or native utility from this generic skill. Keep known
+quick checks inline. Do not start or wait for CI the user has excluded.
 
 Give the watcher only the information it needs:
 
@@ -40,11 +48,12 @@ limits. Do not poll the same logs alongside the watcher or ask repeatedly for
 unchanged status. Keep necessary parent wake-ups brief. Continue automatically
 on the watcher's result; no user confirmation is needed for that handoff.
 
-If the skill's delegation tools, Luna/low, or a free agent slot are unavailable,
-say so once and monitor in the parent with blocking waits and bounded output.
-Use the same fallback when an existing run has no transferable observation
-interface. Do not silently substitute a different watcher model, interrupt
-unrelated agents, or stall verification waiting for capacity.
+If the skill's delegation tools, required managed or caller-supplied watcher
+lineup, or a free agent slot are unavailable, say so once and monitor in the
+parent with blocking waits and bounded output. Use the same fallback when an
+existing run has no transferable observation interface. Do not silently
+substitute a different watcher model, interrupt unrelated agents, or stall
+verification waiting for capacity.
 
 ## Watcher instructions
 

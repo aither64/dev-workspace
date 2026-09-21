@@ -28,10 +28,12 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/microcosm-cc/bluemonday"
@@ -61,27 +63,31 @@ type codexController interface {
 }
 
 type Config struct {
-	ObserveActivity  bool
-	CollectUploads   bool
-	Workspace        string
-	BaseURL          string
-	DisplayLabel     string
-	HostLabel        string
-	SSHHost          string
-	DevSession       string
-	HostProfile      string
-	GH               string
-	Tmux             string
-	AuthorityDir     string
-	TransitionLock   string
-	CodexSocket      string
-	CodexVersion     string
-	ClusterProviders []cluster.Provider
-	UserStateRoot    string
-	Logger           *log.Logger
-	Codex            codexController
-	VerifyThread     func(context.Context, string, string) error
-	ReadThread       func(context.Context, string) (codex.Transcript, error)
+	ObserveActivity    bool
+	CollectUploads     bool
+	Workspace          string
+	BaseURL            string
+	TrustedOrigins     []string
+	DisplayLabel       string
+	HostLabel          string
+	SSHHost            string
+	DevSession         string
+	HostProfile        string
+	GH                 string
+	Tmux               string
+	AuthorityDir       string
+	TransitionLock     string
+	CodexSocket        string
+	CodexVersion       string
+	ClusterProviders   []cluster.Provider
+	UserStateRoot      string
+	PackageRoot        string
+	WorkspaceName      string
+	RegistrationMarker string
+	Logger             *log.Logger
+	Codex              codexController
+	VerifyThread       func(context.Context, string, string) error
+	ReadThread         func(context.Context, string) (codex.Transcript, error)
 }
 
 type cachedRepositories struct {
@@ -168,6 +174,8 @@ type Server struct {
 	stopOnce         sync.Once
 	stopping         chan struct{}
 	conversation     http.Handler
+	trustedOrigins   []string
+	installedTeams   *agentteams.Installed
 }
 
 type hostProfileIdentity struct {
@@ -198,9 +206,30 @@ type pageData struct {
 	PendingLifecycle  string
 	LifecycleOnly     bool
 	LifecycleTargetID string
+	AgentTeams        *agentTeamsPage
+	TeamStatusError   string
+	DirectTeam        *teamruntime.Roster
+	TeamPresets       []teamruntime.Preset
+}
+
+type agentTeamsPage struct {
+	Managed       bool
+	CatalogDigest string
+	DefaultTeam   string
+	Teams         []agentTeamRow
+}
+
+type agentTeamRow struct {
+	Name        string
+	Label       string
+	Description string
+	RoleSummary string
+	LeadModel   string
+	LeadEffort  string
 }
 
 func New(config Config) (*Server, error) {
+	var installedTeams *agentteams.Installed
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
@@ -228,12 +257,41 @@ func New(config Config) (*Server, error) {
 		return nil, fmt.Errorf("resolve workspace: %w", err)
 	}
 	config.Workspace = workspace
+	if config.PackageRoot != "" || config.WorkspaceName != "" || config.RegistrationMarker != "" {
+		if config.PackageRoot == "" || config.WorkspaceName == "" || config.RegistrationMarker == "" || config.UserStateRoot == "" {
+			return nil, errors.New("portal agent team authorities are incomplete")
+		}
+		if !filepath.IsAbs(config.PackageRoot) || filepath.Clean(config.PackageRoot) != config.PackageRoot ||
+			!filepath.IsAbs(config.RegistrationMarker) || filepath.Clean(config.RegistrationMarker) != config.RegistrationMarker ||
+			!filepath.IsAbs(config.CodexSocket) || filepath.Clean(config.CodexSocket) != config.CodexSocket ||
+			filepath.Base(config.RegistrationMarker) != "registration.json" ||
+			filepath.Dir(config.RegistrationMarker) != filepath.Dir(config.CodexSocket) {
+			return nil, errors.New("portal agent team authorities must be absolute and canonical")
+		}
+		resolvedPackageRoot, resolveErr := filepath.EvalSymlinks(config.PackageRoot)
+		if resolveErr != nil || resolvedPackageRoot != config.PackageRoot {
+			return nil, errors.New("portal package root must be a resolved canonical path")
+		}
+		installed, loadErr := agentteams.LoadInstalled(config.PackageRoot)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load installed agent teams: %w", loadErr)
+		}
+		if installed.Managed && installed.Catalog == nil {
+			return nil, errors.New("managed package has no agent team catalog")
+		}
+		config.PackageRoot = filepath.Clean(config.PackageRoot)
+		installedTeams = &installed
+	}
 	baseURL, err := url.Parse(config.BaseURL)
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" || baseURL.Path != "" || baseURL.RawQuery != "" || baseURL.Fragment != "" || baseURL.User != nil {
 		return nil, fmt.Errorf("invalid base URL %q", config.BaseURL)
 	}
 	if baseURL.Scheme != "https" {
 		return nil, fmt.Errorf("portal requires an HTTPS base URL")
+	}
+	trustedOrigins, err := portalTrustedOrigins(config.BaseURL, config.TrustedOrigins)
+	if err != nil {
+		return nil, err
 	}
 	if config.DevSession == "" || !filepath.IsAbs(config.DevSession) {
 		return nil, errors.New("portal requires an absolute dev-session command")
@@ -284,13 +342,15 @@ func New(config Config) (*Server, error) {
 		operationContext: operationContext,
 		cancelOperations: cancelOperations,
 		stopping:         make(chan struct{}),
+		trustedOrigins:   trustedOrigins,
+		installedTeams:   installedTeams,
 	}
 	if err := server.loadCreations(); err != nil {
 		cancelOperations()
 		return nil, err
 	}
 	conversationHandler, err := conversation.NewHandler(conversation.Options{
-		AllowedOrigins: []string{config.BaseURL}, BasePath: "/codex", Logger: config.Logger,
+		AllowedOrigins: trustedOrigins, BasePath: "/codex", Logger: config.Logger,
 		MaxMessageBytes: session.MaxMessageBytes, Shutdown: server.stopping,
 		Resolver: conversation.ResolverFunc(server.resolveConversation),
 	})
@@ -310,6 +370,28 @@ func New(config Config) (*Server, error) {
 		go server.reconcileThreadInstructions()
 	}
 	return server, nil
+}
+
+// portalTrustedOrigins extends the canonical portal origin with aliases chosen
+// by the registered workspace. Callers must provide complete HTTPS origins so
+// browser Origin values can be compared exactly; request Host headers never
+// add an origin to this set.
+func portalTrustedOrigins(baseURL string, aliases []string) ([]string, error) {
+	origins := make([]string, 0, len(aliases)+1)
+	seen := make(map[string]struct{}, len(aliases)+1)
+	for _, origin := range append([]string{baseURL}, aliases...) {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "" ||
+			parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+			return nil, fmt.Errorf("invalid trusted portal origin %q", origin)
+		}
+		if _, duplicate := seen[origin]; duplicate {
+			return nil, fmt.Errorf("duplicate trusted portal origin %q", origin)
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins, nil
 }
 
 func (s *Server) reconcileThreadInstructions() {
@@ -543,7 +625,13 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 }
 
 func (s *Server) validMutation(r *http.Request) bool {
-	return r.Header.Get("Origin") == s.config.BaseURL
+	origin := r.Header.Get("Origin")
+	for _, trusted := range s.trustedOrigins {
+		if origin == trusted {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
@@ -552,6 +640,7 @@ func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
 	data := pageData{
 		BaseURL: s.config.BaseURL, CreationDate: now.Format(time.DateOnly),
 		IndexGeneratedAt: now.Format(time.RFC3339Nano), MaxMessageBytes: session.MaxMessageBytes,
+		AgentTeams: s.agentTeamsPage(),
 	}
 	if err != nil {
 		data.Error = err.Error()
@@ -830,6 +919,13 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		BaseURL: s.config.BaseURL, Session: summary,
 		CreationDate: time.Now().Format(time.DateOnly), MaxMessageBytes: session.MaxMessageBytes,
 		LifecycleTargetID: lifecycleTargetID,
+		AgentTeams:        s.agentTeamsPage(),
+		TeamPresets:       s.directTeamPresets(),
+	}
+	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
+		data.Error = "Team roster is unavailable: " + rosterErr.Error()
+	} else {
+		data.DirectTeam = roster
 	}
 	if lifecycleIdentityErr != nil {
 		data.Error = "Session lifecycle identity is unavailable: " + lifecycleIdentityErr.Error()
@@ -860,6 +956,29 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	s.render(w, "session", data)
 }
 
+// agentTeamsPage is intentionally a presentation-only projection of the
+// installed immutable catalog. Creation still resolves every submitted value
+// against the catalog and the live App Server inventory before any effect.
+func (s *Server) agentTeamsPage() *agentTeamsPage {
+	if s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
+		return &agentTeamsPage{}
+	}
+	presets, err := teamruntime.PresetsFromCatalog(*s.installedTeams.Catalog)
+	if err != nil {
+		s.config.Logger.Printf("project direct team catalog: %v", err)
+		return &agentTeamsPage{}
+	}
+	rows := make([]agentTeamRow, 0, len(presets))
+	for _, preset := range presets {
+		rows = append(rows, agentTeamRow{
+			Name: preset.ID, Label: preset.Name, Description: preset.Description,
+			RoleSummary: strings.Join(preset.Roles, " · "), LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort,
+		})
+	}
+	return &agentTeamsPage{Managed: true, CatalogDigest: s.installedTeams.Catalog.CatalogDigest,
+		DefaultTeam: s.installedTeams.Catalog.DefaultTeam, Teams: rows}
+}
+
 // sessionDetails refreshes the existing sections without replacing the conversation.
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	var warning string
@@ -872,13 +991,24 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		summary.Repositories = repositories
 	}
 	data := pageData{Session: summary, Repositories: s.repositories(r.Context(), summary), RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary)}
-	var repositories, artifacts bytes.Buffer
+	data.TeamPresets = s.directTeamPresets()
+	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
+		s.config.Logger.Printf("refresh team roster for %s: %v", summary.Slug, rosterErr)
+		data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
+	} else {
+		data.DirectTeam = roster
+	}
+	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render repositories"})
 		return
 	}
 	if err := s.templates.ExecuteTemplate(&artifacts, "artifact-list", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render artifacts"})
+		return
+	}
+	if err := s.templates.ExecuteTemplate(&members, "member-status", data); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render team status"})
 		return
 	}
 	if !summary.Archived && s.clusters.MayExist(summary.Slug) {
@@ -898,6 +1028,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
 		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
+		"teamHTML": members.String(),
 	})
 }
 
@@ -954,6 +1085,8 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	goal := strings.TrimSpace(r.FormValue("goal"))
 	model := strings.TrimSpace(r.FormValue("model"))
 	effort := strings.TrimSpace(r.FormValue("effort"))
+	team := strings.TrimSpace(r.FormValue("team"))
+	catalogDigest := strings.TrimSpace(r.FormValue("catalogDigest"))
 	creationDate := strings.TrimSpace(r.FormValue("creation_date"))
 	if !session.ValidSlug(name) || len(name) > 48 {
 		s.writeError(w, r, http.StatusBadRequest, "session name is invalid")
@@ -970,7 +1103,31 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "session creation date is invalid")
 		return
 	}
-	if err := validateCreationSettings(model, effort); err != nil {
+	_, teamSubmitted := r.Form["team"]
+	_, digestSubmitted := r.Form["catalogDigest"]
+	request := creationRequest{Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort}
+	resolvedRequest, resolveErr := s.resolveManagedCreation(r.Context(), request, agentteams.CreationSelectionInput{
+		Team:            agentteams.StringPresence{Present: teamSubmitted, Value: team},
+		CatalogDigest:   agentteams.StringPresence{Present: digestSubmitted, Value: catalogDigest},
+		Model:           agentteams.StringPresence{Present: model != "", Value: model},
+		ReasoningEffort: agentteams.StringPresence{Present: effort != "", Value: effort},
+	})
+	if resolveErr != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(resolveErr.Error(), "catalog digest is stale") {
+			status = http.StatusConflict
+		} else if strings.Contains(resolveErr.Error(), "launch evidence") || strings.Contains(resolveErr.Error(), "Codex socket") {
+			status = http.StatusServiceUnavailable
+		}
+		s.writeError(w, r, status, resolveErr.Error())
+		return
+	}
+	request = resolvedRequest
+	settingsModel, settingsEffort := request.Model, request.Effort
+	if request.directTeam != nil {
+		settingsModel, settingsEffort = request.directTeam.LeadModel, request.directTeam.LeadEffort
+	}
+	if err := validateCreationSettings(settingsModel, settingsEffort); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -988,10 +1145,8 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, prepareErr.Error())
 		return
 	}
-	goal = preparedGoal
-	receipt, err := s.acceptCreation(creationRequest{
-		Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort,
-	})
+	request.Goal = preparedGoal
+	receipt, err := s.acceptCreation(request)
 	if err != nil {
 		s.writeError(w, r, http.StatusConflict, err.Error())
 		return
@@ -1050,9 +1205,6 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	if models == nil {
 		models = []codex.Model{}
-	}
-	for index := range models {
-		models[index].IsDefault = models[index].Model == workspacecodex.DefaultNewThreadModel
 	}
 	s.writeJSON(w, http.StatusOK, models)
 }
@@ -1380,6 +1532,14 @@ func (s *Server) sessionAPIForSummary(
 		s.sessionDetails(w, r, summary)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "team" {
+		s.teamAPI(w, r, summary)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "team-thread" {
+		s.teamThreadAPI(w, r, summary)
+		return
+	}
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
 		s.releaseCluster(w, r, summary)
 		return
@@ -1435,6 +1595,221 @@ func (s *Server) sessionAPIForSummary(
 		return
 	}
 	http.NotFound(w, r)
+}
+
+type teamRequestBody struct {
+	Action    string `json:"action"`
+	Preset    string `json:"preset"`
+	Role      string `json:"role"`
+	Address   string `json:"address"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Message   string `json:"message"`
+	MessageID string `json:"messageId"`
+	Model     string `json:"model"`
+	Effort    string `json:"reasoningEffort"`
+}
+
+func (s *Server) teamEnvironment(summary *session.Summary) map[string]string {
+	work := filepath.Join(s.config.Workspace, "work", summary.Slug)
+	return map[string]string{
+		"DEV_SESSION_SLUG": summary.Slug, "DEV_SESSION_WORKSPACE": s.config.Workspace,
+		"DEV_SESSION_WORK_DIR": work, "DEV_SESSION_WORKTREES_DIR": filepath.Join(s.config.Workspace, "worktrees", summary.Slug),
+		"DEV_SESSION_PORTAL_BASE_URL": s.config.BaseURL, "DEV_SESSION_URL": strings.TrimSuffix(s.config.BaseURL, "/") + "/" + summary.Slug + "/",
+		"DEV_SESSION_AUTHORITY_DIR": s.config.AuthorityDir, "DEV_SESSION_CODEX_SOCKET": s.config.CodexSocket,
+		"DEV_SESSION_CODEX_VERSION": s.config.CodexVersion, "DEV_SESSION_REQUIRE_RUNTIME": "1",
+	}
+}
+
+func (s *Server) directTeamPresets() []teamruntime.Preset {
+	if s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
+		return teamruntime.Presets()
+	}
+	presets, err := teamruntime.PresetsFromCatalog(*s.installedTeams.Catalog)
+	if err != nil {
+		s.config.Logger.Printf("project installed direct team presets: %v", err)
+		return nil
+	}
+	return presets
+}
+
+func (s *Server) teamService() (teamruntime.Service, error) {
+	if s.config.UserStateRoot == "" || s.config.Codex == nil {
+		return teamruntime.Service{}, errors.New("team runtime is unavailable")
+	}
+	client, ok := s.config.Codex.(teamruntime.Client)
+	if !ok {
+		return teamruntime.Service{}, errors.New("this Codex client cannot create independent team threads")
+	}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		return teamruntime.Service{}, err
+	}
+	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace}
+	if s.installedTeams != nil && s.installedTeams.Managed {
+		service.Catalog = s.installedTeams.Catalog
+	}
+	return service, nil
+}
+
+func (s *Server) loadTeamRoster(summary *session.Summary) (*teamruntime.Roster, error) {
+	if s.config.UserStateRoot == "" || summary.Codex.ThreadID == "" {
+		return nil, os.ErrNotExist
+	}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		return nil, err
+	}
+	return store.Load(summary.Slug, summary.Codex.ThreadID)
+}
+
+// teamAPI is intentionally a small direct-thread adapter. A request never
+// reaches the retired virtual-team dispatcher: it either changes the roster or
+// sends one normal, client-correlated turn to the selected independent thread.
+func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	if r.Method == http.MethodGet {
+		roster, err := s.loadTeamRoster(summary)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster, "presets": s.directTeamPresets()})
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "unsupported team operation"})
+		return
+	}
+	// The creation receipt proves the exact initial roster. Keep all Team
+	// mutations behind that proof, including assignment and retry, so a ready
+	// manifest cannot expose a roster that invalidates its pending receipt.
+	if receipt, ok := s.currentCreation(summary.Slug); ok && receipt.blocksSession() {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session initialization has not finished"})
+		return
+	}
+	// Match all other browser mutations: this shared runtime lock is the same
+	// lock held exclusively by dev-session lifecycle commands. Keep the App
+	// Server side effect and roster transition inside it so archive/delete cannot
+	// race member creation or assignment.
+	lock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	defer lock.Close()
+	owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if journalErr != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
+		return
+	}
+	if owner != "" {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session " + owner + " is unfinished; retry that operation first"})
+		return
+	}
+	summary, err = session.Find(s.config.Workspace, summary.Slug)
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session state changed"})
+		return
+	}
+	s.normalizeInteractivity(r.Context(), summary)
+	if summary.Archived || !summary.Interactive {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready for team changes"})
+		return
+	}
+	service, err := s.teamService()
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	var request teamRequestBody
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	request.Action, request.Address, request.Role = strings.TrimSpace(request.Action), strings.TrimSpace(request.Address), strings.TrimSpace(request.Role)
+	if r.Method == http.MethodDelete || request.Action == "remove" {
+		err = service.Remove(r.Context(), summary.Slug, summary.Codex.ThreadID, request.Address)
+	} else {
+		cwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
+		if request.Action == "add" || request.Action == "configure" {
+			request.Model = strings.TrimSpace(request.Model)
+			request.Effort = strings.TrimSpace(request.Effort)
+			if request.Model == "" || request.Effort == "" {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose a model and reasoning effort for this member"})
+				return
+			}
+			if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}, false); err != nil {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		switch request.Action {
+		case "preset":
+			if s.installedTeams != nil && s.installedTeams.Managed && s.installedTeams.Catalog != nil {
+				var preset teamruntime.Preset
+				preset, err = teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, strings.TrimSpace(request.Preset))
+				if err == nil {
+					_, err = service.ApplyPresetSpec(r.Context(), summary.Slug, summary.Codex.ThreadID, cwd, s.teamEnvironment(summary), preset)
+				}
+			} else {
+				_, err = service.ApplyPreset(r.Context(), summary.Slug, summary.Codex.ThreadID, cwd, s.teamEnvironment(summary), strings.TrimSpace(request.Preset), strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort))
+			}
+		case "add":
+			_, err = service.Add(r.Context(), summary.Slug, summary.Codex.ThreadID, cwd, s.teamEnvironment(summary), request.Role, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort))
+		case "retry":
+			_, err = service.RetryCreating(r.Context(), summary.Slug, summary.Codex.ThreadID, cwd, s.teamEnvironment(summary), request.Address)
+		case "configure":
+			_, err = service.Configure(r.Context(), summary.Slug, summary.Codex.ThreadID, request.Address, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort))
+		case "assign":
+			_, err = service.Assign(r.Context(), summary.Slug, summary.Codex.ThreadID, strings.TrimSpace(request.From), strings.TrimSpace(request.To), request.Message, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort), strings.TrimSpace(request.MessageID))
+		default:
+			err = errors.New("unknown team action")
+		}
+	}
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	roster, rosterErr := s.loadTeamRoster(summary)
+	if rosterErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": rosterErr.Error()})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster})
+}
+
+// teamThreadAPI accepts only a roster address, never a raw thread ID. This
+// keeps read-only member transcripts inside the owning session boundary.
+func (s *Server) teamThreadAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "team transcripts are read-only"})
+		return
+	}
+	roster, err := s.loadTeamRoster(summary)
+	if err != nil {
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "team member is unavailable"})
+		return
+	}
+	address := strings.TrimSpace(r.URL.Query().Get("member"))
+	var threadID string
+	for _, member := range roster.Members {
+		if member.Address == address {
+			threadID = member.Thread
+			break
+		}
+	}
+	if threadID == "" {
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "team member is unavailable"})
+		return
+	}
+	transcript, err := s.config.Codex.ReadThread(r.Context(), threadID)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	s.presentTranscript(&transcript)
+	s.writeJSON(w, http.StatusOK, map[string]any{"member": address, "transcript": transcript})
 }
 
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug string) {
@@ -1580,34 +1955,72 @@ func planDigest(text string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
 }
 
+type implementPlanRequest struct {
+	PlanContextVersion  int     `json:"planContextVersion"`
+	PlanText            string  `json:"planText"`
+	Model               *string `json:"model"`
+	ReasoningEffort     *string `json:"reasoningEffort"`
+	Team                *string `json:"team"`
+	CatalogDigest       *string `json:"catalogDigest"`
+	Action              string  `json:"action"`
+	PlanTurnID          string  `json:"planTurnId"`
+	PlanSHA256          string  `json:"planSha256"`
+	ClientUserMessageID string  `json:"clientUserMessageId"`
+	Name                string  `json:"name"`
+	CreationDate        string  `json:"creationDate"`
+}
+
 func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
-	var body struct {
-		PlanContextVersion  int    `json:"planContextVersion"`
-		PlanText            string `json:"planText"`
-		Model               string `json:"model"`
-		ReasoningEffort     string `json:"reasoningEffort"`
-		Action              string `json:"action"`
-		PlanTurnID          string `json:"planTurnId"`
-		PlanSHA256          string `json:"planSha256"`
-		ClientUserMessageID string `json:"clientUserMessageId"`
-		Name                string `json:"name"`
-		CreationDate        string `json:"creationDate"`
+	var payload json.RawMessage
+	if !s.decodeJSON(w, r, &payload) {
+		return
 	}
-	if !s.decodeJSON(w, r, &body) {
+	if err := rejectDuplicateCreationJSONKeys(payload); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil || raw == nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	var body implementPlanRequest
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
 		return
 	}
 	if strings.TrimSpace(body.Action) == "new" {
+		for _, field := range []string{"model", "reasoningEffort", "team", "catalogDigest"} {
+			if value, ok := raw[field]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "managed creation fields must be omitted instead of null"})
+				return
+			}
+		}
 		destination, err := creationDestination(strings.TrimSpace(body.Name), strings.TrimSpace(body.CreationDate))
 		if err != nil {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		s.acceptPlanCreation(w, r, summary, creationRequest{
+		request := creationRequest{
 			Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
 			PlanSHA256: strings.TrimSpace(body.PlanSHA256), PlanText: body.PlanText,
-			Model: strings.TrimSpace(body.Model), Effort: strings.TrimSpace(body.ReasoningEffort),
-		})
+		}
+		if body.Model != nil {
+			request.Model, request.modelSubmitted = strings.TrimSpace(*body.Model), true
+		}
+		if body.ReasoningEffort != nil {
+			request.Effort, request.effortSubmitted = strings.TrimSpace(*body.ReasoningEffort), true
+		}
+		if body.Team != nil {
+			request.Team, request.teamSubmitted = strings.TrimSpace(*body.Team), true
+		}
+		if body.CatalogDigest != nil {
+			request.CatalogDigest, request.digestSubmitted = strings.TrimSpace(*body.CatalogDigest), true
+		}
+		s.acceptPlanCreation(w, r, summary, request)
 		return
 	}
 
@@ -2453,6 +2866,10 @@ func (s *Server) resolveConversation(
 			Settings: true, Respond: true, EventStream: true,
 		}
 	}
+	// Every retained root thread uses the normal conversation client. The old
+	// virtual-team classifier could reduce a healthy root to read-only access,
+	// which is precisely the failure mode this cutover removes.
+	conversationClient := conversation.Client(s.config.Codex)
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
 	var attachments conversation.AttachmentProvider
 	if s.uploadStore != nil {
@@ -2466,7 +2883,7 @@ func (s *Server) resolveConversation(
 	failed = false
 	return conversation.Target{
 		Attachments: attachments,
-		Client:      s.config.Codex, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
+		Client:      conversationClient, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(summary.Slug),
 		TransformTranscript: s.presentTranscript,
 		Activity:            s.activityProvider(),

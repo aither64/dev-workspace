@@ -21,6 +21,7 @@
       <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
         {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">Codex</span></a>{{end}}
         <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
+        {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" title="Team" aria-label="Team"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
@@ -111,6 +112,12 @@
         {{end}}
       </section>
 
+      {{if .Session.Codex.ThreadID}}
+      <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
+        <div id="team-member-status">{{template "member-status" .}}</div>
+      </section>
+      {{end}}
+
       <section id="repositories" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-repositories">
         {{template "repositories" .}}
       </section>
@@ -146,11 +153,23 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create fork</button></div>
     </form>
   </dialog>
+  {{end}}
+  {{if .Session.Interactive}}
   <dialog id="plan-session-dialog">
     <form id="plan-session-form" class="stack">
-      <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan and uses this session's model and reasoning setting.</p></div>
+      <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
+      {{if .AgentTeams.Managed}}
+      <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
+      <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}">{{.Label}}: {{.RoleSummary}}</option>{{end}}</select></label>
+      <p class="muted" data-team-description></p>
+      <p class="notice warning" data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed since you saved this draft. Check the team and lead settings before creating the session.</p>
+      <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>
+      <div class="field-grid"><label>Lead model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Lead reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+      {{else}}
+      <div class="field-grid"><label>Lead model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Lead reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+      {{end}}
       <p id="plan-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create session</button></div>
     </form>
@@ -183,4 +202,34 @@
   <script src="/static/app.js" defer></script>
 </body>
 </html>
+{{end}}
+
+{{define "member-status"}}
+  <div class="section-heading"><h2>Team</h2><span>Independent threads</span></div>
+  <p class="muted">The lead is this session's normal conversation. Each member has its own persistent Codex thread. Member settings apply to its next assignment.</p>
+  {{if and .Session.Interactive (not .DirectTeam)}}
+  <form class="stack managed-team-form" data-direct-team-form data-action="preset">
+    <label>Start from a preset<select name="preset">{{range .TeamPresets}}<option value="{{.ID}}">{{.Name}} — {{range .Roles}}{{.}} {{end}}</option>{{end}}</select></label>
+    <button type="submit">Create team</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
+  </form>
+  {{end}}
+  {{if .Session.Interactive}}
+  <div id="team-role-defaults" hidden data-current-preset="{{if .DirectTeam}}{{.DirectTeam.PresetID}}{{end}}" data-default-preset="{{if .AgentTeams}}{{.AgentTeams.DefaultTeam}}{{end}}">{{range .TeamPresets}}{{$preset := .ID}}{{range .Members}}<span data-preset="{{$preset}}" data-role="{{.Role}}" data-model="{{.Model}}" data-effort="{{.Effort}}"></span>{{end}}{{end}}</div>
+  <form class="stack managed-team-form" data-direct-team-form data-action="add">
+    <h3>Add member</h3><div class="field-grid"><label>Role<select name="role" required><option value="architect">Architect</option><option value="implementer" selected>Implementer</option><option value="reviewer">Reviewer</option></select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+    <button type="submit">Add member</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
+  </form>
+  {{end}}
+  <h3>Members</h3>
+  <div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Next-turn settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>
+  <tr><td><code>lead</code></td><td><span class="badge team-state-active">root</span></td><td>Use the Codex controls</td><td><code>{{.Session.Codex.ThreadID}}</code></td><td></td></tr>
+  {{if .DirectTeam}}{{range .DirectTeam.Members}}<tr><td><code>{{.Address}}</code></td><td><span class="badge team-state-{{.State}}">{{.State}}</span></td><td>{{if eq .State "ready"}}<form data-direct-team-form data-action="configure" data-address="{{.Address}}" class="member-settings"><select name="model" data-model-select data-current-value="{{.Model}}" aria-label="{{.Address}} model" required><option value="">Loading models…</option></select><select name="effort" data-effort-select data-current-value="{{.Effort}}" aria-label="{{.Address}} reasoning" required><option value="">Loading efforts…</option></select><button type="submit" class="quiet">Save</button><p class="operation-progress" role="status" aria-live="polite" hidden></p></form>{{else}}<code>{{.Model}}</code> <code>{{.Effort}}</code>{{end}}</td><td><code>{{.Thread}}</code></td><td>{{if .Thread}}<button type="button" class="quiet" data-team-thread="{{.Address}}">View messages</button>{{end}}{{if eq .State "ready"}}<button type="button" class="quiet" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>{{end}}{{else}}<tr><td colspan="5" class="muted">No team roster yet.</td></tr>{{end}}
+  </tbody></table></div>
+  <p id="team-action-status" class="operation-progress" role="status" aria-live="polite" hidden></p>
+  <section class="panel" id="team-transcript" hidden><div class="section-heading"><h3>Member messages</h3><button type="button" class="quiet" data-team-transcript-close>Close</button></div><div class="transcript" role="log"></div></section>
+  {{if and .Session.Interactive .DirectTeam}}
+  <form class="stack managed-team-form" data-direct-team-form data-action="assign">
+    <h3>Assign work</h3><label>To<select name="to"><option value="lead">lead</option>{{range .DirectTeam.Members}}{{if eq .State "ready"}}<option value="{{.Address}}">{{.Address}}</option>{{end}}{{end}}</select></label><label>Task<textarea name="message" rows="3" required maxlength="32768" placeholder="Describe the work and expected report."></textarea></label><div class="field-grid"><label>Model for this turn<select name="model" data-model-select><option value="">Member default</option></select></label><label>Reasoning for this turn<select name="effort" data-effort-select><option value="">Member default</option></select></label></div><button type="submit">Assign</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
+  </form>
+  {{end}}
 {{end}}

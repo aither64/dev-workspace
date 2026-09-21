@@ -63,14 +63,18 @@ selected profile:
 workspace-host switch --source "$PWD"
 ```
 
-The switch command retains the previous profile generation and its Codex
-runtime. Use `workspace-host rollback` to return to that pair.
+Workspace package switches are forward-only. `workspace-host rollback` refuses
+to select an earlier profile; recover by repeating the same switch or selecting
+a newer package.
 
 ## Workspace configuration
 
 The package can be extended through `lib.mkPackage`. Extensions supply immutable
 command, skill and cluster-provider catalogs. Workspace configuration selects
-provider IDs; it cannot supply executable paths.
+provider IDs; it cannot supply executable paths. A downstream can also pass an
+explicit `teamConfig` to generate an immutable agent-team catalog; see the
+[portal guide](docs/workspace-portal.md#installed-team-policy) for its package-time
+contract.
 
 A workspace declares its portal identity and optional providers in
 `.dev-workspace.json`:
@@ -280,7 +284,7 @@ leaving capacity for other conversations. Noninteractive pages keep one
 successful timing snapshot.
 The portal keeps these records, creation receipts, and saved comparisons in
 separate private files; existing session manifests and lifecycle journals retain
-their formats for rollback.
+their formats for recovery.
 
 ## Automatic archival
 

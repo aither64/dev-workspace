@@ -27,6 +27,12 @@ The portal hostname and aliases are configuration, not application constants.
 The registry stores the resolved values so routing remains deterministic until
 the next explicit registration update.
 
+The canonical hostname remains the portal's published base URL. At service
+start, `workspace-host` passes only the registered aliases as additional exact
+HTTPS origins. The portal permits browser conversation, upload and mutation
+requests from that fixed set; it never derives trust from a request Host or
+Origin header.
+
 Provider IDs must exist in the immutable package extension catalog. Workspace
 files cannot choose executable paths or labels.
 
@@ -72,9 +78,10 @@ The default paths are:
   `$XDG_RUNTIME_DIR/dev-workspaces/<name>/`;
 - router socket: `/run/dev-workspaces/router.sock`.
 
-The profile switcher retains the previous generation and its exact Codex build.
-`workspace-host rollback` selects that pair together. Commands waiting on a
-transition lock reject a generation change and must be run again.
+Profile switches are forward-only. `workspace-host rollback` refuses to select
+an older package; recover by repeating the same switch or selecting a newer
+package. Commands waiting on a transition lock reject a generation change and
+must be run again.
 
 ## Extension catalog
 
@@ -114,6 +121,100 @@ validated legacy activation marker when the installed generation must invoke
 that compatibility package. The selected values are recorded in
 `share/dev-workspace/package.json` so a deployment-specific migration can
 verify both sides of a cutover before moving state.
+
+## Direct Codex thread teams
+
+The Team tab and `dev-session team` control real, independent Codex threads.
+The normal session conversation is always `lead` and remains the one available
+through `dev-session attach`; member threads do not get tmux panes. Adding a
+member creates its persistent Codex thread immediately, before it receives its
+first assignment. Members use compact addresses such as `architect0`,
+`implementer0`, and `reviewer0`. Addresses are never reused or renumbered.
+
+The roster is a private, workspace-and-session-scoped record. It contains only
+the root identity, member addresses, thread IDs, lifecycle state, and desired
+next-turn model and reasoning settings. Message history stays in each Codex
+thread. A team message resolves both addresses through the same roster, and the
+member transcript API accepts a roster address rather than a raw thread ID.
+There is no global message bus or cross-session member discovery.
+
+The installed workspace policy supplies three starting teams: Solo (`solo`),
+Full team (`delegated`), and Lead-designed team (`lead_designed`). Their role
+lists and exact lead model and reasoning effort appear on the new-session
+screen. Full team has `lead`, `architect0`, `implementer0`, and `reviewer0`;
+Lead-designed team omits the architect. The selected team and its member
+settings are saved with the creation receipt. Member threads are created before
+the lead receives the initial request. A failed creation can be retried with
+that saved selection.
+
+After creation, the Team tab can add, remove, configure, assign work to, and
+inspect the messages of an individual member. Model and reasoning settings
+apply to the member's next assignment. An assignment to a busy member uses App
+Server's ordinary turn-steer behavior. Reports and questions are assignments
+to `lead`; progress remains in the member transcript and does not wake another
+thread.
+
+Removing a member is permanent for that roster address: archive/revive and
+fork retain it as removed rather than making it active again. Session lifecycle
+operations and team mutations share the runtime lock, so an active lifecycle
+transition rejects an add, removal, configuration change, or assignment.
+
+The CLI uses the same record:
+
+```sh
+dev-session team list example
+dev-session team preset example delegated
+dev-session team add example architect --model gpt-6-sol --effort xhigh
+dev-session team configure example architect0 --model gpt-6-sol --effort high
+dev-session team assign example --to implementer0 --message 'Implement the approved plan.'
+```
+
+Forking materializes a matching member thread for every source member. Archive
+and delete archive member threads with the root; revive unarchives them. The
+retired virtual-team ledger is ignored for existing idle sessions, which retain
+their root conversation and begin with an empty direct roster.
+
+## Installed team policy
+
+An optional `teamConfig` in `lib.mkPackage` builds the installed team
+catalog. The catalog supplies named presets and exact model, reasoning,
+behavior, and access defaults; it is not a virtual-team dispatcher. The
+package records its catalog digest, and the host launch marker binds it through
+the registration-plan digest. No native child-agent capacity or per-role startup
+arguments are required for direct threads.
+
+At creation, the selected preset is copied into the private schema-3 receipt
+and durable roster. That snapshot includes each member's address, model,
+reasoning effort, behavior, and access. Retrying creation uses the snapshot,
+even if a later package has different defaults. Team mutations remain
+unavailable until the creation receipt is ready. If a member's App Server
+start has an uncertain outcome, retry reconciles its session-and-member project
+identity and refuses to start another thread when the result is ambiguous.
+
+The runtime applies the retained role instructions to each member thread.
+Architects and reviewers use a read-only sandbox; implementers use
+workspace-write. Ordinary portal reads leave the thread's persisted
+instructions alone. Assignments reapply the retained policy and use a stable
+message ID for retries. The browser retains an uncertain assignment ID across
+reloads in the current tab until the request is confirmed. In the CLI, keep
+the ID shown after an uncertain assignment failure and pass it with
+`--message-id` when retrying.
+
+A fork requires all source members to have finished creation, preserves the
+source member snapshot, and refuses an interrupted retry if that roster
+changes. Because App Server forks have no project identity,
+an uncertain member-fork response is not retried automatically. Archive,
+revive, and delete follow the root session lifecycle. Session quiescence checks
+the lead and every ready member before archive or a package transition;
+deletion moves the retired roster into private recovery storage so the slug
+can be reused. Existing idle
+virtual-team sessions keep their lead
+conversation; the old virtual ledger is not read to construct a direct roster.
+Operators can add direct members after those sessions restart.
+
+The catalog defines a verification watcher separately from the team. The
+site selects its model and effort for each fresh, operation-scoped subagent;
+it is not a persistent team member.
 
 ## Host module
 

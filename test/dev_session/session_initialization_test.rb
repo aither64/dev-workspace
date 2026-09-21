@@ -55,6 +55,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {},
         portal_command:,
+        codex_socket: '/run/test/codex.sock',
         portal_url: 'https://workspace.example.test'
       )
 
@@ -138,6 +139,7 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {},
         portal_command:,
+        codex_socket: '/run/test/codex.sock',
         portal_url: 'https://workspace.example.test'
       )
 
@@ -223,7 +225,7 @@ class DevSessionTest < Minitest::Test
           end
         end
         runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new,
-                                  err: StringIO.new, today: TODAY, env: {})
+                                  err: StringIO.new, today: TODAY, env: {}, portal_command: [])
         arguments = { as_is: true, new: false, attach: false, run_codex: true, json: true,
                       exclusive: true, model: 'model-1', effort: 'high', goal_text: goal, **options }
         assert_raises(DevSession::Error) { runner.start(slug, **arguments) }
@@ -449,6 +451,7 @@ class DevSessionTest < Minitest::Test
         err: StringIO.new,
         today: TODAY,
         env: {},
+        codex_socket: '/run/test/codex.sock',
         portal_command: [RbConfig.ruby, portal]
       )
 

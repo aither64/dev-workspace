@@ -105,25 +105,18 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_rollback_restores_clients_and_timer_after_timer_stop_failure
+  def test_rollback_refuses_before_touching_timer_or_terminal_clients
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.candidate = make_package(paths.fetch(:root), 'package-two')
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      stopped = false
-      host.define_singleton_method(:stop_auto_archive_services) do |*|
-        unless stopped
-          stopped = true
-          raise DevWorkspaceHost::Error, 'injected timer stop failure'
-        end
-      end
-      host.define_singleton_method(:configure_auto_archive_services) { |**| events << [:timer_restored] }
       host.events.clear
+
       assert_equal(1, host.run('workspace-host', ['rollback']))
-      assert_equal(2, host.send(:profile_generation))
-      assert_includes(host.events, [:timer_restored])
-      assert(host.events.any? { |event| event.first == :sessions_restored })
+
+      assert_equal(1, host.send(:profile_generation))
+      refute(host.events.any? { |event| event.first == :sessions_restored })
+      refute(host.events.any? { |event| event == [:timer_restored] })
+      assert_includes(host.instance_variable_get(:@err).string, 'forward-only')
     end
   end
 

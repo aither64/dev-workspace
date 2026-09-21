@@ -18,6 +18,18 @@ require_relative 'workspace-auto-archive'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
+  AGENT_TEAM_BINDING_PATTERN = /\Av1\.[A-Za-z0-9_-]+\.([0-9a-f]{64})\z/
+
+  # JSON accepts duplicate object keys by default and keeps the last value.
+  # Durable managed-creation authorities must reject that ambiguity at every
+  # nesting level before their token can be replayed.
+  class StrictJSONHash < Hash
+    def []=(key, value)
+      raise JSON::ParserError, "JSON object contains a duplicate key: #{key}" if key?(key)
+
+      super
+    end
+  end
 
   def self.load_runtime_contract
     candidates = [
@@ -31,6 +43,12 @@ module DevSession
   end
 
   RUNTIME_CONTRACT = load_runtime_contract.freeze
+  AGENT_TEAM_REGISTRATION = RUNTIME_CONTRACT.fetch('agentTeamRegistration')
+  AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES = AGENT_TEAM_REGISTRATION.fetch('maxPersistedScalarBytes')
+  unless AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES.is_a?(Integer) &&
+         AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES.positive?
+    raise 'workspace runtime contract has an invalid agent team persisted scalar limit'
+  end
   LIFECYCLE_JOURNALS = RUNTIME_CONTRACT.fetch('lifecycleJournals').map do |journal|
     unless journal.is_a?(Hash) && journal.keys.sort == %w[command name] &&
            journal.fetch('name').match?(SAFE_PART) &&
@@ -71,6 +89,7 @@ module DevSession
   ENV_CODEX_VERSION = 'DEV_SESSION_CODEX_VERSION'
   ENV_REQUIRE_RUNTIME = 'DEV_SESSION_REQUIRE_RUNTIME'
   ENV_TMUX_IDENTITY = 'DEV_SESSION_TMUX_IDENTITY'
+  ENV_MEMBER_ADDRESS = 'DEV_SESSION_MEMBER_ADDRESS'
 
   TMUX_METADATA = RUNTIME_CONTRACT.fetch('tmuxMetadata').freeze
   TMUX_AUTHORITY_FORMAT = TMUX_METADATA.fetch('authorityFormat').freeze
@@ -171,8 +190,8 @@ module DevSession
     Usage:
       dev-session start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
-        [--goal-file FILE] [--json] [--exclusive] [--model MODEL]
-        [--effort EFFORT]
+        [--goal-file FILE] [--json] [--exclusive] [--team TEAM]
+        [--model MODEL] [--effort EFFORT]
       dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
         [--model MODEL] [--effort EFFORT]
       dev-session attach <name-or-slug> [--as-is]
@@ -196,6 +215,14 @@ module DevSession
       dev-session worktree remove <name-or-slug> <name> [--as-is] [--force]
       dev-session worktree capture-comparison <name-or-slug> <name> [--as-is]
         [--base SHA --head SHA]
+      dev-session team list <name-or-slug> [--as-is]
+	  dev-session team preset <name-or-slug> <package-team-id> [--as-is]
+        [--model MODEL] [--effort EFFORT]
+      dev-session team add <name-or-slug> <role> --model MODEL --effort EFFORT [--as-is]
+      dev-session team configure <name-or-slug> <address> --model MODEL --effort EFFORT [--as-is]
+      dev-session team remove <name-or-slug> <address> [--as-is]
+      dev-session team assign <name-or-slug> --to ADDRESS --message TEXT [--message-id ID] [--as-is]
+        [--from ADDRESS] [--model MODEL] [--effort EFFORT]
   USAGE
 
   class Error < StandardError; end
@@ -244,13 +271,14 @@ module DevSession
       @err = err
     end
 
-    def capture(argv, allow_failure: false, env: nil, pass_fds: [])
+    def capture(argv, allow_failure: false, env: nil, pass_fds: [], input: nil)
       command = argv.map(&:to_s)
       command = ['timeout', '--signal=TERM', '--kill-after=5s', "#{@timeout}s", *command] if @timeout
       descriptor_options = pass_fds.to_h do |file|
         descriptor = file.fileno
         [descriptor, descriptor]
       end
+	  descriptor_options[:stdin_data] = input unless input.nil?
       arguments = env ? [env, *command] : command
       arguments << descriptor_options unless descriptor_options.empty?
       stdout, stderr, status = Open3.capture3(*arguments)
@@ -625,17 +653,35 @@ module DevSession
       lifecycle_operation_id: nil,
       creation_receipt_id: nil,
       creation_evidence: nil,
+      team: nil,
+      team_binding: nil,
+	  team_preset: nil,
       expected_source: nil,
       expected_source_thread: nil,
       expected_source_identity: nil
     )
-      if goal_file && goal_text
+	  if [team, team_binding, team_preset].compact.length > 1
+		raise Error, '--team, --team-binding and --team-preset cannot be combined'
+	  end
+	  if team && (!run_codex || (!goal_file && !goal_text))
+		raise Error, '--team requires a fresh Codex session with an initial request'
+	  end
+	  if goal_file && goal_text
         raise Error, 'initial request cannot use both a goal file and direct text'
       end
-      receipt = creation_receipt_options(
+	  direct_team = team_preset && load_direct_team_preset!(team_preset)
+	  receipt = creation_receipt_options(
         creation_receipt_id, creation_evidence,
-        expected_source:, expected_source_thread:, expected_source_identity:
+        expected_source:, expected_source_thread:, expected_source_identity:, team_binding:
       )
+	  if receipt && receipt['agent_team_binding'] && team_binding &&
+	     receipt['agent_team_binding'] != team_binding
+		raise Error, 'agent team binding does not match the creation receipt'
+	  end
+	  team_binding ||= receipt&.fetch('agent_team_binding', nil)
+	  if team_binding
+		raise Error, 'virtual team creation is retired; start a new direct-team session'
+	  end
       goal_snapshot = nil
       if goal_file || goal_text
         goal = goal_text ? normalize_goal_text(goal_text) : read_goal(goal_file)
@@ -648,7 +694,9 @@ module DevSession
         goal_file = goal_snapshot.path
       end
       raise Error, '--json cannot be combined with --attach' if json && attach
-
+	  if direct_team && (!run_codex || !goal_file)
+		raise Error, 'agent team selection requires a fresh Codex session with an initial request'
+      end
       slug = resolve_start_slug(input, as_is:, new:)
       if goal_file.nil? && !run_codex && preserved_tracking_candidate?(slug)
         raise Error, "restarting retained tracking requires a Codex conversation: #{slug}"
@@ -662,6 +710,39 @@ module DevSession
       replayed = false
 
       session = with_creation_lock(slug) do
+		# An omitted --team resolves the installed default only for a fresh
+		# destination. Existing, preserved, and revived sessions retain their
+		# established conversation identity and are never adopted here.
+		journal_exists = path_exists?(creation_journal_file(slug))
+		selection_requested = team || direct_team
+		fresh_destination = selection_requested && !journal_exists && !slug_state_exists?(slug)
+		if journal_exists && recover_managed_creation!(slug, goal_file)
+		  raise Error, 'unfinished virtual team creation cannot be resumed after the direct-team cutover'
+		end
+		frozen_direct_creation = journal_exists && recover_direct_creation!(slug, goal_file)
+		if (team || direct_team) && !fresh_destination && !journal_exists
+		  raise Error, 'agent team selection is only valid for a fresh session destination'
+		end
+		if frozen_direct_creation
+		  if direct_team && direct_team != frozen_direct_creation.fetch('direct_team')
+			raise Error, 'direct team preset does not match the unfinished session creation'
+		  end
+		  if team
+			resolved = resolve_current_direct_team!(team, model:, effort:)
+			unless resolved == frozen_direct_creation.fetch('direct_team')
+			  raise Error, 'agent team selection does not match the unfinished session creation'
+			end
+		  end
+		  direct_team = frozen_direct_creation.fetch('direct_team')
+		  model = direct_team.fetch('leadModel')
+		  effort = direct_team.fetch('leadEffort')
+		elsif journal_exists && (team || direct_team)
+		  raise Error, 'agent team selection does not match the existing session creation'
+		elsif team
+		  direct_team = resolve_current_direct_team!(team, model:, effort:)
+		  model = direct_team.fetch('leadModel')
+		  effort = direct_team.fetch('leadEffort')
+		end
         # An existing destination journal owns recovery of the exact accepted
         # goal. The locked binding and journal checks below must succeed before
         # any replay; only a fresh creation still needs its live source.
@@ -681,7 +762,7 @@ module DevSession
             prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
           end
           prepare_portal_creation_receipt!(
-            receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:
+            receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:, team_binding:, direct_team:
           )
           creation_journal = prepare_creation_journal(
             slug,
@@ -690,6 +771,8 @@ module DevSession
             run_codex:,
             model:,
             effort:,
+            team_binding:,
+			direct_team:,
             lifecycle_operation:
           )
           runtime_journal = load_start_journal(slug)
@@ -910,6 +993,7 @@ module DevSession
           selected = sync_slug(slug, require_session: true, session: selected)
           manifest = load_portal_manifest(portal_file(slug), required: true)
           trusted_thread_id = thread_id
+	  apply_direct_team_preset!(slug, thread_id, direct_team) if goal_pending && direct_team
           if goal_pending && !manifest.fetch('creation').key?('initial_goal_attempted')
             manifest['schema'] = 2
             manifest['creation']['initial_goal_attempted'] = true
@@ -967,8 +1051,8 @@ module DevSession
             clear_preserved_tracking_metadata!(current_manifest)
             current_manifest['schema'] = 1
             write_portal_manifest(slug, current_manifest)
-            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
             write_session_authority(slug, current, state: 'ready')
+            mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
             current
           end
         end
@@ -1060,6 +1144,7 @@ module DevSession
       end
       raise Error, 'fork source and destination must be different' if source_slug == destination_slug
 
+
       if (recovered = recover_completed_fork(
         destination_slug,
         source_slug,
@@ -1111,7 +1196,7 @@ module DevSession
         with_slug_lock(destination_slug) do
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
-          require_current_portal_creation!(receipt, destination_slug) if receipt
+          require_current_portal_creation!(receipt, destination_slug, model:, effort:) if receipt
           fork_journal = load_fork_journal(destination_slug, source_slug)
           if fork_journal
             if receipt && fork_journal['source_thread_id'] != receipt.fetch('source_thread')
@@ -1175,6 +1260,7 @@ module DevSession
             selected = ensure_managed_session!(destination_slug, session: selected)
             selected = reconcile_native_client!(destination_slug, selected)
             write_session_authority(destination_slug, selected, state: 'ready')
+			fork_team_members!(source_slug, destination_slug)
             write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
             delete_fork_journal(destination_slug)
             next selected
@@ -1207,6 +1293,7 @@ module DevSession
             raise Error, "created tmux session does not match fork identity for #{destination_slug}"
           end
           write_session_authority(destination_slug, selected, state: 'ready')
+		  fork_team_members!(source_slug, destination_slug)
           write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
           delete_fork_journal(destination_slug)
           selected
@@ -1296,6 +1383,7 @@ module DevSession
           selected = reconcile_native_client!(destination_slug, selected)
           selected = sync_slug(destination_slug, require_session: true, session: selected)
           write_session_authority(destination_slug, selected, state: 'ready')
+		  fork_team_members!(source_slug, destination_slug)
           write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
           delete_fork_journal(destination_slug)
           selected
@@ -1362,6 +1450,120 @@ module DevSession
     def resolve_slug(input, as_is:)
       lookup_slug(input, as_is:)
     end
+
+    def team(slug, action:, preset: nil, role: nil, address: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
+      raise Error, 'workspace-portal is required for team controls' unless @portal_command && !@portal_command.empty?
+	  member_address = @env[ENV_MEMBER_ADDRESS]
+	  if member_address && !member_address.empty?
+		unless slug == @env[ENV_SLUG]
+		  raise Error, 'a team member can only access its own session roster'
+		end
+		if action == 'assign' && from != member_address
+		  raise Error, 'a team member can only assign from its own address'
+		end
+	  end
+	  return invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if lifecycle
+	  return invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if action == 'list'
+
+	  with_slug_lock(slug) do
+		select_tmux_for_slug!(slug)
+		reject_conflicting_lifecycle_journal!(slug)
+		raise Error, "session is archived: #{slug}" unless path_exists?(work_dir(slug))
+		require_team_creation_ready!(slug)
+		invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:)
+	  end
+	end
+
+	def require_team_creation_ready!(slug)
+	  workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+	  path = File.join(@workspace_state_root, 'portal', workspace_id, 'creations', "#{slug}.json")
+	  return unless path_exists?(path)
+
+	  receipt = read_private_json_object(
+		path, 'portal creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384, mode: 0o600
+	  )
+	  unless receipt['workspace'] == workspace && receipt.dig('request', 'slug') == slug &&
+	         [1, 2, 3].include?(receipt['schema'])
+		raise Error, "session creation receipt is invalid: #{slug}"
+	  end
+	  if receipt['schema'] == 3 && receipt['state'] != 'ready'
+		raise Error, "team controls wait for session creation to complete: #{slug}"
+	  end
+	end
+
+	def invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id: nil, model:, effort:, source_slug:, source_root_thread:)
+      tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      root_thread = manifest.dig('codex', 'thread_id')
+      unless root_thread.is_a?(String) && root_thread.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, "session has no valid lead Codex thread: #{slug}"
+      end
+	  command = [*@portal_command, 'team', action,
+                 '--user-state-root', @workspace_state_root,
+                 '--workspace', workspace,
+                 '--session-slug', slug,
+                 '--root-thread-id', root_thread,
+                 '--cwd', work_dir(slug)]
+	  if %w[list add].include?(action)
+		portal = File.realpath(@portal_command.first)
+		command.concat(['--package-root', File.dirname(File.dirname(portal))])
+	  end
+	  command += ['--socket', @codex_socket] if @codex_socket
+	  if action == 'preset'
+		preset_spec = resolve_current_direct_team!(preset, model:, effort:)
+		return apply_direct_team_preset!(slug, root_thread, preset_spec)
+	  end
+      { preset:, role:, address:, from:, to:, message:, message_id:, model:, effort: }.each do |name, value|
+        next if value.nil? || value.empty?
+        command.concat(["--#{name.to_s.tr('_', '-')}", value])
+      end
+	  command.concat(['--source-session-slug', source_slug]) if source_slug && !source_slug.empty?
+      command.concat(['--source-root-thread-id', source_root_thread]) if source_root_thread && !source_root_thread.empty?
+      begin
+        output, = @command_runner.capture(command)
+      rescue Error => e
+        raise Error, "#{e.message}\nIf it may have been sent, retry with --message-id #{message_id}" if action == 'assign' && message_id
+        raise
+      end
+      output
+    end
+
+    def fork_team_members!(source_slug, destination_slug)
+	  return unless @portal_command && !@portal_command.empty? && direct_team_state_present?(source_slug)
+      source_tracking = if path_exists?(portal_file(source_slug))
+                          portal_file(source_slug)
+                        else
+                          File.join(archive_dir(source_slug), PORTAL_MANIFEST)
+                        end
+      return unless path_exists?(source_tracking)
+      source = load_portal_manifest(source_tracking, required: true, expected_slug: source_slug)
+      source_thread = source.dig('codex', 'thread_id')
+      unless source_thread.is_a?(String) && source_thread.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, "source session has no valid lead Codex thread: #{source_slug}"
+      end
+	  team(destination_slug, action: 'fork', source_slug:, source_root_thread: source_thread, lifecycle: true)
+    end
+
+	def sync_team_lifecycle!(slug, action)
+	  return unless @portal_command && !@portal_command.empty? && direct_team_state_present?(slug)
+	  return team(slug, action:, lifecycle: true) unless action == 'retire'
+
+	  @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { team(slug, action:, lifecycle: true) }
+	end
+
+	def direct_team_state_present?(slug)
+	  File.lstat(direct_team_state_path(slug))
+	  true
+	rescue Errno::ENOENT
+	  false
+	rescue Errno::ENOTDIR, Errno::EACCES, Errno::ELOOP => e
+	  raise Error, "cannot inspect direct team state: #{e.message}"
+	end
+
+	def direct_team_state_path(slug)
+	  workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+	  File.join(@workspace_state_root, 'codex-teams', workspace_id, "#{slug}.json")
+	end
 
     def archive(input, as_is:, abandoned: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
@@ -1452,6 +1654,7 @@ module DevSession
           verify_committed_archive_tracking!(slug, journal)
           if archive_phase_before?(journal, 'thread_retired')
             retire_portal_thread!(slug, force: false)
+			sync_team_lifecycle!(slug, 'archive')
             advance_archive!(slug, journal, 'thread_retired')
           end
           if archive_phase_before?(journal, 'runtime_retired')
@@ -1548,6 +1751,7 @@ module DevSession
       end
       with_creation_lock(slug) do
         with_slug_lock(slug) do
+		  sync_team_lifecycle!(slug, 'revive')
           auto_archive_reset(slug)
           finish_revive_journal!(slug, load_revive_journal(slug, operation_id:))
         end
@@ -1593,9 +1797,11 @@ module DevSession
           end
           if removal_phase_before?(removal, 'thread_retiring')
             quiesced = quiesce_native_client!(slug, plan.session)
+            sync_team_lifecycle!(slug, 'require-idle') unless removal.fetch('force')
             advance_removal!(slug, removal, 'thread_retiring')
           end
           if removal_phase_before?(removal, 'thread_retired')
+            sync_team_lifecycle!(slug, removal.fetch('force') ? 'retire' : 'archive')
             retire_portal_thread!(slug, force: removal.fetch('force'))
             advance_removal!(slug, removal, 'thread_retired')
           end
@@ -2391,7 +2597,8 @@ module DevSession
 
     def reject_symlink_components!(path, label)
       current = Pathname.new(File::SEPARATOR)
-      Pathname.new(File.expand_path(path)).each_filename do |component|
+      expanded = Pathname.new(File.expand_path(path))
+      expanded.each_filename do |component|
         current = current.join(component)
         begin
           stat = File.lstat(current)
@@ -2399,6 +2606,9 @@ module DevSession
           break
         end
         raise Error, "#{label} has a symlink component: #{current}" if stat.symlink?
+        unless current == expanded || stat.directory?
+          raise Error, "#{label} has a non-directory component: #{current}"
+        end
       end
     end
 
@@ -2430,6 +2640,8 @@ module DevSession
       run_codex:,
       model:,
       effort:,
+      team_binding: nil,
+	  direct_team: nil,
       lifecycle_operation: nil
     )
       path = creation_journal_file(slug)
@@ -2445,22 +2657,34 @@ module DevSession
       end
 
       goal = read_goal(goal_file) if goal_file
+	  if team_binding && direct_team
+		raise Error, 'agent team binding and direct team preset cannot be combined'
+	  end
+	  raise Error, 'direct team preset is invalid' if direct_team && !valid_direct_team_preset?(direct_team)
+	  binding_match = team_binding && AGENT_TEAM_BINDING_PATTERN.match(team_binding)
+	  if team_binding && (!binding_match || team_binding.bytesize > 32 * 1024)
+		raise Error, 'agent team binding is invalid'
+	  end
+	  binding_digest = binding_match&.[](1)
       expected = {
-        'schema' => 1,
+		'schema' => direct_team ? 3 : (team_binding ? 2 : 1),
         'slug' => slug,
         'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
         'run_codex' => run_codex
       }
       expected['model'] = model unless model.nil?
       expected['effort'] = effort unless effort.nil?
+	  if team_binding
+		expected['agent_team_binding'] = team_binding
+		expected['agent_team_binding_digest'] = binding_digest
+	  end
+	  expected['direct_team'] = direct_team if direct_team
       if path_exists?(path)
-        raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
         raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
 
-        actual = JSON.parse(File.read(path))
-        unless actual.is_a?(Hash)
-          raise Error, "invalid creation journal #{path}"
-        end
+        actual = read_private_json_object(
+          path, 'creation journal', max_size: 64 * 1024, mode: 0o600
+        )
         state = actual['state']
         if state == 'creating' && !actual.key?('tmux_identity')
           if cleanup_session(slug)
@@ -2611,12 +2835,133 @@ module DevSession
       raise Error, "invalid creation journal #{path}: #{e.message}"
     end
 
+    # A schema-2 journal is an already accepted, opaque selection. Recovery
+    # must replay that exact token and effective lead, not consult the current
+    # package or make a newly installed default adopt an existing creation.
+    # This deliberately validates only journal integrity and the frozen goal;
+    # policy decoding remains owned by the portal helper at first acceptance.
+    def recover_managed_creation!(slug, goal_file)
+      path = creation_journal_file(slug)
+      raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
+
+      journal = read_private_json_object(
+        path, 'managed creation journal', max_size: 64 * 1024, mode: 0o600
+      )
+      return nil unless journal.is_a?(Hash) && journal['schema'] == 2
+
+      required = %w[
+        schema slug goal_sha256 run_codex state model effort
+        agent_team_binding agent_team_binding_digest
+      ]
+      creating = journal['state'] == 'creating'
+      ready = journal['state'] == 'ready'
+      expected_keys = creating ? required + ['tmux_identity'] : required
+      binding = journal['agent_team_binding']
+      binding_match = binding.is_a?(String) && AGENT_TEAM_BINDING_PATTERN.match(binding)
+      unless journal.keys.sort == expected_keys.sort && journal['slug'] == slug &&
+             journal['run_codex'] == true && (creating || ready) &&
+             (!creating || journal['tmux_identity'].is_a?(String) && journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/)) &&
+             binding_match && binding.bytesize <= 32 * 1024 &&
+             journal['agent_team_binding_digest'] == binding_match[1] &&
+             %w[model effort].all? do |key|
+               valid_agent_team_persisted_scalar?(journal[key])
+             end
+        raise Error, "invalid managed creation journal #{path}"
+      end
+      unless journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid managed creation journal #{path}"
+      end
+      return nil if ready && goal_file.nil?
+
+      goal_sha256 = goal_file && Digest::SHA256.hexdigest(read_goal(goal_file))
+      unless journal['goal_sha256'] == goal_sha256
+        raise Error, "managed creation journal goal does not match #{path}"
+      end
+      journal
+    rescue JSON::ParserError => e
+      raise Error, "invalid managed creation journal #{path}: #{e.message}"
+    end
+
+    # Schema-3 is the direct-thread creation record. Unlike retired schema-2
+    # virtual bindings, it contains a complete immutable roster snapshot. A
+    # retry deliberately reuses that snapshot even if the installed catalog
+    # changed after the initial request was accepted.
+    def recover_direct_creation!(slug, goal_file)
+      path = creation_journal_file(slug)
+      raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
+
+      journal = read_private_json_object(
+        path, 'direct team creation journal', max_size: 64 * 1024, mode: 0o600
+      )
+      return nil unless journal.is_a?(Hash) && journal['schema'] == 3
+
+      required = %w[schema slug goal_sha256 run_codex state model effort direct_team]
+      creating = journal['state'] == 'creating'
+      ready = journal['state'] == 'ready'
+      expected_keys = creating ? required + ['tmux_identity'] : required
+      unless journal.keys.sort == expected_keys.sort && journal['slug'] == slug &&
+             journal['run_codex'] == true && (creating || ready) &&
+             (!creating || journal['tmux_identity'].is_a?(String) && journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/)) &&
+             journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(/\A[0-9a-f]{64}\z/) &&
+             valid_direct_team_preset?(journal['direct_team']) &&
+             journal['model'] == journal.dig('direct_team', 'leadModel') &&
+             journal['effort'] == journal.dig('direct_team', 'leadEffort')
+        raise Error, "invalid direct team creation journal #{path}"
+      end
+      return nil if ready && goal_file.nil?
+
+      goal_sha256 = goal_file && Digest::SHA256.hexdigest(read_goal(goal_file))
+      unless journal['goal_sha256'] == goal_sha256
+        raise Error, "direct team creation journal goal does not match #{path}"
+      end
+      journal
+    rescue JSON::ParserError => e
+      raise Error, "invalid direct team creation journal #{path}: #{e.message}"
+    end
+
+    def valid_direct_team_preset?(preset)
+      return false unless preset.is_a?(Hash) &&
+                          preset.keys.sort == %w[catalogDigest description id leadEffort leadModel members name roles teamDigest]
+      scalar = lambda do |value, maximum = AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES|
+        value.is_a?(String) && !value.empty? && value.bytesize <= maximum &&
+          value.valid_encoding? && !value.include?("\0") && !value.match?(/[\r\n]/)
+      end
+      return false unless valid_part?(preset['id']) && scalar.call(preset['name'], 256) &&
+                          scalar.call(preset['description'], 4096) &&
+                          preset['catalogDigest'].is_a?(String) && preset['catalogDigest'].match?(/\A[0-9a-f]{64}\z/) &&
+                          preset['teamDigest'].is_a?(String) && preset['teamDigest'].match?(/\A[0-9a-f]{64}\z/) &&
+                          valid_agent_team_persisted_scalar?(preset['leadModel']) &&
+                          valid_agent_team_persisted_scalar?(preset['leadEffort']) &&
+                          preset['roles'].is_a?(Array) && preset['members'].is_a?(Array) &&
+                          preset['roles'].length <= 64 && preset['members'].length <= 64
+      return false unless preset['roles'].all? { |role| role == 'lead' || role.is_a?(String) && role.match?(/\A[a-z][a-z0-9]*[0-9]+\z/) } &&
+                          preset['roles'].uniq.length == preset['roles'].length
+
+      addresses = {}
+      preset['members'].all? do |member|
+        next false unless member.is_a?(Hash) && member.keys.sort == %w[access address behavior model reasoningEffort role] &&
+                          valid_part?(member['role']) && member['role'] != 'lead' &&
+                          member['address'].is_a?(String) && member['address'].match?(/\A#{Regexp.escape(member['role'])}[0-9]+\z/) &&
+                          valid_agent_team_persisted_scalar?(member['model']) &&
+                          valid_agent_team_persisted_scalar?(member['reasoningEffort']) &&
+                          { 'architect' => ['designer', 'read_only'],
+                            'implementer' => ['implementer', 'workspace_write'],
+                            'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
+                            [member['behavior'], member['access']]
+        addresses[member['address']] = true
+      end && addresses.length == preset['members'].length &&
+        preset['roles'] == ['lead'] + preset['members'].map { |member| member['address'] }
+    end
+
     def valid_stored_creation_journal?(journal, slug, manifest)
       required = %w[schema slug goal_sha256 run_codex state]
       tracking = PRESERVED_JOURNAL_TRACKING_KEYS
-      allowed = required + %w[model effort preserve_tracking tmux_identity] + tracking
+      allowed = required + %w[
+        model effort agent_team_binding agent_team_binding_digest
+        direct_team preserve_tracking tmux_identity
+      ] + tracking
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
-      return false unless journal['schema'] == 1 && journal['slug'] == slug &&
+      return false unless [1, 2, 3].include?(journal['schema']) && journal['slug'] == slug &&
                           journal['state'] == 'ready' &&
                           [true, false].include?(journal['run_codex'])
 
@@ -2626,6 +2971,26 @@ module DevSession
       return false unless manifest.dig('creation', 'goal_sha256') == goal_sha256
       return false unless [nil, true].include?(journal['preserve_tracking'])
       return false if journal.key?('tmux_identity')
+
+	  managed = journal['schema'] == 2
+	  direct = journal['schema'] == 3
+	  return false unless if direct
+	                        valid_direct_team_preset?(journal['direct_team']) &&
+	                          journal['model'] == journal.dig('direct_team', 'leadModel') &&
+	                          journal['effort'] == journal.dig('direct_team', 'leadEffort') &&
+	                          !journal.key?('agent_team_binding') && !journal.key?('agent_team_binding_digest') &&
+	                          !journal.key?('preserve_tracking')
+	                      else
+	                        !journal.key?('direct_team')
+	                      end
+	  binding_match = AGENT_TEAM_BINDING_PATTERN.match(journal['agent_team_binding'].to_s)
+	  return false unless if managed
+	                        journal['agent_team_binding'].is_a?(String) &&
+	                          journal['agent_team_binding'].bytesize <= 32 * 1024 &&
+	                          binding_match && journal['agent_team_binding_digest'] == binding_match[1]
+	                      else
+	                        !journal.key?('agent_team_binding') && !journal.key?('agent_team_binding_digest')
+	                      end
 
       tracking_present = tracking.count { |key| journal.key?(key) }
       return false unless if journal['preserve_tracking']
@@ -2638,10 +3003,14 @@ module DevSession
                             tracking_present.zero?
                           end
 
-      %w[model effort].all? do |key|
-        !journal.key?(key) ||
-          (journal[key].is_a?(String) && !journal[key].empty? && journal[key].bytesize <= 1024)
-      end
+	  %w[model effort].all? do |key|
+		if managed || direct
+		  valid_agent_team_persisted_scalar?(journal[key])
+		else
+		  !journal.key?(key) ||
+			valid_agent_team_persisted_scalar?(journal[key])
+		end
+	  end
     end
 
     def valid_preserved_creation_journal_shape?(journal, slug)
@@ -2669,8 +3038,14 @@ module DevSession
       end
       %w[model effort].all? do |key|
         !journal.key?(key) ||
-          (journal[key].is_a?(String) && !journal[key].empty? && journal[key].bytesize <= 1024)
+          valid_agent_team_persisted_scalar?(journal[key])
       end
+    end
+
+    def valid_agent_team_persisted_scalar?(value)
+      value.is_a?(String) && !value.empty? && value.valid_encoding? &&
+        value.bytesize <= AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES &&
+        !value.include?("\0")
     end
 
     def completed_creation_manifest?(manifest)
@@ -2793,10 +3168,11 @@ module DevSession
     def mark_creation_journal_ready(slug, journal)
       path = creation_journal_file(slug)
       raise Error, "creation journal disappeared: #{path}" unless path_exists?(path)
-      raise Error, "creation journal is a symlink: #{path}" if File.symlink?(path)
       raise Error, "creation journal is not a file: #{path}" unless File.file?(path)
 
-      actual = JSON.parse(File.read(path))
+      actual = read_private_json_object(
+        path, 'creation journal', max_size: 64 * 1024, mode: 0o600
+      )
       unless actual == journal
         raise Error, "creation journal changed during creation: #{path}"
       end
@@ -2834,12 +3210,20 @@ module DevSession
 
     # Private receipt metadata is additive: strict runtime and fork journals
     # remain readable by the preceding package generation.
-    def creation_receipt_options(id, evidence, expected_source:, expected_source_thread:, expected_source_identity:)
+    def creation_receipt_options(id, evidence, expected_source:, expected_source_thread:, expected_source_identity:, team_binding: nil)
       values = [id, evidence, expected_source, expected_source_thread, expected_source_identity]
       return nil if values.all?(&:nil?)
       unless id.is_a?(String) && id.match?(/\A[0-9a-f]{64}\z/) &&
              evidence.is_a?(String) && evidence.start_with?('/')
         raise Error, 'creation receipt requires a valid ID and absolute evidence path'
+      end
+      binding_digest = nil
+	  if team_binding
+		binding_match = team_binding.is_a?(String) && AGENT_TEAM_BINDING_PATTERN.match(team_binding)
+		unless binding_match && team_binding.bytesize <= 32 * 1024
+		  raise Error, 'agent team binding is invalid'
+		end
+		binding_digest = binding_match[1]
       end
       source_values = [expected_source, expected_source_thread, expected_source_identity]
       unless source_values.all?(&:nil?) ||
@@ -2857,8 +3241,10 @@ module DevSession
       {
         'receipt_id' => id, 'evidence' => evidence,
         'source' => expected_source, 'source_thread' => expected_source_thread,
-        'source_identity' => expected_source_identity
-      }
+        'source_identity' => expected_source_identity,
+        'agent_team_binding' => team_binding,
+        'agent_team_binding_digest' => binding_digest
+      }.compact
     end
 
     def verify_creation_source!(receipt)
@@ -2886,21 +3272,27 @@ module DevSession
       end
     end
 
-    def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:)
+    def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:, team_binding: nil, direct_team: nil)
       return unless receipt
       path = receipt.fetch('evidence') + '.request'
-      history = require_current_portal_creation!(receipt, slug)
+      history = require_current_portal_creation!(receipt, slug, model:, effort:, direct_team:)
       binding = {
-        'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'kind' => kind,
+        'schema' => direct_team ? 3 : (team_binding ? 2 : 1), 'workspace' => workspace, 'slug' => slug, 'kind' => kind,
         'receipt_id' => receipt.fetch('receipt_id'), 'deletion_history_sha256' => history,
         'source_thread' => receipt['source_thread'],
         'source_identity' => receipt['source_identity'],
         'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
         'model' => model, 'effort' => effort
       }
+	  if team_binding
+		binding['agent_team_binding'] = team_binding
+		binding['agent_team_binding_digest'] = receipt.fetch('agent_team_binding_digest')
+	  end
+	  binding['direct_team'] = direct_team if direct_team
       if path_exists?(path)
-        unless File.file?(path) && !File.symlink?(path) && File.size(path) <= 16 * 1024 &&
-               JSON.parse(File.read(path)) == binding
+        unless read_private_json_object(
+          path, 'creation request binding', max_size: 16 * 1024, mode: 0o600
+        ) == binding
           raise Error, 'creation receipt does not match the recorded CLI request'
         end
       else
@@ -2911,23 +3303,31 @@ module DevSession
       end
       write_creation_journal(path, binding, create: true) unless path_exists?(path)
       receipt['binding'] = binding
+	  receipt['direct_team'] = direct_team if direct_team
     rescue JSON::ParserError => e
       raise Error, "invalid creation request binding: #{e.message}"
     end
 
     # The current receipt is mandatory even after a CLI binding exists. Its
     # disappearance or replacement ends a worker queued before cache retirement.
-    def require_current_portal_creation!(receipt, slug)
+    def require_current_portal_creation!(receipt, slug, model:, effort:, direct_team: nil)
       path = File.join(File.dirname(receipt.fetch('evidence')), "#{slug}.json")
-      unless File.file?(path) && !File.symlink?(path) && File.stat(path).mode & 0o777 == 0o600
-        raise Error, 'creation request is no longer current; start a new request'
-      end
-      current = JSON.parse(read_bounded_file(path, 'creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384))
-      unless current.is_a?(Hash) && current['schema'] == 1 && current['workspace'] == workspace &&
+      current = read_private_json_object(
+        path, 'creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384, mode: 0o600,
+        missing_error: 'creation request is no longer current; start a new request'
+      )
+      expected_schema = direct_team ? 3 : (receipt['agent_team_binding'] ? 2 : 1)
+      unless current.is_a?(Hash) && current['schema'] == expected_schema && current['workspace'] == workspace &&
              current['receiptId'] == receipt.fetch('receipt_id') && current['request'].is_a?(Hash) &&
              current['request']['slug'] == slug && current['deletionHistorySha256'].is_a?(String) &&
              current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'creation request is no longer current; start a new request'
+      end
+      if expected_schema == 2
+		validate_current_managed_portal_receipt!(current, receipt, slug, model:, effort:)
+		receipt['agent_team_catalog_digest'] = current.fetch('request').fetch('catalogDigest')
+	  elsif expected_schema == 3
+		validate_current_direct_portal_receipt!(current, receipt, slug, model:, effort:, direct_team:)
       end
       history = current.fetch('deletionHistorySha256')
       if receipt['binding'] && receipt['binding']['deletion_history_sha256'] != history
@@ -2939,6 +3339,112 @@ module DevSession
       history
     rescue JSON::ParserError => e
       raise Error, "invalid creation receipt: #{e.message}"
+    end
+
+    def validate_current_direct_portal_receipt!(current, receipt, slug, model:, effort:, direct_team:)
+      root_required = %w[
+        attempt deletionHistorySha256 directTeam effort model phase receiptId request
+        schema startedAt state updatedAt validated workspace
+      ]
+      root_allowed = root_required + %w[error goal]
+      request = current['request']
+      unless current.keys.all? { |key| root_allowed.include?(key) } &&
+             (root_required - current.keys).empty? && current['schema'] == 3 &&
+             current['workspace'] == workspace && current['receiptId'] == receipt.fetch('receipt_id') &&
+             current['deletionHistorySha256'].is_a?(String) && current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/) &&
+             current['attempt'].is_a?(Integer) && current['attempt'].positive? &&
+             [true, false].include?(current['validated']) &&
+             %w[running paused failed ready conflict].include?(current['state']) &&
+             valid_direct_team_preset?(current['directTeam']) && current['directTeam'] == direct_team &&
+             valid_agent_team_persisted_scalar?(model) && valid_agent_team_persisted_scalar?(effort) &&
+             current['model'] == model && current['effort'] == effort && request.is_a?(Hash)
+        raise Error, 'direct team creation request is no longer current; start a new request'
+      end
+      required = if request['kind'] == 'new'
+                   %w[kind slug goal team catalogDigest]
+                 elsif request['kind'] == 'plan'
+                   %w[kind slug source sourceThreadId sourceIdentity planTurnId planSha256 team catalogDigest]
+                 else
+                   []
+                 end
+	  allowed = required.dup
+	  allowed << 'planText' if request['kind'] == 'plan'
+	  # An explicit lead override remains in the accepted browser request as
+	  # provenance. Its resolved, immutable values live in directTeam.
+	  allowed.concat(%w[model effort])
+      unless required.any? && request.keys.all? { |key| allowed.include?(key) } &&
+             (required - request.keys).empty? && request['slug'] == slug &&
+             request['team'] == direct_team['id'] && request['catalogDigest'] == direct_team['catalogDigest']
+        raise Error, 'direct team creation request is no longer current; start a new request'
+      end
+    end
+
+    # The browser receipt is a separate authority from Ruby's journal. Keep
+    # the schema-2 shape exact so an added field, duplicate key, or changed
+    # optional override cannot be replayed as the accepted selection.
+    def validate_current_managed_portal_receipt!(current, receipt, slug, model:, effort:)
+      root_required = %w[
+        agentTeamBinding agentTeamBindingDigest attempt deletionHistorySha256 effort
+        model phase receiptId request schema startedAt state updatedAt validated workspace
+      ]
+      root_allowed = root_required + %w[error goal]
+      request = current['request']
+      unless current.keys.all? { |key| root_allowed.include?(key) } &&
+             (root_required - current.keys).empty? && current['schema'] == 2 &&
+             current['workspace'] == workspace && current['receiptId'] == receipt.fetch('receipt_id') &&
+             current['deletionHistorySha256'].is_a?(String) && current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/) &&
+             current['attempt'].is_a?(Integer) && current['attempt'].positive? &&
+             [true, false].include?(current['validated']) &&
+             %w[running paused failed ready conflict cancelled].include?(current['state']) &&
+             request.is_a?(Hash)
+        raise Error, 'managed creation request is no longer current; start a new request'
+      end
+      binding = current['agentTeamBinding']
+      binding_match = binding.is_a?(String) && AGENT_TEAM_BINDING_PATTERN.match(binding)
+      # The CLI receipt carries the delegated binding, not duplicated lead
+      # settings. Compare the browser receipt with the separately resolved
+      # effective lead before treating either as the accepted request.
+      unless binding_match && binding.bytesize <= 32 * 1024 &&
+             binding == receipt.fetch('agent_team_binding') &&
+             current['agentTeamBindingDigest'] == binding_match[1] &&
+             current['agentTeamBindingDigest'] == receipt.fetch('agent_team_binding_digest') &&
+	             valid_agent_team_persisted_scalar?(current['model']) &&
+	             valid_agent_team_persisted_scalar?(current['effort']) &&
+	             valid_agent_team_persisted_scalar?(model) && valid_agent_team_persisted_scalar?(effort) &&
+             current['model'] == model && current['effort'] == effort
+        raise Error, 'managed creation request is no longer current; start a new request'
+      end
+
+      common = %w[catalogDigest kind slug team]
+      optional = %w[model effort]
+      kind = request['kind']
+      kind_required = if kind == 'new'
+                        common + ['goal']
+                      elsif kind == 'plan'
+                        common + %w[source sourceThreadId sourceIdentity planTurnId planSha256]
+                      else
+                        []
+                      end
+      kind_allowed = kind_required + optional
+      kind_allowed << 'planText' if kind == 'plan'
+      unless kind_required.any? && request.keys.all? { |key| kind_allowed.include?(key) } &&
+             (kind_required - request.keys).empty? && request['slug'] == slug &&
+             request['team'].is_a?(String) && request['team'].match?(SAFE_PART) &&
+             request['catalogDigest'].is_a?(String) && request['catalogDigest'].match?(/\A[0-9a-f]{64}\z/) &&
+             optional.all? { |key| !request.key?(key) || request[key].is_a?(String) && !request[key].empty? }
+        raise Error, 'managed creation request is no longer current; start a new request'
+      end
+      if kind == 'new'
+        unless request['goal'].is_a?(String) && !request['goal'].empty? && request['goal'].bytesize <= MAX_MESSAGE_BYTES
+          raise Error, 'managed creation request is no longer current; start a new request'
+        end
+      else
+        unless %w[source sourceThreadId sourceIdentity planTurnId].all? { |key| request[key].is_a?(String) && !request[key].empty? } &&
+               request['planSha256'].is_a?(String) && request['planSha256'].match?(/\A[0-9a-f]{64}\z/) &&
+               (!request.key?('planText') || request['planText'].is_a?(String) && !request['planText'].empty?)
+          raise Error, 'managed creation request is no longer current; start a new request'
+        end
+      end
     end
 
     # Hash only operation identities: wall-clock correction does not change
@@ -2987,6 +3493,35 @@ module DevSession
         'model' => binding['model'].to_s, 'effort' => binding['effort'].to_s,
         'trackingDevice' => stat.dev, 'trackingInode' => stat.ino
       }
+	  if receipt['agent_team_binding']
+		identity = selected.identity_token
+		catalog_digest = receipt['agent_team_catalog_digest']
+		unless identity.is_a?(String) && identity.match?(/\A[0-9a-f]{64}\z/) &&
+		       catalog_digest.is_a?(String) && catalog_digest.match?(/\A[0-9a-f]{64}\z/) &&
+		       receipt['agent_team_binding_digest'].is_a?(String) &&
+		       receipt['agent_team_binding_digest'].match?(/\A[0-9a-f]{64}\z/)
+		  raise Error, 'managed creation evidence has incomplete identity'
+		end
+		evidence.merge!(
+		  'schema' => 2,
+		  'agentTeamBindingDigest' => receipt.fetch('agent_team_binding_digest'),
+		  'catalogDigest' => catalog_digest,
+		  'creationIdentity' => identity,
+		  'removalEpoch' => receipt.fetch('binding').fetch('deletion_history_sha256')
+		)
+	  end
+	  if receipt['direct_team']
+		preset = receipt.fetch('direct_team')
+		unless valid_direct_team_preset?(preset)
+		  raise Error, 'direct creation evidence has an invalid preset'
+		end
+		evidence.merge!(
+		  'schema' => 3,
+		  'catalogDigest' => preset.fetch('catalogDigest'),
+		  'teamDigest' => preset.fetch('teamDigest'),
+		  'team' => preset.fetch('id')
+		)
+	  end
       write_creation_journal(receipt.fetch('evidence'), evidence, create: false)
     end
 
@@ -3226,6 +3761,31 @@ module DevSession
         raise Error, "#{label} exceeds #{max_size / (1024 * 1024)} MiB: #{path}"
       end
       data
+    end
+
+    # This is a trusted development host. Validate the final file's ordinary
+    # ownership, mode, size and JSON content, while allowing an operator to
+    # place its private state under a symlinked directory.
+    def read_private_json_object(path, label, max_size:, mode:, missing_error: nil)
+      stat = File.stat(path)
+      unless stat.file? && stat.uid == Process.euid &&
+             (stat.mode & 0o777) == mode && stat.size <= max_size
+        raise Error, "#{label} is not a private bounded regular file: #{path}"
+      end
+      data = File.binread(path, max_size + 1)
+      raise Error, "#{label} exceeds its size limit: #{path}" if data.bytesize > max_size
+      object = JSON.parse(data, create_additions: false, object_class: StrictJSONHash)
+      raise Error, "#{label} must be a JSON object: #{path}" unless object.is_a?(Hash)
+
+      object
+    rescue JSON::ParserError => e
+      raise Error, "invalid #{label}: #{e.message}"
+    rescue Errno::ENOENT => e
+      raise Error, missing_error if missing_error
+
+      raise Error, "cannot read #{label}: #{e.message}"
+    rescue Errno::ENOTDIR, Errno::EACCES => e
+      raise Error, "cannot read #{label}: #{e.message}"
     end
 
     def write_portal_manifest(slug, manifest)
@@ -3603,6 +4163,78 @@ module DevSession
       command += ['--socket', @codex_socket] if @codex_socket
       @command_runner.capture(command)
     end
+
+	# Direct teams are package-owned projections of the immutable catalog. The
+	# returned object is a complete snapshot, not a capability token: creation
+	# journals retain it verbatim so later package changes cannot alter staff,
+	# addresses, lead settings, or specialist settings during recovery.
+	def resolve_current_direct_team!(team, model: nil, effort: nil)
+	  unless team.is_a?(String) && team.match?(SAFE_PART) && @portal_command && !@portal_command.empty?
+		raise Error, 'direct team selection requires the installed workspace portal'
+	  end
+	  if [model, effort].compact.length == 1
+		raise Error, '--model and --effort must be selected together for a direct team'
+	  end
+	  portal = File.realpath(@portal_command.first)
+	  package = File.dirname(File.dirname(portal))
+	  command = [*@portal_command, 'team-preset', '--package-root', package, '--team', team]
+	  if model
+		command.concat(['--model', model, '--effort', effort])
+		command.concat(['--socket', @codex_socket]) if @codex_socket
+	  end
+	  stdout, _stderr, _status = @command_runner.capture(command)
+	  preset = JSON.parse(stdout)
+	  raise Error, 'workspace-portal returned an invalid direct team preset' unless valid_direct_team_preset?(preset)
+
+	  preset
+	rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+	  raise Error, "cannot resolve installed workspace portal package: #{e.message}"
+	rescue JSON::ParserError => e
+	  raise Error, "workspace-portal returned invalid direct team preset JSON: #{e.message}"
+	end
+
+	def load_direct_team_preset!(path)
+	  raise Error, 'direct team preset path must be absolute' unless path.is_a?(String) && path.start_with?(File::SEPARATOR)
+	  preset = read_private_json_object(path, 'direct team preset', max_size: 64 * 1024, mode: 0o600)
+	  raise Error, 'direct team preset is invalid' unless valid_direct_team_preset?(preset)
+
+	  preset
+	rescue JSON::ParserError => e
+	  raise Error, "invalid direct team preset: #{e.message}"
+	end
+
+	def apply_direct_team_preset!(slug, root_thread_id, preset)
+	  raise Error, 'workspace-portal is required to create a direct team' unless @portal_command && !@portal_command.empty?
+	  raise Error, 'direct team creation has an invalid root thread' unless root_thread_id.is_a?(String) && root_thread_id.match?(/\A[0-9A-Za-z-]+\z/)
+	  raise Error, 'direct team preset is invalid' unless valid_direct_team_preset?(preset)
+
+	  snapshot = Tempfile.new(['dev-session-direct-team-', '.json'])
+	  snapshot.chmod(0o600)
+	  snapshot.write(JSON.generate(preset))
+	  snapshot.write("\n")
+	  snapshot.flush
+	  snapshot.fsync
+	  command = [
+		*@portal_command, 'team', 'apply-preset',
+		'--user-state-root', @workspace_state_root,
+		'--workspace', workspace,
+		'--session-slug', slug,
+		'--root-thread-id', root_thread_id,
+		'--cwd', work_dir(slug),
+		'--preset-file', snapshot.path
+	  ]
+	  command += ['--socket', @codex_socket] if @codex_socket
+	  stdout, _stderr, _status = @command_runner.capture(command)
+	  result = JSON.parse(stdout)
+	  unless result.is_a?(Hash) && result['rootThreadId'] == root_thread_id && result['slug'] == slug
+		raise Error, 'workspace-portal returned an invalid direct team roster'
+	  end
+	  stdout
+	rescue JSON::ParserError => e
+	  raise Error, "workspace-portal returned invalid direct team roster JSON: #{e.message}"
+	ensure
+	  snapshot&.close!
+	end
 
     def codex_metadata(thread_id)
       metadata = { 'thread_id' => thread_id }
@@ -4818,6 +5450,12 @@ module DevSession
 
     def preserve_removed_state!(slug, removal, plan)
       recovery = removal.fetch('recovery')
+      team_state = direct_team_state_path(slug)
+      if path_exists?(team_state)
+        raise Error, "team roster is a symlink: #{team_state}" if File.symlink?(team_state)
+        raise Error, "team roster is not a file: #{team_state}" unless File.file?(team_state)
+        move_to_removal_recovery!(team_state, recovery, 'team.json')
+      end
       journal = creation_journal_file(slug)
       if path_exists?(journal)
         raise Error, "creation journal is a symlink: #{journal}" if File.symlink?(journal)
@@ -6998,6 +7636,7 @@ module DevSession
     def quiesce_and_require_idle!(slug, session)
       quiesced = quiesce_native_client!(slug, session)
       ensure_portal_thread_idle!(slug, @selected_authority)
+      sync_team_lifecycle!(slug, 'require-idle')
       quiesced
     rescue StandardError
       restore_native_client!(slug, quiesced) if quiesced
@@ -7320,6 +7959,8 @@ module DevSession
         run_url
       when 'worktree'
         run_worktree
+      when 'team'
+        run_team
       else
         raise Error, "unknown command: #{command}"
       end
@@ -7518,6 +8159,8 @@ module DevSession
         exclusive: false,
         model: nil,
         effort: nil,
+        team: nil,
+        team_binding: nil,
         goal_text: nil
       }
       parser = OptionParser.new do |parser_opts|
@@ -7532,6 +8175,12 @@ module DevSession
         parser_opts.on('--exclusive') { opts[:exclusive] = true }
         parser_opts.on('--model MODEL') { |value| opts[:model] = value }
         parser_opts.on('--effort EFFORT') { |value| opts[:effort] = value }
+		parser_opts.on('--team TEAM') { |value| opts[:team] = value }
+		parser_opts.on('--team-binding TOKEN') { |value| opts[:team_binding] = value }
+		# Browser creation passes its accepted immutable snapshot through this
+		# private transport. Normal terminal callers use --team, which resolves
+		# the installed catalog once before any creation effect.
+		parser_opts.on('--team-preset FILE') { |value| opts[:team_preset] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'start')
@@ -7607,6 +8256,34 @@ module DevSession
       require_arity!(0..1, @argv, 'url')
 
       runner.url(@argv.first, as_is: opts[:as_is])
+    end
+
+    def run_team
+      action = @argv.shift
+      raise Error, 'usage: team list|preset|add|configure|remove|assign <session> ...' unless action
+      opts = { as_is: false, model: nil, effort: nil, from: 'lead', to: nil, message: nil, message_id: nil }
+      parser = OptionParser.new do |flags|
+        flags.on('--as-is') { opts[:as_is] = true }
+        flags.on('--model MODEL') { |value| opts[:model] = value }
+        flags.on('--effort EFFORT') { |value| opts[:effort] = value }
+        flags.on('--from ADDRESS') { |value| opts[:from] = value }
+        flags.on('--to ADDRESS') { |value| opts[:to] = value }
+        flags.on('--message TEXT') { |value| opts[:message] = value }
+        flags.on('--message-id ID') { |value| opts[:message_id] = value }
+      end
+      parser.parse!(@argv)
+      expected = { 'list' => 1, 'preset' => 2, 'add' => 2, 'configure' => 2, 'remove' => 2, 'assign' => 1 }
+      raise Error, "unknown team action: #{action}" unless expected.key?(action)
+      require_arity!(expected.fetch(action), @argv, "team #{action}")
+      slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
+      opts[:message_id] ||= SecureRandom.uuid if action == 'assign'
+      parameters = { model: opts[:model], effort: opts[:effort], from: opts[:from], to: opts[:to], message: opts[:message], message_id: opts[:message_id] }
+      case action
+      when 'preset' then parameters[:preset] = @argv.fetch(1)
+      when 'add' then parameters[:role] = @argv.fetch(1)
+      when 'configure', 'remove' then parameters[:address] = @argv.fetch(1)
+      end
+      @out.write(runner.team(slug, action:, **parameters))
     end
 
     def run_delete

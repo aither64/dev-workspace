@@ -101,6 +101,7 @@ class DevSessionTest < Minitest::Test
         err: StringIO.new,
         today: TODAY,
         env: {},
+        codex_socket: '/run/test/codex.sock',
         portal_command: [RbConfig.ruby, portal]
       )
 
@@ -530,7 +531,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_exclusive_browser_replay_repairs_authority_after_ready_journal_crash
+  def test_exclusive_browser_replay_completes_terminal_journal_after_authority_ready
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       goal = File.join(workspace, 'goal.txt')
@@ -542,7 +543,9 @@ class DevSessionTest < Minitest::Test
       File.chmod(0o755, codex)
       File.write(portal, <<~RUBY)
         require 'json'
-        puts JSON.generate(threadId: 'thread-crash') if ARGV[1] == 'create'
+        if ARGV[0, 2] == ['thread', 'create']
+          puts JSON.generate(threadId: 'thread-crash')
+        end
       RUBY
       session = DevSession::Tmux::Session.new(
         id: '$8', name: slug, mark: '1', slug:, workspace:,
@@ -555,9 +558,8 @@ class DevSessionTest < Minitest::Test
         define_method(:revalidate_session!) { |_expected| session }
         define_method(:reconcile_native_client!) { |_slug, expected, **_keywords| expected }
 
-        def mark_creation_journal_ready(slug, journal)
-          super
-          raise DevSession::Error, 'simulated crash before authority publication'
+        def mark_creation_journal_ready(_slug, _journal)
+          raise DevSession::Error, 'simulated crash before terminal journal'
         end
       end
       runner = crashing_runner_class.new(
@@ -585,9 +587,10 @@ class DevSessionTest < Minitest::Test
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       authority_path = File.join(authority_dir, "#{slug}.json")
       authority = JSON.parse(File.read(authority_path))
-      assert_equal('ready', journal.fetch('state'))
+      assert_equal('creating', journal.fetch('state'))
       assert_equal('ready', manifest.dig('creation', 'state'))
-      assert_equal('creating', authority.fetch('state'))
+      assert_equal('ready', authority.fetch('state'))
+      creation_identity = journal.fetch('tmux_identity')
 
       out = StringIO.new
       replay = DevSession::Runner.new(
@@ -600,7 +603,7 @@ class DevSessionTest < Minitest::Test
           codex_thread_id: 'thread-crash',
           codex_socket_path: '/run/test/codex.sock',
           codex_client_version: '0.152.1',
-          id: '$8'
+          id: '$8', identity_token: creation_identity
         ),
         out:,
         err: StringIO.new,
@@ -648,6 +651,7 @@ class DevSessionTest < Minitest::Test
         err: StringIO.new,
         today: TODAY,
         env: {},
+        codex_socket: '/run/test/codex.sock',
         portal_command: [RbConfig.ruby, portal]
       )
 
@@ -748,6 +752,7 @@ class DevSessionTest < Minitest::Test
         err: StringIO.new,
         today: TODAY,
         env: {},
+        codex_socket: '/run/test/codex.sock',
         portal_command: [RbConfig.ruby, '-e', "require 'json'; puts JSON.generate(threadId: 'thread-early')"]
       )
 

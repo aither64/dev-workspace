@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,8 +20,10 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -38,7 +41,8 @@ func newCodexClient(socket, workspace string) *workspacecodex.Client {
 		ClientInfo: codex.ClientInfo{
 			Name: "dev-workspace", Title: "Development Workspace", Version: "0.1.0",
 		},
-		DeveloperInstructions: sessionLifecycleDeveloperInstructions,
+		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
+		PreserveThreadInstructionsOnResume: true,
 		// Keep the deployed retry identity while making storage ownership explicit.
 		SubmissionLedgerPath: socket + ".submission-attempts-v3.json",
 	})
@@ -86,7 +90,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal serve|router|thread|validate|version")
+		return errors.New("usage: workspace-portal serve|router|thread|team|team-preset|agent-teams|validate|version")
 	}
 	switch args[0] {
 	case "serve":
@@ -95,6 +99,12 @@ func run(args []string) error {
 		return routeWorkspaces(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
+	case "team":
+		return teamCommand(args[1:])
+	case "team-preset":
+		return teamPresetCommand(args[1:])
+	case "agent-teams":
+		return agentTeamsCommand(args[1:])
 	case "capture-comparison":
 		return captureComparisonCommand(args[1:])
 	case "uploads":
@@ -109,13 +119,69 @@ func run(args []string) error {
 	}
 }
 
+// teamPresetCommand resolves one package-provided, direct-thread preset. It
+// is deliberately read-only: callers persist the returned snapshot in their
+// creation receipt and replay that snapshot rather than consulting a later
+// package generation.
+func teamPresetCommand(args []string) error {
+	flags := flag.NewFlagSet("team-preset", flag.ContinueOnError)
+	packageRoot := flags.String("package-root", "", "absolute installed package root")
+	id := flags.String("team", "", "package team identifier")
+	model := flags.String("model", "", "explicit lead Codex model")
+	effort := flags.String("effort", "", "explicit lead reasoning effort")
+	socket := flags.String("socket", "", "Codex App Server Unix socket for lead override validation")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || !canonicalAbsolutePath(*packageRoot) || *id == "" {
+		return errors.New("team-preset requires --package-root and --team")
+	}
+	if (*model == "") != (*effort == "") {
+		return errors.New("team-preset requires --model and --effort together")
+	}
+	if *model != "" && !canonicalAbsolutePath(*socket) {
+		return errors.New("team-preset lead override requires --socket")
+	}
+	installed, err := agentteams.LoadInstalled(*packageRoot)
+	if err != nil {
+		return err
+	}
+	if !installed.Managed || installed.Catalog == nil {
+		return errors.New("this workspace package has no direct team catalog")
+	}
+	preset, err := teamruntime.FindCatalogPreset(*installed.Catalog, *id)
+	if err != nil {
+		return err
+	}
+	if *model != "" {
+		client := newCodexClient(*socket, "")
+		defer client.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		models, err := client.ListModels(ctx)
+		if err != nil {
+			return fmt.Errorf("load live Codex models: %w", err)
+		}
+		settings, err := workspacecodex.ResolveNewThreadSettings(models, codex.ThreadSettings{
+			Model: *model, ReasoningEffort: *effort,
+		})
+		if err != nil {
+			return err
+		}
+		preset.LeadModel, preset.LeadEffort = settings.Model, settings.ReasoningEffort
+	}
+	return json.NewEncoder(os.Stdout).Encode(preset)
+}
+
 type serveOptions struct {
 	unixSocket, workspace, baseURL, devSession, authorityDir string
 	userStateRoot                                            string
+	packageRoot, workspaceName, registrationMarker           string
 	displayLabel, hostLabel, sshHost                         string
 	hostProfile, transitionLock                              string
 	codexSocket, codexVersion                                string
 	gh, tmux                                                 string
+	trustedOrigins                                           trustedOriginValues
 	clusterProviders                                         clusterProviderValues
 }
 
@@ -140,18 +206,34 @@ func (values *clusterProviderValues) Set(value string) error {
 	return nil
 }
 
+// trustedOriginValues keeps the service boundary explicit: workspace-host
+// supplies only the complete origins of aliases already recorded in its private
+// registry. The web package validates every value before use.
+type trustedOriginValues []string
+
+func (values *trustedOriginValues) String() string { return strings.Join(*values, ",") }
+
+func (values *trustedOriginValues) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
 func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	options := &serveOptions{}
 	flags.StringVar(&options.unixSocket, "unix-socket", "", "required HTTP Unix socket")
 	flags.StringVar(&options.workspace, "workspace", "", "required workspace root")
 	flags.StringVar(&options.baseURL, "base-url", "", "required external base URL")
+	flags.Var(&options.trustedOrigins, "trusted-origin", "registered alias HTTPS origin (repeatable)")
 	flags.StringVar(&options.displayLabel, "display-label", "Development workspace", "workspace label shown in the portal")
 	flags.StringVar(&options.hostLabel, "host-label", "this host", "host label shown in local commands")
 	flags.StringVar(&options.sshHost, "ssh-host", "", "optional SSH host for remote attach commands")
 	flags.StringVar(&options.devSession, "dev-session", "", "absolute installed dev-session command")
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
 	flags.StringVar(&options.userStateRoot, "user-state-root", "", "absolute package-selected user state root")
+	flags.StringVar(&options.packageRoot, "package-root", "", "absolute current workspace package root")
+	flags.StringVar(&options.workspaceName, "workspace-name", "", "registered workspace name")
+	flags.StringVar(&options.registrationMarker, "registration-marker", "", "private host registration marker")
 	flags.StringVar(&options.hostProfile, "host-profile", "", "selected workspace host profile")
 	flags.StringVar(&options.transitionLock, "transition-lock", "", "host-wide runtime transition lock")
 	flags.StringVar(&options.codexSocket, "codex-socket", codex.DefaultSocket(), "Codex App Server Unix socket")
@@ -167,8 +249,22 @@ func serve(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if options.userStateRoot != "" && !filepath.IsAbs(options.userStateRoot) {
-		return errors.New("--user-state-root must be absolute")
+	if flags.NArg() != 0 {
+		return errors.New("serve accepts no positional arguments")
+	}
+	if options.userStateRoot == "" || options.packageRoot == "" || options.workspaceName == "" || options.registrationMarker == "" {
+		return errors.New("serve requires --user-state-root, --package-root, --workspace-name and --registration-marker")
+	}
+	if !workspaceNamePattern.MatchString(options.workspaceName) {
+		return errors.New("serve workspace name is invalid")
+	}
+	for flagName, value := range map[string]string{
+		"--user-state-root": options.userStateRoot, "--package-root": options.packageRoot,
+		"--registration-marker": options.registrationMarker,
+	} {
+		if value != "" && (!filepath.IsAbs(value) || filepath.Clean(value) != value) {
+			return fmt.Errorf("%s must be absolute and canonical", flagName)
+		}
 	}
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
 	codexClient := newCodexClient(options.codexSocket, options.workspace)
@@ -177,9 +273,11 @@ func serve(args []string) error {
 		ObserveActivity: true,
 		CollectUploads:  true,
 		Workspace:       options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
-		HostLabel: options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
+		TrustedOrigins: options.trustedOrigins,
+		HostLabel:      options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
+		PackageRoot: options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
 		CodexSocket: options.codexSocket, CodexVersion: options.codexVersion,
 		ClusterProviders: options.clusterProviders,
 		Logger:           logger, Codex: codexClient,
@@ -239,9 +337,221 @@ func portalListener(socketPath string) (net.Listener, error) {
 	return listener, nil
 }
 
+type teamModelCatalog interface {
+	ListModels(context.Context) ([]codex.Model, error)
+}
+
+// resolveTeamMemberSettings keeps add/configure from falling through to the
+// App Server default model. Existing members can only be changed to an exact
+// live model/effort pair, matching browser-side validation.
+func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, command, model, effort string) (codex.ThreadSettings, error) {
+	if command != "add" && command != "configure" {
+		return codex.ThreadSettings{Model: model, ReasoningEffort: effort}, nil
+	}
+	if model == "" || effort == "" {
+		return codex.ThreadSettings{}, fmt.Errorf("team %s requires --model and --effort", command)
+	}
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		return codex.ThreadSettings{}, fmt.Errorf("load live Codex models: %w", err)
+	}
+	settings, err := workspacecodex.ResolveNewThreadSettings(models, codex.ThreadSettings{
+		Model: model, ReasoningEffort: effort,
+	})
+	if err != nil {
+		return codex.ThreadSettings{}, err
+	}
+	return settings, nil
+}
+
+// teamCommand is the CLI counterpart of the portal's team endpoint. Both use
+// the same private roster and direct App Server thread operations.
+func teamCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|remove|assign|require-idle|archive|retire|revive|fork")
+	}
+	command := args[0]
+	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
+	stateRoot := flags.String("user-state-root", "", "private user state root")
+	packageRoot := flags.String("package-root", "", "installed workspace package root")
+	workspace := flags.String("workspace", "", "development workspace root")
+	slug := flags.String("session-slug", "", "development session slug")
+	rootThread := flags.String("root-thread-id", "", "lead Codex thread id")
+	sourceSlug := flags.String("source-session-slug", "", "source development session slug")
+	sourceRootThread := flags.String("source-root-thread-id", "", "source lead Codex thread id")
+	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
+	cwd := flags.String("cwd", "", "session working directory")
+	preset := flags.String("preset", "", "team preset")
+	presetFile := flags.String("preset-file", "", "immutable team preset JSON file")
+	role := flags.String("role", "", "member role")
+	address := flags.String("address", "", "team member address")
+	from := flags.String("from", "lead", "sender address")
+	to := flags.String("to", "", "recipient address")
+	message := flags.String("message", "", "assignment message")
+	messageID := flags.String("message-id", "", "stable assignment retry ID")
+	inputFile := flags.String("input-file", "", "file containing an assignment message")
+	model := flags.String("model", "", "Codex model")
+	effort := flags.String("effort", "", "Codex reasoning effort")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *stateRoot == "" || *workspace == "" || !session.ValidSlug(*slug) || *rootThread == "" {
+		return errors.New("team command requires --user-state-root, --workspace, --session-slug and --root-thread-id")
+	}
+	store, err := teamruntime.NewStore(*stateRoot, *workspace)
+	if err != nil {
+		return err
+	}
+	if command == "list" {
+		presets := teamruntime.Presets()
+		if *packageRoot != "" {
+			if !canonicalAbsolutePath(*packageRoot) {
+				return errors.New("team list requires a canonical absolute package root")
+			}
+			installed, err := agentteams.LoadInstalled(*packageRoot)
+			if err != nil {
+				return err
+			}
+			if installed.Managed && installed.Catalog != nil {
+				presets, err = teamruntime.PresetsFromCatalog(*installed.Catalog)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		roster, err := store.Load(*slug, *rootThread)
+		if errors.Is(err, os.ErrNotExist) {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": nil, "presets": presets})
+		}
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": roster, "presets": presets})
+	}
+	if *cwd == "" {
+		*cwd = filepath.Join(*workspace, "work", *slug)
+	}
+	var teamCatalog *agentteams.Catalog
+	if *packageRoot != "" {
+		if !canonicalAbsolutePath(*packageRoot) {
+			return errors.New("team command requires a canonical absolute package root")
+		}
+		installed, loadErr := agentteams.LoadInstalled(*packageRoot)
+		if loadErr != nil {
+			return loadErr
+		}
+		if installed.Managed {
+			if installed.Catalog == nil {
+				return errors.New("installed team catalog is unavailable")
+			}
+			teamCatalog = installed.Catalog
+		}
+	}
+	client := newCodexClient(*socket, *workspace)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	settings, err := resolveTeamMemberSettings(ctx, client, command, *model, *effort)
+	if err != nil {
+		return err
+	}
+	if command == "add" || command == "configure" {
+		*model, *effort = settings.Model, settings.ReasoningEffort
+	}
+	environment := map[string]string{
+		"DEV_SESSION_SLUG": *slug, "DEV_SESSION_WORKSPACE": *workspace, "DEV_SESSION_WORK_DIR": *cwd,
+		"DEV_SESSION_REQUIRE_RUNTIME": "1", "DEV_SESSION_CODEX_SOCKET": *socket,
+	}
+	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog}
+	var presetSpec teamruntime.Preset
+	if command == "apply-preset" {
+		if *presetFile == "" {
+			return errors.New("team apply-preset requires --preset-file")
+		}
+		info, statErr := os.Lstat(*presetFile)
+		if statErr != nil {
+			return fmt.Errorf("inspect team preset: %w", statErr)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&0o077 != 0 {
+			return errors.New("team preset must be a private regular file")
+		}
+		file, openErr := os.Open(*presetFile)
+		if openErr != nil {
+			return openErr
+		}
+		decoder := json.NewDecoder(io.LimitReader(file, 64*1024+1))
+		decoder.DisallowUnknownFields()
+		decodeErr := decoder.Decode(&presetSpec)
+		if decodeErr == nil && decoder.Decode(&struct{}{}) != io.EOF {
+			decodeErr = errors.New("team preset has trailing data")
+		}
+		if closeErr := file.Close(); decodeErr == nil {
+			decodeErr = closeErr
+		}
+		if decodeErr != nil {
+			return fmt.Errorf("decode team preset: %w", decodeErr)
+		}
+	}
+	if *inputFile != "" {
+		contents, readErr := os.ReadFile(*inputFile)
+		if readErr != nil {
+			return readErr
+		}
+		*message = string(contents)
+	}
+	var result any
+	switch command {
+	case "preset":
+		result, err = service.ApplyPreset(ctx, *slug, *rootThread, *cwd, environment, *preset, *model, *effort)
+	case "apply-preset":
+		result, err = service.ApplyPresetSpec(ctx, *slug, *rootThread, *cwd, environment, presetSpec)
+	case "add":
+		result, err = service.Add(ctx, *slug, *rootThread, *cwd, environment, *role, *model, *effort)
+	case "configure":
+		result, err = service.Configure(ctx, *slug, *rootThread, *address, *model, *effort)
+	case "remove":
+		err = service.Remove(ctx, *slug, *rootThread, *address)
+	case "assign":
+		result, err = service.Assign(ctx, *slug, *rootThread, *from, *to, *message, *model, *effort, *messageID)
+	case "require-idle":
+		err = service.RequireIdleAll(ctx, *slug, *rootThread)
+	case "archive":
+		err = service.ArchiveAll(ctx, *slug, *rootThread)
+	case "retire":
+		err = service.RetireAll(ctx, *slug, *rootThread)
+	case "revive":
+		err = service.ReviveAll(ctx, *slug, *rootThread)
+	case "fork":
+		if !session.ValidSlug(*sourceSlug) || *sourceRootThread == "" {
+			return errors.New("team fork requires --source-session-slug and --source-root-thread-id")
+		}
+		source, loadErr := store.Load(*sourceSlug, *sourceRootThread)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			result = map[string]any{"roster": nil}
+		} else if loadErr != nil {
+			err = loadErr
+		} else {
+			result, err = service.Fork(ctx, source, *slug, *rootThread, *cwd, environment)
+		}
+	default:
+		return fmt.Errorf("unknown team command %q", command)
+	}
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		roster, loadErr := store.Load(*slug, *rootThread)
+		if loadErr != nil {
+			return loadErr
+		}
+		result = roster
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|models|defaults|resolve-fork-settings|ensure-initial|require-materialized|require-idle|retire")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|require-materialized|require-idle|retire")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -270,15 +580,6 @@ func threadCommand(args []string) error {
 	force := flags.Bool("force", false, "interrupt an active thread before retiring it")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
-	}
-	if command == "defaults" {
-		if flags.NArg() != 0 {
-			return errors.New("thread defaults accepts no positional arguments")
-		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]string{
-			"model":           workspacecodex.DefaultNewThreadModel,
-			"reasoningEffort": workspacecodex.DefaultNewThreadReasoningEffort,
-		})
 	}
 	client := newCodexClient(*socket, *workspace)
 	defer client.Close()
@@ -345,6 +646,9 @@ func threadCommand(args []string) error {
 		var err error
 		settings := codex.ThreadSettings{Model: *model, ReasoningEffort: *effort}
 		resolveSettings := func() (codex.ThreadSettings, error) {
+			if settings.Model == "" && settings.ReasoningEffort == "" {
+				return settings, nil
+			}
 			models, listErr := client.ListModels(ctx)
 			if listErr != nil {
 				return codex.ThreadSettings{}, fmt.Errorf("load Codex models: %w", listErr)
@@ -541,4 +845,61 @@ func captureComparisonCommand(args []string) error {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(pair)
+}
+
+// agentTeamsCommand is the bounded JSON bridge for host registration.
+// Filesystem authorities remain explicit flags so callers cannot hide them
+// inside policy JSON.
+func agentTeamsCommand(args []string) error {
+	return agentTeamsCommandIO(args, os.Stdin, os.Stdout)
+}
+
+func agentTeamsCommandIO(args []string, input io.Reader, output io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: workspace-portal agent-teams registration")
+	}
+	command := args[0]
+	if command != "registration" {
+		return fmt.Errorf("unknown agent team command %q", command)
+	}
+	flags := flag.NewFlagSet("agent-teams "+command, flag.ContinueOnError)
+	packageRoot := flags.String("package-root", "", "absolute installed or candidate package root")
+	stateRoot := flags.String("state-root", "", "absolute private user-state root")
+	workspace := flags.String("workspace", "", "absolute canonical workspace root")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("agent team helper accepts no positional arguments")
+	}
+	if !canonicalAbsolutePath(*packageRoot) || !canonicalAbsolutePath(*stateRoot) || !canonicalAbsolutePath(*workspace) {
+		return errors.New("registration requires --package-root, --state-root and --workspace")
+	}
+	requestData, err := readAgentTeamsRequest(input)
+	if err != nil {
+		return err
+	}
+	if _, err := agentteams.DecodeRegistrationRequest(requestData); err != nil {
+		return err
+	}
+	plan, err := agentteams.BuildRegistrationPlan(*packageRoot)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(plan)
+}
+
+func readAgentTeamsRequest(input io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(input, int64(agentteams.MaxHelperRequestBytes)+1))
+	if err != nil {
+		return nil, fmt.Errorf("read agent team helper request: %w", err)
+	}
+	if len(data) > agentteams.MaxHelperRequestBytes {
+		return nil, errors.New("agent team helper request exceeds bounds")
+	}
+	return data, nil
+}
+
+func canonicalAbsolutePath(path string) bool {
+	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path
 }

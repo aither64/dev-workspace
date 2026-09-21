@@ -17,10 +17,10 @@ import (
 	"github.com/coder/websocket"
 )
 
-func TestResolveNewThreadSettingsOwnsWorkspaceDefaults(t *testing.T) {
+func TestResolveNewThreadSettingsPreservesOmittedSettings(t *testing.T) {
 	models := []codex.Model{
 		{
-			Model: DefaultNewThreadModel, DisplayName: "GPT-6 Astra",
+			Model: "configured-default", DisplayName: "Configured Default", IsDefault: true,
 			DefaultReasoningEffort: "medium",
 			SupportedReasoningEfforts: []codex.ReasoningEffortOption{
 				{ReasoningEffort: "medium"}, {ReasoningEffort: "xhigh"},
@@ -35,12 +35,80 @@ func TestResolveNewThreadSettingsOwnsWorkspaceDefaults(t *testing.T) {
 	}
 
 	settings, err := ResolveNewThreadSettings(models, codex.ThreadSettings{})
-	if err != nil || settings.Model != DefaultNewThreadModel || settings.ReasoningEffort != "xhigh" {
-		t.Fatalf("default settings = %#v, %v", settings, err)
+	if err != nil || settings != (codex.ThreadSettings{}) {
+		t.Fatalf("omitted settings = %#v, %v", settings, err)
 	}
 	settings, err = ResolveNewThreadSettings(models, codex.ThreadSettings{Model: "bounded"})
-	if err != nil || settings.Model != "bounded" || settings.ReasoningEffort != "high" {
-		t.Fatalf("bounded settings = %#v, %v", settings, err)
+	if err != nil || settings != (codex.ThreadSettings{Model: "bounded"}) {
+		t.Fatalf("model-only settings = %#v, %v", settings, err)
+	}
+	settings, err = ResolveNewThreadSettings(models, codex.ThreadSettings{
+		Model: "bounded", ReasoningEffort: "high",
+	})
+	if err != nil || settings != (codex.ThreadSettings{Model: "bounded", ReasoningEffort: "high"}) {
+		t.Fatalf("explicit settings = %#v, %v", settings, err)
+	}
+	settings, err = ResolveNewThreadSettings(models, codex.ThreadSettings{ReasoningEffort: "xhigh"})
+	if err != nil || settings != (codex.ThreadSettings{ReasoningEffort: "xhigh"}) {
+		t.Fatalf("effort-only settings = %#v, %v", settings, err)
+	}
+	for _, requested := range []codex.ThreadSettings{
+		{Model: "missing"},
+		{Model: "bounded", ReasoningEffort: "xhigh"},
+	} {
+		if _, err := ResolveNewThreadSettings(models, requested); err == nil {
+			t.Fatalf("invalid explicit settings were accepted: %#v", requested)
+		}
+	}
+}
+
+func TestStartThreadWithSettingsPassesOnlyExplicitSelections(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		settings codex.ThreadSettings
+	}{
+		{name: "omitted"},
+		{name: "explicit", settings: codex.ThreadSettings{Model: "bounded", ReasoningEffort: "high"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/start" {
+					return fmt.Errorf("thread/start request = %#v, %v", request, err)
+				}
+				params := request["params"].(map[string]any)
+				config := params["config"].(map[string]any)
+				if testCase.settings.Model == "" {
+					if _, ok := params["model"]; ok {
+						return fmt.Errorf("omitted model reached thread/start: %#v", params)
+					}
+				} else if params["model"] != testCase.settings.Model {
+					return fmt.Errorf("explicit model = %#v", params)
+				}
+				if testCase.settings.ReasoningEffort == "" {
+					if _, ok := config["model_reasoning_effort"]; ok {
+						return fmt.Errorf("omitted effort reached thread/start: %#v", config)
+					}
+				} else if config["model_reasoning_effort"] != testCase.settings.ReasoningEffort {
+					return fmt.Errorf("explicit effort = %#v", config)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-new", "cwd": "/workspace/work/example",
+					}},
+				})
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", nil, testCase.settings); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -827,6 +895,14 @@ func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testi
 		request, err = readObject(connection)
 		if err != nil || request["method"] != "thread/start" {
 			return fmt.Errorf("expected replacement thread/start: %v", err)
+		}
+		params := request["params"].(map[string]any)
+		config := params["config"].(map[string]any)
+		if _, ok := params["model"]; ok {
+			return fmt.Errorf("replacement start synthesized a model: %#v", params)
+		}
+		if _, ok := config["model_reasoning_effort"]; ok {
+			return fmt.Errorf("replacement start synthesized an effort: %#v", config)
 		}
 		return writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"thread": map[string]any{

@@ -25,7 +25,7 @@ func (s *Server) initUploads() error {
 	}
 	s.uploadStore = store
 	handler, err := conversation.NewUploadHandler(conversation.UploadOptions{
-		BasePath: "/uploads", AllowedOrigins: []string{s.config.BaseURL}, Resolve: s.resolveUploads,
+		BasePath: "/uploads", AllowedOrigins: s.trustedOrigins, Resolve: s.resolveUploads,
 	})
 	if err != nil {
 		return err

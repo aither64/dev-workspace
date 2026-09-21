@@ -3,7 +3,7 @@ module github.com/aither64/dev-workspace/portal
 go 1.24.0
 
 require (
-	github.com/aither64/codex-web v0.0.0-20260918123057-0a75d720171c
+	github.com/aither64/codex-web v0.0.0-20260922204706-1635ea2b2348
 	github.com/coder/websocket v1.8.14
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/yuin/goldmark v1.7.17

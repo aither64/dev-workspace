@@ -2,6 +2,15 @@
   "developmentClusterStateSchema": 1,
   "developmentClusterTransitionPolicy": 2,
   "runtimeAuthorityIdentityPolicy": 1,
+  "agentTeamRegistration": {
+    "helperSchema": 1,
+    "policy": 1,
+    "markerSchema": 1,
+    "pendingSchema": 1,
+    "maxPersistedScalarBytes": 4096,
+    "maxOutputBytes": 4194304,
+    "migrationJournalSuffix": ".agent-teams-migration.json"
+  },
   "clusterProvider": { "statusBusyExitCode": 75, "releaseTimeoutSeconds": 180 },
   "trackingMaxBytes": 8388608,
   "maxMessageBytes": 20000,
@@ -94,6 +103,7 @@
   "portalServeFlags": [
     "--workspace",
     "--base-url",
+    "--trusted-origin",
     "--display-label",
     "--host-label",
     "--ssh-host",
@@ -101,6 +111,9 @@
     "--dev-session",
     "--authority-dir",
     "--user-state-root",
+    "--package-root",
+    "--workspace-name",
+    "--registration-marker",
     "--host-profile",
     "--transition-lock",
     "--codex-socket",

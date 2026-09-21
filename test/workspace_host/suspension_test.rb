@@ -356,7 +356,8 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   class TransitionHost < DevWorkspaceHost::Host
-    attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart, :fail_restore
+    attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart, :fail_restore,
+                  :fail_set_after_profile
     attr_reader :events
 
     def initialize(candidate:, busy:, **options)
@@ -392,6 +393,10 @@ class WorkspaceHostTest < Minitest::Test
           File.unlink(@profile) if File.symlink?(@profile)
           File.symlink(File.basename(generation), @profile)
           @events << [:profile_set, current]
+          if fail_set_after_profile
+            self.fail_set_after_profile = false
+            raise DevWorkspaceHost::Error, 'injected post-commit profile selection failure'
+          end
           return
         elsif argv[3] == '--rollback'
           target = previous_profile_generation
@@ -469,6 +474,19 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:codex_checked, File.realpath(command)]
     end
 
+    def registration_plan_for(_entry, package: package_root)
+      DevWorkspaceHost::RegistrationPlan.new(
+        package_root: File.realpath(package),
+        argv: ['-c', 'agents.dw_transition.config_file=/nix/store/transition-role.toml'],
+        digest: 'a' * 64, policy: 1,
+        required_native_child_threads: 1, states: []
+      )
+    end
+
+    def probe_codex_registration(codex, plan)
+      @events << [:registration_probed, File.realpath(codex), plan.digest]
+    end
+
     def busy_codex_sessions
       busy
     end
@@ -478,6 +496,9 @@ class WorkspaceHostTest < Minitest::Test
       if fail_restart
         self.fail_restart = false
         raise DevWorkspaceHost::Error, 'injected consumer restart failure'
+      end
+      registration_plans.each do |entry, plan|
+        write_registration_marker(entry, File.realpath(@system_codex), plan)
       end
     end
   end

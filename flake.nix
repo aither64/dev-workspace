@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix";
     codex-web = {
-      url = "github:aither64/codex-web/0a75d720171c52719679c7dd2e356d50f4b81f16";
+      url = "github:aither64/codex-web/1635ea2b23488082b14146e95ec4606631771df9";
       flake = false;
     };
   };
@@ -28,6 +28,7 @@
           pkgs,
           extensions ? { },
           routerSocket ? hostPaths.routerSocket,
+          teamConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
@@ -39,6 +40,7 @@
             activationEnvironmentAliases
             extensions
             routerSocket
+            teamConfig
             userNamespace
             ;
         };
@@ -77,6 +79,9 @@
           inherit devWorkspace hostPaths pkgs;
         };
         extension-catalog = import ./nix/tests/extension-catalog.nix {
+          inherit pkgs mkPackage;
+        };
+        agent-team-catalog = import ./nix/tests/agent-team-catalog.nix {
           inherit pkgs mkPackage;
         };
         user-namespace = import ./nix/tests/user-namespace.nix {

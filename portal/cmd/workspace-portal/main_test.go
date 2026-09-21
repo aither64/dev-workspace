@@ -1,31 +1,328 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
-	"github.com/aither64/codex-web/conversation"
-	"github.com/aither64/dev-workspace/portal/internal/uploads"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
+	"github.com/coder/websocket"
 )
 
+type teamModelCatalogStub struct {
+	models []codex.Model
+	err    error
+	calls  int
+}
+
+func (stub *teamModelCatalogStub) ListModels(context.Context) ([]codex.Model, error) {
+	stub.calls++
+	return stub.models, stub.err
+}
+
+func TestTeamMemberSettingsRequireAnExplicitLivePair(t *testing.T) {
+	catalog := func() *teamModelCatalogStub {
+		return &teamModelCatalogStub{models: []codex.Model{
+			{Model: "member-model", DisplayName: "Member model", SupportedReasoningEfforts: []codex.ReasoningEffortOption{
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "high"},
+			}},
+		}}
+	}
+	for _, command := range []string{"add", "configure"} {
+		for _, requested := range []codex.ThreadSettings{
+			{}, {Model: "member-model"}, {ReasoningEffort: "high"},
+		} {
+			t.Run(command+"/missing-pair", func(t *testing.T) {
+				client := catalog()
+				_, err := resolveTeamMemberSettings(context.Background(), client, command, requested.Model, requested.ReasoningEffort)
+				if err == nil || !strings.Contains(err.Error(), "requires --model and --effort") {
+					t.Fatalf("missing pair error = %v", err)
+				}
+				if client.calls != 0 {
+					t.Fatalf("missing pair loaded live models %d times", client.calls)
+				}
+			})
+		}
+	}
+
+	t.Run("accepts advertised pair", func(t *testing.T) {
+		client := catalog()
+		settings, err := resolveTeamMemberSettings(context.Background(), client, "add", "member-model", "high")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if settings != (codex.ThreadSettings{Model: "member-model", ReasoningEffort: "high"}) || client.calls != 1 {
+			t.Fatalf("settings = %#v, calls = %d", settings, client.calls)
+		}
+	})
+
+	t.Run("rejects unavailable effort", func(t *testing.T) {
+		client := catalog()
+		_, err := resolveTeamMemberSettings(context.Background(), client, "configure", "member-model", "xhigh")
+		if err == nil || !strings.Contains(err.Error(), "not available") || client.calls != 1 {
+			t.Fatalf("unavailable pair error = %v, calls = %d", err, client.calls)
+		}
+	})
+
+	t.Run("assign retains optional override semantics", func(t *testing.T) {
+		client := catalog()
+		settings, err := resolveTeamMemberSettings(context.Background(), client, "assign", "", "")
+		if err != nil || settings != (codex.ThreadSettings{}) || client.calls != 0 {
+			t.Fatalf("assign settings = %#v, error = %v, calls = %d", settings, err, client.calls)
+		}
+	})
+}
+
+func TestAgentTeamHelperRetainsRegistrationOnly(t *testing.T) {
+	request := []byte(`{"schema":1}`)
+	root, stateRoot, workspace := t.TempDir(), t.TempDir(), t.TempDir()
+	registration := []string{"registration", "--package-root", root, "--state-root", stateRoot, "--workspace", workspace}
+	for _, testCase := range []struct {
+		name string
+		args []string
+	}{
+		{"retired static resolver", []string{"resolve-creation"}},
+		{"retired live resolver", []string{"resolve-current-creation"}},
+		{"retired publication command", []string{"publish-creation"}},
+		{"retired lifecycle guard command", []string{"require-unmanaged"}},
+		{"registration missing state authority", []string{"registration", "--package-root", root}},
+		{"registration rejects socket", append(append([]string{}, registration...), "--socket", "/run/codex.sock")},
+		{"registration rejects positional arguments", append(append([]string{}, registration...), "extra")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := agentTeamsCommandIO(testCase.args, bytes.NewReader(request), &bytes.Buffer{}); err == nil {
+				t.Fatal("agent team helper accepted a retired command or invalid registration authority")
+			}
+		})
+	}
+	for _, invalid := range []string{`{}`, `{"schema":1,"team":"solo"}`, `{"schema":1,"schema":1}`} {
+		if err := agentTeamsCommandIO(registration, strings.NewReader(invalid), &bytes.Buffer{}); err == nil {
+			t.Fatalf("registration accepted invalid JSON request %s", invalid)
+		}
+	}
+	if err := agentTeamsCommandIO(registration, bytes.NewReader(request), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "canonical package store root") {
+		t.Fatalf("registration did not reach package validation: %v", err)
+	}
+}
+
+func TestThreadEnsureInitialUsesOrdinaryRootTurn(t *testing.T) {
+	workspace := t.TempDir()
+	cwd := filepath.Join(workspace, "work", "example")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(t.TempDir(), "goal")
+	if err := os.WriteFile(input, []byte("initial goal\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := func(socket string) []string {
+		return []string{"ensure-initial", "--socket", socket, "--workspace", workspace,
+			"--thread-id", "thread-1", "--cwd", cwd, "--input-file", input, "--start-unmaterialized"}
+	}
+	socket := threadCommandInitialAppServer(t, cwd)
+	if err := threadCommand(base(socket)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func threadCommandInitialAppServer(t *testing.T, cwd string) string {
+	t.Helper()
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	return threadCommandAppServer(t, func(connection *websocket.Conn) error {
+		if err := threadCommandHandshake(connection); err != nil {
+			return err
+		}
+		started := false
+		for requestNumber := 0; requestNumber < 5; requestNumber++ {
+			request, err := threadCommandReadObject(connection)
+			if err != nil {
+				return err
+			}
+			params, ok := request["params"].(map[string]any)
+			if !ok {
+				return fmt.Errorf("request has no parameters: %#v", request)
+			}
+			var result map[string]any
+			switch request["method"] {
+			case "thread/read":
+				result = map[string]any{"thread": threadCommandFreshMetadata("thread-1", cwd, rollout)}
+			case "turn/start":
+				if started {
+					return errors.New("initial turn was started twice")
+				}
+				if err := assertThreadCommandStartOptions(params); err != nil {
+					return err
+				}
+				if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+					return err
+				}
+				started = true
+				result = map[string]any{}
+			case "thread/resume":
+				result = map[string]any{}
+			case "thread/turns/list":
+				if !started {
+					return errors.New("initial history was read before turn/start")
+				}
+				result = map[string]any{"data": []any{map[string]any{"items": []any{map[string]any{
+					"type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "initial goal"}},
+				}}}}}
+			default:
+				return fmt.Errorf("unexpected App Server request %q", request["method"])
+			}
+			if err := threadCommandWriteObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func assertThreadCommandStartOptions(params map[string]any) error {
+	if params["threadId"] != "thread-1" {
+		return fmt.Errorf("turn/start thread = %#v", params)
+	}
+	for _, key := range []string{"model", "effort", "additionalContext"} {
+		if _, found := params[key]; found {
+			return fmt.Errorf("root turn/start unexpectedly included %s: %#v", key, params)
+		}
+	}
+	return nil
+}
+
+func threadCommandFreshMetadata(id, cwd, rollout string) map[string]any {
+	return map[string]any{
+		"id": id, "cwd": cwd, "path": rollout, "preview": "", "source": "vscode",
+		"ephemeral": false, "historyMode": "paginated", "status": map[string]any{"type": "idle"}, "turns": []any{},
+	}
+}
+
+func threadCommandHandshake(connection *websocket.Conn) error {
+	request, err := threadCommandReadObject(connection)
+	if err != nil {
+		return err
+	}
+	params, _ := request["params"].(map[string]any)
+	capabilities, _ := params["capabilities"].(map[string]any)
+	if request["method"] != "initialize" || capabilities["experimentalApi"] != true {
+		return fmt.Errorf("invalid App Server initialization: %#v", request)
+	}
+	if err := threadCommandWriteObject(connection, map[string]any{
+		"id": request["id"], "result": map[string]any{"userAgent": "codex-cli/99.0.0"},
+	}); err != nil {
+		return err
+	}
+	_, err = threadCommandReadObject(connection)
+	return err
+}
+
+func threadCommandAppServer(t *testing.T, handler func(*websocket.Conn) error) string {
+	t.Helper()
+	// AF_UNIX leaves little room for the filename, while Go's per-test
+	// directories include the full package/test path. Keep this generated path
+	// short and remove only this exact private directory at test cleanup.
+	directory, err := os.MkdirTemp("/tmp", "wpc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "app-server.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorsChannel := make(chan error, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, acceptErr := websocket.Accept(w, r, nil)
+		if acceptErr != nil {
+			errorsChannel <- acceptErr
+			return
+		}
+		go func() {
+			if handlerErr := handler(connection); handlerErr != nil {
+				errorsChannel <- handlerErr
+			}
+		}()
+	})}
+	go func() {
+		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errorsChannel <- serveErr
+		}
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		select {
+		case err := <-errorsChannel:
+			t.Errorf("fake App Server: %v", err)
+		default:
+		}
+	})
+	return socket
+}
+
+func threadCommandReadObject(connection *websocket.Conn) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, data, err := connection.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func threadCommandWriteObject(connection *websocket.Conn, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return connection.Write(ctx, websocket.MessageText, data)
+}
+
+func TestServeRequiresExplicitManagedCreationAuthorities(t *testing.T) {
+	if err := serve(nil); err == nil || !strings.Contains(err.Error(), "requires --user-state-root") {
+		t.Fatalf("serve missing authority error = %v", err)
+	}
+	root := t.TempDir()
+	err := serve([]string{
+		"--user-state-root", root, "--package-root", root,
+		"--workspace-name", "Invalid_Name", "--registration-marker", filepath.Join(root, "registration.json"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "workspace name is invalid") {
+		t.Fatalf("serve workspace name error = %v", err)
+	}
+}
+
 type runtimeContract struct {
-	TrackingMaxBytes       int                        `json:"trackingMaxBytes"`
-	MaxMessageBytes        int                        `json:"maxMessageBytes"`
-	FormEncodingExpansion  int                        `json:"formEncodingExpansion"`
-	JSONEncodingExpansion  int                        `json:"jsonEncodingExpansion"`
-	TransportEnvelopeBytes int                        `json:"transportEnvelopeBytes"`
-	LifecycleJournals      []session.LifecycleJournal `json:"lifecycleJournals"`
-	ThreadEnvironmentKeys  []string                   `json:"threadEnvironmentKeys"`
-	PortalServeFlags       []string                   `json:"portalServeFlags"`
+	AgentTeamRegistration  session.AgentTeamRegistrationContract `json:"agentTeamRegistration"`
+	TrackingMaxBytes       int                                   `json:"trackingMaxBytes"`
+	MaxMessageBytes        int                                   `json:"maxMessageBytes"`
+	FormEncodingExpansion  int                                   `json:"formEncodingExpansion"`
+	JSONEncodingExpansion  int                                   `json:"jsonEncodingExpansion"`
+	TransportEnvelopeBytes int                                   `json:"transportEnvelopeBytes"`
+	LifecycleJournals      []session.LifecycleJournal            `json:"lifecycleJournals"`
+	ThreadEnvironmentKeys  []string                              `json:"threadEnvironmentKeys"`
+	PortalServeFlags       []string                              `json:"portalServeFlags"`
 }
 
 func loadRuntimeContract(t *testing.T) runtimeContract {
@@ -48,6 +345,9 @@ func TestThreadRuntimeEnvironmentMatchesPublishedContract(t *testing.T) {
 	}
 	if contract.TrackingMaxBytes != session.TrackingMaxSize {
 		t.Fatalf("tracking size = %d, want %d", session.TrackingMaxSize, contract.TrackingMaxBytes)
+	}
+	if contract.AgentTeamRegistration.MaxPersistedScalarBytes != session.MaxAgentTeamPersistedScalarBytes {
+		t.Fatalf("agent-team persisted scalar size = %d, want %d", contract.AgentTeamRegistration.MaxPersistedScalarBytes, session.MaxAgentTeamPersistedScalarBytes)
 	}
 	actualJournals := session.LifecycleJournals()
 	if len(actualJournals) != len(contract.LifecycleJournals) {
@@ -91,6 +391,16 @@ func TestThreadRuntimeEnvironmentMatchesPublishedContract(t *testing.T) {
 	sort.Strings(expected)
 	if strings.Join(actual, "\n") != strings.Join(expected, "\n") {
 		t.Fatalf("runtime environment keys = %v, want %v", actual, expected)
+	}
+}
+
+func TestAgentTeamRegistrationContractMatchesHelperConstants(t *testing.T) {
+	contract := loadRuntimeContract(t).AgentTeamRegistration
+	if contract != session.AgentTeamRegistration() {
+		t.Fatalf("agent team registration contract = %#v, want %#v", session.AgentTeamRegistration(), contract)
+	}
+	if contract.HelperSchema != agentteams.HelperSchemaVersion || contract.Policy != agentteams.RegistrationPolicyVersion {
+		t.Fatalf("agent team helper contract = %#v, helper=%d policy=%d", contract, agentteams.HelperSchemaVersion, agentteams.RegistrationPolicyVersion)
 	}
 }
 

@@ -32,6 +32,17 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_public_rollback_refuses_the_selected_forward_generation
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(1, host.send(:profile_generation))
+      assert_includes(host.instance_variable_get(:@err).string, 'forward-only')
+    end
+  end
+
   def test_switch_refuses_unfinished_session_lifecycle_operations
     DevWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
       kind = journal.fetch('name')
@@ -60,8 +71,41 @@ class WorkspaceHostTest < Minitest::Test
         JSON.generate(
           'schema' => 1,
           'slug' => '2026-09-07-pending',
+          'goal_sha256' => 'b' * 64,
+          'run_codex' => true,
           'state' => 'creating',
           'tmux_identity' => 'a' * 64
+        ) + "\n"
+      )
+      File.chmod(0o600, journal)
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, '(creation)')
+    end
+  end
+
+  def test_switch_refuses_an_unfinished_managed_session_creation
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-managed.creation.json')
+      binding_digest = 'c' * 64
+      File.write(
+        journal,
+        JSON.generate(
+          'schema' => 2,
+          'slug' => '2026-09-07-managed',
+          'goal_sha256' => 'b' * 64,
+          'run_codex' => true,
+          'state' => 'creating',
+          'tmux_identity' => 'a' * 64,
+          'model' => 'gpt-6-astra',
+          'effort' => 'xhigh',
+          'agent_team_binding' => "v1.fixture.#{binding_digest}",
+          'agent_team_binding_digest' => binding_digest
         ) + "\n"
       )
       File.chmod(0o600, journal)
@@ -84,6 +128,8 @@ class WorkspaceHostTest < Minitest::Test
         JSON.generate(
           'schema' => 1,
           'slug' => '2026-09-07-ready',
+          'goal_sha256' => 'b' * 64,
+          'run_codex' => true,
           'state' => 'ready'
         ) + "\n"
       )
@@ -94,7 +140,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_switch_allows_a_legacy_journal_only_creation_for_safe_retry
+  def test_switch_fails_closed_on_a_creating_journal_without_a_tmux_identity
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
@@ -106,13 +152,16 @@ class WorkspaceHostTest < Minitest::Test
         JSON.generate(
           'schema' => 1,
           'slug' => '2026-09-07-legacy',
+          'goal_sha256' => 'b' * 64,
+          'run_codex' => true,
           'state' => 'creating'
         ) + "\n"
       )
       File.chmod(0o600, journal)
 
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      assert_equal(1, host.send(:profile_generation))
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, 'creation journal has an invalid shape')
     end
   end
 
@@ -158,8 +207,39 @@ class WorkspaceHostTest < Minitest::Test
       refute(File.exist?(host.instance_variable_get(:@profile)))
       assert_includes(
         host.instance_variable_get(:@err).string,
-        'cannot inspect session operation state'
+        'invalid creation journal'
       )
+    end
+  end
+
+  def test_switch_refuses_a_reserved_agent_team_migration_journal
+    with_transition_host do |host, paths|
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      File.write(
+        File.join(locks, '2026-09-22-pending.agent-teams-migration.json'),
+        "reserved for the forward migration\n"
+      )
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_includes(host.instance_variable_get(:@err).string, '(agent-teams migration)')
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+    end
+  end
+
+  def test_switch_quiesces_before_changing_the_profile_generation
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      probe = host.events.index { |event| event.first == :registration_probed }
+      quiesce = host.events.index([:sessions_quiesced])
+      profile_set = host.events.index { |event| event.first == :profile_set }
+      refute_nil(probe)
+      refute_nil(quiesce)
+      refute_nil(profile_set)
+      assert_operator(probe, :<, quiesce)
+      assert_operator(quiesce, :<, profile_set)
     end
   end
 
@@ -185,74 +265,6 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_rollback_refuses_a_cluster_contract_with_the_old_tracking_limit
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.candidate = make_package(paths.fetch(:root), 'package-two')
-      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      old_contract = File.join(
-        host.send(:profile_generation_path, 1),
-        'share/workspace-portal/runtime-contract.json'
-      )
-      File.write(old_contract, JSON.generate(
-        'developmentClusterStateSchema' => 1,
-        'developmentClusterTransitionPolicy' =>
-          DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
-            'developmentClusterTransitionPolicy'
-          ),
-        'trackingMaxBytes' => 1024 * 1024
-      ))
-      workspace = host.send(:registry).entries.fetch(0).fetch('root')
-      FileUtils.mkdir_p(File.join(
-        workspace, '.dev-clusters', 'beta', 'clusters',
-        '2026-09-07-active-cluster'
-      ))
-
-      assert_equal(1, host.run('workspace-host', ['rollback']))
-      assert_equal(2, host.send(:profile_generation))
-      assert_includes(
-        host.instance_variable_get(:@err).string,
-        'target package has no compatible cluster-state contract'
-      )
-    end
-  end
-
-  def test_rollback_refuses_a_package_without_the_identity_authority_contract
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.candidate = make_package(paths.fetch(:root), 'package-two')
-      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      old_contract = File.join(
-        host.send(:profile_generation_path, 1),
-        'share/workspace-portal/runtime-contract.json'
-      )
-      contract = JSON.parse(File.read(old_contract))
-      contract.delete('runtimeAuthorityIdentityPolicy')
-      File.write(old_contract, JSON.generate(contract))
-      runtime = host.send(:instance_runtime, host.send(:registry).entries.fetch(0))
-      FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
-      File.write(
-        File.join(runtime.fetch(:authority), '2026-09-07-active.json'),
-        JSON.generate('tmux_identity' => 'a' * 64),
-        mode: 'w'
-      )
-      File.chmod(0o600, File.join(runtime.fetch(:authority), '2026-09-07-active.json'))
-
-      assert_equal(1, host.run('workspace-host', ['rollback']))
-      assert_equal(2, host.send(:profile_generation))
-      assert_includes(
-        host.instance_variable_get(:@err).string,
-        'target package cannot validate their tmux identities'
-      )
-    end
-  end
-
   def test_switch_accepts_a_stricter_cluster_transition_policy
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -273,42 +285,6 @@ class WorkspaceHostTest < Minitest::Test
 
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       assert_equal(1, host.send(:profile_generation))
-    end
-  end
-
-  def test_rollback_refuses_the_permissive_cluster_transition_policy
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.candidate = make_package(paths.fetch(:root), 'package-two')
-      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      old_contract = File.join(
-        host.send(:profile_generation_path, 1),
-        'share/workspace-portal/runtime-contract.json'
-      )
-      File.write(old_contract, JSON.generate(
-        'developmentClusterStateSchema' =>
-          DevWorkspaceHost::RUNTIME_CONTRACT.fetch('developmentClusterStateSchema'),
-        'developmentClusterTransitionPolicy' => 1,
-        'trackingMaxBytes' =>
-          DevWorkspaceHost::RUNTIME_CONTRACT.fetch('trackingMaxBytes')
-      ))
-      workspace = host.send(:registry).entries.fetch(0).fetch('root')
-      cluster = File.join(
-        workspace, '.dev-clusters', 'alpha', 'clusters',
-        '2026-09-07-active-cluster'
-      )
-      FileUtils.mkdir_p(cluster)
-      File.write(File.join(cluster, 'socket-dir'), "/tmp/workspace-scoped-socket\n")
-
-      assert_equal(1, host.run('workspace-host', ['rollback']))
-      assert_equal(2, host.send(:profile_generation))
-      assert_includes(
-        host.instance_variable_get(:@err).string,
-        'target package has no compatible cluster-state contract'
-      )
     end
   end
 
@@ -428,64 +404,16 @@ class WorkspaceHostTest < Minitest::Test
     with_transition_host(busy: ['example-workspace/active']) do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
 
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       assert_equal(File.realpath(paths.fetch(:old_codex)), File.realpath(host.send(:active_codex)))
-      assert(host.send(:pending_codex_update?, File.realpath(paths.fetch(:system_codex))))
+      assert_equal(File.realpath(host.candidate), host.send(:pending_codex_update).fetch('package_root'))
       refute_includes(host.events, [:consumers_restarted])
 
       host.busy = []
-      assert_equal(0, host.run('workspace-host', ['reconcile-codex', '--pending-only']))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       assert_equal(File.realpath(paths.fetch(:system_codex)), File.realpath(host.send(:active_codex)))
-      refute(host.send(:pending_codex_update?))
+      assert_nil(host.send(:pending_codex_update))
       assert_includes(host.events, [:consumers_restarted])
-
-      checks = host.events.count { |event| event.first == :codex_checked }
-      assert_equal(0, host.run('workspace-host', ['reconcile-codex', '--pending-only']))
-      assert_equal(checks, host.events.count { |event| event.first == :codex_checked })
-    end
-  end
-
-  def test_rollback_selects_the_retained_codex_for_the_previous_profile_generation
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      second_package = make_package(paths.fetch(:root), 'package-two')
-      second_codex = make_codex(paths.fetch(:root), 'codex-two')
-      host.candidate = second_package
-      host.instance_variable_set(:@system_codex, second_codex)
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      assert_equal(2, host.send(:profile_generation))
-
-      assert_equal(0, host.run('workspace-host', ['rollback']))
-      assert_equal(1, host.send(:profile_generation))
-      assert_equal(File.realpath(paths.fetch(:system_codex)), File.realpath(host.send(:active_codex)))
-      assert_includes(host.events, [:router_restarted])
-      assert_includes(host.events, [:consumers_restarted])
-      assert_includes(
-        host.events,
-        [:sessions_restored, File.realpath(host.send(:profile_generation_path, 1))]
-      )
-    end
-  end
-
-  def test_rollback_keeps_the_selected_generation_when_terminal_restoration_fails
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      second_package = make_package(paths.fetch(:root), 'package-two')
-      host.candidate = second_package
-      host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.fail_restore = true
-
-      assert_equal(1, host.run('workspace-host', ['rollback']))
-      assert_equal(1, host.send(:profile_generation))
-      assert_includes(
-        host.instance_variable_get(:@err).string,
-        'workspace package rollback completed, but terminal clients need dev-session sync'
-      )
     end
   end
 
@@ -576,59 +504,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_rollback_refuses_unfinished_session_lifecycle_operations
-    DevWorkspaceHost::LIFECYCLE_JOURNALS.each do |journal|
-      kind = journal.fetch('name')
-      with_transition_host do |host, paths|
-        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-        host.candidate = make_package(paths.fetch(:root), 'package-two')
-        host.instance_variable_set(:@system_codex, make_codex(paths.fetch(:root), 'codex-two'))
-        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-        workspace = host.send(:registry).entries.fetch(0).fetch('root')
-        locks = File.join(workspace, 'worktrees', '.locks')
-        FileUtils.mkdir_p(locks)
-        File.write(File.join(locks, "2026-09-07-pending.#{kind}.json"), "{}\n")
-
-        assert_equal(1, host.run('workspace-host', ['rollback']))
-        assert_equal(2, host.send(:profile_generation))
-      end
-    end
-  end
-
-  def test_rollback_refuses_canonical_and_legacy_development_cluster_state
-    [
-      ['beta', '2026-09-07-canonical-cluster'],
-      ['alpha', '2026-08-18-alpha-password-reset']
-    ].each do |kind, slug|
-      with_transition_host do |host, paths|
-        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-        File.unlink(
-          File.join(
-            host.send(:profile_generation_path, 1),
-            'share/workspace-portal/runtime-contract.json'
-          )
-        )
-        host.candidate = make_package(paths.fetch(:root), 'package-two')
-        host.instance_variable_set(
-          :@system_codex,
-          make_codex(paths.fetch(:root), 'codex-two')
-        )
-        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-        workspace = host.send(:registry).entries.fetch(0).fetch('root')
-        FileUtils.mkdir_p(File.join(workspace, '.dev-clusters', kind, 'clusters', slug))
-
-        assert_equal(1, host.run('workspace-host', ['rollback']))
-        assert_equal(2, host.send(:profile_generation))
-        error_output = host.instance_variable_get(:@err).string
-        assert_includes(error_output, "example-workspace/#{kind}/#{slug}")
-        assert_includes(error_output, 'reset these clusters first')
-      end
-    end
-  end
-
-  def test_failed_switch_restores_the_previous_profile_and_codex_pair
+  def test_failed_switch_keeps_the_selected_forward_generation_and_pending_evidence
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
@@ -638,14 +514,14 @@ class WorkspaceHostTest < Minitest::Test
       host.fail_activation = true
       assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
 
-      assert_equal(1, host.send(:profile_generation))
+      assert_equal(2, host.send(:profile_generation))
       assert_equal(first_codex, File.realpath(host.send(:active_codex)))
-      assert_includes(host.events, [:profile_selected, 1])
-      assert_includes(host.events, [:consumers_restarted])
+      refute_includes(host.events, [:profile_selected, 1])
+      refute_nil(host.send(:pending_codex_update))
     end
   end
 
-  def test_failed_link_install_restores_the_previous_profile_and_codex_pair
+  def test_failed_link_install_keeps_the_selected_forward_generation_and_pending_evidence
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
@@ -655,35 +531,45 @@ class WorkspaceHostTest < Minitest::Test
       host.fail_links = true
       assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
 
-      assert_equal(1, host.send(:profile_generation))
+      assert_equal(2, host.send(:profile_generation))
       assert_equal(first_codex, File.realpath(host.send(:active_codex)))
-      assert_includes(host.events, [:profile_selected, 1])
-      assert_includes(host.events, [:consumers_restarted])
+      refute_includes(host.events, [:profile_selected, 1])
+      refute_nil(host.send(:pending_codex_update))
     end
   end
 
-  def test_failed_switch_generation_is_not_eligible_for_later_rollback
+  def test_forward_retry_preserves_pending_evidence_when_the_candidate_was_already_selected
     with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-
-      host.candidate = make_package(paths.fetch(:root), 'failed-package')
       host.fail_activation = true
       assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      refute(File.exist?(host.send(:profile_generation_path, 2)))
-      assert_nil(host.send(:generation_codex, 2))
-
-      host.candidate = make_package(paths.fetch(:root), 'working-package')
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      assert_equal(2, host.send(:profile_generation))
-
-      assert_equal(0, host.run('workspace-host', ['rollback']))
       assert_equal(1, host.send(:profile_generation))
-      assert_equal(File.realpath(paths.fetch(:system_codex)), File.realpath(host.send(:active_codex)))
+      first_pending = host.send(:pending_codex_update)
+      refute_nil(first_pending)
+      restored = host.events.count { |event| event.first == :sessions_restored }
+
+      host.fail_links = true
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      assert_equal(1, host.send(:profile_generation))
+      assert_equal(first_pending.fetch('package_root'), host.send(:pending_codex_update).fetch('package_root'))
+      assert_equal(restored, host.events.count { |event| event.first == :sessions_restored })
     end
   end
 
-  def test_failed_codex_adoption_restores_the_previous_pair
+  def test_post_commit_profile_selection_failure_preserves_the_forward_candidate_and_pending_evidence
+    with_transition_host do |host, paths|
+      host.fail_set_after_profile = true
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+
+      assert_equal(1, host.send(:profile_generation))
+      assert_equal(File.realpath(host.candidate), File.realpath(host.instance_variable_get(:@profile)))
+      refute_nil(host.send(:pending_codex_update))
+      refute(host.events.any? { |event| event.first == :sessions_restored })
+    end
+  end
+
+  def test_failed_codex_adoption_keeps_the_forward_target_and_pending_evidence
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
@@ -691,38 +577,14 @@ class WorkspaceHostTest < Minitest::Test
       replacement = make_codex(paths.fetch(:root), 'codex-replacement')
       host.instance_variable_set(:@system_codex, replacement)
       host.fail_restart = true
+      restarts_before = host.events.count { |event| event == [:consumers_restarted] }
 
       assert_equal(1, host.run('workspace-host', ['reconcile-codex']))
 
-      assert_equal(previous, File.realpath(host.send(:active_codex)))
-      assert_equal(previous, File.realpath(host.send(:generation_codex, 1)))
-      assert_operator(host.events.count { |event| event == [:consumers_restarted] }, :>=, 2)
-    end
-  end
-
-  def test_failed_rollback_restores_the_original_generation_pair
-    with_transition_host do |host, paths|
-      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.candidate = make_package(paths.fetch(:root), 'package-two')
-      second_codex = make_codex(paths.fetch(:root), 'codex-two')
-      host.instance_variable_set(:@system_codex, second_codex)
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
-      host.fail_restart = true
-      host.fail_restore = true
-
-      assert_equal(1, host.run('workspace-host', ['rollback']))
-
-      assert_equal(2, host.send(:profile_generation))
-      assert_equal(File.realpath(second_codex), File.realpath(host.send(:active_codex)))
-      assert_includes(host.events, [:profile_selected, 2])
-      assert_includes(
-        host.events,
-        [:sessions_restored, File.realpath(host.send(:profile_generation_path, 2))]
-      )
-      error_output = host.instance_variable_get(:@err).string
-      assert_includes(error_output, 'injected consumer restart failure')
-      assert_includes(error_output, 'injected restoration failure')
+      assert_equal(File.realpath(replacement), File.realpath(host.send(:active_codex)))
+      refute_equal(previous, File.realpath(host.send(:active_codex)))
+      refute_nil(host.send(:pending_codex_update))
+      assert_equal(restarts_before + 1, host.events.count { |event| event == [:consumers_restarted] })
     end
   end
 

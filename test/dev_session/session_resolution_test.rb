@@ -292,6 +292,10 @@ class DevSessionTest < Minitest::Test
         contract.fetch('trackingMaxBytes')
       )
       assert_equal(
+        DevSession::AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES,
+        contract.fetch('agentTeamRegistration').fetch('maxPersistedScalarBytes')
+      )
+      assert_equal(
         DevSession::LIFECYCLE_JOURNALS,
         contract.fetch('lifecycleJournals')
       )

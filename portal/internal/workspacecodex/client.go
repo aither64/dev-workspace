@@ -10,15 +10,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 )
 
-const (
-	DefaultNewThreadModel           = "gpt-6-astra"
-	DefaultNewThreadReasoningEffort = "xhigh"
-	threadSourceKind                = "vscode"
-)
-
-var defaultThreadSettings = codex.ThreadSettings{
-	Model: DefaultNewThreadModel, ReasoningEffort: DefaultNewThreadReasoningEffort,
-}
+const threadSourceKind = "vscode"
 
 // Client keeps development-workspace recovery and retirement policy above the
 // reusable App Server client.
@@ -40,7 +32,40 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 func ResolveNewThreadSettings(
 	models []codex.Model, requested codex.ThreadSettings,
 ) (codex.ThreadSettings, error) {
-	return codex.ResolveNewThreadSettings(models, requested, defaultThreadSettings)
+	if requested.Model == "" {
+		// The App Server resolves any omitted model and effort from its live
+		// configuration. An effort-only request is also server-owned because this
+		// layer does not know which configured default model will receive it.
+		return requested, nil
+	}
+
+	var selected *codex.Model
+	for index := range models {
+		candidate := &models[index]
+		if candidate.Model != requested.Model {
+			continue
+		}
+		if selected != nil {
+			return codex.ThreadSettings{}, fmt.Errorf(
+				"Codex model catalog has more than one %q model", requested.Model,
+			)
+		}
+		selected = candidate
+	}
+	if selected == nil {
+		return codex.ThreadSettings{}, fmt.Errorf("Codex model %q is not available", requested.Model)
+	}
+	if requested.ReasoningEffort == "" {
+		return requested, nil
+	}
+	for _, effort := range selected.SupportedReasoningEfforts {
+		if effort.ReasoningEffort == requested.ReasoningEffort {
+			return requested, nil
+		}
+	}
+	return codex.ThreadSettings{}, fmt.Errorf(
+		"reasoning effort %q is not available for %s", requested.ReasoningEffort, selected.DisplayName,
+	)
 }
 
 func (c *Client) RecoverCreatingThread(

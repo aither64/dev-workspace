@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/session"
-	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"golang.org/x/sys/unix"
 )
 
@@ -40,9 +41,9 @@ func (client *creationTestCodex) ListModels(ctx context.Context) ([]codex.Model,
 		}
 	}
 	models, _ := client.browserContractCodex.ListModels(ctx)
-	return append(models, codex.Model{Model: workspacecodex.DefaultNewThreadModel, IsDefault: true,
-		DefaultReasoningEffort:    workspacecodex.DefaultNewThreadReasoningEffort,
-		SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: workspacecodex.DefaultNewThreadReasoningEffort}}}), nil
+	return append(models, codex.Model{Model: "native-default", DisplayName: "Native Default", IsDefault: true,
+		DefaultReasoningEffort:    "medium",
+		SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: "medium"}}}), nil
 }
 func awaitCreation(t *testing.T, server *Server, slug string) creationReceipt {
 	t.Helper()
@@ -118,6 +119,300 @@ func writeCreationProof(t *testing.T, server *Server, receipt creationReceipt) {
 	}
 }
 
+func legacyVirtualBinding() (string, string) {
+	digest := strings.Repeat("a", 64)
+	return "v1.e30." + digest, digest
+}
+
+func TestCompletedCreationJournalRecognizesStrictManagedReadyState(t *testing.T) {
+	t.Helper()
+	token, digest := legacyVirtualBinding()
+	journal := map[string]any{
+		"schema": 2, "slug": "2026-09-22-managed", "goal_sha256": strings.Repeat("c", 64),
+		"run_codex": true, "state": "ready", "model": "model-lead", "effort": "high",
+		"agent_team_binding": token, "agent_team_binding_digest": digest,
+	}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := completedCreationJournal(raw, "2026-09-22-managed")
+	if err != nil || !ready {
+		t.Fatalf("managed ready journal = %v, %v", ready, err)
+	}
+	raw["tmux_identity"] = json.RawMessage(`"` + strings.Repeat("d", 64) + `"`)
+	if _, err := completedCreationJournal(raw, "2026-09-22-managed"); err == nil {
+		t.Fatal("managed ready journal retained a creating-only field")
+	}
+}
+
+func TestCreationProofRejectsBothReceiptSchemaMismatches(t *testing.T) {
+	for _, schemas := range [][2]int{{1, 2}, {2, 1}} {
+		t.Run(fmt.Sprintf("receipt_%d_proof_%d", schemas[0], schemas[1]), func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			receipt := creationReceipt{
+				Schema: schemas[0], Workspace: server.config.Workspace,
+				Request:   creationRequest{Kind: "new", Slug: "2026-09-22-schema-proof", Goal: "Initial request"},
+				ReceiptID: strings.Repeat("a", 64), DeletionHistorySHA256: strings.Repeat("b", 64),
+				Validated: true, Model: "model-1", Effort: "high",
+			}
+			if err := os.MkdirAll(server.creationDirectory(), 0700); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(creationEvidence{Schema: schemas[1]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(server.creationEvidencePath(receipt), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.proveCreation(receipt); err == nil {
+				t.Fatalf("receipt schema %d accepted proof schema %d", schemas[0], schemas[1])
+			}
+		})
+	}
+}
+
+func TestDirectCreationProofAcceptsSchemaThreeJournalAndRoster(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	slug := "2026-09-22-direct-proof"
+	preset := teamruntime.Preset{ID: "delegated", Name: "Full team", Description: "A lead and reviewer thread",
+		CatalogDigest: strings.Repeat("a", 64), TeamDigest: strings.Repeat("b", 64),
+		LeadModel: "model-1", LeadEffort: "high", Roles: []string{"lead", "reviewer0"},
+		Members: []teamruntime.MemberSpec{{Role: "reviewer", Address: "reviewer0", Model: "model-1", Effort: "high", Behavior: "reviewer", Access: "read_only"}}}
+	receipt := creationReceipt{Schema: 3, Workspace: server.config.Workspace,
+		Request:   creationRequest{Kind: "new", Slug: slug, Goal: "Initial request", Team: preset.ID, CatalogDigest: preset.CatalogDigest},
+		ReceiptID: strings.Repeat("c", 64), DeletionHistorySHA256: strings.Repeat("d", 64),
+		Validated: true, Goal: "Initial request", Model: preset.LeadModel, Effort: preset.LeadEffort, DirectTeam: &preset}
+	if err := os.MkdirAll(server.creationDirectory(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeCreationProof(t, server, receipt)
+	journal := map[string]any{"schema": 3, "slug": slug, "goal_sha256": planDigest(receipt.Goal),
+		"run_codex": true, "state": "ready", "model": receipt.Model, "effort": receipt.Effort, "direct_team": preset}
+	journalData, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(server.config.Workspace, "worktrees", ".locks", slug+".creation.json")
+	if err := os.MkdirAll(filepath.Dir(journalPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(journalPath, journalData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), slug, "created-thread", true, func(roster *teamruntime.Roster) error {
+		roster.PresetID, roster.CatalogDigest, roster.TeamDigest = preset.ID, preset.CatalogDigest, preset.TeamDigest
+		roster.LeadModel, roster.LeadEffort = preset.LeadModel, preset.LeadEffort
+		roster.Members = []teamruntime.Member{{Address: "reviewer0", Role: "reviewer", Index: 0, Thread: "reviewer-thread",
+			Model: "model-1", Effort: "high", Behavior: "reviewer", Access: "read_only", State: "ready", AddedAt: time.Now().UTC()}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var proof creationEvidence
+	if err := readCreationJSON(server.creationEvidencePath(receipt), &proof); err != nil {
+		t.Fatal(err)
+	}
+	proof.Schema, proof.CatalogDigest, proof.TeamDigest, proof.Team = 3, preset.CatalogDigest, preset.TeamDigest, preset.ID
+	proofData, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.creationEvidencePath(receipt), proofData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.proveCreation(receipt); err != nil {
+		t.Fatalf("schema-three browser proof: %v", err)
+	}
+	roster, err := store.Load(slug, "created-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster.Members[0].Access = "workspace_write"
+	if err := rosterMatchesDirectTeam(*roster, preset); err == nil {
+		t.Fatal("creation proof accepted a changed member access policy")
+	}
+}
+
+func TestTeamMutationsWaitForCreationProof(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	slug := "2026-09-22-pending-team"
+	server.creations[slug] = creationReceipt{Schema: 3, Workspace: server.config.Workspace,
+		Request: creationRequest{Kind: "new", Slug: slug}, ReceiptID: strings.Repeat("a", 64),
+		DeletionHistorySHA256: planDigest(""), State: "paused"}
+	summary := &session.Summary{Manifest: session.Manifest{Slug: slug, Codex: session.Codex{ThreadID: "created-thread"}}, Interactive: true}
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		request := httptest.NewRequest(method, "/api/sessions/"+slug+"/team", strings.NewReader(`{"action":"remove","address":"reviewer0"}`))
+		response := httptest.NewRecorder()
+		server.teamAPI(response, request, summary)
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "initialization has not finished") {
+			t.Fatalf("%s pending team mutation = %d %s", method, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestCreationSettingValueMatchesManagedScalarBound(t *testing.T) {
+	if err := validateCreationSettingValue(strings.Repeat("m", session.MaxAgentTeamPersistedScalarBytes)); err != nil {
+		t.Fatalf("%d-byte model setting rejected: %v", session.MaxAgentTeamPersistedScalarBytes, err)
+	}
+	if err := validateCreationSettingValue(strings.Repeat("m", session.MaxAgentTeamPersistedScalarBytes+1)); err == nil {
+		t.Fatalf("%d-byte model setting was accepted", session.MaxAgentTeamPersistedScalarBytes+1)
+	}
+}
+
+func managedCreationReceiptForRestart(t *testing.T, server *Server, kind string) creationReceipt {
+	t.Helper()
+	token, digest := legacyVirtualBinding()
+	request := creationRequest{Kind: kind, Slug: "2026-09-22-managed", Team: "solo", CatalogDigest: strings.Repeat("a", 64)}
+	if kind == "new" {
+		request.Goal = "Create the managed session."
+	} else {
+		request.Source = "source"
+		request.SourceThreadID = "source-thread"
+		request.SourceIdentity = strings.Repeat("c", 64)
+		request.PlanTurnID = "plan-turn"
+		request.PlanSHA256 = strings.Repeat("d", 64)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return creationReceipt{
+		Schema: 2, Workspace: server.config.Workspace, Request: request, ReceiptID: strings.Repeat("e", 64),
+		DeletionHistorySHA256: strings.Repeat("f", 64), Attempt: 1, State: "ready", Phase: "Session is ready.",
+		StartedAt: now, UpdatedAt: now, Validated: true, Model: "model-lead", Effort: "high",
+		AgentTeamBinding: token, AgentTeamBindingDigest: digest,
+	}
+}
+
+func TestPendingLegacyVirtualCreationFailsClosed(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	receipt := managedCreationReceiptForRestart(t, server, "new")
+	receipt.State = "paused"
+	if err := server.initializeCreation(&receipt); err == nil || !strings.Contains(err.Error(), "virtual team creation cannot resume") {
+		t.Fatalf("pending virtual creation resumed after cutover: %v", err)
+	}
+}
+
+func TestLoadCreationsRejectsMalformedManagedRequestRecords(t *testing.T) {
+	writeReceipt := func(t *testing.T, server *Server, receipt creationReceipt, mutate func(map[string]any)) {
+		t.Helper()
+		data, err := json.Marshal(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		mutate(raw)
+		data, err = json.Marshal(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(server.creationDirectory(), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(server.creationPath("2026-09-22-managed"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(raw map[string]any) map[string]any {
+		return raw["request"].(map[string]any)
+	}
+
+	for _, test := range []struct {
+		name   string
+		kind   string
+		valid  bool
+		mutate func(map[string]any)
+	}{
+		{name: "new accepts exact fields", kind: "new", valid: true, mutate: func(map[string]any) {}},
+		{name: "plan accepts exact fields", kind: "plan", valid: true, mutate: func(map[string]any) {}},
+		{name: "pre-effect plan cancellation survives restart", kind: "plan", valid: true, mutate: func(raw map[string]any) {
+			raw["state"] = "cancelled"
+			raw["validated"] = false
+		}},
+		{name: "cancellation rejects an already validated plan", kind: "plan", mutate: func(raw map[string]any) { raw["state"] = "cancelled" }},
+		{name: "new rejects source field", kind: "new", mutate: func(raw map[string]any) { request(raw)["source"] = "source" }},
+		{name: "new rejects missing goal", kind: "new", mutate: func(raw map[string]any) { delete(request(raw), "goal") }},
+		{name: "plan rejects goal", kind: "plan", mutate: func(raw map[string]any) { request(raw)["goal"] = "not a plan field" }},
+		{name: "plan rejects missing source identity", kind: "plan", mutate: func(raw map[string]any) { delete(request(raw), "sourceIdentity") }},
+		{name: "plan rejects control turn identity", kind: "plan", mutate: func(raw map[string]any) { request(raw)["planTurnId"] = "turn\nnext" }},
+		{name: "rejects null optional override", kind: "new", mutate: func(raw map[string]any) { request(raw)["model"] = nil }},
+		{name: "accepts effort without model", kind: "new", valid: true, mutate: func(raw map[string]any) { request(raw)["effort"] = "high" }},
+		{name: "rejects invalid team identifier", kind: "new", mutate: func(raw map[string]any) { request(raw)["team"] = "not-a-team" }},
+		{name: "rejects invalid catalog digest", kind: "new", mutate: func(raw map[string]any) { request(raw)["catalogDigest"] = "not-a-digest" }},
+		{name: "rejects oversized new goal", kind: "new", mutate: func(raw map[string]any) { request(raw)["goal"] = strings.Repeat("x", session.MaxMessageBytes+1) }},
+		{name: "rejects unsupported receipt schema", kind: "new", mutate: func(raw map[string]any) { raw["schema"] = 3 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			writeReceipt(t, server, managedCreationReceiptForRestart(t, server, test.kind), test.mutate)
+			err := server.loadCreations()
+			if test.valid {
+				if err != nil {
+					t.Fatalf("load exact managed %s receipt: %v", test.kind, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("malformed managed receipt loaded across restart")
+			}
+		})
+	}
+}
+
+// The browser must not accept a stale rendered direct-team catalog and then
+// leave a durable receipt whose immutable roster differs from what was shown.
+func TestBrowserCreationRejectsStaleDirectTeamFieldsBeforeReceipt(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.Codex = &browserContractCodex{}
+	server.installedTeams = &agentteams.Installed{
+		Managed: true,
+		Catalog: &agentteams.Catalog{
+			CatalogDigest: strings.Repeat("a", 64),
+			Teams: map[string]agentteams.Team{"solo": {
+				Description: "A single lead thread",
+				TeamDigest:  strings.Repeat("c", 64),
+				Roles: map[string]agentteams.Role{
+					"team_lead": {Model: "model-1", Effort: "high"},
+				},
+			}},
+		},
+	}
+
+	newResponse := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=stale-team&goal=Initial+request&team=solo&catalogDigest="+strings.Repeat("b", 64), "application/x-www-form-urlencoded")
+	if newResponse.Code != http.StatusConflict || !strings.Contains(newResponse.Body.String(), "catalog digest is stale") {
+		t.Fatalf("stale direct team new response: %d %s", newResponse.Code, newResponse.Body.String())
+	}
+	if _, ok := server.currentCreation("2026-09-12-stale-team"); ok {
+		t.Fatal("stale direct team new request persisted a receipt")
+	}
+
+	prepareInteractiveConversation(t, server, "source")
+	plan := "Approved plan"
+	planResponse := postCreation(t, server, "/api/sessions/source/implement-plan", fmt.Sprintf(`{"action":"new","name":"stale-plan","creationDate":"2026-09-12","planTurnId":"approved","planText":%q,"planSha256":%q,"team":"solo","catalogDigest":%q}`, plan, planDigest(plan), strings.Repeat("b", 64)), "application/json")
+	if planResponse.Code != http.StatusConflict || !strings.Contains(planResponse.Body.String(), "catalog digest is stale") {
+		t.Fatalf("stale direct team plan response: %d %s", planResponse.Code, planResponse.Body.String())
+	}
+	if _, ok := server.currentCreation("2026-09-12-stale-plan"); ok {
+		t.Fatal("stale direct team plan request persisted a receipt")
+	}
+}
+
 func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
@@ -127,7 +422,7 @@ func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing
 	defer close(release)
 	accepted := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		accepted <- postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&goal=Initial+request", "application/x-www-form-urlencoded")
+		accepted <- postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&model=model-1&effort=high&goal=Initial+request", "application/x-www-form-urlencoded")
 	}()
 	// Validation stays blocked until cleanup, so the response proves it is asynchronous.
 	select {
@@ -161,7 +456,7 @@ func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing
 	if stored.Request.Goal != "Initial request" {
 		t.Fatalf("lost captured goal: %#v", stored)
 	}
-	duplicate := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&goal=Initial+request", "application/x-www-form-urlencoded")
+	duplicate := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&model=model-1&effort=high&goal=Initial+request", "application/x-www-form-urlencoded")
 	if duplicate.Code != http.StatusSeeOther {
 		t.Fatal(duplicate.Body.String())
 	}
@@ -169,7 +464,7 @@ func TestCreationNavigationPrecedesSlowValidationAndManifestDiscovery(t *testing
 	if receipt.ReceiptID != stored.ReceiptID || receipt.Attempt != 1 {
 		t.Fatal("duplicate started a new receipt or attempt")
 	}
-	conflicting := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&goal=Different+request", "application/x-www-form-urlencoded")
+	conflicting := postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=latency&model=model-1&effort=high&goal=Different+request", "application/x-www-form-urlencoded")
 	if conflicting.Code != http.StatusConflict {
 		t.Fatalf("conflicting duplicate = %d", conflicting.Code)
 	}
@@ -258,7 +553,7 @@ func TestCreationInterruptedReceiptPausesAndRequiresExactRetryAttempt(t *testing
 	entered := make(chan struct{}, 1)
 	never := make(chan struct{})
 	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}, entered: entered, release: never}
-	postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=interrupted&goal=Request", "application/x-www-form-urlencoded")
+	postCreation(t, server, "/sessions", "creation_date=2026-09-12&name=interrupted&model=model-1&effort=high&goal=Request", "application/x-www-form-urlencoded")
 	<-entered
 	server.Close()
 	receipt, _ := server.currentCreation("2026-09-12-interrupted")
@@ -307,6 +602,27 @@ func TestCreationRecoveryRequiresReceiptBoundCompletionAndExactSession(t *testin
 	if err := server.proveCreation(wrong); err == nil {
 		t.Fatal("accepted another receipt's completion")
 	}
+	proofPath := server.creationEvidencePath(receipt)
+	proofData, err := os.ReadFile(proofPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proof map[string]any
+	if err := json.Unmarshal(proofData, &proof); err != nil {
+		t.Fatal(err)
+	}
+	proof["schema"] = 2
+	mismatchedSchema, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(proofPath, mismatchedSchema, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.proveCreation(receipt); err == nil {
+		t.Fatal("schema-1 receipt accepted schema-2 completion evidence")
+	}
+	writeCreationProof(t, server, receipt)
 	if err := os.Remove(server.creationEvidencePath(receipt)); err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +971,7 @@ func TestCreationFinalPersistenceFailureKeepsExplicitRetryAvailable(t *testing.T
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}, entered: entered, release: release}
-	receipt, err := server.acceptCreation(creationRequest{Kind: "new", Slug: "2026-09-12-save-failed", Goal: "Request"})
+	receipt, err := server.acceptCreation(creationRequest{Kind: "new", Slug: "2026-09-12-save-failed", Goal: "Request", Model: "model-1", Effort: "high"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +1064,7 @@ func TestCreationHeadBaseHeadBeforeCLIBindingPreservesCanonicalSession(t *testin
 	entered := make(chan struct{}, 1)
 	never := make(chan struct{})
 	server.config.Codex = &creationTestCodex{browserContractCodex: &browserContractCodex{}, entered: entered, release: never}
-	accepted, err := server.acceptCreation(creationRequest{Kind: "new", Slug: "2026-09-12-rollback", Goal: "Original accepted request"})
+	accepted, err := server.acceptCreation(creationRequest{Kind: "new", Slug: "2026-09-12-rollback", Goal: "Original accepted request", Model: "model-1", Effort: "high"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1226,7 +1542,10 @@ func TestCreationConflictRetentionIsBoundedAndDoesNotEvictPendingBindings(t *tes
 	if err := os.Remove(filepath.Join(directory, protected.Request.Slug+".fork.json")); err != nil {
 		t.Fatal(err)
 	}
-	journal := fmt.Sprintf(`{"schema":1,"slug":%q,"state":"creating"}`, protected.Request.Slug)
+	journal := fmt.Sprintf(
+		`{"schema":1,"slug":%q,"goal_sha256":null,"run_codex":true,"state":"creating","tmux_identity":%q}`,
+		protected.Request.Slug, strings.Repeat("a", 64),
+	)
 	if err := os.WriteFile(filepath.Join(directory, protected.Request.Slug+".creation.json"), []byte(journal), 0600); err != nil {
 		t.Fatal(err)
 	}

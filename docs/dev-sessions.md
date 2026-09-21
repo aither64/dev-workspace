@@ -150,10 +150,12 @@ commits are not tracking-only checkpoints.
 ## Monitor long verification
 
 The built-in `dev-session-monitor` skill delegates long tests, CI checks and
-builds to a fresh `gpt-5.6-luna` subagent with `low` reasoning. The parent keeps
-its model, reasoning effort and development context, then continues when the
-watcher returns. Planning, diagnosis, code changes, review and acceptance remain
-with the parent. The skill does not initiate deployments or unwanted CI waits.
+builds to a fresh operation-only watcher. The installed policy defines that
+watcher separately from the persistent team roster; at this site it uses
+GPT-6 Luna with low reasoning effort. The parent keeps its model, reasoning
+effort and development context, then continues when the watcher returns.
+Planning, diagnosis, code changes, review and acceptance remain with the parent.
+The skill does not initiate deployments or unwanted CI waits.
 
 Automatic skill selection is enabled. To require this workflow, add a brief rule
 to the consuming workspace's instructions:
@@ -166,9 +168,12 @@ to the consuming workspace's instructions:
 It can also be requested explicitly with `$dev-session-monitor`. The
 [skill](../skills/dev-session-monitor/SKILL.md) defines the brief, watcher
 boundaries, result format and visible fallback when delegation is unavailable.
-Callers supply any project-specific deadlines and escalation rules. A watcher
-owns newly launched commands; an existing run needs independently accessible
-status and logs rather than an assumed transferable parent tool handle.
+Callers supply any project-specific deadlines and escalation rules. An unmanaged
+session uses an explicit applicable caller or site policy; if none is supplied,
+the parent visibly performs the monitoring rather than inventing a watcher
+lineup. A watcher owns newly launched commands; an existing run needs
+independently accessible status and logs rather than an assumed transferable
+parent tool handle.
 
 This is agent-directed delegation, not a persistent job supervisor or a model
 change inside an executing turn. Parent waiting still has tool/runtime overhead.
@@ -176,9 +181,8 @@ Fresh briefs, blocking waits and compact results reduce repeated model work;
 actual allowance savings depend on the workload and must be measured. Full logs
 remain available for the parent to investigate failures.
 
-The skill uses the existing schema-1 package catalog and managed skill links.
-Profile activation installs it; rollback to a package without it removes its
-managed link. No conversation, manifest or process-state migration is needed.
+Profile activation installs the skill. No conversation, manifest or process-state
+migration is needed for the watcher.
 Verify discovery in a fresh turn after activation; already-running turns may
 retain their earlier instructions. When the skill is absent, perform the same
 operation with minimal-output parent monitoring and report that fallback once.
@@ -300,6 +304,30 @@ new layout. It continues to reject modified partial drafts. Unfinished forks
 and current creation operations retain their existing package-transition gate;
 complete them with their originating generation before switching packages.
 
+## Team members
+
+`dev-session attach` continues to attach the root `lead` conversation in tmux.
+Team members are independent persistent Codex threads and do not create extra
+tmux panes. Choose an installed team when starting a session, or manage members
+later from the portal's Team tab or CLI:
+
+```sh
+dev-session start api-token-rotation --team delegated --goal-file request.txt
+dev-session team list api-token-rotation
+dev-session team preset api-token-rotation delegated
+dev-session team add api-token-rotation implementer --model gpt-6-sol --effort xhigh
+dev-session team assign api-token-rotation --to implementer0 --message 'Implement the approved plan.'
+```
+
+The member roster is isolated to the session. Its compact addresses are stable,
+for example `architect0`, `implementer0`, and `reviewer0`; members from another
+session cannot be addressed. The Team tab also provides read-only member
+transcripts. Fork, archive, delete, and revive apply the corresponding Codex
+operation to all roster members with the root session.
+
+Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
+team member. That watcher has no persistent roster identity.
+
 ## Attaching and syncing
 
 ```sh
@@ -413,8 +441,13 @@ Missing or stale `portal.yml` repository entries do not block deletion when the
 actual worktrees can be proven to belong to canonical workspace repositories.
 Symlinks, unmanaged entries, foreign repositories, path escapes, and ambiguous
 ownership are always refused. `--force` permits dirty worktrees and interrupts
-an active Codex turn. If a non-forced attempt stops at an active turn, rerunning
-it with `--force` records a one-way upgrade to that authorization and resumes
+active lead and independent team-member turns, waits for each turn to stop, then
+archives their threads. The wait is bounded; a member that does not stop leaves
+the deletion journal retryable. Ordinary archive and non-forced deletion still
+require every member to be idle. A forced deletion can also retire a member
+whose thread was confirmed while member creation remained unfinished; a missing
+thread identity still blocks deletion. If a non-forced attempt stops at an
+active turn, rerunning it with `--force` records a one-way upgrade and resumes
 the same journal. Forced deletion still requires the interactive `y/N`
 confirmation:
 
@@ -528,8 +561,8 @@ reproves the exact heads stored in the archive journal before every remaining
 destructive phase; another merged commit on the feature branch cannot replace
 the head originally approved for archival.
 
-Before changing state, `archive` proves the thread has no active turn, pending
-request, or queued message; verifies the tracking commit and clean attached
+Before changing state, `archive` proves the lead and every ready team member
+have no active turn, pending request, or queued message; verifies the tracking commit and clean attached
 worktrees; checks the atomic move; and verifies that the shared workspace can
 make an exact-path commit. It then quiesces the terminal client, releases both
 development cluster types, records immutable repository heads, removes
@@ -673,17 +706,33 @@ deployment.
 Host-specific runtime options are private implementation details fixed by the
 dispatcher. Callers can select only a registered workspace, not replace its
 runtime paths. The App Server uses the Codex package bundled with the current
-application profile. `workspace-host` checks its protocol and model catalog
-before activation and retains the tested Codex store path with each profile
-generation. Profile switches and rollbacks gate new mutations, quiesce native
-terminal clients, verify all threads are idle, restart App Server and portal
+application profile. `workspace-host` checks its protocol and transient App
+Server startup before activation and retains the tested Codex store path with
+each profile generation. Profile switches and rollbacks gate new mutations, quiesce native
+terminal clients, verify the lead and ready team members are idle, restart App Server and portal
 pairs, and restore the clients. A compatible profile update that finds an
 active turn is retried every five minutes. Use `--no-codex` to start a shell in
 the left pane instead.
 
-New conversations use GPT-6 Astra with `xhigh` reasoning. When an explicitly
-chosen model does not support `xhigh`, its advertised default reasoning effort
-is used. An explicit reasoning choice always takes precedence.
+For sessions started with `--team`, the installed team policy supplies the
+lead and member model and reasoning effort. The lead can override both settings
+together; member settings remain those of the selected team. The same
+selection is used when the portal starts a session. Without a selected team,
+omitted settings are passed unchanged to `thread/start`, so the App Server's
+live configuration resolves them. Explicit model and effort choices are
+validated against the live model catalog. The retired virtual-team creation
+flags are not public options.
+
+Before `fork`, `archive`, `revive`, `delete`, or automatic archive changes a
+session, `dev-session` validates the normal root thread and lifecycle journal.
+If a direct team roster exists, the same operation is applied to its member
+threads while the root lifecycle lock is held. Archived members revive with the
+session; explicitly removed members remain removed. Old virtual-team metadata
+is ignored during the forward-only cutover, so it cannot deny access to a
+retained root conversation or its ordinary lifecycle.
+If App Server archives a member before the roster update is saved, an archive
+or deletion retry checks the thread's exact ID and session directory, then
+saves the roster state without sending another archive request.
 
 `--goal-file FILE` provides the initial Codex request and seeds the Goal
 section in a new plan. It is required when a noninteractive caller creates a

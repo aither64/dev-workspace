@@ -1,6 +1,6 @@
 interface:
   display_name: "Development Monitoring"
-  short_description: "Delegate long test and build waits to Luna."
+  short_description: "Delegate long test and build monitoring by session policy."
   default_prompt: "Use $dev-session-monitor to run or watch this long verification operation and return its result."
 
 policy:
