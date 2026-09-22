@@ -24,6 +24,10 @@ type testClient struct {
 	messageIDs         []string
 	options            []codex.TurnOptions
 	starts             []codex.ThreadSettings
+	projects           map[string]codex.ProjectMetadata
+	projectCreates     int
+	lostProjectCreate  bool
+	projectReadError   error
 	resumes            []codex.ThreadSettings
 	forkEnvs           []map[string]string
 	threads            []codex.ThreadMetadata
@@ -48,6 +52,39 @@ type testClient struct {
 	archives           []string
 	sendEntered        chan struct{}
 	releaseSend        chan struct{}
+}
+
+func (client *testClient) CreateProject(_ context.Context, name, key string) (codex.ProjectMetadata, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.projectCreates++
+	if client.projects == nil {
+		client.projects = make(map[string]codex.ProjectMetadata)
+	}
+	project, ok := client.projects[key]
+	if !ok {
+		project = codex.ProjectMetadata{ID: fmt.Sprintf("00000000-0000-7000-8000-%012x", len(client.projects)+1), Name: name}
+		client.projects[key] = project
+	}
+	if client.lostProjectCreate {
+		client.lostProjectCreate = false
+		return codex.ProjectMetadata{}, errors.New("lost project/create response")
+	}
+	return project, nil
+}
+
+func (client *testClient) ReadProject(_ context.Context, id string) (codex.ProjectMetadata, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.projectReadError != nil {
+		return codex.ProjectMetadata{}, client.projectReadError
+	}
+	for _, project := range client.projects {
+		if project.ID == id {
+			return project, nil
+		}
+	}
+	return codex.ProjectMetadata{}, &codex.ProjectNotFoundError{ProjectID: id}
 }
 
 func (client *testClient) StartThreadWithSettings(_ context.Context, cwd string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
@@ -780,8 +817,105 @@ func TestRetryCreatingReconcilesLostResponseWithoutSecondStart(t *testing.T) {
 		t.Fatalf("reconciled member = %#v, starts %d, error %v", member, client.next, err)
 	}
 	if client.starts[0].ProjectID != member.ProjectID ||
-		member.ProjectID == memberProjectID(workspace, "one", "different-root", "implementer0") {
+		member.ProjectID == memberProjectKey(workspace, "one", "different-root", "implementer0") {
 		t.Fatalf("project identity was not bound to the root: %#v", member)
+	}
+}
+
+func TestRetryCreatingReplaysLostProjectRegistrationBeforeStarting(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{lostProjectCreate: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh"); err == nil {
+		t.Fatal("lost project/create response unexpectedly completed member start")
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || partial.Members[0].ProjectID != "" || partial.Members[0].CreateAttempted || len(client.starts) != 0 {
+		t.Fatalf("project reservation = %#v, starts %d, error %v", partial, len(client.starts), err)
+	}
+	member, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "architect0")
+	if err != nil || member.State != "ready" || len(client.projects) != 1 || client.projectCreates != 2 || len(client.starts) != 1 ||
+		client.starts[0].ProjectID != member.ProjectID {
+		t.Fatalf("registered member = %#v, projects %#v, creates %d, starts %#v, error %v",
+			member, client.projects, client.projectCreates, client.starts, err)
+	}
+}
+
+func TestRetryCreatingRequiresRegisteredProject(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{projectReadError: errors.New("project not found")}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "reviewer", "gpt-6-sol", "xhigh"); err == nil ||
+		!strings.Contains(err.Error(), "verify reviewer0 project") {
+		t.Fatalf("missing project verification = %v", err)
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || !projectUUIDPattern.MatchString(partial.Members[0].ProjectID) || partial.Members[0].CreateAttempted || len(client.starts) != 0 {
+		t.Fatalf("unstarted member = %#v, starts %d, error %v", partial, len(client.starts), err)
+	}
+	client.projectReadError = nil
+	if _, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "reviewer0"); err != nil || len(client.starts) != 1 {
+		t.Fatalf("verified project retry = %v, starts %d", err, len(client.starts))
+	}
+}
+
+func TestRetryCreatingRejectsProjectKeyBoundToDifferentName(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := memberProjectKey(workspace, "one", "root-one", "reviewer0")
+	client := &testClient{projects: map[string]codex.ProjectMetadata{
+		key: {ID: "00000000-0000-7000-8000-000000000001", Name: "another member"},
+	}}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "reviewer", "gpt-6-sol", "xhigh"); err == nil ||
+		!strings.Contains(err.Error(), "different identity") || len(client.starts) != 0 {
+		t.Fatalf("wrong-name project = %v, starts %d", err, len(client.starts))
+	}
+}
+
+func TestRetryCreatingRepairsOnlyMissingLegacyProject(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	_, err = store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		roster.Members = append(roster.Members, Member{Address: "architect0", Role: "architect", State: "creating",
+			Model: "gpt-6-sol", Effort: "xhigh", Behavior: "designer", Access: "read_only",
+			ProjectID: memberProjectKey(workspace, "one", "root-one", "architect0"), CreateAttempted: true, AddedAt: time.Now().UTC()})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.projectReadError = errors.New("project lookup unavailable")
+	if _, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "architect0"); err == nil ||
+		!strings.Contains(err.Error(), "needs project reconciliation") || len(client.starts) != 0 || client.projectCreates != 0 {
+		t.Fatalf("uncertain legacy reservation = %v, starts %d, projects %d", err, len(client.starts), client.projectCreates)
+	}
+	client.projectReadError = nil
+	member, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, "architect0")
+	if err != nil || member.State != "ready" || !projectUUIDPattern.MatchString(member.ProjectID) ||
+		len(client.starts) != 1 || client.projectCreates != 1 {
+		t.Fatalf("reconciled legacy reservation = %#v, starts %d, projects %d, error %v",
+			member, len(client.starts), client.projectCreates, err)
 	}
 }
 
@@ -817,7 +951,7 @@ func TestConcurrentRetryCreatingStartsOnce(t *testing.T) {
 	_, err = store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
 		roster.Members = append(roster.Members, Member{Address: "reviewer0", Role: "reviewer", State: "creating",
 			Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only",
-			ProjectID: memberProjectID(workspace, "one", "root-one", "reviewer0"), AddedAt: time.Now().UTC()})
+			AddedAt: time.Now().UTC()})
 		return nil
 	})
 	if err != nil {

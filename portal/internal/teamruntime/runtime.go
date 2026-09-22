@@ -29,6 +29,7 @@ const schema = 1
 
 var rolePattern = regexp.MustCompile(`^[a-z][a-z0-9]{0,31}$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var projectUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var messageIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 
 // Roster is the durable identity of an independent team.  Lead is always the
@@ -357,7 +358,8 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 		if member.PolicyCatalogDigest != "" && (member.Behavior == "" || member.Access == "") {
 			return errors.New("team roster member has a catalog digest without policy")
 		}
-		if member.ProjectID != "" && member.ProjectID != memberProjectID(workspace, slug, rootThreadID, member.Address) {
+		if member.ProjectID != "" && member.ProjectID != memberProjectKey(workspace, slug, rootThreadID, member.Address) &&
+			!projectUUIDPattern.MatchString(member.ProjectID) {
 			return errors.New("team roster member has the wrong project identity")
 		}
 		if member.CreateAttempted && member.ProjectID == "" && roster.ForkSource == nil {
@@ -367,7 +369,9 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 	return nil
 }
 
-func memberProjectID(workspace, slug, rootThreadID, address string) string {
+// memberProjectKey is also the synthetic projectId used by the first direct-team
+// release. Keep it stable so project/create replays and legacy recovery work.
+func memberProjectKey(workspace, slug, rootThreadID, address string) string {
 	data, _ := json.Marshal([]string{workspace, slug, rootThreadID, address})
 	digest := sha256.Sum256(data)
 	return "dev-workspace-member:" + hex.EncodeToString(digest[:])
@@ -553,6 +557,8 @@ func (store *Store) Update(ctx context.Context, slug, rootThreadID string, creat
 }
 
 type Client interface {
+	CreateProject(context.Context, string, string) (codex.ProjectMetadata, error)
+	ReadProject(context.Context, string) (codex.ProjectMetadata, error)
 	StartThreadWithSettings(context.Context, string, map[string]string, codex.ThreadSettings) (string, error)
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
 	ResumeThreadWithSettings(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
@@ -600,7 +606,6 @@ func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, 
 				Model: model, Effort: effort, Behavior: policyRole.Behavior, Access: policyRole.Access,
 				PolicyCatalogDigest: catalogDigest,
 				State:               "creating", AddedAt: time.Now().UTC()}
-			pending.ProjectID = memberProjectID(service.Store.workspace, slug, rootThreadID, pending.Address)
 			roster.Members = append(roster.Members, pending)
 			return nil
 		})
@@ -673,8 +678,7 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 					roster.Members = append(roster.Members, Member{Address: member.Address, Role: member.Role,
 						Index: 0, Model: member.Model, Effort: member.Effort,
 						Behavior: member.Behavior, Access: member.Access, PolicyCatalogDigest: preset.CatalogDigest,
-						ProjectID: memberProjectID(service.Store.workspace, slug, rootThreadID, member.Address),
-						State:     "creating", AddedAt: now})
+						State: "creating", AddedAt: now})
 				}
 				return nil
 			}
@@ -794,8 +798,67 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 	}
 	memberEnvironment["DEV_SESSION_MEMBER_ADDRESS"] = address
 	if threadID == "" {
+		projectKey := memberProjectKey(service.Store.workspace, slug, rootThreadID, address)
+		projectName := slug + " " + address
+		if pending.ProjectID == projectKey {
+			// The previous client passed this idempotency key as projectId. In
+			// the pinned App Server, thread/start rejects a missing project
+			// before allocating a thread. Only that exact missing-project
+			// result proves the old attempt could not have started one.
+			if _, readErr := service.Client.ReadProject(ctx, projectKey); !codex.IsProjectNotFound(readErr, projectKey) {
+				if readErr == nil {
+					readErr = errors.New("legacy project exists")
+				}
+				return Member{}, fmt.Errorf("legacy %s start needs project reconciliation: %w", address,
+					readErr)
+			}
+			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
+				for index := range updated.Members {
+					member := &updated.Members[index]
+					if member.Address == address && member.State == "creating" && member.Thread == "" &&
+						member.ProjectID == projectKey && member.CreateAttempted == pending.CreateAttempted {
+						member.ProjectID = ""
+						member.CreateAttempted = false
+						return nil
+					}
+				}
+				return errors.New("legacy member reservation changed")
+			}); err != nil {
+				return Member{}, err
+			}
+			pending.ProjectID = ""
+			pending.CreateAttempted = false
+		}
+		project, err := service.Client.CreateProject(ctx, projectName, projectKey)
+		if err != nil {
+			return Member{}, fmt.Errorf("register %s project: %w", address, err)
+		}
+		if !projectUUIDPattern.MatchString(project.ID) || project.Name != projectName ||
+			(pending.ProjectID != "" && pending.ProjectID != project.ID) {
+			return Member{}, errors.New("member project registration returned a different identity")
+		}
 		if pending.ProjectID == "" {
-			return Member{}, errors.New("member has no durable project identity; creation outcome is unknown")
+			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
+				for index := range updated.Members {
+					member := &updated.Members[index]
+					if member.Address == address && member.State == "creating" && member.Thread == "" &&
+						!member.CreateAttempted && member.ProjectID == "" {
+						member.ProjectID = project.ID
+						return nil
+					}
+				}
+				return errors.New("member project reservation changed")
+			}); err != nil {
+				return Member{}, err
+			}
+			pending.ProjectID = project.ID
+		}
+		verified, err := service.Client.ReadProject(ctx, pending.ProjectID)
+		if err != nil {
+			return Member{}, fmt.Errorf("verify %s project: %w", address, err)
+		}
+		if verified.ID != pending.ProjectID || verified.Name != projectName {
+			return Member{}, errors.New("member project lookup returned a different identity")
 		}
 		if !pending.CreateAttempted {
 			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {

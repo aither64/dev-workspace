@@ -188,8 +188,14 @@ and durable roster. That snapshot includes each member's address, model,
 reasoning effort, behavior, and access. Retrying creation uses the snapshot,
 even if a later package has different defaults. Team mutations remain
 unavailable until the creation receipt is ready. If a member's App Server
-start has an uncertain outcome, retry reconciles its session-and-member project
-identity and refuses to start another thread when the result is ambiguous.
+start has an uncertain outcome, retry reconciles its registered App Server
+project and refuses to start another thread when the result is ambiguous. Each
+member's project is created with a durable idempotency key derived from the
+workspace, session, lead thread, and member address. The roster stores the
+project ID returned by App Server before attempting `thread/start`. A lost
+`project/create` response can be retried with the same key; a lost
+`thread/start` response is resolved by listing threads in that project. If
+the project lookup or thread listing is unavailable, creation remains pending.
 
 The runtime applies the retained role instructions to each member thread.
 Architects and reviewers use a read-only sandbox; implementers use
