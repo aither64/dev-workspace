@@ -89,6 +89,8 @@ type Member struct {
 	PolicyCatalogDigest string     `json:"policyCatalogDigest,omitempty"`
 	ProjectID           string     `json:"projectId,omitempty"`
 	CreateAttempted     bool       `json:"createAttempted,omitempty"`
+	BootstrapAttempted  bool       `json:"bootstrapAttempted,omitempty"`
+	RetireIntent        string     `json:"retireIntent,omitempty"`
 	State               string     `json:"state"`
 	AddedAt             time.Time  `json:"addedAt"`
 	RemovedAt           *time.Time `json:"removedAt,omitempty"`
@@ -365,6 +367,14 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 		if member.CreateAttempted && member.ProjectID == "" && roster.ForkSource == nil {
 			return errors.New("team roster member has an attempt without a project identity")
 		}
+		if member.BootstrapAttempted && member.Thread == "" {
+			return errors.New("team roster member has a bootstrap attempt without a thread")
+		}
+		if member.RetireIntent != "" && (member.RetireIntent != "replace" && member.RetireIntent != "remove" ||
+			member.Thread == "" || !projectUUIDPattern.MatchString(member.ProjectID) ||
+			(member.State != "creating" && member.State != "ready")) {
+			return errors.New("team roster member has an invalid retirement reservation")
+		}
 	}
 	return nil
 }
@@ -375,6 +385,10 @@ func memberProjectKey(workspace, slug, rootThreadID, address string) string {
 	data, _ := json.Marshal([]string{workspace, slug, rootThreadID, address})
 	digest := sha256.Sum256(data)
 	return "dev-workspace-member:" + hex.EncodeToString(digest[:])
+}
+
+func memberBootstrapMarker(slug, address, threadID string) string {
+	return fmt.Sprintf("Internal team member initialization for %s in session %s (thread %s). No assignment has been sent yet.", address, slug, threadID)
 }
 
 func snapshotSource(source *Roster) (*ForkSourceSnapshot, error) {
@@ -571,6 +585,13 @@ type Client interface {
 	RequireThreadTurnsIdle(context.Context, string) error
 	UnarchiveThread(context.Context, string) (codex.ThreadMetadata, error)
 	SetName(context.Context, string, string) error
+	HeadlessThreadMaterialized(context.Context, string, string, string) (bool, error)
+	ForkedHeadlessThreadMaterialized(context.Context, string, string, string) (bool, error)
+	BootstrapHeadlessThread(context.Context, string, string, string, string) error
+	BootstrapForkedHeadlessThread(context.Context, string, string, string, string) error
+	VerifyHeadlessBootstrap(context.Context, string, string, string, string) error
+	VerifyForkedHeadlessBootstrap(context.Context, string, string, string, string) error
+	DeleteFreshHeadlessThread(context.Context, string, string, string) error
 	SendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, error)
 }
 
@@ -713,8 +734,19 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 // findStartedMember is deliberately read-only. A zero-result list may race a
 // start whose response was lost, so it never authorizes a second start.
 func (service Service) findStartedMember(ctx context.Context, projectID, cwd string) (string, error) {
+	matches, err := service.listMemberThreads(ctx, projectID, cwd)
+	if err != nil {
+		return "", err
+	}
+	if len(matches) == 0 {
+		return "", errors.New("member thread start outcome is unknown; retry after App Server lists the project identity")
+	}
+	return matches[0], nil
+}
+
+func (service Service) listMemberThreads(ctx context.Context, projectID, cwd string) ([]string, error) {
 	if projectID == "" || cwd == "" {
-		return "", errors.New("member thread recovery requires project identity and cwd")
+		return nil, errors.New("member thread recovery requires project identity and cwd")
 	}
 	archived := false
 	var matches []string
@@ -725,30 +757,130 @@ func (service Service) findStartedMember(ctx context.Context, projectID, cwd str
 			ProjectID: projectID, Cwd: cwd, Archived: &archived, Limit: 100, Cursor: cursor,
 		})
 		if err != nil {
-			return "", fmt.Errorf("list member threads: %w", err)
+			return nil, fmt.Errorf("list member threads: %w", err)
 		}
 		for _, thread := range threads {
 			if thread.ID == "" || thread.Cwd != cwd || thread.ProjectID == nil || *thread.ProjectID != projectID || thread.ForkedFromID != "" {
-				return "", errors.New("member thread listing contains an unexpected identity")
+				return nil, errors.New("member thread listing contains an unexpected identity")
 			}
 			matches = append(matches, thread.ID)
 		}
 		if len(matches) > 1 {
-			return "", errors.New("member thread recovery is ambiguous: multiple threads have the project identity")
+			return nil, errors.New("member thread recovery is ambiguous: multiple threads have the project identity")
 		}
 		if next == nil || *next == "" {
 			break
 		}
 		if seenCursors[*next] {
-			return "", errors.New("member thread listing repeated a cursor")
+			return nil, errors.New("member thread listing repeated a cursor")
 		}
 		seenCursors[*next] = true
 		cursor = *next
 	}
-	if len(matches) == 0 {
-		return "", errors.New("member thread start outcome is unknown; retry after App Server lists the project identity")
+	return matches, nil
+}
+
+// recycleFreshMemberLocked replaces an empty headless thread that App Server
+// unloaded before it acquired a rollout. The address and project stay stable;
+// only a verified no-history thread may be deleted.
+func (service Service) recycleFreshMemberLocked(ctx context.Context, slug, rootThreadID, cwd string, member Member) error {
+	if err := service.reserveFreshRetirementLocked(ctx, slug, rootThreadID, &member, "replace"); err != nil {
+		return err
 	}
-	return matches[0], nil
+	if materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID); err == nil && materialized {
+		marker := memberBootstrapMarker(slug, member.Address, member.Thread)
+		if err := service.Client.VerifyHeadlessBootstrap(ctx, member.Thread, cwd, member.ProjectID, marker); err != nil {
+			return fmt.Errorf("member rollout appeared during replacement without its exact bootstrap marker: %w", err)
+		}
+		_, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+			for index := range roster.Members {
+				current := &roster.Members[index]
+				if current.Address == member.Address && current.Thread == member.Thread && current.RetireIntent == "replace" {
+					current.RetireIntent = ""
+					return nil
+				}
+			}
+			return errors.New("member bootstrap reconciliation changed")
+		})
+		return err
+	}
+	if err := service.deleteUniqueFreshMemberLocked(ctx, slug, cwd, member); err != nil {
+		return err
+	}
+	_, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+		for index := range roster.Members {
+			current := &roster.Members[index]
+			if current.Address == member.Address && current.Thread == member.Thread &&
+				current.ProjectID == member.ProjectID && current.State == member.State && current.RetireIntent == "replace" {
+				current.Thread = ""
+				current.CreateAttempted = false
+				current.BootstrapAttempted = false
+				current.RetireIntent = ""
+				current.State = "creating"
+				return nil
+			}
+		}
+		return errors.New("member recovery reservation changed")
+	})
+	return err
+}
+
+func (service Service) reserveFreshRetirementLocked(ctx context.Context, slug, rootThreadID string, member *Member, intent string) error {
+	if member.RetireIntent == intent {
+		return nil
+	}
+	if member.RetireIntent != "" || (intent != "replace" && intent != "remove") {
+		return errors.New("member has a conflicting retirement reservation")
+	}
+	_, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+		for index := range roster.Members {
+			current := &roster.Members[index]
+			if current.Address == member.Address && current.Thread == member.Thread &&
+				current.ProjectID == member.ProjectID && current.State == member.State && current.RetireIntent == "" {
+				current.RetireIntent = intent
+				return nil
+			}
+		}
+		return errors.New("member retirement reservation changed")
+	})
+	if err == nil {
+		member.RetireIntent = intent
+	}
+	return err
+}
+
+func (service Service) deleteUniqueFreshMemberLocked(ctx context.Context, slug, cwd string, member Member) error {
+	if member.Thread == "" || !projectUUIDPattern.MatchString(member.ProjectID) {
+		return errors.New("member has no confirmed thread and project to recycle")
+	}
+	project, err := service.Client.ReadProject(ctx, member.ProjectID)
+	if err != nil || project.ID != member.ProjectID || project.Name != slug+" "+member.Address {
+		return fmt.Errorf("member project identity changed before recovery: %v", err)
+	}
+	matches, err := service.listMemberThreads(ctx, member.ProjectID, cwd)
+	if err != nil {
+		return err
+	}
+	if len(matches) == 0 && member.RetireIntent != "" {
+		// The reserved deletion completed before the roster could record its
+		// result. This project held exactly one known member thread before it.
+		return nil
+	}
+	if len(matches) != 1 || matches[0] != member.Thread {
+		return errors.New("member thread recovery is not a unique project match")
+	}
+	deleteErr := service.Client.DeleteFreshHeadlessThread(ctx, member.Thread, cwd, member.ProjectID)
+	matches, err = service.listMemberThreads(ctx, member.ProjectID, cwd)
+	if err != nil {
+		return errors.Join(deleteErr, err)
+	}
+	if len(matches) != 0 {
+		return errors.Join(deleteErr, errors.New("retired member thread still appears under its project"))
+	}
+	// A lost thread/delete response is reconciled only after the project-scoped
+	// store reports no thread. The pre-delete inspection proved this exact old
+	// member had no rollout, pending work, or unresolved submission.
+	return nil
 }
 
 // RetryCreating completes a reserved member without allocating another
@@ -787,7 +919,29 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 	if pending.State != "creating" {
 		return Member{}, errors.New("team member cannot be resumed")
 	}
+	if pending.RetireIntent == "replace" {
+		if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, *pending); err != nil {
+			return Member{}, fmt.Errorf("finish %s replacement: %w", address, err)
+		}
+		return service.retryCreatingLocked(ctx, slug, rootThreadID, cwd, environment, address)
+	}
+	if pending.RetireIntent != "" {
+		return Member{}, errors.New("member retirement has a conflicting intent")
+	}
+	if pending.Thread != "" {
+		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, pending.Thread, cwd, pending.ProjectID)
+		if err != nil {
+			return Member{}, fmt.Errorf("inspect %s bootstrap: %w", address, err)
+		}
+		if !materialized {
+			if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, *pending); err != nil {
+				return Member{}, fmt.Errorf("recover %s bootstrap: %w", address, err)
+			}
+			return service.retryCreatingLocked(ctx, slug, rootThreadID, cwd, environment, address)
+		}
+	}
 	threadID := pending.Thread
+	wasStarted := threadID != ""
 	policy, err := policyForRole(pending.Role, pending.Behavior, pending.Access)
 	if err != nil {
 		return Member{}, fmt.Errorf("member %s has no retained policy: %w", address, err)
@@ -901,7 +1055,29 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 		}); err != nil {
 			return Member{}, err
 		}
-	} else {
+		pending.Thread = threadID
+	}
+	marker := memberBootstrapMarker(slug, address, threadID)
+	if !pending.BootstrapAttempted {
+		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
+			for index := range updated.Members {
+				member := &updated.Members[index]
+				if member.Address == address && member.State == "creating" && member.Thread == threadID && !member.BootstrapAttempted {
+					member.BootstrapAttempted = true
+					return nil
+				}
+			}
+			return errors.New("member bootstrap reservation changed")
+		}); err != nil {
+			return Member{}, err
+		}
+		if err := service.Client.BootstrapHeadlessThread(ctx, threadID, cwd, pending.ProjectID, marker); err != nil {
+			return Member{}, fmt.Errorf("bootstrap %s thread outcome is uncertain: %w", address, err)
+		}
+	} else if err := service.Client.VerifyHeadlessBootstrap(ctx, threadID, cwd, pending.ProjectID, marker); err != nil {
+		return Member{}, fmt.Errorf("verify %s bootstrap: %w", address, err)
+	}
+	if wasStarted {
 		if _, err := service.Client.ResumeThreadWithSettings(ctx, threadID, cwd, memberEnvironment,
 			codex.ThreadSettings{Model: pending.Model, ReasoningEffort: pending.Effort, Policy: policy}); err != nil {
 			return Member{}, fmt.Errorf("resume %s thread: %w", address, err)
@@ -951,6 +1127,9 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 		if member.State == "removed" {
 			return nil
 		}
+		if member.RetireIntent == "replace" {
+			return errors.New("member replacement is pending; finish recovery before removal")
+		}
 		if member.State == "creating" && member.Thread == "" && (member.CreateAttempted || member.ProjectID == "") {
 			return errors.New("member thread start outcome is unknown; reconcile it before removal")
 		}
@@ -958,11 +1137,45 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 		// durable reservation. Retiring it preserves the non-reuse guarantee
 		// without attempting an invalid App Server operation.
 		if member.Thread != "" {
-			if err := service.Client.RequireThreadIdle(ctx, member.Thread, filepath.Join(service.Store.workspace, "work", slug)); err != nil {
-				return fmt.Errorf("member %s is not idle: %w", address, err)
+			cwd := filepath.Join(service.Store.workspace, "work", slug)
+			materialized := true
+			if member.ProjectID != "" {
+				var err error
+				materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+				if err != nil && member.RetireIntent == "" {
+					return fmt.Errorf("inspect %s thread: %w", address, err)
+				}
+				if err != nil {
+					materialized = false
+				}
 			}
-			if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
-				return fmt.Errorf("archive %s: %w", address, err)
+			if !materialized || member.RetireIntent == "remove" {
+				if materialized {
+					if err := service.Client.VerifyHeadlessBootstrap(ctx, member.Thread, cwd, member.ProjectID,
+						memberBootstrapMarker(slug, member.Address, member.Thread)); err != nil {
+						return fmt.Errorf("member rollout appeared during removal without its exact bootstrap marker: %w", err)
+					}
+					if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+						return fmt.Errorf("member %s is not idle: %w", address, err)
+					}
+					if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
+						return fmt.Errorf("archive %s: %w", address, err)
+					}
+				} else {
+					if err := service.reserveFreshRetirementLocked(ctx, slug, rootThreadID, &member, "remove"); err != nil {
+						return fmt.Errorf("reserve retirement of %s: %w", address, err)
+					}
+					if err := service.deleteUniqueFreshMemberLocked(ctx, slug, cwd, member); err != nil {
+						return fmt.Errorf("retire %s: %w", address, err)
+					}
+				}
+			} else {
+				if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+					return fmt.Errorf("member %s is not idle: %w", address, err)
+				}
+				if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
+					return fmt.Errorf("archive %s: %w", address, err)
+				}
 			}
 		}
 		_, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -971,6 +1184,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 					now := time.Now().UTC()
 					updated.Members[index].State = "removed"
 					updated.Members[index].RemovedAt = &now
+					updated.Members[index].RetireIntent = ""
 					return nil
 				}
 			}
@@ -1009,6 +1223,9 @@ func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThrea
 		if member.State != "ready" || member.Thread == "" {
 			return fmt.Errorf("member %s has no confirmed idle thread", member.Address)
 		}
+		if member.RetireIntent != "" {
+			return fmt.Errorf("member %s retirement is pending", member.Address)
+		}
 		archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
 		if err != nil {
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
@@ -1046,11 +1263,6 @@ func (service Service) RetireAll(ctx context.Context, slug, rootThreadID string)
 }
 
 func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID string, force bool) error {
-	if !force {
-		if err := service.requireIdleAllLocked(ctx, slug, rootThreadID); err != nil {
-			return err
-		}
-	}
 	roster, err := service.Store.Load(slug, rootThreadID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1059,6 +1271,40 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		return err
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
+	for _, member := range roster.Members {
+		if member.State != "ready" || member.ProjectID == "" {
+			continue
+		}
+		if member.RetireIntent == "remove" {
+			return fmt.Errorf("member %s removal is pending", member.Address)
+		}
+		materialized := false
+		if member.RetireIntent != "replace" {
+			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+			if err != nil {
+				return fmt.Errorf("inspect %s before archive: %w", member.Address, err)
+			}
+		}
+		if materialized {
+			continue
+		}
+		if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, member); err != nil {
+			return fmt.Errorf("recover %s before archive: %w", member.Address, err)
+		}
+		if _, err := service.retryCreatingLocked(ctx, slug, rootThreadID, cwd,
+			map[string]string{"DEV_SESSION_SLUG": slug, "DEV_SESSION_WORKSPACE": service.Store.workspace, "DEV_SESSION_WORK_DIR": cwd}, member.Address); err != nil {
+			return fmt.Errorf("recreate %s before archive: %w", member.Address, err)
+		}
+	}
+	roster, err = service.Store.Load(slug, rootThreadID)
+	if err != nil {
+		return err
+	}
+	if !force {
+		if err := service.requireIdleAllLocked(ctx, slug, rootThreadID); err != nil {
+			return err
+		}
+	}
 	archivedMembers := make(map[string]bool, len(roster.Members))
 	for _, member := range roster.Members {
 		if member.State == "archived" || member.State == "removed" {
@@ -1277,6 +1523,30 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	if strings.TrimSpace(message) == "" {
 		return codex.SendReceipt{}, errors.New("assignment is empty")
 	}
+	if to != "lead" && target.ProjectID != "" {
+		if target.RetireIntent == "remove" {
+			return codex.SendReceipt{}, errors.New("member removal is pending")
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		materialized := false
+		if target.RetireIntent != "replace" {
+			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, target.Thread, cwd, target.ProjectID)
+			if err != nil {
+				return codex.SendReceipt{}, fmt.Errorf("inspect %s thread: %w", to, err)
+			}
+		}
+		if !materialized {
+			if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, *target); err != nil {
+				return codex.SendReceipt{}, fmt.Errorf("recover %s thread: %w", to, err)
+			}
+			recovered, err := service.retryCreatingLocked(ctx, slug, rootThreadID, cwd,
+				map[string]string{"DEV_SESSION_SLUG": slug, "DEV_SESSION_WORKSPACE": service.Store.workspace, "DEV_SESSION_WORK_DIR": cwd}, to)
+			if err != nil {
+				return codex.SendReceipt{}, fmt.Errorf("recreate %s thread: %w", to, err)
+			}
+			target = &recovered
+		}
+	}
 	if model == "" {
 		model = target.Model
 	}
@@ -1320,6 +1590,16 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		if member.State == "creating" {
 			return nil, fmt.Errorf("fork source member %s is still creating", member.Address)
 		}
+		if member.State == "ready" && member.ProjectID != "" {
+			materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread,
+				filepath.Join(service.Store.workspace, "work", source.Slug), member.ProjectID)
+			if err != nil {
+				return nil, fmt.Errorf("inspect fork source member %s: %w", member.Address, err)
+			}
+			if !materialized {
+				return nil, fmt.Errorf("fork source member %s has no persisted rollout", member.Address)
+			}
+		}
 	}
 	requested, err := snapshotSource(source)
 	if err != nil {
@@ -1347,7 +1627,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			roster.ForkSource = requested
 			for _, old := range source.Members {
 				member := old
-				member.Thread, member.ProjectID, member.CreateAttempted = "", "", false
+				member.Thread, member.ProjectID, member.CreateAttempted, member.BootstrapAttempted = "", "", false, false
 				if member.State != "removed" {
 					member.State, member.RemovedAt = "creating", nil
 				}
@@ -1425,6 +1705,31 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			}); err != nil {
 				return nil, err
 			}
+		}
+		materialized, err := service.Client.ForkedHeadlessThreadMaterialized(ctx, threadID, cwd, old.Thread)
+		if err != nil {
+			return nil, fmt.Errorf("inspect fork %s bootstrap: %w", old.Address, err)
+		}
+		if !materialized && member.BootstrapAttempted {
+			return nil, fmt.Errorf("fork %s bootstrap outcome is uncertain; reconcile the exact thread before retry", old.Address)
+		}
+		marker := memberBootstrapMarker(slug, old.Address, threadID)
+		if !member.BootstrapAttempted {
+			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+				candidate := &roster.Members[index]
+				if candidate.Address != old.Address || candidate.State != "creating" || candidate.Thread != threadID || candidate.BootstrapAttempted {
+					return errors.New("fork bootstrap reservation changed")
+				}
+				candidate.BootstrapAttempted = true
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+			if err := service.Client.BootstrapForkedHeadlessThread(ctx, threadID, cwd, old.Thread, marker); err != nil {
+				return nil, fmt.Errorf("fork %s bootstrap outcome is uncertain: %w", old.Address, err)
+			}
+		} else if err := service.Client.VerifyForkedHeadlessBootstrap(ctx, threadID, cwd, old.Thread, marker); err != nil {
+			return nil, fmt.Errorf("verify fork %s bootstrap: %w", old.Address, err)
 		}
 		if err := service.Client.SetName(ctx, threadID, slug+" "+old.Address); err != nil {
 			return nil, fmt.Errorf("name %s thread: %w", old.Address, err)

@@ -31,6 +31,11 @@ type testClient struct {
 	resumes            []codex.ThreadSettings
 	forkEnvs           []map[string]string
 	threads            []codex.ThreadMetadata
+	unmaterialized     map[string]bool
+	bootstrapCalls     []string
+	bootstrapError     error
+	deleted            []string
+	deleteError        error
 	archived           map[string]bool
 	archiveAfter       func()
 	archiveResultError error
@@ -208,6 +213,54 @@ func (client *testClient) SetName(context.Context, string, string) error {
 	}
 	return nil
 }
+func (client *testClient) HeadlessThreadMaterialized(_ context.Context, thread, _, _ string) (bool, error) {
+	for _, item := range client.threads {
+		if item.ID == thread {
+			return !client.unmaterialized[thread], nil
+		}
+	}
+	return false, errors.New("thread not found")
+}
+func (client *testClient) ForkedHeadlessThreadMaterialized(_ context.Context, thread, _, _ string) (bool, error) {
+	return !client.unmaterialized[thread], nil
+}
+func (client *testClient) BootstrapHeadlessThread(_ context.Context, thread, _, _, marker string) error {
+	client.bootstrapCalls = append(client.bootstrapCalls, thread+":"+marker)
+	if client.bootstrapError != nil {
+		return client.bootstrapError
+	}
+	delete(client.unmaterialized, thread)
+	return nil
+}
+func (client *testClient) BootstrapForkedHeadlessThread(ctx context.Context, thread, cwd, source, marker string) error {
+	return client.BootstrapHeadlessThread(ctx, thread, cwd, source, marker)
+}
+func (client *testClient) VerifyHeadlessBootstrap(_ context.Context, thread, _, _, _ string) error {
+	if client.unmaterialized[thread] {
+		return errors.New("bootstrap marker is absent")
+	}
+	return nil
+}
+func (client *testClient) VerifyForkedHeadlessBootstrap(ctx context.Context, thread, cwd, source, marker string) error {
+	return client.VerifyHeadlessBootstrap(ctx, thread, cwd, source, marker)
+}
+func (client *testClient) DeleteFreshHeadlessThread(_ context.Context, thread, _, _ string) error {
+	if client.deleteError != nil {
+		return client.deleteError
+	}
+	if !client.unmaterialized[thread] {
+		return errors.New("thread has materialized history")
+	}
+	client.deleted = append(client.deleted, thread)
+	for index, item := range client.threads {
+		if item.ID == thread {
+			client.threads = append(client.threads[:index], client.threads[index+1:]...)
+			break
+		}
+	}
+	delete(client.unmaterialized, thread)
+	return nil
+}
 func (client *testClient) SendWithOptions(_ context.Context, thread, text, messageID string, _ string, options codex.TurnOptions) (codex.SendReceipt, error) {
 	if client.sendEntered != nil {
 		close(client.sendEntered)
@@ -239,6 +292,245 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	if client.starts[0].Policy.Sandbox != "workspace-write" ||
 		client.options[0].ThreadPolicy != client.starts[0].Policy {
 		t.Fatalf("member policy changed between start and assignment: %#v, %#v", client.starts, client.options)
+	}
+}
+
+func TestAssignmentReplacesOnlyUniqueUnmaterializedMember(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	messageID := "0123456789abcdef0123456789abcdef"
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", member.Address, "check", "", "", messageID); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roster.Members) != 1 || roster.Members[0].Address != member.Address ||
+		roster.Members[0].ProjectID != member.ProjectID || roster.Members[0].Thread == member.Thread ||
+		roster.Members[0].State != "ready" || len(client.deleted) != 1 || client.deleted[0] != member.Thread ||
+		len(client.messageIDs) != 1 || client.messageIDs[0] != messageID ||
+		len(client.bootstrapCalls) != 2 {
+		t.Fatalf("recovered member = %#v, deleted = %#v, messages = %#v, bootstraps = %#v", roster.Members, client.deleted, client.messageIDs, client.bootstrapCalls)
+	}
+}
+
+func TestAssignmentRefusesAmbiguousUnmaterializedMember(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.threads = append(client.threads, codex.ThreadMetadata{ID: "other-thread", Cwd: cwd, ProjectID: &member.ProjectID})
+	_, err = service.Assign(context.Background(), "one", "root-one", "lead", member.Address, "check", "", "", "0123456789abcdef0123456789abcdef")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") || len(client.deleted) != 0 || len(client.sends) != 0 {
+		t.Fatalf("ambiguous recovery = %v, deleted = %#v, sends = %#v", err, client.deleted, client.sends)
+	}
+}
+
+func TestRetryCreatingReplacesUnmaterializedBootstrap(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true, unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh"); err == nil {
+		t.Fatal("expected interrupted member creation")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := roster.Members[0]
+	if old.State != "creating" || !old.BootstrapAttempted {
+		t.Fatalf("interrupted bootstrap = %#v", old)
+	}
+	client.unmaterialized[old.Thread] = true
+	member, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, old.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Thread == old.Thread || member.Address != old.Address || member.ProjectID != old.ProjectID ||
+		member.State != "ready" || len(client.deleted) != 1 || client.deleted[0] != old.Thread {
+		t.Fatalf("retry recovery = %#v, deleted = %#v", member, client.deleted)
+	}
+}
+
+func TestArchiveReplacesUnmaterializedMemberBeforeArchiving(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.deleted) != 1 || client.deleted[0] != member.Thread ||
+		len(client.archives) != 1 || client.archives[0] == member.Thread ||
+		roster.Members[0].Thread != client.archives[0] || roster.Members[0].State != "archived" {
+		t.Fatalf("archive recovery = %#v, deleted = %#v, archives = %#v", roster.Members, client.deleted, client.archives)
+	}
+}
+
+func TestRemoveDeletesOnlyEmptyUnmaterializedMember(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.deleted) != 1 || client.deleted[0] != member.Thread || len(client.archives) != 0 ||
+		roster.Members[0].State != "removed" || roster.Members[0].Thread != member.Thread {
+		t.Fatalf("remove recovery = %#v, deleted = %#v, archives = %#v", roster.Members, client.deleted, client.archives)
+	}
+}
+
+func TestAssignmentCompletesReservedDeletionAfterRosterWriteWasLost(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+		roster.Members[0].RetireIntent = "replace"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client.threads = nil // thread/delete committed before the roster replacement write.
+	messageID := "0123456789abcdef0123456789abcdef"
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", member.Address, "check", "", "", messageID); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].Thread == member.Thread || roster.Members[0].RetireIntent != "" ||
+		roster.Members[0].State != "ready" || len(client.messageIDs) != 1 || client.messageIDs[0] != messageID {
+		t.Fatalf("lost roster write recovery = %#v, messages = %#v", roster.Members, client.messageIDs)
+	}
+}
+
+func TestRemoveCompletesReservedDeletionAfterRosterWriteWasLost(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+		roster.Members[0].RetireIntent = "remove"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client.threads = nil
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].State != "removed" || roster.Members[0].RetireIntent != "" ||
+		roster.Members[0].Thread != member.Thread {
+		t.Fatalf("lost removal write recovery = %#v", roster.Members)
+	}
+}
+
+func TestRetryCreatingKeepsThreadWhenBootstrapMaterializesAfterRetireReservation(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true, unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh"); err == nil {
+		t.Fatal("expected interrupted creation")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := roster.Members[0]
+	if _, err := store.Update(context.Background(), "one", "root-one", false, func(updated *Roster) error {
+		updated.Members[0].RetireIntent = "replace"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The inject response was delayed; its exact marker appeared after the
+	// retirement reservation but before deletion.
+	member, err := service.RetryCreating(context.Background(), "one", "root-one", cwd, nil, old.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Thread != old.Thread || member.State != "ready" || member.RetireIntent != "" ||
+		len(client.deleted) != 0 || client.next != 1 {
+		t.Fatalf("late bootstrap recovery = %#v, deleted = %#v", member, client.deleted)
 	}
 }
 
@@ -1035,6 +1327,36 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 	}
 	if environment["DEV_SESSION_MEMBER_ADDRESS"] != "lead" {
 		t.Fatalf("fork changed caller environment: %#v", environment)
+	}
+	if len(client.bootstrapCalls) != 4 || !strings.Contains(client.bootstrapCalls[2], "thread-3") ||
+		!strings.Contains(client.bootstrapCalls[3], "thread-4") {
+		t.Fatalf("forked members were not bootstrapped: %#v", client.bootstrapCalls)
+	}
+}
+
+func TestForkRejectsUnmaterializedSourceBeforeDestinationReservation(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	source, err := store.Load("source", "root-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Fork(context.Background(), source, "target", "root-target", filepath.Join(workspace, "work", "target"), nil)
+	if err == nil || !strings.Contains(err.Error(), "no persisted rollout") || len(client.forkEnvs) != 0 {
+		t.Fatalf("unmaterialized source fork = %v, forks = %#v", err, client.forkEnvs)
+	}
+	if _, err := store.Load("target", "root-target"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fork reserved destination despite missing source rollout: %v", err)
 	}
 }
 

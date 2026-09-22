@@ -196,6 +196,12 @@ project ID returned by App Server before attempting `thread/start`. A lost
 `project/create` response can be retried with the same key; a lost
 `thread/start` response is resolved by listing threads in that project. If
 the project lookup or thread listing is unavailable, creation remains pending.
+Fresh headless threads have no rollout until history is written, and App Server
+can unload them when the creating client disconnects. Before marking a member
+ready, the runtime injects one internal developer bootstrap item and verifies
+its exact marker in that thread's rollout; this starts no model turn. An
+uncertain injection is reconciled against that marker, never blindly repeated.
+Fork destinations receive the same bootstrap before becoming ready.
 
 The runtime applies the retained role instructions to each member thread.
 Architects and reviewers use a read-only sandbox; implementers use
