@@ -137,6 +137,9 @@ next-turn model and reasoning settings. Message history stays in each Codex
 thread. A team message resolves both addresses through the same roster, and the
 member transcript API accepts a roster address rather than a raw thread ID.
 There is no global message bus or cross-session member discovery.
+The portal's Team assignment API sends as `lead` only. A member can report to
+`lead` through its bound host tool, which checks that member's roster and
+thread identity; browser input cannot claim to be a member.
 
 The installed workspace policy supplies three starting teams: Solo (`solo`),
 Full team (`delegated`), and Lead-designed team (`lead_designed`). Their role

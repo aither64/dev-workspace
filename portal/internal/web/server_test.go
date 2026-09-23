@@ -1654,6 +1654,42 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	}
 }
 
+func TestTeamHTTPAssignmentUsesLeadSender(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "example")
+	server.config.Codex = workspacecodex.NewWithOptions(server.config.CodexSocket, server.config.Workspace,
+		codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "team-attempts.json")})
+	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", true, func(*teamruntime.Roster) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		from    string
+		code    int
+		message string
+	}{
+		{name: "spoofed member", from: `,"from":"implementer0"`, code: http.StatusBadRequest, message: "The portal can only assign work as lead."},
+		{name: "omitted sender", code: http.StatusConflict, message: "team member is unavailable"},
+		{name: "explicit lead", from: `,"from":"lead"`, code: http.StatusConflict, message: "team member is unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"action":"assign","to":"missing0","message":"work","messageId":"0123456789abcdef0123456789abcdef"` + test.from + `}`
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/sessions/example/team", strings.NewReader(body))
+			request.Header.Set("Origin", server.config.BaseURL)
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != test.code || !strings.Contains(response.Body.String(), test.message) {
+				t.Fatalf("assignment response = %d %q, want %d and %q", response.Code, response.Body.String(), test.code, test.message)
+			}
+		})
+	}
+}
+
 func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()

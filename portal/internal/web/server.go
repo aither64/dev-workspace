@@ -1772,16 +1772,20 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready for team changes"})
 		return
 	}
-	service, err := s.teamService()
-	if err != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
 	var request teamRequestBody
 	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	request.Action, request.Address, request.Role = strings.TrimSpace(request.Action), strings.TrimSpace(request.Address), strings.TrimSpace(request.Role)
+	if request.Action == "assign" && strings.TrimSpace(request.From) != "" && strings.TrimSpace(request.From) != "lead" {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "The portal can only assign work as lead."})
+		return
+	}
+	service, err := s.teamService()
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
 	if r.Method == http.MethodDelete || request.Action == "remove" {
 		err = service.Remove(r.Context(), summary.Slug, summary.Codex.ThreadID, request.Address)
 	} else {
@@ -1816,7 +1820,7 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		case "configure":
 			_, err = service.Configure(r.Context(), summary.Slug, summary.Codex.ThreadID, request.Address, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort))
 		case "assign":
-			_, err = service.Assign(r.Context(), summary.Slug, summary.Codex.ThreadID, strings.TrimSpace(request.From), strings.TrimSpace(request.To), request.Message, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort), strings.TrimSpace(request.MessageID))
+			_, err = service.Assign(r.Context(), summary.Slug, summary.Codex.ThreadID, "lead", strings.TrimSpace(request.To), request.Message, strings.TrimSpace(request.Model), strings.TrimSpace(request.Effort), strings.TrimSpace(request.MessageID))
 		default:
 			err = errors.New("unknown team action")
 		}
