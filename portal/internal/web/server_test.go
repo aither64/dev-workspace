@@ -2375,6 +2375,12 @@ func TestReconcilesDeveloperInstructionsForActiveManifestThreads(t *testing.T) {
 	if len(controller.threadIDs) != 1 || controller.threadIDs[0] != "thread-1" {
 		t.Fatalf("reconciled instruction threads = %#v", controller.threadIDs)
 	}
+	if len(controller.policies) != 1 || controller.policies[0] != workspacecodex.LeadThreadPolicy() {
+		t.Fatalf("reconciled lead policies = %#v", controller.policies)
+	}
+	if controller.deadlines != 1 {
+		t.Fatalf("reconciliation attempts with deadline = %d", controller.deadlines)
+	}
 }
 
 func TestRetriesDeveloperInstructionReconciliation(t *testing.T) {
@@ -2391,27 +2397,44 @@ func TestRetriesDeveloperInstructionReconciliation(t *testing.T) {
 	writeWebTrackingFiles(t, directory, "active")
 	controller := &instructionReconcilingCodex{
 		browserContractCodex: &browserContractCodex{}, failures: 1,
+		afterFailure: func() {
+			updated := strings.Replace(manifest, "thread-1", "thread-2", 1)
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(updated), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
 	}
 	server.config.Codex = controller
 	server.operationWG.Add(1)
 	server.reconcileThreadInstructions()
-	if len(controller.threadIDs) != 2 {
+	if len(controller.threadIDs) != 2 || controller.threadIDs[0] != "thread-1" ||
+		controller.threadIDs[1] != "thread-2" || controller.deadlines != 2 {
 		t.Fatalf("instruction reconciliation attempts = %#v", controller.threadIDs)
 	}
 }
 
 type instructionReconcilingCodex struct {
 	*browserContractCodex
-	threadIDs []string
-	failures  int
+	threadIDs    []string
+	policies     []codex.ThreadPolicy
+	failures     int
+	deadlines    int
+	afterFailure func()
 }
 
-func (client *instructionReconcilingCodex) ReconcileThreadInstructions(
-	_ context.Context, threadID string,
+func (client *instructionReconcilingCodex) ReconcileThreadInstructionsWithPolicy(
+	ctx context.Context, threadID string, policy codex.ThreadPolicy,
 ) error {
 	client.threadIDs = append(client.threadIDs, threadID)
+	client.policies = append(client.policies, policy)
+	if _, ok := ctx.Deadline(); ok {
+		client.deadlines++
+	}
 	if client.failures > 0 {
 		client.failures--
+		if client.afterFailure != nil {
+			client.afterFailure()
+		}
 		return errors.New("temporary reconciliation failure")
 	}
 	return nil
@@ -2452,8 +2475,8 @@ type browserContractCodex struct {
 	subscribed             chan<- struct{}
 }
 
-func (client *browserContractCodex) ReconcileThreadInstructions(
-	_ context.Context, _ string,
+func (client *browserContractCodex) ReconcileThreadInstructionsWithPolicy(
+	_ context.Context, _ string, _ codex.ThreadPolicy,
 ) error {
 	return nil
 }

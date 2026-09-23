@@ -59,7 +59,7 @@ type codexController interface {
 	PrepareSend(string, string, string, string, bool) error
 	ReconcileSend(context.Context, string, string, string, string) (codex.SendReceipt, bool, error)
 	DiscardPreparedSend(string, string, string, string) (bool, error)
-	ReconcileThreadInstructions(context.Context, string) error
+	ReconcileThreadInstructionsWithPolicy(context.Context, string, codex.ThreadPolicy) error
 }
 
 type Config struct {
@@ -406,38 +406,86 @@ func (s *Server) reconcileThreadInstructions() {
 	if s.config.Codex == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.operationContext, 30*time.Second)
-	defer cancel()
-	summaries, err := s.listSessions()
-	if err != nil {
-		s.config.Logger.Printf("list sessions for Codex instruction reconciliation: %v", err)
-	}
+	ctx := s.operationContext
 	pending := make(map[string]string)
-	for _, summary := range summaries {
-		if summary.Archived || summary.Codex.ThreadID == "" {
-			continue
+	lastErrors := make(map[string]string)
+	initialized := false
+	var listError string
+	waitForRetry := func() bool {
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
 		}
-		pending[summary.Slug] = summary.Codex.ThreadID
 	}
-	for len(pending) > 0 {
-		for slug, threadID := range pending {
-			if err := s.config.Codex.ReconcileThreadInstructions(ctx, threadID); err == nil {
-				delete(pending, slug)
-			} else if ctx.Err() != nil {
-				return
-			} else {
-				s.config.Logger.Printf("reconcile Codex instructions for %s: %v", slug, err)
+	for {
+		summaries, err := s.listSessions()
+		if err != nil {
+			if listError != err.Error() {
+				s.config.Logger.Printf("list sessions for Codex instruction reconciliation: %v", err)
+				listError = err.Error()
+			}
+			if len(summaries) == 0 {
+				if !waitForRetry() {
+					return
+				}
+				continue
+			}
+		} else {
+			listError = ""
+		}
+		current := make(map[string]string)
+		for _, summary := range summaries {
+			if !summary.Archived && summary.Codex.ThreadID != "" {
+				current[summary.Slug] = summary.Codex.ThreadID
+			}
+		}
+		if !initialized {
+			pending = current
+			initialized = true
+		} else {
+			for slug, threadID := range pending {
+				if currentThreadID := current[slug]; currentThreadID == "" {
+					if err == nil {
+						delete(pending, slug)
+						delete(lastErrors, slug)
+					}
+				} else if currentThreadID != threadID {
+					pending[slug] = currentThreadID
+					delete(lastErrors, slug)
+				}
 			}
 		}
 		if len(pending) == 0 {
 			return
 		}
-		timer := time.NewTimer(2 * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		for slug, threadID := range pending {
+			if err != nil && current[slug] == "" {
+				continue
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := s.config.Codex.ReconcileThreadInstructionsWithPolicy(
+				attemptCtx, threadID, workspacecodex.LeadThreadPolicy(),
+			)
+			cancel()
+			if err == nil {
+				delete(pending, slug)
+				delete(lastErrors, slug)
+			} else if ctx.Err() != nil {
+				return
+			} else if lastErrors[slug] != err.Error() {
+				s.config.Logger.Printf("reconcile Codex instructions for %s: %v", slug, err)
+				lastErrors[slug] = err.Error()
+			}
+		}
+		if len(pending) == 0 {
 			return
-		case <-timer.C:
+		}
+		if !waitForRetry() {
+			return
 		}
 	}
 }

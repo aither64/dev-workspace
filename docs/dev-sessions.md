@@ -328,6 +328,17 @@ policy and saved model settings still apply. Fork, archive, delete, and revive
 apply the corresponding Codex operation to all roster members with the root
 session.
 
+The root conversation is the team lead in both the portal and tmux. For each
+new substantive work item, it checks the current roster, assigns nontrivial
+design to a ready architect and separable implementation to a ready implementer,
+and integrates their reports. It handles short or dependent steps itself and
+uses the applicable mandatory-review workflow for a retained reviewer. Member
+addresses and settings are read from the live roster, so later team changes
+apply without restarting the lead. Selecting a team creates no automatic work
+assignments. An existing idle root conversation receives the same lead policy
+when the portal reconciles its instructions; active turns are left alone until
+they finish.
+
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.
 

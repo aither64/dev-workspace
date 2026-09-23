@@ -21,8 +21,21 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/coder/websocket"
 )
+
+func TestRootThreadSettingsKeepLeadPolicySeparateFromModel(t *testing.T) {
+	for _, selected := range []struct{ model, effort string }{
+		{}, {"gpt-6-sol", "xhigh"},
+	} {
+		settings := rootThreadSettings(selected.model, selected.effort)
+		if settings.Model != selected.model || settings.ReasoningEffort != selected.effort ||
+			settings.Policy != workspacecodex.LeadThreadPolicy() {
+			t.Fatalf("root settings = %#v", settings)
+		}
+	}
+}
 
 type teamModelCatalogStub struct {
 	models []codex.Model

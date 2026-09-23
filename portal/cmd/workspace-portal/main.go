@@ -48,6 +48,12 @@ func newCodexClient(socket, workspace string) *workspacecodex.Client {
 	})
 }
 
+func rootThreadSettings(model, effort string) codex.ThreadSettings {
+	return codex.ThreadSettings{
+		Model: model, ReasoningEffort: effort, Policy: workspacecodex.LeadThreadPolicy(),
+	}
+}
+
 const version = "0.1.0"
 
 type threadRuntime struct {
@@ -646,7 +652,7 @@ func threadCommand(args []string) error {
 		}
 		var id string
 		var err error
-		settings := codex.ThreadSettings{Model: *model, ReasoningEffort: *effort}
+		settings := rootThreadSettings(*model, *effort)
 		resolveSettings := func() (codex.ThreadSettings, error) {
 			if settings.Model == "" && settings.ReasoningEffort == "" {
 				return settings, nil
@@ -659,6 +665,9 @@ func threadCommand(args []string) error {
 		}
 		if *recoverArchived {
 			id, err = client.RecoverArchivedThread(ctx, *threadID, *cwd, runtime.environment())
+			if err == nil {
+				err = client.ReconcileThreadInstructionsWithPolicy(ctx, id, settings.Policy)
+			}
 		} else if *recoverCreating {
 			id, err = client.RecoverCreatingThreadWithSettingsResolver(
 				ctx, *threadID, *cwd, runtime.environment(), resolveSettings,
@@ -689,7 +698,7 @@ func threadCommand(args []string) error {
 		}
 		id, err := client.RecoverForkThread(
 			ctx, *threadID, *cwd, runtime.environment(),
-			codex.ThreadSettings{Model: *model, ReasoningEffort: *effort},
+			rootThreadSettings(*model, *effort),
 		)
 		if err != nil {
 			return err
