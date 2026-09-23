@@ -212,6 +212,12 @@ message ID for retries. The browser retains an uncertain assignment ID across
 reloads in the current tab until the request is confirmed. In the CLI, keep
 the ID shown after an uncertain assignment failure and pass it with
 `--message-id` when retrying.
+Retry the same ID within the same installed package generation. A package
+switch can change the retained assignment text or tool path, so an earlier
+uncertain ID may be rejected rather than silently replayed. If that happens,
+inspect the member transcript to determine whether the assignment arrived.
+Send a new assignment with a new ID only after confirming it did not; if the
+outcome remains uncertain, stop and investigate before resending.
 
 The report tool is bound to the workspace, session, lead thread, member address,
 and exact member thread. A new or forked thread receives the tool after its ID
