@@ -1632,12 +1632,13 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
-	server.render(response, "index", pageData{
+	data := pageData{
 		BaseURL: "https://workspace.example.test", CreationDate: "2026-09-22",
 		AgentTeams: &agentTeamsPage{Managed: true, DefaultTeam: "delegated", CatalogDigest: strings.Repeat("a", 64),
 			Teams: []agentTeamRow{{Name: "delegated", Label: "Full team", Description: "Separate design and review",
 				MemberCount: 4, RoleSummary: "1 lead, 1 architect, 1 implementer, 1 reviewer", LeadModel: "gpt-6-sol", LeadEffort: "high"}}},
-	})
+	}
+	server.render(response, "index", data)
 	body := response.Body.String()
 	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`, `data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
 		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required`,
@@ -1648,6 +1649,12 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	}
 	if strings.Contains(body, `Advanced lead override`) || strings.Contains(body, `Configured default`) {
 		t.Fatal("new session still exposes an ambiguous lead override")
+	}
+	data.Session = &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true}
+	response = httptest.NewRecorder()
+	server.render(response, "session", data)
+	if !strings.Contains(response.Body.String(), `Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`) {
+		t.Fatal("plan-to-new-session dialog omitted the total member count")
 	}
 }
 
