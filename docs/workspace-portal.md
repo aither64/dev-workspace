@@ -219,6 +219,11 @@ is known. Before each assignment, App Server resumes the member thread with
 that binding, including for members created by an earlier package. No roster
 format change is needed. The helper checks the current roster identity before
 sending. A missing or mismatched binding fails without sending to `lead`.
+The helper exposes only `report_to_lead`. It passes the report through stdin to
+the installed session command, which checks that the lead thread still belongs
+to this session under the session lock. Neither command puts the report text in
+its process arguments. Use a fresh message ID for each report, and reuse that
+ID only when retrying delivery of the same report.
 
 A fork requires all source members to have finished creation, preserves the
 source member snapshot, and refuses an interrupted retry if that roster
