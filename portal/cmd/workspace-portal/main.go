@@ -90,7 +90,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal serve|router|thread|team|team-preset|agent-teams|validate|version")
+		return errors.New("usage: workspace-portal serve|router|thread|team|team-mcp|team-preset|agent-teams|validate|version")
 	}
 	switch args[0] {
 	case "serve":
@@ -101,6 +101,8 @@ func run(args []string) error {
 		return threadCommand(args[1:])
 	case "team":
 		return teamCommand(args[1:])
+	case "team-mcp":
+		return teamMCPCommand(args[1:], os.Stdin, os.Stdout, os.Stderr, teamMCPDependencies{})
 	case "team-preset":
 		return teamPresetCommand(args[1:])
 	case "agent-teams":

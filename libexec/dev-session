@@ -90,6 +90,7 @@ module DevSession
   ENV_REQUIRE_RUNTIME = 'DEV_SESSION_REQUIRE_RUNTIME'
   ENV_TMUX_IDENTITY = 'DEV_SESSION_TMUX_IDENTITY'
   ENV_MEMBER_ADDRESS = 'DEV_SESSION_MEMBER_ADDRESS'
+  ENV_EXPECTED_ROOT_THREAD_ID = 'DEV_SESSION_EXPECTED_ROOT_THREAD_ID'
 
   TMUX_METADATA = RUNTIME_CONTRACT.fetch('tmuxMetadata').freeze
   TMUX_AUTHORITY_FORMAT = TMUX_METADATA.fetch('authorityFormat').freeze
@@ -1470,6 +1471,12 @@ module DevSession
 		reject_conflicting_lifecycle_journal!(slug)
 		raise Error, "session is archived: #{slug}" unless path_exists?(work_dir(slug))
 		require_team_creation_ready!(slug)
+		if @env.key?(ENV_EXPECTED_ROOT_THREAD_ID)
+		  current = load_portal_manifest(portal_file(slug), required: true, expected_slug: slug)
+		  unless current.dig('codex', 'thread_id') == @env[ENV_EXPECTED_ROOT_THREAD_ID]
+			raise Error, "Team member's lead thread changed; report was not sent."
+		  end
+		end
 		invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:)
 	  end
 	end
@@ -1514,13 +1521,19 @@ module DevSession
 		return apply_direct_team_preset!(slug, root_thread, preset_spec)
 	  end
       { preset:, role:, address:, from:, to:, message:, message_id:, model:, effort: }.each do |name, value|
+        next if action == 'assign' && name == :message
         next if value.nil? || value.empty?
         command.concat(["--#{name.to_s.tr('_', '-')}", value])
       end
+	  command.concat(['--input-file', '/dev/stdin']) if action == 'assign'
 	  command.concat(['--source-session-slug', source_slug]) if source_slug && !source_slug.empty?
       command.concat(['--source-root-thread-id', source_root_thread]) if source_root_thread && !source_root_thread.empty?
       begin
-        output, = @command_runner.capture(command)
+        output, = if action == 'assign'
+                    @command_runner.capture(command, input: message.to_s)
+                  else
+                    @command_runner.capture(command)
+                  end
       rescue Error => e
         raise Error, "#{e.message}\nIf it may have been sent, retry with --message-id #{message_id}" if action == 'assign' && message_id
         raise
@@ -8261,20 +8274,28 @@ module DevSession
     def run_team
       action = @argv.shift
       raise Error, 'usage: team list|preset|add|configure|remove|assign <session> ...' unless action
-      opts = { as_is: false, model: nil, effort: nil, from: 'lead', to: nil, message: nil, message_id: nil }
+      opts = { as_is: false, model: nil, effort: nil, from: 'lead', to: nil, message: nil,
+               message_id: nil, message_stdin: false, message_option: false }
       parser = OptionParser.new do |flags|
         flags.on('--as-is') { opts[:as_is] = true }
         flags.on('--model MODEL') { |value| opts[:model] = value }
         flags.on('--effort EFFORT') { |value| opts[:effort] = value }
         flags.on('--from ADDRESS') { |value| opts[:from] = value }
         flags.on('--to ADDRESS') { |value| opts[:to] = value }
-        flags.on('--message TEXT') { |value| opts[:message] = value }
+        flags.on('--message TEXT') { |value| opts[:message], opts[:message_option] = value, true }
+		flags.on('--message-stdin') { opts[:message_stdin] = true }
         flags.on('--message-id ID') { |value| opts[:message_id] = value }
       end
       parser.parse!(@argv)
       expected = { 'list' => 1, 'preset' => 2, 'add' => 2, 'configure' => 2, 'remove' => 2, 'assign' => 1 }
       raise Error, "unknown team action: #{action}" unless expected.key?(action)
       require_arity!(expected.fetch(action), @argv, "team #{action}")
+	  if opts[:message_stdin]
+		raise Error, '--message-stdin is only available for team assign' unless action == 'assign'
+		raise Error, '--message and --message-stdin cannot be combined' if opts[:message_option]
+		opts[:message] = @input.read(MAX_MESSAGE_BYTES + 1).to_s
+		raise Error, "team message exceeds #{MAX_MESSAGE_BYTES} bytes" if opts[:message].bytesize > MAX_MESSAGE_BYTES
+	  end
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       opts[:message_id] ||= SecureRandom.uuid if action == 'assign'
       parameters = { model: opts[:model], effort: opts[:effort], from: opts[:from], to: opts[:to], message: opts[:message], message_id: opts[:message_id] }
