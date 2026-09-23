@@ -209,7 +209,13 @@ type pageData struct {
 	AgentTeams        *agentTeamsPage
 	TeamStatusError   string
 	DirectTeam        *teamruntime.Roster
+	RemovedMembers    []teamruntime.Member
 	TeamPresets       []teamruntime.Preset
+	ReadyMembers      []teamruntime.Member
+	SelectedMember    string
+	SelectedThreadID  string
+	ConversationID    string
+	MemberNotice      string
 }
 
 type agentTeamsPage struct {
@@ -983,6 +989,7 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 
 // sessionDetails refreshes the existing sections without replacing the conversation.
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	s.normalizeInteractivity(r.Context(), summary)
 	var warning string
 	if !summary.Archived {
 		repositories, err := s.activeRepositories(r.Context(), summary)
@@ -992,13 +999,22 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		}
 		summary.Repositories = repositories
 	}
-	data := pageData{Session: summary, Repositories: s.repositories(r.Context(), summary), RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary)}
+	data := pageData{Session: summary, Repositories: s.repositories(r.Context(), summary), RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary), AgentTeams: s.agentTeamsPage()}
 	data.TeamPresets = s.directTeamPresets()
+	readyMembers := make([]string, 0)
 	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
 		s.config.Logger.Printf("refresh team roster for %s: %v", summary.Slug, rosterErr)
 		data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
 	} else {
 		data.DirectTeam = roster
+		data.RemovedMembers = removedTeamMembers(roster)
+		if roster != nil && summary.Interactive {
+			for _, member := range roster.Members {
+				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" {
+					readyMembers = append(readyMembers, member.Address)
+				}
+			}
+		}
 	}
 	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
@@ -1030,8 +1046,22 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
 		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
-		"teamHTML": members.String(),
+		"teamHTML":     members.String(),
+		"readyMembers": readyMembers,
 	})
+}
+
+func removedTeamMembers(roster *teamruntime.Roster) []teamruntime.Member {
+	if roster == nil {
+		return nil
+	}
+	removed := make([]teamruntime.Member, 0)
+	for _, member := range roster.Members {
+		if member.State == "removed" {
+			removed = append(removed, member)
+		}
+	}
+	return removed
 }
 
 func (s *Server) repositories(ctx context.Context, summary *session.Summary) []repository.Status {

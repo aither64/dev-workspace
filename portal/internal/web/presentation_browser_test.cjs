@@ -102,7 +102,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.keyboard.press("Escape");
       await expect(limits).toHaveAttribute("aria-expanded", "false");
       for (const name of ["Workspace", "Delete session"]) await expect(sidebar.getByRole(name === "Workspace" ? "link" : "button", {name, exact: true})).toBeVisible();
-      await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+      await page.getByRole("tab", {name: "Settings", exact: true}).click();
       await width(250);
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await width(58);
@@ -117,7 +117,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await width(58);
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).focus();
       await page.keyboard.press("End");
-      await expect(page.getByRole("tab", {name: "Session settings", exact: true})).toBeFocused();
+      await expect(page.getByRole("tab", {name: "Settings", exact: true})).toBeFocused();
       const historyLength = await page.evaluate(() => history.length);
       await page.keyboard.press("End");
       assert.equal(await page.evaluate(() => history.length), historyLength, "same-tab key added a history entry");
@@ -132,7 +132,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       failArchive = true;
       await expireAutoArchiveCache();
       await page.getByRole("tab", {name: "Codex", exact: true}).click();
-      await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+      await page.getByRole("tab", {name: "Settings", exact: true}).click();
       await expect(page.locator("#auto-archive-status")).toContainText("Showing the last available settings");
       await expect(page.locator("#auto-archive-values")).toContainText("Not before");
       await expect(technical.locator("pre")).toContainText("Fixture read failure");
@@ -150,7 +150,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
         archive = fixture;
         await expireAutoArchiveCache();
         await page.getByRole("tab", {name: "Codex", exact: true}).click();
-        await page.getByRole("tab", {name: "Session settings", exact: true}).click();
+        await page.getByRole("tab", {name: "Settings", exact: true}).click();
         await expect(page.locator("#auto-archive-values")).toContainText("Waiting for the first scan");
         await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
       }

@@ -158,6 +158,12 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .team-table th { color: var(--muted); font-size: .76rem; text-transform: uppercase; letter-spacing: .06em; }
 .team-table td { font-size: .85rem; }
 .team-table .badge { white-space: nowrap; }
+.removed-members { margin-top: 1rem; }
+.removed-members summary { cursor: pointer; color: var(--muted); }
+#team-transcript .transcript { display: block; height: min(55dvh, 32rem); overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; }
+#team-transcript .message { margin-bottom: .7rem; }
+#team-transcript .message pre { overflow: visible; white-space: pre-wrap; overflow-wrap: anywhere; }
+#team-transcript .message-time { display: block; }
 .team-state-active, .team-state-completed { color: var(--accent); border-color: #2b6652; }
 .team-state-submitting, .team-state-accepted-awaiting-observation { color: var(--warning); border-color: #66532e; }
 .team-state-unknown, .team-state-blocked { color: var(--danger); border-color: #713b46; }

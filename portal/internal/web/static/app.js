@@ -1394,9 +1394,9 @@
   let currentEffort = "";
   let currentMode = "";
   let currentThreadId = body.dataset.threadId || "";
+  const conversationID = body.dataset.conversationId || body.dataset.session || "";
+  const selectedMember = body.dataset.selectedMember || "";
   let threadActive = false;
-  const modelSelects = Array.from(document.querySelectorAll("[data-model-select]"));
-  const effortSelects = Array.from(document.querySelectorAll("[data-effort-select]"));
   const teamSelects = Array.from(document.querySelectorAll("[data-team-select]"));
 
   const updateTeamDescription = (teamSelect) => {
@@ -1563,9 +1563,11 @@
     effortSelect.disabled = !model || (threadActive && existingSettings);
   };
 
-  const applyCurrentSettings = () => {
-    modelSelects.forEach((modelSelect, index) => {
-      const effortSelect = effortSelects[index];
+  const pairedEffortSelect = (modelSelect) => modelSelect.id === "codex-model" ?
+    document.getElementById("codex-effort") : modelSelect.closest("form")?.elements.effort;
+  const applyCurrentSettings = (root = document) => {
+    root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
+      const effortSelect = pairedEffortSelect(modelSelect);
       const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
       const retainedValue = modelSelect.dataset.currentValue || "";
       if (retainedValue && Array.from(modelSelect.options).some((option) => option.value === retainedValue)) {
@@ -1575,14 +1577,16 @@
         if (Array.from(modelSelect.options).some((option) => option.value === team.dataset.leadModel)) {
           modelSelect.value = team.dataset.leadModel;
         } else modelSelect.selectedIndex = -1;
-      } else if (!team && currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
+      } else if (!team && !retainedValue && !modelSelect.closest("[data-direct-team-form]") &&
+                 currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
         modelSelect.value = currentModel;
       }
       // A plan/new-session override is a pending creation choice, not a view
       // of the source conversation. Preserve both its explicit value and its
       // intentional empty default across background settings refreshes.
+      const retainedEffort = modelSelect.closest('[data-action="configure"]') ? effortSelect.dataset.currentValue : "";
       populateEfforts(modelSelect, effortSelect, team && effortSelect.dataset.userEdited !== "true" ?
-        team.dataset.leadEffort : effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
+        team.dataset.leadEffort : retainedEffort || effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
       if (modelSelect.dataset.existingSettings === "true") {
         modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
       }
@@ -1598,11 +1602,14 @@
       button.setAttribute("aria-pressed", active ? "true" : "false");
     });
     restoreManagedCreationDrafts();
+    updateCreationCLI();
   };
 
-  const loadModels = async () => {
+  const loadModels = async (root = document) => {
+    const modelSelects = Array.from(root.querySelectorAll("[data-model-select]"));
+    const effortSelects = Array.from(root.querySelectorAll("[data-effort-select]"));
     try {
-      models = await request("/api/models");
+      if (!models.length) models = await request("/api/models");
       for (const modelSelect of modelSelects) {
         const allowDefault = !modelSelect.required;
         modelSelect.replaceChildren();
@@ -1624,7 +1631,7 @@
           if (defaultModel) modelSelect.value = defaultModel.model;
         }
       }
-      applyCurrentSettings();
+      applyCurrentSettings(root);
       applyMemberDefaults();
       restoreManagedCreationDrafts();
     } catch (_error) {
@@ -1640,15 +1647,18 @@
     }
   };
 
-  modelSelects.forEach((modelSelect, index) => {
-    modelSelect.addEventListener("change", () => {
-      modelSelect.dataset.userEdited = "true";
-      populateEfforts(modelSelect, effortSelects[index]);
+  const bindModelSelects = (root = document) => {
+    root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
+      modelSelect.addEventListener("change", () => {
+        modelSelect.dataset.userEdited = "true";
+        populateEfforts(modelSelect, pairedEffortSelect(modelSelect));
+      });
+      pairedEffortSelect(modelSelect)?.addEventListener("change", (event) => {
+        event.currentTarget.dataset.userEdited = "true";
+      });
     });
-    effortSelects[index]?.addEventListener("change", () => {
-      effortSelects[index].dataset.userEdited = "true";
-    });
-  });
+  };
+  bindModelSelects();
   teamSelects.forEach((teamSelect) => {
     updateTeamDescription(teamSelect);
     teamSelect.addEventListener("change", () => {
@@ -1656,9 +1666,9 @@
       applyTeamLeadSettings(teamSelect);
     });
   });
-  const memberDefaults = document.getElementById("team-role-defaults");
-  const addMemberForm = document.querySelector('[data-direct-team-form][data-action="add"]');
   const applyMemberDefaults = () => {
+    const memberDefaults = document.getElementById("team-role-defaults");
+    const addMemberForm = document.querySelector('[data-direct-team-form][data-action="add"]');
     if (!memberDefaults || !addMemberForm || !models.length) return;
     const preset = memberDefaults.dataset.currentPreset || memberDefaults.dataset.defaultPreset;
     const role = addMemberForm.elements.role.value.trim();
@@ -1676,15 +1686,16 @@
     modelSelect.selectedIndex = -1;
     populateEfforts(modelSelect, effortSelect);
   };
-  addMemberForm?.elements.role?.addEventListener("change", applyMemberDefaults);
-  addMemberForm?.elements.role?.addEventListener("input", applyMemberDefaults);
+  document.addEventListener("change", (event) => {
+    if (event.target.matches('[data-direct-team-form][data-action="add"] [name="role"]')) applyMemberDefaults();
+  });
   document.querySelectorAll("[data-team-catalog-acknowledge]").forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
       if (checkbox.checked) acknowledgeManagedCatalogRecovery(checkbox.closest("form"));
     });
   });
   restoreManagedCreationDrafts();
-  if (modelSelects.length) loadModels();
+  if (document.querySelector("[data-model-select]")) loadModels();
 
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy]");
@@ -1831,15 +1842,20 @@
         const item = document.createElement("article"); item.className = "message";
         const heading = document.createElement("strong"); heading.textContent = entry.kind || "message";
         const text = document.createElement("pre"); text.textContent = entry.text || entry.displayText || "";
-        item.append(heading, text); output.append(item);
+        const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+        const time = document.createElement("time"); time.className = "message-time";
+        time.textContent = timestamp.text;
+        time.title = timestamp.title;
+        if (timestamp.dateTime) time.dateTime = timestamp.dateTime;
+        item.append(heading, text, time); output.append(item);
       }
       if (!output.childElementCount) output.append(Object.assign(document.createElement("p"), {className: "empty", textContent: "This member has no visible messages yet."}));
     } catch (error) {
       output.replaceChildren(Object.assign(document.createElement("p"), {className: "notice error", textContent: error.message}));
     } finally { button.disabled = false; }
   });
-  document.querySelector("[data-team-transcript-close]")?.addEventListener("click", () => {
-    document.getElementById("team-transcript").hidden = true;
+  document.addEventListener("click", (event) => {
+    if (event.target.closest("[data-team-transcript-close]")) document.getElementById("team-transcript").hidden = true;
   });
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-team-retry]");
@@ -2294,8 +2310,30 @@
       if (typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
         if (teamStatus) {
+          const removedOpen = teamStatus.querySelector(".removed-members")?.open || false;
           teamStatus.innerHTML = payload.teamHTML;
           lastTeamHTML = payload.teamHTML;
+          const removed = teamStatus.querySelector(".removed-members");
+          if (removed) removed.open = removedOpen;
+          bindModelSelects(teamStatus);
+          void loadModels(teamStatus);
+        }
+      }
+      if (Array.isArray(payload.readyMembers)) {
+        const selector = document.getElementById("codex-member");
+        if (selector) {
+          const addresses = ["lead", ...payload.readyMembers];
+          if (selectedMember && !addresses.includes(selectedMember)) {
+            const target = new URL(location.href);
+            target.searchParams.delete("member");
+            target.hash = "codex";
+            location.replace(target.href);
+            return;
+          }
+          if (JSON.stringify([...selector.options].map((option) => option.value)) !== JSON.stringify(addresses)) {
+            selector.replaceChildren(...addresses.map((address) => new Option(address, address)));
+            selector.value = selectedMember || "lead";
+          }
         }
       }
       for (const [section, label, count] of [

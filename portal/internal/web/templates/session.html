@@ -25,7 +25,7 @@
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
-        <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Session settings" aria-label="Session settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Session settings</span></a>
+        <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Settings" aria-label="Settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Settings</span></a>
       </nav>
     {{end}}
     </div>
@@ -51,7 +51,7 @@
     {{else}}
     <section class="session-tabs">
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
-        <div class="section-heading"><h2>Session settings</h2></div>
+        <div class="section-heading"><h2>Settings</h2></div>
         <section id="auto-archive-panel" class="panel">
           <h3>Automatic archival</h3>
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
@@ -206,10 +206,10 @@
 
 {{define "member-status"}}
   <div class="section-heading"><h2>Team</h2><span>Independent threads</span></div>
-  <p class="muted">The lead is this session's normal conversation. Each member has its own persistent Codex thread. Member settings apply to its next assignment.</p>
+  <p class="muted">The lead is this session's normal conversation. Each member has a persistent Codex thread. Member settings apply to its next turn.</p>
   {{if and .Session.Interactive (not .DirectTeam)}}
   <form class="stack managed-team-form" data-direct-team-form data-action="preset">
-    <label>Start from a preset<select name="preset">{{range .TeamPresets}}<option value="{{.ID}}">{{.Name}} — {{range .Roles}}{{.}} {{end}}</option>{{end}}</select></label>
+    <label>Start from a preset<select name="preset">{{range .TeamPresets}}<option value="{{.ID}}">{{.Name}} ({{.MemberCount}}): {{.RoleSummary}}</option>{{end}}</select></label>
     <button type="submit">Create team</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
   </form>
   {{end}}
@@ -223,8 +223,9 @@
   <h3>Members</h3>
   <div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Next-turn settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>
   <tr><td><code>lead</code></td><td><span class="badge team-state-active">root</span></td><td>Use the Codex controls</td><td><code>{{.Session.Codex.ThreadID}}</code></td><td></td></tr>
-  {{if .DirectTeam}}{{range .DirectTeam.Members}}<tr><td><code>{{.Address}}</code></td><td><span class="badge team-state-{{.State}}">{{.State}}</span></td><td>{{if eq .State "ready"}}<form data-direct-team-form data-action="configure" data-address="{{.Address}}" class="member-settings"><select name="model" data-model-select data-current-value="{{.Model}}" aria-label="{{.Address}} model" required><option value="">Loading models…</option></select><select name="effort" data-effort-select data-current-value="{{.Effort}}" aria-label="{{.Address}} reasoning" required><option value="">Loading efforts…</option></select><button type="submit" class="quiet">Save</button><p class="operation-progress" role="status" aria-live="polite" hidden></p></form>{{else}}<code>{{.Model}}</code> <code>{{.Effort}}</code>{{end}}</td><td><code>{{.Thread}}</code></td><td>{{if .Thread}}<button type="button" class="quiet" data-team-thread="{{.Address}}">View messages</button>{{end}}{{if eq .State "ready"}}<button type="button" class="quiet" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>{{end}}{{else}}<tr><td colspan="5" class="muted">No team roster yet.</td></tr>{{end}}
+  {{if .DirectTeam}}{{range .DirectTeam.Members}}{{if ne .State "removed"}}{{template "team-member-row" .}}{{end}}{{end}}{{else}}<tr><td colspan="5" class="muted">No team roster yet.</td></tr>{{end}}
   </tbody></table></div>
+  {{if .RemovedMembers}}<details class="removed-members"><summary>Removed members ({{len .RemovedMembers}})</summary><div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Last settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>{{range .RemovedMembers}}{{template "team-member-row" .}}{{end}}</tbody></table></div></details>{{end}}
   <p id="team-action-status" class="operation-progress" role="status" aria-live="polite" hidden></p>
   <section class="panel" id="team-transcript" hidden><div class="section-heading"><h3>Member messages</h3><button type="button" class="quiet" data-team-transcript-close>Close</button></div><div class="transcript" role="log"></div></section>
   {{if and .Session.Interactive .DirectTeam}}
@@ -232,4 +233,8 @@
     <h3>Assign work</h3><label>To<select name="to"><option value="lead">lead</option>{{range .DirectTeam.Members}}{{if eq .State "ready"}}<option value="{{.Address}}">{{.Address}}</option>{{end}}{{end}}</select></label><label>Task<textarea name="message" rows="3" required maxlength="32768" placeholder="Describe the work and expected report."></textarea></label><div class="field-grid"><label>Model for this turn<select name="model" data-model-select><option value="">Member default</option></select></label><label>Reasoning for this turn<select name="effort" data-effort-select><option value="">Member default</option></select></label></div><button type="submit">Assign</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
   </form>
   {{end}}
+{{end}}
+
+{{define "team-member-row"}}
+<tr><td><code>{{.Address}}</code></td><td><span class="badge team-state-{{.State}}">{{.State}}</span></td><td>{{if eq .State "ready"}}<form data-direct-team-form data-action="configure" data-address="{{.Address}}" class="member-settings"><select name="model" data-model-select data-current-value="{{.Model}}" aria-label="{{.Address}} model" required><option value="">Loading models…</option></select><select name="effort" data-effort-select data-current-value="{{.Effort}}" aria-label="{{.Address}} reasoning" required><option value="">Loading efforts…</option></select><button type="submit" class="quiet">Save</button><p class="operation-progress" role="status" aria-live="polite" hidden></p></form>{{else}}<code>{{.Model}}</code> <code>{{.Effort}}</code>{{end}}</td><td><code>{{.Thread}}</code></td><td>{{if .Thread}}<button type="button" class="quiet" data-team-thread="{{.Address}}">View messages</button>{{end}}{{if eq .State "ready"}}<button type="button" class="quiet" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>
 {{end}}

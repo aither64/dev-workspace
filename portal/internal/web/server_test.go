@@ -4222,26 +4222,40 @@ func TestSessionDetailsReplaceClusterStateAfterStopAndReset(t *testing.T) {
 
 func TestSessionDetailsRetainsDirectTeamRoster(t *testing.T) {
 	server := newTestServer(t)
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, "example")
 	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Update(context.Background(), "example", "root-example", true, func(roster *teamruntime.Roster) error {
+	if _, err := store.Update(context.Background(), "example", "thread-1", true, func(roster *teamruntime.Roster) error {
 		roster.Members = append(roster.Members, teamruntime.Member{
-			Address: "implementer0", Role: "implementer", Thread: "member-thread", State: "ready", AddedAt: time.Now().UTC(),
+			Address: "implementer0", Role: "implementer", Thread: "member-thread", Model: "gpt-6-sol", Effort: "xhigh", State: "ready", AddedAt: time.Now().UTC(),
+		}, teamruntime.Member{
+			Address: "reviewer0", Role: "reviewer", Thread: "old-reviewer", State: "removed", AddedAt: time.Now().UTC(),
 		})
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	summary := &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "root-example"}}, Interactive: true}
 	response := httptest.NewRecorder()
-	server.sessionDetails(response, httptest.NewRequest("GET", "/api/sessions/example/details", nil), summary)
+	server.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/api/sessions/example/details", nil))
 	if response.Code != http.StatusOK {
 		t.Fatal(response.Body.String())
 	}
 	var payload struct {
-		TeamHTML string `json:"teamHTML"`
+		TeamHTML     string   `json:"teamHTML"`
+		ReadyMembers []string `json:"readyMembers"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
