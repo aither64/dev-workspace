@@ -43,7 +43,7 @@
         <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
         {{if .AgentTeams.Managed}}
         <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
-        <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}">{{.Label}}: {{.RoleSummary}}</option>{{end}}</select></label>
+        <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}">{{.Label}} ({{.MemberCount}}): {{.RoleSummary}}</option>{{end}}</select></label>
         <p class="muted" data-team-description></p>
         <p class="notice warning" data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed since you saved this draft. Check the team and lead settings before creating the session.</p>
         <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>
@@ -55,6 +55,7 @@
         </div>
         {{end}}
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
+        <div class="cli-preview"><label>From {{.HostLabel}}, in this workspace<div class="copy-row"><input data-cli-command readonly aria-label="CLI command"><button type="button" data-copy disabled>Copy</button></div></label><p class="muted">The CLI asks for the initial request on stdin. Portal uploads are not included in this command.</p></div>
         <input type="hidden" name="uploadScope">
         <div id="creation-uploads"></div>
         <p id="new-session-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>

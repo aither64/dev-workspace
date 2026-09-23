@@ -20,8 +20,14 @@ const {
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
   lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
-  renderCollaborationModes, storeCreationDraft,
+  renderCollaborationModes, storeCreationDraft, creationCLICommand,
 } = require("./static/app.js");
+
+assert.equal(creationCLICommand({name:"feature", team:"delegated", model:"gpt-6-sol", effort:"xhigh"}),
+  "dev-session start 'feature' --team 'delegated' --model 'gpt-6-sol' --effort 'xhigh'");
+assert.equal(creationCLICommand({name:"feature", model:"gpt-6-sol", effort:"high"}),
+  "dev-session start 'feature' --model 'gpt-6-sol' --effort 'high'");
+assert.equal(creationCLICommand({name:"", model:"gpt-6-sol", effort:"high"}), "");
 
 const archivalDiagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
 const archivalState = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z",

@@ -108,6 +108,48 @@ type Preset struct {
 	Members       []MemberSpec `json:"members"`
 }
 
+func (preset Preset) MemberCount() int {
+	if preset.CatalogDigest == "" && len(preset.Members) == 0 {
+		return len(preset.Roles) + 1
+	}
+	return len(preset.Members) + 1
+}
+
+func (preset Preset) RoleSummary() string {
+	counts := map[string]int{"lead": 1}
+	if preset.CatalogDigest == "" && len(preset.Members) == 0 {
+		for _, role := range preset.Roles {
+			counts[role]++
+		}
+	} else {
+		for _, member := range preset.Members {
+			counts[member.Role]++
+		}
+	}
+	roles := []string{"lead", "architect", "implementer", "reviewer"}
+	extraRoles := make([]string, 0)
+	for role := range counts {
+		if role != "lead" && role != "architect" && role != "implementer" && role != "reviewer" {
+			extraRoles = append(extraRoles, role)
+		}
+	}
+	sort.Strings(extraRoles)
+	roles = append(roles, extraRoles...)
+	parts := make([]string, 0, len(counts))
+	for _, role := range roles {
+		count := counts[role]
+		if count == 0 {
+			continue
+		}
+		label := role
+		if count != 1 {
+			label += "s"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", count, label))
+	}
+	return strings.Join(parts, ", ")
+}
+
 type MemberSpec struct {
 	Role     string `json:"role"`
 	Address  string `json:"address"`

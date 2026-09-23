@@ -223,6 +223,7 @@ type agentTeamRow struct {
 	Name        string
 	Label       string
 	Description string
+	MemberCount int
 	RoleSummary string
 	LeadModel   string
 	LeadEffort  string
@@ -972,7 +973,8 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 	for _, preset := range presets {
 		rows = append(rows, agentTeamRow{
 			Name: preset.ID, Label: preset.Name, Description: preset.Description,
-			RoleSummary: strings.Join(preset.Roles, " · "), LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort,
+			MemberCount: preset.MemberCount(), RoleSummary: preset.RoleSummary(),
+			LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort,
 		})
 	}
 	return &agentTeamsPage{Managed: true, CatalogDigest: s.installedTeams.Catalog.CatalogDigest,

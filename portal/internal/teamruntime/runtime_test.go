@@ -1153,6 +1153,23 @@ func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) 
 		preset.Members[0].Model != "gpt-6-sol" || preset.Members[0].Effort != "xhigh" {
 		t.Fatalf("catalog projection = %#v", preset)
 	}
+	if preset.MemberCount() != 4 || preset.RoleSummary() != "1 lead, 1 architect, 1 implementer, 1 reviewer" {
+		t.Fatalf("catalog role summary = %d %q", preset.MemberCount(), preset.RoleSummary())
+	}
+}
+
+func TestPresetRoleSummaryCountsRepeatedRoles(t *testing.T) {
+	preset := Preset{Members: []MemberSpec{{Role: "reviewer"}, {Role: "reviewer"}, {Role: "implementer"}}}
+	if preset.MemberCount() != 4 || preset.RoleSummary() != "1 lead, 1 implementer, 2 reviewers" {
+		t.Fatalf("role summary = %d %q", preset.MemberCount(), preset.RoleSummary())
+	}
+}
+
+func TestUnmanagedPresetRoleSummaryUsesRoles(t *testing.T) {
+	preset, ok := FindPreset("full")
+	if !ok || preset.MemberCount() != 4 || preset.RoleSummary() != "1 lead, 1 architect, 1 implementer, 1 reviewer" {
+		t.Fatalf("unmanaged preset summary = %d %q, found %t", preset.MemberCount(), preset.RoleSummary(), ok)
+	}
 }
 
 func TestSoloCatalogPresetSerializesEmptyMembers(t *testing.T) {

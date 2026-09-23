@@ -1635,12 +1635,12 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 		BaseURL: "https://workspace.example.test", CreationDate: "2026-09-22",
 		AgentTeams: &agentTeamsPage{Managed: true, DefaultTeam: "delegated", CatalogDigest: strings.Repeat("a", 64),
 			Teams: []agentTeamRow{{Name: "delegated", Label: "Full team", Description: "Separate design and review",
-				RoleSummary: "lead · architect0 · implementer0 · reviewer0", LeadModel: "gpt-6-sol", LeadEffort: "high"}}},
+				MemberCount: 4, RoleSummary: "1 lead, 1 architect, 1 implementer, 1 reviewer", LeadModel: "gpt-6-sol", LeadEffort: "high"}}},
 	})
 	body := response.Body.String()
-	for _, marker := range []string{`Full team: lead · architect0 · implementer0 · reviewer0</option>`, `data-roles="lead · architect0 · implementer0 · reviewer0"`,
+	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`, `data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
 		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required`,
-		`Lead reasoning effort<select name="effort" data-effort-select required`} {
+		`Lead reasoning effort<select name="effort" data-effort-select required`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("new session omitted %q", marker)
 		}

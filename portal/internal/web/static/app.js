@@ -857,6 +857,14 @@
   const creationSubmitEligible = ({uploadReady = true, recoveryPending = false, inFlight = false} = {}) => (
     Boolean(uploadReady) && !recoveryPending && !inFlight
   );
+  const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+  const creationCLICommand = ({name, team, model, effort}) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(name || "") || !model || !effort) return "";
+    const args = ["dev-session start", shellQuote(name)];
+    if (team) args.push("--team", shellQuote(team));
+    args.push("--model", shellQuote(model), "--effort", shellQuote(effort));
+    return args.join(" ");
+  };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
@@ -881,6 +889,7 @@
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
       creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
+      creationCLICommand,
     };
     return;
   }
@@ -1241,6 +1250,7 @@
   let planSessionDraft = null;
   let persistCreationDraft = null;
   let persistPlanSessionDraft = null;
+  let updateCreationCLI = () => {};
   const managedDraftRecoveries = new WeakMap();
   const managedFormSubmissionState = new WeakMap();
   const managedFormSubmitButtons = (form) => Array.from(form.querySelectorAll("button")).filter((button) => (
@@ -1285,6 +1295,16 @@
       }
     };
     if (form) {
+      updateCreationCLI = () => {
+        const output = form.querySelector("[data-cli-command]");
+        if (!output) return;
+        const command = creationCLICommand({
+          name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
+          model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
+        });
+        output.value = command || "Choose a short name, model and reasoning effort.";
+        output.parentElement.querySelector("[data-copy]").disabled = !command || managedFormRecoveryPending(form);
+      };
       persistCreationDraft = saveCreationDraft;
       creationDraft = loadCreationDraft(creationDraftStorage, creationDraftKey, "new");
       if (creationDraft) {
@@ -1292,8 +1312,9 @@
         form.elements.goal.value = creationDraft.goal;
         form.elements.creation_date.value = creationDraft.date;
       }
-      form.addEventListener("input", saveCreationDraft);
-      form.addEventListener("change", saveCreationDraft);
+      form.addEventListener("input", () => { saveCreationDraft(); updateCreationCLI(); });
+      form.addEventListener("change", () => { saveCreationDraft(); updateCreationCLI(); });
+      updateCreationCLI();
     }
     if (form) {
       const uploadRoot = document.getElementById("creation-uploads");
