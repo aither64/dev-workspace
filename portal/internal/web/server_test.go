@@ -1604,6 +1604,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	for _, marker := range []string{
 		`id="session-tab-team"`, `id="team-member-status"`, `Independent threads`, `<code>lead</code>`,
 		`data-direct-team-form`, `Start from a preset`, `Add member`,
+		`class="member-selector"><span>Member</span><select id="codex-member"`,
 		`<option value="architect">Architect</option>`, `<option value="reviewer">Reviewer</option>`,
 	} {
 		if !strings.Contains(body, marker) {
@@ -1618,13 +1619,37 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	if !strings.Contains(body[teamStart:teamEnd], "<button") || !strings.Contains(body[teamStart:teamEnd], "<form") {
 		t.Fatalf("direct team status omitted its controls: %q", body[teamStart:teamEnd])
 	}
+	response = httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		BaseURL:      server.config.BaseURL,
+		Session:      &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		DirectTeam:   &teamruntime.Roster{Members: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}}},
+		ReadyMembers: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}},
+	})
+	body = response.Body.String()
+	teamStart = strings.Index(body, `<section id="team"`)
+	teamEnd = strings.Index(body, `<section id="repositories"`)
+	if teamStart < 0 || teamEnd < teamStart {
+		t.Fatalf("direct team section is malformed: %q", body)
+	}
+	if !strings.Contains(body, `<option value="implementer0"`) {
+		t.Fatal("Codex member selector omits the ready member")
+	}
+	if strings.Contains(body[teamStart:teamEnd], `data-action="assign"`) || strings.Contains(body[teamStart:teamEnd], `Assign work`) {
+		t.Fatal("team tab still renders the assignment form")
+	}
 	javascript, err := assets.ReadFile("static/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{`directTeamRequest`, `data-direct-team-form`, `data-team-remove`, `action === "assign"`, `body.messageId = messageId`, `assignmentStorage.setItem`, `assignmentStorage.getItem(key) !== messageId`, `assignmentStorage.removeItem`} {
+	for _, marker := range []string{`directTeamRequest`, `data-direct-team-form`, `data-team-remove`, `data-team-retry`, `data-team-thread`} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("direct team controls do not handle %q", marker)
+		}
+	}
+	for _, marker := range []string{`action === "assign"`, `direct-team-assignment:`, `assignmentStorage`} {
+		if strings.Contains(string(javascript), marker) {
+			t.Fatalf("browser client still contains the assignment form path %q", marker)
 		}
 	}
 }

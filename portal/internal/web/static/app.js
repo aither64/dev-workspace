@@ -1773,9 +1773,6 @@
     teamActionStatus.textContent = message;
     teamActionStatus.hidden = false;
   };
-  const assignmentStorageKey = (fingerprint) => `direct-team-assignment:${slug}:${fingerprint}`;
-  let assignmentStorage = null;
-  try { assignmentStorage = globalThis.sessionStorage; } catch (_error) {}
   document.addEventListener("submit", async (event) => {
     const form = event.target.closest("[data-direct-team-form]");
     if (!form || !interactive) return;
@@ -1785,47 +1782,14 @@
     const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
     const value = name => form.elements[name]?.value?.trim() || "";
     const body = {action, model: value("model"), reasoningEffort: value("effort")};
-    let assignmentFingerprint = "";
     if (action === "preset") body.preset = value("preset");
     if (action === "add") body.role = value("role");
     if (action === "configure") body.address = form.dataset.address;
-    if (action === "assign") {
-      Object.assign(body, {from: "lead", to: value("to"), message: value("message")});
-      assignmentFingerprint = await sha256Hex(JSON.stringify(body));
-      try {
-        if (!assignmentStorage) throw new Error("Session storage is unavailable");
-        const key = assignmentStorageKey(assignmentFingerprint);
-        let messageId = assignmentStorage.getItem(key) || "";
-        if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(messageId)) {
-          messageId = crypto.randomUUID();
-          assignmentStorage.setItem(key, messageId);
-          if (assignmentStorage.getItem(key) !== messageId) throw new Error("Session storage did not retain the assignment ID");
-        }
-        body.messageId = messageId;
-      } catch (_error) {
-        if (status) {
-          status.textContent = "Browser session storage is unavailable; the assignment cannot be submitted safely.";
-          status.hidden = false;
-        }
-        return;
-      }
-    }
     controls.forEach(control => { control.disabled = true; });
-    if (status) { status.textContent = action === "assign" ? "Sending assignment…" : "Saving team…"; status.hidden = false; }
+    if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
       await directTeamRequest(body);
-      if (action === "assign") {
-        try {
-          const key = assignmentStorageKey(assignmentFingerprint);
-          assignmentStorage.removeItem(key);
-          if (assignmentStorage.getItem(key) !== null) throw new Error("Session storage retained the assignment ID");
-        } catch (_error) {
-          if (status) status.textContent = "Assignment sent, but its browser retry record could not be cleared.";
-          setTimeout(() => location.reload(), 250);
-          return;
-        }
-      }
-      if (status) status.textContent = action === "assign" ? "Assignment sent." : "Saved.";
+      if (status) status.textContent = "Saved.";
       setTimeout(() => location.reload(), 250);
     } catch (error) {
       if (status) status.textContent = error.message;

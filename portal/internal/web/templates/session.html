@@ -229,11 +229,6 @@
   {{if .RemovedMembers}}<details class="removed-members"><summary>Removed members ({{len .RemovedMembers}})</summary><div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Last settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>{{range .RemovedMembers}}{{template "team-member-row" .}}{{end}}</tbody></table></div></details>{{end}}
   <p id="team-action-status" class="operation-progress" role="status" aria-live="polite" hidden></p>
   <section class="panel" id="team-transcript" hidden><div class="section-heading"><h3>Member messages</h3><button type="button" class="quiet" data-team-transcript-close>Close</button></div><div class="transcript" role="log"></div></section>
-  {{if and .Session.Interactive .DirectTeam}}
-  <form class="stack managed-team-form" data-direct-team-form data-action="assign">
-    <h3>Assign work</h3><label>To<select name="to"><option value="lead">lead</option>{{range .DirectTeam.Members}}{{if eq .State "ready"}}<option value="{{.Address}}">{{.Address}}</option>{{end}}{{end}}</select></label><label>Task<textarea name="message" rows="3" required maxlength="32768" placeholder="Describe the work and expected report."></textarea></label><div class="field-grid"><label>Model for this turn<select name="model" data-model-select><option value="">Member default</option></select></label><label>Reasoning for this turn<select name="effort" data-effort-select><option value="">Member default</option></select></label></div><button type="submit">Assign</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
-  </form>
-  {{end}}
 {{end}}
 
 {{define "team-member-row"}}

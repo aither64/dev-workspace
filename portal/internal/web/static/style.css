@@ -191,8 +191,9 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .transcript-filters { display: flex; gap: .35rem; margin: 0 auto 0 .5rem; }
 .transcript-filters button { padding: .38rem .65rem; font-size: .78rem; }
 .transcript-filters button.active { border-color: var(--accent-2); background: #142b23; color: var(--accent); }
-.member-selector { display: flex; align-items: center; gap: .35rem; margin-left: auto; font-size: .75rem; color: var(--muted); }
-.member-selector select { max-width: min(18rem, 28vw); padding: .38rem .5rem; font-size: .78rem; }
+.member-selector { display: flex; align-items: center; gap: .35rem; min-width: 0; margin-left: auto; font-size: .75rem; color: var(--muted); }
+.member-selector span { flex: none; }
+.member-selector select { width: auto; min-width: 0; max-width: min(18rem, 28vw); margin-top: 0; padding: .38rem .5rem; font-size: .78rem; }
 .chat-heading { display: flex; align-items: center; gap: .5rem; }
 .chat-heading .transcript-filters { margin-left: .5rem; margin-right: 0; }
 .transcript { flex: 1; overflow-y: auto; min-height: 0; padding: 1.2rem .3rem; overscroll-behavior: contain; overflow-anchor: none; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: .7rem; }
@@ -364,8 +365,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 
 @media (max-width: 760px) {
   .index-sidebar .codex-limits-panel[popover] { left: max(125px, calc(30vw + 10px)); right: .75rem; width: auto; max-width: 260px; }
-  .chat-heading { gap: .4rem; }
+  .chat-heading { gap: .4rem; flex-wrap: wrap; }
   .chat-heading h2 { display: none; }
+  .member-selector { flex: 1 1 10rem; margin-left: 0; }
+  .member-selector select { flex: 1 1 auto; max-width: 100%; }
   .transcript-filters { margin-left: 0; gap: .2rem; }
   .transcript-filters button { padding: .35rem .45rem; }
   .chat-heading .badge { font-size: .6rem; padding: .25rem .4rem; letter-spacing: 0; }

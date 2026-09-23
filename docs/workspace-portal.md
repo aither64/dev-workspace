@@ -147,12 +147,12 @@ settings are saved with the creation receipt. Member threads are created before
 the lead receives the initial request. A failed creation can be retried with
 that saved selection.
 
-After creation, the Team tab can add, remove, configure, assign work to, and
-inspect the messages of an individual member. Model and reasoning settings
-apply to the member's next turn. Removed members stay in a collapsed history
-section. The Codex tab can switch between `lead` and ready members to show
-each complete conversation; direct messages use the member's current role
-policy and model settings. An assignment to a busy member uses App
+After creation, the Team tab can add, remove, and configure members, and
+inspect their messages. Model and reasoning settings apply to a member's next
+turn. Removed members stay in a collapsed history section. The Codex tab can
+switch between `lead` and ready members to show each complete conversation;
+direct messages use the member's current role policy and model settings. Work
+can also be assigned from the CLI. An assignment to a busy member uses App
 Server's ordinary turn-steer behavior. Members send results and blocking
 questions to `lead` through the package-owned `report_to_lead` tool. Each
 message has a unique ID that the member reuses only if delivery needs a retry.
@@ -217,10 +217,8 @@ The runtime applies the retained role instructions to each member thread.
 Architects and reviewers use a read-only sandbox; implementers use
 workspace-write. Ordinary portal reads leave the thread's persisted
 instructions alone. Assignments reapply the retained policy and use a stable
-message ID for retries. The browser retains an uncertain assignment ID across
-reloads in the current tab until the request is confirmed. In the CLI, keep
-the ID shown after an uncertain assignment failure and pass it with
-`--message-id` when retrying.
+message ID for retries. In the CLI, keep the ID shown after an uncertain
+assignment failure and pass it with `--message-id` when retrying.
 Retry the same ID within the same installed package generation. A package
 switch can change the retained assignment text or tool path, so an earlier
 uncertain ID may be rejected rather than silently replayed. If that happens,
