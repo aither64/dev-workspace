@@ -27,6 +27,8 @@ type testClient struct {
 	starts             []codex.ThreadSettings
 	projects           map[string]codex.ProjectMetadata
 	projectCreates     int
+	projectEntered     chan struct{}
+	releaseProject     <-chan struct{}
 	lostProjectCreate  bool
 	projectReadError   error
 	resumes            []codex.ThreadSettings
@@ -64,6 +66,13 @@ type testClient struct {
 }
 
 func (client *testClient) CreateProject(_ context.Context, name, key string) (codex.ProjectMetadata, error) {
+	if client.projectEntered != nil {
+		select {
+		case client.projectEntered <- struct{}{}:
+		default:
+		}
+		<-client.releaseProject
+	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.projectCreates++
@@ -1132,6 +1141,181 @@ func TestPresetDoesNotAppendMembersToExistingTeam(t *testing.T) {
 	}
 	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "full", "", ""); err == nil {
 		t.Fatal("preset appended to an existing team")
+	}
+	cwd := filepath.Join(workspace, "work", "two")
+	if _, err := service.Add(context.Background(), "two", "root-two", cwd, nil, "implementer", "model-1", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "two", "root-two", cwd, nil, "delivery", "model-1", "high"); err == nil {
+		t.Fatal("preset expanded an all-ready manual prefix")
+	}
+}
+
+func TestUnmanagedPresetReservesAllMembersBeforeStartingThreads(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	client := &testClient{projectEntered: entered, releaseProject: release}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	type outcome struct {
+		members []Member
+		err     error
+	}
+	results := make(chan outcome, 2)
+	apply := func() {
+		members, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "delivery", "model-1", "high")
+		results <- outcome{members: members, err: err}
+	}
+	go apply()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("preset did not start its first member")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || len(roster.Members) != 2 || roster.Members[0].Address != "implementer0" ||
+		roster.Members[1].Address != "reviewer0" || roster.Members[0].State != "creating" || roster.Members[1].State != "creating" {
+		t.Fatalf("preset reservation = %#v, %v", roster, err)
+	}
+	go apply()
+	close(release)
+	var succeeded int
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				succeeded++
+				if len(result.members) != 2 {
+					t.Fatalf("completed preset members = %#v", result.members)
+				}
+			} else if !strings.Contains(result.err.Error(), "a preset can only create an empty team") {
+				t.Fatalf("concurrent preset = %v", result.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent preset did not finish")
+		}
+	}
+	roster, err = store.Load("one", "root-one")
+	if succeeded == 0 || err != nil || len(roster.Members) != 2 ||
+		roster.Members[0].State != "ready" || roster.Members[1].State != "ready" || client.next != 2 {
+		t.Fatalf("concurrent preset result = successes %d, roster %#v, starts %d, error %v", succeeded, roster, client.next, err)
+	}
+}
+
+func TestUnmanagedPresetRetryResumesPartialCreation(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "delivery", "model-1", "high"); err == nil {
+		t.Fatal("expected injected member name failure")
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || len(partial.Members) != 2 || partial.Members[0].State != "creating" ||
+		partial.Members[0].Thread != "thread-1" || partial.Members[1].State != "creating" || partial.Members[1].Thread != "" {
+		t.Fatalf("retained partial preset = %#v, %v", partial, err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "full", "model-1", "high"); err == nil {
+		t.Fatal("different preset changed the partial reservation")
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "delivery", "model-1", "medium"); err == nil {
+		t.Fatal("changed settings reused the partial reservation")
+	}
+	ready, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "delivery", "model-1", "high")
+	if err != nil || len(ready) != 2 || ready[0].Address != "implementer0" || ready[1].Address != "reviewer0" || client.next != 2 {
+		t.Fatalf("resumed preset = %#v, starts %d, error %v", ready, client.next, err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || len(roster.Members) != 2 || roster.Members[0].State != "ready" || roster.Members[1].State != "ready" {
+		t.Fatalf("ready preset roster = %#v, %v", roster, err)
+	}
+}
+
+func TestUnmanagedPresetRejectsOldSequentialPrefix(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	if _, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "model-1", "high"); err == nil {
+		t.Fatal("expected injected member name failure")
+	}
+	partial, err := store.Load("one", "root-one")
+	if err != nil || len(partial.Members) != 1 || partial.Members[0].State != "creating" {
+		t.Fatalf("old sequential prefix = %#v, %v", partial, err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "delivery", "model-1", "high"); err == nil {
+		t.Fatal("preset expanded an old sequential prefix")
+	}
+	retained, err := store.Load("one", "root-one")
+	if err != nil || len(retained.Members) != 1 || retained.Members[0].Address != "implementer0" || client.next != 1 {
+		t.Fatalf("old prefix changed = %#v, starts %d, error %v", retained, client.next, err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", cwd, nil, "solo", "", ""); err == nil {
+		t.Fatal("solo accepted a nonempty team")
+	}
+}
+
+func TestUnmanagedPresetRejectsManualCreatingPrefix(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		roster.Members = append(roster.Members, Member{Address: "implementer0", Role: "implementer", Model: "model-1",
+			Effort: "high", Behavior: "implementer", Access: "workspace_write", State: "creating", AddedAt: time.Now().UTC()})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"delivery", "model-1", "high"); err == nil {
+		t.Fatal("preset expanded a manual creating prefix")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || len(roster.Members) != 1 || roster.Members[0].Address != "implementer0" || client.next != 0 {
+		t.Fatalf("manual creating prefix changed = %#v, starts %d, error %v", roster, client.next, err)
+	}
+}
+
+func TestUnmanagedSoloChecksRosterUnderOperationLock(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Store: store, Client: &testClient{}, Workspace: workspace}
+	release, err := store.LockOperation(context.Background(), "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = service.ApplyPreset(ctx, "one", "root-one", "", nil, "solo", "", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("solo bypassed a concurrent team operation: %v", err)
+	}
+	release()
+	if _, err := service.ApplyPreset(context.Background(), "one", "root-one", "", nil, "solo", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load("one", "root-one"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("solo created a persistent reservation: %v", err)
 	}
 }
 

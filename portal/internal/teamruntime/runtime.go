@@ -742,28 +742,87 @@ func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, 
 }
 
 func (service Service) ApplyPreset(ctx context.Context, slug, rootThreadID, cwd string, environment map[string]string, preset string, model, effort string) ([]Member, error) {
+	if service.Store == nil || service.Client == nil {
+		return nil, errors.New("team runtime is unavailable")
+	}
 	selected, ok := FindPreset(preset)
 	if !ok {
 		return nil, errors.New("unknown team preset")
 	}
-	roster, err := service.Store.Load(slug, rootThreadID)
-	if err == nil && len(roster.Members) > 0 {
-		return nil, errors.New("a preset can only create an empty team")
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	if len(selected.Roles) == 0 {
-		return nil, nil
-	}
-	if roster == nil {
-		if _, err := service.Store.Update(ctx, slug, rootThreadID, true, func(*Roster) error { return nil }); err != nil {
+	var expected []Member
+	indices := make(map[string]uint64)
+	for _, role := range selected.Roles {
+		policy, err := catalogRole(service.Catalog, role, false)
+		if err != nil {
 			return nil, err
 		}
+		index := indices[role]
+		indices[role]++
+		member := Member{Address: fmt.Sprintf("%s%d", role, index), Role: role, Index: index,
+			Model: model, Effort: effort, Behavior: policy.Behavior, Access: policy.Access}
+		if service.Catalog != nil {
+			member.PolicyCatalogDigest = service.Catalog.CatalogDigest
+		}
+		expected = append(expected, member)
 	}
-	created := make([]Member, 0, len(selected.Roles))
-	for _, role := range selected.Roles {
-		member, err := service.Add(ctx, slug, rootThreadID, cwd, environment, role, model, effort)
+	if len(selected.Roles) == 0 {
+		// Unmanaged Solo has no persisted preset identity. Serialize its empty
+		// roster check, but keep it a no-op when there is no roster to reserve.
+		var err error
+		err = service.Store.withOperationLock(ctx, slug, func() error {
+			roster, loadErr := service.Store.Load(slug, rootThreadID)
+			if errors.Is(loadErr, os.ErrNotExist) {
+				return nil
+			}
+			if loadErr != nil {
+				return loadErr
+			}
+			if roster.PresetID != "" || len(roster.Members) != 0 {
+				return errors.New("a preset can only create an empty team")
+			}
+			return nil
+		})
+		return nil, err
+	}
+	err := service.Store.withOperationLock(ctx, slug, func() error {
+		_, updateErr := service.Store.Update(ctx, slug, rootThreadID, true, func(roster *Roster) error {
+			// A partial creating prefix could come from a concurrent manual Add.
+			// Only the complete atomic reservation can be retried safely.
+			if roster.PresetID != "" || (len(roster.Members) != 0 && len(roster.Members) != len(expected)) {
+				return errors.New("a preset can only create an empty team")
+			}
+			creating := false
+			for index, member := range roster.Members {
+				want := expected[index]
+				if member.Address != want.Address || member.Role != want.Role || member.Index != want.Index ||
+					member.Model != want.Model || member.Effort != want.Effort ||
+					member.Behavior != want.Behavior || member.Access != want.Access ||
+					member.PolicyCatalogDigest != want.PolicyCatalogDigest ||
+					(member.State != "creating" && member.State != "ready") {
+					return errors.New("team preset differs from the retained roster")
+				}
+				creating = creating || member.State == "creating"
+			}
+			// An all-ready roster could also be a manually built team, so it
+			// cannot prove a preset retry.
+			if len(roster.Members) > 0 && !creating {
+				return errors.New("a preset can only create an empty team")
+			}
+			now := time.Now().UTC()
+			for _, member := range expected[len(roster.Members):] {
+				member.State, member.AddedAt = "creating", now
+				roster.Members = append(roster.Members, member)
+			}
+			return nil
+		})
+		return updateErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	created := make([]Member, 0, len(expected))
+	for _, member := range expected {
+		member, err := service.RetryCreating(ctx, slug, rootThreadID, cwd, environment, member.Address)
 		if err != nil {
 			return created, err
 		}
