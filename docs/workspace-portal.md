@@ -150,9 +150,10 @@ that saved selection.
 After creation, the Team tab can add, remove, configure, assign work to, and
 inspect the messages of an individual member. Model and reasoning settings
 apply to the member's next assignment. An assignment to a busy member uses App
-Server's ordinary turn-steer behavior. Reports and questions are assignments
-to `lead`; progress remains in the member transcript and does not wake another
-thread.
+Server's ordinary turn-steer behavior. Members send results and blocking
+questions to `lead` through the package-owned `report_to_lead` tool. Each
+message has a unique ID that the member reuses only if delivery needs a retry.
+The member's work remains in its own transcript.
 
 Removing a member is permanent for that roster address: archive/revive and
 fork retain it as removed rather than making it active again. Session lifecycle
@@ -211,6 +212,13 @@ message ID for retries. The browser retains an uncertain assignment ID across
 reloads in the current tab until the request is confirmed. In the CLI, keep
 the ID shown after an uncertain assignment failure and pass it with
 `--message-id` when retrying.
+
+The report tool is bound to the workspace, session, lead thread, member address,
+and exact member thread. A new or forked thread receives the tool after its ID
+is known. Before each assignment, App Server resumes the member thread with
+that binding, including for members created by an earlier package. No roster
+format change is needed. The helper checks the current roster identity before
+sending. A missing or mismatched binding fails without sending to `lead`.
 
 A fork requires all source members to have finished creation, preserves the
 source member snapshot, and refuses an interrupted retry if that roster

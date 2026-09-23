@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ type testClient struct {
 	projectReadError   error
 	resumes            []codex.ThreadSettings
 	forkEnvs           []map[string]string
+	forkSettings       []codex.ThreadSettings
 	threads            []codex.ThreadMetadata
 	unmaterialized     map[string]bool
 	bootstrapCalls     []string
@@ -164,11 +166,12 @@ func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ 
 	client.resumes = append(client.resumes, settings)
 	return thread, nil
 }
-func (client *testClient) ForkThread(_ context.Context, source, cwd string, environment map[string]string, _ codex.ThreadSettings) (string, error) {
+func (client *testClient) ForkThread(_ context.Context, source, cwd string, environment map[string]string, settings codex.ThreadSettings) (string, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.next++
 	client.forkEnvs = append(client.forkEnvs, environment)
+	client.forkSettings = append(client.forkSettings, settings)
 	id := fmt.Sprintf("thread-%d", client.next)
 	client.threads = append(client.threads, codex.ThreadMetadata{ID: id, Cwd: cwd, ForkedFromID: source})
 	if client.lostFork {
@@ -307,9 +310,48 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	if len(client.options) != 1 || client.options[0].Model != "gpt-5.6-sol" || client.options[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("assignment settings = %#v", client.options)
 	}
-	if client.starts[0].Policy.Sandbox != "workspace-write" ||
-		client.options[0].ThreadPolicy != client.starts[0].Policy {
-		t.Fatalf("member policy changed between start and assignment: %#v, %#v", client.starts, client.options)
+	bound := client.options[0].ThreadPolicy
+	if client.starts[0].Policy.Sandbox != "workspace-write" || client.starts[0].Policy.MCPServer != nil ||
+		bound.Sandbox != client.starts[0].Policy.Sandbox || bound.DeveloperInstructions != client.starts[0].Policy.DeveloperInstructions ||
+		bound.MCPServer == nil || bound.MCPServer.Tool != "report_to_lead" {
+		t.Fatalf("member report policy = starts %#v, assignment %#v", client.starts, client.options)
+	}
+	if got, want := bound.MCPServer.Args, []string{
+		"team-mcp", "--user-state-root", store.stateRoot, "--workspace", workspace,
+		"--session-slug", "one", "--root-thread-id", "root-one", "--member-address", "implementer0", "--member-thread-id", "thread-1",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("member report helper args = %#v, want %#v", got, want)
+	}
+	if len(client.sends) != 1 || !strings.Contains(client.sends[0], "report_to_lead") ||
+		!strings.Contains(client.sends[0], "new message_id for each message") || strings.Contains(client.sends[0], "dev-session team assign") {
+		t.Fatalf("assignment report instruction = %#v", client.sends)
+	}
+}
+
+func TestMemberReportBindingChangesWithExactThreadIdentity(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Store: store, Workspace: workspace}
+	member := Member{Role: "reviewer", Behavior: "reviewer", Access: "read_only", Address: "reviewer0", Thread: "member-one"}
+	first, err := service.memberTurnPolicy("one", "root-one", member)
+	if err != nil || first.MCPServer == nil {
+		t.Fatalf("first report binding = %#v, %v", first, err)
+	}
+	member.Thread = "member-two"
+	second, err := service.memberTurnPolicy("one", "root-one", member)
+	if err != nil || second.MCPServer == nil || first.MCPServer.Name == second.MCPServer.Name {
+		t.Fatalf("thread replacement reused report binding: first %#v, second %#v, %v", first.MCPServer, second.MCPServer, err)
+	}
+	if !filepath.IsAbs(first.MCPServer.Command) || filepath.Clean(first.MCPServer.Command) != first.MCPServer.Command ||
+		first.MCPServer.Tool != "report_to_lead" {
+		t.Fatalf("invalid helper launch: %#v", first.MCPServer)
+	}
+	member.Thread = ""
+	if _, err := service.memberTurnPolicy("one", "root-one", member); err == nil {
+		t.Fatal("member report helper accepted an unbound thread")
 	}
 }
 
@@ -1208,7 +1250,10 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 	if len(client.starts) != 1 || client.starts[0].Model != "gpt-6-sol" || client.starts[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("member settings = %#v", client.starts)
 	}
-	if len(client.resumes) != 1 || client.resumes[0].Policy != client.starts[0].Policy {
+	if len(client.resumes) != 1 || client.resumes[0].Policy.Sandbox != client.starts[0].Policy.Sandbox ||
+		client.resumes[0].Policy.DeveloperInstructions != client.starts[0].Policy.DeveloperInstructions ||
+		client.starts[0].Policy.MCPServer != nil || client.resumes[0].Policy.MCPServer == nil ||
+		client.resumes[0].Policy.MCPServer.Args[len(client.resumes[0].Policy.MCPServer.Args)-1] != "thread-1" {
 		t.Fatalf("retry did not restore retained policy: starts %#v, resumes %#v", client.starts, client.resumes)
 	}
 	service.Catalog = &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 3), Teams: map[string]agentteams.Team{
@@ -1493,6 +1538,16 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 	if len(client.bootstrapCalls) != 4 || !strings.Contains(client.bootstrapCalls[2], "thread-3") ||
 		!strings.Contains(client.bootstrapCalls[3], "thread-4") {
 		t.Fatalf("forked members were not bootstrapped: %#v", client.bootstrapCalls)
+	}
+	if len(client.forkSettings) != 2 || client.forkSettings[0].Policy.MCPServer != nil || client.forkSettings[1].Policy.MCPServer != nil {
+		t.Fatalf("fork exposed a report tool before destination thread identity: %#v", client.forkSettings)
+	}
+	if _, err := service.Assign(context.Background(), "target", "root-target", "lead", "architect0", "Review the design", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.options) != 1 || client.options[0].ThreadPolicy.MCPServer == nil ||
+		client.options[0].ThreadPolicy.MCPServer.Args[len(client.options[0].ThreadPolicy.MCPServer.Args)-1] != "thread-3" {
+		t.Fatalf("forked member assignment did not bind its destination thread: %#v", client.options)
 	}
 }
 

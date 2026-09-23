@@ -414,13 +414,15 @@ func snapshotSource(source *Roster) (*ForkSourceSnapshot, error) {
 type Store struct {
 	directory string
 	workspace string
+	stateRoot string
 }
 
 func NewStore(stateRoot, workspace string) (*Store, error) {
-	if stateRoot == "" || workspace == "" || !filepath.IsAbs(stateRoot) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
+	if stateRoot == "" || workspace == "" || !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot ||
+		!filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
 		return nil, errors.New("team roster requires canonical absolute state and workspace paths")
 	}
-	return &Store{directory: userstate.WorkspaceDirectory(stateRoot, "codex-teams", workspace), workspace: workspace}, nil
+	return &Store{directory: userstate.WorkspaceDirectory(stateRoot, "codex-teams", workspace), workspace: workspace, stateRoot: stateRoot}, nil
 }
 
 func (store *Store) path(slug string) string     { return filepath.Join(store.directory, slug+".json") }
@@ -601,6 +603,43 @@ type Service struct {
 	Client    Client
 	Workspace string
 	Catalog   *agentteams.Catalog
+}
+
+// memberTurnPolicy binds the report tool to the exact roster identity on each
+// resume before a member turn. A thread ID is unavailable during thread/start
+// and thread/fork; neither operation can expose this helper before the roster
+// has durably recorded that ID.
+func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member) (codex.ThreadPolicy, error) {
+	policy, err := policyForRole(member.Role, member.Behavior, member.Access)
+	if err != nil {
+		return codex.ThreadPolicy{}, err
+	}
+	if service.Store == nil || member.Thread == "" || !session.ValidSlug(slug) || rootThreadID == "" || member.Address == "" {
+		return codex.ThreadPolicy{}, errors.New("member report tool has incomplete roster identity")
+	}
+	command, err := os.Executable()
+	if err != nil {
+		return codex.ThreadPolicy{}, fmt.Errorf("locate member report helper: %w", err)
+	}
+	command, err = filepath.EvalSymlinks(command)
+	if err != nil {
+		return codex.ThreadPolicy{}, fmt.Errorf("locate canonical member report helper: %w", err)
+	}
+	if !filepath.IsAbs(command) || filepath.Clean(command) != command {
+		return codex.ThreadPolicy{}, errors.New("member report helper path is not canonical and absolute")
+	}
+	identity := strings.Join([]string{service.Store.workspace, slug, rootThreadID, member.Address, member.Thread}, "\x00")
+	digest := sha256.Sum256([]byte(identity))
+	policy.MCPServer = &codex.ThreadMCPServer{
+		Name: "team_" + hex.EncodeToString(digest[:16]), Tool: "report_to_lead", Command: command,
+		Args: []string{
+			"team-mcp", "--user-state-root", service.Store.stateRoot,
+			"--workspace", service.Store.workspace, "--session-slug", slug,
+			"--root-thread-id", rootThreadID, "--member-address", member.Address,
+			"--member-thread-id", member.Thread,
+		},
+	}
+	return policy, nil
 }
 
 func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, environment map[string]string, role, model, effort string) (Member, error) {
@@ -1089,8 +1128,12 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 		return Member{}, fmt.Errorf("verify %s bootstrap: %w", address, err)
 	}
 	if wasStarted {
+		boundPolicy, err := service.memberTurnPolicy(slug, rootThreadID, *pending)
+		if err != nil {
+			return Member{}, fmt.Errorf("bind %s report tool: %w", address, err)
+		}
 		if _, err := service.Client.ResumeThreadWithSettings(ctx, threadID, cwd, memberEnvironment,
-			codex.ThreadSettings{Model: pending.Model, ReasoningEffort: pending.Effort, Policy: policy}); err != nil {
+			codex.ThreadSettings{Model: pending.Model, ReasoningEffort: pending.Effort, Policy: boundPolicy}); err != nil {
 			return Member{}, fmt.Errorf("resume %s thread: %w", address, err)
 		}
 	}
@@ -1566,12 +1609,15 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	}
 	var policy codex.ThreadPolicy
 	if to != "lead" {
-		policy, err = policyForRole(target.Role, target.Behavior, target.Access)
+		policy, err = service.memberTurnPolicy(slug, rootThreadID, *target)
 		if err != nil {
-			return codex.SendReceipt{}, fmt.Errorf("member %s has no retained policy: %w", to, err)
+			return codex.SendReceipt{}, fmt.Errorf("member %s has no report policy: %w", to, err)
 		}
 	}
-	envelope := fmt.Sprintf("Team assignment from %s to %s:\n\n%s\n\nReport the result or a blocking question to lead with `dev-session team assign $DEV_SESSION_SLUG --from %s --to lead --message '...'`.", from, target.Address, strings.TrimSpace(message), target.Address)
+	envelope := fmt.Sprintf("Team assignment from %s to %s:\n\n%s", from, target.Address, strings.TrimSpace(message))
+	if to != "lead" {
+		envelope += "\n\nSend results or blocking questions to lead with report_to_lead. Use a new message_id for each message; reuse it only to retry that message."
+	}
 	return service.Client.SendWithOptions(ctx, target.Thread, envelope, messageID, "team:"+slug+":"+from+":"+to, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
 }
 
