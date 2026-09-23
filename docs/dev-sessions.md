@@ -321,9 +321,12 @@ dev-session team assign api-token-rotation --to implementer0 --message 'Implemen
 
 The member roster is isolated to the session. Its compact addresses are stable,
 for example `architect0`, `implementer0`, and `reviewer0`; members from another
-session cannot be addressed. The Team tab also provides read-only member
-transcripts. Fork, archive, delete, and revive apply the corresponding Codex
-operation to all roster members with the root session.
+session cannot be addressed. The Team tab shows member messages and keeps
+removed members in a collapsed history section. In the Codex tab, select any
+ready member to read its full conversation or message it directly. Its role
+policy and saved model settings still apply. Fork, archive, delete, and revive
+apply the corresponding Codex operation to all roster members with the root
+session.
 
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.

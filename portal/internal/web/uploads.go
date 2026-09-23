@@ -56,8 +56,12 @@ func (s *Server) resolveUploads(ctx context.Context, id string, mutation bool) (
 		return conversation.UploadTarget{}, &conversation.UploadError{Status: 404, Message: "Upload scope is unavailable"}
 	}
 	if strings.HasPrefix(id, "s-") {
-		slug := strings.TrimPrefix(id, "s-")
-		target, err := s.resolveConversation(ctx, conversation.ResolveRequest{ID: slug, Operation: "uploads", Mutation: mutation})
+		conversationID := strings.TrimPrefix(id, "s-")
+		slug, _, valid := parseTeamConversationID(conversationID)
+		if !valid {
+			return unavailable()
+		}
+		target, err := s.resolveConversation(ctx, conversation.ResolveRequest{ID: conversationID, Operation: "uploads", Mutation: mutation})
 		if err != nil {
 			return unavailable()
 		}
@@ -68,6 +72,7 @@ func (s *Server) resolveUploads(ctx context.Context, id string, mutation bool) (
 			}
 			return conversation.UploadTarget{}, err
 		}
+		backend.BaseURL = "/uploads/s-" + conversationID
 		return conversation.UploadTarget{Store: backend, Writable: target.Capabilities.Send, Release: target.Release}, nil
 	}
 	if !strings.HasPrefix(id, "d-") {

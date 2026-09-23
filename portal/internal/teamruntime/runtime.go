@@ -476,37 +476,52 @@ func (store *Store) operationLockPath(slug string) string {
 // withOperationLock spans App Server calls as well as local journal writes.
 // It is distinct from the short roster file lock used by Update.
 func (store *Store) withOperationLock(ctx context.Context, slug string, run func() error) error {
-	if ctx == nil || !session.ValidSlug(slug) {
-		return errors.New("invalid team operation")
-	}
-	if err := os.MkdirAll(store.directory, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(store.directory, 0o700); err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(store.operationLockPath(slug), os.O_CREATE|os.O_RDWR, 0o600)
+	release, err := store.LockOperation(ctx, slug)
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer release()
+	return run()
+}
+
+// LockOperation serializes a member conversation mutation with team commands.
+// The caller retains the lock across the App Server request and must release it.
+func (store *Store) LockOperation(ctx context.Context, slug string) (func(), error) {
+	if ctx == nil || !session.ValidSlug(slug) {
+		return nil, errors.New("invalid team operation")
+	}
+	if err := os.MkdirAll(store.directory, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(store.directory, 0o700); err != nil {
+		return nil, err
+	}
+	lock, err := os.OpenFile(store.operationLockPath(slug), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			lock.Close()
+			return nil, err
 		}
 		err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-			return run()
+			return func() {
+				_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+				_ = lock.Close()
+			}, nil
 		}
 		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
-			return err
+			lock.Close()
+			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			lock.Close()
+			return nil, ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -682,6 +697,12 @@ func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member
 		},
 	}
 	return policy, nil
+}
+
+// MemberTurnPolicy is the same package-owned policy used by team assignments.
+// Portal conversations must rebind it before every direct member turn too.
+func (service Service) MemberTurnPolicy(slug, rootThreadID string, member Member) (codex.ThreadPolicy, error) {
+	return service.memberTurnPolicy(slug, rootThreadID, member)
 }
 
 func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, environment map[string]string, role, model, effort string) (Member, error) {

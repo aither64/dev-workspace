@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -2274,7 +2275,7 @@ func TestSessionDeletionCanClearBrowserStateBeforeTranscriptLoads(t *testing.T) 
 	if !strings.Contains(string(javascript), `let currentThreadId = body.dataset.threadId || "";`) {
 		t.Fatal("browser client does not initialize deletion identity from the rendered session")
 	}
-	if !strings.Contains(string(template), `data-thread-id="{{.Session.Codex.ThreadID}}"`) {
+	if !strings.Contains(string(template), `data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}"`) {
 		t.Fatal("session page does not render the persisted thread identity")
 	}
 }
@@ -4262,5 +4263,90 @@ func TestSessionDetailsRetainsDirectTeamRoster(t *testing.T) {
 	}
 	if !strings.Contains(payload.TeamHTML, "implementer0") || strings.Contains(payload.TeamHTML, "No team roster yet") {
 		t.Fatalf("direct roster disappeared during refresh: %s", payload.TeamHTML)
+	}
+	if !strings.Contains(payload.TeamHTML, `data-action="add"`) ||
+		!strings.Contains(payload.TeamHTML, `Removed members (1)`) ||
+		!slices.Equal(payload.ReadyMembers, []string{"implementer0"}) {
+		t.Fatalf("team controls disappeared during refresh: %#v", payload)
+	}
+}
+
+func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.Codex = workspacecodex.NewWithOptions(server.config.CodexSocket, server.config.Workspace,
+		codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "member-attempts.json")})
+	server.config.HostProfile = ""
+	directory := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n" +
+		"  socket_path: /run/dev-workspace-codex/app-server.sock\n  client_version: 0.152.1\n" +
+		"creation:\n  state: ready\n  initial_goal_sent: true\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	writeWebRuntimeAuthority(t, server, "example")
+	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", true, func(roster *teamruntime.Roster) error {
+		roster.Members = append(roster.Members,
+			teamruntime.Member{Address: "implementer0", Role: "implementer", Thread: "member-thread", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write", State: "ready", AddedAt: time.Now().UTC()},
+			teamruntime.Member{Address: "reviewer0", Role: "reviewer", Thread: "old-reviewer", State: "removed", AddedAt: time.Now().UTC()},
+		)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/?member=implementer0", nil))
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `data-conversation-id="example~implementer0"`) ||
+		!strings.Contains(page.Body.String(), `data-thread-id="member-thread"`) ||
+		!strings.Contains(page.Body.String(), `<option value="implementer0" selected>`) {
+		t.Fatalf("member page did not select the ready thread: %d %s", page.Code, page.Body.String())
+	}
+	request := conversation.ResolveRequest{ID: "example~implementer0", Operation: "thread"}
+	target, err := server.resolveConversation(context.Background(), request)
+	if err != nil || target.ThreadID != "member-thread" {
+		t.Fatalf("ready member resolution = %#v, %v", target, err)
+	}
+	if _, ok := target.Client.(conversation.PromptResponder); !ok {
+		t.Fatal("member conversation lost token-bound prompt responses")
+	}
+	if _, ok := target.Client.(conversation.QueueDeletionCompleter); !ok {
+		t.Fatal("member conversation lost attachment-aware queue deletion")
+	}
+	memberClient := target.Client.(memberConversationClient)
+	firstOptions, err := memberClient.turnOptions("message", "message-1", "")
+	if err != nil || firstOptions.ReasoningEffort != "xhigh" {
+		t.Fatalf("member turn options = %#v, %v", firstOptions, err)
+	}
+	controller := server.config.Codex.(*workspacecodex.Client)
+	if err := controller.PrepareSendWithOptions("member-thread", "message", "message-1", "", false, firstOptions); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", false, func(roster *teamruntime.Roster) error {
+		roster.Members[0].Effort = "high"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retryOptions, err := memberClient.turnOptions("message", "message-1", "")
+	if err != nil || retryOptions.ReasoningEffort != "xhigh" {
+		t.Fatalf("member retry changed original options: %#v, %v", retryOptions, err)
+	}
+	if attempted, err := memberClient.SendAttempted(context.Background(), "member-thread", "message", "message-1", ""); err != nil || !attempted {
+		t.Fatalf("member retry discovery = %t, %v", attempted, err)
+	}
+	target.Release()
+	for _, id := range []string{"example~reviewer0", "example~architect0", "example~bad-address", "other~implementer0"} {
+		if target, err := server.resolveConversation(context.Background(), conversation.ResolveRequest{ID: id, Operation: "thread"}); err == nil {
+			target.Release()
+			t.Fatalf("unavailable member %q resolved", id)
+		}
 	}
 }

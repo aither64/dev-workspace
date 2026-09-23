@@ -191,6 +191,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .transcript-filters { display: flex; gap: .35rem; margin: 0 auto 0 .5rem; }
 .transcript-filters button { padding: .38rem .65rem; font-size: .78rem; }
 .transcript-filters button.active { border-color: var(--accent-2); background: #142b23; color: var(--accent); }
+.member-selector { display: flex; align-items: center; gap: .35rem; margin-left: auto; font-size: .75rem; color: var(--muted); }
+.member-selector select { max-width: min(18rem, 28vw); padding: .38rem .5rem; font-size: .78rem; }
+.chat-heading { display: flex; align-items: center; gap: .5rem; }
+.chat-heading .transcript-filters { margin-left: .5rem; margin-right: 0; }
 .transcript { flex: 1; overflow-y: auto; min-height: 0; padding: 1.2rem .3rem; overscroll-behavior: contain; overflow-anchor: none; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: .7rem; }
 .message p:first-child { margin-top: 0; }
 .message p:last-child { margin-bottom: 0; }

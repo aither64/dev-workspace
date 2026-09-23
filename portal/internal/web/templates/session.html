@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=2">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{.Session.Codex.ThreadID}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -39,6 +39,7 @@
   </aside>
   <main class="page session-page">
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
+    {{if .MemberNotice}}<p class="notice warning full">{{.MemberNotice}}</p>{{end}}
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
     <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
@@ -69,7 +70,7 @@
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="all">All</button>
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
-        </div><span id="codex-status" class="badge">Connecting</span></div>
+        </div><label class="member-selector"><span>Member</span><select id="codex-member"><option value="lead">lead</option>{{range .ReadyMembers}}<option value="{{.Address}}"{{if eq .Address $.SelectedMember}} selected{{end}}>{{.Address}}</option>{{end}}</select></label><span id="codex-status" class="badge">Connecting</span></div>
         <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
         <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
         <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>

@@ -933,6 +933,29 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error = "Team roster is unavailable: " + rosterErr.Error()
 	} else {
 		data.DirectTeam = roster
+		data.RemovedMembers = removedTeamMembers(roster)
+	}
+	data.SelectedThreadID = summary.Codex.ThreadID
+	data.ConversationID = summary.Slug
+	if data.DirectTeam != nil {
+		for _, member := range data.DirectTeam.Members {
+			if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && summary.Interactive {
+				data.ReadyMembers = append(data.ReadyMembers, member)
+			}
+		}
+	}
+	if address := r.URL.Query().Get("member"); address != "" {
+		for _, member := range data.ReadyMembers {
+			if member.Address == address {
+				data.SelectedMember = address
+				data.SelectedThreadID = member.Thread
+				data.ConversationID = teamConversationID(summary.Slug, address)
+				break
+			}
+		}
+		if data.SelectedMember == "" {
+			data.MemberNotice = "That team member is no longer available. Showing lead."
+		}
 	}
 	if lifecycleIdentityErr != nil {
 		data.Error = "Session lifecycle identity is unavailable: " + lifecycleIdentityErr.Error()
@@ -2826,7 +2849,8 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 func (s *Server) resolveConversation(
 	ctx context.Context, request conversation.ResolveRequest,
 ) (conversation.Target, error) {
-	if !session.ValidSlug(request.ID) {
+	slug, address, valid := parseTeamConversationID(request.ID)
+	if !valid {
 		return conversation.Target{}, errors.New("invalid session identity")
 	}
 	var releases []func()
@@ -2842,7 +2866,7 @@ func (s *Server) resolveConversation(
 		}
 	}()
 	if request.Mutation {
-		if receipt, ok := s.currentCreation(request.ID); ok && receipt.blocksSession() {
+		if receipt, ok := s.currentCreation(slug); ok && receipt.blocksSession() {
 			return conversation.Target{}, errors.New("session initialization has not finished")
 		}
 	}
@@ -2856,7 +2880,7 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, err
 		}
 	}
-	summary, err := session.Find(s.config.Workspace, request.ID)
+	summary, err := session.Find(s.config.Workspace, slug)
 	if err != nil {
 		return conversation.Target{}, err
 	}
@@ -2877,7 +2901,7 @@ func (s *Server) resolveConversation(
 		if owner != "" {
 			return conversation.Target{}, fmt.Errorf("session %s is unfinished", owner)
 		}
-		summary, err = session.Find(s.config.Workspace, request.ID)
+		summary, err = session.Find(s.config.Workspace, slug)
 		if err != nil {
 			return conversation.Target{}, errors.New("session state changed")
 		}
@@ -2898,25 +2922,47 @@ func (s *Server) resolveConversation(
 			Settings: true, Respond: true, EventStream: true,
 		}
 	}
-	// Every retained root thread uses the normal conversation client. The old
-	// virtual-team classifier could reduce a healthy root to read-only access,
-	// which is precisely the failure mode this cutover removes.
 	conversationClient := conversation.Client(s.config.Codex)
+	threadID := summary.Codex.ThreadID
+	if address != "" {
+		service, serviceErr := s.teamService()
+		if serviceErr != nil {
+			return conversation.Target{}, serviceErr
+		}
+		if request.Mutation {
+			unlock, lockErr := service.Store.LockOperation(ctx, slug)
+			if lockErr != nil {
+				return conversation.Target{}, lockErr
+			}
+			releases = append(releases, unlock)
+		}
+		member, memberErr := readyConversationMember(service.Store, slug, summary.Codex.ThreadID, address)
+		if memberErr != nil {
+			return conversation.Target{}, memberErr
+		}
+		threadID = member.Thread
+		conversationClient = memberConversationClient{
+			Client: s.config.Codex, server: s, service: service,
+			slug: slug, rootThreadID: summary.Codex.ThreadID,
+			address: address, threadID: threadID,
+		}
+	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
 	var attachments conversation.AttachmentProvider
 	if s.uploadStore != nil {
-		backend, err := s.sessionUploads(ctx, summary.Slug, summary.Codex.ThreadID, !interactive)
+		backend, err := s.sessionUploads(ctx, summary.Slug, threadID, !interactive)
 		if err != nil {
 			return conversation.Target{}, err
 		}
+		backend.BaseURL = "/uploads/s-" + request.ID
 		attachments = backend
 	}
 	var once sync.Once
 	failed = false
 	return conversation.Target{
 		Attachments: attachments,
-		Client:      conversationClient, ThreadID: summary.Codex.ThreadID, Directory: expectedCwd,
-		Capabilities: capabilities, MutationLock: s.messageLock(summary.Slug),
+		Client:      conversationClient, ThreadID: threadID, Directory: expectedCwd,
+		Capabilities: capabilities, MutationLock: s.messageLock(request.ID),
 		TransformTranscript: s.presentTranscript,
 		Activity:            s.activityProvider(),
 		Release:             func() { once.Do(release) },

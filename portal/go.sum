@@ -2,6 +2,10 @@ github.com/aither64/codex-web v0.0.0-20260923001226-0f59be164036 h1:IihiXpLGH16N
 github.com/aither64/codex-web v0.0.0-20260923001226-0f59be164036/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
 github.com/aither64/codex-web v0.0.0-20260923005742-2a228e70de42 h1:nKdhpgluQwNV59y9QaLyE28MfxAFRU4eBzYpsKj7PEs=
 github.com/aither64/codex-web v0.0.0-20260923005742-2a228e70de42/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20260923075748-bd8cb096f110 h1:3sIl74uLh1Tv2ngAB5/uQLKqtTt/QhMlM/hufKs8A+s=
+github.com/aither64/codex-web v0.0.0-20260923075748-bd8cb096f110/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20260923082514-d542e767310d h1:vesoLEnuq+X7UGd12wOnz7a/zovgLSShn+zUjwrrMAQ=
+github.com/aither64/codex-web v0.0.0-20260923082514-d542e767310d/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

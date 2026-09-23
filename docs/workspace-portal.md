@@ -149,11 +149,20 @@ that saved selection.
 
 After creation, the Team tab can add, remove, configure, assign work to, and
 inspect the messages of an individual member. Model and reasoning settings
-apply to the member's next assignment. An assignment to a busy member uses App
+apply to the member's next turn. Removed members stay in a collapsed history
+section. The Codex tab can switch between `lead` and ready members to show
+each complete conversation; direct messages use the member's current role
+policy and model settings. An assignment to a busy member uses App
 Server's ordinary turn-steer behavior. Members send results and blocking
 questions to `lead` through the package-owned `report_to_lead` tool. Each
 message has a unique ID that the member reuses only if delivery needs a retry.
 The member's work remains in its own transcript.
+
+The new-session form labels presets by size and role counts, such as
+`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer`. It also shows
+a copyable `dev-session start` command that tracks the selected name, team,
+model, and reasoning effort. From an interactive terminal, that command asks
+for the initial request; portal uploads are not transferred to the CLI.
 
 Removing a member is permanent for that roster address: archive/revive and
 fork retain it as removed rather than making it active again. Session lifecycle

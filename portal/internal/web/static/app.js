@@ -1749,18 +1749,26 @@
 
   if (!slug) return;
   const conversation = slug ? conversationAssets.createConversationClient({
-    id: slug,
+    id: conversationID,
     basePath: "/codex",
-    conversationPath: `/api/sessions/${encodeURIComponent(slug)}`,
+    ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
   const client = createSessionClient(slug, request, conversation);
+  document.getElementById("codex-member")?.addEventListener("change", (event) => {
+    const target = new URL(location.href);
+    const member = event.target.value;
+    if (member === "lead") target.searchParams.delete("member");
+    else target.searchParams.set("member", member);
+    target.hash = "codex";
+    location.assign(target.href);
+  });
   const directTeamRequest = async (body, method = "POST") => request(
     `/api/sessions/${encodeURIComponent(slug)}/team`, {
       method, headers: {"content-type": "application/json"}, body: JSON.stringify(body),
     },
   );
-  const teamActionStatus = document.getElementById("team-action-status");
   const showTeamActionStatus = (message) => {
+    const teamActionStatus = document.getElementById("team-action-status");
     if (!teamActionStatus) return;
     teamActionStatus.textContent = message;
     teamActionStatus.hidden = false;
@@ -2001,7 +2009,7 @@
   const archiveFailure = document.getElementById("archive-last-failure");
   function renderArchiveFailure() {
     if (!archiveFailure) return;
-    const failure = archiveFailurePresentation(lastLifecycleOperation, lastAutoArchive, body.dataset.threadId);
+    const failure = archiveFailurePresentation(lastLifecycleOperation, lastAutoArchive, body.dataset.rootThreadId);
     archiveFailure.hidden = !failure;
     archiveFailure.querySelector("span").textContent = failure ?
       `Last automatic attempt failed (${new Date(failure.attemptedAt).toLocaleString()}): ${failure.message}` : "";
@@ -2744,6 +2752,7 @@
   const renderPlanActions = async (payload) => {
     const panel = document.getElementById("plan-actions");
     if (!panel) return;
+    if (selectedMember) { composerView.setPlanVisible(false); return; }
     const generation = ++planRenderGeneration;
     const plan = currentCompletedPlan(payload);
     const eligibleMode = ["plan", "default"].includes(payload.collaborationMode);
@@ -3571,7 +3580,7 @@
   if (form && interactive) {
     const textarea = form.elements.message;
     composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
-      basePath: `/uploads/s-${encodeURIComponent(slug)}`, dropTarget: form,
+      basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form,
       controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,
       onChange: ({ready, count}) => { composerUploadReady = ready; textarea.required = !count; updateMessageActions(); },
