@@ -36,6 +36,8 @@ type testClient struct {
 	bootstrapError     error
 	deleted            []string
 	deleteError        error
+	deleteResponseLost bool
+	readError          error
 	archived           map[string]bool
 	archiveAfter       func()
 	archiveResultError error
@@ -145,6 +147,19 @@ func (client *testClient) ListThreads(_ context.Context, options codex.ThreadLis
 	}
 	return found, nil, nil
 }
+func (client *testClient) ReadThreadMetadata(_ context.Context, threadID string, _ bool) (codex.ThreadMetadata, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.readError != nil {
+		return codex.ThreadMetadata{}, client.readError
+	}
+	for _, thread := range client.threads {
+		if thread.ID == threadID {
+			return thread, nil
+		}
+	}
+	return codex.ThreadMetadata{}, &codex.ThreadNotFoundError{ThreadID: threadID}
+}
 func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
 	client.resumes = append(client.resumes, settings)
 	return thread, nil
@@ -251,15 +266,18 @@ func (client *testClient) DeleteFreshHeadlessThread(_ context.Context, thread, _
 	if !client.unmaterialized[thread] {
 		return errors.New("thread has materialized history")
 	}
-	client.deleted = append(client.deleted, thread)
 	for index, item := range client.threads {
 		if item.ID == thread {
+			client.deleted = append(client.deleted, thread)
 			client.threads = append(client.threads[:index], client.threads[index+1:]...)
-			break
+			delete(client.unmaterialized, thread)
+			if client.deleteResponseLost {
+				return errors.New("lost thread/delete response")
+			}
+			return nil
 		}
 	}
-	delete(client.unmaterialized, thread)
-	return nil
+	return &codex.ThreadNotFoundError{ThreadID: thread}
 }
 func (client *testClient) SendWithOptions(_ context.Context, thread, text, messageID string, _ string, options codex.TurnOptions) (codex.SendReceipt, error) {
 	if client.sendEntered != nil {
@@ -323,6 +341,35 @@ func TestAssignmentReplacesOnlyUniqueUnmaterializedMember(t *testing.T) {
 		len(client.messageIDs) != 1 || client.messageIDs[0] != messageID ||
 		len(client.bootstrapCalls) != 2 {
 		t.Fatalf("recovered member = %#v, deleted = %#v, messages = %#v, bootstraps = %#v", roster.Members, client.deleted, client.messageIDs, client.bootstrapCalls)
+	}
+}
+
+func TestAssignmentReplacesFreshMemberHiddenFromThreadList(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.hideThreads = true // A no-rollout thread can be absent from thread/list.
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", member.Address,
+		"check", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].Thread == member.Thread || len(client.deleted) != 1 ||
+		client.deleted[0] != member.Thread || len(client.sends) != 1 {
+		t.Fatalf("hidden fresh thread recovery = %#v, deleted = %#v, sends = %#v", roster.Members, client.deleted, client.sends)
 	}
 }
 
@@ -496,6 +543,121 @@ func TestRemoveCompletesReservedDeletionAfterRosterWriteWasLost(t *testing.T) {
 	if roster.Members[0].State != "removed" || roster.Members[0].RetireIntent != "" ||
 		roster.Members[0].Thread != member.Thread {
 		t.Fatalf("lost removal write recovery = %#v", roster.Members)
+	}
+}
+
+func TestRemoveReconcilesLostDeleteResponseByExactThreadRead(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.hideThreads = true
+	client.deleteResponseLost = true
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].State != "removed" || len(client.deleted) != 1 || client.deleted[0] != member.Thread {
+		t.Fatalf("lost delete response = %#v, deleted = %#v", roster.Members, client.deleted)
+	}
+}
+
+func TestRemoveAcceptsConfirmedDeleteWhenReadReportsNotLoaded(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.hideThreads = true
+	client.readError = errors.New("Codex RPC -32600: thread not loaded: " + member.Thread)
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].State != "removed" || len(client.deleted) != 1 || client.deleted[0] != member.Thread {
+		t.Fatalf("confirmed delete = %#v, deleted = %#v", roster.Members, client.deleted)
+	}
+}
+
+func TestRemoveDoesNotAcceptNotLoadedAfterLostDeleteResponse(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.hideThreads = true
+	client.deleteResponseLost = true
+	client.readError = errors.New("Codex RPC -32600: thread not loaded: " + member.Thread)
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		!strings.Contains(err.Error(), "thread not loaded") {
+		t.Fatalf("uncertain delete with not-loaded read = %v", err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].State != "ready" || roster.Members[0].RetireIntent != "remove" {
+		t.Fatalf("retained uncertain member = %#v", roster.Members)
+	}
+}
+
+func TestRemoveRefusesWhenExactThreadStillExists(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{unmaterialized: make(map[string]bool)}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"architect", "gpt-6-sol", "xhigh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unmaterialized[member.Thread] = true
+	client.hideThreads = true
+	client.deleteError = errors.New("lost response before deletion")
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		!strings.Contains(err.Error(), "retired member thread still exists") {
+		t.Fatalf("removal after failed deletion = %v", err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].State != "ready" || len(client.deleted) != 0 {
+		t.Fatalf("retained member = %#v, deleted = %#v", roster.Members, client.deleted)
 	}
 }
 

@@ -575,6 +575,7 @@ type Client interface {
 	ReadProject(context.Context, string) (codex.ProjectMetadata, error)
 	StartThreadWithSettings(context.Context, string, map[string]string, codex.ThreadSettings) (string, error)
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
+	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	ResumeThreadWithSettings(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ForkThread(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ArchiveThread(context.Context, string) error
@@ -861,15 +862,25 @@ func (service Service) deleteUniqueFreshMemberLocked(ctx context.Context, slug, 
 	if err != nil {
 		return err
 	}
-	if len(matches) == 0 && member.RetireIntent != "" {
-		// The reserved deletion completed before the roster could record its
-		// result. This project held exactly one known member thread before it.
-		return nil
-	}
-	if len(matches) != 1 || matches[0] != member.Thread {
+	// Fresh no-turn threads can be absent from thread/list while thread/read
+	// still finds them. The exact thread ID, not an empty project listing,
+	// determines whether retirement has completed.
+	if len(matches) == 1 && matches[0] != member.Thread {
 		return errors.New("member thread recovery is not a unique project match")
 	}
 	deleteErr := service.Client.DeleteFreshHeadlessThread(ctx, member.Thread, cwd, member.ProjectID)
+	if deleteErr != nil {
+		// A successful thread/delete response is authoritative even when the
+		// deleted no-rollout thread later reads as "thread not loaded". An
+		// uncertain response needs stronger proof: exact not-found from read.
+		_, readErr := service.Client.ReadThreadMetadata(ctx, member.Thread, false)
+		if !codex.IsThreadNotFound(readErr, member.Thread) {
+			if readErr == nil {
+				readErr = errors.New("retired member thread still exists")
+			}
+			return errors.Join(deleteErr, fmt.Errorf("verify retired member thread: %w", readErr))
+		}
+	}
 	matches, err = service.listMemberThreads(ctx, member.ProjectID, cwd)
 	if err != nil {
 		return errors.Join(deleteErr, err)
@@ -877,9 +888,9 @@ func (service Service) deleteUniqueFreshMemberLocked(ctx context.Context, slug, 
 	if len(matches) != 0 {
 		return errors.Join(deleteErr, errors.New("retired member thread still appears under its project"))
 	}
-	// A lost thread/delete response is reconciled only after the project-scoped
-	// store reports no thread. The pre-delete inspection proved this exact old
-	// member had no rollout, pending work, or unresolved submission.
+	// A lost thread/delete response is reconciled only after thread/read
+	// reports that the exact old member no longer exists. Project-scoped list
+	// remains an ambiguity check, not proof of deletion for a fresh thread.
 	return nil
 }
 
