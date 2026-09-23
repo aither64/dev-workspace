@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	CatalogSchemaVersion        = 3
+	CatalogSchemaVersion        = 4
 	PackageMetadataSchema       = 1
 	maxCatalogBytes             = 4 * 1024 * 1024
 	maxPackageMetadataBytes     = 1024 * 1024
@@ -78,6 +78,8 @@ type Role struct {
 	Model          string   `json:"model"`
 	Effort         string   `json:"effort"`
 	Behavior       string   `json:"behavior"`
+	Purpose        string   `json:"purpose"`
+	Instructions   string   `json:"instructions"`
 	Lifetime       string   `json:"lifetime"`
 	AllowedEfforts []string `json:"allowed_efforts"`
 	Access         string   `json:"access"`
@@ -437,7 +439,9 @@ func validateVariants(catalog Catalog) error {
 			variant.Path != expectedRolePath(variant) || !nativeName(variant.Name) || seenNames[variant.Name] {
 			return errors.New("invalid native role variant")
 		}
-		_ = role
+		if variant.Identity.BehaviorDigest != fmt.Sprintf("%x", sha256.Sum256([]byte(role.Instructions))) {
+			return errors.New("native role instructions differ from the catalog")
+		}
 		if variant.Name != expectedRoleName(catalog.CatalogDigest, variant) {
 			return errors.New("native role name does not match immutable identity")
 		}
@@ -460,47 +464,58 @@ func validateVariants(catalog Catalog) error {
 func validTeam(name string, team Team, capacity Capacity, policies WorkPolicies) bool {
 	if !nonempty(team.Description, 4096) || (team.Mode != "solo" && team.Mode != "development") ||
 		(team.ServicePolicy != "unmanaged" && team.ServicePolicy != "non_priority") || !identifier(team.DesignOwner) ||
-		!validLifecycle(team.Lifecycle) || !isDigest(team.TeamDigest) || len(team.Roles) == 0 {
+		!validLifecycle(team.Lifecycle) || !isDigest(team.TeamDigest) || len(team.Roles) == 0 || len(team.Roles) > 8 {
 		return false
 	}
 	lead, exists := team.Roles["team_lead"]
-	if !exists || lead.Behavior != "team_lead" || !validRole(lead) {
+	if !exists || lead.Behavior != "team_lead" || !validRole(lead) ||
+		(team.Roles["designer"].Behavior != "" && team.Roles["architect"].Behavior != "") {
 		return false
 	}
 	for roleName, role := range team.Roles {
-		if !identifier(roleName) || !validRole(role) || role.Behavior == "verification_watcher" {
+		if !roleNameIdentifier(roleName) || !validRole(role) ||
+			roleName == "lead" ||
+			(roleName != "team_lead" && role.Purpose == "lead") ||
+			(role.Purpose == "implementation" && role.Access != "workspace_write") ||
+			(role.Purpose == "review" && role.Access != "read_only") ||
+			(roleName == "designer" && role.Purpose != "design") ||
+			(roleName == "implementer" && role.Purpose != "implementation") ||
+			(roleName == "reviewer" && role.Purpose != "review") {
 			return false
 		}
 	}
-	if team.DesignOwner != "team_lead" && team.DesignOwner != "designer" {
-		return false
-	}
 	owner, ok := team.Roles[team.DesignOwner]
-	if !ok || (team.DesignOwner == "team_lead" && (owner.Behavior != "team_lead" || team.Roles["designer"].Behavior != "")) ||
-		(team.DesignOwner == "designer" && owner.Behavior != "designer") {
+	if !ok || (team.DesignOwner == "team_lead" && owner.Purpose != "lead") ||
+		(team.DesignOwner != "team_lead" && owner.Purpose != "design") {
 		return false
 	}
 	if team.Mode == "solo" {
 		return len(team.Roles) == 1 && team.DesignOwner == "team_lead" && team.MaxOpenAgents == 0 &&
 			team.Routing == (Routing{}) && supportsPolicy(lead, policies.Design) && supportsPolicy(lead, policies.Implementation)
 	}
-	implementer, implementerOK := team.Roles["implementer"]
-	reviewer, reviewerOK := team.Roles["reviewer"]
-	if !matchesPolicy(owner, policies.Design) || !implementerOK || implementer.Behavior != "implementer" || !matchesPolicy(implementer, policies.Implementation) ||
-		!reviewerOK || reviewer.Behavior != "reviewer" || !reviewer.FreshContext || team.MaxOpenAgents < 1 ||
+	hasImplementation, hasReviewer := false, false
+	for _, role := range team.Roles {
+		if role.Purpose == "implementation" && matchesPolicy(role, policies.Implementation) {
+			hasImplementation = true
+		}
+		if role.Purpose == "review" && role.FreshContext {
+			hasReviewer = true
+		}
+	}
+	if !matchesPolicy(owner, policies.Design) || !hasImplementation || !hasReviewer || team.MaxOpenAgents < 1 ||
 		team.MaxOpenAgents > capacity.RequiredNativeChildThreads || team.Routing.DesignSimpleEffort == nil ||
 		team.Routing.ImplementerSimpleEffort == nil || *team.Routing.DesignSimpleEffort != policies.Design.Simple ||
 		*team.Routing.ImplementerSimpleEffort != policies.Implementation.Simple {
 		return false
 	}
 	for _, role := range team.Roles {
-		if role.Behavior == "reviewer" && !role.FreshContext {
+		if role.Purpose == "review" && !role.FreshContext {
 			return false
 		}
 	}
 	if team.Routing.LowRiskReviewRole != nil {
 		role, ok := team.Roles[*team.Routing.LowRiskReviewRole]
-		if !ok || role.Behavior != "reviewer" || !role.FreshContext {
+		if !ok || role.Purpose != "review" || !role.FreshContext {
 			return false
 		}
 	}
@@ -514,9 +529,14 @@ func validWorkPolicy(policy WorkPolicy) bool {
 
 func validRole(role Role) bool {
 	return nonempty(role.Model, session.MaxAgentTeamPersistedScalarBytes) && supportedEfforts[role.Effort] && validEffortList(role.AllowedEfforts) &&
-		contains(role.AllowedEfforts, role.Effort) && contains([]string{"team_lead", "designer", "implementer", "reviewer"}, role.Behavior) &&
+		contains(role.AllowedEfforts, role.Effort) && contains([]string{"team_lead", "designer", "implementer", "reviewer", "general"}, role.Behavior) &&
+		validPurpose(role.Purpose, role.Behavior) && nonempty(role.Instructions, 4096) && !strings.ContainsRune(role.Instructions, '\x00') &&
 		contains([]string{"session", "initiative", "work_unit", "review_cycle"}, role.Lifetime) &&
 		contains([]string{"read_only", "workspace_write"}, role.Access)
+}
+
+func validPurpose(purpose, behavior string) bool {
+	return map[string]string{"team_lead": "lead", "designer": "design", "implementer": "implementation", "reviewer": "review", "general": "general"}[behavior] == purpose && purpose != ""
 }
 
 func validLifecycle(lifecycle Lifecycle) bool {
@@ -835,7 +855,7 @@ func validateCatalogShape(data []byte) error {
 			return errors.New("team roles must be a nonempty object")
 		}
 		for _, role := range roles {
-			if _, err := strictObject(role, "model", "effort", "behavior", "lifetime", "allowed_efforts", "access", "fresh_context"); err != nil {
+			if _, err := strictObject(role, "model", "effort", "behavior", "purpose", "instructions", "lifetime", "allowed_efforts", "access", "fresh_context"); err != nil {
 				return err
 			}
 		}
@@ -1059,6 +1079,21 @@ func identifier(value string) bool {
 	}
 	for _, character := range value[1:] {
 		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func roleNameIdentifier(value string) bool {
+	if value == "team_lead" {
+		return true
+	}
+	if len(value) == 0 || len(value) > 32 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9') {
 			return false
 		}
 	}

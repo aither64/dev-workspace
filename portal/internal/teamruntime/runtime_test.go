@@ -302,6 +302,116 @@ func (client *testClient) SendWithOptions(_ context.Context, thread, text, messa
 	return codex.SendReceipt{TurnID: "turn"}, nil
 }
 
+func TestStoreUpdateRejectsOversizeForkSnapshotWithoutLosingRoster(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeSnapshot := func(target int) *ForkSourceSnapshot {
+		snapshot := &ForkSourceSnapshot{Workspace: workspace, Slug: "source", RootThreadID: "root-source",
+			Revision: 1, Digest: strings.Repeat("a", 64), Members: make([]ForkSourceMember, 70)}
+		for i := range snapshot.Members {
+			snapshot.Members[i] = ForkSourceMember{Address: fmt.Sprintf("analyst%d", i), Role: "analyst",
+				Index: uint64(i), Thread: fmt.Sprintf("thread-%d", i), Model: "model", Effort: "high",
+				Behavior: "general", Purpose: "general", Instructions: strings.Repeat("x", 4096),
+				Access: "read_only", State: "ready"}
+		}
+		now := time.Now().UTC()
+		candidate := Roster{Schema: schema, Workspace: workspace, Slug: "target", RootThreadID: "root-target",
+			Revision: 2, CreatedAt: now, UpdatedAt: now, ForkSource: snapshot, Members: []Member{}}
+		encoded, err := json.MarshalIndent(candidate, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		trim := len(encoded) + 1 - target
+		if trim <= 0 {
+			t.Fatal("fork snapshot fixture did not reach the roster size boundary")
+		}
+		for i := range snapshot.Members {
+			available := len(snapshot.Members[i].Instructions) - 1
+			if available > trim {
+				available = trim
+			}
+			snapshot.Members[i].Instructions = snapshot.Members[i].Instructions[:len(snapshot.Members[i].Instructions)-available]
+			trim -= available
+			if trim == 0 {
+				break
+			}
+		}
+		if trim != 0 {
+			t.Fatalf("fork snapshot fixture could not reach %d bytes", target)
+		}
+		return snapshot
+	}
+	_, err = store.Update(context.Background(), "target", "root-target", true, func(roster *Roster) error {
+		roster.Members = []Member{}
+		roster.ForkSource = makeSnapshot(maxRosterBytes - 128)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(store.path("target"))
+	if err != nil || before.Size() > maxRosterBytes || before.Size() < maxRosterBytes-256 {
+		t.Fatalf("near-boundary roster size = %v, %v", before, err)
+	}
+	_, err = store.Update(context.Background(), "target", "root-target", false, func(roster *Roster) error {
+		roster.ForkSource = makeSnapshot(maxRosterBytes + 128)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeds 256 KiB") {
+		t.Fatalf("oversize fork snapshot update = %v", err)
+	}
+	after, err := os.Stat(store.path("target"))
+	if err != nil || after.Size() != before.Size() {
+		t.Fatalf("rejected update changed roster file: before %v, after %v, error %v", before, after, err)
+	}
+	if _, err := store.Load("target", "root-target"); err != nil {
+		t.Fatalf("rejected update left unreadable roster: %v", err)
+	}
+}
+
+func TestAddSkipsAddressUsedByAnotherRoleEvenWhenRemoved(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err = store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		for i := 0; i < 10; i++ {
+			roster.Members = append(roster.Members, Member{Address: fmt.Sprintf("analyst%d", i), Role: "analyst",
+				Index: uint64(i), Behavior: "general", Purpose: "general", Instructions: "Analyze.",
+				Access: "read_only", State: "removed", AddedAt: now})
+		}
+		roster.Members = append(roster.Members, Member{Address: "analyst10", Role: "analyst1", Index: 0,
+			Behavior: "general", Purpose: "general", Instructions: "Analyze.", Access: "read_only",
+			State: "removed", AddedAt: now})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"custom": {Roles: map[string]agentteams.Role{
+			"analyst":  {Behavior: "general", Purpose: "general", Instructions: "Analyze.", Access: "read_only"},
+			"analyst1": {Behavior: "general", Purpose: "general", Instructions: "Analyze.", Access: "read_only"},
+		}},
+	}}
+	service := Service{Store: store, Client: &testClient{}, Workspace: workspace, Catalog: catalog}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"analyst", "model", "high")
+	if err != nil || member.Address != "analyst11" || member.Index != 11 {
+		t.Fatalf("member after cross-role collision = %#v, %v", member, err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || len(roster.Members) != 12 || roster.Members[10].Address != "analyst10" ||
+		roster.Members[11].Address != "analyst11" {
+		t.Fatalf("retained cross-role addresses = %#v, %v", roster, err)
+	}
+}
+
 func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
@@ -1322,10 +1432,10 @@ func TestUnmanagedSoloChecksRosterUnderOperationLock(t *testing.T) {
 func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) {
 	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
 		"delegated": {Description: "Separate design and review", TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
-			"team_lead":   {Model: "gpt-6-sol", Effort: "high"},
-			"designer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "designer", Access: "read_only"},
-			"implementer": {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write"},
-			"reviewer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only"},
+			"team_lead":   {Model: "gpt-6-sol", Effort: "high", Purpose: "lead", Instructions: "Coordinate this team."},
+			"designer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "designer", Purpose: "design", Instructions: "Design the change.", Access: "read_only"},
+			"implementer": {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the change.", Access: "workspace_write"},
+			"reviewer":    {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Instructions: "Review the change.", Access: "read_only"},
 		}},
 	}}
 	preset, err := FindCatalogPreset(catalog, "delegated")
@@ -1333,12 +1443,59 @@ func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) 
 		t.Fatal(err)
 	}
 	if preset.Name != "Full team" || preset.LeadModel != "gpt-6-sol" || preset.LeadEffort != "high" ||
+		preset.LeadInstructions != "Coordinate this team." ||
 		len(preset.Members) != 3 || preset.Members[0].Address != "architect0" ||
-		preset.Members[0].Model != "gpt-6-sol" || preset.Members[0].Effort != "xhigh" {
+		preset.Members[0].Model != "gpt-6-sol" || preset.Members[0].Effort != "xhigh" ||
+		preset.Members[0].Purpose != "design" || preset.Members[0].Instructions != "Design the change." {
 		t.Fatalf("catalog projection = %#v", preset)
 	}
 	if preset.MemberCount() != 4 || preset.RoleSummary() != "1 lead, 1 architect, 1 implementer, 1 reviewer" {
 		t.Fatalf("catalog role summary = %d %q", preset.MemberCount(), preset.RoleSummary())
+	}
+}
+
+func TestCatalogPresetProjectsCustomRole(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"custom": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead": {Model: "gpt-6-sol", Effort: "high", Purpose: "lead", Instructions: "Coordinate the work."},
+			"analyst": {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "general", Purpose: "general",
+				Instructions: "Analyze the assigned evidence.", Access: "read_only"},
+		}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "custom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preset.Members) != 1 || preset.Members[0].Address != "analyst0" ||
+		preset.Members[0].Purpose != "general" || preset.Members[0].Instructions != "Analyze the assigned evidence." ||
+		preset.RoleSummary() != "1 lead, 1 analyst" {
+		t.Fatalf("custom role projection = %#v", preset)
+	}
+}
+
+func TestMemberPolicyBindsSessionAndRetainsInstructions(t *testing.T) {
+	member := Member{Role: "analyst", Address: "analyst0", Behavior: "general", Purpose: "general",
+		Instructions: "Analyze the assigned evidence.", Access: "read_only"}
+	policy, err := memberPolicy("/srv/workspace", "2026-09-24-example", member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Sandbox != "read-only" || !strings.Contains(policy.DeveloperInstructions, "2026-09-24-example") ||
+		!strings.Contains(policy.DeveloperInstructions, "/srv/workspace") ||
+		!strings.Contains(policy.DeveloperInstructions, "analyst0") ||
+		!strings.HasSuffix(policy.DeveloperInstructions, member.Instructions) {
+		t.Fatalf("member policy = %#v", policy)
+	}
+	legacy := Member{Role: "reviewer", Address: "reviewer0", Behavior: "reviewer", Access: "read_only"}
+	legacyPolicy, err := memberPolicy("/srv/workspace", "2026-09-24-example", legacy)
+	if err != nil || !strings.HasSuffix(legacyPolicy.DeveloperInstructions, legacyBehaviorInstructions["reviewer"]) {
+		t.Fatalf("legacy member instructions = %#v, %v", legacyPolicy, err)
+	}
+	for _, invalid := range []string{"", "bad\x00prompt", string([]byte{0xff})} {
+		member.Instructions = invalid
+		if _, err := memberPolicy("/srv/workspace", "2026-09-24-example", member); err == nil {
+			t.Fatalf("accepted invalid custom instructions %q", invalid)
+		}
 	}
 }
 
@@ -1359,7 +1516,7 @@ func TestUnmanagedPresetRoleSummaryUsesRoles(t *testing.T) {
 func TestSoloCatalogPresetSerializesEmptyMembers(t *testing.T) {
 	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
 		"solo": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
-			"team_lead": {Model: "gpt-6-sol", Effort: "high"},
+			"team_lead": {Model: "gpt-6-sol", Effort: "high", Purpose: "lead", Instructions: "Lead the work."},
 		}},
 	}}
 	preset, err := FindCatalogPreset(catalog, "solo")
@@ -1382,8 +1539,8 @@ func TestSoloCatalogPresetSerializesEmptyMembers(t *testing.T) {
 func TestCatalogPresetRejectsInstructionDigestDrift(t *testing.T) {
 	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
 		"delegated": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
-			"team_lead": {Model: "gpt-6-sol", Effort: "high"},
-			"reviewer":  {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Access: "read_only"},
+			"team_lead": {Model: "gpt-6-sol", Effort: "high", Purpose: "lead", Instructions: "Lead the work."},
+			"reviewer":  {Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Instructions: "Review the work.", Access: "read_only"},
 		}},
 	}, NativeAgentConfigs: agentteams.NativeAgentConfigs{Roles: []agentteams.NativeRoleConfig{
 		{Team: "delegated", Role: "reviewer", Effort: "xhigh", Identity: agentteams.NativeIdentity{BehaviorDigest: fmt.Sprintf("%064x", 9)}},
@@ -1433,15 +1590,17 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 	client := &testClient{nameFailure: true}
 	service := Service{Store: store, Client: client, Workspace: workspace}
 	preset := Preset{ID: "delivery", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
-		LeadModel: "gpt-6-sol", LeadEffort: "xhigh", Members: []MemberSpec{
-			{Role: "implementer", Address: "implementer0", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write"},
+		LeadModel: "gpt-6-sol", LeadEffort: "xhigh", LeadInstructions: "Coordinate the delivery.", Members: []MemberSpec{
+			{Role: "implementer", Address: "implementer0", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer",
+				Purpose: "implementation", Instructions: "Implement this assignment.", Access: "workspace_write"},
 		}}
 	cwd := filepath.Join(workspace, "work", "one")
 	if _, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset); err == nil {
 		t.Fatal("expected injected name failure")
 	}
 	partial, err := store.Load("one", "root-one")
-	if err != nil || len(partial.Members) != 1 || partial.Members[0].State != "creating" || partial.Members[0].Thread != "thread-1" {
+	if err != nil || len(partial.Members) != 1 || partial.Members[0].State != "creating" || partial.Members[0].Thread != "thread-1" ||
+		partial.LeadInstructions != preset.LeadInstructions || partial.Members[0].Instructions != preset.Members[0].Instructions {
 		t.Fatalf("retained partial member = %#v, %v", partial, err)
 	}
 	ready, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset)
@@ -1450,6 +1609,9 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 	}
 	if len(client.starts) != 1 || client.starts[0].Model != "gpt-6-sol" || client.starts[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("member settings = %#v", client.starts)
+	}
+	if !strings.HasSuffix(client.starts[0].Policy.DeveloperInstructions, "Implement this assignment.") {
+		t.Fatalf("member did not start with retained instructions: %#v", client.starts[0].Policy)
 	}
 	if len(client.resumes) != 1 || client.resumes[0].Policy.Sandbox != client.starts[0].Policy.Sandbox ||
 		client.resumes[0].Policy.DeveloperInstructions != client.starts[0].Policy.DeveloperInstructions ||
@@ -1483,6 +1645,20 @@ func TestSoloPresetRetainsSelectionWithoutSpecialistThread(t *testing.T) {
 	roster, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, preset)
 	if err != nil || roster.PresetID != "solo" || len(roster.Members) != 0 || client.next != 0 {
 		t.Fatalf("solo roster = %#v, starts %d, error %v", roster, client.next, err)
+	}
+}
+
+func TestPresetRejectsInvalidRetainedLeadInstructions(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Store: store, Client: &testClient{}, Workspace: workspace}
+	preset := Preset{ID: "solo", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
+		LeadModel: "gpt-6-sol", LeadEffort: "high", LeadInstructions: "bad\x00prompt"}
+	if _, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, preset); err == nil {
+		t.Fatal("invalid lead instructions were retained")
 	}
 }
 
@@ -1716,6 +1892,13 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := store.Update(context.Background(), "source", "root-source", false, func(roster *Roster) error {
+		roster.Members[0].Purpose = "design"
+		roster.Members[0].Instructions = "Design only this branch."
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	source, err := store.Load("source", "root-source")
 	if err != nil {
 		t.Fatal(err)
@@ -1742,6 +1925,14 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 	}
 	if len(client.forkSettings) != 2 || client.forkSettings[0].Policy.MCPServer != nil || client.forkSettings[1].Policy.MCPServer != nil {
 		t.Fatalf("fork exposed a report tool before destination thread identity: %#v", client.forkSettings)
+	}
+	if !strings.Contains(client.forkSettings[0].Policy.DeveloperInstructions, "session \"target\"") ||
+		!strings.HasSuffix(client.forkSettings[0].Policy.DeveloperInstructions, "Design only this branch.") {
+		t.Fatalf("fork did not retain instructions with destination identity: %#v", client.forkSettings[0].Policy)
+	}
+	destination, err := store.Load("target", "root-target")
+	if err != nil || destination.Members[0].Purpose != "design" || destination.Members[0].Instructions != "Design only this branch." {
+		t.Fatalf("forked retained policy = %#v, %v", destination, err)
 	}
 	if _, err := service.Assign(context.Background(), "target", "root-target", "lead", "architect0", "Review the design", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatal(err)

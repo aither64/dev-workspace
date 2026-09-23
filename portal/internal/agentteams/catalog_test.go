@@ -1,7 +1,9 @@
 package agentteams
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +17,7 @@ func catalogFixture(t *testing.T) Catalog {
 	identity := NativeIdentity{
 		Generator:      GeneratorIdentity{Identity: agentTeamsGeneratorIdentity, Version: 1, Canonicalization: agentTeamsCanonicalization},
 		NativeAdapter:  NativeAdapterIdentity{Identity: nativeAdapterIdentity, Version: 1},
-		BehaviorDigest: strings.Repeat("a", 64),
+		BehaviorDigest: fmt.Sprintf("%x", sha256.Sum256([]byte("Lead work."))),
 	}
 	utilityIdentity := identity
 	utilityIdentity.BehaviorDigest = strings.Repeat("b", 64)
@@ -28,7 +30,7 @@ func catalogFixture(t *testing.T) Catalog {
 		Teams: map[string]Team{"solo": {
 			Description: "A neutral solo team.", DesignOwner: "team_lead", MaxOpenAgents: 0, Mode: "solo", ServicePolicy: "unmanaged",
 			Lifecycle: Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"},
-			Roles:     map[string]Role{"team_lead": {Model: "model-lead", Effort: "high", Behavior: "team_lead", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"}},
+			Roles:     map[string]Role{"team_lead": {Model: "model-lead", Effort: "high", Behavior: "team_lead", Purpose: "lead", Instructions: "Lead work.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"}},
 		}},
 		Utilities:          Utilities{VerificationWatcher: VerificationWatcher{Model: "model-watcher", Effort: "low", Behavior: "verification_watcher", Lifetime: "operation", Access: "workspace_write", Startup: "on_demand", MaxConcurrent: 1, RequiredFor: []string{"long_check"}}},
 		ModelInventory:     []string{"model-lead", "model-watcher"},
@@ -235,25 +237,13 @@ func TestCanonicalJSONMatchesNixSpecialCharacterFixture(t *testing.T) {
 	}
 }
 
-func TestNixProducedCatalogSpecialCharacterDigests(t *testing.T) {
-	// This fixture was emitted by Nix, not constructed or hashed by Go. It
-	// captures the literal <>&, é, U+2028, and U+2029 behavior that catalog,
-	// team, and native-name hashing must preserve.
+func TestLegacyCatalogSchemaRejected(t *testing.T) {
+	// The old package catalog cannot supply frozen role instructions. Existing
+	// session receipts and rosters remain readable, but new package catalogs
+	// must carry the complete schema-4 policy.
 	const fixture = `{"capacity":{"required_native_child_threads":1},"catalog_digest":"8726f5f556d30a9292fe27483539c473ea32702ff853a5616e8d82706e2e7c25","default_development_team":null,"default_team":"solo","model_inventory":["model-<>&é","watcher-<>&é"],"native_agent_configs":{"adapter":{"identity":"codex-custom-agent-toml","version":1},"roles":[{"effort":"high","identity":{"behavior_digest":"f9203d5f97672c28bd89e56beacf8406bd80bc03617752836a7080220421a674","generator":{"canonicalization":"nix-builtins-toJSON-attrset-v1","identity":"dev-workspace-nix-agent-teams","version":1},"native_adapter":{"identity":"codex-custom-agent-toml","version":1}},"kind":"role","name":"dw_76635e4136ba7ffbd2d59c3f412482aa2544bde741392841","path":"share/dev-workspace/agent-teams/solo/team_lead-high.toml","role":"team_lead","team":"solo"}],"utilities":[{"effort":"low","identity":{"behavior_digest":"40e97c6355a385f81a0bdcc354486b3a6f05d6bb1ef459f7b61dfafd3098a90c","generator":{"canonicalization":"nix-builtins-toJSON-attrset-v1","identity":"dev-workspace-nix-agent-teams","version":1},"native_adapter":{"identity":"codex-custom-agent-toml","version":1}},"kind":"utility","name":"dw_a92c058f263afc4e6ddb553dbe0e61429719cd1a10b11deb","path":"share/dev-workspace/agent-teams/utilities/verification_watcher-low.toml","utility":"verification_watcher"}]},"schema_version":3,"teams":{"solo":{"description":"Nix <>& é   ","design_owner":"team_lead","lifecycle":{"communication":"lead_mediated","reviewer_reuse":"same_change","startup":"on_demand"},"max_open_agents":0,"mode":"solo","roles":{"team_lead":{"access":"workspace_write","allowed_efforts":["high"],"behavior":"team_lead","effort":"high","fresh_context":false,"lifetime":"session","model":"model-<>&é"}},"routing":{},"service_policy":"unmanaged","team_digest":"92f8ad296b34d6abb047a35491aa27db6c925fae29eba4e8b4492a6b6444acf3"}},"utilities":{"verification_watcher":{"access":"workspace_write","behavior":"verification_watcher","effort":"low","lifetime":"operation","max_concurrent":1,"model":"watcher-<>&é","required_for":["long_check"],"startup":"on_demand"}},"work_policy":{"design":{"allowed":["high"],"default":"high","followup":"retain","simple":"high","simple_requires_reason":true},"implementation":{"allowed":["high"],"default":"high","followup":"retain","simple":"high","simple_requires_reason":true}}}`
-	catalog, err := decodeCatalog([]byte(fixture))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if catalog.CatalogDigest != "8726f5f556d30a9292fe27483539c473ea32702ff853a5616e8d82706e2e7c25" ||
-		catalog.Teams["solo"].TeamDigest != "92f8ad296b34d6abb047a35491aa27db6c925fae29eba4e8b4492a6b6444acf3" {
-		t.Fatalf("Nix catalog digest fixture changed: %#v", catalog)
-	}
-	role, ok := catalog.RoleVariant("solo", "team_lead", "high")
-	if !ok || role.Name != "dw_76635e4136ba7ffbd2d59c3f412482aa2544bde741392841" {
-		t.Fatalf("Nix role native identity = %#v", role)
-	}
-	if utility := catalog.NativeAgentConfigs.Utilities[0]; utility.Name != "dw_a92c058f263afc4e6ddb553dbe0e61429719cd1a10b11deb" {
-		t.Fatalf("Nix utility native identity = %#v", utility)
+	if _, err := decodeCatalog([]byte(fixture)); err == nil {
+		t.Fatal("schema-3 package catalog was accepted without frozen role instructions")
 	}
 }
 
@@ -285,6 +275,50 @@ func TestCatalogRejectsRefinedTeamAndRoutingContracts(t *testing.T) {
 	catalog.NativeAgentConfigs.Roles[0] = variant
 	if err := validateVariants(catalog); err == nil {
 		t.Fatal("nondeterministic role path was accepted")
+	}
+}
+
+func TestDevelopmentTeamAcceptsPurposeBasedCustomRoles(t *testing.T) {
+	catalog := catalogFixture(t)
+	team := Team{
+		Description: "Purpose-based team", DesignOwner: "architect", MaxOpenAgents: 3,
+		Mode: "development", ServicePolicy: "non_priority", TeamDigest: strings.Repeat("a", 64),
+		Lifecycle: Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"},
+		Roles: map[string]Role{
+			"team_lead": {Model: "model", Effort: "high", Behavior: "team_lead", Purpose: "lead", Instructions: "Lead.",
+				Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"},
+			"architect": {Model: "model", Effort: "high", Behavior: "designer", Purpose: "design", Instructions: "Design.",
+				Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only"},
+			"coder": {Model: "model", Effort: "high", Behavior: "implementer", Purpose: "implementation", Instructions: "Implement.",
+				Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"},
+			"auditor": {Model: "model", Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review.",
+				Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true},
+		},
+		Routing: Routing{DesignSimpleEffort: ptrString("high"), ImplementerSimpleEffort: ptrString("high")},
+	}
+	if !validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("purpose-based role names were rejected")
+	}
+	team.Roles["bad_name"] = team.Roles["architect"]
+	if validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("non-addressable role name was accepted")
+	}
+	delete(team.Roles, "bad_name")
+	team.Roles["lead"] = team.Roles["architect"]
+	if validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("reserved lead member name was accepted")
+	}
+	delete(team.Roles, "lead")
+	team.Roles["designer"] = team.Roles["architect"]
+	if validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("duplicate architect address projection was accepted")
+	}
+	delete(team.Roles, "designer")
+	reviewer := team.Roles["auditor"]
+	reviewer.Access = "workspace_write"
+	team.Roles["auditor"] = reviewer
+	if validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("review role with write access was accepted")
 	}
 }
 

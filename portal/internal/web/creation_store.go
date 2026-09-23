@@ -458,6 +458,9 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 		if !ok {
 			return errors.New("schema-3 receipt lacks a direct team")
 		}
+		if err := validateDirectPresetShape(presetRaw); err != nil {
+			return fmt.Errorf("schema-3 receipt has an invalid direct team: %w", err)
+		}
 		var preset teamruntime.Preset
 		decoder := json.NewDecoder(bytes.NewReader(presetRaw))
 		decoder.DisallowUnknownFields()
@@ -491,6 +494,53 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 		}
 	}
 	return validateManagedCreationRequestShape(request)
+}
+
+func validateDirectPresetShape(data json.RawMessage) error {
+	team, err := rawCreationObject(data)
+	if err != nil {
+		return err
+	}
+	fields := []string{"id", "name", "description", "roles", "catalogDigest", "teamDigest", "leadModel", "leadEffort", "members"}
+	_, withInstructions := team["leadInstructions"]
+	if withInstructions {
+		fields = append(fields, "leadInstructions")
+		var leadInstructions string
+		if err := json.Unmarshal(team["leadInstructions"], &leadInstructions); err != nil ||
+			!validDirectInstructions(leadInstructions) {
+			return errors.New("direct team lead instructions are invalid")
+		}
+	}
+	if !exactDirectPresetFields(team, fields) {
+		return errors.New("direct team has missing or unknown fields")
+	}
+	var members []json.RawMessage
+	if err := json.Unmarshal(team["members"], &members); err != nil || members == nil {
+		return errors.New("direct team members are invalid")
+	}
+	memberFields := []string{"role", "address", "model", "reasoningEffort", "behavior", "access"}
+	if withInstructions {
+		memberFields = append(memberFields, "purpose", "instructions")
+	}
+	for _, data := range members {
+		member, err := rawCreationObject(data)
+		if err != nil || !exactDirectPresetFields(member, memberFields) {
+			return errors.New("direct team member has missing or unknown fields")
+		}
+	}
+	return nil
+}
+
+func exactDirectPresetFields(object map[string]json.RawMessage, fields []string) bool {
+	if len(object) != len(fields) {
+		return false
+	}
+	for _, field := range fields {
+		if _, ok := object[field]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Schema-2 request records are a durable, policy-bearing replay contract. They

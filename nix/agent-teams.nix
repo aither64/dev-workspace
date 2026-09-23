@@ -30,6 +30,14 @@ let
     "designer"
     "implementer"
     "reviewer"
+    "general"
+  ];
+  rolePurposes = [
+    "lead"
+    "design"
+    "implementation"
+    "review"
+    "general"
   ];
   roleLifetimes = [
     "session"
@@ -37,21 +45,40 @@ let
     "work_unit"
     "review_cycle"
   ];
-  accesses = [ "read_only" "workspace_write" ];
+  accesses = [
+    "read_only"
+    "workspace_write"
+  ];
   isNonemptyString = value: builtins.isString value && value != "";
   isIdentifier =
     value:
     isNonemptyString value
     && builtins.stringLength value <= 63
     && builtins.match "[a-z][a-z0-9_]*" value != null;
+  isRoleName =
+    value:
+    value == "team_lead"
+    || (
+      value != "lead"
+      && isNonemptyString value
+      && builtins.stringLength value <= 32
+      && builtins.match "[a-z][a-z0-9]*" value != null
+    );
   isPositiveInt = value: builtins.isInt value && value > 0;
   isUnique = values: builtins.length values == builtins.length (lib.unique values);
   hasExactFields = fields: value: builtins.isAttrs value && builtins.attrNames value == fields;
-  hasOnlyFields = fields: value: builtins.isAttrs value && builtins.all (field: builtins.elem field fields) (builtins.attrNames value);
+  hasOnlyFields =
+    fields: value:
+    builtins.isAttrs value
+    && builtins.all (field: builtins.elem field fields) (builtins.attrNames value);
   validEffort = value: builtins.elem value supportedEfforts;
   validModel = isNonemptyString;
-  validStringList = values: builtins.isList values && values != [ ] && isUnique values && builtins.all isNonemptyString values;
-  validIdentifierList = values: builtins.isList values && values != [ ] && isUnique values && builtins.all isIdentifier values;
+  validStringList =
+    values:
+    builtins.isList values && values != [ ] && isUnique values && builtins.all isNonemptyString values;
+  validIdentifierList =
+    values:
+    builtins.isList values && values != [ ] && isUnique values && builtins.all isIdentifier values;
   validEffortList = values: validStringList values && builtins.all validEffort values;
   validRole =
     role:
@@ -61,16 +88,33 @@ let
       "behavior"
       "effort"
       "fresh_context"
+      "instructions"
       "lifetime"
       "model"
+      "purpose"
     ] role
     && validModel role.model
     && validEffort role.effort
     && validEffortList role.allowed_efforts
     && builtins.elem role.effort role.allowed_efforts
     && builtins.elem role.behavior roleBehaviors
+    && builtins.elem role.purpose rolePurposes
+    &&
+      role.purpose == {
+        team_lead = "lead";
+        designer = "design";
+        implementer = "implementation";
+        reviewer = "review";
+        general = "general";
+      }
+      .${role.behavior}
+    && isNonemptyString role.instructions
+    && builtins.stringLength role.instructions <= 4096
     && builtins.elem role.lifetime roleLifetimes
     && builtins.elem role.access accesses
+    && (role.purpose != "lead" || role.access == "workspace_write")
+    && (role.purpose != "implementation" || role.access == "workspace_write")
+    && (role.purpose != "review" || role.access == "read_only")
     && builtins.isBool role.fresh_context;
   validWorkPolicy =
     policy:
@@ -113,8 +157,7 @@ let
     && isPositiveInt utility.max_concurrent
     && validIdentifierList utility.required_for;
   roleMatchesWorkPolicy =
-    role: policy:
-    role.effort == policy.default && role.allowed_efforts == policy.allowed;
+    role: policy: role.effort == policy.default && role.allowed_efforts == policy.allowed;
   roleSupportsWorkPolicy =
     role: policy:
     builtins.elem policy.default role.allowed_efforts
@@ -143,9 +186,9 @@ let
     && (
       !team.routing ? low_risk_review_role
       || (
-        isIdentifier team.routing.low_risk_review_role
+        isRoleName team.routing.low_risk_review_role
         && builtins.hasAttr team.routing.low_risk_review_role team.roles
-        && (builtins.getAttr team.routing.low_risk_review_role team.roles).behavior == "reviewer"
+        && (builtins.getAttr team.routing.low_risk_review_role team.roles).purpose == "review"
         && (builtins.getAttr team.routing.low_risk_review_role team.roles).fresh_context
       )
     );
@@ -162,26 +205,40 @@ let
       "service_policy"
     ] team
     && isNonemptyString team.description
-    && builtins.elem team.mode [ "solo" "development" ]
-    && builtins.elem team.service_policy [ "unmanaged" "non_priority" ]
+    && builtins.elem team.mode [
+      "solo"
+      "development"
+    ]
+    && builtins.elem team.service_policy [
+      "unmanaged"
+      "non_priority"
+    ]
     && builtins.isAttrs team.roles
     && team.roles != { }
-    && builtins.all isIdentifier (builtins.attrNames team.roles)
+    && builtins.length (builtins.attrNames team.roles) <= 8
+    && !(team.roles ? designer && team.roles ? architect)
+    && builtins.all isRoleName (builtins.attrNames team.roles)
     && builtins.all validRole (builtins.attrValues team.roles)
+    && builtins.all (
+      name:
+      let
+        role = team.roles.${name};
+      in
+      (name == "team_lead" || role.purpose != "lead")
+      && (name != "designer" || role.purpose == "design")
+      && (name != "implementer" || role.purpose == "implementation")
+      && (name != "reviewer" || role.purpose == "review")
+    ) (builtins.attrNames team.roles)
     && validLifecycle team.lifecycle
     && builtins.isAttrs team.routing
     && validRouting team workPolicy
     && team.roles ? team_lead
     && team.roles.team_lead.behavior == "team_lead"
-    && builtins.elem team.design_owner [ "team_lead" "designer" ]
     && builtins.hasAttr team.design_owner team.roles
-    && (
-      if team.design_owner == "team_lead" then
-        team.roles.team_lead.behavior == "team_lead"
-        && !(team.roles ? designer)
-      else
-        team.roles.designer.behavior == "designer"
-    )
+    && builtins.elem team.roles.${team.design_owner}.purpose [
+      "lead"
+      "design"
+    ]
     && (
       if team.mode == "solo" then
         builtins.attrNames team.roles == [ "team_lead" ]
@@ -192,16 +249,15 @@ let
         && roleSupportsWorkPolicy team.roles.team_lead workPolicy.implementation
       else
         roleMatchesWorkPolicy (builtins.getAttr team.design_owner team.roles) workPolicy.design
-        &&
-        team.roles ? implementer
-        && team.roles.implementer.behavior == "implementer"
-        && roleMatchesWorkPolicy team.roles.implementer workPolicy.implementation
-        && team.roles ? reviewer
-        && team.roles.reviewer.behavior == "reviewer"
-        && team.roles.reviewer.fresh_context
-        && builtins.all (
-          role: role.behavior != "reviewer" || role.fresh_context
+        && builtins.any (
+          role: role.purpose == "implementation" && roleMatchesWorkPolicy role workPolicy.implementation
         ) (builtins.attrValues team.roles)
+        && builtins.any (role: role.purpose == "review" && role.fresh_context) (
+          builtins.attrValues team.roles
+        )
+        && builtins.all (role: role.purpose != "review" || role.fresh_context) (
+          builtins.attrValues team.roles
+        )
         && isPositiveInt team.max_open_agents
         && team.max_open_agents <= capacity.required_native_child_threads
         && team.routing ? design_simple_effort
@@ -218,7 +274,7 @@ let
       "utilities"
       "work_policy"
     ] teamConfig
-    && teamConfig.schema_version == 3
+    && teamConfig.schema_version == 4
     && hasExactFields [ "required_native_child_threads" ] teamConfig.capacity
     && isPositiveInt teamConfig.capacity.required_native_child_threads
     && hasExactFields [ "design" "implementation" ] teamConfig.work_policy
@@ -227,9 +283,9 @@ let
     && builtins.isAttrs teamConfig.teams
     && teamConfig.teams != { }
     && builtins.all isIdentifier (builtins.attrNames teamConfig.teams)
-    && builtins.all (
-      team: validTeam team teamConfig.capacity teamConfig.work_policy
-    ) (builtins.attrValues teamConfig.teams)
+    && builtins.all (team: validTeam team teamConfig.capacity teamConfig.work_policy) (
+      builtins.attrValues teamConfig.teams
+    )
     && isIdentifier teamConfig.default_team
     && builtins.hasAttr teamConfig.default_team teamConfig.teams
     && (
@@ -243,34 +299,28 @@ let
     && hasExactFields [ "verification_watcher" ] teamConfig.utilities
     && validUtility teamConfig.utilities.verification_watcher;
   canonicalJSON = value: builtins.toJSON value;
-  catalogDigest = if teamConfig == null then null else builtins.hashString "sha256" (canonicalJSON teamConfig);
+  catalogDigest =
+    if teamConfig == null then null else builtins.hashString "sha256" (canonicalJSON teamConfig);
   teamDigest =
     teamName: team:
-    builtins.hashString "sha256" (
-      canonicalJSON {
-        schema_version = teamConfig.schema_version;
-        inherit (teamConfig) capacity;
-        work_policy = teamConfig.work_policy;
-        team_name = teamName;
-        inherit team;
-      }
-    );
-  roleInstructions = {
-    team_lead = "Coordinate the assigned work and return clear decisions and handoffs. Do not create work outside the assigned team policy.";
-    designer = "Develop and assess the technical design. Do not edit application source.";
-    implementer = "Implement the assigned change and keep unrelated files untouched.";
-    reviewer = "Independently review the assigned change for correctness, security, and verification gaps. Do not edit application source.";
-  };
+    builtins.hashString "sha256" (canonicalJSON {
+      schema_version = teamConfig.schema_version;
+      inherit (teamConfig) capacity;
+      work_policy = teamConfig.work_policy;
+      team_name = teamName;
+      inherit team;
+    });
   nativeIdentity = developerInstructions: {
     inherit generator;
     native_adapter = nativeAdapter;
     behavior_digest = builtins.hashString "sha256" developerInstructions;
   };
-  nativeName = data: "dw_${builtins.substring 0 48 (builtins.hashString "sha256" (canonicalJSON data))}";
+  nativeName =
+    data: "dw_${builtins.substring 0 48 (builtins.hashString "sha256" (canonicalJSON data))}";
   roleVariant =
     team: roleName: role: effort:
     let
-      developerInstructions = roleInstructions.${role.behavior};
+      developerInstructions = role.instructions;
       identity = nativeIdentity developerInstructions;
       name = nativeName {
         catalog_digest = catalogDigest;
@@ -282,7 +332,13 @@ let
     in
     {
       kind = "role";
-      inherit team effort identity name path;
+      inherit
+        team
+        effort
+        identity
+        name
+        path
+        ;
       role = roleName;
       source = writeText "${name}.toml" ''
         name = ${builtins.toJSON name}
@@ -333,16 +389,17 @@ let
         '';
       };
   nativeRoleConfigs = map (variant: builtins.removeAttrs variant [ "source" ]) roleVariants;
-  nativeUtilityConfigs = if utilityVariant == null then [ ] else [ (builtins.removeAttrs utilityVariant [ "source" ]) ];
+  nativeUtilityConfigs =
+    if utilityVariant == null then [ ] else [ (builtins.removeAttrs utilityVariant [ "source" ]) ];
   modelInventory =
     if teamConfig == null then
       [ ]
     else
       lib.sort builtins.lessThan (
         lib.unique (
-          (lib.concatMap (
-            team: map (role: role.model) (builtins.attrValues team.roles)
-          ) (builtins.attrValues teamConfig.teams))
+          (lib.concatMap (team: map (role: role.model) (builtins.attrValues team.roles)) (
+            builtins.attrValues teamConfig.teams
+          ))
           ++ [ teamConfig.utilities.verification_watcher.model ]
         )
       );
@@ -354,16 +411,18 @@ let
       // {
         catalog_digest = catalogDigest;
         model_inventory = modelInventory;
-        teams = lib.mapAttrs (
-          name: team: team // { team_digest = teamDigest name team; }
-        ) teamConfig.teams;
+        teams = lib.mapAttrs (name: team: team // { team_digest = teamDigest name team; }) teamConfig.teams;
         native_agent_configs = {
           adapter = nativeAdapter;
           roles = nativeRoleConfigs;
           utilities = nativeUtilityConfigs;
         };
       };
-  catalog = if catalogData == null then null else writeText "dev-workspace-agent-teams.json" (canonicalJSON catalogData);
+  catalog =
+    if catalogData == null then
+      null
+    else
+      writeText "dev-workspace-agent-teams.json" (canonicalJSON catalogData);
 in
 {
   configured = teamConfig != null;

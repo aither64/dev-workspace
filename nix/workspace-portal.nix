@@ -183,7 +183,7 @@ assert lib.assertMsg validUserNamespace
 assert lib.assertMsg validRouterSocket
   "dev-workspace router socket must be an absolute path below /run";
 assert lib.assertMsg agentTeams.valid
-  "dev-workspace teamConfig must satisfy the version 3 agent-team catalog schema";
+  "dev-workspace teamConfig must satisfy the version 4 agent-team catalog schema";
 assert lib.assertMsg extensionsValid "dev-workspace extensions contain an unknown section";
 assert lib.assertMsg skillNamesUnique
   "dev-workspace extension skills must not replace a built-in skill";

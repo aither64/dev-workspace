@@ -321,23 +321,33 @@ dev-session team assign api-token-rotation --to implementer0 --message 'Implemen
 
 The member roster is isolated to the session. Its compact addresses are stable,
 for example `architect0`, `implementer0`, and `reviewer0`; members from another
-session cannot be addressed. The Team tab shows member messages and keeps
-removed members in a collapsed history section. In the Codex tab, select any
-ready member to read its full conversation or message it directly. Its role
-policy and saved model settings still apply. Fork, archive, delete, and revive
+session cannot be addressed. A site can configure another role, such as
+`analyst`, whose members are addressed as `analyst0`, `analyst1`, and so on.
+The installed catalog supplies each role's purpose and instructions. A new
+session retains the selected team's exact lead and member instructions; adding
+a member later uses the currently installed role policy. A fork copies the
+source instructions and binds them to the destination session. The instructions
+are available on each member's first assignment without sending an earlier
+model turn. The Team tab shows member messages and keeps removed members in a
+collapsed history section. In the Codex tab, select any ready member to read
+its full conversation or message it directly. Its role policy and saved model
+settings still apply. Fork, archive, delete, and revive
 apply the corresponding Codex operation to all roster members with the root
 session.
 
 The root conversation is the team lead in both the portal and tmux. For each
 new substantive work item, it checks the current roster, assigns nontrivial
-design to a ready architect and separable implementation to a ready implementer,
-and integrates their reports. It handles short or dependent steps itself and
-uses the applicable mandatory-review workflow for a retained reviewer. Member
-addresses and settings are read from the live roster, so later team changes
+design to a ready member with design purpose and separable implementation to a
+ready member with implementation purpose, then integrates their reports. It
+handles short or dependent steps itself and uses the applicable mandatory-review
+workflow for a retained reviewer. Member addresses and settings are read from
+the live roster, so later team changes
 apply without restarting the lead. Selecting a team creates no automatic work
-assignments. An existing idle root conversation receives the same lead policy
-when the portal reconciles its instructions; active turns are left alone until
-they finish.
+assignments. The portal binds the lead conversation to its exact workspace and
+session. This binding and the configured lead instructions are attached before
+the first user request, with no extra model turn. An existing idle root
+conversation receives the same lead policy when the portal reconciles its
+instructions; active turns are left alone until they finish.
 
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.

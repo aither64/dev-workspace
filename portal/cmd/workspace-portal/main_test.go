@@ -29,9 +29,9 @@ func TestRootThreadSettingsKeepLeadPolicySeparateFromModel(t *testing.T) {
 	for _, selected := range []struct{ model, effort string }{
 		{}, {"gpt-6-sol", "xhigh"},
 	} {
-		settings := rootThreadSettings(selected.model, selected.effort)
+		settings := rootThreadSettings(selected.model, selected.effort, "example", "/workspace", "")
 		if settings.Model != selected.model || settings.ReasoningEffort != selected.effort ||
-			settings.Policy != workspacecodex.LeadThreadPolicy() {
+			settings.Policy != workspacecodex.LeadThreadPolicy("example", "/workspace", "") {
 			t.Fatalf("root settings = %#v", settings)
 		}
 	}

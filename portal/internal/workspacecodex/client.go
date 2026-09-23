@@ -80,8 +80,8 @@ func (c *Client) RecoverCreatingThreadWithSettings(
 	environment map[string]string,
 	settings codex.ThreadSettings,
 ) (string, error) {
-	return c.RecoverCreatingThreadWithSettingsResolver(
-		ctx, threadID, cwd, environment,
+	return c.RecoverCreatingThreadWithPolicyAndSettingsResolver(
+		ctx, threadID, cwd, environment, settings.Policy,
 		func() (codex.ThreadSettings, error) { return settings, nil },
 	)
 }
@@ -93,6 +93,21 @@ func (c *Client) RecoverCreatingThreadWithSettingsResolver(
 	ctx context.Context,
 	threadID, cwd string,
 	environment map[string]string,
+	resolveSettings func() (codex.ThreadSettings, error),
+) (string, error) {
+	return c.RecoverCreatingThreadWithPolicyAndSettingsResolver(
+		ctx, threadID, cwd, environment, codex.ThreadPolicy{}, resolveSettings,
+	)
+}
+
+// RecoverCreatingThreadWithPolicyAndSettingsResolver applies the accepted
+// thread policy to an existing candidate without resolving or replacing its
+// saved model and reasoning effort. Only a new replacement calls the resolver.
+func (c *Client) RecoverCreatingThreadWithPolicyAndSettingsResolver(
+	ctx context.Context,
+	threadID, cwd string,
+	environment map[string]string,
+	policy codex.ThreadPolicy,
 	resolveSettings func() (codex.ThreadSettings, error),
 ) (string, error) {
 	candidates := make(map[string]struct{})
@@ -142,10 +157,10 @@ func (c *Client) RecoverCreatingThreadWithSettingsResolver(
 		if candidateID != threadID && materialized {
 			return "", errors.New("refusing a different materialized Codex thread as a creation replacement")
 		}
-		if !materialized {
+		if !materialized && policy == (codex.ThreadPolicy{}) {
 			return candidateID, nil
 		}
-		return c.ResumeThread(ctx, candidateID, cwd, environment)
+		return c.ResumeThreadWithSettings(ctx, candidateID, cwd, environment, codex.ThreadSettings{Policy: policy})
 	}
 	settings, err := resolveSettings()
 	if err != nil {

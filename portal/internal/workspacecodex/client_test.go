@@ -771,6 +771,66 @@ func TestRetireThreadArchivesAFreshThreadWithoutARollout(t *testing.T) {
 	}
 }
 
+func TestRecoverCreatingThreadRestoresPolicyBeforeFirstRequest(t *testing.T) {
+	cwd := "/workspace/work/example"
+	rollout := filepath.Join(t.TempDir(), "not-yet-materialized.jsonl")
+	environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace", "DEV_SESSION_SLUG": "example"}
+	policy := codex.ThreadPolicy{DeveloperInstructions: "Frozen lead role instructions."}
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{"thread/loaded/list", "thread/list", "thread/read", "thread/resume"} {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != method {
+				return fmt.Errorf("expected %s: %#v, %v", method, request, err)
+			}
+			var result map[string]any
+			switch method {
+			case "thread/loaded/list":
+				result = map[string]any{"data": []any{}, "nextCursor": nil}
+			case "thread/list":
+				result = map[string]any{"data": []any{map[string]any{"id": "thread-existing", "cwd": cwd}}, "nextCursor": nil}
+			case "thread/read":
+				result = map[string]any{"thread": freshThreadMetadata("thread-existing", cwd, rollout)}
+			case "thread/resume":
+				params := request["params"].(map[string]any)
+				if params["developerInstructions"] != policy.DeveloperInstructions || params["model"] != nil {
+					return fmt.Errorf("retry did not restore only the saved policy: %#v", params)
+				}
+				config := params["config"].(map[string]any)
+				if _, ok := config["model_reasoning_effort"]; ok {
+					return fmt.Errorf("retry replaced saved reasoning effort: %#v", config)
+				}
+				set := config["shell_environment_policy"].(map[string]any)["set"].(map[string]any)
+				if set["DEV_SESSION_SLUG"] != "example" {
+					return fmt.Errorf("retry omitted the session environment: %#v", set)
+				}
+				result = map[string]any{"thread": map[string]any{"id": "thread-existing", "cwd": cwd}}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resolved := false
+	id, err := client.RecoverCreatingThreadWithPolicyAndSettingsResolver(
+		ctx, "thread-existing", cwd, environment, policy,
+		func() (codex.ThreadSettings, error) {
+			resolved = true
+			return codex.ThreadSettings{}, errors.New("current model catalog changed")
+		},
+	)
+	if err != nil || id != "thread-existing" || resolved {
+		t.Fatalf("frozen candidate recovery = %q, resolved=%t, error=%v", id, resolved, err)
+	}
+}
+
 func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T) {
 	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {

@@ -211,11 +211,47 @@ type pageData struct {
 	DirectTeam        *teamruntime.Roster
 	RemovedMembers    []teamruntime.Member
 	TeamPresets       []teamruntime.Preset
+	TeamRoles         []teamRoleOption
 	ReadyMembers      []teamruntime.Member
 	SelectedMember    string
 	SelectedThreadID  string
 	ConversationID    string
 	MemberNotice      string
+}
+
+type teamRoleOption struct {
+	ID    string
+	Label string
+}
+
+func teamRoles(presets []teamruntime.Preset) []teamRoleOption {
+	roles := make(map[string]bool)
+	for _, preset := range presets {
+		for _, member := range preset.Members {
+			roles[member.Role] = true
+		}
+		if len(preset.Members) == 0 {
+			for _, role := range preset.Roles {
+				if role != "lead" {
+					roles[role] = true
+				}
+			}
+		}
+	}
+	ids := make([]string, 0, len(roles))
+	for role := range roles {
+		ids = append(ids, role)
+	}
+	sort.Strings(ids)
+	options := make([]teamRoleOption, 0, len(ids))
+	for _, role := range ids {
+		label := strings.ReplaceAll(role, "_", " ")
+		if label != "" {
+			label = strings.ToUpper(label[:1]) + label[1:]
+		}
+		options = append(options, teamRoleOption{ID: role, Label: label})
+	}
+	return options
 }
 
 type agentTeamsPage struct {
@@ -438,9 +474,11 @@ func (s *Server) reconcileThreadInstructions() {
 			listError = ""
 		}
 		current := make(map[string]string)
+		currentSummaries := make(map[string]*session.Summary)
 		for _, summary := range summaries {
 			if !summary.Archived && summary.Codex.ThreadID != "" {
 				current[summary.Slug] = summary.Codex.ThreadID
+				currentSummaries[summary.Slug] = &summary
 			}
 		}
 		if !initialized {
@@ -466,9 +504,25 @@ func (s *Server) reconcileThreadInstructions() {
 			if err != nil && current[slug] == "" {
 				continue
 			}
+			var leadInstructions string
+			if summary := currentSummaries[slug]; summary != nil {
+				roster, loadErr := s.loadTeamRoster(summary)
+				if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+					if lastErrors[slug] != loadErr.Error() {
+						s.config.Logger.Printf("load lead policy for %s: %v", slug, loadErr)
+						lastErrors[slug] = loadErr.Error()
+					}
+					continue
+				}
+				if roster != nil {
+					leadInstructions = roster.LeadInstructions
+				} else if receipt, ok := s.currentCreation(slug); ok && receipt.DirectTeam != nil {
+					leadInstructions = receipt.DirectTeam.LeadInstructions
+				}
+			}
 			attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			err := s.config.Codex.ReconcileThreadInstructionsWithPolicy(
-				attemptCtx, threadID, workspacecodex.LeadThreadPolicy(),
+				attemptCtx, threadID, workspacecodex.LeadThreadPolicy(slug, s.config.Workspace, leadInstructions),
 			)
 			cancel()
 			if err == nil {
@@ -983,6 +1037,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.DirectTeam = roster
 		data.RemovedMembers = removedTeamMembers(roster)
 	}
+	data.TeamRoles = teamRoles(data.TeamPresets)
 	data.SelectedThreadID = summary.Codex.ThreadID
 	data.ConversationID = summary.Slug
 	if data.DirectTeam != nil {
@@ -1087,6 +1142,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 			}
 		}
 	}
+	data.TeamRoles = teamRoles(data.TeamPresets)
 	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render repositories"})

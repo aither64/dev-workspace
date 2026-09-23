@@ -129,13 +129,16 @@ The normal session conversation is always `lead` and remains the one available
 through `dev-session attach`; member threads do not get tmux panes. Adding a
 member creates its persistent Codex thread immediately, before it receives its
 first assignment. Members use compact addresses such as `architect0`,
-`implementer0`, and `reviewer0`. Addresses are never reused or renumbered.
+`implementer0`, and `reviewer0`. A configured `analyst` role becomes
+`analyst0`, then `analyst1` when another is added. Addresses are never reused
+or renumbered.
 
-The roster is a private, workspace-and-session-scoped record. It contains only
-the root identity, member addresses, thread IDs, lifecycle state, and desired
-next-turn model and reasoning settings. Message history stays in each Codex
-thread. A team message resolves both addresses through the same roster, and the
-member transcript API accepts a roster address rather than a raw thread ID.
+The roster is a private, workspace-and-session-scoped record. It contains the
+root identity, member addresses, thread IDs, lifecycle state, desired next-turn
+model and reasoning settings, and frozen role instructions. Message history
+stays in each Codex thread. A team message resolves both addresses through the
+same roster, and the member transcript API accepts a roster address rather than
+a raw thread ID.
 There is no global message bus or cross-session member discovery.
 The portal's Team assignment API sends as `lead` only. A member can report to
 `lead` through its bound host tool, which checks that member's roster and
@@ -152,7 +155,9 @@ that saved selection.
 
 After creation, the Team tab can add, remove, and configure members, and
 inspect their messages. Model and reasoning settings apply to a member's next
-turn. Removed members stay in a collapsed history section. The Codex tab can
+turn. Its add selector lists every role in the installed catalog. If a role is
+outside the current preset, choose its model and reasoning effort explicitly.
+Removed members stay in a collapsed history section. The Codex tab can
 switch between `lead` and ready members to show each complete conversation;
 direct messages use the member's current role policy and model settings. Work
 can also be assigned from the CLI. An assignment to a busy member uses App
@@ -191,16 +196,31 @@ their root conversation and begin with an empty direct roster.
 
 An optional `teamConfig` in `lib.mkPackage` builds the installed team
 catalog. The catalog supplies named presets and exact model, reasoning,
-behavior, and access defaults; it is not a virtual-team dispatcher. The
-package records its catalog digest, and the host launch marker binds it through
-the registration-plan digest. No native child-agent capacity or per-role startup
+behavior, purpose, access, and instruction defaults; it is not a virtual-team
+dispatcher. Site configuration may add up to eight roles per team, including
+the lead. Member role names use lowercase letters and digits and are at most
+32 characters long. Each member role has a purpose of `design`,
+`implementation`, `review`, or `general`. The lead uses purpose `lead`.
+The generic package requires instructions for every role. A site can provide
+defaults for known roles and supply instructions for its own roles. A
+development team still needs a design owner, an implementer, and a reviewer,
+but their role names can differ from the built-in names. The package records
+its catalog digest, and the host launch marker binds it through the
+registration-plan digest. No native child-agent capacity or per-role startup
 arguments are required for direct threads.
 
 At creation, the selected preset is copied into the private schema-3 receipt
-and durable roster. That snapshot includes each member's address, model,
-reasoning effort, behavior, and access. Retrying creation uses the snapshot,
-even if a later package has different defaults. Team mutations remain
-unavailable until the creation receipt is ready. If a member's App Server
+and durable roster. The expanded snapshot includes `leadInstructions` and each
+member's address, model, reasoning effort, behavior, purpose, access, and exact
+instructions. Retrying creation uses the snapshot, even if a
+later package has different defaults. Forks copy the source prompts and bind
+them to the destination session; members added later use the then-installed
+catalog. Older receipts without `leadInstructions`, and rosters without
+instruction fields, continue with their original role instructions. Newly
+created expanded receipts require the newer package and are not readable by an
+older package; this is a forward-only
+package transition. Team mutations remain unavailable until the creation
+receipt is ready. If a member's App Server
 start has an uncertain outcome, retry reconciles its registered App Server
 project and refuses to start another thread when the result is ambiguous. Each
 member's project is created with a durable idempotency key derived from the
@@ -212,14 +232,19 @@ the project lookup or thread listing is unavailable, creation remains pending.
 Fresh headless threads have no rollout until history is written, and App Server
 can unload them when the creating client disconnects. Before marking a member
 ready, the runtime injects one internal developer bootstrap item and verifies
-its exact marker in that thread's rollout; this starts no model turn. An
-uncertain injection is reconciled against that marker, never blindly repeated.
+its exact marker in that thread's rollout; this starts no model turn. Retained
+role instructions are attached as developer instructions when the thread starts
+and on later turns. They do not cause a separate model turn before the first
+assignment. An uncertain injection is reconciled against that marker, never
+blindly repeated.
 Fork destinations receive the same bootstrap before becoming ready.
 
-The runtime applies the retained role instructions to each member thread.
-Architects and reviewers use a read-only sandbox; implementers use
-workspace-write. Ordinary portal reads leave the thread's persisted
-instructions alone. Assignments reapply the retained policy and use a stable
+The runtime combines each member's retained role instructions with an exact
+workspace, session, and member-address binding. It checks the role purpose and
+configured access before starting a turn. The built-in architect and reviewer
+roles use a read-only sandbox; the built-in implementer uses workspace-write.
+Ordinary portal reads leave the thread's persisted instructions alone.
+Assignments reapply the retained policy and use a stable
 message ID for retries. In the CLI, keep the ID shown after an uncertain
 assignment failure and pass it with `--message-id` when retrying.
 Retry the same ID within the same installed package generation. A package

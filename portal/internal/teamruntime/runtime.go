@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
@@ -25,7 +26,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const schema = 1
+const (
+	schema         = 1
+	maxRosterBytes = 256 * 1024
+)
 
 var rolePattern = regexp.MustCompile(`^[a-z][a-z0-9]{0,31}$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -36,20 +40,21 @@ var messageIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]
 // session's normal root conversation and therefore has no separate member
 // record.
 type Roster struct {
-	Schema        int                 `json:"schema"`
-	Workspace     string              `json:"workspace"`
-	Slug          string              `json:"slug"`
-	RootThreadID  string              `json:"rootThreadId"`
-	Revision      uint64              `json:"revision"`
-	CreatedAt     time.Time           `json:"createdAt"`
-	UpdatedAt     time.Time           `json:"updatedAt"`
-	PresetID      string              `json:"presetId,omitempty"`
-	CatalogDigest string              `json:"catalogDigest,omitempty"`
-	TeamDigest    string              `json:"teamDigest,omitempty"`
-	LeadModel     string              `json:"leadModel,omitempty"`
-	LeadEffort    string              `json:"leadEffort,omitempty"`
-	ForkSource    *ForkSourceSnapshot `json:"forkSource,omitempty"`
-	Members       []Member            `json:"members"`
+	Schema           int                 `json:"schema"`
+	Workspace        string              `json:"workspace"`
+	Slug             string              `json:"slug"`
+	RootThreadID     string              `json:"rootThreadId"`
+	Revision         uint64              `json:"revision"`
+	CreatedAt        time.Time           `json:"createdAt"`
+	UpdatedAt        time.Time           `json:"updatedAt"`
+	PresetID         string              `json:"presetId,omitempty"`
+	CatalogDigest    string              `json:"catalogDigest,omitempty"`
+	TeamDigest       string              `json:"teamDigest,omitempty"`
+	LeadModel        string              `json:"leadModel,omitempty"`
+	LeadEffort       string              `json:"leadEffort,omitempty"`
+	LeadInstructions string              `json:"leadInstructions,omitempty"`
+	ForkSource       *ForkSourceSnapshot `json:"forkSource,omitempty"`
+	Members          []Member            `json:"members"`
 }
 
 // ForkSourceSnapshot is the immutable source roster selection used by every
@@ -72,6 +77,8 @@ type ForkSourceMember struct {
 	Model               string `json:"model"`
 	Effort              string `json:"reasoningEffort"`
 	Behavior            string `json:"behavior"`
+	Purpose             string `json:"purpose,omitempty"`
+	Instructions        string `json:"instructions,omitempty"`
 	Access              string `json:"access"`
 	PolicyCatalogDigest string `json:"policyCatalogDigest,omitempty"`
 	State               string `json:"state"`
@@ -85,6 +92,8 @@ type Member struct {
 	Model               string     `json:"model,omitempty"`
 	Effort              string     `json:"reasoningEffort,omitempty"`
 	Behavior            string     `json:"behavior,omitempty"`
+	Purpose             string     `json:"purpose,omitempty"`
+	Instructions        string     `json:"instructions,omitempty"`
 	Access              string     `json:"access,omitempty"`
 	PolicyCatalogDigest string     `json:"policyCatalogDigest,omitempty"`
 	ProjectID           string     `json:"projectId,omitempty"`
@@ -97,15 +106,16 @@ type Member struct {
 }
 
 type Preset struct {
-	ID            string       `json:"id"`
-	Name          string       `json:"name"`
-	Description   string       `json:"description"`
-	Roles         []string     `json:"roles"`
-	CatalogDigest string       `json:"catalogDigest,omitempty"`
-	TeamDigest    string       `json:"teamDigest,omitempty"`
-	LeadModel     string       `json:"leadModel,omitempty"`
-	LeadEffort    string       `json:"leadEffort,omitempty"`
-	Members       []MemberSpec `json:"members"`
+	ID               string       `json:"id"`
+	Name             string       `json:"name"`
+	Description      string       `json:"description"`
+	Roles            []string     `json:"roles"`
+	CatalogDigest    string       `json:"catalogDigest,omitempty"`
+	TeamDigest       string       `json:"teamDigest,omitempty"`
+	LeadModel        string       `json:"leadModel,omitempty"`
+	LeadEffort       string       `json:"leadEffort,omitempty"`
+	LeadInstructions string       `json:"leadInstructions,omitempty"`
+	Members          []MemberSpec `json:"members"`
 }
 
 func (preset Preset) MemberCount() int {
@@ -151,49 +161,72 @@ func (preset Preset) RoleSummary() string {
 }
 
 type MemberSpec struct {
-	Role     string `json:"role"`
-	Address  string `json:"address"`
-	Model    string `json:"model"`
-	Effort   string `json:"reasoningEffort"`
-	Behavior string `json:"behavior"`
-	Access   string `json:"access"`
+	Role         string `json:"role"`
+	Address      string `json:"address"`
+	Model        string `json:"model"`
+	Effort       string `json:"reasoningEffort"`
+	Behavior     string `json:"behavior"`
+	Purpose      string `json:"purpose,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
+	Access       string `json:"access"`
 }
 
-// These are the App Server equivalents of nix/agent-teams.nix roleInstructions.
-// The pinned catalog selects a behavior; a role/access mismatch fails closed.
-var behaviorInstructions = map[string]string{
+// Legacy rosters predate retained instructions. Keep their original behavioral
+// text so an installed catalog update cannot alter an existing member's job.
+var legacyBehaviorInstructions = map[string]string{
 	"designer":    "Develop and assess the technical design. Do not edit application source.",
 	"implementer": "Implement the assigned change and keep unrelated files untouched.",
 	"reviewer":    "Independently review the assigned change for correctness, security, and verification gaps. Do not edit application source.",
 }
 
-func memberPolicy(behavior, access string) (codex.ThreadPolicy, error) {
-	instructions := behaviorInstructions[behavior]
+var purposeForBehavior = map[string]string{
+	"designer": "design", "implementer": "implementation", "reviewer": "review", "general": "general",
+}
+
+func validateMemberPolicy(role, behavior, purpose, instructions, access string) error {
+	if !rolePattern.MatchString(role) || role == "lead" || role == "team_lead" ||
+		purposeForBehavior[behavior] == "" || (purpose != "" && purpose != purposeForBehavior[behavior]) ||
+		!validRetainedInstructions(instructions) || (access != "read_only" && access != "workspace_write") {
+		return fmt.Errorf("team role %s has invalid retained policy", role)
+	}
+	if purpose == "" || instructions == "" {
+		legacy := map[string]string{"architect": "designer", "implementer": "implementer", "reviewer": "reviewer"}
+		if purpose != "" || instructions != "" || behavior != legacy[role] || access != map[string]string{
+			"architect": "read_only", "implementer": "workspace_write", "reviewer": "read_only",
+		}[role] {
+			return fmt.Errorf("team role %s has incomplete retained policy", role)
+		}
+	} else if (purpose == "implementation" && access != "workspace_write") ||
+		(purpose == "review" && access != "read_only") {
+		return fmt.Errorf("team role %s has incompatible access", role)
+	}
+	return nil
+}
+
+func validRetainedInstructions(instructions string) bool {
+	return len(instructions) <= 4096 && utf8.ValidString(instructions) && !strings.ContainsRune(instructions, '\x00')
+}
+
+func memberPolicy(workspace, slug string, member Member) (codex.ThreadPolicy, error) {
+	if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, member.Access); err != nil {
+		return codex.ThreadPolicy{}, err
+	}
+	instructions := member.Instructions
 	if instructions == "" {
-		return codex.ThreadPolicy{}, fmt.Errorf("unknown team member behavior %q", behavior)
+		instructions = legacyBehaviorInstructions[member.Behavior]
 	}
 	var sandbox string
-	switch access {
+	switch member.Access {
 	case "read_only":
 		sandbox = "read-only"
 	case "workspace_write":
 		sandbox = "workspace-write"
-	default:
-		return codex.ThreadPolicy{}, fmt.Errorf("unknown team member access %q", access)
 	}
-	return codex.ThreadPolicy{DeveloperInstructions: instructions, Sandbox: sandbox}, nil
-}
-
-func policyForRole(role, behavior, access string) (codex.ThreadPolicy, error) {
-	expected := map[string]struct{ behavior, access string }{
-		"architect":   {"designer", "read_only"},
-		"implementer": {"implementer", "workspace_write"},
-		"reviewer":    {"reviewer", "read_only"},
-	}[role]
-	if expected.behavior == "" || behavior != expected.behavior || access != expected.access {
-		return codex.ThreadPolicy{}, fmt.Errorf("team role %s has unsupported behavior or access", role)
+	if !session.ValidSlug(slug) || workspace == "" || member.Address == "" {
+		return codex.ThreadPolicy{}, errors.New("member policy has incomplete session identity")
 	}
-	return memberPolicy(behavior, access)
+	identity := fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working on session files, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch.\n\n", slug, workspace, member.Address)
+	return codex.ThreadPolicy{DeveloperInstructions: identity + instructions, Sandbox: sandbox}, nil
 }
 
 func validateCatalogInstructions(catalog *agentteams.Catalog, teamID, roleName string, role agentteams.Role) error {
@@ -201,11 +234,7 @@ func validateCatalogInstructions(catalog *agentteams.Catalog, teamID, roleName s
 		// Hand-constructed catalog fixtures have no generated native variants.
 		return nil
 	}
-	policy, err := memberPolicy(role.Behavior, role.Access)
-	if err != nil {
-		return err
-	}
-	want := fmt.Sprintf("%x", sha256.Sum256([]byte(policy.DeveloperInstructions)))
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(role.Instructions)))
 	for _, variant := range catalog.NativeAgentConfigs.Roles {
 		if variant.Team == teamID && variant.Role == roleName && variant.Effort == role.Effort {
 			if variant.Identity.BehaviorDigest != want {
@@ -217,7 +246,7 @@ func validateCatalogInstructions(catalog *agentteams.Catalog, teamID, roleName s
 	return fmt.Errorf("catalog has no instructions for %s/%s", teamID, roleName)
 }
 
-func catalogRole(catalog *agentteams.Catalog, role string, managed bool) (agentteams.Role, error) {
+func catalogRole(catalog *agentteams.Catalog, teamID, role string, managed bool) (agentteams.Role, error) {
 	if catalog == nil {
 		if managed {
 			return agentteams.Role{}, errors.New("installed team catalog is required to add a member")
@@ -238,30 +267,77 @@ func catalogRole(catalog *agentteams.Catalog, role string, managed bool) (agentt
 	if !digestPattern.MatchString(catalog.CatalogDigest) {
 		return agentteams.Role{}, errors.New("installed team catalog has no valid digest")
 	}
-	name := role
-	if name == "architect" {
-		name = "designer"
+	if role == "lead" || role == "team_lead" {
+		return agentteams.Role{}, errors.New("lead cannot be added as a member")
 	}
-	var found *agentteams.Role
-	for teamID, team := range catalog.Teams {
+	find := func(id string) (agentteams.Role, bool, error) {
+		team, ok := catalog.Teams[id]
+		if !ok {
+			return agentteams.Role{}, false, nil
+		}
+		name := role
 		candidate, ok := team.Roles[name]
+		if !ok && name == "architect" {
+			name = "designer"
+			candidate, ok = team.Roles[name]
+		}
 		if !ok || name == "team_lead" {
+			return agentteams.Role{}, false, nil
+		}
+		if err := validateMemberPolicy(role, candidate.Behavior, candidate.Purpose, candidate.Instructions, candidate.Access); err != nil {
+			return agentteams.Role{}, false, err
+		}
+		if err := validateCatalogInstructions(catalog, id, name, candidate); err != nil {
+			return agentteams.Role{}, false, err
+		}
+		return candidate, true, nil
+	}
+	// A retained team's own role wins. Otherwise the configured development
+	// default supplies additions to older or smaller teams.
+	preferred := []string{teamID}
+	if catalog.DefaultDevelopmentTeam != nil {
+		preferred = append(preferred, *catalog.DefaultDevelopmentTeam)
+	}
+	preferred = append(preferred, catalog.DefaultTeam)
+	seen := map[string]bool{}
+	for _, id := range preferred {
+		if id == "" || seen[id] {
 			continue
 		}
-		if found != nil && (found.Behavior != candidate.Behavior || found.Access != candidate.Access) {
-			return agentteams.Role{}, fmt.Errorf("team role %s has conflicting catalog policies", role)
-		}
-		if err := validateCatalogInstructions(catalog, teamID, name, candidate); err != nil {
+		seen[id] = true
+		found, ok, err := find(id)
+		if err != nil {
 			return agentteams.Role{}, err
+		}
+		if ok {
+			return found, nil
+		}
+	}
+	ids := make([]string, 0, len(catalog.Teams))
+	for id := range catalog.Teams {
+		if !seen[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	var found *agentteams.Role
+	for _, id := range ids {
+		candidate, ok, err := find(id)
+		if err != nil {
+			return agentteams.Role{}, err
+		}
+		if !ok {
+			continue
+		}
+		if found != nil && (found.Behavior != candidate.Behavior || found.Purpose != candidate.Purpose ||
+			found.Instructions != candidate.Instructions || found.Access != candidate.Access) {
+			return agentteams.Role{}, fmt.Errorf("team role %s has conflicting catalog policies", role)
 		}
 		copy := candidate
 		found = &copy
 	}
 	if found == nil {
 		return agentteams.Role{}, fmt.Errorf("team role %s has no pinned catalog policy", role)
-	}
-	if _, err := policyForRole(role, found.Behavior, found.Access); err != nil {
-		return agentteams.Role{}, err
 	}
 	return *found, nil
 }
@@ -286,8 +362,12 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 		}
 		team := catalog.Teams[id]
 		lead, ok := team.Roles["team_lead"]
-		if !ok || lead.Model == "" || lead.Effort == "" || team.TeamDigest == "" {
+		if !ok || lead.Model == "" || lead.Effort == "" || lead.Purpose != "lead" ||
+			lead.Instructions == "" || team.TeamDigest == "" {
 			return nil, fmt.Errorf("team %s has incomplete lead settings", id)
+		}
+		if err := validateCatalogInstructions(&catalog, id, "team_lead", lead); err != nil {
+			return nil, err
 		}
 		name := map[string]string{"solo": "Solo", "delegated": "Full team", "lead_designed": "Lead-designed team"}[id]
 		if name == "" {
@@ -296,7 +376,7 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 		}
 		preset := Preset{ID: id, Name: name, Description: team.Description, Members: []MemberSpec{},
 			CatalogDigest: catalog.CatalogDigest, TeamDigest: team.TeamDigest,
-			LeadModel: lead.Model, LeadEffort: lead.Effort,
+			LeadModel: lead.Model, LeadEffort: lead.Effort, LeadInstructions: lead.Instructions,
 			Roles: []string{"lead"}}
 		roleNames := make([]string, 0, len(team.Roles))
 		for roleName := range team.Roles {
@@ -305,16 +385,19 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 			}
 		}
 		sort.Strings(roleNames)
+		addresses := make(map[string]bool, len(roleNames))
 		for _, roleName := range roleNames {
 			role := team.Roles[roleName]
 			addressRole := roleName
 			if addressRole == "designer" {
 				addressRole = "architect"
 			}
-			if !rolePattern.MatchString(addressRole) || role.Model == "" || role.Effort == "" {
+			if !rolePattern.MatchString(addressRole) || addressRole == "lead" || addresses[addressRole] ||
+				role.Model == "" || role.Effort == "" {
 				return nil, fmt.Errorf("team %s has invalid direct member %s", id, roleName)
 			}
-			if _, err := policyForRole(addressRole, role.Behavior, role.Access); err != nil {
+			addresses[addressRole] = true
+			if err := validateMemberPolicy(addressRole, role.Behavior, role.Purpose, role.Instructions, role.Access); err != nil {
 				return nil, fmt.Errorf("team %s member %s: %w", id, roleName, err)
 			}
 			if err := validateCatalogInstructions(&catalog, id, roleName, role); err != nil {
@@ -322,7 +405,7 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 			}
 			preset.Members = append(preset.Members, MemberSpec{Role: addressRole,
 				Address: addressRole + "0", Model: role.Model, Effort: role.Effort,
-				Behavior: role.Behavior, Access: role.Access})
+				Behavior: role.Behavior, Purpose: role.Purpose, Instructions: role.Instructions, Access: role.Access})
 			preset.Roles = append(preset.Roles, addressRole+"0")
 		}
 		presets = append(presets, preset)
@@ -367,10 +450,12 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 	}
 	if roster.PresetID != "" {
 		if !session.ValidSlug(roster.PresetID) || !digestPattern.MatchString(roster.CatalogDigest) ||
-			!digestPattern.MatchString(roster.TeamDigest) || roster.LeadModel == "" || roster.LeadEffort == "" {
+			!digestPattern.MatchString(roster.TeamDigest) || roster.LeadModel == "" || roster.LeadEffort == "" ||
+			!validRetainedInstructions(roster.LeadInstructions) {
 			return errors.New("team roster has an invalid preset identity")
 		}
-	} else if roster.CatalogDigest != "" || roster.TeamDigest != "" || roster.LeadModel != "" || roster.LeadEffort != "" {
+	} else if roster.CatalogDigest != "" || roster.TeamDigest != "" || roster.LeadModel != "" ||
+		roster.LeadEffort != "" || roster.LeadInstructions != "" {
 		return errors.New("team roster has settings without a preset")
 	}
 	if roster.ForkSource != nil {
@@ -392,9 +477,11 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 		}
 		seen[member.Address] = struct{}{}
 		if member.Behavior != "" || member.Access != "" {
-			if _, err := policyForRole(member.Role, member.Behavior, member.Access); err != nil {
+			if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, member.Access); err != nil {
 				return fmt.Errorf("team roster member %s policy: %w", member.Address, err)
 			}
+		} else if member.Purpose != "" || member.Instructions != "" {
+			return errors.New("team roster member has instructions without a policy")
 		}
 		if member.PolicyCatalogDigest != "" && !digestPattern.MatchString(member.PolicyCatalogDigest) {
 			return errors.New("team roster member has an invalid policy catalog digest")
@@ -446,7 +533,7 @@ func snapshotSource(source *Roster) (*ForkSourceSnapshot, error) {
 		snapshot.Members = append(snapshot.Members, ForkSourceMember{
 			Address: member.Address, Role: member.Role, Index: member.Index,
 			Thread: member.Thread, Model: member.Model, Effort: member.Effort,
-			Behavior: member.Behavior, Access: member.Access,
+			Behavior: member.Behavior, Purpose: member.Purpose, Instructions: member.Instructions, Access: member.Access,
 			PolicyCatalogDigest: member.PolicyCatalogDigest, State: member.State,
 		})
 	}
@@ -536,11 +623,11 @@ func (store *Store) Load(slug, rootThreadID string) (*Roster, error) {
 		return nil, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 256*1024+1))
+	data, err := io.ReadAll(io.LimitReader(file, maxRosterBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read team roster: %w", err)
 	}
-	if len(data) > 256*1024 {
+	if len(data) > maxRosterBytes {
 		return nil, errors.New("team roster exceeds 256 KiB")
 	}
 	var roster Roster
@@ -593,6 +680,11 @@ func (store *Store) Update(ctx context.Context, slug, rootThreadID string, creat
 	data, err := json.MarshalIndent(roster, "", "  ")
 	if err != nil {
 		return nil, err
+	}
+	// The trailing newline is part of the on-disk record. Reject it here so
+	// a successful update can always be loaded by the next operation.
+	if len(data) >= maxRosterBytes {
+		return nil, errors.New("team roster exceeds 256 KiB")
 	}
 	temporary, err := os.CreateTemp(store.directory, ".team-*.tmp")
 	if err != nil {
@@ -667,12 +759,12 @@ type Service struct {
 // and thread/fork; neither operation can expose this helper before the roster
 // has durably recorded that ID.
 func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member) (codex.ThreadPolicy, error) {
-	policy, err := policyForRole(member.Role, member.Behavior, member.Access)
-	if err != nil {
-		return codex.ThreadPolicy{}, err
-	}
 	if service.Store == nil || member.Thread == "" || !session.ValidSlug(slug) || rootThreadID == "" || member.Address == "" {
 		return codex.ThreadPolicy{}, errors.New("member report tool has incomplete roster identity")
+	}
+	policy, err := memberPolicy(service.Store.workspace, slug, member)
+	if err != nil {
+		return codex.ThreadPolicy{}, err
 	}
 	command, err := os.Executable()
 	if err != nil {
@@ -712,22 +804,34 @@ func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, 
 	var pending Member
 	err := service.Store.withOperationLock(ctx, slug, func() error {
 		_, err := service.Store.Update(ctx, slug, rootThreadID, true, func(roster *Roster) error {
-			policyRole, err := catalogRole(service.Catalog, role, roster.PresetID != "")
+			policyRole, err := catalogRole(service.Catalog, roster.PresetID, role, roster.PresetID != "")
 			if err != nil {
 				return err
 			}
 			var next uint64
+			occupied := make(map[string]bool, len(roster.Members))
 			for _, member := range roster.Members {
+				occupied[member.Address] = true
 				if member.Role == role && member.Index >= next {
+					if member.Index == ^uint64(0) {
+						return errors.New("team member index is exhausted")
+					}
 					next = member.Index + 1
 				}
+			}
+			for occupied[fmt.Sprintf("%s%d", role, next)] {
+				if next == ^uint64(0) {
+					return errors.New("team member index is exhausted")
+				}
+				next++
 			}
 			var catalogDigest string
 			if service.Catalog != nil {
 				catalogDigest = service.Catalog.CatalogDigest
 			}
 			pending = Member{Address: fmt.Sprintf("%s%d", role, next), Role: role, Index: next,
-				Model: model, Effort: effort, Behavior: policyRole.Behavior, Access: policyRole.Access,
+				Model: model, Effort: effort, Behavior: policyRole.Behavior, Purpose: policyRole.Purpose,
+				Instructions: policyRole.Instructions, Access: policyRole.Access,
 				PolicyCatalogDigest: catalogDigest,
 				State:               "creating", AddedAt: time.Now().UTC()}
 			roster.Members = append(roster.Members, pending)
@@ -752,14 +856,15 @@ func (service Service) ApplyPreset(ctx context.Context, slug, rootThreadID, cwd 
 	var expected []Member
 	indices := make(map[string]uint64)
 	for _, role := range selected.Roles {
-		policy, err := catalogRole(service.Catalog, role, false)
+		policy, err := catalogRole(service.Catalog, "", role, false)
 		if err != nil {
 			return nil, err
 		}
 		index := indices[role]
 		indices[role]++
 		member := Member{Address: fmt.Sprintf("%s%d", role, index), Role: role, Index: index,
-			Model: model, Effort: effort, Behavior: policy.Behavior, Access: policy.Access}
+			Model: model, Effort: effort, Behavior: policy.Behavior, Purpose: policy.Purpose,
+			Instructions: policy.Instructions, Access: policy.Access}
 		if service.Catalog != nil {
 			member.PolicyCatalogDigest = service.Catalog.CatalogDigest
 		}
@@ -796,7 +901,8 @@ func (service Service) ApplyPreset(ctx context.Context, slug, rootThreadID, cwd 
 				want := expected[index]
 				if member.Address != want.Address || member.Role != want.Role || member.Index != want.Index ||
 					member.Model != want.Model || member.Effort != want.Effort ||
-					member.Behavior != want.Behavior || member.Access != want.Access ||
+					member.Behavior != want.Behavior || member.Purpose != want.Purpose ||
+					member.Instructions != want.Instructions || member.Access != want.Access ||
 					member.PolicyCatalogDigest != want.PolicyCatalogDigest ||
 					(member.State != "creating" && member.State != "ready") {
 					return errors.New("team preset differs from the retained roster")
@@ -844,7 +950,7 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 			member.Address != member.Role+"0" || member.Model == "" || member.Effort == "" {
 			return nil, errors.New("team preset contains an invalid member")
 		}
-		if _, err := policyForRole(member.Role, member.Behavior, member.Access); err != nil {
+		if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, member.Access); err != nil {
 			return nil, fmt.Errorf("team preset member %s: %w", member.Address, err)
 		}
 	}
@@ -856,24 +962,28 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 				}
 				roster.PresetID, roster.CatalogDigest, roster.TeamDigest = preset.ID, preset.CatalogDigest, preset.TeamDigest
 				roster.LeadModel, roster.LeadEffort = preset.LeadModel, preset.LeadEffort
+				roster.LeadInstructions = preset.LeadInstructions
 				now := time.Now().UTC()
 				for _, member := range preset.Members {
 					roster.Members = append(roster.Members, Member{Address: member.Address, Role: member.Role,
 						Index: 0, Model: member.Model, Effort: member.Effort,
-						Behavior: member.Behavior, Access: member.Access, PolicyCatalogDigest: preset.CatalogDigest,
+						Behavior: member.Behavior, Purpose: member.Purpose, Instructions: member.Instructions,
+						Access: member.Access, PolicyCatalogDigest: preset.CatalogDigest,
 						State: "creating", AddedAt: now})
 				}
 				return nil
 			}
 			if roster.PresetID != preset.ID || roster.CatalogDigest != preset.CatalogDigest ||
 				roster.TeamDigest != preset.TeamDigest || roster.LeadModel != preset.LeadModel ||
-				roster.LeadEffort != preset.LeadEffort || len(roster.Members) != len(preset.Members) {
+				roster.LeadEffort != preset.LeadEffort || roster.LeadInstructions != preset.LeadInstructions ||
+				len(roster.Members) != len(preset.Members) {
 				return errors.New("team preset differs from the retained roster")
 			}
 			for index, spec := range preset.Members {
 				member := roster.Members[index]
 				if member.Address != spec.Address || member.Role != spec.Role || member.Model != spec.Model ||
-					member.Effort != spec.Effort || member.Behavior != spec.Behavior || member.Access != spec.Access ||
+					member.Effort != spec.Effort || member.Behavior != spec.Behavior ||
+					member.Purpose != spec.Purpose || member.Instructions != spec.Instructions || member.Access != spec.Access ||
 					(member.State != "creating" && member.State != "ready") {
 					return errors.New("team preset differs from the retained roster")
 				}
@@ -1114,7 +1224,7 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 	}
 	threadID := pending.Thread
 	wasStarted := threadID != ""
-	policy, err := policyForRole(pending.Role, pending.Behavior, pending.Access)
+	policy, err := memberPolicy(service.Store.workspace, slug, *pending)
 	if err != nil {
 		return Member{}, fmt.Errorf("member %s has no retained policy: %w", address, err)
 	}
@@ -1803,6 +1913,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		destination, err = service.Store.Update(ctx, slug, rootThreadID, true, func(roster *Roster) error {
 			roster.PresetID, roster.CatalogDigest, roster.TeamDigest = source.PresetID, source.CatalogDigest, source.TeamDigest
 			roster.LeadModel, roster.LeadEffort = source.LeadModel, source.LeadEffort
+			roster.LeadInstructions = source.LeadInstructions
 			roster.ForkSource = requested
 			for _, old := range source.Members {
 				member := old
@@ -1821,6 +1932,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 	}
 	if destination.ForkSource == nil || destination.ForkSource.Digest != requested.Digest ||
 		destination.ForkSource.Slug != requested.Slug || destination.ForkSource.RootThreadID != requested.RootThreadID ||
+		destination.LeadInstructions != source.LeadInstructions ||
 		len(destination.Members) != len(requested.Members) {
 		return nil, errors.New("destination team roster differs from its frozen fork source")
 	}
@@ -1828,6 +1940,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		member := destination.Members[index]
 		if member.Address != old.Address || member.Role != old.Role || member.Index != old.Index ||
 			member.Model != old.Model || member.Effort != old.Effort || member.Behavior != old.Behavior ||
+			member.Purpose != old.Purpose || member.Instructions != old.Instructions ||
 			member.Access != old.Access || member.PolicyCatalogDigest != old.PolicyCatalogDigest ||
 			(old.State == "removed" && member.State != "removed") ||
 			(old.State != "removed" && member.State != "creating" && member.State != "ready") {
@@ -1847,7 +1960,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			if member.CreateAttempted {
 				return nil, fmt.Errorf("fork %s outcome is unknown; App Server does not provide a unique fork retry identity", old.Address)
 			}
-			policy, err := policyForRole(old.Role, old.Behavior, old.Access)
+			policy, err := memberPolicy(service.Store.workspace, slug, member)
 			if err != nil {
 				return nil, fmt.Errorf("fork %s without retained policy: %w", old.Address, err)
 			}

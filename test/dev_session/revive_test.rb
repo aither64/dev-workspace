@@ -446,7 +446,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_start_revived_existing_thread_uses_exact_archived_recovery_without_a_goal
+  def test_start_revived_existing_thread_restores_frozen_lead_instructions_without_a_goal
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -483,6 +483,11 @@ class DevSessionTest < Minitest::Test
         codex_client_version: '0.152.1', codex_pane_id: '%1'
       )
       runner_class = Class.new(DevSession::Runner) do
+        define_method(:frozen_direct_team_lead_instructions) do |candidate_slug, root_thread_id|
+          raise 'wrong restored lead identity' unless candidate_slug == slug && root_thread_id == 'thread-existing'
+
+          'Frozen lead prompt.'
+        end
         define_method(:create_tmux_session) { |*_args, **_options| session }
         define_method(:sync_slug) { |*_args, **_options| session }
         define_method(:revalidate_session!) { |_selected| session }
@@ -517,6 +522,7 @@ class DevSessionTest < Minitest::Test
       assert_includes(recorded, 'thread create')
       assert_includes(recorded, '--thread-id thread-existing')
       assert_includes(recorded, '--recover-archived')
+      assert_includes(recorded, '--lead-instructions Frozen lead prompt.')
       refute_includes(recorded, 'ensure-initial')
       updated = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('thread-existing', updated.dig('codex', 'thread_id'))

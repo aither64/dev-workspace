@@ -217,7 +217,7 @@
   {{if .Session.Interactive}}
   <div id="team-role-defaults" hidden data-current-preset="{{if .DirectTeam}}{{.DirectTeam.PresetID}}{{end}}" data-default-preset="{{if .AgentTeams}}{{.AgentTeams.DefaultTeam}}{{end}}">{{range .TeamPresets}}{{$preset := .ID}}{{range .Members}}<span data-preset="{{$preset}}" data-role="{{.Role}}" data-model="{{.Model}}" data-effort="{{.Effort}}"></span>{{end}}{{end}}</div>
   <form class="stack managed-team-form" data-direct-team-form data-action="add">
-    <h3>Add member</h3><div class="field-grid"><label>Role<select name="role" required><option value="architect">Architect</option><option value="implementer" selected>Implementer</option><option value="reviewer">Reviewer</option></select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+    <h3>Add member</h3><div class="field-grid"><label>Role<select name="role" required>{{range .TeamRoles}}<option value="{{.ID}}"{{if eq .ID "implementer"}} selected{{end}}>{{.Label}}</option>{{end}}</select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
     <button type="submit">Add member</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
   </form>
   {{end}}

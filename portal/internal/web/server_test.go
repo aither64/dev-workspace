@@ -1597,8 +1597,9 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
-		BaseURL: server.config.BaseURL,
-		Session: &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		BaseURL:   server.config.BaseURL,
+		Session:   &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		TeamRoles: teamRoles(teamruntime.Presets()),
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
@@ -2375,7 +2376,7 @@ func TestReconcilesDeveloperInstructionsForActiveManifestThreads(t *testing.T) {
 	if len(controller.threadIDs) != 1 || controller.threadIDs[0] != "thread-1" {
 		t.Fatalf("reconciled instruction threads = %#v", controller.threadIDs)
 	}
-	if len(controller.policies) != 1 || controller.policies[0] != workspacecodex.LeadThreadPolicy() {
+	if len(controller.policies) != 1 || controller.policies[0] != workspacecodex.LeadThreadPolicy("example", server.config.Workspace, "") {
 		t.Fatalf("reconciled lead policies = %#v", controller.policies)
 	}
 	if controller.deadlines != 1 {
@@ -4438,6 +4439,24 @@ func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
 		if target, err := server.resolveConversation(context.Background(), conversation.ResolveRequest{ID: id, Operation: "thread"}); err == nil {
 			target.Release()
 			t.Fatalf("unavailable member %q resolved", id)
+		}
+	}
+}
+
+func TestTeamRolesIncludeConfiguredCustomRolesAcrossPresets(t *testing.T) {
+	presets := []teamruntime.Preset{
+		{ID: "solo", Roles: []string{"lead"}},
+		{ID: "default", Members: []teamruntime.MemberSpec{{Role: "implementer"}, {Role: "reviewer"}}},
+		{ID: "security", Members: []teamruntime.MemberSpec{{Role: "security"}, {Role: "reviewer"}}},
+	}
+	roles := teamRoles(presets)
+	want := []string{"implementer", "reviewer", "security"}
+	if len(roles) != len(want) {
+		t.Fatalf("role options = %#v", roles)
+	}
+	for index, role := range roles {
+		if role.ID != want[index] {
+			t.Fatalf("role options = %#v", roles)
 		}
 	}
 }

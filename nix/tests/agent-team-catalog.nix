@@ -23,7 +23,7 @@ let
     reviewer_reuse = "same_change";
   };
   validTeamConfig = {
-    schema_version = 3;
+    schema_version = 4;
     default_team = "development";
     default_development_team = "development";
     capacity.required_native_child_threads = 4;
@@ -44,6 +44,8 @@ let
           model = "model_lead";
           effort = "high";
           behavior = "team_lead";
+          purpose = "lead";
+          instructions = "Lead this session.";
           lifetime = "session";
           allowed_efforts = [ "high" "xhigh" ];
           access = "workspace_write";
@@ -67,6 +69,8 @@ let
             model = "model_lead";
             effort = "high";
             behavior = "team_lead";
+            purpose = "lead";
+            instructions = "Lead this session.";
             lifetime = "session";
             allowed_efforts = [ "high" "xhigh" ];
             access = "workspace_write";
@@ -76,6 +80,8 @@ let
             model = "model_designer";
             effort = "high";
             behavior = "designer";
+            purpose = "design";
+            instructions = "Design the assigned change.";
             lifetime = "initiative";
             allowed_efforts = [ "high" "xhigh" ];
             access = "read_only";
@@ -85,6 +91,8 @@ let
             model = "model_implementer";
             effort = "xhigh";
             behavior = "implementer";
+            purpose = "implementation";
+            instructions = "Implement the assigned change.";
             lifetime = "work_unit";
             allowed_efforts = [ "high" "xhigh" ];
             access = "workspace_write";
@@ -94,6 +102,8 @@ let
             model = "model_reviewer";
             effort = "high";
             behavior = "reviewer";
+            purpose = "review";
+            instructions = "Review the assigned change.";
             lifetime = "review_cycle";
             allowed_efforts = [ "high" "xhigh" ];
             access = "read_only";
@@ -192,8 +202,8 @@ pkgs.runCommand "dev-workspace-agent-team-catalog" {
   test -f "$catalog"
   test ! -e ${unmanagedPackage}/share/dev-workspace/agent-teams.json
   test "$(jq -r '.agent_teams.managed' ${unmanagedPackage}/share/dev-workspace/package.json)" = false
-  test "$(jq -r '.schema_version' "$catalog")" = 3
-  test "$(jq -r '.agent_teams.catalog.schema_version' "$metadata")" = 3
+  test "$(jq -r '.schema_version' "$catalog")" = 4
+  test "$(jq -r '.agent_teams.catalog.schema_version' "$metadata")" = 4
   test "$(jq -r '.agent_teams.capacity.required_native_child_threads' "$metadata")" = 4
   test "$(jq -r '.agent_teams.native_capacity.config_key' "$metadata")" = agents.max_concurrent_threads_per_session
   test "$(jq -r '.agent_teams.native_capacity.required_value' "$metadata")" = 4

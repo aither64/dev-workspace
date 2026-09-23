@@ -1,6 +1,11 @@
 package workspacecodex
 
-import "github.com/aither64/codex-web/codex"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/aither64/codex-web/codex"
+)
 
 const leadDeveloperInstructions = "You are the lead of this development session. " +
 	"At the start of each new substantive work item, inspect the live same-session roster with " +
@@ -20,8 +25,23 @@ const leadDeveloperInstructions = "You are the lead of this development session.
 	"fresh agents for their roles. Never invent members or address another " +
 	"session's team."
 
-// LeadThreadPolicy applies only to the normal root conversation. The policy
-// names no members because the roster can change during the session.
-func LeadThreadPolicy() codex.ThreadPolicy {
-	return codex.ThreadPolicy{DeveloperInstructions: leadDeveloperInstructions}
+// LeadThreadPolicy applies only to the normal root conversation. A catalog
+// instruction is frozen when the session is created; legacy sessions retain
+// the exact original lead instruction. The technical binding is always fresh
+// for the destination session, including forks.
+func LeadThreadPolicy(slug, workspace, roleInstructions string) codex.ThreadPolicy {
+	instructions := leadDeveloperInstructions
+	if strings.TrimSpace(roleInstructions) != "" {
+		instructions = roleInstructions
+	}
+	if slug != "" && workspace != "" {
+		instructions = fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q. "+
+			"Before using session-owned records, branches, worktrees or teams, run dev-session current "+
+			"and require its result to match this exact session slug. DEV_SESSION_SLUG and "+
+			"DEV_SESSION_WORKSPACE must either both be absent or both match this binding; a mismatch "+
+			"means stop rather than claiming another session. A missing shell environment "+
+			"marker alone does not negate this thread-bound identity.\n\n%s",
+			slug, workspace, instructions)
+	}
+	return codex.ThreadPolicy{DeveloperInstructions: instructions}
 }

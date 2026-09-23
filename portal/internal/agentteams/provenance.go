@@ -188,8 +188,12 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 // as an unmanaged session.
 func validateDirectCreationTeam(data json.RawMessage, model, effort string) error {
 	var raw map[string]json.RawMessage
-	if err := decodeStrict(data, &raw); err != nil || raw == nil || len(raw) != 9 {
+	if err := decodeStrict(data, &raw); err != nil || raw == nil || (len(raw) != 9 && len(raw) != 10) {
 		return errors.New("invalid direct team object")
+	}
+	_, withInstructions := raw["leadInstructions"]
+	if withInstructions != (len(raw) == 10) {
+		return errors.New("invalid direct team instruction fields")
 	}
 	for _, key := range []string{"id", "name", "description", "roles", "catalogDigest", "teamDigest", "leadModel", "leadEffort", "members"} {
 		if _, ok := raw[key]; !ok {
@@ -197,21 +201,24 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 		}
 	}
 	var team struct {
-		ID            string   `json:"id"`
-		Name          string   `json:"name"`
-		Description   string   `json:"description"`
-		CatalogDigest string   `json:"catalogDigest"`
-		TeamDigest    string   `json:"teamDigest"`
-		LeadModel     string   `json:"leadModel"`
-		LeadEffort    string   `json:"leadEffort"`
-		Roles         []string `json:"roles"`
-		Members       []struct {
+		ID               string   `json:"id"`
+		Name             string   `json:"name"`
+		Description      string   `json:"description"`
+		CatalogDigest    string   `json:"catalogDigest"`
+		TeamDigest       string   `json:"teamDigest"`
+		LeadModel        string   `json:"leadModel"`
+		LeadEffort       string   `json:"leadEffort"`
+		LeadInstructions string   `json:"leadInstructions"`
+		Roles            []string `json:"roles"`
+		Members          []struct {
 			Role            string `json:"role"`
 			Address         string `json:"address"`
 			Model           string `json:"model"`
 			ReasoningEffort string `json:"reasoningEffort"`
 			Behavior        string `json:"behavior"`
 			Access          string `json:"access"`
+			Purpose         string `json:"purpose"`
+			Instructions    string `json:"instructions"`
 		} `json:"members"`
 	}
 	var rawMembers []json.RawMessage
@@ -223,6 +230,7 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 		!directCreationScalar(team.Description, 4096) || !isDigest(team.CatalogDigest) || !isDigest(team.TeamDigest) ||
 		!directCreationScalar(team.LeadModel, session.MaxAgentTeamPersistedScalarBytes) ||
 		!directCreationScalar(team.LeadEffort, session.MaxAgentTeamPersistedScalarBytes) ||
+		(withInstructions && !directCreationInstructions(team.LeadInstructions)) ||
 		team.LeadModel != model || team.LeadEffort != effort || len(team.Roles) != len(team.Members)+1 ||
 		len(team.Roles) > 64 || team.Roles[0] != "lead" {
 		return errors.New("invalid direct team values")
@@ -230,7 +238,11 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 	seen := make(map[string]bool, len(team.Members))
 	for index, member := range team.Members {
 		var fields map[string]json.RawMessage
-		if err := decodeStrict(rawMembers[index], &fields); err != nil || fields == nil || len(fields) != 6 {
+		expectedCount := 6
+		if withInstructions {
+			expectedCount = 8
+		}
+		if err := decodeStrict(rawMembers[index], &fields); err != nil || fields == nil || len(fields) != expectedCount {
 			return errors.New("invalid direct team member object")
 		}
 		for _, key := range []string{"role", "address", "model", "reasoningEffort", "behavior", "access"} {
@@ -238,10 +250,18 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 				return errors.New("incomplete direct team member object")
 			}
 		}
-		if !identifier(member.Role) || member.Role == "lead" || member.Address != member.Role+"0" ||
+		if withInstructions {
+			if _, ok := fields["purpose"]; !ok {
+				return errors.New("incomplete direct team member object")
+			}
+			if _, ok := fields["instructions"]; !ok {
+				return errors.New("incomplete direct team member object")
+			}
+		}
+		if !directCreationRole(member.Role) || member.Role == "lead" || member.Address != member.Role+"0" ||
 			!directCreationScalar(member.Model, session.MaxAgentTeamPersistedScalarBytes) ||
 			!directCreationScalar(member.ReasoningEffort, session.MaxAgentTeamPersistedScalarBytes) ||
-			!validDirectCreationPolicy(member.Role, member.Behavior, member.Access) ||
+			!validDirectCreationPolicy(member.Role, member.Behavior, member.Access, member.Purpose, member.Instructions, withInstructions) ||
 			team.Roles[index+1] != member.Address || seen[member.Address] {
 			return errors.New("invalid direct team member")
 		}
@@ -250,7 +270,27 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 	return nil
 }
 
-func validDirectCreationPolicy(role, behavior, access string) bool {
+func validDirectCreationPolicy(role, behavior, access, purpose, instructions string, withInstructions bool) bool {
+	if withInstructions {
+		if !directCreationInstructions(instructions) {
+			return false
+		}
+		switch behavior {
+		case "designer":
+			return purpose == "design" && (access == "read_only" || access == "workspace_write")
+		case "implementer":
+			return purpose == "implementation" && access == "workspace_write"
+		case "reviewer":
+			return purpose == "review" && access == "read_only"
+		case "general":
+			return purpose == "general" && (access == "read_only" || access == "workspace_write")
+		default:
+			return false
+		}
+	}
+	if purpose != "" || instructions != "" {
+		return false
+	}
 	switch role {
 	case "architect":
 		return behavior == "designer" && access == "read_only"
@@ -261,6 +301,22 @@ func validDirectCreationPolicy(role, behavior, access string) bool {
 	default:
 		return false
 	}
+}
+
+func directCreationRole(role string) bool {
+	if len(role) == 0 || len(role) > 32 || role[0] < 'a' || role[0] > 'z' {
+		return false
+	}
+	for _, character := range role[1:] {
+		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func directCreationInstructions(value string) bool {
+	return nonempty(value, 4096) && !strings.ContainsRune(value, '\x00')
 }
 
 func directCreationScalar(value string, limit int) bool {

@@ -151,13 +151,17 @@ func validDirectTeamPreset(preset teamruntime.Preset) error {
 		preset.LeadModel == "" || preset.LeadEffort == "" || len(preset.Roles) > 64 || len(preset.Members) > 64 {
 		return errors.New("direct team preset is malformed")
 	}
+	withInstructions := preset.LeadInstructions != ""
+	if withInstructions && !validDirectInstructions(preset.LeadInstructions) {
+		return errors.New("direct team preset has invalid lead instructions")
+	}
 	addresses := make(map[string]struct{}, len(preset.Members))
 	expectedRoles := make([]string, 0, len(preset.Members)+1)
 	expectedRoles = append(expectedRoles, "lead")
 	for _, member := range preset.Members {
-		if !validManagedCreationTeam(member.Role) || member.Role == "lead" ||
+		if !validDirectMemberRole(member.Role) || member.Role == "lead" ||
 			member.Address != member.Role+"0" || member.Model == "" || member.Effort == "" ||
-			!validDirectMemberPolicy(member.Role, member.Behavior, member.Access) ||
+			!validDirectMemberPolicy(member.Role, member.Behavior, member.Access, member.Purpose, member.Instructions, withInstructions) ||
 			validateCreationSettingValue(member.Model) != nil || validateCreationSettingValue(member.Effort) != nil {
 			return errors.New("direct team preset has an invalid member")
 		}
@@ -178,7 +182,43 @@ func validDirectTeamPreset(preset teamruntime.Preset) error {
 	return nil
 }
 
-func validDirectMemberPolicy(role, behavior, access string) bool {
+func validDirectMemberRole(role string) bool {
+	if len(role) == 0 || len(role) > 32 || role[0] < 'a' || role[0] > 'z' {
+		return false
+	}
+	for _, character := range role[1:] {
+		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validDirectInstructions(value string) bool {
+	return value != "" && len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
+}
+
+func validDirectMemberPolicy(role, behavior, access, purpose, instructions string, withInstructions bool) bool {
+	if withInstructions {
+		if !validDirectInstructions(instructions) {
+			return false
+		}
+		switch behavior {
+		case "designer":
+			return purpose == "design" && (access == "read_only" || access == "workspace_write")
+		case "implementer":
+			return purpose == "implementation" && access == "workspace_write"
+		case "reviewer":
+			return purpose == "review" && access == "read_only"
+		case "general":
+			return purpose == "general" && (access == "read_only" || access == "workspace_write")
+		default:
+			return false
+		}
+	}
+	if purpose != "" || instructions != "" {
+		return false
+	}
 	switch role {
 	case "architect":
 		return behavior == "designer" && access == "read_only"
@@ -615,7 +655,8 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 
 func rosterMatchesDirectTeam(roster teamruntime.Roster, preset teamruntime.Preset) error {
 	if roster.PresetID != preset.ID || roster.CatalogDigest != preset.CatalogDigest || roster.TeamDigest != preset.TeamDigest ||
-		roster.LeadModel != preset.LeadModel || roster.LeadEffort != preset.LeadEffort || len(roster.Members) != len(preset.Members) {
+		roster.LeadModel != preset.LeadModel || roster.LeadEffort != preset.LeadEffort ||
+		roster.LeadInstructions != preset.LeadInstructions || len(roster.Members) != len(preset.Members) {
 		return errors.New("direct team roster does not match the creation snapshot")
 	}
 	members := make(map[string]teamruntime.Member, len(roster.Members))
@@ -626,6 +667,7 @@ func rosterMatchesDirectTeam(roster teamruntime.Roster, preset teamruntime.Prese
 		member, ok := members[expected.Address]
 		if !ok || member.Role != expected.Role || member.Model != expected.Model || member.Effort != expected.Effort ||
 			member.Behavior != expected.Behavior || member.Access != expected.Access ||
+			member.Purpose != expected.Purpose || member.Instructions != expected.Instructions ||
 			member.Thread == "" || member.State != "ready" {
 			return errors.New("direct team roster does not prove all configured member threads")
 		}

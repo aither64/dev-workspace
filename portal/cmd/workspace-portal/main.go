@@ -48,9 +48,9 @@ func newCodexClient(socket, workspace string) *workspacecodex.Client {
 	})
 }
 
-func rootThreadSettings(model, effort string) codex.ThreadSettings {
+func rootThreadSettings(model, effort, slug, workspace, leadInstructions string) codex.ThreadSettings {
 	return codex.ThreadSettings{
-		Model: model, ReasoningEffort: effort, Policy: workspacecodex.LeadThreadPolicy(),
+		Model: model, ReasoningEffort: effort, Policy: workspacecodex.LeadThreadPolicy(slug, workspace, leadInstructions),
 	}
 }
 
@@ -581,6 +581,7 @@ func threadCommand(args []string) error {
 	model := flags.String("model", "", "Codex model")
 	effort := flags.String("effort", "", "Codex reasoning effort")
 	inputFile := flags.String("input-file", "", "file containing a message")
+	leadInstructions := flags.String("lead-instructions", "", "frozen lead role instructions")
 	requireRuntime := flags.Bool("require-runtime", false, "require complete deployed runtime provenance")
 	recoverCreating := flags.Bool("recover-creating", false, "reconcile a creating thread by working directory")
 	recoverArchived := flags.Bool("recover-archived", false, "restore the exact thread retained by revived tracking")
@@ -652,7 +653,7 @@ func threadCommand(args []string) error {
 		}
 		var id string
 		var err error
-		settings := rootThreadSettings(*model, *effort)
+		settings := rootThreadSettings(*model, *effort, runtime.Slug, runtime.Workspace, *leadInstructions)
 		resolveSettings := func() (codex.ThreadSettings, error) {
 			if settings.Model == "" && settings.ReasoningEffort == "" {
 				return settings, nil
@@ -669,8 +670,8 @@ func threadCommand(args []string) error {
 				err = client.ReconcileThreadInstructionsWithPolicy(ctx, id, settings.Policy)
 			}
 		} else if *recoverCreating {
-			id, err = client.RecoverCreatingThreadWithSettingsResolver(
-				ctx, *threadID, *cwd, runtime.environment(), resolveSettings,
+			id, err = client.RecoverCreatingThreadWithPolicyAndSettingsResolver(
+				ctx, *threadID, *cwd, runtime.environment(), settings.Policy, resolveSettings,
 			)
 		} else {
 			if *threadID == "" {
@@ -698,7 +699,7 @@ func threadCommand(args []string) error {
 		}
 		id, err := client.RecoverForkThread(
 			ctx, *threadID, *cwd, runtime.environment(),
-			rootThreadSettings(*model, *effort),
+			rootThreadSettings(*model, *effort, runtime.Slug, runtime.Workspace, *leadInstructions),
 		)
 		if err != nil {
 			return err

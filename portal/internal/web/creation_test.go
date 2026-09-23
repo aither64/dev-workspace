@@ -124,6 +124,43 @@ func legacyVirtualBinding() (string, string) {
 	return "v1.e30." + digest, digest
 }
 
+func TestDirectTeamPresetAcceptsFrozenCustomRoleInstructions(t *testing.T) {
+	preset := teamruntime.Preset{
+		ID: "custom", Name: "Custom team", Description: "A lead and scribe",
+		CatalogDigest: strings.Repeat("a", 64), TeamDigest: strings.Repeat("b", 64),
+		LeadModel: "model-1", LeadEffort: "high", LeadInstructions: "Coordinate the team.\nWait for the first request.",
+		Roles: []string{"lead", "scribe0"},
+		Members: []teamruntime.MemberSpec{{Role: "scribe", Address: "scribe0", Model: "model-1", Effort: "high",
+			Behavior: "general", Access: "read_only", Purpose: "general", Instructions: "Summarize the assignment."}},
+	}
+	if err := validDirectTeamPreset(preset); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDirectPresetShape(data); err != nil {
+		t.Fatal(err)
+	}
+	var malformed map[string]any
+	if err := json.Unmarshal(data, &malformed); err != nil {
+		t.Fatal(err)
+	}
+	malformed["leadInstructions"] = ""
+	emptyLead, err := json.Marshal(malformed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDirectPresetShape(emptyLead); err == nil {
+		t.Fatal("accepted an explicitly empty lead prompt")
+	}
+	preset.Members[0].Purpose = "review"
+	if err := validDirectTeamPreset(preset); err == nil {
+		t.Fatal("accepted a custom role with the wrong purpose")
+	}
+}
+
 func TestCompletedCreationJournalRecognizesStrictManagedReadyState(t *testing.T) {
 	t.Helper()
 	token, digest := legacyVirtualBinding()
@@ -388,7 +425,7 @@ func TestBrowserCreationRejectsStaleDirectTeamFieldsBeforeReceipt(t *testing.T) 
 				Description: "A single lead thread",
 				TeamDigest:  strings.Repeat("c", 64),
 				Roles: map[string]agentteams.Role{
-					"team_lead": {Model: "model-1", Effort: "high"},
+					"team_lead": {Model: "model-1", Effort: "high", Purpose: "lead", Instructions: "Coordinate this session."},
 				},
 			}},
 		},

@@ -204,6 +204,22 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  class ThreadCommandRunner
+    attr_accessor :roster
+    attr_reader :commands
+
+    def initialize
+      @commands = []
+    end
+
+    def capture(argv, **_options)
+      @commands << argv
+      return [JSON.generate('roster' => roster, 'presets' => []), '', nil] if argv[1, 2] == ['team', 'list']
+
+      [JSON.generate('threadId' => 'thread-frozen'), '', nil]
+    end
+  end
+
   class ManagedCreationRunner < DevSession::Runner
     def initialize(*arguments, scenario:, **keywords)
       @scenario = scenario
@@ -371,6 +387,70 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_prompt_bearing_direct_snapshot_and_thread_flags
+    with_workspace do |workspace|
+      slug = '2026-09-22-custom-team'
+      preset = direct_team_preset
+      preset['leadInstructions'] = "Coordinate the team.\nWait for the request."
+      preset['roles'] = %w[lead scribe0]
+      preset['members'] = [{
+        'role' => 'scribe', 'address' => 'scribe0', 'behavior' => 'general',
+        'access' => 'read_only', 'purpose' => 'general',
+        'instructions' => 'Summarize the assignment.',
+        'model' => 'model-scribe', 'reasoningEffort' => 'high'
+      }]
+      commands = ThreadCommandRunner.new
+      portal = File.join(workspace, 'package', 'bin', 'workspace-portal')
+      FileUtils.mkdir_p(File.dirname(portal))
+      File.write(portal, "#!/bin/sh\n")
+      File.chmod(0o755, portal)
+      runner = DevSession::Runner.new(
+        workspace:, authority_dir: File.join(workspace, 'runtime-authority'),
+        tmux: InertTmux.new, out: StringIO.new, err: StringIO.new,
+        today: Date.new(2026, 9, 22),
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') },
+        cwd: workspace, portal_command: [portal], command_runner: commands
+      )
+      assert(runner.send(:valid_direct_team_preset?, preset))
+      assert_equal('thread-frozen', runner.send(:create_portal_thread, slug,
+        model: preset.fetch('leadModel'), effort: preset.fetch('leadEffort'),
+        lead_instructions: preset.fetch('leadInstructions')))
+      assert_equal('thread-frozen', runner.send(:create_portal_fork, slug, 'source-thread',
+        model: preset.fetch('leadModel'), effort: preset.fetch('leadEffort'),
+        lead_instructions: preset.fetch('leadInstructions')))
+      commands.commands.each do |command|
+        assert_equal(preset.fetch('leadInstructions'), command.fetch(command.index('--lead-instructions') + 1))
+      end
+
+      path = runner.send(:creation_journal_file, slug)
+      journal = {
+        'schema' => 3, 'slug' => slug, 'goal_sha256' => 'c' * 64,
+        'run_codex' => true, 'state' => 'ready',
+        'model' => preset.fetch('leadModel'), 'effort' => preset.fetch('leadEffort'),
+        'direct_team' => preset
+      }
+      File.write(path, JSON.generate(journal))
+      File.chmod(0o600, path)
+      assert_equal(preset.fetch('leadInstructions'),
+        runner.send(:frozen_direct_team_lead_instructions, slug, 'source-thread'))
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = { 'thread_id' => 'source-thread' }
+      runner.send(:write_portal_manifest, slug, manifest)
+      team_state = runner.send(:direct_team_state_path, slug)
+      FileUtils.mkdir_p(File.dirname(team_state))
+      File.write(team_state, "{}\n")
+      commands.roster = {
+        'workspace' => workspace, 'slug' => slug, 'rootThreadId' => 'source-thread',
+        'leadInstructions' => 'Frozen from the source roster.'
+      }
+      assert_equal('Frozen from the source roster.',
+        runner.send(:frozen_direct_team_lead_instructions, slug, 'source-thread'))
+      preset['members'].first.delete('instructions')
+      refute(runner.send(:valid_direct_team_preset?, preset))
+    end
+  end
+
   def test_cli_team_resolves_the_installed_direct_snapshot_without_hidden_lead_defaults
     with_workspace do |workspace|
       scenario = DirectCreationScenario.new
@@ -406,6 +486,59 @@ class DevSessionTest < Minitest::Test
       end
       assert_match(/--model and --effort/, error.message)
       assert_equal(1, command_runner.commands.length)
+    end
+  end
+
+  def test_cli_team_retry_keeps_frozen_snapshot_after_catalog_changes
+    with_workspace do |workspace|
+      slug = '2026-09-22-frozen-team-retry'
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Start the team.\n")
+      package = File.join(workspace, 'package')
+      portal = File.join(package, 'bin', 'workspace-portal')
+      FileUtils.mkdir_p(File.dirname(portal))
+      File.write(portal, "#!/bin/sh\n")
+      File.chmod(0o755, portal)
+      scenario = DirectCreationScenario.new
+      original = direct_team_preset
+      original['leadInstructions'] = 'Original frozen lead instructions.'
+      original['members'].each do |member|
+        member['purpose'] = { 'designer' => 'design', 'implementer' => 'implementation' }.fetch(member['behavior'])
+        member['instructions'] = "Original frozen #{member['role']} instructions."
+      end
+      scenario.catalog_preset = original
+      scenario.queue_send(:response_lost_materialized_exact)
+      create_runner = lambda do |command_runner|
+        DirectCreationRunner.new(
+          workspace:, authority_dir: File.join(workspace, 'runtime-authority'),
+          tmux: InertTmux.new, out: StringIO.new, err: StringIO.new,
+          today: Date.new(2026, 9, 22),
+          env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') },
+          cwd: workspace, portal_command: [portal], command_runner:, scenario:
+        )
+      end
+      first_commands = DirectCreationCommandRunner.new(scenario)
+      first = create_runner.call(first_commands)
+      start = lambda do |runner, model|
+        runner.start(slug, as_is: true, new: false, attach: false, run_codex: true,
+          goal_file: goal, json: true, team: 'delegated', model:, effort: 'high')
+      end
+      assert_raises(DevSession::Error) { start.call(first, 'model-lead') }
+      assert(first_commands.commands.any? { |command| command[1] == 'team-preset' })
+
+      changed = JSON.parse(JSON.generate(original))
+      changed['leadInstructions'] = 'New catalog instructions.'
+      changed['members'].first['instructions'] = 'New member instructions.'
+      scenario.catalog_preset = changed
+      retry_commands = DirectCreationCommandRunner.new(scenario)
+      retry_runner = create_runner.call(retry_commands)
+      error = assert_raises(DevSession::Error) { start.call(retry_runner, 'another-model') }
+      assert_match(/selection does not match/, error.message)
+      start.call(retry_runner, 'model-lead')
+
+      refute(retry_commands.commands.any? { |command| command[1] == 'team-preset' })
+      assert_equal([original, original], scenario.applied_presets)
+      assert_equal(1, scenario.turn_starts)
     end
   end
 
