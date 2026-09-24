@@ -1565,8 +1565,9 @@
 
   const pairedEffortSelect = (modelSelect) => modelSelect.id === "codex-model" ?
     document.getElementById("codex-effort") : modelSelect.closest("form")?.elements.effort;
-  const applyCurrentSettings = (root = document) => {
+  const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
+      if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
       const effortSelect = pairedEffortSelect(modelSelect);
       const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
       const retainedValue = modelSelect.dataset.currentValue || "";
@@ -1631,7 +1632,7 @@
           if (defaultModel) modelSelect.value = defaultModel.model;
         }
       }
-      applyCurrentSettings(root);
+      applyCurrentSettings(root, true);
       applyMemberDefaults();
       restoreManagedCreationDrafts();
     } catch (_error) {
@@ -1785,6 +1786,7 @@
     if (action === "preset") body.preset = value("preset");
     if (action === "add") body.role = value("role");
     if (action === "configure") body.address = form.dataset.address;
+    form.dataset.teamSubmitting = "true";
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
@@ -1792,9 +1794,14 @@
       if (status) status.textContent = "Saved.";
       setTimeout(() => location.reload(), 250);
     } catch (error) {
+      delete form.dataset.teamSubmitting;
       if (status) status.textContent = error.message;
       controls.forEach(control => { control.disabled = false; });
     }
+  });
+  document.addEventListener("change", (event) => {
+    const form = event.target.closest("[data-direct-team-form]");
+    if (form) form.dataset.teamDirty = "true";
   });
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-team-thread]");
@@ -2281,7 +2288,8 @@
       }
       if (typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
-        if (teamStatus) {
+        const editingTeam = teamStatus?.querySelector("[data-direct-team-form]:focus-within, [data-direct-team-form][data-team-dirty], [data-direct-team-form][data-team-submitting]");
+        if (teamStatus && !editingTeam) {
           const removedOpen = teamStatus.querySelector(".removed-members")?.open || false;
           teamStatus.innerHTML = payload.teamHTML;
           lastTeamHTML = payload.teamHTML;

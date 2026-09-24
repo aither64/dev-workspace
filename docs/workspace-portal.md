@@ -241,8 +241,13 @@ Fork destinations receive the same bootstrap before becoming ready.
 
 The runtime combines each member's retained role instructions with an exact
 workspace, session, and member-address binding. It checks the role purpose and
-configured access before starting a turn. The built-in architect and reviewer
-roles use a read-only sandbox; the built-in implementer uses workspace-write.
+configured access before starting a turn. The Team tab shows each member's
+saved access. The built-in architect and reviewer roles use a read-only sandbox;
+the built-in implementer uses workspace-write. A site catalog can grant its
+architect role workspace-write access to edit assigned design artifacts.
+Changing that catalog does not alter existing rosters. Team model and reasoning
+choices remain in the form during background conversation and roster refreshes
+until they are saved or the page is reloaded.
 Ordinary portal reads leave the thread's persisted instructions alone.
 Assignments reapply the retained policy and use a stable
 message ID for retries. In the CLI, keep the ID shown after an uncertain

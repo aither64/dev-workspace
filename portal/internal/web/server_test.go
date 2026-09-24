@@ -1655,6 +1655,25 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	}
 }
 
+func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.render(response, "session", pageData{
+		BaseURL: server.config.BaseURL,
+		Session: &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
+			{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "high"},
+			{Address: "reviewer0", State: "ready", Access: "read_only", Model: "model-1", Effort: "high"},
+		}},
+	})
+	body := response.Body.String()
+	for _, marker := range []string{`<code>architect0</code>`, `Workspace write`, `<code>reviewer0</code>`, `Read only`} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("direct team page omitted %q", marker)
+		}
+	}
+}
+
 func TestTeamHTTPAssignmentUsesLeadSender(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
