@@ -7997,7 +7997,9 @@ module DevSession
       raise Error, USAGE unless command
 
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
-        with_transition_lock(File::LOCK_SH) do
+        read_only = %w[current list url validate].include?(command) ||
+                    (command == 'team' && @argv.first == 'list')
+        with_transition_lock(File::LOCK_SH, read_only:) do
           validate_host_generation!
           run_command(command)
         end
@@ -8057,14 +8059,21 @@ module DevSession
       end
     end
 
-    def with_transition_lock(mode)
-      directory = File.dirname(@transition_lock)
-      FileUtils.mkdir_p(directory, mode: 0o700)
+    def with_transition_lock(mode, read_only: false)
+      FileUtils.mkdir_p(File.dirname(@transition_lock), mode: 0o700) unless read_only
       raise Error, "transition lock is a symlink: #{@transition_lock}" if File.symlink?(@transition_lock)
-      File.open(@transition_lock, File::RDWR | File::CREAT, 0o600) do |file|
-        file.flock(mode)
-        yield
+      flags = read_only ? File::RDONLY : File::RDWR | File::CREAT
+      file = begin
+        File.open(@transition_lock, flags, 0o600)
+      rescue Errno::ENOENT
+        raise Error, "transition lock is missing: #{@transition_lock}" if read_only
+
+        raise
       end
+      file.flock(mode)
+      yield
+    ensure
+      file&.close
     end
 
     def with_lifecycle_transition(&block)

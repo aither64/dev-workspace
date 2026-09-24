@@ -3,6 +3,104 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_current_uses_a_read_only_transition_lock
+    Dir.mktmpdir('dev-session-read-only-lock-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      File.write(path, '')
+      File.chmod(0o400, path)
+      File.chmod(0o500, directory)
+      output = StringIO.new
+      errors = StringIO.new
+      cli = DevSession::CLI.new(
+        ['--transition-lock', path, 'current'], out: output, err: errors
+      )
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:current) { output.puts('2026-09-24-example') }
+      cli.define_singleton_method(:runner) { fake_runner }
+
+      assert_equal(0, cli.run)
+      assert_equal("2026-09-24-example\n", output.string)
+      assert_empty(errors.string)
+    ensure
+      File.chmod(0o700, directory)
+    end
+  end
+
+  def test_current_checks_generation_after_waiting_for_an_exclusive_transition
+    Dir.mktmpdir('dev-session-read-only-generation-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      expected = File.join(directory, 'old')
+      selected = File.join(directory, 'new')
+      profile = File.join(directory, 'profile')
+      FileUtils.mkdir_p(expected)
+      FileUtils.mkdir_p(selected)
+      File.symlink(expected, profile)
+      owner = File.open(path, File::RDWR | File::CREAT, 0o600)
+      owner.flock(File::LOCK_EX)
+      output = StringIO.new
+      errors = StringIO.new
+      cli = DevSession::CLI.new(
+        ['--transition-lock', path, '--host-profile', profile,
+         '--expected-host-generation', expected,
+         '--expected-host-profile-token', profile_link_token(profile),
+         '--', 'current'], out: output, err: errors
+      )
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:current) { output.puts('wrong-session') }
+      cli.define_singleton_method(:runner) { fake_runner }
+
+      thread = Thread.new { cli.run }
+      sleep 0.05
+      assert_empty(output.string)
+      File.unlink(profile)
+      File.symlink(selected, profile)
+      owner.flock(File::LOCK_UN)
+
+      assert_equal(1, thread.value)
+      assert_empty(output.string)
+      assert_includes(errors.string, 'superseded package generation')
+    ensure
+      owner&.flock(File::LOCK_UN)
+      owner&.close
+      thread&.join
+    end
+  end
+
+  def test_current_reports_a_missing_transition_lock_without_creating_it
+    Dir.mktmpdir('dev-session-missing-lock-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      errors = StringIO.new
+      cli = DevSession::CLI.new(
+        ['--transition-lock', path, 'current'], out: StringIO.new, err: errors
+      )
+
+      assert_equal(1, cli.run)
+      assert_includes(errors.string, 'transition lock is missing')
+      refute(File.exist?(path))
+    end
+  end
+
+  def test_other_read_only_commands_use_the_existing_read_only_lock
+    Dir.mktmpdir('dev-session-read-only-commands-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      File.write(path, '')
+      File.chmod(0o400, path)
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:list) { |_input, as_is:| nil }
+      fake_runner.define_singleton_method(:url) { |_input, as_is:| nil }
+      fake_runner.define_singleton_method(:validate) { nil }
+      fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+      fake_runner.define_singleton_method(:team) { |_slug, **_options| "roster\n" }
+      [%w[list], %w[url example --as-is], %w[validate], %w[team list example --as-is]].each do |command|
+        errors = StringIO.new
+        cli = DevSession::CLI.new(['--transition-lock', path, *command], out: StringIO.new, err: errors)
+        cli.define_singleton_method(:runner) { fake_runner }
+        assert_equal(0, cli.run, command.join(' '))
+        assert_empty(errors.string)
+      end
+    end
+  end
+
   def test_cli_holds_the_shared_host_transition_lock_while_mutating_state
     Dir.mktmpdir('dev-session-transition-lock-test') do |directory|
       path = File.join(directory, 'transition.lock')
