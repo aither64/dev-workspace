@@ -356,8 +356,9 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   class TransitionHost < DevWorkspaceHost::Host
-    attr_accessor :busy, :candidate, :fail_activation, :fail_links, :fail_restart, :fail_restore,
-                  :fail_set_after_profile
+    attr_accessor :busy, :candidate, :executing_package, :delegate_quiesce,
+                  :quiesce_output, :fail_activation, :fail_links, :fail_restart,
+                  :fail_restore, :fail_set_before_profile, :fail_set_after_profile
     attr_reader :events
 
     def initialize(candidate:, busy:, **options)
@@ -373,7 +374,7 @@ class WorkspaceHostTest < Minitest::Test
     # reuse this host object across invocations, so follow the selected profile
     # to model the package that a new process would execute.
     def package_root
-      File.symlink?(@profile) ? File.realpath(@profile) : super
+      executing_package || (File.symlink?(@profile) ? File.realpath(@profile) : super)
     end
 
     def capture!(*argv)
@@ -384,6 +385,10 @@ class WorkspaceHostTest < Minitest::Test
     def system!(*argv)
       if argv[0, 3] == ['nix-env', '--profile', @profile]
         if argv[3] == '--set'
+          if fail_set_before_profile
+            self.fail_set_before_profile = false
+            raise DevWorkspaceHost::Error, 'injected pre-commit profile selection failure'
+          end
           generations = Dir["#{@profile}-*-link"].filter_map do |path|
             File.basename(path)[/-(\d+)-link\z/, 1]&.to_i
           end
@@ -452,10 +457,19 @@ class WorkspaceHostTest < Minitest::Test
       reconcile_codex_update(defer_busy: true)
     end
 
-    def quiesce_sessions
+    def quiesce_sessions(*args)
+      return super if delegate_quiesce
+
       raise DevWorkspaceHost::Error, busy.join(', ') unless busy.empty?
       @events << [:sessions_quiesced]
       []
+    end
+
+    def capture_env!(environment, *argv)
+      return super unless argv.include?('quiesce')
+
+      @events << [:quiesce_invocation, argv]
+      quiesce_output || "idle session: example\n"
     end
 
     def wait_for_codex_sockets

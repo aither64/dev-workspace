@@ -413,7 +413,12 @@ module DevWorkspaceHost
       case command
       when 'register' then with_current_generation_lock(allow_first_install: true) { register(argv) }
       when 'unregister' then with_current_generation_lock(allow_first_install: true) { unregister(argv) }
-      when 'switch' then with_current_generation_lock(allow_first_install: true) { switch(argv) }
+      when 'switch'
+        if argv.include?('--from-candidate')
+          with_candidate_generation_lock { switch(argv, from_candidate: true) }
+        else
+          with_current_generation_lock(allow_first_install: true) { switch(argv) }
+        end
       when 'rollback' then with_current_generation_lock { rollback(argv) }
       when 'suspend' then with_current_generation_lock { suspend(argv) }
       when 'status' then status(argv)
@@ -452,7 +457,7 @@ module DevWorkspaceHost
         Usage:
           workspace-host register NAME ROOT [--hostname HOST] [--alias HOST] [--replace]
           workspace-host unregister NAME
-          workspace-host switch --source PATH
+          workspace-host switch --source PATH [--from-candidate]
           workspace-host rollback
           workspace-host suspend
           workspace-host status
@@ -572,14 +577,18 @@ module DevWorkspaceHost
       @out.puts "unregistered #{name}"
     end
 
-    def switch(argv)
+    def switch(argv, from_candidate: false)
       options = {}
       parser = OptionParser.new do |opts|
         opts.on('--source PATH') { |value| options[:source] = value }
+        opts.on('--from-candidate') { options[:from_candidate] = true }
       end
       parser.parse!(argv)
       raise Error, 'switch requires --source PATH' unless argv.empty? && options[:source]
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
+      unless options.fetch(:from_candidate, false) == from_candidate
+        raise Error, 'candidate switch entry must be selected explicitly'
+      end
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition') unless from_candidate
       source = File.realpath(File.expand_path(options.fetch(:source)))
       output = capture!(
         'nix', 'build', '--no-link', '--print-out-paths', source
@@ -589,6 +598,12 @@ module DevWorkspaceHost
       candidate = File.realpath(candidates.fetch(0))
       candidate_host = File.join(candidate, 'bin/workspace-host')
       raise Error, "workspace package has no workspace-host command: #{candidate}" unless File.executable?(candidate_host)
+      if from_candidate
+        unless candidate == File.realpath(package_root) && !profile_selects_package?(candidate)
+          raise Error, 'candidate switch entry requires the exact unselected source package'
+        end
+        require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
+      end
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
       current_codex = File.realpath(active_codex)
@@ -599,6 +614,7 @@ module DevWorkspaceHost
 
       candidate_plans = registration_plans(package: candidate)
       probe_registration_plans!(File.realpath(@system_codex), candidate_plans)
+      predecessor_package = preselection_session_package
       quiesced = []
       begin
         quiesced = quiesce_sessions
@@ -631,7 +647,7 @@ module DevWorkspaceHost
                 "#{transition_error.message}"
         end
         clear_pending_codex_update
-        reraise_after_terminal_restoration(transition_error, quiesced)
+        reraise_after_terminal_restoration(transition_error, quiesced, package: predecessor_package)
       end
       wait_for_codex_sockets
       verify_registration_semantics!(candidate_plans, File.realpath(@system_codex))
@@ -1653,6 +1669,7 @@ module DevWorkspaceHost
 
     def quiesce_sessions(entries = registry.entries)
       quiesced = []
+      predecessor_package = preselection_session_package
       entries.each do |entry|
         current_socket = instance_runtime(entry).fetch(:codex)
         Dir[File.join(entry.fetch('root'), 'work', '*', 'portal.yml')].sort.each do |manifest_path|
@@ -1666,7 +1683,8 @@ module DevWorkspaceHost
           environment, command, arguments = dev_session_invocation(
             entry,
             ['quiesce', slug, '--as-is'],
-            transition_lock: false
+            transition_lock: false,
+            package: predecessor_package
           )
           output = capture_env!(environment, command, *arguments)
           quiesced << [entry, slug] if output.lines.any? do |line|
@@ -1676,7 +1694,13 @@ module DevWorkspaceHost
       end
       quiesced
     rescue StandardError => primary_error
-      reraise_after_terminal_restoration(primary_error, quiesced)
+      reraise_after_terminal_restoration(primary_error, quiesced, package: predecessor_package)
+    end
+
+    def preselection_session_package
+      # The candidate entry is not selected yet, so its session helper must
+      # not own quiesce or pre-selection recovery.
+      File.symlink?(@profile) ? File.realpath(@profile) : package_root
     end
 
     def require_no_unfinished_lifecycle_operations!(
@@ -2414,6 +2438,22 @@ module DevWorkspaceHost
                 'workspace package transition completed while this command waited; rerun it'
         end
         require_current_package_generation! unless allow_first_install && uninstalled
+        yield
+      end
+    end
+
+    # A newer candidate may need to read persisted state that the installed
+    # generation cannot parse. Bind its explicit entry to the exact source
+    # build, then run the ordinary switch preflight and activation under the
+    # same transition lock. No other command can enter from a candidate.
+    def with_candidate_generation_lock
+      observed_profile = profile_link_token
+      with_transition_lock do
+        unless observed_profile && profile_link_token == observed_profile &&
+               File.symlink?(@profile) &&
+               File.executable?(File.join(File.realpath(@profile), 'bin/workspace-host'))
+          raise Error, 'selected workspace package changed or is unavailable; rerun the switch'
+        end
         yield
       end
     end

@@ -83,6 +83,22 @@ an older package; recover by repeating the same switch or selecting a newer
 package. Commands waiting on a transition lock reject a generation change and
 must be run again.
 
+If the installed `workspace-host switch` cannot parse valid persisted state,
+run the candidate's explicit recovery entry from the source checkout:
+
+```sh
+nix run .#workspace-host -- switch --source "$PWD" --from-candidate
+```
+
+This entry requires an installed profile and verifies that the executing
+package is the exact output built from `--source`. It then applies the same
+transition lock, session and cluster preflights, profile selection, and
+recovery sequence as a normal switch. Session terminals are quiesced through
+the still-selected package and restored through the new package after profile
+selection. Use the installed command for ordinary
+updates; the candidate entry does not rewrite saved team rosters or creation
+journals.
+
 ## Extension catalog
 
 Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`

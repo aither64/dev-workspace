@@ -20,6 +20,109 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_candidate_switch_uses_the_exact_source_and_accepts_a_ready_expanded_team
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      previous = File.realpath(host.instance_variable_get(:@profile))
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+      host.executing_package = host.candidate
+
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-ready.creation.json')
+      preset = {
+        'id' => 'delegated', 'name' => 'Full team', 'description' => 'Direct threads',
+        'catalogDigest' => 'a' * 64, 'teamDigest' => 'b' * 64,
+        'leadModel' => 'gpt-6-sol', 'leadEffort' => 'high',
+        'leadInstructions' => "Coordinate the team.\n", 'roles' => %w[lead architect0],
+        'members' => [{
+          'role' => 'architect', 'address' => 'architect0', 'behavior' => 'designer',
+          'purpose' => 'design', 'access' => 'read_only',
+          'instructions' => 'Write assigned design artifacts.',
+          'model' => 'gpt-6-sol', 'reasoningEffort' => 'xhigh'
+        }]
+      }
+      File.write(journal, JSON.generate(
+        'schema' => 3, 'slug' => '2026-09-07-ready', 'goal_sha256' => 'c' * 64,
+        'run_codex' => true, 'state' => 'ready', 'model' => 'gpt-6-sol',
+        'effort' => 'high', 'direct_team' => preset
+      ))
+      File.chmod(0o600, journal)
+      manifest_directory = File.join(workspace, 'work', '2026-09-07-ready')
+      FileUtils.mkdir_p(manifest_directory)
+      socket = host.send(:instance_runtime, host.send(:registry).entries.fetch(0)).fetch(:codex)
+      File.write(File.join(manifest_directory, 'portal.yml'), YAML.dump(
+        'codex' => { 'thread_id' => 'thread-one', 'socket_path' => socket },
+        'creation' => { 'state' => 'ready' }
+      ))
+      host.delegate_quiesce = true
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(previous, File.realpath(host.instance_variable_get(:@profile)))
+      host.quiesce_output = "quiesced terminal: 2026-09-07-ready\n"
+      host.fail_set_before_profile = true
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      assert_equal(previous, File.realpath(host.instance_variable_get(:@profile)))
+      assert_includes(host.events, [:sessions_restored, previous])
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      invocation = host.events.find { |event| event.first == :quiesce_invocation }.fetch(1)
+      assert_equal(File.join(previous, 'libexec/workspace-portal/dev-session'), invocation.fetch(0))
+      assert_equal(previous, invocation.fetch(invocation.index('--expected-host-generation') + 1))
+      assert_equal(File.realpath(host.candidate), File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(2, host.send(:profile_generation))
+    end
+  end
+
+  def test_candidate_switch_rejects_a_different_source_package
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      previous = File.realpath(host.instance_variable_get(:@profile))
+      host.executing_package = make_package(paths.fetch(:root), 'unmatched-package')
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      assert_equal(previous, File.realpath(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, 'exact unselected source package')
+    end
+  end
+
+  def test_candidate_switch_requires_an_installed_profile
+    with_transition_host do |host, paths|
+      host.executing_package = host.candidate
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, 'selected workspace package')
+    end
+  end
+
+  def test_candidate_switch_still_refuses_an_unfinished_creation
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      previous = File.realpath(host.instance_variable_get(:@profile))
+      host.candidate = make_package(paths.fetch(:root), 'package-two')
+      host.executing_package = host.candidate
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      journal = File.join(locks, '2026-09-07-pending.creation.json')
+      File.write(journal, JSON.generate(
+        'schema' => 1, 'slug' => '2026-09-07-pending',
+        'goal_sha256' => 'b' * 64, 'run_codex' => true,
+        'state' => 'creating', 'tmux_identity' => 'a' * 64
+      ))
+      File.chmod(0o600, journal)
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      assert_equal(previous, File.realpath(host.instance_variable_get(:@profile)))
+      assert_includes(host.instance_variable_get(:@err).string, '(creation)')
+    end
+  end
+
   def test_switch_rejects_a_nonactivating_profile_change
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
