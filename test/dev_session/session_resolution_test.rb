@@ -353,6 +353,7 @@ class DevSessionTest < Minitest::Test
         '--transition-lock' => File.join(workspace, 'transition.lock')
       }
       FileUtils.mkdir_p(values.fetch('--expected-host-generation'))
+      File.write(values.fetch('--transition-lock'), '')
       File.symlink(
         values.fetch('--expected-host-generation'), values.fetch('--host-profile')
       )
