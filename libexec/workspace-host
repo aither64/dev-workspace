@@ -1930,24 +1930,43 @@ module DevWorkspaceHost
 	end
 
 	def valid_direct_portal_preset?(preset)
-	  return false unless preset.is_a?(Hash) &&
-		preset.keys.sort == %w[catalogDigest description id leadEffort leadModel members name roles teamDigest] &&
+	  legacy_keys = %w[catalogDigest description id leadEffort leadModel members name roles teamDigest]
+	  return false unless preset.is_a?(Hash)
+	  with_instructions = preset.key?('leadInstructions')
+	  expected_keys = with_instructions ? legacy_keys + %w[leadInstructions] : legacy_keys
+	  return false unless preset.keys.sort == expected_keys.sort &&
 		valid_portal_team_identifier?(preset['id']) &&
 		%w[catalogDigest teamDigest].all? { |key| preset[key].is_a?(String) && preset[key].match?(SHA256_HEX) } &&
 		%w[name description leadModel leadEffort].all? { |key| bounded_portal_receipt_string?(preset[key], key == 'description' ? 4096 : AGENT_TEAM_PERSISTED_SCALAR_MAX_BYTES) } &&
+		(!with_instructions || bounded_portal_receipt_string?(preset['leadInstructions'], 4096)) &&
 		preset['roles'].is_a?(Array) && preset['members'].is_a?(Array) &&
 		preset['roles'].length <= 64 && preset['members'].length <= 64
 	  addresses = []
 	  return false unless preset['members'].all? do |member|
-		member.is_a?(Hash) && member.keys.sort == %w[access address behavior model reasoningEffort role] &&
-		  valid_portal_team_identifier?(member['role']) && member['role'] != 'lead' &&
-		  member['address'].is_a?(String) && member['address'] == "#{member['role']}0" &&
-		  bounded_portal_setting?(member['model']) && bounded_portal_setting?(member['reasoningEffort']) &&
-		  { 'architect' => ['designer', 'read_only'],
-		    'implementer' => ['implementer', 'workspace_write'],
-		    'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
-		    [member['behavior'], member['access']] &&
-		  addresses << member['address']
+		next false unless member.is_a?(Hash)
+		member_keys = %w[access address behavior model reasoningEffort role]
+		member_keys += %w[purpose instructions] if with_instructions
+		next false unless member.keys.sort == member_keys.sort &&
+		  member['role'].is_a?(String) && member['role'].match?(/\A[a-z][a-z0-9]{0,31}\z/) && member['role'] != 'lead' &&
+		  member['address'] == "#{member['role']}0" &&
+		  bounded_portal_setting?(member['model']) && bounded_portal_setting?(member['reasoningEffort'])
+		if with_instructions
+		  purpose = { 'designer' => 'design', 'implementer' => 'implementation',
+		              'reviewer' => 'review', 'general' => 'general' }[member['behavior']]
+		  next false unless purpose && member['purpose'] == purpose &&
+		    bounded_portal_receipt_string?(member['instructions'], 4096) &&
+		    (case member['behavior']
+		     when 'implementer' then member['access'] == 'workspace_write'
+		     when 'reviewer' then member['access'] == 'read_only'
+		     else %w[read_only workspace_write].include?(member['access'])
+		     end)
+		else
+		  next false unless { 'architect' => ['designer', 'read_only'],
+		                      'implementer' => ['implementer', 'workspace_write'],
+		                      'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
+		                    [member['behavior'], member['access']]
+		end
+		addresses << member['address']
 	  end
 	  addresses.uniq.length == addresses.length && preset['roles'] == ['lead'] + addresses
 	end

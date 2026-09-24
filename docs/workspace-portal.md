@@ -219,7 +219,10 @@ catalog. Older receipts without `leadInstructions`, and rosters without
 instruction fields, continue with their original role instructions. Newly
 created expanded receipts require the newer package and are not readable by an
 older package; this is a forward-only
-package transition. Team mutations remain unavailable until the creation
+package transition. Host package-switch checks accept both legacy and expanded
+snapshots, including an architect's saved read-only or workspace-write access;
+they do not replace saved policy with current catalog defaults. Team mutations
+remain unavailable until the creation
 receipt is ready. If a member's App Server
 start has an uncertain outcome, retry reconciles its registered App Server
 project and refuses to start another thread when the result is ambiguous. Each

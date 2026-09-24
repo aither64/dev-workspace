@@ -144,6 +144,27 @@ class WorkspaceHostTest < Minitest::Test
       assert(host.send(:valid_direct_portal_preset?, preset))
       preset['members'].first['access'] = 'workspace_write'
       refute(host.send(:valid_direct_portal_preset?, preset))
+
+      # Current snapshots freeze instructions and access. An old architect may
+      # remain read-only while a new architect can write design artifacts.
+      preset['leadInstructions'] = "Coordinate the team.\n"
+      preset['members'].first['purpose'] = 'design'
+      preset['members'].first['instructions'] = 'Write assigned design artifacts.'
+      assert(host.send(:valid_direct_portal_preset?, preset))
+      preset['members'].first['access'] = 'read_only'
+      assert(host.send(:valid_direct_portal_preset?, preset))
+      preset['members'].first['purpose'] = 'implementation'
+      refute(host.send(:valid_direct_portal_preset?, preset))
+      preset['members'].first['purpose'] = 'design'
+
+      path = File.join(directory, 'example.creation.json')
+      File.write(path, JSON.generate(
+        'schema' => 3, 'slug' => 'example', 'goal_sha256' => 'c' * 64,
+        'run_codex' => true, 'state' => 'ready', 'model' => 'gpt-6-sol',
+        'effort' => 'high', 'direct_team' => preset
+      ))
+      File.chmod(0o600, path)
+      assert_equal('ready', host.send(:read_private_creation_journal!, path, 'example').fetch('state'))
     end
   end
 
