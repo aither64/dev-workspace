@@ -200,6 +200,7 @@ dev-session team list example
 dev-session team preset example delegated
 dev-session team add example architect --model gpt-6-sol --effort xhigh
 dev-session team configure example architect0 --model gpt-6-sol --effort high
+dev-session team update-access example architect0 --access workspace_write
 dev-session team assign example --to implementer0 --message 'Implement the approved plan.'
 ```
 
@@ -264,7 +265,14 @@ configured access before starting a turn. The Team tab shows each member's
 saved access. The built-in architect and reviewer roles use a read-only sandbox;
 the built-in implementer uses workspace-write. A site catalog can grant its
 architect role workspace-write access to edit assigned design artifacts.
-Changing that catalog does not alter existing rosters. Team model and reasoning
+Changing that catalog does not alter existing rosters. An operator can
+explicitly run `team update-access` for one ready member, choosing `read_only`
+or `workspace_write`. The command requires the member thread to be idle and
+validates the requested access against the member's retained purpose; an
+implementer cannot become read-only, and a reviewer cannot become writable.
+It preserves the member's thread, instructions, model, and effort. The member's
+catalog digest is cleared to mark a manual access override, and the new
+sandbox takes effect on its next turn. Team model and reasoning
 choices remain in the form during background conversation and roster refreshes
 until they are saved or the page is reloaded.
 Ordinary portal reads leave the thread's persisted instructions alone.

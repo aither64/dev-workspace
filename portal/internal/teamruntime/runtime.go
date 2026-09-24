@@ -1759,6 +1759,61 @@ func (service Service) Configure(ctx context.Context, slug, rootThreadID, addres
 	return result, err
 }
 
+// UpdateAccess changes one idle member's retained sandbox policy without
+// replacing its thread, instructions, or model settings. Purpose constraints
+// still apply; the next turn rebinds the saved policy through memberTurnPolicy.
+func (service Service) UpdateAccess(ctx context.Context, slug, rootThreadID, address, access string) (*Roster, error) {
+	if service.Store == nil || service.Client == nil {
+		return nil, errors.New("team runtime is unavailable")
+	}
+	if access != "read_only" && access != "workspace_write" {
+		return nil, errors.New("access must be read_only or workspace_write")
+	}
+	var result *Roster
+	err := service.Store.withOperationLock(ctx, slug, func() error {
+		roster, err := service.Store.Load(slug, rootThreadID)
+		if err != nil {
+			return err
+		}
+		var member *Member
+		for index := range roster.Members {
+			if roster.Members[index].Address == address {
+				member = &roster.Members[index]
+				break
+			}
+		}
+		if member == nil || member.State != "ready" || member.RetireIntent != "" {
+			return errors.New("team member is unavailable")
+		}
+		if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, access); err != nil {
+			return fmt.Errorf("member %s access: %w", address, err)
+		}
+		if member.Access == access {
+			result = roster
+			return nil
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+			return fmt.Errorf("member %s is not idle: %w", address, err)
+		}
+		result, err = service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
+			if updated.Revision != roster.Revision {
+				return errors.New("team roster changed during access update")
+			}
+			for index := range updated.Members {
+				if updated.Members[index].Address == address {
+					updated.Members[index].Access = access
+					updated.Members[index].PolicyCatalogDigest = ""
+					return nil
+				}
+			}
+			return errors.New("team member disappeared during access update")
+		})
+		return err
+	})
+	return result, err
+}
+
 func (service Service) Assign(ctx context.Context, slug, rootThreadID, from, to, message, model, effort, messageID string) (codex.SendReceipt, error) {
 	if service.Store == nil || service.Client == nil {
 		return codex.SendReceipt{}, errors.New("team runtime is unavailable")

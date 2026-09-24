@@ -447,6 +447,73 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	}
 }
 
+func TestUpdateAccessRetainsThreadAndRebindsNextTurn(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	before, err := store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		roster.Members = append(roster.Members, Member{Address: "architect0", Role: "architect", Index: 0,
+			Thread: "thread-1", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "designer", Purpose: "design",
+			Instructions: legacyBehaviorInstructions["designer"], Access: "read_only",
+			PolicyCatalogDigest: strings.Repeat("a", 64), State: "ready",
+			AddedAt: time.Now().UTC()})
+		roster.Members = append(roster.Members, Member{Address: "reviewer0", Role: "reviewer", Index: 0,
+			Thread: "thread-2", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "reviewer", Purpose: "review",
+			Instructions: legacyBehaviorInstructions["reviewer"], Access: "read_only", State: "ready",
+			AddedAt: time.Now().UTC()})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpdateAccess(context.Background(), "one", "root-one", "reviewer0", "workspace_write"); err == nil ||
+		!strings.Contains(err.Error(), "incompatible access") {
+		t.Fatalf("reviewer write access = %v", err)
+	}
+	updated, err := service.UpdateAccess(context.Background(), "one", "root-one", "architect0", "workspace_write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := updated.Members[0]
+	if updated.Revision != before.Revision+1 || member.Thread != "thread-1" || member.Address != "architect0" ||
+		member.Model != "gpt-6-sol" || member.Effort != "xhigh" || member.Access != "workspace_write" ||
+		member.Instructions != legacyBehaviorInstructions["designer"] || member.PolicyCatalogDigest != "" ||
+		updated.Members[1].Access != "read_only" {
+		t.Fatalf("updated roster = %#v", updated)
+	}
+	if want := "thread-1:" + filepath.Join(workspace, "work", "one"); !reflect.DeepEqual(client.idleChecks, []string{want}) {
+		t.Fatalf("idle checks = %#v, want %q", client.idleChecks, want)
+	}
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "architect0", "draft design", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.options) != 1 || client.options[0].ThreadPolicy.Sandbox != "workspace-write" ||
+		!strings.Contains(client.options[0].ThreadPolicy.DeveloperInstructions, legacyBehaviorInstructions["designer"]) {
+		t.Fatalf("next turn policy = %#v", client.options)
+	}
+	noChange, err := service.UpdateAccess(context.Background(), "one", "root-one", "architect0", "workspace_write")
+	if err != nil || noChange.Revision != updated.Revision {
+		t.Fatalf("unchanged access updated roster: %#v, %v", noChange, err)
+	}
+	client.idleError = errors.New("turn in progress")
+	if _, err := service.UpdateAccess(context.Background(), "one", "root-one", "architect0", "read_only"); err == nil ||
+		!strings.Contains(err.Error(), "not idle") {
+		t.Fatalf("busy access update = %v", err)
+	}
+	retained, err := store.Load("one", "root-one")
+	if err != nil || retained.Revision != updated.Revision {
+		t.Fatalf("busy access update changed roster: %#v, %v", retained, err)
+	}
+	if _, err := service.UpdateAccess(context.Background(), "one", "root-one", "architect0", "invalid"); err == nil ||
+		!strings.Contains(err.Error(), "read_only or workspace_write") {
+		t.Fatalf("invalid access = %v", err)
+	}
+}
+
 func TestMemberReportBindingChangesWithExactThreadIdentity(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)

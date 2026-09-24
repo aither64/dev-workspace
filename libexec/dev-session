@@ -221,6 +221,7 @@ module DevSession
         [--model MODEL] [--effort EFFORT]
       dev-session team add <name-or-slug> <role> --model MODEL --effort EFFORT [--as-is]
       dev-session team configure <name-or-slug> <address> --model MODEL --effort EFFORT [--as-is]
+      dev-session team update-access <name-or-slug> <address> --access read_only|workspace_write [--as-is]
       dev-session team remove <name-or-slug> <address> [--as-is]
       dev-session team assign <name-or-slug> --to ADDRESS --message TEXT [--message-id ID] [--as-is]
         [--from ADDRESS] [--model MODEL] [--effort EFFORT]
@@ -1465,7 +1466,7 @@ module DevSession
       lookup_slug(input, as_is:)
     end
 
-    def team(slug, action:, preset: nil, role: nil, address: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
+    def team(slug, action:, preset: nil, role: nil, address: nil, access: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
       raise Error, 'workspace-portal is required for team controls' unless @portal_command && !@portal_command.empty?
 	  member_address = @env[ENV_MEMBER_ADDRESS]
 	  if member_address && !member_address.empty?
@@ -1475,9 +1476,10 @@ module DevSession
 		if action == 'assign' && from != member_address
 		  raise Error, 'a team member can only assign from its own address'
 		end
+		raise Error, 'a team member cannot update access' if action == 'update-access'
 	  end
-	  return invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if lifecycle
-	  return invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if action == 'list'
+	  return invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if lifecycle
+	  return invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if action == 'list'
 
 	  with_slug_lock(slug) do
 		select_tmux_for_slug!(slug)
@@ -1490,7 +1492,7 @@ module DevSession
 			raise Error, "Team member's lead thread changed; report was not sent."
 		  end
 		end
-		invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:)
+		invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:)
 	  end
 	end
 
@@ -1511,7 +1513,7 @@ module DevSession
 	  end
 	end
 
-	def invoke_team_command(slug, action:, preset:, role:, address:, from:, to:, message:, message_id: nil, model:, effort:, source_slug:, source_root_thread:)
+	def invoke_team_command(slug, action:, preset:, role:, address:, access: nil, from:, to:, message:, message_id: nil, model:, effort:, source_slug:, source_root_thread:)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
       root_thread = manifest.dig('codex', 'thread_id')
@@ -1533,7 +1535,7 @@ module DevSession
 		preset_spec = resolve_current_direct_team!(preset, model:, effort:)
 		return apply_direct_team_preset!(slug, root_thread, preset_spec)
 	  end
-      { preset:, role:, address:, from:, to:, message:, message_id:, model:, effort: }.each do |name, value|
+      { preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort: }.each do |name, value|
         next if action == 'assign' && name == :message
         next if value.nil? || value.empty?
         command.concat(["--#{name.to_s.tr('_', '-')}", value])
@@ -8360,13 +8362,14 @@ module DevSession
 
     def run_team
       action = @argv.shift
-      raise Error, 'usage: team list|preset|add|configure|remove|assign <session> ...' unless action
-      opts = { as_is: false, model: nil, effort: nil, from: 'lead', to: nil, message: nil,
+      raise Error, 'usage: team list|preset|add|configure|update-access|remove|assign <session> ...' unless action
+      opts = { as_is: false, model: nil, effort: nil, access: nil, from: 'lead', to: nil, message: nil,
                message_id: nil, message_stdin: false, message_option: false }
       parser = OptionParser.new do |flags|
         flags.on('--as-is') { opts[:as_is] = true }
         flags.on('--model MODEL') { |value| opts[:model] = value }
         flags.on('--effort EFFORT') { |value| opts[:effort] = value }
+        flags.on('--access ACCESS') { |value| opts[:access] = value }
         flags.on('--from ADDRESS') { |value| opts[:from] = value }
         flags.on('--to ADDRESS') { |value| opts[:to] = value }
         flags.on('--message TEXT') { |value| opts[:message], opts[:message_option] = value, true }
@@ -8374,7 +8377,8 @@ module DevSession
         flags.on('--message-id ID') { |value| opts[:message_id] = value }
       end
       parser.parse!(@argv)
-      expected = { 'list' => 1, 'preset' => 2, 'add' => 2, 'configure' => 2, 'remove' => 2, 'assign' => 1 }
+      expected = { 'list' => 1, 'preset' => 2, 'add' => 2, 'configure' => 2,
+                   'update-access' => 2, 'remove' => 2, 'assign' => 1 }
       raise Error, "unknown team action: #{action}" unless expected.key?(action)
       require_arity!(expected.fetch(action), @argv, "team #{action}")
 	  if opts[:message_stdin]
@@ -8385,11 +8389,11 @@ module DevSession
 	  end
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       opts[:message_id] ||= SecureRandom.uuid if action == 'assign'
-      parameters = { model: opts[:model], effort: opts[:effort], from: opts[:from], to: opts[:to], message: opts[:message], message_id: opts[:message_id] }
+      parameters = { model: opts[:model], effort: opts[:effort], access: opts[:access], from: opts[:from], to: opts[:to], message: opts[:message], message_id: opts[:message_id] }
       case action
       when 'preset' then parameters[:preset] = @argv.fetch(1)
       when 'add' then parameters[:role] = @argv.fetch(1)
-      when 'configure', 'remove' then parameters[:address] = @argv.fetch(1)
+      when 'configure', 'update-access', 'remove' then parameters[:address] = @argv.fetch(1)
       end
       @out.write(runner.team(slug, action:, **parameters))
     end

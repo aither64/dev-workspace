@@ -376,7 +376,7 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 // the same private roster and direct App Server thread operations.
 func teamCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|remove|assign|require-idle|archive|retire|revive|fork")
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|archive|retire|revive|fork")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
@@ -393,6 +393,7 @@ func teamCommand(args []string) error {
 	presetFile := flags.String("preset-file", "", "immutable team preset JSON file")
 	role := flags.String("role", "", "member role")
 	address := flags.String("address", "", "team member address")
+	access := flags.String("access", "", "retained member access")
 	from := flags.String("from", "lead", "sender address")
 	to := flags.String("to", "", "recipient address")
 	message := flags.String("message", "", "assignment message")
@@ -517,6 +518,8 @@ func teamCommand(args []string) error {
 		result, err = service.Add(ctx, *slug, *rootThread, *cwd, environment, *role, *model, *effort)
 	case "configure":
 		result, err = service.Configure(ctx, *slug, *rootThread, *address, *model, *effort)
+	case "update-access":
+		result, err = service.UpdateAccess(ctx, *slug, *rootThread, *address, *access)
 	case "remove":
 		err = service.Remove(ctx, *slug, *rootThread, *address)
 	case "assign":
