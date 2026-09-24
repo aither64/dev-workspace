@@ -248,7 +248,7 @@ func TestPortalMutationRejectsProfileSwitchWhileWaiting(t *testing.T) {
 			select {
 			case <-done:
 				t.Fatal("portal mutation did not wait for the transition")
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(10 * time.Millisecond):
 			}
 
 			oldTarget, err := os.Readlink(server.config.HostProfile)
