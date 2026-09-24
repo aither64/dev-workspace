@@ -35,7 +35,7 @@ const baseURL = process.argv[2];
       }
       if (operation === "team" && route.request().method() === "POST") {
         saved.push(route.request().postDataJSON());
-        return route.fulfill(saved.length === 1 ? {status: 503, json: {error: "Fixture save failure"}} : {json: {ok: true}});
+        return route.fulfill(saved.length < 3 ? {status: 503, json: {error: "Fixture save failure"}} : {json: {ok: true}});
       }
       if (operation === "pending") return route.fulfill({json: []});
       if (operation === "queue") return route.fulfill({json: []});
@@ -51,6 +51,17 @@ const baseURL = process.argv[2];
     await page.evaluate(() => dispatchEvent(new Event("focus")));
     await expect.poll(() => detailsReads).toBeGreaterThan(idleReads);
     await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
+    await page.getByRole("button", {name: "Save"}).click();
+    await expect.poll(() => saved.length).toBe(1);
+    await expect(page.getByText("Fixture save failure")).toBeVisible();
+    assert.equal(saved[0].model, "model-1");
+    assert.equal(saved[0].reasoningEffort, "medium");
+    detailsVersion++;
+    const failedReads = detailsReads;
+    await page.getByRole("tab", {name: "Team"}).click();
+    await expect.poll(() => detailsReads).toBeGreaterThan(failedReads);
+    await expect(page.getByText("Fixture save failure")).toBeVisible();
+    await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
     await model.selectOption("model-2");
     await effort.selectOption("high");
     await model.focus();
@@ -65,14 +76,14 @@ const baseURL = process.argv[2];
     await expect(effort).toHaveValue("high");
     await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
     await page.getByRole("button", {name: "Save"}).click();
-    await expect.poll(() => saved.length).toBe(1);
+    await expect.poll(() => saved.length).toBe(2);
     await expect(page.getByText("Fixture save failure")).toBeVisible();
-    assert.equal(saved[0].model, "model-2");
-    assert.equal(saved[0].reasoningEffort, "high");
+    assert.equal(saved[1].model, "model-2");
+    assert.equal(saved[1].reasoningEffort, "high");
     await expect(model).toHaveValue("model-2");
     await page.getByRole("button", {name: "Save"}).click();
-    await expect.poll(() => saved.length).toBe(2);
-    assert.deepEqual(saved[1], saved[0]);
+    await expect.poll(() => saved.length).toBe(3);
+    assert.deepEqual(saved[2], saved[1]);
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();

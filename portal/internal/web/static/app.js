@@ -1795,6 +1795,7 @@
       setTimeout(() => location.reload(), 250);
     } catch (error) {
       delete form.dataset.teamSubmitting;
+      form.dataset.teamDirty = "true";
       if (status) status.textContent = error.message;
       controls.forEach(control => { control.disabled = false; });
     }

@@ -1664,10 +1664,11 @@ func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
 		DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
 			{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "high"},
 			{Address: "reviewer0", State: "ready", Access: "read_only", Model: "model-1", Effort: "high"},
+			{Address: "legacy0", State: "ready", Model: "model-1", Effort: "high"},
 		}},
 	})
 	body := response.Body.String()
-	for _, marker := range []string{`<code>architect0</code>`, `Workspace write`, `<code>reviewer0</code>`, `Read only`} {
+	for _, marker := range []string{`<code>architect0</code>`, `Workspace write`, `<code>reviewer0</code>`, `Read only`, `<code>legacy0</code>`, `Access unrecorded`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("direct team page omitted %q", marker)
 		}
