@@ -741,6 +741,7 @@ type Client interface {
 	ForkThread(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ArchiveThread(context.Context, string) error
 	RequireThreadIdle(context.Context, string, string) error
+	RequireSubmissionAttemptsResolved(context.Context, string) error
 	VerifyThread(context.Context, string, string) error
 	ActiveTurnID(context.Context, string) (string, error)
 	Interrupt(context.Context, string) error
@@ -1423,7 +1424,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 			continue
 		}
 		if member.State == "removed" {
-			return service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member)
+			return service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member, false)
 		}
 		if member.RetireIntent == "replace" {
 			return errors.New("member replacement is pending; finish recovery before removal")
@@ -1482,7 +1483,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 			}
 			// A failed ledger cleanup leaves this member nonterminal. Retrying
 			// proves the same archived or deleted thread before clearing again.
-			if err := service.Client.ClearRetiredThreadAttempts(member.Thread); err != nil {
+			if err := service.clearRetiredMemberAttempts(ctx, member.Thread, false); err != nil {
 				return fmt.Errorf("clear retired %s attempts: %w", address, err)
 			}
 		}
@@ -1539,6 +1540,9 @@ func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThrea
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
 		if archived {
+			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
+			}
 			continue
 		}
 		if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
@@ -1641,7 +1645,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 	}
 	for _, member := range roster.Members {
 		if member.State == "archived" {
-			if err := service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member); err != nil {
+			if err := service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member, force); err != nil {
 				return fmt.Errorf("reconcile archived %s attempts: %w", member.Address, err)
 			}
 			continue
@@ -1675,7 +1679,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 				return fmt.Errorf("archive %s: %w", member.Address, err)
 			}
 		}
-		if err := service.Client.ClearRetiredThreadAttempts(member.Thread); err != nil {
+		if err := service.clearRetiredMemberAttempts(ctx, member.Thread, force); err != nil {
 			return fmt.Errorf("clear retired %s attempts: %w", member.Address, err)
 		}
 		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -1712,7 +1716,7 @@ func (service Service) archiveMemberThread(ctx context.Context, threadID, cwd st
 // thread's retirement. A missing active thread is insufficient by itself:
 // archived threads are listed separately, and deleted fresh threads must also
 // be absent from their dedicated project.
-func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context, slug string, member Member) error {
+func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context, slug string, member Member, force bool) error {
 	if member.Thread == "" {
 		return nil
 	}
@@ -1744,7 +1748,19 @@ func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context,
 			return fmt.Errorf("verify retired member thread: %w", readErr)
 		}
 	}
-	return service.Client.ClearRetiredThreadAttempts(member.Thread)
+	return service.clearRetiredMemberAttempts(ctx, member.Thread, force)
+}
+
+// Forced session deletion intentionally discards unresolved attempts after
+// interrupting the member. Ordinary retirement keeps their retry markers
+// until the owning thread's attempts are resolved.
+func (service Service) clearRetiredMemberAttempts(ctx context.Context, threadID string, force bool) error {
+	if !force {
+		if err := service.Client.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
+			return fmt.Errorf("unresolved member submission attempts: %w", err)
+		}
+	}
+	return service.Client.ClearRetiredThreadAttempts(threadID)
 }
 
 // archivedMemberThread finds only the roster's exact archived thread. A

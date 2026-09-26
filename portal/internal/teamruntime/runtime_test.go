@@ -29,6 +29,8 @@ type testClient struct {
 	clearedThreads     []string
 	clearError         error
 	ledgerEvents       []string
+	unresolvedAttempts map[string]bool
+	attemptChecks      []string
 	starts             []codex.ThreadSettings
 	projects           map[string]codex.ProjectMetadata
 	projectCreates     int
@@ -214,6 +216,13 @@ func (client *testClient) RequireThreadIdle(_ context.Context, thread, cwd strin
 	defer client.mu.Unlock()
 	client.idleChecks = append(client.idleChecks, thread+":"+cwd)
 	return client.idleError
+}
+func (client *testClient) RequireSubmissionAttemptsResolved(_ context.Context, thread string) error {
+	client.attemptChecks = append(client.attemptChecks, thread)
+	if client.unresolvedAttempts[thread] {
+		return errors.New("unresolved message attempt")
+	}
+	return nil
 }
 func (client *testClient) VerifyThread(_ context.Context, thread, cwd string) error {
 	client.verified = append(client.verified, thread+":"+cwd)
@@ -1233,6 +1242,85 @@ func TestMemberArchiveRetriesCleanupBeforeTerminalRosterState(t *testing.T) {
 	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err == nil ||
 		len(client.clearedThreads) != 3 {
 		t.Fatalf("active archived-thread identity = %v, cleared %#v", err, client.clearedThreads)
+	}
+}
+
+func TestArchivedMemberKeepsUnresolvedAttemptsAcrossOrdinaryRetirement(t *testing.T) {
+	cases := []struct {
+		name       string
+		startState string
+		operation  string
+		wantState  string
+	}{
+		{name: "archive ready", startState: "ready", operation: "archive", wantState: "archived"},
+		{name: "remove ready", startState: "ready", operation: "remove", wantState: "removed"},
+		{name: "archive terminal retry", startState: "archived", operation: "archive", wantState: "archived"},
+		{name: "remove terminal retry", startState: "removed", operation: "remove", wantState: "removed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &testClient{unresolvedAttempts: make(map[string]bool)}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+				"implementer", "gpt-6-sol", "high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := "0123456789abcdef0123456789abcdef"
+			for i := 0; i < 2; i++ {
+				if _, err := service.Assign(context.Background(), "one", "root-one", "lead", member.Address,
+					"same assignment", "", "", id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !reflect.DeepEqual(client.messageIDs, []string{id, id}) || !reflect.DeepEqual(client.options[0], client.options[1]) {
+				t.Fatalf("same-ID assignment changed: IDs %#v, options %#v", client.messageIDs, client.options)
+			}
+			if tc.startState != "ready" {
+				if _, err := store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+					roster.Members[0].State = tc.startState
+					if tc.startState == "removed" {
+						now := time.Now().UTC()
+						roster.Members[0].RemovedAt = &now
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client.archived = map[string]bool{member.Thread: true}
+			client.unresolvedAttempts[member.Thread] = true
+			retire := func() error {
+				if tc.operation == "remove" {
+					return service.Remove(context.Background(), "one", "root-one", member.Address)
+				}
+				return service.ArchiveAll(context.Background(), "one", "root-one")
+			}
+			if err := retire(); err == nil || !strings.Contains(err.Error(), "unresolved message attempt") {
+				t.Fatalf("unresolved retirement = %v", err)
+			}
+			roster, err := store.Load("one", "root-one")
+			if err != nil || roster.Members[0].State != tc.startState || len(client.clearedThreads) != 0 ||
+				len(client.archives) != 0 || len(client.attemptChecks) == 0 {
+				t.Fatalf("unresolved attempts were lost: roster %#v, error %v, cleared %#v, archived %#v, checks %#v",
+					roster, err, client.clearedThreads, client.archives, client.attemptChecks)
+			}
+			client.unresolvedAttempts[member.Thread] = false
+			if err := retire(); err != nil {
+				t.Fatal(err)
+			}
+			roster, err = store.Load("one", "root-one")
+			if err != nil || roster.Members[0].State != tc.wantState ||
+				!reflect.DeepEqual(client.clearedThreads, []string{member.Thread}) || len(client.archives) != 0 {
+				t.Fatalf("resolved retirement = %#v, error %v, cleared %#v, archived %#v",
+					roster, err, client.clearedThreads, client.archives)
+			}
+		})
 	}
 }
 

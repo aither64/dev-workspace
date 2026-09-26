@@ -193,12 +193,14 @@ fork retain it as removed rather than making it active again. Session lifecycle
 operations and team mutations share the runtime lock, so an active lifecycle
 transition rejects an add, removal, configuration change, or assignment.
 Removal clears that member thread's submission attempts only after the exact
-thread is proved archived or deleted. Archiving a session applies the same
-rule to each member before recording its archived roster state. If cleanup or
-the roster write fails, a retry proves retirement again and completes the
-cleanup. The root conversation's operation marker is retained for lifecycle
-recovery. A retry of an already removed or archived member also checks its
-retired identity before clearing attempts left by an older package.
+thread is proved archived or deleted and ordinary submission attempts are
+resolved. Archiving a session applies the same rule to each member before
+recording its archived roster state. If cleanup or the roster write fails, a
+retry proves retirement again and completes the cleanup. The root
+conversation's operation marker is retained for lifecycle recovery. A retry
+of an already removed or archived member also checks its retired identity and
+unresolved attempts before clearing records left by an older package. Forced
+session deletion may discard unresolved attempts after interrupting members.
 
 The CLI uses the same record:
 
