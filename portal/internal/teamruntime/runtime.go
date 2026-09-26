@@ -466,6 +466,7 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 		}
 	}
 	seen := make(map[string]struct{}, len(roster.Members))
+	seenThreads := make(map[string]struct{}, len(roster.Members))
 	for _, member := range roster.Members {
 		if !rolePattern.MatchString(member.Role) || member.Address != fmt.Sprintf("%s%d", member.Role, member.Index) ||
 			(member.State != "creating" && member.State != "ready" && member.State != "archived" && member.State != "removed") || member.AddedAt.IsZero() ||
@@ -476,6 +477,15 @@ func (roster Roster) Validate(workspace, slug, rootThreadID string) error {
 			return errors.New("team roster contains a duplicate member address")
 		}
 		seen[member.Address] = struct{}{}
+		if member.Thread != "" {
+			if member.Thread == rootThreadID {
+				return errors.New("team roster member uses the root thread")
+			}
+			if _, found := seenThreads[member.Thread]; found {
+				return errors.New("team roster contains a duplicate member thread")
+			}
+			seenThreads[member.Thread] = struct{}{}
+		}
 		if member.Behavior != "" || member.Access != "" {
 			if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, member.Access); err != nil {
 				return fmt.Errorf("team roster member %s policy: %w", member.Address, err)
@@ -745,6 +755,8 @@ type Client interface {
 	VerifyForkedHeadlessBootstrap(context.Context, string, string, string, string) error
 	DeleteFreshHeadlessThread(context.Context, string, string, string) error
 	SendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, error)
+	CompactAcceptedSendOptions(string) error
+	ClearRetiredThreadAttempts(string) error
 }
 
 type Service struct {
@@ -1411,7 +1423,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 			continue
 		}
 		if member.State == "removed" {
-			return nil
+			return service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member)
 		}
 		if member.RetireIntent == "replace" {
 			return errors.New("member replacement is pending; finish recovery before removal")
@@ -1424,44 +1436,54 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 		// without attempting an invalid App Server operation.
 		if member.Thread != "" {
 			cwd := filepath.Join(service.Store.workspace, "work", slug)
-			materialized := true
-			if member.ProjectID != "" {
-				var err error
-				materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
-				if err != nil && member.RetireIntent == "" {
-					return fmt.Errorf("inspect %s thread: %w", address, err)
-				}
-				if err != nil {
-					materialized = false
-				}
+			archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+			if err != nil {
+				return fmt.Errorf("inspect archived member %s: %w", address, err)
 			}
-			if !materialized || member.RetireIntent == "remove" {
-				if materialized {
-					if err := service.Client.VerifyHeadlessBootstrap(ctx, member.Thread, cwd, member.ProjectID,
-						memberBootstrapMarker(slug, member.Address, member.Thread)); err != nil {
-						return fmt.Errorf("member rollout appeared during removal without its exact bootstrap marker: %w", err)
+			if !archived {
+				materialized := true
+				if member.ProjectID != "" {
+					materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+					if err != nil && member.RetireIntent == "" {
+						return fmt.Errorf("inspect %s thread: %w", address, err)
 					}
+					if err != nil {
+						materialized = false
+					}
+				}
+				if !materialized || member.RetireIntent == "remove" {
+					if materialized {
+						if err := service.Client.VerifyHeadlessBootstrap(ctx, member.Thread, cwd, member.ProjectID,
+							memberBootstrapMarker(slug, member.Address, member.Thread)); err != nil {
+							return fmt.Errorf("member rollout appeared during removal without its exact bootstrap marker: %w", err)
+						}
+						if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+							return fmt.Errorf("member %s is not idle: %w", address, err)
+						}
+						if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
+							return fmt.Errorf("archive %s: %w", address, err)
+						}
+					} else {
+						if err := service.reserveFreshRetirementLocked(ctx, slug, rootThreadID, &member, "remove"); err != nil {
+							return fmt.Errorf("reserve retirement of %s: %w", address, err)
+						}
+						if err := service.deleteUniqueFreshMemberLocked(ctx, slug, cwd, member); err != nil {
+							return fmt.Errorf("retire %s: %w", address, err)
+						}
+					}
+				} else {
 					if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
 						return fmt.Errorf("member %s is not idle: %w", address, err)
 					}
-					if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
+					if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
 						return fmt.Errorf("archive %s: %w", address, err)
 					}
-				} else {
-					if err := service.reserveFreshRetirementLocked(ctx, slug, rootThreadID, &member, "remove"); err != nil {
-						return fmt.Errorf("reserve retirement of %s: %w", address, err)
-					}
-					if err := service.deleteUniqueFreshMemberLocked(ctx, slug, cwd, member); err != nil {
-						return fmt.Errorf("retire %s: %w", address, err)
-					}
 				}
-			} else {
-				if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
-					return fmt.Errorf("member %s is not idle: %w", address, err)
-				}
-				if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
-					return fmt.Errorf("archive %s: %w", address, err)
-				}
+			}
+			// A failed ledger cleanup leaves this member nonterminal. Retrying
+			// proves the same archived or deleted thread before clearing again.
+			if err := service.Client.ClearRetiredThreadAttempts(member.Thread); err != nil {
+				return fmt.Errorf("clear retired %s attempts: %w", address, err)
 			}
 		}
 		_, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -1564,6 +1586,13 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.RetireIntent == "remove" {
 			return fmt.Errorf("member %s removal is pending", member.Address)
 		}
+		archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+		if err != nil {
+			return fmt.Errorf("inspect archived member %s before recovery: %w", member.Address, err)
+		}
+		if archived {
+			continue
+		}
 		materialized := false
 		if member.RetireIntent != "replace" {
 			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
@@ -1611,7 +1640,13 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		}
 	}
 	for _, member := range roster.Members {
-		if member.State == "archived" || member.State == "removed" {
+		if member.State == "archived" {
+			if err := service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member); err != nil {
+				return fmt.Errorf("reconcile archived %s attempts: %w", member.Address, err)
+			}
+			continue
+		}
+		if member.State == "removed" {
 			continue
 		}
 		if force && !archivedMembers[member.Address] {
@@ -1636,15 +1671,12 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			}
 		}
 		if !archivedMembers[member.Address] {
-			if err := service.Client.ArchiveThread(ctx, member.Thread); err != nil {
-				archived, lookupErr := service.archivedMemberThread(ctx, member.Thread, cwd)
-				if lookupErr != nil {
-					return fmt.Errorf("archive %s: %w", member.Address, errors.Join(err, lookupErr))
-				}
-				if !archived {
-					return fmt.Errorf("archive %s: %w", member.Address, err)
-				}
+			if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
+				return fmt.Errorf("archive %s: %w", member.Address, err)
 			}
+		}
+		if err := service.Client.ClearRetiredThreadAttempts(member.Thread); err != nil {
+			return fmt.Errorf("clear retired %s attempts: %w", member.Address, err)
 		}
 		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
 			for index := range updated.Members {
@@ -1659,6 +1691,60 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		}
 	}
 	return nil
+}
+
+// archiveMemberThread proves the exact roster thread reached archived history,
+// including when App Server accepted the archive but its response was lost.
+func (service Service) archiveMemberThread(ctx context.Context, threadID, cwd string) error {
+	archiveErr := service.Client.ArchiveThread(ctx, threadID)
+	archived, lookupErr := service.archivedMemberThread(ctx, threadID, cwd)
+	if lookupErr != nil {
+		return errors.Join(archiveErr, lookupErr)
+	}
+	if !archived {
+		return errors.Join(archiveErr, errors.New("retired member thread is not archived"))
+	}
+	return nil
+}
+
+// Older generations could leave attempts behind after recording a terminal
+// member state. A retry may clear them only with fresh proof of that exact
+// thread's retirement. A missing active thread is insufficient by itself:
+// archived threads are listed separately, and deleted fresh threads must also
+// be absent from their dedicated project.
+func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context, slug string, member Member) error {
+	if member.Thread == "" {
+		return nil
+	}
+	cwd := filepath.Join(service.Store.workspace, "work", slug)
+	archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+	if err != nil {
+		return err
+	}
+	if !archived {
+		if member.State != "removed" || !projectUUIDPattern.MatchString(member.ProjectID) {
+			return errors.New("retired member thread has no archived or deleted identity proof")
+		}
+		project, err := service.Client.ReadProject(ctx, member.ProjectID)
+		if err != nil || project.ID != member.ProjectID || project.Name != slug+" "+member.Address {
+			return fmt.Errorf("retired member project identity changed: %v", err)
+		}
+		matches, err := service.listMemberThreads(ctx, member.ProjectID, cwd)
+		if err != nil {
+			return err
+		}
+		if len(matches) != 0 {
+			return errors.New("retired member thread still appears under its project")
+		}
+		_, readErr := service.Client.ReadThreadMetadata(ctx, member.Thread, false)
+		if !codex.IsThreadNotFound(readErr, member.Thread) {
+			if readErr == nil {
+				readErr = errors.New("retired member thread still exists")
+			}
+			return fmt.Errorf("verify retired member thread: %w", readErr)
+		}
+	}
+	return service.Client.ClearRetiredThreadAttempts(member.Thread)
 }
 
 // archivedMemberThread finds only the roster's exact archived thread. A
@@ -1904,6 +1990,12 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	envelope := fmt.Sprintf("Team assignment from %s to %s:\n\n%s", from, target.Address, strings.TrimSpace(message))
 	if to != "lead" {
 		envelope += "\n\nSend results or blocking questions to lead with report_to_lead. Use a new message_id for each message; reuse it only to retry that message."
+	}
+	// Team retries always supply their exact options. Compact only accepted
+	// team attempts before SendWithOptions reserves another ledger entry; the
+	// retained digests still bind a same-ID retry to its original request.
+	if err := service.Client.CompactAcceptedSendOptions("team:"); err != nil {
+		return codex.SendReceipt{}, fmt.Errorf("compact accepted team assignments: %w", err)
 	}
 	return service.Client.SendWithOptions(ctx, target.Thread, envelope, messageID, "team:"+slug+":"+from+":"+to, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
 }

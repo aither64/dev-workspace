@@ -24,6 +24,11 @@ type testClient struct {
 	sends              []string
 	messageIDs         []string
 	options            []codex.TurnOptions
+	compactPrefixes    []string
+	compactError       error
+	clearedThreads     []string
+	clearError         error
+	ledgerEvents       []string
 	starts             []codex.ThreadSettings
 	projects           map[string]codex.ProjectMetadata
 	projectCreates     int
@@ -299,7 +304,20 @@ func (client *testClient) SendWithOptions(_ context.Context, thread, text, messa
 	client.sends = append(client.sends, thread+"\n"+text)
 	client.messageIDs = append(client.messageIDs, messageID)
 	client.options = append(client.options, options)
+	client.ledgerEvents = append(client.ledgerEvents, "send")
 	return codex.SendReceipt{TurnID: "turn"}, nil
+}
+
+func (client *testClient) CompactAcceptedSendOptions(prefix string) error {
+	client.compactPrefixes = append(client.compactPrefixes, prefix)
+	client.ledgerEvents = append(client.ledgerEvents, "compact")
+	return client.compactError
+}
+
+func (client *testClient) ClearRetiredThreadAttempts(threadID string) error {
+	client.clearedThreads = append(client.clearedThreads, threadID)
+	client.ledgerEvents = append(client.ledgerEvents, "clear")
+	return client.clearError
 }
 
 func TestStoreUpdateRejectsOversizeForkSnapshotWithoutLosingRoster(t *testing.T) {
@@ -369,6 +387,28 @@ func TestStoreUpdateRejectsOversizeForkSnapshotWithoutLosingRoster(t *testing.T)
 	}
 	if _, err := store.Load("target", "root-target"); err != nil {
 		t.Fatalf("rejected update left unreadable roster: %v", err)
+	}
+}
+
+func TestRosterRejectsMemberThreadSharedWithRootOrAnotherMember(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	roster := Roster{Schema: schema, Workspace: workspace, Slug: "one", RootThreadID: "root-one",
+		Revision: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		Members: []Member{
+			{Address: "architect0", Role: "architect", Thread: "thread-one", State: "ready", AddedAt: time.Now().UTC()},
+			{Address: "reviewer0", Role: "reviewer", Thread: "thread-two", State: "ready", AddedAt: time.Now().UTC()},
+		},
+	}
+	if err := roster.Validate(workspace, "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	roster.Members[1].Thread = "root-one"
+	if err := roster.Validate(workspace, "one", "root-one"); err == nil || !strings.Contains(err.Error(), "root thread") {
+		t.Fatalf("root thread collision = %v", err)
+	}
+	roster.Members[1].Thread = "thread-one"
+	if err := roster.Validate(workspace, "one", "root-one"); err == nil || !strings.Contains(err.Error(), "duplicate member thread") {
+		t.Fatalf("member thread collision = %v", err)
 	}
 }
 
@@ -444,6 +484,41 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	if len(client.sends) != 1 || !strings.Contains(client.sends[0], "report_to_lead") ||
 		!strings.Contains(client.sends[0], "new message_id for each message") || strings.Contains(client.sends[0], "dev-session team assign") {
 		t.Fatalf("assignment report instruction = %#v", client.sends)
+	}
+}
+
+func TestAssignmentCompactsAcceptedTeamOptionsBeforeEachSend(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high"); err != nil {
+		t.Fatal(err)
+	}
+	id := "0123456789abcdef0123456789abcdef"
+	client.compactError = errors.New("ledger unavailable")
+	if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "implementer0", "work", "", "", id); err == nil ||
+		!strings.Contains(err.Error(), "compact accepted team assignments") {
+		t.Fatalf("compaction failure = %v", err)
+	}
+	if len(client.sends) != 0 {
+		t.Fatalf("assignment sent before compaction: %#v", client.sends)
+	}
+	client.compactError = nil
+	for i := 0; i < 2; i++ {
+		if _, err := service.Assign(context.Background(), "one", "root-one", "lead", "implementer0", "work", "", "", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(client.compactPrefixes, []string{"team:", "team:", "team:"}) ||
+		!reflect.DeepEqual(client.ledgerEvents, []string{"compact", "compact", "send", "compact", "send"}) ||
+		!reflect.DeepEqual(client.messageIDs, []string{id, id}) || !reflect.DeepEqual(client.options[0], client.options[1]) {
+		t.Fatalf("retry order and identity: prefixes=%#v events=%#v IDs=%#v options=%#v",
+			client.compactPrefixes, client.ledgerEvents, client.messageIDs, client.options)
 	}
 }
 
@@ -704,8 +779,81 @@ func TestRemoveDeletesOnlyEmptyUnmaterializedMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(client.deleted) != 1 || client.deleted[0] != member.Thread || len(client.archives) != 0 ||
-		roster.Members[0].State != "removed" || roster.Members[0].Thread != member.Thread {
+		roster.Members[0].State != "removed" || roster.Members[0].Thread != member.Thread ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread}) {
 		t.Fatalf("remove recovery = %#v, deleted = %#v, archives = %#v", roster.Members, client.deleted, client.archives)
+	}
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread, member.Thread}) {
+		t.Fatalf("deleted member cleanup retry = %v, cleared %#v", err, client.clearedThreads)
+	}
+}
+
+func TestMemberRemovalRetriesCleanupAfterExactArchive(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{clearError: errors.New("ledger write failed")}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		!strings.Contains(err.Error(), "clear retired") {
+		t.Fatalf("cleanup failure = %v", err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" || !client.archived[member.Thread] ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread}) {
+		t.Fatalf("interrupted removal = %#v, error %v, archived %#v, cleared %#v",
+			roster, err, client.archived, client.clearedThreads)
+	}
+	client.clearError = nil
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatal(err)
+	}
+	roster, err = store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "removed" || len(client.archives) != 1 ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread, member.Thread}) {
+		t.Fatalf("removal retry = %#v, error %v, archives %#v, cleared %#v",
+			roster, err, client.archives, client.clearedThreads)
+	}
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread, member.Thread, member.Thread}) {
+		t.Fatalf("terminal removal retry = %v, cleared %#v", err, client.clearedThreads)
+	}
+	client.archived[member.Thread] = false
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		len(client.clearedThreads) != 3 {
+		t.Fatalf("active retired-thread identity = %v, cleared %#v", err, client.clearedThreads)
+	}
+}
+
+func TestMemberRemovalDoesNotClearAttemptsWithoutArchiveProof(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.hideThreads = true
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		!strings.Contains(err.Error(), "not archived") {
+		t.Fatalf("missing archive proof = %v", err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" || len(client.clearedThreads) != 0 {
+		t.Fatalf("unproved removal = %#v, error %v, cleared %#v", roster, err, client.clearedThreads)
 	}
 }
 
@@ -1037,12 +1185,54 @@ func TestMemberArchiveReconcilesLostAppServerResponse(t *testing.T) {
 	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil {
 		t.Fatalf("lost archive response was not reconciled: %v", err)
 	}
-	if len(client.archives) != 1 {
-		t.Fatalf("archive was repeated: %#v", client.archives)
+	if len(client.archives) != 1 || !reflect.DeepEqual(client.clearedThreads, []string{"thread-1"}) {
+		t.Fatalf("archive was repeated or cleanup missed: archives %#v, cleared %#v", client.archives, client.clearedThreads)
 	}
 	roster, err := store.Load("one", "root-one")
 	if err != nil || roster.Members[0].State != "archived" {
 		t.Fatalf("reconciled roster = %#v, %v", roster, err)
+	}
+}
+
+func TestMemberArchiveRetriesCleanupBeforeTerminalRosterState(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{clearError: errors.New("ledger write failed")}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err == nil ||
+		!strings.Contains(err.Error(), "clear retired") {
+		t.Fatalf("cleanup failure = %v", err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" || !client.archived[member.Thread] {
+		t.Fatalf("interrupted archive = %#v, error %v", roster, err)
+	}
+	client.clearError = nil
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	roster, err = store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "archived" || len(client.archives) != 1 ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread, member.Thread}) {
+		t.Fatalf("archive retry = %#v, error %v, archives %#v, cleared %#v",
+			roster, err, client.archives, client.clearedThreads)
+	}
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err != nil ||
+		!reflect.DeepEqual(client.clearedThreads, []string{member.Thread, member.Thread, member.Thread}) {
+		t.Fatalf("terminal archive retry = %v, cleared %#v", err, client.clearedThreads)
+	}
+	client.archived[member.Thread] = false
+	if err := service.ArchiveAll(context.Background(), "one", "root-one"); err == nil ||
+		len(client.clearedThreads) != 3 {
+		t.Fatalf("active archived-thread identity = %v, cleared %#v", err, client.clearedThreads)
 	}
 }
 

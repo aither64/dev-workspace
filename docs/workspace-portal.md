@@ -192,6 +192,13 @@ Removing a member is permanent for that roster address: archive/revive and
 fork retain it as removed rather than making it active again. Session lifecycle
 operations and team mutations share the runtime lock, so an active lifecycle
 transition rejects an add, removal, configuration change, or assignment.
+Removal clears that member thread's submission attempts only after the exact
+thread is proved archived or deleted. Archiving a session applies the same
+rule to each member before recording its archived roster state. If cleanup or
+the roster write fails, a retry proves retirement again and completes the
+cleanup. The root conversation's operation marker is retained for lifecycle
+recovery. A retry of an already removed or archived member also checks its
+retired identity before clearing attempts left by an older package.
 
 The CLI uses the same record:
 
@@ -279,6 +286,10 @@ Ordinary portal reads leave the thread's persisted instructions alone.
 Assignments reapply the retained policy and use a stable
 message ID for retries. In the CLI, keep the ID shown after an uncertain
 assignment failure and pass it with `--message-id` when retrying.
+Before reserving an assignment, the runtime compacts the original turn options
+of accepted `team:` submissions. Their request digests and accepted receipts
+remain available, so a retry with the same ID and exact text and options keeps
+its identity. Unresolved submissions and other contexts are untouched.
 Retry the same ID within the same installed package generation. A package
 switch can change the retained assignment text or tool path, so an earlier
 uncertain ID may be rejected rather than silently replayed. If that happens,
