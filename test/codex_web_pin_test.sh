@@ -4,9 +4,9 @@ set -euo pipefail
 checker=$1
 jq_bin=$2
 expected=$3
-version=v0.0.0-20260929193321-$expected
 wrong=aaaaaaaaaaaa
-[ "$expected" = "$wrong" ] && wrong=bbbbbbbbbbbb
+wrong_timestamp=v0.0.0-20200101000000-${expected##*-}
+[ "$wrong_timestamp" = "$expected" ] && wrong_timestamp=v0.0.0-20210101000000-${expected##*-}
 fixture_dir=$(mktemp -d)
 trap 'rm -rf "$fixture_dir"' EXIT
 fixture=$fixture_dir/go.mod
@@ -36,21 +36,25 @@ reject() {
   fi
 }
 
-write_fixture "$version" ""
+write_fixture "$expected" ""
 accept
 write_fixture "v0.0.0-20260929190212-$wrong" \
-  "// github.com/aither64/codex-web $version"
+  "// github.com/aither64/codex-web $expected"
 reject
-write_fixture "$version" \
+write_fixture "$wrong_timestamp" ""
+reject
+write_fixture "$expected" \
   "replace github.com/aither64/codex-web => example.com/fork v1.0.0"
 reject
-write_fixture "$version" \
-  "replace github.com/aither64/codex-web $version => example.com/fork v1.0.0"
+write_fixture "$expected" \
+  "replace github.com/aither64/codex-web $expected => example.com/fork v1.0.0"
 reject
-write_fixture "$version" \
+write_fixture "$expected" \
   "replace github.com/aither64/codex-web v0.0.0-20260929190212-$wrong => example.com/fork v1.0.0"
 accept
-write_fixture "$version" "exclude github.com/aither64/codex-web $version"
+write_fixture "$expected" "replace example.com/unrelated => example.com/fork v1.0.0"
+accept
+write_fixture "$expected" "exclude github.com/aither64/codex-web $expected"
 reject
 
 echo "codex-web pin contracts passed"

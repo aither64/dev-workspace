@@ -35,7 +35,7 @@
           src = self;
           codex = llm-agents.packages.${pkgs.system}.codex;
           codexWebSrc = codex-web;
-          codexWebRev = codex-web.rev;
+          codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
           inherit
             activationEnvironmentAliases
             extensions

@@ -6,7 +6,7 @@
   coreutils,
   codex,
   codexWebSrc,
-  codexWebRev,
+  codexWebVersion,
   git,
   gh,
   jq,
@@ -201,7 +201,7 @@ buildGoModule {
   vendorHash = "sha256-XCmaphXVXVvhnV3oU1UnreAw01qEoyBGB1bbb8Y9dSg=";
 
   postPatch = ''
-    expected=${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
+    expected=${lib.escapeShellArg codexWebVersion}
     module_file=portal/go.mod
     [ -f "$module_file" ] || module_file=go.mod
     ${bash}/bin/bash ${src}/nix/check-codex-web-pin.sh \
@@ -238,7 +238,7 @@ buildGoModule {
     mkdir -p "$HOME" "$TMUX_TMPDIR"
     ${bash}/bin/bash ../test/codex_web_pin_test.sh \
       ../nix/check-codex-web-pin.sh ${jq}/bin/jq \
-      ${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
+      ${lib.escapeShellArg codexWebVersion}
     ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
