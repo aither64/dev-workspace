@@ -204,10 +204,8 @@ buildGoModule {
     expected=${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
     module_file=portal/go.mod
     [ -f "$module_file" ] || module_file=go.mod
-    if ! grep -Eq "github.com/aither64/codex-web v0.0.0-[0-9]{14}-$expected" "$module_file"; then
-      echo "portal/go.mod does not pin codex-web revision $expected" >&2
-      exit 1
-    fi
+    ${bash}/bin/bash ${src}/nix/check-codex-web-pin.sh \
+      "$module_file" "$expected" ${jq}/bin/jq
   '';
 
   preBuild = ''
@@ -238,6 +236,9 @@ buildGoModule {
     export TMUX_TMPDIR="$TMPDIR/tmux"
     export DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
     mkdir -p "$HOME" "$TMUX_TMPDIR"
+    ${bash}/bin/bash ../test/codex_web_pin_test.sh \
+      ../nix/check-codex-web-pin.sh ${jq}/bin/jq \
+      ${lib.escapeShellArg (builtins.substring 0 12 codexWebRev)}
     ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
