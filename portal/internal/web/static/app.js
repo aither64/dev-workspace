@@ -275,6 +275,26 @@
     follow: shouldFollowTranscript(container),
     scrollTop: container.scrollTop,
   });
+  const hasTranscriptPagingHelpers = (assets) =>
+    ["createTranscriptHistory", "readTranscriptPage", "transcriptEntryKey"]
+      .every(name => typeof assets[name] === "function");
+  const refreshLegacyTranscriptView = (container, view, follow, render) => {
+    const disclosures = captureTranscriptDisclosureState(container);
+    const previousTop = container.scrollTop;
+    const viewportTop = container.getBoundingClientRect?.().top;
+    const entries = () => [...container.querySelectorAll("[data-transcript-entry-key]")];
+    const anchor = !follow && Number.isFinite(viewportTop) ? entries().find((element) =>
+      element.getBoundingClientRect?.().bottom > viewportTop) : null;
+    const anchorKey = anchor?.dataset.transcriptEntryKey;
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    render(disclosures);
+    const retained = anchorKey && entries().find((element) => element.dataset.transcriptEntryKey === anchorKey);
+    if (follow) container.scrollTop = container.scrollHeight;
+    else if (retained?.getBoundingClientRect && Number.isFinite(anchorTop)) {
+      container.scrollTop = previousTop + retained.getBoundingClientRect().top - anchorTop;
+    } else container.scrollTop = previousTop;
+    view.disclosures = disclosures;
+  };
   const formatElapsed = (elapsedMilliseconds) => {
     const seconds = Math.max(0, Math.floor(Number(elapsedMilliseconds || 0) / 1000));
     if (seconds < 60) return `${seconds}s`;
@@ -889,7 +909,9 @@
       renderCollaborationModes,
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
-      captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
+      captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
+      refreshLegacyTranscriptView,
+      cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
@@ -2557,8 +2579,7 @@
   ) : null;
   let sync = null;
   let transcriptInitialized = false;
-  const pagingHelpersAvailable = ["createTranscriptHistory", "readTranscriptPage", "transcriptEntryKey"]
-    .every(name => typeof conversationAssets[name] === "function");
+  const pagingHelpersAvailable = hasTranscriptPagingHelpers(conversationAssets);
   const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory() : null;
   let pagingUnavailable = !pagingHelpersAvailable;
   let historyRead = null, historyRetryTimer = null, historyError = "";
@@ -3148,7 +3169,8 @@
       currentMode = "";
     }
     if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
-    else renderTranscriptEntries(transcriptEntries, view.disclosures);
+    else refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
+      renderTranscriptEntries(transcriptEntries, disclosures));
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
     const newOutput = document.getElementById("new-output");

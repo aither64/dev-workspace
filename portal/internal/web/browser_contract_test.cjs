@@ -5,7 +5,9 @@ const {pathToFileURL} = require("node:url");
 const {
   currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest,
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
-  captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
+  captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
+  refreshLegacyTranscriptView,
+  cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
@@ -115,6 +117,10 @@ if (!conversationModulePath) throw new Error("browser contract test requires the
 
 (async () => {
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
+assert.equal(hasTranscriptPagingHelpers(conversationAssets), true);
+assert.equal(hasTranscriptPagingHelpers({
+  ...conversationAssets, createTranscriptHistory: undefined,
+}), false);
 configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 const retainedHistory = conversationAssets.createTranscriptHistory();
 const recentReceipt = {turnId: "turn-1", itemId: "recent", kind: "userMessage",
@@ -283,6 +289,33 @@ const transcriptView = captureTranscriptViewState({
 assert.equal(transcriptView.scrollTop, 275);
 assert.equal(transcriptView.follow, false);
 assert.deepEqual(Array.from(transcriptView.disclosures), []);
+const legacyRow = (key, top, open) => ({
+  dataset: {transcriptEntryKey: key},
+  getBoundingClientRect: () => ({top, bottom: top + 40}),
+  querySelector: () => ({open}),
+});
+let legacyRows = [legacyRow("older", -50, false), legacyRow("expanded", 25, true)];
+const legacyContainer = {
+  scrollTop: 180,
+  scrollHeight: 800,
+  getBoundingClientRect: () => ({top: 0}),
+  querySelectorAll: () => legacyRows,
+};
+const legacyView = {disclosures: new Map()};
+refreshLegacyTranscriptView(legacyContainer, legacyView, false, (disclosures) => {
+  assert.deepEqual(Array.from(disclosures), [["older", false], ["expanded", true]]);
+  legacyRows = [legacyRow("new", -30, false), legacyRow("expanded", 75, disclosures.get("expanded"))];
+});
+assert.equal(legacyContainer.scrollTop, 230);
+assert.equal(legacyView.disclosures.get("expanded"), true);
+refreshLegacyTranscriptView(legacyContainer, legacyView, false, () => {
+  legacyRows = [legacyRow("replacement", 0, false)];
+});
+assert.equal(legacyContainer.scrollTop, 230);
+refreshLegacyTranscriptView(legacyContainer, legacyView, true, () => {
+  legacyContainer.scrollHeight = 1000;
+});
+assert.equal(legacyContainer.scrollTop, 1000);
 const filterEntries = [
   {kind: "userMessage", text: "question"},
   {kind: "reasoning", text: "condensed reasoning"},

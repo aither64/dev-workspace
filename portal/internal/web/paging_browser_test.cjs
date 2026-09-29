@@ -5,6 +5,7 @@ const fs = require("node:fs");
 
 const source = fs.readFileSync(require.resolve("./static/app.js"), "utf8");
 assert.match(source, /conversationAssets\.createTranscriptHistory\(\)/);
+assert.match(source, /const pagingHelpersAvailable = hasTranscriptPagingHelpers\(conversationAssets\)/);
 assert.match(source, /conversationAssets\.readTranscriptPage\(client,/);
 assert.match(source, /conversationAssets\.transcriptEntryKey\(entry,/);
 assert.doesNotMatch(source, /const createTranscriptHistory\s*=/);
@@ -14,6 +15,7 @@ const historyRead = source.slice(source.indexOf("const runHistoryRead = async"),
   source.indexOf("const scheduleHistoryRepair =", source.indexOf("const runHistoryRead = async")));
 assert.match(historyRead, /const readVersion = transcriptHistory\.repairVersion/);
 assert.equal((historyRead.match(/readVersion !== transcriptHistory\.repairVersion/g) || []).length, 2);
+assert.match(source, /else refreshLegacyTranscriptView\(transcript, view, follow,/);
 assert.match(source, /renderMessageReceipts\(\)/);
 assert.match(source, /observePageReceipts\(transcriptEntries, currentThreadId\)/);
 assert.match(source, /sendAcknowledgementCandidates\(transcriptEntries,/);
