@@ -574,3 +574,28 @@ func TestTeamRequireArchivedAcceptsRootOnlySession(t *testing.T) {
 		t.Fatalf("root-only archive preflight: %v", err)
 	}
 }
+
+func TestTeamRetainedArchiveRequiresTrustedAuthorityAndAcceptsRootOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DEV_WORKSPACE_CODEX_HOME", home)
+	workspace := t.TempDir()
+	cwd := filepath.Join(workspace, "work", "example")
+	args := []string{
+		"archive", "--retained-only", "--user-state-root", t.TempDir(), "--workspace", workspace,
+		"--session-slug", "example", "--root-thread-id", "11111111-1111-7111-8111-111111111111",
+		"--cwd", cwd, "--socket", filepath.Join(t.TempDir(), "app-server.sock"),
+		"--authority-dir", t.TempDir(), "--codex-home", home,
+	}
+	if err := teamCommand(args); err != nil {
+		t.Fatalf("root-only retained archive: %v", err)
+	}
+	wrong := append([]string(nil), args...)
+	wrong[len(wrong)-1] = filepath.Join(home, "other")
+	if err := teamCommand(wrong); err == nil || !strings.Contains(err.Error(), "session authority") {
+		t.Fatalf("untrusted retained archive passed: %v", err)
+	}
+	wrong[0] = "require-idle"
+	if err := teamCommand(wrong); err == nil || !strings.Contains(err.Error(), "only valid") {
+		t.Fatalf("retained-only nonarchive command passed: %v", err)
+	}
+}

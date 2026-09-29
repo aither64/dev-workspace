@@ -130,9 +130,9 @@ updates; the candidate entry does not rewrite saved team rosters or creation
 journals.
 
 An archive journal paused at `tracking_committed` can block that switch when
-the selected package cannot prove a conversation that Codex has already moved
-out of normal history discovery. Recover only that recorded operation with the
-candidate package:
+the selected package cannot prove an archived conversation or when part of a
+retained team was archived before its roster update completed. Recover only
+that recorded operation with the candidate package:
 
 ```sh
 nix run .#workspace-host -- recover-archive \
@@ -141,11 +141,14 @@ nix run .#workspace-host -- recover-archive \
 
 This command is not a general lifecycle override. It accepts only an exact
 archive journal at `tracking_committed`, keeps the selected profile and Codex
-generation unchanged, proves the retained root and member conversations from
-their exact metadata and archived rollout headers, and invokes the selected
-package's private lifecycle executor with only the portal helper replaced by
-the candidate helper. A failed proof or lifecycle retry leaves the journal in
-place.
+generation unchanged, and verifies the committed archive tracking while holding
+the normal session locks. It first proves the retained root. It then reconciles
+already archived team members and archives only retained, materialized active
+members that pass the normal idle and submission checks. A final exact proof
+must cover every member before the command invokes the selected package's
+private lifecycle executor with only the portal helper replaced by the candidate
+helper. A failed retry leaves the journal in place. Members completed before an
+interruption remain archived and are rechecked on the next retry.
 
 ## Extension catalog
 

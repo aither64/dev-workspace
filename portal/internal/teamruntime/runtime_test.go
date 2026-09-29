@@ -44,6 +44,8 @@ type testClient struct {
 	forkSettings       []codex.ThreadSettings
 	threads            []codex.ThreadMetadata
 	unmaterialized     map[string]bool
+	materializedChecks map[string]int
+	disappearOnCheck   map[string]int
 	bootstrapCalls     []string
 	bootstrapError     error
 	deleted            []string
@@ -201,6 +203,14 @@ func (client *testClient) ProveArchivedThread(_ context.Context, threadID, cwd, 
 	}
 	return workspacecodex.ArchiveUnknown, &codex.ThreadNotFoundError{ThreadID: threadID}
 }
+func (client *testClient) ProveMaterializedActiveThread(_ context.Context, threadID, cwd string) (workspacecodex.ArchiveState, error) {
+	for _, thread := range client.threads {
+		if thread.ID == threadID && thread.Cwd == cwd && !client.archived[threadID] && !client.unmaterialized[threadID] {
+			return workspacecodex.ArchiveActive, nil
+		}
+	}
+	return workspacecodex.ArchiveUnknown, errors.New("legacy retained member is not materialized")
+}
 func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
 	client.resumes = append(client.resumes, settings)
 	return thread, nil
@@ -278,6 +288,15 @@ func (client *testClient) SetName(context.Context, string, string) error {
 	return nil
 }
 func (client *testClient) HeadlessThreadMaterialized(_ context.Context, thread, _, _ string) (bool, error) {
+	if client.disappearOnCheck != nil {
+		if client.materializedChecks == nil {
+			client.materializedChecks = make(map[string]int)
+		}
+		client.materializedChecks[thread]++
+		if at := client.disappearOnCheck[thread]; at > 0 && client.materializedChecks[thread] >= at {
+			return false, nil
+		}
+	}
 	for _, item := range client.threads {
 		if item.ID == thread {
 			return !client.unmaterialized[thread], nil
@@ -787,6 +806,166 @@ func TestArchiveReplacesUnmaterializedMemberBeforeArchiving(t *testing.T) {
 		len(client.archives) != 1 || client.archives[0] == member.Thread ||
 		roster.Members[0].Thread != client.archives[0] || roster.Members[0].State != "archived" {
 		t.Fatalf("archive recovery = %#v, deleted = %#v, archives = %#v", roster.Members, client.deleted, client.archives)
+	}
+}
+
+func TestArchiveRetainedAllCompletesMixedAndArchivedReadyRoster(t *testing.T) {
+	for _, allArchived := range []bool{false, true} {
+		workspace := filepath.Join(t.TempDir(), "workspace")
+		store, err := NewStore(t.TempDir(), workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &testClient{}
+		service := Service{Store: store, Client: client, Workspace: workspace}
+		cwd := filepath.Join(workspace, "work", "one")
+		var members []Member
+		for _, role := range []string{"architect", "implementer", "reviewer"} {
+			member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, role, "gpt-6-sol", "high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			members = append(members, member)
+		}
+		client.archived = map[string]bool{members[0].Thread: true}
+		if allArchived {
+			for _, member := range members {
+				client.archived[member.Thread] = true
+			}
+		}
+		client.hideThreads = true
+		listedBefore := client.listCalls
+		if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err != nil {
+			t.Fatal(err)
+		}
+		roster, err := store.Load("one", "root-one")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, member := range roster.Members {
+			if member.State != "archived" || member.Thread != members[i].Thread || member.ProjectID != members[i].ProjectID {
+				t.Fatalf("retained identity changed: %#v", member)
+			}
+		}
+		wantArchives := []string{members[1].Thread, members[2].Thread}
+		if allArchived {
+			wantArchives = nil
+		}
+		if !reflect.DeepEqual(client.archives, wantArchives) || len(client.starts) != 3 ||
+			len(client.resumes) != 0 || len(client.deleted) != 0 || client.listCalls != listedBefore {
+			t.Fatalf("retained archive side effects: archives=%#v starts=%d resumes=%d deleted=%d lists=%d",
+				client.archives, len(client.starts), len(client.resumes), len(client.deleted), client.listCalls)
+		}
+		if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err != nil || len(client.archives) != len(wantArchives) {
+			t.Fatalf("retained archive retry: %v archives=%#v", err, client.archives)
+		}
+	}
+}
+
+func TestArchiveRetainedAllPrevalidatesBeforeMutation(t *testing.T) {
+	for _, failure := range []string{"unmaterialized", "identity", "attempts", "busy", "intent"} {
+		t.Run(failure, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &testClient{}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			cwd := filepath.Join(workspace, "work", "one")
+			first, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "architect", "gpt-6-sol", "high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch failure {
+			case "unmaterialized":
+				client.unmaterialized = map[string]bool{second.Thread: true}
+			case "identity":
+				client.threads[1].Cwd = filepath.Join(workspace, "work", "other")
+			case "attempts":
+				client.archived = map[string]bool{second.Thread: true}
+				client.unresolvedAttempts = map[string]bool{second.Thread: true}
+			case "busy":
+				client.idleError = errors.New("busy")
+			case "intent":
+				_, err = store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+					roster.Members[1].RetireIntent = "replace"
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("invalid retained roster passed")
+			}
+			roster, err := store.Load("one", "root-one")
+			if err != nil || roster.Members[0].State != "ready" || roster.Members[0].Thread != first.Thread ||
+				len(client.archives) != 0 || len(client.deleted) != 0 || len(client.resumes) != 0 {
+				t.Fatalf("prevalidation mutated first member: roster=%#v err=%v archives=%#v", roster, err, client.archives)
+			}
+		})
+	}
+}
+
+func TestArchiveRetainedAllRetriesAfterLostResponseAndCleanupFailure(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.archiveResultError = errors.New("lost archive response")
+	client.clearError = errors.New("cleanup interrupted")
+	if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("interrupted cleanup passed")
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "ready" || !client.archived[member.Thread] || len(client.archives) != 1 {
+		t.Fatalf("interrupted retained archive = %#v, %v, %#v", roster, err, client.archives)
+	}
+	client.clearError = nil
+	if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	roster, err = store.Load("one", "root-one")
+	if err != nil || roster.Members[0].State != "archived" || roster.Members[0].Thread != member.Thread ||
+		len(client.archives) != 1 {
+		t.Fatalf("retained retry = %#v, %v, %#v", roster, err, client.archives)
+	}
+}
+
+func TestArchiveRetainedAllRefusesMaterializationLostBeforeArchive(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.materializedChecks = nil
+	client.disappearOnCheck = map[string]int{member.Thread: 3}
+	if err := service.ArchiveRetainedAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("retained member disappeared before archive")
+	}
+	if len(client.archives) != 0 || len(client.deleted) != 0 || len(client.resumes) != 0 || len(client.starts) != 1 {
+		t.Fatalf("disappearance activated fresh recovery: archives=%#v deleted=%#v starts=%d",
+			client.archives, client.deleted, len(client.starts))
 	}
 }
 

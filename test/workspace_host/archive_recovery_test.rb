@@ -3,8 +3,25 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_workspace_host_loads_dev_session_only_for_archive_recovery
+    script = <<~RUBY
+      load ARGV.fetch(0)
+      abort 'dev-session loaded eagerly' if defined?(DevSession::Runner)
+      begin
+        DevWorkspaceHost::Host.allocate.send(:with_verified_archive_recovery, {}, 'example', {}, {}, {})
+      rescue KeyError
+      end
+      abort 'dev-session was not loaded for recovery' unless defined?(DevSession::Runner)
+    RUBY
+    host_path = File.expand_path('../../libexec/workspace-host', __dir__)
+    output, error, status = Open3.capture3(RbConfig.ruby, '-e', script, host_path)
+    assert(status.success?, "#{output}#{error}")
+  end
+
   module RecoveryBehavior
     attr_accessor :recovery_journal, :fail_recovery_preflight, :fail_recovery_executor,
+                  :fail_recovery_team, :fail_recovery_verifier,
+                  :fail_recovery_final_proof,
                   :change_profile_before_lock
 
     private
@@ -23,12 +40,28 @@ class WorkspaceHostTest < Minitest::Test
     end
 
     def capture_env!(environment, *argv)
+      if argv.include?('--retained-only')
+        events << [:archive_team, environment, argv]
+        raise DevWorkspaceHost::Error, 'injected retained team failure' if fail_recovery_team
+
+        return ''
+      end
       return super unless argv.include?('require-archived')
 
       events << [:archive_preflight, environment, argv]
+      if fail_recovery_final_proof && events.count { |event| event.first == :archive_preflight } == 2
+        raise DevWorkspaceHost::Error, 'injected final archive proof failure'
+      end
       raise DevWorkspaceHost::Error, 'injected archive proof failure' if fail_recovery_preflight
 
       ''
+    end
+
+    def with_verified_archive_recovery(_entry, _slug, _journal, _runtime, _environment)
+      events << [:archive_tracking_verified]
+      raise DevWorkspaceHost::Error, 'injected tracking failure' if fail_recovery_verifier
+
+      yield
     end
 
     def system_env_interactive!(environment, command, *arguments)
@@ -43,6 +76,8 @@ class WorkspaceHostTest < Minitest::Test
     with_recovery_host do |host, paths|
       creation_before = File.binread(paths.fetch(:creation))
       assert_equal(0, recover_archive(host, paths))
+      assert_equal(%i[archive_tracking_verified archive_preflight archive_team archive_preflight archive_executor],
+                   host.events.map(&:first).reject { |event| event == :codex_checked })
       preflights = host.events.select { |event| event.first == :archive_preflight }
       assert_equal(%w[thread team], preflights.map { |event| event.fetch(2).fetch(1) })
       assert(preflights.all? { |event| event.fetch(1).fetch('DEV_WORKSPACE_CODEX_HOME') == paths.fetch(:codex_home) })
@@ -231,6 +266,36 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_recover_archive_keeps_journal_when_verifier_or_team_fails
+    with_recovery_host do |host, paths|
+      %i[fail_recovery_verifier fail_recovery_team].each do |failure|
+        host.public_send("#{failure}=", true)
+        host.events.clear
+        assert_equal(1, recover_archive(host, paths), failure)
+        assert(File.file?(paths.fetch(:journal)), failure)
+        assert_equal(paths.fetch(:predecessor), File.realpath(host.instance_variable_get(:@profile)), failure)
+        refute(host.events.any? { |event| event.first == :archive_executor }, failure)
+        host.public_send("#{failure}=", false)
+      end
+      host.events.clear
+      assert_equal(0, recover_archive(host, paths))
+    end
+  end
+
+  def test_recover_archive_final_team_proof_blocks_executor
+    with_recovery_host do |host, paths|
+      host.fail_recovery_final_proof = true
+      assert_equal(1, recover_archive(host, paths))
+      assert_equal(%i[archive_tracking_verified archive_preflight archive_team archive_preflight],
+                   host.events.map(&:first).reject { |event| event == :codex_checked })
+      assert(File.file?(paths.fetch(:journal)))
+      assert_equal(paths.fetch(:predecessor), File.realpath(host.instance_variable_get(:@profile)))
+      host.fail_recovery_final_proof = false
+      host.events.clear
+      assert_equal(0, recover_archive(host, paths))
+    end
+  end
+
   def test_recover_archive_preserves_existing_abandoned_mode_without_force
     with_recovery_host do |host, paths|
       journal = JSON.parse(File.read(paths.fetch(:journal)))
@@ -262,7 +327,7 @@ class WorkspaceHostTest < Minitest::Test
   def assert_recovery_refused_before_proof(host, paths, failure)
     journal_before = File.binread(paths.fetch(:journal))
     assert_equal(1, recover_archive(host, paths), failure)
-    refute(host.events.any? { |event| %i[archive_preflight archive_executor].include?(event.first) }, failure)
+    refute(host.events.any? { |event| %i[archive_preflight archive_team archive_executor].include?(event.first) }, failure)
     assert_equal(journal_before, File.binread(paths.fetch(:journal)), failure)
     assert_equal(paths.fetch(:predecessor), File.realpath(host.instance_variable_get(:@profile)), failure)
   end

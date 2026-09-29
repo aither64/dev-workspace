@@ -109,6 +109,25 @@ func TestProveArchivedThreadKeepsNonarchivedAndUnknownDistinct(t *testing.T) {
 	}
 }
 
+func TestProveMaterializedActiveThreadRequiresRolloutFile(t *testing.T) {
+	identity, reader, path := archiveProofFixture(t)
+	active := filepath.Join(identity.CodexHome, "sessions", filepath.Base(path))
+	if err := os.MkdirAll(filepath.Dir(active), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reader.metadata.Path = &active
+	identity.RequireActiveFile = true
+	if state, err := ProveArchivedThread(context.Background(), reader, identity); err == nil || state != ArchiveUnknown {
+		t.Fatalf("missing active rollout passed: %v, %v", state, err)
+	}
+	if err := os.WriteFile(active, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := ProveArchivedThread(context.Background(), reader, identity); err != nil || state != ArchiveActive {
+		t.Fatalf("materialized active rollout refused: %v, %v", state, err)
+	}
+}
+
 func TestProveArchivedThreadRejectsConflictingEvidence(t *testing.T) {
 	cases := []struct {
 		name   string

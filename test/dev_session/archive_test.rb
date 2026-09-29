@@ -502,6 +502,42 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_committed_archive_verifier_is_read_only_and_rejects_dirty_tree
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      slug = '2026-06-06-archive-verifier'
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:retire_portal_thread!) do |*_arguments, **_options|
+          raise DevSession::Error, 'injected retirement failure'
+        end
+      end
+      runner = runner_class.new(
+        workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+      )
+      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+      journal_path = runner.send(:lifecycle_journal_file, slug, 'archive')
+      journal = JSON.parse(File.read(journal_path))
+      assert_equal('tracking_committed', journal.fetch('phase'))
+      before = File.binread(journal_path)
+      reached = false
+      runner.with_verified_committed_archive(slug, journal) { reached = true }
+      assert(reached)
+      assert_equal(before, File.binread(journal_path))
+      File.open(File.join(workspace, 'archive', slug, 'plan.md'), 'a') { |file| file.write("\nDirty.\n") }
+      assert_raises(DevSession::Error) do
+        runner.with_verified_committed_archive(slug, journal) { flunk('dirty archive passed verifier') }
+      end
+      assert_equal(before, File.binread(journal_path))
+    end
+  end
+
   def test_archive_retry_reproves_the_retained_feature_branch
     skip 'git is not available' unless command_available?('git')
 

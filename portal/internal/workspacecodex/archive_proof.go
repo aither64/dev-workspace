@@ -33,11 +33,12 @@ const (
 )
 
 type ArchivedThreadIdentity struct {
-	ThreadID   string
-	Cwd        string
-	ProjectID  string
-	CodexHome  string
-	SourceKind string
+	ThreadID          string
+	Cwd               string
+	ProjectID         string
+	CodexHome         string
+	SourceKind        string
+	RequireActiveFile bool
 }
 
 type ThreadMetadataReader interface {
@@ -76,8 +77,19 @@ func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expec
 		if err != nil || resolvedParent != filepath.Dir(path) {
 			return ArchiveUnknown, errors.New("active rollout directory is not canonical")
 		}
-		if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() || err != nil && !errors.Is(err, os.ErrNotExist) {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) && expected.RequireActiveFile {
+			return ArchiveUnknown, errors.New("active rollout is not materialized")
+		}
+		if err == nil && !info.Mode().IsRegular() || err != nil && !errors.Is(err, os.ErrNotExist) {
 			return ArchiveUnknown, errors.New("active rollout has an invalid file identity")
+		}
+		if expected.RequireActiveFile {
+			again, readErr := reader.ReadThreadMetadata(ctx, expected.ThreadID, false)
+			current, statErr := os.Lstat(path)
+			if readErr != nil || !reflect.DeepEqual(metadata, again) || statErr != nil || !os.SameFile(info, current) {
+				return ArchiveUnknown, errors.New("active rollout changed during materialization proof")
+			}
 		}
 		return ArchiveActive, nil
 	}
@@ -135,19 +147,24 @@ func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expec
 }
 
 func (c *Client) ProveArchivedThread(ctx context.Context, threadID, cwd, projectID string) (ArchiveState, error) {
-	return c.proveArchivedThread(ctx, threadID, cwd, projectID, "")
+	return c.proveArchivedThread(ctx, threadID, cwd, projectID, "", false)
 }
 
 func (c *Client) ProveArchivedRootThread(ctx context.Context, threadID, cwd string) (ArchiveState, error) {
-	return c.proveArchivedThread(ctx, threadID, cwd, "", threadSourceKind)
+	return c.proveArchivedThread(ctx, threadID, cwd, "", threadSourceKind, false)
 }
 
-func (c *Client) proveArchivedThread(ctx context.Context, threadID, cwd, projectID, sourceKind string) (ArchiveState, error) {
+func (c *Client) ProveMaterializedActiveThread(ctx context.Context, threadID, cwd string) (ArchiveState, error) {
+	return c.proveArchivedThread(ctx, threadID, cwd, "", "", true)
+}
+
+func (c *Client) proveArchivedThread(ctx context.Context, threadID, cwd, projectID, sourceKind string, requireActiveFile bool) (ArchiveState, error) {
 	if c.archiveProof != nil {
 		return c.archiveProof(ctx, threadID, cwd, projectID)
 	}
 	return ProveArchivedThread(ctx, c.Client, ArchivedThreadIdentity{
 		ThreadID: threadID, Cwd: cwd, ProjectID: projectID, CodexHome: c.CodexHome, SourceKind: sourceKind,
+		RequireActiveFile: requireActiveFile,
 	})
 }
 

@@ -739,6 +739,7 @@ type Client interface {
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error)
+	ProveMaterializedActiveThread(context.Context, string, string) (workspacecodex.ArchiveState, error)
 	ResumeThreadWithSettings(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ForkThread(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ArchiveThread(context.Context, string) error
@@ -1591,7 +1592,16 @@ func (service Service) ArchiveAll(ctx context.Context, slug, rootThreadID string
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
-		return service.archiveAllLocked(ctx, slug, rootThreadID, false)
+		return service.archiveAllLocked(ctx, slug, rootThreadID, false, false)
+	})
+}
+
+func (service Service) ArchiveRetainedAll(ctx context.Context, slug, rootThreadID string) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		return service.archiveAllLocked(ctx, slug, rootThreadID, false, true)
 	})
 }
 
@@ -1604,11 +1614,11 @@ func (service Service) RetireAll(ctx context.Context, slug, rootThreadID string)
 	bounded, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	return service.Store.withOperationLock(bounded, slug, func() error {
-		return service.archiveAllLocked(bounded, slug, rootThreadID, true)
+		return service.archiveAllLocked(bounded, slug, rootThreadID, true, false)
 	})
 }
 
-func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID string, force bool) error {
+func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID string, force, retainedOnly bool) error {
 	roster, err := service.Store.Load(slug, rootThreadID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1617,36 +1627,57 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		return err
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
-	for _, member := range roster.Members {
-		if member.State != "ready" || member.ProjectID == "" {
-			continue
-		}
-		if member.RetireIntent == "remove" {
-			return fmt.Errorf("member %s removal is pending", member.Address)
-		}
-		archived, err := service.archivedMemberThread(ctx, member, cwd)
-		if err != nil {
-			return fmt.Errorf("inspect archived member %s before recovery: %w", member.Address, err)
-		}
-		if archived {
-			continue
-		}
-		materialized := false
-		if member.RetireIntent != "replace" {
-			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
-			if err != nil {
-				return fmt.Errorf("inspect %s before archive: %w", member.Address, err)
+	if retainedOnly {
+		for _, member := range roster.Members {
+			if member.State == "removed" {
+				continue
+			}
+			if member.State == "archived" {
+				if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+					return fmt.Errorf("verify retired %s: %w", member.Address, err)
+				}
+				if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+					return fmt.Errorf("retired %s has unresolved attempts: %w", member.Address, err)
+				}
+				continue
+			}
+			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+				return fmt.Errorf("verify retained %s: %w", member.Address, err)
 			}
 		}
-		if materialized {
-			continue
-		}
-		if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, member); err != nil {
-			return fmt.Errorf("recover %s before archive: %w", member.Address, err)
-		}
-		if _, err := service.retryCreatingLocked(ctx, slug, rootThreadID, cwd,
-			map[string]string{"DEV_SESSION_SLUG": slug, "DEV_SESSION_WORKSPACE": service.Store.workspace, "DEV_SESSION_WORK_DIR": cwd}, member.Address); err != nil {
-			return fmt.Errorf("recreate %s before archive: %w", member.Address, err)
+	}
+	if !retainedOnly {
+		for _, member := range roster.Members {
+			if member.State != "ready" || member.ProjectID == "" {
+				continue
+			}
+			if member.RetireIntent == "remove" {
+				return fmt.Errorf("member %s removal is pending", member.Address)
+			}
+			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			if err != nil {
+				return fmt.Errorf("inspect archived member %s before recovery: %w", member.Address, err)
+			}
+			if archived {
+				continue
+			}
+			materialized := false
+			if member.RetireIntent != "replace" {
+				materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+				if err != nil {
+					return fmt.Errorf("inspect %s before archive: %w", member.Address, err)
+				}
+			}
+			if materialized {
+				continue
+			}
+			if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, member); err != nil {
+				return fmt.Errorf("recover %s before archive: %w", member.Address, err)
+			}
+			if _, err := service.retryCreatingLocked(ctx, slug, rootThreadID, cwd,
+				map[string]string{"DEV_SESSION_SLUG": slug, "DEV_SESSION_WORKSPACE": service.Store.workspace, "DEV_SESSION_WORK_DIR": cwd}, member.Address); err != nil {
+				return fmt.Errorf("recreate %s before archive: %w", member.Address, err)
+			}
 		}
 	}
 	roster, err = service.Store.Load(slug, rootThreadID)
@@ -1671,6 +1702,11 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
 		archivedMembers[member.Address] = archived
+		if retainedOnly && !archived {
+			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+				return fmt.Errorf("recheck retained %s: %w", member.Address, err)
+			}
+		}
 		if force && !archived {
 			if err := service.Client.VerifyThread(ctx, member.Thread, cwd); err != nil {
 				return fmt.Errorf("verify member %s thread: %w", member.Address, err)
@@ -1708,6 +1744,13 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 				}
 			}
 		}
+		if retainedOnly && !archivedMembers[member.Address] {
+			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			if err != nil {
+				return fmt.Errorf("recheck retained %s before archive: %w", member.Address, err)
+			}
+			archivedMembers[member.Address] = archived
+		}
 		if !archivedMembers[member.Address] {
 			if err := service.archiveMemberThread(ctx, member, cwd); err != nil {
 				return fmt.Errorf("archive %s: %w", member.Address, err)
@@ -1729,6 +1772,41 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		}
 	}
 	return nil
+}
+
+func (service Service) retainedMemberArchiveState(ctx context.Context, member Member, cwd string) (bool, error) {
+	if member.Thread == "" || member.RetireIntent != "" ||
+		(member.State != "ready" && member.State != "archived") {
+		return false, errors.New("member has no stable retained thread identity")
+	}
+	state, err := service.Client.ProveArchivedThread(ctx, member.Thread, cwd, member.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	if member.State == "archived" {
+		if state != workspacecodex.ArchiveArchived {
+			return false, errors.New("retired member is not archived")
+		}
+		return true, nil
+	}
+	if state == workspacecodex.ArchiveArchived {
+		return true, nil
+	}
+	if state != workspacecodex.ArchiveActive {
+		return false, errors.New("retained member is not a materialized active thread")
+	}
+	if member.ProjectID != "" {
+		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+		if err != nil || !materialized {
+			return false, fmt.Errorf("retained member is not materialized: %v", err)
+		}
+	} else {
+		active, err := service.Client.ProveMaterializedActiveThread(ctx, member.Thread, cwd)
+		if err != nil || active != workspacecodex.ArchiveActive {
+			return false, fmt.Errorf("legacy retained member is not materialized: %v", err)
+		}
+	}
+	return false, nil
 }
 
 // archiveMemberThread proves the exact roster thread reached archived history,

@@ -1697,6 +1697,20 @@ module DevSession
       end
     end
 
+    def with_verified_committed_archive(slug, expected_journal)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
+          journal = load_archive_journal(slug, operation_id: expected_journal.fetch('operation_id'))
+          unless journal == expected_journal && journal&.fetch('phase') == 'tracking_committed'
+            raise Error, "archive recovery journal changed: #{slug}"
+          end
+          verify_committed_archive_tracking!(slug, journal)
+          yield
+        end
+      end
+    end
+
     def revive(input, as_is:, allow_abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)

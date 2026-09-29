@@ -624,9 +624,9 @@ when retrying an empty-session archive, matching its recorded abandoned mode.
 Manual retries use the same journal checks and retirement deadline. Finish pending
 operations before switching packages; do not remove their journals to unblock activation.
 
-If the selected package cannot complete that retry because Codex has already
-archived a retained thread but omits it from directory-filtered history, use a
-newer candidate package's narrow host recovery entry:
+If the selected package cannot complete that retry because it cannot prove an
+archived retained thread, or because only part of a retained team reached
+archived state, use a newer candidate package's narrow host recovery entry:
 
 ```sh
 nix run .#workspace-host -- recover-archive \
@@ -634,10 +634,14 @@ nix run .#workspace-host -- recover-archive \
 ```
 
 The candidate must match `--source` and the selected runtime contract. The
-entry accepts only the existing `tracking_committed` archive journal, proves
-the retained root and member threads without changing the profile, and lets
-the selected package's lifecycle executor finish the journal. It cannot force
-an archive, change its recorded mode, or recover another lifecycle operation.
+entry accepts only the existing `tracking_committed` archive journal and keeps
+the selected profile unchanged. Under the journal's normal locks, it verifies
+the committed tracking, proves the retained root, and reconciles the retained
+team. It archives only materialized active members that pass the ordinary idle
+and submission checks, then proves every member archived before the selected
+package's lifecycle executor finishes the journal. It cannot force an archive,
+replace or recreate a member, change the recorded mode, or recover another
+lifecycle operation. A retry rechecks work completed before an interruption.
 
 The journal binds the exact projected archive tree and retained Codex thread;
 retry refuses changed lifecycle, manifest, artifacts, or conversation identity
