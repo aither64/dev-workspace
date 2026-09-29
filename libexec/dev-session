@@ -1619,7 +1619,7 @@ module DevSession
             validate_tracking_committed!(slug)
             plan = prepare_cleanup(slug, force: false)
             proven_heads = mode == 'complete' ? prove_registered_branches_merged!(slug, plan) : {}
-            ensure_portal_thread_idle!(slug, @selected_authority)
+            ensure_portal_thread_idle!(slug, @selected_authority) unless automatic
             validate_development_cluster_helpers!
             validate_archive_move_command!
             archive_root = File.join(workspace, 'archive')
@@ -1628,6 +1628,7 @@ module DevSession
               raise Error, 'work and archive directories must be on the same filesystem'
             end
             validate_tracking_transition_commit!(slug)
+            sync_team_lifecycle!(slug, 'require-idle') if automatic
             automatic&.call(nil)
             journal = prepare_archive_journal!(
               slug, mode, proven_heads, plan, operation_id:
@@ -5703,7 +5704,7 @@ module DevSession
     def release_development_clusters!(slug, operation:)
       validate_development_cluster_helpers!
       lock = @held_slug_lock
-      unless lock && lock.fetch(:slug) == slug
+      unless lock && lock.fetch(:slug) == slug && lock.fetch(:mode) == File::LOCK_EX
         raise Error, "development session lock is not held for #{slug}"
       end
       lock_file = lock.fetch(:file)
@@ -6757,7 +6758,8 @@ module DevSession
       ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
-    def with_host_lock(path, description, wait: false, busy_message: nil)
+    def with_host_lock(path, description, wait: false, busy_message: nil, mode: File::LOCK_EX)
+      raise Error, "invalid #{description} mode" unless [File::LOCK_SH, File::LOCK_EX].include?(mode)
       reject_symlink_components!(path, description)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |file|
         stat = file.stat
@@ -6767,8 +6769,8 @@ module DevSession
                (stat.mode & 0o777) == 0o600
           raise Error, "#{description} must be a uid #{Process.euid} mode-0600 file: #{path}"
         end
-        locked = file.flock(File::LOCK_EX | File::LOCK_NB)
-        locked = file.flock(File::LOCK_EX) if !locked && wait
+        locked = file.flock(mode | File::LOCK_NB)
+        locked = file.flock(mode) if !locked && wait
         unless locked
           raise Error, busy_message || "cannot lock #{description}: #{path}"
         end
@@ -6815,11 +6817,22 @@ module DevSession
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|
         previous = @held_slug_lock
-        @held_slug_lock = { slug:, path:, file: }
+        @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
         block.call
       ensure
         @held_slug_lock = previous
       end
+    end
+
+    def with_slug_observation_lock(slug, &block)
+      path = session_lock_file(slug)
+      with_host_lock(
+        path,
+        "development session observation lock for #{slug}",
+        busy_message: "another dev-session command is changing #{slug}",
+        mode: File::LOCK_SH,
+        &block
+      )
     end
 
     def path_exists?(path)

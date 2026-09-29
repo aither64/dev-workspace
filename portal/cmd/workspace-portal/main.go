@@ -562,7 +562,7 @@ func teamCommand(args []string) error {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|require-materialized|require-idle|retire")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|observe|activity|require-materialized|require-idle|retire")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -604,6 +604,15 @@ func threadCommand(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	switch command {
+	case "observe":
+		if *threadID == "" || *cwd == "" {
+			return errors.New("thread observe requires --thread-id and --cwd")
+		}
+		observation, err := client.ObserveThread(ctx, *threadID, *cwd)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(observation)
 	case "activity":
 		if *threadID == "" || *cwd == "" {
 			return errors.New("thread activity requires --thread-id and --cwd")

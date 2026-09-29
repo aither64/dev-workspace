@@ -232,7 +232,7 @@ module WorkspaceAutoArchive
         return result
       end
       observation.call do
-        with_slug_lock(slug) do
+        with_slug_observation_lock(slug) do
           select_tmux_for_slug!(slug)
           result = auto_archive_observe(slug, persist: !dry_run)
         end
@@ -336,16 +336,28 @@ module WorkspaceAutoArchive
 
     def auto_archive_observe(slug, persist:)
       snapshot = auto_archive_snapshot(slug)
+      read = lambda do
+        Policy.observe(auto_archive_store.session(slug), snapshot, auto_archive_store.policy, Time.now)
+      end
+      initial = persist ? auto_archive_store.lock(&read) : read.call
+      proof_error = nil
+      if initial['eligible']
+        begin
+          plan = prepare_cleanup(slug, force: false)
+          prove_registered_branches_merged!(slug, plan) unless initial['tier'] == 'empty'
+        rescue StandardError => e
+          proof_error = e
+        end
+      end
       observe = lambda do
-        state = Policy.observe(auto_archive_store.session(slug), snapshot, auto_archive_store.policy, Time.now)
-        if state['eligible']
-          begin
-            plan = prepare_cleanup(slug, force: false)
-            prove_registered_branches_merged!(slug, plan) unless state['tier'] == 'empty'
-          rescue StandardError => e
-            state['eligible'] = false
-            state['blockers'] << e.message
-          end
+        state = read.call
+        if state['eligible'] && !initial['eligible']
+          state['eligible'] = false
+          state['blockers'] << 'Automatic archive eligibility changed during observation.'
+        elsif state['eligible'] && proof_error
+          state['eligible'] = false
+          state['blockers'] << proof_error.message
+          state['reset_at'] = Time.now.utc.iso8601
         end
         auto_archive_store.write("session-#{slug}", state) if persist
         state
@@ -365,13 +377,17 @@ module WorkspaceAutoArchive
       end
       raise Error, 'Conversation activity reader is unavailable.' unless @portal_command && @codex_socket
       output, = @command_runner.capture([
-        *@portal_command, 'thread', 'activity', '--thread-id', thread,
+        *@portal_command, 'thread', 'observe', '--thread-id', thread,
         '--cwd', work_dir(slug), '--socket', @codex_socket
       ])
       activity = JSON.parse(output)
       unless activity['threadId'] == thread && activity['cwd'] == work_dir(slug) &&
              activity['updatedAt'].is_a?(Integer) && activity['updatedAt'].positive? &&
-             activity['updatedAt'] <= Time.now.to_i + 60
+             activity['updatedAt'] <= Time.now.to_i + 60 &&
+             [true, false].include?(activity['idle']) &&
+             activity['blockers'].is_a?(Array) && activity['blockers'].length <= 16 &&
+             activity['blockers'].all? { |blocker| blocker.is_a?(String) && blocker.bytesize.between?(1, 240) && !blocker.match?(/[[:cntrl:]]/) } &&
+             activity['idle'] == activity['blockers'].empty?
         raise Error, 'Conversation activity is invalid or in the future.'
       end
       repositories = manifest.fetch('repositories', [])
@@ -393,20 +409,10 @@ module WorkspaceAutoArchive
              elsif lifecycle == 'active' && entries.empty?
                'empty'
              end
-      blockers = []
+      blockers = activity.fetch('blockers').dup
       blockers << 'Abandoned sessions require manual archival.' if lifecycle == 'abandoned'
       blockers << 'Session has uncommitted worktree changes.' if dirty
       blockers << 'Session has no automatic archive rule.' unless tier
-      # Idle checks include active turns, pending requests, queued messages and
-      # unresolved submission attempts. A failed check never ages a candidate.
-      begin
-        @command_runner.capture([
-          *@portal_command, 'thread', 'require-idle', '--thread-id', thread,
-          '--cwd', work_dir(slug), '--socket', @codex_socket
-        ])
-      rescue StandardError => e
-        blockers << e.message
-      end
       files = %w[plan.md state.md] + manifest.fetch('artifacts', []).map { |artifact| artifact.fetch('path') }
       contents = files.uniq.sort.map do |relative|
         path = File.expand_path(relative, work_dir(slug))

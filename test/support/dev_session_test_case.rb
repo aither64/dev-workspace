@@ -24,9 +24,11 @@ class DevSessionTest < Minitest::Test
       require 'json'
       exit 0 unless ARGV.first == 'thread'
       cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
-      if ARGV[1] == 'activity'
+      if ARGV[1] == 'observe'
+        blockers = File.exist?(File.join(cwd, 'busy')) ? ['Conversation has a queued message.'] : []
         puts JSON.generate('threadId' => ARGV.fetch(ARGV.index('--thread-id') + 1),
-                           'cwd' => cwd, 'updatedAt' => #{stamp})
+                           'cwd' => cwd, 'updatedAt' => #{stamp},
+                           'idle' => blockers.empty?, 'blockers' => blockers)
       elsif ARGV[1] == 'require-idle' && File.exist?(File.join(cwd, 'busy'))
         warn 'Conversation has a queued message.'
         exit 1

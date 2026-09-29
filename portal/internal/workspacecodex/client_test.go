@@ -181,6 +181,116 @@ func TestListThreadActivityAcceptsOnlyWorkspaceThreads(t *testing.T) {
 	}
 }
 
+func TestObserveThreadUsesOneMetadataReadAndFailsClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		status     string
+		cwd        string
+		queue      bool
+		pending    bool
+		badQueue   bool
+		unresolved bool
+		wantBlock  string
+		wantError  bool
+	}{
+		{name: "idle", status: "completed"},
+		{name: "active", status: "inProgress", wantBlock: "Codex has an active turn."},
+		{name: "pending request", status: "completed", pending: true, wantBlock: "Codex has pending requests."},
+		{name: "queued", status: "completed", queue: true, wantBlock: "Codex has queued messages."},
+		{name: "unresolved attempt", status: "completed", unresolved: true, wantBlock: "Codex has unresolved submission attempts."},
+		{name: "unknown status", status: "unknown", wantError: true},
+		{name: "wrong directory", status: "completed", cwd: "/foreign", wantError: true},
+		{name: "malformed queue", status: "completed", badQueue: true, wantError: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cwd := "/workspace/work/one"
+			reads := 0
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				methods := []string{"thread/read"}
+				if testCase.cwd == "" {
+					methods = append(methods, "thread/turns/list")
+					if testCase.status != "unknown" {
+						methods = append(methods, "thread/queue/list")
+					}
+				}
+				for _, method := range methods {
+					request, err := readObject(connection)
+					if err != nil || request["method"] != method {
+						return fmt.Errorf("observation method = %#v, %v; want %s", request, err, method)
+					}
+					var result any
+					switch method {
+					case "thread/read":
+						reads++
+						if testCase.pending {
+							if err := writeObject(connection, map[string]any{
+								"id": "input-1", "method": "item/tool/requestUserInput",
+								"params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+									"questions": []any{map[string]any{"id": "choice", "header": "Choice", "question": "Continue?"}}},
+							}); err != nil {
+								return err
+							}
+						}
+						returnedCwd := cwd
+						if testCase.cwd != "" {
+							returnedCwd = testCase.cwd
+						}
+						result = map[string]any{"thread": map[string]any{
+							"id": "thread-1", "cwd": returnedCwd, "source": "vscode", "updatedAt": time.Now().Unix(),
+						}}
+					case "thread/turns/list":
+						result = map[string]any{"data": []any{map[string]any{"id": "turn-1", "status": testCase.status}}}
+					case "thread/queue/list":
+						var queue any = []any{}
+						if testCase.queue {
+							queue = []any{map[string]any{"id": "queued-1", "clientUserMessageId": "message-1"}}
+						}
+						if testCase.badQueue {
+							queue = nil
+						}
+						result = map[string]any{"data": queue}
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{
+				SubmissionLedgerPath: filepath.Join(t.TempDir(), "attempts.json"),
+			})
+			defer client.Close()
+			if testCase.unresolved {
+				if err := client.PrepareSendWithOptions("thread-1", "message", "client-1", "", false, codex.TurnOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			observation, err := client.ObserveThread(ctx, "thread-1", cwd)
+			wantBlockers := 0
+			if testCase.wantBlock != "" {
+				wantBlockers = 1
+			}
+			if testCase.wantError {
+				if err == nil {
+					t.Fatalf("invalid observation succeeded: %#v", observation)
+				}
+			} else if err != nil || observation.ThreadID != "thread-1" || observation.Cwd != cwd ||
+				observation.Idle != (testCase.wantBlock == "") || len(observation.Blockers) != wantBlockers ||
+				(testCase.wantBlock != "" && observation.Blockers[0] != testCase.wantBlock) {
+				t.Fatalf("observation = %#v, %v", observation, err)
+			}
+			if reads != 1 {
+				t.Fatalf("metadata reads = %d, want one", reads)
+			}
+		})
+	}
+}
+
 func TestRetireThreadReportsFailingStage(t *testing.T) {
 	for failAt, stage := range []string{
 		"find session conversation", "verify session conversation", "verify session conversation",

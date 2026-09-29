@@ -508,6 +508,12 @@ worktrees block archival; returning to clean starts a fresh period. Portal
 visits, polling, file touches and routine runtime metadata updates do not count.
 Unknown conversation activity, active turns, pending requests, queued messages
 and incomplete lifecycle operations prevent a new automatic archive.
+The passive scan holds shared transition and session locks, so portal access can
+continue during observation. It asks Codex for one combined activity and idle
+result, then releases those locks. A candidate archive acquires exclusive locks
+and checks current policy, conversation, team members, worktrees and branch
+proofs again before starting the archive journal. Missing or inconsistent Codex
+data defers archival and restarts the inactivity period.
 
 The first scan after enabling starts a fresh period for existing sessions.
 Observations survive service restarts. Re-enabling, reviving a session or

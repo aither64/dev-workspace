@@ -3,6 +3,56 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def subprocess_can_lock?(path, mode)
+    _output, _error, status = Open3.capture3(
+      RbConfig.ruby, '-e',
+      'File.open(ARGV[0], File::RDWR) { |file| exit(file.flock(ARGV[1].to_i | File::LOCK_NB) ? 0 : 2) }',
+      path, mode.to_s
+    )
+    status.success?
+  end
+
+  def test_automatic_observation_shares_session_lock_without_mutation_authority
+    with_workspace do |workspace|
+      slug = '2026-06-06-shared-observation'
+      runner = automatic_fixture(workspace, slug)
+      path = runner.send(:session_lock_file, slug)
+      runner.send(:with_slug_observation_lock, slug) do
+        assert(subprocess_can_lock?(path, File::LOCK_SH))
+        refute(subprocess_can_lock?(path, File::LOCK_EX))
+        assert_nil(runner.instance_variable_get(:@held_slug_lock))
+        assert_raises(DevSession::Error) do
+          runner.send(:release_development_clusters!, slug, operation: 'archive')
+        end
+      end
+      runner.send(:with_slug_lock, slug) do
+        refute(subprocess_can_lock?(path, File::LOCK_SH))
+        refute(subprocess_can_lock?(path, File::LOCK_EX))
+      end
+    end
+  end
+
+  def test_automatic_observation_uses_shared_transition_lock
+    Dir.mktmpdir('automatic-transition-observation') do |directory|
+      path = File.join(directory, 'transition.lock')
+      command = Object.new
+      test = self
+      command.define_singleton_method(:auto_archive_scan) do |dry_run:, transition:, observation:|
+        observation.call do
+          test.assert(test.subprocess_can_lock?(path, File::LOCK_SH))
+          test.refute(test.subprocess_can_lock?(path, File::LOCK_EX))
+        end
+        []
+      end
+      cli = DevSession::CLI.new(
+        ['--transition-lock', path, 'auto-archive', 'scan', '--dry-run', '--json'],
+        out: StringIO.new, err: StringIO.new
+      )
+      cli.define_singleton_method(:runner) { command }
+      assert_equal(0, cli.run)
+    end
+  end
+
   def test_automatic_archive_uses_completed_and_empty_session_modes
     { 'complete' => [86_400, 'complete'], 'active' => [1_209_600, 'abandoned'] }.each do |lifecycle, (period, outcome)|
       with_workspace do |workspace|
@@ -77,6 +127,39 @@ class DevSessionTest < Minitest::Test
         assert_empty(recovered['blockers'])
         assert(File.directory?(File.join(workspace, 'work', slug)))
       end
+    end
+  end
+
+  def test_automatic_observation_rejects_missing_or_inconsistent_fields
+    with_workspace do |workspace|
+      slug = '2026-06-06-invalid-observation'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      portal = File.join(workspace, 'automatic-portal.rb')
+      original = File.read(portal)
+      valid = {
+        'threadId' => "thread-#{slug}", 'cwd' => File.join(workspace, 'work', slug),
+        'updatedAt' => Time.now.to_i, 'idle' => true, 'blockers' => []
+      }
+      [
+        valid.except('idle'),
+        valid.merge('idle' => false),
+        valid.merge('blockers' => ['Queued message.']),
+        valid.merge('blockers' => ['x' * 241]),
+        valid.merge('updatedAt' => Time.now.to_i + 120),
+        valid.merge('cwd' => '/foreign'),
+      ].each do |response|
+        age_automatic_session(runner, slug, 86_401)
+        File.write(portal, "puts #{JSON.generate(response).inspect}\n")
+        result = automatic_scan(runner).fetch(0)
+        assert_equal('deferred', result['result'])
+        refute(result['eligible'])
+        assert(runner.auto_archive_store.session(slug)['reset_at'])
+      end
+      File.write(portal, original)
+      recovered = automatic_scan(runner).fetch(0)
+      refute(recovered['eligible'])
+      assert_empty(recovered['blockers'])
     end
   end
 
@@ -172,6 +255,71 @@ class DevSessionTest < Minitest::Test
       assert_nil(runner.auto_archive_store.session(slug)['operation'])
       runner.auto_archive_hold(slug, false, as_is: true)
       refute(automatic_scan(runner, dry_run: true).fetch(0)['eligible'])
+    end
+  end
+
+  def test_automatic_archive_rechecks_activity_and_worktrees_before_journal
+    {
+      'activity' => ->(workspace, slug) { File.write(File.join(workspace, 'work', slug, 'busy'), 'queued') },
+      'worktree' => lambda do |workspace, slug|
+        FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'unexpected'))
+      end
+    }.each do |change, mutate|
+      with_workspace do |workspace|
+        slug = "2026-06-06-#{change}-race"
+        runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+        automatic_scan(runner)
+        age_automatic_session(runner, slug, 86_401)
+        original = runner.method(:archive)
+        runner.define_singleton_method(:archive) do |input, **keywords|
+          mutate.call(workspace, slug)
+          original.call(input, **keywords)
+        end
+        result = automatic_scan(runner).fetch(0)
+        assert_equal('deferred', result['result'])
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      end
+    end
+  end
+
+  def test_automatic_archive_checks_team_idle_before_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-member-race'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 86_401)
+      runner.define_singleton_method(:sync_team_lifecycle!) do |_slug, action|
+        raise DevSession::Error, 'member is active' if action == 'require-idle'
+      end
+      result = automatic_scan(runner).fetch(0)
+      assert_equal('deferred', result['result'])
+      assert_includes(result['blockers'].join, 'member is active')
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
+  def test_automatic_archive_rechecks_branch_head_before_journal
+    with_workspace do |workspace|
+      slug = '2026-06-06-head-race'
+      runner = automatic_fixture(workspace, slug)
+      create_bare_repo(workspace, 'sample')
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+      merge_registered_branches(workspace, slug)
+      automatic_scan(runner)
+      age_automatic_session(runner, slug, 604_801)
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      original = runner.method(:archive)
+      runner.define_singleton_method(:archive) do |input, **keywords|
+        File.write(File.join(path, 'new-work.txt'), 'changed head')
+        system('git', '-C', path, 'add', 'new-work.txt', exception: true)
+        system('git', '-C', path, 'commit', '-m', 'new work', exception: true, out: File::NULL)
+        original.call(input, **keywords)
+      end
+      result = automatic_scan(runner).fetch(0)
+      assert_equal('deferred', result['result'])
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
     end
   end
 
