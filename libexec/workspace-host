@@ -10,6 +10,7 @@ require 'pathname'
 require 'shellwords'
 require 'socket'
 require 'tmpdir'
+require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 
@@ -419,6 +420,7 @@ module DevWorkspaceHost
         else
           with_current_generation_lock(allow_first_install: true) { switch(argv) }
         end
+      when 'recover-archive' then recover_archive(argv)
       when 'rollback' then with_current_generation_lock { rollback(argv) }
       when 'suspend' then with_current_generation_lock { suspend(argv) }
       when 'status' then status(argv)
@@ -660,6 +662,154 @@ module DevWorkspaceHost
               "#{restore_error.message}"
       end
       @out.puts "workspace package: #{candidate}"
+    end
+
+    def recover_archive(argv)
+      options = {}
+      parser = OptionParser.new do |opts|
+        opts.on('--source PATH') { |value| options[:source] = value }
+        opts.on('--workspace NAME') { |value| options[:workspace] = value }
+        opts.on('--session SLUG') { |value| options[:session] = value }
+      end
+      parser.parse!(argv)
+      unless argv.empty? && options.keys.sort == %i[session source workspace] &&
+             options.fetch(:workspace).match?(NAME) &&
+             options.fetch(:session).match?(/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/)
+        raise Error, 'recover-archive requires --source, --workspace and --session'
+      end
+      observed_token = profile_link_token
+      unless observed_token && File.symlink?(@profile)
+        raise Error, 'archive recovery requires a selected predecessor profile'
+      end
+      predecessor = File.realpath(@profile)
+      source = File.realpath(File.expand_path(options.fetch(:source)))
+      output = capture!('nix', 'build', '--no-link', '--print-out-paths', source)
+      packages = output.lines.map(&:strip).reject(&:empty?).uniq
+      raise Error, 'archive recovery source did not build exactly one package' unless packages.length == 1
+
+      candidate = File.realpath(packages.fetch(0))
+      unless candidate == File.realpath(package_root) && candidate != predecessor &&
+             File.executable?(File.join(candidate, 'bin/workspace-host')) &&
+             File.executable?(File.join(candidate, 'bin/workspace-portal')) &&
+             File.executable?(File.join(predecessor, 'libexec/workspace-portal/dev-session'))
+        raise Error, 'archive recovery requires the exact unselected source package and selected lifecycle executor'
+      end
+      require_archive_recovery_contract!(predecessor, candidate)
+      selected_codex = File.realpath(active_codex)
+      unless codex_version(selected_codex) == '0.155.0'
+        raise Error, 'archive recovery requires the selected Codex 0.155.0 protocol'
+      end
+      check_codex(selected_codex)
+      with_transition_lock do
+        unless observed_token == profile_link_token && File.symlink?(@profile) &&
+               File.realpath(@profile) == predecessor && File.realpath(active_codex) == selected_codex
+          raise Error, 'selected workspace package or Codex changed before archive recovery'
+        end
+        entry = registry.find(options.fetch(:workspace))
+        raise Error, 'archive recovery workspace is not registered' unless entry
+
+        slug = options.fetch(:session)
+        journal_path, journal = require_archive_recovery_journal!(entry, slug)
+        runtime = instance_runtime(entry)
+        manifest = read_portal_manifest(File.join(entry.fetch('root'), 'archive', slug, 'portal.yml'))
+        unless manifest['slug'] == slug && manifest.dig('creation', 'state') == 'ready' &&
+               manifest.dig('codex', 'thread_id') == journal.fetch('retained_thread_id') &&
+               manifest.dig('codex', 'socket_path') == runtime.fetch(:codex)
+          raise Error, 'archived tracking does not match the retained root and Codex authority'
+        end
+        helper = File.join(candidate, 'bin/workspace-portal')
+        environment = @env.to_h.merge(
+          'DEV_WORKSPACE_NAME' => entry.fetch('name'),
+          'DEV_WORKSPACE_CODEX_HOME' => codex_home
+        )
+        root_cwd = File.join(entry.fetch('root'), 'work', slug)
+        capture_env!(environment, helper, 'thread', 'require-archived',
+                     '--thread-id', journal.fetch('retained_thread_id'), '--cwd', root_cwd,
+                     '--socket', runtime.fetch(:codex), '--codex-home', codex_home,
+                     '--authority-dir', runtime.fetch(:authority))
+        capture_env!(environment, helper, 'team', 'require-archived',
+                     '--user-state-root', @state, '--workspace', entry.fetch('root'),
+                     '--session-slug', slug, '--root-thread-id', journal.fetch('retained_thread_id'),
+                     '--cwd', root_cwd, '--socket', runtime.fetch(:codex), '--codex-home', codex_home,
+                     '--authority-dir', runtime.fetch(:authority))
+        request = ['archive', slug, '--as-is']
+        request << '--abandoned' if journal.fetch('mode') == 'abandoned'
+        invocation_environment, command, arguments = dev_session_invocation(
+          entry, request, transition_lock: false, package: predecessor
+        )
+        index = arguments.index('--portal-command')
+        unless index && arguments[index + 1] == File.join(predecessor, 'bin/workspace-portal')
+          raise Error, 'selected lifecycle invocation has no expected portal helper'
+        end
+        arguments[index + 1] = helper
+        system_env_interactive!(invocation_environment, command, *arguments)
+        unless observed_token == profile_link_token && File.symlink?(@profile) &&
+               File.realpath(@profile) == predecessor && File.realpath(active_codex) == selected_codex &&
+               !File.exist?(journal_path) && !File.symlink?(journal_path)
+          raise Error, 'archive recovery did not complete the selected journal without changing the profile'
+        end
+        @out.puts "recovered archive: #{entry.fetch('name')}/#{slug}"
+      end
+    end
+
+    def require_archive_recovery_contract!(predecessor, candidate)
+      paths = [predecessor, candidate].map do |package|
+        File.join(package, 'share/workspace-portal/runtime-contract.json')
+      end
+      contracts = paths.map do |path|
+        parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'archive recovery contract', 64 * 1024)
+      end
+      unless contracts[0] == contracts[1] && contracts[1] == RUNTIME_CONTRACT &&
+             contracts[0]['devSessionFlags'].include?('--portal-command') &&
+             contracts[0]['lifecycleJournals'] == LIFECYCLE_JOURNALS
+        raise Error, 'selected predecessor has an incompatible private archive recovery contract'
+      end
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+      raise Error, "archive recovery contract is unavailable: #{e.message}"
+    end
+
+    def require_archive_recovery_journal!(entry, slug)
+      root = File.join(entry.fetch('root'), 'worktrees', '.locks')
+      (LIFECYCLE_JOURNALS.map { |item| item.fetch('name') } - ['archive']).each do |name|
+        raise Error, 'conflicting session lifecycle journal blocks archive recovery' if
+          File.exist?(File.join(root, "#{slug}.#{name}.json")) ||
+          File.symlink?(File.join(root, "#{slug}.#{name}.json"))
+      end
+      %w[creation fork start agent-teams-migration].each do |name|
+        raise Error, 'conflicting session operation blocks archive recovery' if
+          File.exist?(File.join(root, "#{slug}.#{name}.json")) ||
+          File.symlink?(File.join(root, "#{slug}.#{name}.json"))
+      end
+      path = File.join(root, "#{slug}.archive.json")
+      require_safe_private_file!(path, 'archive recovery journal')
+      journal = parse_strict_json_object(
+        read_private_json_file!(path, 'archive recovery journal', maximum: 64 * 1024),
+        'archive recovery journal', 64 * 1024
+      )
+      expected = %w[
+        schema slug workspace operation_id phase mode proven_heads finalized_at
+        retained_thread_id target_tracking_sha256
+      ]
+      valid_heads = journal['proven_heads'].is_a?(Hash) && journal['proven_heads'].all? do |name, head|
+        name.is_a?(String) && name.match?(/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/) && head.is_a?(String) &&
+          head.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
+      end
+      valid_time = journal['finalized_at'].is_a?(String) &&
+                   Time.iso8601(journal['finalized_at']).utc.iso8601 == journal['finalized_at']
+      unless journal.keys.sort == expected.sort && journal['schema'] == 2 &&
+             journal['slug'] == slug && journal['workspace'] == entry.fetch('root') &&
+             journal['phase'] == 'tracking_committed' && %w[complete abandoned].include?(journal['mode']) &&
+             journal['operation_id'].is_a?(String) && journal['operation_id'].match?(SHA256_HEX) &&
+             journal['retained_thread_id'].is_a?(String) &&
+             journal['retained_thread_id'].match?(/\A[0-9A-Za-z-]+\z/) &&
+             journal['target_tracking_sha256'].is_a?(String) &&
+             journal['target_tracking_sha256'].match?(SHA256_HEX) &&
+             valid_heads && valid_time
+        raise Error, 'archive recovery journal has an invalid identity or phase'
+      end
+      [path, journal]
+    rescue ArgumentError
+      raise Error, 'archive recovery journal has an invalid finalization time'
     end
 
     def activate(argv)
@@ -943,7 +1093,10 @@ module DevWorkspaceHost
       if transition_lock
         arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file)
       end
-      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
+      environment = @env.to_h.merge(
+        'DEV_WORKSPACE_NAME' => entry.fetch('name'),
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home
+      )
       [environment, private_command, arguments]
     end
 
@@ -1024,7 +1177,10 @@ module DevWorkspaceHost
       workspace = workspace_configuration(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
-      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
+      environment = @env.to_h.merge(
+        'DEV_WORKSPACE_NAME' => entry.fetch('name'),
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home
+      )
       arguments = [
         'serve',
         '--workspace', entry.fetch('root'), '--base-url', "https://#{entry.fetch('hostname')}",
@@ -2613,6 +2769,17 @@ module DevWorkspaceHost
       File.executable?(candidate) ? candidate : @system_codex
     end
 
+    def codex_home
+      configured = @env.fetch('CODEX_HOME', File.join(@home, '.codex'))
+      raise Error, 'configured Codex home is not absolute' unless canonical_absolute_path?(configured)
+
+      return File.realpath(configured) if File.exist?(configured) || File.symlink?(configured)
+
+      File.join(File.realpath(File.dirname(configured)), File.basename(configured))
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
+      raise Error, "configured Codex home is unavailable: #{e.message}"
+    end
+
     def codex_version(command)
       output = capture!(command, '--version')
       value = output.scan(/[0-9]+(?:\.[0-9A-Za-z+-]+)+/).last
@@ -2722,6 +2889,12 @@ module DevWorkspaceHost
       @out.write(stdout)
       @err.write(stderr)
       return if status.success?
+      raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
+    end
+
+    def system_env_interactive!(environment, *argv)
+      return if system(environment, *argv)
+
       raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
     end
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -19,6 +20,8 @@ const threadSourceKind = "vscode"
 // reusable App Server client.
 type Client struct {
 	*codex.Client
+	CodexHome    string
+	archiveProof func(context.Context, string, string, string) (ArchiveState, error)
 }
 
 func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Client {
@@ -29,7 +32,7 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 	options.NonBlockingUserInput = &codex.NonBlockingUserInputPolicy{
 		HiddenGrace: 60 * time.Second, VisibleCountdown: 60 * time.Second,
 	}
-	return &Client{Client: codex.NewWithOptions(socket, options)}
+	return &Client{Client: codex.NewWithOptions(socket, options), CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME")}
 }
 
 func ResolveNewThreadSettings(
@@ -282,6 +285,16 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 			}
 		}
 	}
+	stage = "prove session conversation archive state"
+	archiveState, err := c.ProveArchivedThread(ctx, threadID, cwd, "")
+	if err != nil {
+		return err
+	}
+	if archiveState == ArchiveArchived {
+		stage = "clear retired conversation attempts"
+		return c.ClearConversationAttempts(threadID, cwd)
+	}
+	stage = "find session conversation"
 	candidate, found, err = c.retirementCandidate(ctx, cwd, false)
 	if err != nil {
 		return err
@@ -290,15 +303,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		return errors.New("another Codex thread uses the portal session directory")
 	}
 	if !found {
-		_, archivedFound, err := c.retirementThreadByID(ctx, threadID, cwd, true)
-		if err != nil {
-			return err
-		}
-		if archivedFound {
-			stage = "clear retired conversation attempts"
-			return c.ClearConversationAttempts(threadID, cwd)
-		}
-		return errors.New("the expected Codex thread is neither active nor archived")
+		return errors.New("the expected Codex thread is absent from active discovery")
 	}
 	stage = "verify session conversation"
 	metadata, err := c.ReadThreadMetadata(ctx, threadID, true)

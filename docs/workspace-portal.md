@@ -129,6 +129,24 @@ selection. Use the installed command for ordinary
 updates; the candidate entry does not rewrite saved team rosters or creation
 journals.
 
+An archive journal paused at `tracking_committed` can block that switch when
+the selected package cannot prove a conversation that Codex has already moved
+out of normal history discovery. Recover only that recorded operation with the
+candidate package:
+
+```sh
+nix run .#workspace-host -- recover-archive \
+  --source "$PWD" --workspace NAME --session SLUG
+```
+
+This command is not a general lifecycle override. It accepts only an exact
+archive journal at `tracking_committed`, keeps the selected profile and Codex
+generation unchanged, proves the retained root and member conversations from
+their exact metadata and archived rollout headers, and invokes the selected
+package's private lifecycle executor with only the portal helper replaced by
+the candidate helper. A failed proof or lifecycle retry leaves the journal in
+place.
+
 ## Extension catalog
 
 Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`

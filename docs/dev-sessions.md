@@ -624,6 +624,21 @@ when retrying an empty-session archive, matching its recorded abandoned mode.
 Manual retries use the same journal checks and retirement deadline. Finish pending
 operations before switching packages; do not remove their journals to unblock activation.
 
+If the selected package cannot complete that retry because Codex has already
+archived a retained thread but omits it from directory-filtered history, use a
+newer candidate package's narrow host recovery entry:
+
+```sh
+nix run .#workspace-host -- recover-archive \
+  --source "$PWD" --workspace NAME --session SLUG
+```
+
+The candidate must match `--source` and the selected runtime contract. The
+entry accepts only the existing `tracking_committed` archive journal, proves
+the retained root and member threads without changing the profile, and lets
+the selected package's lifecycle executor finish the journal. It cannot force
+an archive, change its recorded mode, or recover another lifecycle operation.
+
 The journal binds the exact projected archive tree and retained Codex thread;
 retry refuses changed lifecycle, manifest, artifacts, or conversation identity
 before it commits tracking or retires the runtime.
@@ -761,8 +776,10 @@ session; explicitly removed members remain removed. Old virtual-team metadata
 is ignored during the forward-only cutover, so it cannot deny access to a
 retained root conversation or its ordinary lifecycle.
 If App Server archives a member before the roster update is saved, an archive
-or deletion retry checks the thread's exact ID and session directory, then
-saves the roster state without sending another archive request.
+or deletion retry uses exact thread metadata and the bounded first record of
+the archived rollout to check the thread ID, session directory, and recorded
+project identity. It does not enumerate archived history. The retry then saves
+the roster state without sending another archive request.
 
 `--goal-file FILE` provides the initial Codex request and seeds the Goal
 section in a new plan. It is required when a noninteractive caller creates a

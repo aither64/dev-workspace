@@ -376,7 +376,7 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 // the same private roster and direct App Server thread operations.
 func teamCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|archive|retire|revive|fork")
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archived|archive|retire|revive|fork")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
@@ -388,6 +388,8 @@ func teamCommand(args []string) error {
 	sourceSlug := flags.String("source-session-slug", "", "source development session slug")
 	sourceRootThread := flags.String("source-root-thread-id", "", "source lead Codex thread id")
 	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
+	codexHome := flags.String("codex-home", "", "host-selected Codex home")
+	authorityDir := flags.String("authority-dir", "", "host-only runtime authority directory")
 	cwd := flags.String("cwd", "", "session working directory")
 	preset := flags.String("preset", "", "team preset")
 	presetFile := flags.String("preset-file", "", "immutable team preset JSON file")
@@ -526,6 +528,13 @@ func teamCommand(args []string) error {
 		result, err = service.Assign(ctx, *slug, *rootThread, *from, *to, *message, *model, *effort, *messageID)
 	case "require-idle":
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
+	case "require-archived":
+		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
+			!canonicalAbsolutePath(*socket) ||
+			!canonicalAbsolutePath(*authorityDir) || *cwd != filepath.Join(*workspace, "work", *slug) {
+			return errors.New("team archive preflight requires deployed Codex and session authority")
+		}
+		err = service.RequireArchivedAll(ctx, *slug, *rootThread)
 	case "archive":
 		err = service.ArchiveAll(ctx, *slug, *rootThread)
 	case "retire":
@@ -562,12 +571,13 @@ func teamCommand(args []string) error {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|observe|activity|require-materialized|require-idle|retire")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|observe|activity|require-materialized|require-idle|require-archived|retire")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
 	userStateRoot := flags.String("user-state-root", "", "package-selected user state root")
 	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
+	codexHome := flags.String("codex-home", "", "host-selected Codex home")
 	cwd := flags.String("cwd", "", "thread working directory")
 	workspace := flags.String("workspace", "", "development workspace root")
 	sessionSlug := flags.String("session-slug", "", "development session slug")
@@ -778,6 +788,20 @@ func threadCommand(args []string) error {
 			return errors.New("thread require-idle requires --thread-id and --cwd")
 		}
 		return client.RequireThreadIdle(ctx, *threadID, *cwd)
+	case "require-archived":
+		if *threadID == "" || !canonicalAbsolutePath(*cwd) || !canonicalAbsolutePath(*socket) ||
+			!canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
+			!canonicalAbsolutePath(*authorityDir) {
+			return errors.New("thread archive preflight requires trusted thread, directory and runtime provenance")
+		}
+		state, err := client.ProveArchivedThread(ctx, *threadID, *cwd, "")
+		if err != nil {
+			return err
+		}
+		if state != workspacecodex.ArchiveArchived {
+			return errors.New("retained session conversation is not archived")
+		}
+		return nil
 	case "require-materialized":
 		if *threadID == "" || *cwd == "" {
 			return errors.New("thread require-materialized requires --thread-id and --cwd")

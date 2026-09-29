@@ -333,6 +333,9 @@ func TestRetireThreadReportsFailingStage(t *testing.T) {
 				return nil
 			})
 			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) {
+				return ArchiveActive, nil
+			}
 			defer client.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -405,6 +408,9 @@ func TestRetireThreadInterruptsAnActiveTurnBeforeArchiving(t *testing.T) {
 		return nil
 	})
 	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+	client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) {
+		return ArchiveActive, nil
+	}
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -742,6 +748,9 @@ func TestRetireThreadRefusesAnotherActiveThreadBesideTheExpectedOne(t *testing.T
 		})
 	})
 	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+	client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) {
+		return ArchiveActive, nil
+	}
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -778,37 +787,15 @@ func TestRetireThreadTreatsMissingCwdCandidateAsAlreadyRetired(t *testing.T) {
 	}
 }
 
-func TestRetireThreadRecoversPersistedIdentityAmongArchivedCwdCandidates(t *testing.T) {
+func TestRetireThreadRecoversPersistedArchivedIdentityWithoutDiscovery(t *testing.T) {
 	cwd := "/workspace/work/example"
-	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
-		if err := handshake(connection); err != nil {
-			return err
+	client := NewWithOptions(filepath.Join(t.TempDir(), "unused.sock"), "/workspace", codex.ClientOptions{})
+	client.archiveProof = func(_ context.Context, id, readCwd, project string) (ArchiveState, error) {
+		if id != "thread-1" || readCwd != cwd || project != "" {
+			return ArchiveUnknown, errors.New("wrong retained root identity")
 		}
-		for index := 0; index < 2; index++ {
-			request, err := readObject(connection)
-			if err != nil {
-				return err
-			}
-			params := request["params"].(map[string]any)
-			if request["method"] != "thread/list" || params["archived"] != (index == 1) {
-				return fmt.Errorf("request %d = %#v", index, request)
-			}
-			data := []any{}
-			if index == 1 {
-				data = []any{
-					map[string]any{"id": "thread-old", "cwd": cwd, "source": "vscode"},
-					map[string]any{"id": "thread-1", "cwd": cwd, "source": "vscode"},
-				}
-			}
-			if err := writeObject(connection, map[string]any{
-				"id": request["id"], "result": map[string]any{"data": data},
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+		return ArchiveArchived, nil
+	}
 	defer client.Close()
 	if err := client.RecordThreadOperationAttempt(cwd, "thread-1"); err != nil {
 		t.Fatal(err)
@@ -873,6 +860,9 @@ func TestRetireThreadArchivesAFreshThreadWithoutARollout(t *testing.T) {
 		return nil
 	})
 	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+	client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) {
+		return ArchiveFresh, nil
+	}
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

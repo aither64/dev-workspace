@@ -23,6 +23,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
 
@@ -737,6 +738,7 @@ type Client interface {
 	StartThreadWithSettings(context.Context, string, map[string]string, codex.ThreadSettings) (string, error)
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
+	ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error)
 	ResumeThreadWithSettings(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ForkThread(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ArchiveThread(context.Context, string) error
@@ -1437,8 +1439,8 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 		// without attempting an invalid App Server operation.
 		if member.Thread != "" {
 			cwd := filepath.Join(service.Store.workspace, "work", slug)
-			archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
-			if err != nil {
+			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			if err != nil && !(member.RetireIntent == "remove" && codex.IsThreadNotFound(err, member.Thread)) {
 				return fmt.Errorf("inspect archived member %s: %w", address, err)
 			}
 			if !archived {
@@ -1461,7 +1463,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 						if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
 							return fmt.Errorf("member %s is not idle: %w", address, err)
 						}
-						if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
+						if err := service.archiveMemberThread(ctx, member, cwd); err != nil {
 							return fmt.Errorf("archive %s: %w", address, err)
 						}
 					} else {
@@ -1476,7 +1478,7 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 					if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
 						return fmt.Errorf("member %s is not idle: %w", address, err)
 					}
-					if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
+					if err := service.archiveMemberThread(ctx, member, cwd); err != nil {
 						return fmt.Errorf("archive %s: %w", address, err)
 					}
 				}
@@ -1516,6 +1518,38 @@ func (service Service) RequireIdleAll(ctx context.Context, slug, rootThreadID st
 	})
 }
 
+func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadID string) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		roster, err := service.Store.Load(slug, rootThreadID)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		for _, member := range roster.Members {
+			if member.State == "archived" || member.State == "removed" {
+				continue
+			}
+			if member.State != "ready" || member.Thread == "" || member.RetireIntent != "" {
+				return fmt.Errorf("member %s has no retained archive-ready identity", member.Address)
+			}
+			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			if err != nil {
+				return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
+			}
+			if !archived {
+				return fmt.Errorf("member %s is not archived", member.Address)
+			}
+		}
+		return nil
+	})
+}
+
 func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThreadID string) error {
 	roster, err := service.Store.Load(slug, rootThreadID)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1535,7 +1569,7 @@ func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThrea
 		if member.RetireIntent != "" {
 			return fmt.Errorf("member %s retirement is pending", member.Address)
 		}
-		archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+		archived, err := service.archivedMemberThread(ctx, member, cwd)
 		if err != nil {
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
@@ -1590,7 +1624,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.RetireIntent == "remove" {
 			return fmt.Errorf("member %s removal is pending", member.Address)
 		}
-		archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+		archived, err := service.archivedMemberThread(ctx, member, cwd)
 		if err != nil {
 			return fmt.Errorf("inspect archived member %s before recovery: %w", member.Address, err)
 		}
@@ -1632,7 +1666,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.Thread == "" || (member.State != "ready" && (!force || member.State != "creating")) {
 			return fmt.Errorf("member %s has no confirmed thread; finish or resolve creation before archive", member.Address)
 		}
-		archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
+		archived, err := service.archivedMemberThread(ctx, member, cwd)
 		if err != nil {
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
@@ -1675,7 +1709,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			}
 		}
 		if !archivedMembers[member.Address] {
-			if err := service.archiveMemberThread(ctx, member.Thread, cwd); err != nil {
+			if err := service.archiveMemberThread(ctx, member, cwd); err != nil {
 				return fmt.Errorf("archive %s: %w", member.Address, err)
 			}
 		}
@@ -1699,9 +1733,9 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 
 // archiveMemberThread proves the exact roster thread reached archived history,
 // including when App Server accepted the archive but its response was lost.
-func (service Service) archiveMemberThread(ctx context.Context, threadID, cwd string) error {
-	archiveErr := service.Client.ArchiveThread(ctx, threadID)
-	archived, lookupErr := service.archivedMemberThread(ctx, threadID, cwd)
+func (service Service) archiveMemberThread(ctx context.Context, member Member, cwd string) error {
+	archiveErr := service.Client.ArchiveThread(ctx, member.Thread)
+	archived, lookupErr := service.archivedMemberThread(ctx, member, cwd)
 	if lookupErr != nil {
 		return errors.Join(archiveErr, lookupErr)
 	}
@@ -1721,8 +1755,8 @@ func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context,
 		return nil
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
-	archived, err := service.archivedMemberThread(ctx, member.Thread, cwd)
-	if err != nil {
+	archived, err := service.archivedMemberThread(ctx, member, cwd)
+	if err != nil && !(member.State == "removed" && codex.IsThreadNotFound(err, member.Thread)) {
 		return err
 	}
 	if !archived {
@@ -1763,45 +1797,9 @@ func (service Service) clearRetiredMemberAttempts(ctx context.Context, threadID 
 	return service.Client.ClearRetiredThreadAttempts(threadID)
 }
 
-// archivedMemberThread finds only the roster's exact archived thread. A
-// completed App Server archive can precede the durable roster update, and
-// thread/archive cannot safely be repeated against that archived thread.
-func (service Service) archivedMemberThread(ctx context.Context, threadID, cwd string) (bool, error) {
-	archived := true
-	seenCursors := make(map[string]bool)
-	var cursor string
-	found := false
-	for {
-		threads, next, err := service.Client.ListThreads(ctx, codex.ThreadListOptions{
-			Cwd: cwd, Archived: &archived, Limit: 100, SortDirection: "asc", Cursor: cursor,
-		})
-		if err != nil {
-			return false, err
-		}
-		for _, thread := range threads {
-			if thread.ID != threadID {
-				continue
-			}
-			if thread.Cwd != cwd {
-				return false, errors.New("archived member thread has the wrong working directory")
-			}
-			if found {
-				return false, errors.New("archived member thread has an ambiguous identity")
-			}
-			found = true
-		}
-		if next == nil {
-			return found, nil
-		}
-		if *next == "" {
-			return false, errors.New("archived member listing returned an empty cursor")
-		}
-		if seenCursors[*next] {
-			return false, errors.New("archived member listing repeated a cursor")
-		}
-		seenCursors[*next] = true
-		cursor = *next
-	}
+func (service Service) archivedMemberThread(ctx context.Context, member Member, cwd string) (bool, error) {
+	state, err := service.Client.ProveArchivedThread(ctx, member.Thread, cwd, member.ProjectID)
+	return state == workspacecodex.ArchiveArchived, err
 }
 
 func (service Service) ReviveAll(ctx context.Context, slug, rootThreadID string) error {

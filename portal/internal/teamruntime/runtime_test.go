@@ -16,6 +16,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
 type testClient struct {
@@ -53,6 +54,7 @@ type testClient struct {
 	archiveAfter       func()
 	archiveResultError error
 	listPageSize       int
+	listCalls          int
 	emptyNextCursor    bool
 	ignoreListCwd      bool
 	lostStart          bool
@@ -127,6 +129,7 @@ func (client *testClient) StartThreadWithSettings(_ context.Context, cwd string,
 func (client *testClient) ListThreads(_ context.Context, options codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	client.listCalls++
 	if client.hideThreads {
 		return nil, nil, nil
 	}
@@ -177,6 +180,26 @@ func (client *testClient) ReadThreadMetadata(_ context.Context, threadID string,
 		}
 	}
 	return codex.ThreadMetadata{}, &codex.ThreadNotFoundError{ThreadID: threadID}
+}
+func (client *testClient) ProveArchivedThread(_ context.Context, threadID, cwd, projectID string) (workspacecodex.ArchiveState, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.readError != nil {
+		return workspacecodex.ArchiveUnknown, client.readError
+	}
+	for _, thread := range client.threads {
+		if thread.ID != threadID {
+			continue
+		}
+		if thread.Cwd != cwd || projectID != "" && (thread.ProjectID == nil || *thread.ProjectID != projectID) {
+			return workspacecodex.ArchiveUnknown, errors.New("archived member identity changed")
+		}
+		if client.archived[threadID] {
+			return workspacecodex.ArchiveArchived, nil
+		}
+		return workspacecodex.ArchiveActive, nil
+	}
+	return workspacecodex.ArchiveUnknown, &codex.ThreadNotFoundError{ThreadID: threadID}
 }
 func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
 	client.resumes = append(client.resumes, settings)
@@ -767,6 +790,44 @@ func TestArchiveReplacesUnmaterializedMemberBeforeArchiving(t *testing.T) {
 	}
 }
 
+func TestRequireArchivedAllUsesRetainedIdentityWithoutDiscovery(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	cwd := filepath.Join(workspace, "work", "one")
+	member, err := service.Add(context.Background(), "one", "root-one", cwd, nil, "implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.hideThreads = true
+	client.archived = map[string]bool{member.Thread: true}
+	client.unresolvedAttempts = map[string]bool{member.Thread: true}
+	listedBefore := client.listCalls
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("omitted archived listing blocked exact preflight: %v", err)
+	}
+	if client.listCalls != listedBefore {
+		t.Fatal("archive preflight called thread/list")
+	}
+	if len(client.archives) != 0 || len(client.resumes) != 0 || len(client.clearedThreads) != 0 {
+		t.Fatalf("read-only preflight mutated a member: archives=%#v resumes=%#v cleared=%#v",
+			client.archives, client.resumes, client.clearedThreads)
+	}
+	client.archived[member.Thread] = false
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("active retained member passed archive preflight")
+	}
+	client.readError = errors.New("metadata unavailable")
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err == nil ||
+		!strings.Contains(err.Error(), "metadata unavailable") {
+		t.Fatalf("unavailable metadata passed archive preflight: %v", err)
+	}
+}
+
 func TestRemoveDeletesOnlyEmptyUnmaterializedMember(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
@@ -842,7 +903,7 @@ func TestMemberRemovalRetriesCleanupAfterExactArchive(t *testing.T) {
 	}
 }
 
-func TestMemberRemovalDoesNotClearAttemptsWithoutArchiveProof(t *testing.T) {
+func TestMemberRemovalIgnoresIncompleteArchivedListing(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
 	if err != nil {
@@ -856,13 +917,12 @@ func TestMemberRemovalDoesNotClearAttemptsWithoutArchiveProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.hideThreads = true
-	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
-		!strings.Contains(err.Error(), "not archived") {
-		t.Fatalf("missing archive proof = %v", err)
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
+		t.Fatalf("exact archive proof failed with omitted listing: %v", err)
 	}
 	roster, err := store.Load("one", "root-one")
-	if err != nil || roster.Members[0].State != "ready" || len(client.clearedThreads) != 0 {
-		t.Fatalf("unproved removal = %#v, error %v, cleared %#v", roster, err, client.clearedThreads)
+	if err != nil || roster.Members[0].State != "removed" || len(client.clearedThreads) != 1 {
+		t.Fatalf("exactly proved removal = %#v, error %v, cleared %#v", roster, err, client.clearedThreads)
 	}
 }
 
@@ -959,7 +1019,7 @@ func TestRemoveReconcilesLostDeleteResponseByExactThreadRead(t *testing.T) {
 	}
 }
 
-func TestRemoveAcceptsConfirmedDeleteWhenReadReportsNotLoaded(t *testing.T) {
+func TestRemoveRefusesNotLoadedBeforeFreshDelete(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
 	if err != nil {
@@ -975,15 +1035,16 @@ func TestRemoveAcceptsConfirmedDeleteWhenReadReportsNotLoaded(t *testing.T) {
 	client.unmaterialized[member.Thread] = true
 	client.hideThreads = true
 	client.readError = errors.New("Codex RPC -32600: thread not loaded: " + member.Thread)
-	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err != nil {
-		t.Fatal(err)
+	if err := service.Remove(context.Background(), "one", "root-one", member.Address); err == nil ||
+		!strings.Contains(err.Error(), "thread not loaded") {
+		t.Fatalf("unknown exact-read state = %v", err)
 	}
 	roster, err := store.Load("one", "root-one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if roster.Members[0].State != "removed" || len(client.deleted) != 1 || client.deleted[0] != member.Thread {
-		t.Fatalf("confirmed delete = %#v, deleted = %#v", roster.Members, client.deleted)
+	if roster.Members[0].State != "ready" || len(client.deleted) != 0 {
+		t.Fatalf("unknown read mutated member = %#v, deleted = %#v", roster.Members, client.deleted)
 	}
 }
 
@@ -1012,7 +1073,7 @@ func TestRemoveDoesNotAcceptNotLoadedAfterLostDeleteResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if roster.Members[0].State != "ready" || roster.Members[0].RetireIntent != "remove" {
+	if roster.Members[0].State != "ready" || roster.Members[0].RetireIntent != "" || len(client.deleted) != 0 {
 		t.Fatalf("retained uncertain member = %#v", roster.Members)
 	}
 }
@@ -1136,6 +1197,14 @@ func TestMemberArchiveRecoversWhenRosterUpdateWasLost(t *testing.T) {
 			// The unrelated archived thread fills the first page. A forked member
 			// may have no project ID in App Server metadata.
 			client.threads[0].ProjectID = nil
+			if _, err := store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+				roster.Members[0].ProjectID = ""
+				roster.Members[0].CreateAttempted = false
+				roster.Members[0].BootstrapAttempted = false
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
 			client.threads = append([]codex.ThreadMetadata{{ID: "other", Cwd: cwd}}, client.threads...)
 			client.archived = map[string]bool{"other": true}
 			original, err := os.ReadFile(store.path("one"))
@@ -1324,9 +1393,9 @@ func TestArchivedMemberKeepsUnresolvedAttemptsAcrossOrdinaryRetirement(t *testin
 	}
 }
 
-func TestArchivedMemberReconciliationRejectsWrongOrDuplicateIdentity(t *testing.T) {
+func TestArchivedMemberReconciliationRejectsWrongIdentity(t *testing.T) {
 	for _, wrongCwd := range []bool{false, true} {
-		name := "duplicate"
+		name := "wrong project"
 		if wrongCwd {
 			name = "wrong directory"
 		}
@@ -1346,7 +1415,8 @@ func TestArchivedMemberReconciliationRejectsWrongOrDuplicateIdentity(t *testing.
 			if wrongCwd {
 				client.threads[0].Cwd = filepath.Join(workspace, "work", "other")
 			} else {
-				client.threads = append(client.threads, client.threads[0])
+				wrong := "00000000-0000-7000-8000-000000000999"
+				client.threads[0].ProjectID = &wrong
 			}
 			if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err == nil {
 				t.Fatal("invalid archived identity passed the idle gate")
@@ -1361,7 +1431,7 @@ func TestArchivedMemberReconciliationRejectsWrongOrDuplicateIdentity(t *testing.
 	}
 }
 
-func TestArchivedMemberReconciliationRejectsEmptyCursor(t *testing.T) {
+func TestArchivedMemberReconciliationDoesNotUseListingCursor(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
 	if err != nil {
@@ -1375,8 +1445,8 @@ func TestArchivedMemberReconciliationRejectsEmptyCursor(t *testing.T) {
 	}
 	client.threads = append(client.threads, codex.ThreadMetadata{ID: "other", Cwd: cwd})
 	client.archived = map[string]bool{"thread-1": true, "other": true}
-	if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err == nil || !strings.Contains(err.Error(), "empty cursor") {
-		t.Fatalf("empty archived cursor = %v", err)
+	if err := service.RequireIdleAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("exact archive proof depended on listing cursor: %v", err)
 	}
 }
 
