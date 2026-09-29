@@ -561,10 +561,13 @@ func teamCommand(args []string) error {
 	}
 	if result == nil {
 		roster, loadErr := store.Load(*slug, *rootThread)
-		if loadErr != nil {
+		if command == "require-archived" && errors.Is(loadErr, os.ErrNotExist) {
+			result = map[string]any{"roster": nil}
+		} else if loadErr != nil {
 			return loadErr
+		} else {
+			result = roster
 		}
-		result = roster
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
 }
@@ -794,7 +797,7 @@ func threadCommand(args []string) error {
 			!canonicalAbsolutePath(*authorityDir) {
 			return errors.New("thread archive preflight requires trusted thread, directory and runtime provenance")
 		}
-		state, err := client.ProveArchivedThread(ctx, *threadID, *cwd, "")
+		state, err := client.ProveArchivedRootThread(ctx, *threadID, *cwd)
 		if err != nil {
 			return err
 		}

@@ -33,10 +33,11 @@ const (
 )
 
 type ArchivedThreadIdentity struct {
-	ThreadID  string
-	Cwd       string
-	ProjectID string
-	CodexHome string
+	ThreadID   string
+	Cwd        string
+	ProjectID  string
+	CodexHome  string
+	SourceKind string
 }
 
 type ThreadMetadataReader interface {
@@ -134,11 +135,19 @@ func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expec
 }
 
 func (c *Client) ProveArchivedThread(ctx context.Context, threadID, cwd, projectID string) (ArchiveState, error) {
+	return c.proveArchivedThread(ctx, threadID, cwd, projectID, "")
+}
+
+func (c *Client) ProveArchivedRootThread(ctx context.Context, threadID, cwd string) (ArchiveState, error) {
+	return c.proveArchivedThread(ctx, threadID, cwd, "", threadSourceKind)
+}
+
+func (c *Client) proveArchivedThread(ctx context.Context, threadID, cwd, projectID, sourceKind string) (ArchiveState, error) {
 	if c.archiveProof != nil {
 		return c.archiveProof(ctx, threadID, cwd, projectID)
 	}
 	return ProveArchivedThread(ctx, c.Client, ArchivedThreadIdentity{
-		ThreadID: threadID, Cwd: cwd, ProjectID: projectID, CodexHome: c.CodexHome,
+		ThreadID: threadID, Cwd: cwd, ProjectID: projectID, CodexHome: c.CodexHome, SourceKind: sourceKind,
 	})
 }
 
@@ -148,6 +157,12 @@ func validateArchiveMetadata(metadata codex.ThreadMetadata, expected ArchivedThr
 	}
 	if expected.ProjectID != "" && (metadata.ProjectID == nil || *metadata.ProjectID != expected.ProjectID) {
 		return errors.New("thread/read returned the wrong retained project")
+	}
+	if expected.SourceKind != "" {
+		source, ok := metadata.Source.(string)
+		if !ok || source != expected.SourceKind {
+			return errors.New("thread/read returned the wrong retained source")
+		}
 	}
 	return nil
 }

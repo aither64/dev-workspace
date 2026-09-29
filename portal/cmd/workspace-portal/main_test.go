@@ -559,3 +559,18 @@ func TestArchivePreflightCommandsRequireDeployedCodexHome(t *testing.T) {
 		t.Fatalf("untrusted team home passed preflight: %v", err)
 	}
 }
+
+func TestTeamRequireArchivedAcceptsRootOnlySession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DEV_WORKSPACE_CODEX_HOME", home)
+	workspace := t.TempDir()
+	cwd := filepath.Join(workspace, "work", "example")
+	if err := teamCommand([]string{
+		"require-archived", "--user-state-root", t.TempDir(), "--workspace", workspace,
+		"--session-slug", "example", "--root-thread-id", "11111111-1111-7111-8111-111111111111",
+		"--cwd", cwd, "--socket", filepath.Join(t.TempDir(), "app-server.sock"),
+		"--authority-dir", t.TempDir(), "--codex-home", home,
+	}); err != nil {
+		t.Fatalf("root-only archive preflight: %v", err)
+	}
+}

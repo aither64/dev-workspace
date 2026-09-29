@@ -787,9 +787,21 @@ func TestRetireThreadTreatsMissingCwdCandidateAsAlreadyRetired(t *testing.T) {
 	}
 }
 
-func TestRetireThreadRecoversPersistedArchivedIdentityWithoutDiscovery(t *testing.T) {
+func TestRetireThreadRecoversPersistedArchivedIdentityAfterActiveCheck(t *testing.T) {
 	cwd := "/workspace/work/example"
-	client := NewWithOptions(filepath.Join(t.TempDir(), "unused.sock"), "/workspace", codex.ClientOptions{})
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/list" {
+			return fmt.Errorf("active retirement check = %#v, %v", request, err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}},
+		})
+	})
+	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
 	client.archiveProof = func(_ context.Context, id, readCwd, project string) (ArchiveState, error) {
 		if id != "thread-1" || readCwd != cwd || project != "" {
 			return ArchiveUnknown, errors.New("wrong retained root identity")
@@ -808,6 +820,46 @@ func TestRetireThreadRecoversPersistedArchivedIdentityWithoutDiscovery(t *testin
 	threadID, err := client.ThreadOperationAttempt(cwd)
 	if err != nil || threadID != "" {
 		t.Fatalf("retirement marker after cleanup = %q, %v", threadID, err)
+	}
+}
+
+func TestRetireThreadKeepsAttemptsWhenArchivedRootHasActiveCandidate(t *testing.T) {
+	for _, activeID := range []string{"thread-sibling", "thread-1"} {
+		t.Run(activeID, func(t *testing.T) {
+			cwd := "/workspace/work/example"
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/list" {
+					return fmt.Errorf("active retirement check = %#v, %v", request, err)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+						"id": activeID, "cwd": cwd, "source": "vscode",
+					}}},
+				})
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) {
+				return ArchiveArchived, nil
+			}
+			defer client.Close()
+			if err := client.RecordThreadOperationAttempt(cwd, "thread-1"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := client.RetireThread(ctx, "thread-1", cwd, false); err == nil ||
+				!strings.Contains(err.Error(), "also appears in active discovery") {
+				t.Fatalf("archived root with active candidate passed: %v", err)
+			}
+			threadID, err := client.ThreadOperationAttempt(cwd)
+			if err != nil || threadID != "thread-1" {
+				t.Fatalf("retirement marker after refusal = %q, %v", threadID, err)
+			}
+		})
 	}
 }
 

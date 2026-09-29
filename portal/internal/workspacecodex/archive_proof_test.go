@@ -76,6 +76,15 @@ func TestProveArchivedThreadUsesExactMetadataAndBoundedHeader(t *testing.T) {
 	}
 }
 
+func TestProveArchivedRootThreadRejectsForeignSource(t *testing.T) {
+	identity, reader, _ := archiveProofFixture(t)
+	identity.SourceKind = threadSourceKind
+	reader.metadata.Source = "cli"
+	if state, err := ProveArchivedThread(context.Background(), reader, identity); err == nil || state != ArchiveUnknown || reader.reads != 1 {
+		t.Fatalf("foreign root source passed: %v, %v, reads=%d", state, err, reader.reads)
+	}
+}
+
 func TestProveArchivedThreadKeepsNonarchivedAndUnknownDistinct(t *testing.T) {
 	identity, reader, path := archiveProofFixture(t)
 	reader.metadata.Path = nil

@@ -286,21 +286,24 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		}
 	}
 	stage = "prove session conversation archive state"
-	archiveState, err := c.ProveArchivedThread(ctx, threadID, cwd, "")
+	archiveState, err := c.ProveArchivedRootThread(ctx, threadID, cwd)
 	if err != nil {
 		return err
-	}
-	if archiveState == ArchiveArchived {
-		stage = "clear retired conversation attempts"
-		return c.ClearConversationAttempts(threadID, cwd)
 	}
 	stage = "find session conversation"
 	candidate, found, err = c.retirementCandidate(ctx, cwd, false)
 	if err != nil {
 		return err
 	}
+	if archiveState == ArchiveArchived && found {
+		return errors.New("archived Codex thread also appears in active discovery")
+	}
 	if found && candidate.ID != threadID {
 		return errors.New("another Codex thread uses the portal session directory")
+	}
+	if archiveState == ArchiveArchived {
+		stage = "clear retired conversation attempts"
+		return c.ClearConversationAttempts(threadID, cwd)
 	}
 	if !found {
 		return errors.New("the expected Codex thread is absent from active discovery")
