@@ -6,7 +6,7 @@ const {
   currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest,
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
-  refreshLegacyTranscriptView,
+  legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView,
   cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
@@ -316,6 +316,47 @@ refreshLegacyTranscriptView(legacyContainer, legacyView, true, () => {
   legacyContainer.scrollHeight = 1000;
 });
 assert.equal(legacyContainer.scrollTop, 1000);
+const legacyWindowEntry = (number) => ({
+  turnId: `turn-${number}`,
+  ...(number === 10 ? {} : {itemId: `item-${number}`}),
+  kind: number === 10 ? "error" : "agentMessage",
+  text: `output ${number}`,
+});
+const oldLegacyWindow = Array.from({length: 20}, (_, index) => legacyWindowEntry(index + 1));
+const newLegacyWindow = Array.from({length: 20}, (_, index) => legacyWindowEntry(index + 2));
+const keyFor = (entry, index, entries) => legacyTranscriptEntryKey(entry, index, entries);
+const retainedErrorKey = keyFor(oldLegacyWindow[9], 9, oldLegacyWindow);
+assert.equal(retainedErrorKey, keyFor(newLegacyWindow[8], 8, newLegacyWindow));
+assert.equal(keyFor(oldLegacyWindow[10], 10, oldLegacyWindow),
+  keyFor(newLegacyWindow[9], 9, newLegacyWindow));
+assert.deepEqual([...legacyTranscriptChanges(oldLegacyWindow, newLegacyWindow)],
+  [keyFor(newLegacyWindow[19], 19, newLegacyWindow)]);
+assert.equal(legacyTranscriptChanges(oldLegacyWindow, oldLegacyWindow.slice(1)).size, 0);
+assert.equal(legacyTranscriptChanges(newLegacyWindow, newLegacyWindow).size, 0);
+const updatedLegacyWindow = newLegacyWindow.map((entry, index) =>
+  index === 8 ? {...entry, text: "updated error"} : entry);
+assert.deepEqual([...legacyTranscriptChanges(newLegacyWindow, updatedLegacyWindow)], [retainedErrorKey]);
+let slidingRows = oldLegacyWindow.map((entry, index) =>
+  legacyRow(keyFor(entry, index, oldLegacyWindow), (index - 9) * 40, index === 9));
+const slidingContainer = {
+  scrollTop: 360,
+  scrollHeight: 800,
+  getBoundingClientRect: () => ({top: 0}),
+  querySelectorAll: () => slidingRows,
+};
+const slidingView = {disclosures: new Map()};
+refreshLegacyTranscriptView(slidingContainer, slidingView, false, (disclosures) => {
+  assert.equal(disclosures.get(retainedErrorKey), true);
+  slidingRows = newLegacyWindow.map((entry, index) => {
+    const key = keyFor(entry, index, newLegacyWindow);
+    return legacyRow(key, (index - 9) * 40, disclosures.get(key) === true);
+  });
+});
+assert.equal(slidingContainer.scrollTop, 320);
+assert.equal(slidingRows[8].querySelector("details").open, true);
+assert.equal(slidingRows.length, 20);
+assert.equal(slidingRows[19].dataset.transcriptEntryKey,
+  keyFor(newLegacyWindow[19], 19, newLegacyWindow));
 const filterEntries = [
   {kind: "userMessage", text: "question"},
   {kind: "reasoning", text: "condensed reasoning"},

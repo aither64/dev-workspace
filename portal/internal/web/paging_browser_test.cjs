@@ -16,6 +16,9 @@ const historyRead = source.slice(source.indexOf("const runHistoryRead = async"),
 assert.match(historyRead, /const readVersion = transcriptHistory\.repairVersion/);
 assert.equal((historyRead.match(/readVersion !== transcriptHistory\.repairVersion/g) || []).length, 2);
 assert.match(source, /else refreshLegacyTranscriptView\(transcript, view, follow,/);
+assert.match(source, /legacyTranscriptEntryKey\(entry, index, entries\)/);
+assert.match(source, /changed: legacyTranscriptChanges\(transcriptEntries, payload\.entries \|\| \[\]\)/);
+assert.match(source, /kind === "newest" && transcriptInitialized && update\.changed\.size/);
 assert.match(source, /renderMessageReceipts\(\)/);
 assert.match(source, /observePageReceipts\(transcriptEntries, currentThreadId\)/);
 assert.match(source, /sendAcknowledgementCandidates\(transcriptEntries,/);

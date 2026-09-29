@@ -278,6 +278,30 @@
   const hasTranscriptPagingHelpers = (assets) =>
     ["createTranscriptHistory", "readTranscriptPage", "transcriptEntryKey"]
       .every(name => typeof assets[name] === "function");
+  const legacyTranscriptEntryKey = (entry, index, entries) => {
+    const turnID = entry?.turnId || "";
+    const itemID = entry?.itemId || "";
+    if (turnID && itemID) return JSON.stringify([turnID, itemID]);
+    if (turnID && entry?.kind === "error") return JSON.stringify([turnID, "turn-error"]);
+    let occurrence = 0;
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      const prior = entries[priorIndex];
+      if (!prior?.itemId && (prior?.turnId || "") === turnID &&
+          (prior?.kind || "") === (entry?.kind || "")) occurrence += 1;
+    }
+    return JSON.stringify([turnID, itemID, entry?.kind || "", occurrence]);
+  };
+  const legacyTranscriptChanges = (previous, current) => {
+    const before = new Map(previous.map((entry, index) =>
+      [legacyTranscriptEntryKey(entry, index, previous), entry]));
+    const changed = new Set();
+    current.forEach((entry, index) => {
+      const key = legacyTranscriptEntryKey(entry, index, current);
+      const prior = before.get(key);
+      if (!prior || JSON.stringify(prior) !== JSON.stringify(entry)) changed.add(key);
+    });
+    return changed;
+  };
   const refreshLegacyTranscriptView = (container, view, follow, render) => {
     const disclosures = captureTranscriptDisclosureState(container);
     const previousTop = container.scrollTop;
@@ -910,6 +934,7 @@
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
+      legacyTranscriptEntryKey, legacyTranscriptChanges,
       refreshLegacyTranscriptView,
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
@@ -2960,7 +2985,7 @@
     const details = entry.details || "";
     const html = entry.html || "";
     const entryKey = pagingHelpersAvailable ? conversationAssets.transcriptEntryKey(entry, index, entries) :
-      JSON.stringify([entry.turnId || "", entry.itemId || "", index]);
+      legacyTranscriptEntryKey(entry, index, entries);
     const element = document.createElement("div");
     const activityElement = conversationAssets.createTranscriptActivity(entry);
     element.className = `message ${kind}`;
@@ -3162,7 +3187,7 @@
     const follow = !transcriptInitialized || (kind === "newest" && view.follow);
     const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(payload) :
       kind === "repair" ? transcriptHistory.applyRepair(payload) : transcriptHistory.applyNewest(payload)) :
-      {changed: new Set(), reset: false};
+      {changed: legacyTranscriptChanges(transcriptEntries, payload.entries || []), reset: false};
     transcriptEntries = transcriptHistory ? transcriptHistory.entries : payload.entries || [];
     if (update.reset) {
       transcriptInitialized = false;
