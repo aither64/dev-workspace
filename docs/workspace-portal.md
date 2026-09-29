@@ -67,6 +67,36 @@ Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
+## Conversation history in the portal
+
+The Codex tab reads the newest 100 transcript items on first load for the lead,
+team members and archived sessions. **Load older** fetches another page. Items
+already on screen retain their DOM nodes as new output arrives; loading older
+items keeps the reader's scroll position. If more than one page arrives while a
+browser is disconnected, the tab reads bounded pages until the new and retained
+history meet. An active item that has moved out of the newest page is also
+checked for its final update.
+The portal uses codex-web's `createTranscriptHistory` and `readTranscriptPage`
+browser helpers for merging pages and deciding when legacy fallback is allowed.
+
+The browser uses `GET /api/sessions/<slug>/thread/page` for the lead and the
+equivalent member conversation route for members. The existing `/thread` route
+remains available to older browsers. The new browser uses it when paging is
+explicitly unavailable, or when the page route is missing and an authorized
+legacy read succeeds. Authorization failures, timeouts and invalid cursors
+remain errors. A changed cursor keeps loaded messages visible while a fresh
+bounded history repair checks their continuity.
+
+Requests, queued messages and activity timing refresh separately from the
+transcript. A slow queue reconciliation does not delay the first conversation
+page. A failed request or queue refresh keeps the last visible result and shows
+a retry control. Transcript receipt and upload clearing require positive
+server evidence across all retained pages, including messages loaded through
+**Load older**. While the server is still checking conversation metadata, the
+mode is shown as pending and plan actions stay hidden. The tab retries metadata
+reads with backoff. Activity reads have a five-second budget while active and
+a thirty-second budget while idle; focus and reconnection prompt a fresh read.
+
 ## User-profile state
 
 The default paths are:

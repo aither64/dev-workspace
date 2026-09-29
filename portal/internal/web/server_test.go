@@ -122,6 +122,7 @@ func TestLegacyConversationPathsRemainAvailableDuringRollbackWindow(t *testing.T
 		path   string
 	}{
 		{http.MethodGet, []string{"example", "thread"}, "/codex/conversations/example/thread"},
+		{http.MethodGet, []string{"example", "thread", "page"}, "/codex/conversations/example/thread/page"},
 		{http.MethodGet, []string{"example", "activity"}, "/codex/conversations/example/activity"},
 		{http.MethodGet, []string{"example", "events"}, "/codex/conversations/example/events"},
 		{http.MethodGet, []string{"example", "pending"}, "/codex/conversations/example/pending"},
@@ -1750,7 +1751,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"await beforeRequestInputAction(snoozeAutoResolution)",
 		"entry.html", "archive-session", "revive-session", "artifactPreview", "release-cluster", "fork-dialog",
 		"data-cluster-service-tab", "data-reveal-secret", "index-status", "modelSelect.required",
-		"const nextSignature = JSON.stringify(entries)", "client.operation().then((operation)",
+		"const signature = JSON.stringify([entries,", "client.operation().then((operation)",
 		"deleteDialog.showModal()", `lifecycleKind === "revive" && needsOptions`,
 		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
 		"renderIndexOperations(payload.operations)", "indexNavigationPending = true",
@@ -4383,6 +4384,18 @@ func TestSessionDetailsRetainsDirectTeamRoster(t *testing.T) {
 	}
 }
 
+type memberPageProbe struct {
+	conversation.Client
+	calls int
+}
+
+func (probe *memberPageProbe) ReadThreadPage(_ context.Context, threadID, cursor string) (codex.TranscriptPage, error) {
+	probe.calls++
+	return codex.TranscriptPage{Transcript: codex.Transcript{
+		ThreadID: threadID, Model: "stale-model", ReasoningEffort: "low",
+	}}, nil
+}
+
 func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
@@ -4432,7 +4445,20 @@ func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
 	if _, ok := target.Client.(conversation.QueueDeletionCompleter); !ok {
 		t.Fatal("member conversation lost attachment-aware queue deletion")
 	}
-	memberClient := target.Client.(memberConversationClient)
+	if _, ok := target.Client.(conversation.TranscriptPageReader); !ok {
+		t.Fatal("member conversation lost bounded transcript paging")
+	}
+	memberClient := target.Client.(memberPagedConversationClient).memberConversationClient
+	probe := &memberPageProbe{Client: memberClient.Client}
+	pagedClient := memberPagedConversationClient{memberConversationClient: memberClient}
+	pagedClient.Client = probe
+	pageResult, err := pagedClient.ReadThreadPage(context.Background(), "member-thread", "")
+	if err != nil || pageResult.Model != "gpt-6-sol" || pageResult.ReasoningEffort != "xhigh" || probe.calls != 1 {
+		t.Fatalf("member page policy = %#v, %v; reads = %d", pageResult, err, probe.calls)
+	}
+	if _, err := pagedClient.ReadThreadPage(context.Background(), "other-thread", ""); err == nil || probe.calls != 1 {
+		t.Fatalf("member page accepted a different thread: %v; reads = %d", err, probe.calls)
+	}
 	firstOptions, err := memberClient.turnOptions("message", "message-1", "")
 	if err != nil || firstOptions.ReasoningEffort != "xhigh" {
 		t.Fatalf("member turn options = %#v, %v", firstOptions, err)

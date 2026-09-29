@@ -53,6 +53,21 @@ type memberConversationClient struct {
 	threadID     string
 }
 
+type memberPagedConversationClient struct{ memberConversationClient }
+
+func (client memberPagedConversationClient) ReadThreadPage(ctx context.Context, threadID, cursor string) (codex.TranscriptPage, error) {
+	member, err := client.member()
+	if err != nil || threadID != client.threadID {
+		return codex.TranscriptPage{}, errors.New("team member is unavailable")
+	}
+	reader := client.Client.(conversation.TranscriptPageReader)
+	page, err := reader.ReadThreadPage(ctx, threadID, cursor)
+	if err == nil {
+		page.Model, page.ReasoningEffort = member.Model, member.Effort
+	}
+	return page, err
+}
+
 func (client memberConversationClient) member() (teamruntime.Member, error) {
 	member, err := readyConversationMember(client.service.Store, client.slug, client.rootThreadID, client.address)
 	if err != nil || member.Thread != client.threadID {

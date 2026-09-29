@@ -32,6 +32,8 @@ type activityMonitor struct {
 	readSlots chan struct{}
 	readMu    sync.Mutex
 	readGates map[string]*activityReadGate
+	snapshots map[string]activityCachedSnapshot
+	clock     func() time.Time
 }
 
 const activityReadConcurrency = 4
@@ -39,6 +41,11 @@ const activityReadConcurrency = 4
 type activityReadGate struct {
 	slot  chan struct{}
 	users int
+}
+
+type activityCachedSnapshot struct {
+	value codex.ActivitySnapshot
+	at    time.Time
 }
 
 type activityWorker struct {
@@ -73,7 +80,40 @@ func (m *activityMonitor) ReadActivity(ctx context.Context, threadID string) (co
 		return codex.ActivitySnapshot{}, err
 	}
 	defer release()
-	return m.observer.ReadActivity(ctx, threadID)
+	return m.readSnapshot(ctx, threadID, false)
+}
+
+func (m *activityMonitor) now() time.Time {
+	if m.clock != nil {
+		return m.clock()
+	}
+	return time.Now()
+}
+
+func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, force bool) (codex.ActivitySnapshot, error) {
+	m.readMu.Lock()
+	cached, found := m.snapshots[threadID]
+	interval := 5 * time.Second
+	if cached.value.CurrentState == "idle" {
+		interval = 30 * time.Second
+	}
+	if found && !force && m.now().Sub(cached.at) < interval {
+		m.readMu.Unlock()
+		return cached.value, nil
+	}
+	m.readMu.Unlock()
+	snapshot, err := m.observer.ReadActivity(ctx, threadID)
+	m.readMu.Lock()
+	if err == nil {
+		if m.snapshots == nil {
+			m.snapshots = make(map[string]activityCachedSnapshot)
+		}
+		m.snapshots[threadID] = activityCachedSnapshot{value: snapshot, at: m.now()}
+	} else {
+		delete(m.snapshots, threadID)
+	}
+	m.readMu.Unlock()
+	return snapshot, err
 }
 
 // Background and browser reads share this authority's limit. Readers queue per
@@ -159,6 +199,9 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 		if wanted[slug] != worker.threadID {
 			worker.cancel()
 			delete(m.workers, slug)
+			m.readMu.Lock()
+			delete(m.snapshots, worker.threadID)
+			m.readMu.Unlock()
 		}
 	}
 	for slug, threadID := range wanted {
@@ -201,6 +244,8 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 	}()
 	cwd := filepath.Join(m.server.config.Workspace, "work", slug)
 	nextRead := time.Time{}
+	nextActivityRead := time.Time{}
+	idleWakeUsed, forceNext, lastIdle := false, false, false
 	for {
 		if delay := time.Until(nextRead); delay > 0 {
 			timer := time.NewTimer(delay)
@@ -211,7 +256,6 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 			case <-timer.C:
 			}
 		}
-		nextRead = time.Now().Add(time.Second)
 		release, err := m.acquireRead(ctx, threadID)
 		if err != nil {
 			return
@@ -227,13 +271,20 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 			events, unsubscribe, err = m.observer.Subscribe(readContext, threadID)
 		}
 		interval := 5 * time.Second
-		if err == nil {
+		if err == nil && (forceNext || !m.now().Before(nextActivityRead)) {
 			var snapshot codex.ActivitySnapshot
-			snapshot, err = m.observer.ReadActivity(readContext, threadID)
+			snapshot, err = m.readSnapshot(readContext, threadID, forceNext)
 			if err == nil && snapshot.CurrentState == "idle" {
 				interval = 30 * time.Second
+				lastIdle = true
+			} else if err == nil {
+				idleWakeUsed = false
+				lastIdle = false
 			}
+			nextActivityRead = m.now().Add(interval)
 		}
+		forceNext = false
+		nextRead = m.now().Add(time.Second)
 		ticker.Reset(interval)
 		cancel()
 		release()
@@ -252,6 +303,9 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 				}
 				unsubscribe = nil
 				events = nil
+			} else if lastIdle && !idleWakeUsed {
+				idleWakeUsed, forceNext = true, true
+				nextRead = time.Time{}
 			}
 		case <-ticker.C:
 		}

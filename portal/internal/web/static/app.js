@@ -11,6 +11,7 @@
   };
   const createSessionClient = (slug, request, conversation) => ({
     thread: conversation?.thread,
+    threadPage: conversation?.threadPage,
     activity: conversation?.activity,
     pending: conversation?.pending,
     modes: () => request("/api/collaboration-modes"),
@@ -173,6 +174,25 @@
       ...attempt, transcriptDigest: observed.get(attempt.id),
     }));
   };
+  const createTranscriptAcknowledgementScheduler = (run, retryDelay = 2000) => {
+    let active = false, queued = false, retryTimer = null;
+    const schedule = () => {
+      if (active) { queued = true; return; }
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = null;
+      active = true;
+      Promise.resolve().then(run).then((result) => {
+        if (result?.again) queued = true;
+        if (result?.retry && !queued) retryTimer = setTimeout(schedule, retryDelay);
+      }).catch(() => {
+        if (!queued) retryTimer = setTimeout(schedule, retryDelay);
+      }).finally(() => {
+        active = false;
+        if (queued) { queued = false; queueMicrotask(schedule); }
+      });
+    };
+    return schedule;
+  };
   const sha256Hex = async (text) => {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
     return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
@@ -202,18 +222,6 @@
   const messageReceiptLabel = (entry) => entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
       "Outcome unknown. Retry to check.";
-  const transcriptEntryKey = (entry, index, entries = []) => {
-    const turnID = entry?.turnId || "";
-    const itemID = entry?.itemId || "";
-    if (turnID && itemID) return JSON.stringify([turnID, itemID]);
-    let occurrence = 0;
-    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
-      const prior = entries[priorIndex];
-      if (!prior?.itemId && (prior?.turnId || "") === turnID &&
-          (prior?.kind || "") === (entry?.kind || "")) occurrence += 1;
-    }
-    return JSON.stringify([turnID, itemID, entry?.kind || "", occurrence]);
-  };
   const captureTranscriptDisclosureState = (container) => {
     const states = new Map();
     for (const element of container.querySelectorAll("[data-transcript-entry-key]")) {
@@ -326,9 +334,9 @@
       pause() { this.view(); paused = true; needsFresh = true; recovery = null; },
       resume() { paused = false; recovery = now(); },
       failed() { needsFresh = true; if (!paused && recovery === null) recovery = now(); },
-      view() {
+      view(maxAge = 15_000) {
         const age = received === null ? Infinity : Math.max(0, now() - received);
-        const stale = needsFresh || age > 15_000;
+        const stale = needsFresh || age > maxAge;
         if (!paused && !stale) elapsed = age;
         if (!paused && stale && recovery === null) recovery = now();
         return {elapsed, stale, unavailable: !paused && stale && recovery !== null && now() - recovery >= 10_000};
@@ -875,6 +883,7 @@
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
       markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
+      createTranscriptAcknowledgementScheduler,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript, transcriptFollowOnScroll,
       renderCollaborationModes,
@@ -885,7 +894,7 @@
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash, sessionTabFromLocation,
-      transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
+      transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
       creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
@@ -910,7 +919,7 @@
   const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
-  const conversationAssets = await import("/codex/assets/conversation.js?v=9");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=11");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -2548,7 +2557,13 @@
   ) : null;
   let sync = null;
   let transcriptInitialized = false;
-  let transcriptSignature = "";
+  const pagingHelpersAvailable = ["createTranscriptHistory", "readTranscriptPage", "transcriptEntryKey"]
+    .every(name => typeof conversationAssets[name] === "function");
+  const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory() : null;
+  let pagingUnavailable = !pagingHelpersAvailable;
+  let historyRead = null, historyRetryTimer = null, historyError = "";
+  let metadataRetryTimer = null, metadataRetryDelay = 2000;
+  let latestThreadPayload = null;
   let transcriptFilter = "messages";
   let transcriptEntries = [];
   const transcriptViews = new Map(["all", "messages", "activity"].map((filter) => [filter, {
@@ -2559,7 +2574,6 @@
   let planImplementationInFlight = false;
   const pendingMessages = new Map();
   const inFlightMessageIDs = new Set();
-  let sendReceiptAcknowledgementActive = false;
   const requestInputDrafts = new Map(), promptStatuses = new Map(), respondingPrompts = new Set(), answeredOffers = new Set();
   let currentPrompts = [];
   const codexWork = document.getElementById("codex-work");
@@ -2573,6 +2587,8 @@
   let activityAvailable = false;
   const timingClock = createTimingClock();
   let activityRead = null;
+  let activityTimer = null, lastActivityReadAt = -Infinity;
+  const activityFreshnessBudget = () => activitySnapshot?.currentState === "idle" ? 35_000 : 15_000;
 
   let sendAttemptStorage = null;
   try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
@@ -2583,7 +2599,7 @@
   const updateCodexWaitingIndicator = () => {
     const state = activitySnapshot?.currentState;
     const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
-    const timing = timingClock.view();
+    const timing = timingClock.view(activityFreshnessBudget());
     const waiting = interactive && activityAvailable && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
       ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
@@ -2594,7 +2610,7 @@
   };
   const updateCodexWork = (active = threadActive) => {
     if (!codexWork || !codexWorkElapsed) return;
-    const timing = timingClock.view();
+    const timing = timingClock.view(activityFreshnessBudget());
     if (!activitySnapshot) {
       codexWork.hidden = !active;
       codexWorkLabel.textContent = "Codex is working";
@@ -2624,10 +2640,23 @@
       "Waiting includes answered blocking requests and gaps between turns. The current wait is shown separately.";
     updateCodexWaitingIndicator();
   };
-  const refreshActivity = () => {
+  const scheduleActivity = (delay) => {
+    if (activityTimer !== null) clearTimeout(activityTimer);
+    activityTimer = null;
+    if (document.hidden || pageReads.paused || !interactive && activitySnapshot) return;
+    activityTimer = setTimeout(() => { activityTimer = null; void refreshActivity(); }, delay);
+  };
+  const refreshActivity = (force = false) => {
     if (!client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead) return activityRead;
+    const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? 30_000 : 5000;
+    const elapsed = Date.now() - lastActivityReadAt;
+    if (!force && elapsed < interval) {
+      scheduleActivity(interval - elapsed);
+      return Promise.resolve();
+    }
+    lastActivityReadAt = Date.now();
     const read = pageReads.begin();
     activityRead = client.activity({signal: read.signal}).then(snapshot => {
       if (!read.isCurrent()) return;
@@ -2635,15 +2664,15 @@
     }).catch(() => { if (read.isCurrent()) { activityAvailable = false; timingClock.failed(); } }).finally(() => {
       read.finish(); activityRead = null;
       if (!pageReads.paused) updateCodexWork();
+      scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? 30_000 : 5000);
     });
     return activityRead;
   };
-  pauseTiming = () => { timingClock.pause(); updateCodexWaitingIndicator(); };
-  resumeTiming = () => { timingClock.resume(); updateCodexWaitingIndicator(); void refreshActivity(); };
+  pauseTiming = () => { timingClock.pause(); updateCodexWaitingIndicator(); clearTimeout(activityTimer); activityTimer = null; };
+  resumeTiming = () => { timingClock.resume(); updateCodexWaitingIndicator(); void refreshActivity(true); };
   if (pageReads.paused) pauseTiming();
   setInterval(() => { if (!document.hidden && !pageReads.paused) updateCodexWork(); }, 1000);
-  setInterval(() => { void refreshActivity(); }, 5000);
-  addEventListener("focus", () => { void refreshActivity(); });
+  addEventListener("focus", () => { void refreshActivity(true); });
 
   const loadMessageReceipts = () => {
     if (!currentThreadId || pendingMessages.size) return;
@@ -2676,51 +2705,39 @@
   loadMessageReceipts();
   renderMessageReceipts();
 
-  const acknowledgeTranscriptMessages = (entries) => {
-    if (sendReceiptAcknowledgementActive) return;
-    const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
+  const acknowledgeTranscriptMessages = createTranscriptAcknowledgementScheduler(async () => {
+    const threadID = currentThreadId;
+    const attempts = loadSendAttempts(sendAttemptStorage, slug, threadID);
     if (!attempts?.length) return;
     const observedAttempts = attempts.filter((attempt) => pendingMessages.get(attempt.id)?.state === "observed");
-    const candidates = sendAcknowledgementCandidates(entries, observedAttempts, inFlightMessageIDs, attempts.length)
+    const candidates = sendAcknowledgementCandidates(transcriptEntries, observedAttempts, inFlightMessageIDs, attempts.length)
       .filter((attempt) => pendingMessages.get(attempt.id)?.transcriptDigest === attempt.transcriptDigest);
     const batch = candidates.slice(0, 100);
     if (!batch.length) return;
-    sendReceiptAcknowledgementActive = true;
-    let continueAcknowledging = false;
-    let retryAcknowledgement = false;
-    void client.acknowledgeMessages(batch.map((attempt) => ({
+    const result = await client.acknowledgeMessages(batch.map((attempt) => ({
       clientUserMessageId: attempt.id, digest: attempt.transcriptDigest,
-    }))).then((result) => {
-      const acknowledged = new Set(result.acknowledgedClientUserMessageIds || []);
-      let removedAll = true;
-      for (const attempt of batch) {
-        if (!acknowledged.has(attempt.id)) {
-          removedAll = false;
-          continue;
-        }
-        if (deleteSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt.id)) {
-          pendingMessages.delete(attempt.id);
-          const composer = document.getElementById("message-form")?.elements.message;
-          if (composer && composer.value.trim() === attempt.message && composerUploads?.ready() &&
-              conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
-            composer.value = "";
-            composerUploads.clear();
-          }
-        } else {
-          removedAll = false;
-        }
+    })));
+    if (threadID !== currentThreadId) return;
+    const acknowledged = new Set(result.acknowledgedClientUserMessageIds || []);
+    let removedAll = true;
+    for (const attempt of batch) {
+      if (!acknowledged.has(attempt.id)) {
+        removedAll = false;
+        continue;
       }
-      renderMessageReceipts();
-      continueAcknowledging = removedAll && candidates.length > batch.length;
-      retryAcknowledgement = !removedAll;
-    }).catch(() => {
-      retryAcknowledgement = true;
-    }).finally(() => {
-      sendReceiptAcknowledgementActive = false;
-      if (continueAcknowledging) queueMicrotask(() => acknowledgeTranscriptMessages(entries));
-      if (retryAcknowledgement) setTimeout(() => acknowledgeTranscriptMessages(entries), 2000);
-    });
-  };
+      if (deleteSendAttempt(sendAttemptStorage, slug, threadID, attempt.id)) {
+        pendingMessages.delete(attempt.id);
+        const composer = document.getElementById("message-form")?.elements.message;
+        if (composer && composer.value.trim() === attempt.message && composerUploads?.ready() &&
+            conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
+          composer.value = "";
+          composerUploads.clear();
+        }
+      } else removedAll = false;
+    }
+    renderMessageReceipts();
+    return {again: removedAll && candidates.length > batch.length, retry: !removedAll};
+  });
 
   const renderPlanActions = async (payload) => {
     const panel = document.getElementById("plan-actions");
@@ -2921,7 +2938,8 @@
     const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
     const details = entry.details || "";
     const html = entry.html || "";
-    const entryKey = transcriptEntryKey(entry, index, entries);
+    const entryKey = pagingHelpersAvailable ? conversationAssets.transcriptEntryKey(entry, index, entries) :
+      JSON.stringify([entry.turnId || "", entry.itemId || "", index]);
     const element = document.createElement("div");
     const activityElement = conversationAssets.createTranscriptActivity(entry);
     element.className = `message ${kind}`;
@@ -2963,7 +2981,7 @@
     footer.className = "message-footer";
     footer.append(conversationAssets.createTranscriptCopyButton(entry), time);
     element.append(footer);
-    transcript.append(element);
+    return element;
   };
 
   const renderTranscriptEntries = (entries, disclosureStates) => {
@@ -2980,7 +2998,7 @@
           separator.textContent = timestamp.dateLabel;
           transcript.append(separator);
         }
-        appendMessage(entry, index, entries, disclosureStates);
+        transcript.append(appendMessage(entry, index, entries, disclosureStates));
       }
     });
     if (!visibleEntries.length) {
@@ -2990,6 +3008,68 @@
         `No ${transcriptFilter} in this conversation.`;
       transcript.append(empty);
     }
+  };
+
+  const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
+    const oldNodes = new Map([...transcript.children].filter((node) => node.dataset.transcriptEntryKey)
+      .map((node) => [node.dataset.transcriptEntryKey, node]));
+    const oldDates = new Map([...transcript.children].filter((node) => node.dataset.transcriptDateKey)
+      .map((node) => [node.dataset.transcriptDateKey, node]));
+    const anchor = !follow ? [...transcript.children].find((node) =>
+      node.getBoundingClientRect().bottom > transcript.getBoundingClientRect().top) : null;
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    const anchorKey = anchor?.dataset.transcriptEntryKey;
+    const anchorDateKey = anchor?.dataset.transcriptDateKey;
+    const previousTop = transcript.scrollTop;
+    const previousHeight = transcript.scrollHeight;
+    const desired = [];
+    const entries = rows.map((row) => row.entry);
+    let lastDate = "", dateOccurrence = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      const {key, entry} = rows[index];
+      if (!transcriptEntryVisible(entry, transcriptFilter)) continue;
+      const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+      if (timestamp.dateKey && timestamp.dateKey !== lastDate) {
+        lastDate = timestamp.dateKey;
+        const dateKey = `${timestamp.dateKey}:${dateOccurrence++}`;
+        let separator = oldDates.get(dateKey);
+        if (!separator) {
+          separator = document.createElement("div");
+          separator.className = "transcript-date";
+          separator.dataset.transcriptDateKey = dateKey;
+          separator.textContent = timestamp.dateLabel;
+        }
+        desired.push(separator);
+      }
+      let node = oldNodes.get(key);
+      if (!node || changed.has(key)) {
+        const disclosures = new Map();
+        const disclosure = node?.querySelector("details");
+        if (disclosure) disclosures.set(key, disclosure.open);
+        node = appendMessage(entry, index, entries, disclosures);
+      }
+      desired.push(node);
+    }
+    if (!desired.length) {
+      const empty = transcript.querySelector(".empty") || document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = transcriptFilter === "all" ? "No conversation entries yet." :
+        `No ${transcriptFilter} in this conversation.`;
+      desired.push(empty);
+    }
+    const keep = new Set(desired);
+    for (const node of [...transcript.children]) if (!keep.has(node)) node.remove();
+    desired.forEach((node, index) => {
+      if (transcript.children[index] !== node) transcript.insertBefore(node, transcript.children[index] || null);
+    });
+    const currentAnchor = anchor?.isConnected ? anchor : desired.find((node) =>
+      (anchorKey && node.dataset.transcriptEntryKey === anchorKey) ||
+      (anchorDateKey && node.dataset.transcriptDateKey === anchorDateKey));
+    if (follow) transcript.scrollTop = transcript.scrollHeight;
+    else if (currentAnchor && Number.isFinite(anchorTop)) {
+      transcript.scrollTop += currentAnchor.getBoundingClientRect().top - anchorTop;
+    } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, transcript.scrollHeight - previousHeight);
+    else transcript.scrollTop = previousTop;
   };
 
   const saveTranscriptView = () => {
@@ -3019,64 +3099,147 @@
     });
   });
 
-  const renderThread = async (payload, isCurrent = () => true) => {
+  const historyControls = document.getElementById("history-controls");
+  const loadOlderButton = document.getElementById("load-older");
+  const repairHistoryButton = document.getElementById("repair-history");
+  const historyStatus = document.getElementById("history-status");
+  const renderHistoryControls = () => {
+    if (!historyControls) return;
+    const older = transcriptHistory?.hasOlder && !transcriptHistory.gap && !pagingUnavailable;
+    loadOlderButton.hidden = !older;
+    loadOlderButton.disabled = Boolean(historyRead);
+    repairHistoryButton.hidden = !transcriptHistory?.gap && !historyError;
+    repairHistoryButton.disabled = Boolean(historyRead);
+    historyStatus.textContent = historyRead ? "Loading history…" :
+      (historyError || (transcriptHistory?.gap ? "Checking earlier messages…" :
+        pagingUnavailable ? "Older history is unavailable on this server." : ""));
+    historyControls.hidden = !older && !historyStatus.textContent && repairHistoryButton.hidden;
+  };
+  const observePageReceipts = (entries, threadID) => {
+    void markTranscriptMessagesObserved(new Map(pendingMessages), entries).then((observed) => {
+      if (currentThreadId !== threadID || pageReads.paused) return;
+      for (const receipt of observed) {
+        const current = pendingMessages.get(receipt.id);
+        if (!current || current.message !== receipt.message || current.state === "observed") continue;
+        pendingMessages.set(receipt.id, receipt);
+        storeSendAttempt(sendAttemptStorage, slug, threadID, receipt);
+      }
+      if (observed.length) renderMessageReceipts();
+      acknowledgeTranscriptMessages();
+    }).catch(() => {});
+  };
+  const renderThread = (payload, isCurrent = () => true, kind = "newest") => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
+    if (!isCurrent()) return;
     if (currentThreadId && currentThreadId !== payload.threadId) {
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
+      pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
     }
     currentThreadId = payload.threadId;
     loadMessageReceipts();
-    recoverPlanAttempts(payload.latestTurnId);
-    const follow = !transcriptInitialized || transcriptViews.get(transcriptFilter).follow;
-    const previousTop = transcript.clientHeight ? transcript.scrollTop : transcriptViews.get(transcriptFilter).scrollTop;
-    const entries = payload.entries || [];
-    const nextSignature = JSON.stringify(entries);
-    const transcriptChanged = !transcriptInitialized || nextSignature !== transcriptSignature;
-    const observedMessages = await markTranscriptMessagesObserved(pendingMessages, entries);
-    if (!isCurrent()) return;
-    for (const observed of observedMessages) {
-      storeSendAttempt(sendAttemptStorage, slug, currentThreadId, observed);
+    const view = transcriptViews.get(transcriptFilter);
+    const follow = !transcriptInitialized || (kind === "newest" && view.follow);
+    const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(payload) :
+      kind === "repair" ? transcriptHistory.applyRepair(payload) : transcriptHistory.applyNewest(payload)) :
+      {changed: new Set(), reset: false};
+    transcriptEntries = transcriptHistory ? transcriptHistory.entries : payload.entries || [];
+    if (update.reset) {
+      transcriptInitialized = false;
+      currentMode = "";
     }
-    renderMessageReceipts();
-    acknowledgeTranscriptMessages(entries);
-    if (transcriptChanged) {
-      const view = transcriptViews.get(transcriptFilter);
-      view.disclosures = captureTranscriptDisclosureState(transcript);
-      view.follow = follow;
-      view.scrollTop = previousTop;
-      view.initialized = transcriptInitialized;
-      transcriptEntries = entries;
-      renderTranscriptEntries(entries, view.disclosures);
-    }
-    const threadStatus = payload.status;
-    threadActive = threadStatus === "active";
-    updateCodexWork(threadActive);
-    currentModel = payload.model || currentModel;
-    currentEffort = payload.reasoningEffort || currentEffort;
-    currentMode = payload.collaborationMode || currentMode;
-    applyCurrentSettings();
-    updateMessageActions();
-    status.textContent = threadStatus || "Connected";
-    status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
+    if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
+    else renderTranscriptEntries(transcriptEntries, view.disclosures);
+    view.scrollTop = transcript.scrollTop;
+    view.initialized = true;
     const newOutput = document.getElementById("new-output");
-    if (transcriptChanged) {
-      if (follow) {
-        transcript.scrollTop = transcript.scrollHeight;
-        if (newOutput) newOutput.hidden = true;
-      } else {
-        transcript.scrollTop = previousTop;
-        if (newOutput && transcriptInitialized) newOutput.hidden = false;
+    if (newOutput && follow) newOutput.hidden = true;
+    else if (newOutput && kind === "newest" && transcriptInitialized && update.changed.size) newOutput.hidden = false;
+    if (kind === "newest") {
+      latestThreadPayload = payload;
+      pagingUnavailable = !pagingHelpersAvailable || Boolean(payload.legacy);
+      historyError = "";
+      recoverPlanAttempts(payload.latestTurnId);
+      const threadStatus = payload.status;
+      threadActive = threadStatus === "active";
+      updateCodexWork(threadActive);
+      currentModel = payload.model || currentModel;
+      currentEffort = payload.reasoningEffort || currentEffort;
+      currentMode = payload.collaborationMode || "";
+      applyCurrentSettings();
+      const modeStatus = document.getElementById("codex-mode-status");
+      if (modeStatus) {
+        modeStatus.hidden = Boolean(currentMode);
+        modeStatus.textContent = payload.metadataPending ? "Checking mode…" : "Mode unavailable";
       }
-      const view = transcriptViews.get(transcriptFilter);
-      view.follow = follow;
-      view.scrollTop = transcript.clientHeight ? transcript.scrollTop : previousTop;
-      view.initialized = true;
+      updateMessageActions();
+      status.textContent = threadStatus || "Connected";
+      status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
+      if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
+      metadataRetryTimer = null;
+      if (payload.metadataPending && !pageReads.paused) {
+        metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; scheduleRefresh(0); }, metadataRetryDelay);
+        metadataRetryDelay = Math.min(30_000, metadataRetryDelay * 2);
+      } else metadataRetryDelay = 2000;
     }
     transcriptInitialized = true;
-    transcriptSignature = nextSignature;
+    observePageReceipts(transcriptEntries, currentThreadId);
     renderMessageReceipts();
-    renderPlanActions(payload);
+    renderHistoryControls();
+    renderPlanActions({...((latestThreadPayload) || payload), entries: transcriptEntries});
   };
+
+  const runHistoryRead = async (kind) => {
+    if (!transcriptHistory || historyRead || pageReads.paused || document.hidden || pagingUnavailable || typeof client.threadPage !== "function") return;
+    const cursor = kind === "older" ? transcriptHistory.olderCursor : transcriptHistory.repairCursor;
+    if (!cursor) return;
+    const threadID = currentThreadId;
+    const readVersion = transcriptHistory.repairVersion;
+    const read = pageReads.begin(35_000);
+    historyRead = true;
+    historyError = "";
+    renderHistoryControls();
+    try {
+      const page = await conversationAssets.readTranscriptPage(client, {
+        cursor, signal: read.signal, expectedThreadId: threadID,
+      });
+      if (!read.isCurrent() || threadID !== currentThreadId ||
+          readVersion !== transcriptHistory.repairVersion) return;
+      renderThread(page, () => read.isCurrent() && threadID === currentThreadId, kind);
+    } catch (error) {
+      if (!read.isCurrent() || threadID !== currentThreadId ||
+          readVersion !== transcriptHistory.repairVersion) return;
+      if (error.code === "transcript_cursor_expired" || error.code === "transcript_reset_required") {
+        transcriptHistory.invalidateCursor();
+        historyError = "History changed. Reconnecting…";
+        scheduleRefresh(0);
+      } else if (error.status === 501 && error.code === "transcript_paging_unavailable") {
+        pagingUnavailable = true;
+        historyError = "Older history is unavailable on this server.";
+        scheduleRefresh(0);
+      } else historyError = "Earlier messages could not be loaded. Retry.";
+    } finally {
+      read.finish();
+      historyRead = null;
+      renderHistoryControls();
+      if (!historyError && transcriptHistory.gap && transcriptHistory.repairCursor) scheduleHistoryRepair(40);
+    }
+  };
+  const scheduleHistoryRepair = (delay = 40) => {
+    if (!transcriptHistory?.gap || !transcriptHistory.repairCursor || historyRetryTimer !== null || historyError ||
+        pageReads.paused || document.hidden || pagingUnavailable) return;
+    historyRetryTimer = setTimeout(() => {
+      historyRetryTimer = null;
+      if (historyRead) scheduleHistoryRepair(100);
+      else void runHistoryRead("repair");
+    }, delay);
+  };
+  loadOlderButton?.addEventListener("click", () => { void runHistoryRead("older"); });
+  repairHistoryButton?.addEventListener("click", () => {
+    historyError = "";
+    if (transcriptHistory?.repairCursor) scheduleHistoryRepair(0);
+    else scheduleRefresh(0);
+    renderHistoryControls();
+  });
 
   const showPromptStatus = (entry, message) => {
     const key = promptDraftKey(entry);
@@ -3092,7 +3255,9 @@
     const read = pageReads.begin(), deadline = Date.now() + 9000;
     try {
       do {
-        const thread = await client.thread({signal: read.signal});
+        const thread = pagingHelpersAvailable ?
+          await conversationAssets.readTranscriptPage(client, {signal: read.signal, legacy: pagingUnavailable}) :
+          await client.thread({signal: read.signal});
         const pending = await client.pending({signal: read.signal});
         if (!read.isCurrent() || read.signal.aborted || thread.threadId !== entry.threadId ||
             thread.latestTurnId !== (entry.turnId || entry.params?.turnId)) return null;
@@ -3461,6 +3626,34 @@
     composerView.replacePending(entries.map(renderApproval));
   };
 
+  const pendingStatus = document.getElementById("pending-status");
+  const pendingRetry = document.getElementById("pending-retry");
+  let pendingRead = null, pendingRetryTimer = null, pendingRetryDelay = 2000;
+  const refreshPending = (force = false) => {
+    if (!interactive || !client.pending || pageReads.paused || document.hidden) return Promise.resolve();
+    if (pendingRead) return pendingRead;
+    if (pendingRetryTimer !== null && !force) return Promise.resolve();
+    if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = null;
+    const read = pageReads.begin(10_000);
+    pendingRead = client.pending({signal: read.signal}).then((entries) => {
+      if (!read.isCurrent()) return;
+      if (!Array.isArray(entries)) throw new Error("Invalid request list");
+      renderPendingEntries(entries);
+      pendingStatus.hidden = true;
+      pendingRetryDelay = 2000;
+    }).catch(() => {
+      if (!read.isCurrent()) return;
+      pendingStatus.querySelector("span").textContent = "Requests could not be refreshed. Previously shown questions remain available.";
+      pendingRetry.hidden = false;
+      pendingStatus.hidden = false;
+      pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
+      pendingRetryDelay = Math.min(30_000, pendingRetryDelay * 2);
+    }).finally(() => { read.finish(); pendingRead = null; });
+    return pendingRead;
+  };
+  pendingRetry?.addEventListener("click", () => { void refreshPending(true); });
+
   const queuePanel = document.getElementById("queue-panel");
   const queueList = document.getElementById("queue-list");
   const queueStart = document.getElementById("queue-start");
@@ -3481,6 +3674,7 @@
         remove.disabled = true;
         try {
           await client.deleteQueued(entry.id);
+          void refreshQueue(true);
           scheduleRefresh(0);
         } catch (error) {
           alert(error.message);
@@ -3499,7 +3693,33 @@
     }
   };
 
-  const refreshQueue = () => sync.refresh();
+  const queueStatus = document.getElementById("queue-status");
+  const queueRetry = document.getElementById("queue-retry");
+  let queueRead = null, queueRetryTimer = null, queueRetryDelay = 2000;
+  const refreshQueue = (force = false) => {
+    if (!interactive || !client.reconcileQueue || pageReads.paused || document.hidden) return Promise.resolve();
+    if (queueRead) return queueRead;
+    if (queueRetryTimer !== null && !force) return Promise.resolve();
+    if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
+    queueRetryTimer = null;
+    const read = pageReads.begin(12_000);
+    queueRead = client.reconcileQueue({signal: read.signal}).then(() => client.queue({signal: read.signal})).then((entries) => {
+      if (!read.isCurrent()) return;
+      if (!Array.isArray(entries)) throw new Error("Invalid queue");
+      renderQueue(entries);
+      queueStatus.hidden = true;
+      queueRetryDelay = 2000;
+    }).catch(() => {
+      if (!read.isCurrent()) return;
+      queueStatus.querySelector("span").textContent = "Queued messages could not be refreshed. The last result may be out of date.";
+      queueRetry.hidden = false;
+      queueStatus.hidden = false;
+      queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
+      queueRetryDelay = Math.min(30_000, queueRetryDelay * 2);
+    }).finally(() => { read.finish(); queueRead = null; });
+    return queueRead;
+  };
+  queueRetry?.addEventListener("click", () => { void refreshQueue(true); });
 
   function scheduleRefresh(delay = 200) {
     sync?.scheduleRefresh(delay);
@@ -3544,7 +3764,7 @@
       }).finally(() => {
         inFlightMessageIDs.delete(attempt.id);
         renderMessageReceipts();
-        acknowledgeTranscriptMessages(transcriptEntries);
+        acknowledgeTranscriptMessages();
       });
     }
   };
@@ -3616,7 +3836,7 @@
         composerUploads.clear();
         if (!queue) followTranscript();
         else {
-          await refreshQueue();
+          void refreshQueue(true);
           queuePanel.scrollIntoView({block: "nearest"});
         }
         scheduleRefresh(0);
@@ -3668,7 +3888,7 @@
       alert(error.message);
     } finally {
       queueStartInFlight = false;
-      await refreshQueue();
+      await refreshQueue(true);
       scheduleRefresh(0);
     }
   });
@@ -3907,23 +4127,35 @@
     }
   });
 
+  let lastSyncStatus = "";
   sync = conversationAssets.createConversationSync({
     live: interactive, eventsPath: interactive ? client.eventsPath() : null,
-    read: signal => Promise.all([
-      client.thread({signal}),
-      interactive ? client.pending({signal}) : Promise.resolve([]),
-      interactive ? client.reconcileQueue({signal}).then(() => client.queue({signal})) : Promise.resolve([]),
-    ]),
-    apply: async ([thread, pendingEntries, queuedEntries], {isCurrent}) => {
-      await renderThread(thread, isCurrent);
+    read: signal => pagingHelpersAvailable ?
+      conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal}),
+    apply: (thread, {isCurrent}) => {
+      const wasActive = threadActive;
+      renderThread(thread, isCurrent);
       if (!isCurrent()) return;
-      renderPendingEntries(pendingEntries);
-      if (interactive) renderQueue(queuedEntries);
-      void refreshActivity();
+      void refreshPending();
+      if (wasActive !== threadActive) void refreshQueue(true);
+      scheduleHistoryRepair();
     },
-    onStateChange: state => conversationAssets.renderConnectionStatus(
-      document.getElementById("conversation-connection"), state, () => sync.retry(),
-    ),
+    onStateChange: state => {
+      conversationAssets.renderConnectionStatus(
+        document.getElementById("conversation-connection"), state, () => sync.retry(),
+      );
+      if (state.status === "connected" && lastSyncStatus !== "connected") {
+        void refreshPending(true);
+        void refreshQueue(true);
+        void refreshActivity(true);
+      }
+      lastSyncStatus = state.status;
+    },
   });
+  void refreshPending();
+  void refreshQueue();
+  void refreshActivity(true);
+  setInterval(() => { void refreshPending(); }, 15_000);
+  setInterval(() => { void refreshQueue(); }, 30_000);
   if (interactive) loadCollaborationModes();
 })();

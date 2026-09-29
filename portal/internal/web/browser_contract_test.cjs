@@ -10,11 +10,12 @@ const {
   deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
   loadRequestInputDraft, loadSendAttempts, markTranscriptMessagesObserved,
+  createTranscriptAcknowledgementScheduler,
   matchingSendAttempt, messageActionLabel, messageReceiptLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
   sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript, transcriptFollowOnScroll,
   shouldSubmitMessage, storeQueueAttempt,
-  storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
+  storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
@@ -115,6 +116,34 @@ if (!conversationModulePath) throw new Error("browser contract test requires the
 (async () => {
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
 configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
+const retainedHistory = conversationAssets.createTranscriptHistory();
+const recentReceipt = {turnId: "turn-1", itemId: "recent", kind: "userMessage",
+  clientUserMessageId: "recent", clientUserMessageDigest: "a".repeat(64)};
+const olderReceipt = {turnId: "turn-1", itemId: "older", kind: "userMessage",
+  clientUserMessageId: "older", clientUserMessageDigest: "b".repeat(64)};
+retainedHistory.applyNewest({threadId: "thread-1", entries: [recentReceipt],
+  hasOlder: true, olderCursor: "old-1"});
+let receiptAttempts = [{id: "recent"}, {id: "older"}];
+let finishRecentAcknowledgement;
+const acknowledgementBatches = [];
+const scheduleAcknowledgement = createTranscriptAcknowledgementScheduler(async () => {
+  const batch = sendAcknowledgementCandidates(retainedHistory.entries, receiptAttempts);
+  acknowledgementBatches.push(batch.map(attempt => attempt.id));
+  if (acknowledgementBatches.length === 1) {
+    await new Promise(resolve => { finishRecentAcknowledgement = resolve; });
+  }
+  receiptAttempts = receiptAttempts.filter(attempt => !batch.some(candidate => candidate.id === attempt.id));
+});
+scheduleAcknowledgement();
+await new Promise(resolve => setImmediate(resolve));
+retainedHistory.applyOlder({threadId: "thread-1", entries: [olderReceipt], hasOlder: false});
+retainedHistory.applyNewest({threadId: "thread-1", entries: [recentReceipt],
+  hasOlder: true, olderCursor: "new-1"});
+scheduleAcknowledgement();
+finishRecentAcknowledgement();
+await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(acknowledgementBatches, [["recent"], ["older"]]);
+assert.deepEqual(receiptAttempts, []);
 const compatibilityConversation = (fetchImplementation) => (
   conversationAssets.createConversationClient({
     id: "example",
@@ -229,16 +258,6 @@ for (const [location, expected] of [
   [{search: "?tab=unrecognized", hash: "#new-L42"}, "codex"],
   [{search: "?tab=repositories", hash: "#%E0%A4%A"}, "repositories"],
 ]) assert.equal(sessionTabFromLocation(location, ["codex", "repositories"], "codex"), expected);
-assert.equal(transcriptEntryKey({turnId: "turn-1", itemId: "item-1"}, 7), '["turn-1","item-1"]');
-const fallbackEntry = {turnId: "turn-1", kind: "error"};
-assert.equal(
-  transcriptEntryKey(fallbackEntry, 1, [{turnId: "old-turn", kind: "plan"}, fallbackEntry]),
-  transcriptEntryKey(fallbackEntry, 0, [fallbackEntry]),
-);
-assert.notEqual(
-  transcriptEntryKey(fallbackEntry, 0, [fallbackEntry, fallbackEntry]),
-  transcriptEntryKey(fallbackEntry, 1, [fallbackEntry, fallbackEntry]),
-);
 const disclosureStates = captureTranscriptDisclosureState({
   querySelectorAll: () => [
     {

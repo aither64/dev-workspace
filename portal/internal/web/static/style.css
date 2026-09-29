@@ -187,6 +187,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .chat-heading h2 { margin: 0; font-size: 1rem; }
 .conversation-connection { flex: none; font-size: .8rem; margin: .5rem 0 0; }
 .conversation-connection button { margin-left: .5rem; padding: .3rem .5rem; }
+.history-controls { display: flex; align-items: center; gap: .65rem; padding: .45rem 0; color: var(--muted); font-size: .8rem; }
+.history-controls[hidden], .lane-status[hidden] { display: none; }
+.history-controls button { padding: .35rem .6rem; font-size: .8rem; }
+.lane-status { margin: .25rem 0; color: var(--warning); font-size: .8rem; }
 .chat-panel.active { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0 clamp(.7rem, 2.5vw, 2.5rem); overflow: hidden; }
 .transcript-filters { display: flex; gap: .35rem; margin: 0 auto 0 .5rem; }
 .transcript-filters button { padding: .38rem .65rem; font-size: .78rem; }

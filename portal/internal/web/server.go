@@ -1633,7 +1633,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 			return nil, false
 		}
 	}
-	if len(parts) == 3 && parts[1] != "queue" &&
+	if len(parts) == 3 && parts[1] != "queue" && !(parts[1] == "thread" && parts[2] == "page") &&
 		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
 		return nil, false
 	}
@@ -1658,6 +1658,9 @@ func legacyConversationPath(parts []string, method string) string {
 	if len(parts) == 3 && parts[1] == "queue" &&
 		(method == http.MethodDelete ||
 			(method == http.MethodPost && (parts[2] == "start" || parts[2] == "reconcile"))) {
+		return "/codex/conversations/" + strings.Join(parts, "/")
+	}
+	if len(parts) == 3 && parts[1] == "thread" && parts[2] == "page" && method == http.MethodGet {
 		return "/codex/conversations/" + strings.Join(parts, "/")
 	}
 	return ""
@@ -3049,10 +3052,14 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, memberErr
 		}
 		threadID = member.Thread
-		conversationClient = memberConversationClient{
+		memberClient := memberConversationClient{
 			Client: s.config.Codex, server: s, service: service,
 			slug: slug, rootThreadID: summary.Codex.ThreadID,
 			address: address, threadID: threadID,
+		}
+		conversationClient = memberClient
+		if _, ok := s.config.Codex.(conversation.TranscriptPageReader); ok {
+			conversationClient = memberPagedConversationClient{memberClient}
 		}
 	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)

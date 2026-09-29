@@ -23,6 +23,60 @@ type testActivityObserver struct {
 	events   chan struct{}
 }
 
+type budgetActivityObserver struct {
+	*testActivityObserver
+	state string
+	fail  bool
+}
+
+func (o *budgetActivityObserver) ReadActivity(_ context.Context, id string) (codex.ActivitySnapshot, error) {
+	o.read <- id
+	if o.fail {
+		return codex.ActivitySnapshot{}, errors.New("activity unavailable")
+	}
+	return codex.ActivitySnapshot{ThreadID: id, CurrentState: o.state}, nil
+}
+
+func TestActivityReadSharesSnapshotWithinStateBudget(t *testing.T) {
+	base := time.Now()
+	var elapsed atomic.Int64
+	observer := &budgetActivityObserver{testActivityObserver: &testActivityObserver{read: make(chan string, 16)}, state: "working"}
+	monitor := &activityMonitor{observer: observer, clock: func() time.Time { return base.Add(time.Duration(elapsed.Load())) }}
+	for _, second := range []int64{0, 4, 5} {
+		elapsed.Store(int64(time.Duration(second) * time.Second))
+		if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(observer.read); got != 2 {
+		t.Fatalf("active reads = %d, want 2", got)
+	}
+	observer.state = "idle"
+	elapsed.Store(int64(10 * time.Second))
+	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	elapsed.Store(int64(39 * time.Second))
+	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(observer.read); got != 3 {
+		t.Fatalf("idle reads = %d, want 3", got)
+	}
+	elapsed.Store(int64(40 * time.Second))
+	observer.fail = true
+	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err == nil {
+		t.Fatal("failed read returned the cached snapshot")
+	}
+	observer.fail = false
+	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(observer.read); got != 5 {
+		t.Fatalf("failed read refreshed cache or blocked retry: %d", got)
+	}
+}
+
 func (o *testActivityObserver) VerifyThread(_ context.Context, id, cwd string) error {
 	select {
 	case o.verified <- cwd:
