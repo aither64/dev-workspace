@@ -717,6 +717,7 @@ module DevWorkspaceHost
                manifest.dig('codex', 'socket_path') == runtime.fetch(:codex)
           raise Error, 'archived tracking does not match the retained root and Codex authority'
         end
+        require_ready_archive_recovery_creation!(entry, slug, manifest.fetch('creation'))
         helper = File.join(candidate, 'bin/workspace-portal')
         environment = @env.to_h.merge(
           'DEV_WORKSPACE_NAME' => entry.fetch('name'),
@@ -775,7 +776,7 @@ module DevWorkspaceHost
           File.exist?(File.join(root, "#{slug}.#{name}.json")) ||
           File.symlink?(File.join(root, "#{slug}.#{name}.json"))
       end
-      %w[creation fork start agent-teams-migration].each do |name|
+      %w[fork start agent-teams-migration].each do |name|
         raise Error, 'conflicting session operation blocks archive recovery' if
           File.exist?(File.join(root, "#{slug}.#{name}.json")) ||
           File.symlink?(File.join(root, "#{slug}.#{name}.json"))
@@ -810,6 +811,19 @@ module DevWorkspaceHost
       [path, journal]
     rescue ArgumentError
       raise Error, 'archive recovery journal has an invalid finalization time'
+    end
+
+    def require_ready_archive_recovery_creation!(entry, slug, creation)
+      path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json")
+      return unless File.exist?(path) || File.symlink?(path)
+
+      require_safe_private_file!(path, 'archive recovery creation journal')
+      journal = read_private_creation_journal!(path, slug)
+      goal = journal.fetch('goal_sha256')
+      goal_matches = goal.nil? ? !creation.key?('goal_sha256') : creation['goal_sha256'] == goal
+      unless journal.fetch('state') == 'ready' && goal_matches
+        raise Error, 'archive recovery creation journal is unfinished or mismatched'
+      end
     end
 
     def activate(argv)
