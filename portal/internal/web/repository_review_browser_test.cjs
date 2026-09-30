@@ -7,7 +7,7 @@ const fs = require("node:fs");
     await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
   const original = "https://workspace.example.test/example/?unrelated=kept#codex";
   const route = {
-    repository: "repository-id", review: "frozen-review", commit: "a".repeat(40),
+    repository: "repository-id", review: "frozen-review", snapshot: "", kind: "", commit: "a".repeat(40),
     file: "file-id", view: "file", version: "old", layout: "unified",
     line: {side: "old", number: 12000},
   };
@@ -27,7 +27,7 @@ const fs = require("node:fs");
     assert.equal(reviewRoute("https://workspace.example.test/" + bad).line, null);
   }
   const overview = reviewURL(href);
-  for (const key of ["repository", "review", "commit", "file", "view", "layout", "version"]) {
+  for (const key of ["repository", "review", "snapshot", "kind", "commit", "file", "view", "layout", "version"]) {
     assert.equal(new URL(overview).searchParams.has(key), false, key);
   }
   assert.equal(new URL(overview).hash, "");
@@ -38,6 +38,11 @@ const fs = require("node:fs");
   assert.deepEqual(fileStatus("R100"), ["renamed", "Renamed"]);
   assert.deepEqual(fileStatus("T"), ["type", "Type changed"]);
   assert.equal(changeCounts({additions: null, deletions: null}), "Binary");
+  assert.equal(changeCounts({additions: null, deletions: null, limited: true}), "Not compared");
+  const worktreeURL = reviewURL(original, {repository: "repository-id", snapshot: "ephemeral-id", kind: "unstaged", file: "file-id"});
+  assert.equal(reviewRoute(worktreeURL).snapshot, "ephemeral-id");
+  assert.equal(reviewRoute(worktreeURL).review, "");
+  assert.equal(reviewRoute(worktreeURL).kind, "unstaged");
   for (const total of [0, 1, 50, 51, 101]) {
     const pages = Math.max(1, Math.ceil(total / 50));
     for (let page = 0; page < pages; page++) {
@@ -46,6 +51,8 @@ const fs = require("node:fs");
   }
   assert.equal(changeCounts({files: 3, additions: 7, deletions: 2, binaryFiles: 1}, true),
     "3 changed files · +7 · −2 · 1 binary file");
+  assert.equal(changeCounts({files: 2, additions: 0, deletions: 0, limitedFiles: 1, lineCountsIncomplete: true}, true),
+    "2 changed files · 1 not compared");
 
   class FakeElement {
     constructor(tag, className = "", textContent = "") {

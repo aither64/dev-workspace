@@ -32,20 +32,22 @@ const normalClick = event => event.button === 0 && !event.metaKey && !event.ctrl
 const request = async (url, options = {}) => {
   const response = await fetch(url, {credentials: "same-origin", ...options});
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Review request failed (" + response.status + ")");
+  if (!response.ok) throw Object.assign(new Error(payload.error || "Review request failed (" + response.status + ")"), {status: response.status});
   return payload;
 };
 const readMode = () => {
   try { return localStorage.getItem("repository-review-mode") === "split" ? "split" : "unified"; }
   catch (_) { return "unified"; }
 };
-const routeKeys = ["repository", "review", "commit", "file", "view", "layout", "version"];
+const routeKeys = ["repository", "review", "snapshot", "kind", "commit", "file", "view", "layout", "version"];
 export function reviewRoute(href, fallbackLayout = "unified") {
   const url = new URL(href);
   const line = /^#(old|new)-L([1-9][0-9]*)$/.exec(url.hash);
   return {
     repository: url.searchParams.get("repository") || "",
     review: url.searchParams.get("review") || "",
+    snapshot: url.searchParams.get("snapshot") || "",
+    kind: ["staged", "unstaged"].includes(url.searchParams.get("kind")) ? url.searchParams.get("kind") : "",
     commit: url.searchParams.get("commit") || "",
     file: url.searchParams.get("file") || "",
     view: url.searchParams.get("view") === "file" ? "file" : "diff",
@@ -68,12 +70,13 @@ export function fileStatus(status) {
 }
 const countParts = (stats, total) => {
   if (!stats) return [];
-  if (!total && (stats.additions === null || stats.deletions === null)) return [{text: "Binary"}];
+  if (!total && (stats.additions === null || stats.deletions === null)) return [{text: stats.limited ? "Not compared" : "Binary"}];
   const parts = [];
   if (total) parts.push({text: stats.files + " changed " + (stats.files === 1 ? "file" : "files")});
-  parts.push({text: "+" + Number(stats.additions || 0).toLocaleString(), className: "repository-additions"},
+  if (!total || !(stats.lineCountsIncomplete || stats.limitedFiles)) parts.push({text: "+" + Number(stats.additions || 0).toLocaleString(), className: "repository-additions"},
     {text: "−" + Number(stats.deletions || 0).toLocaleString(), className: "repository-deletions"});
   if (total && stats.binaryFiles) parts.push({text: stats.binaryFiles + " binary " + (stats.binaryFiles === 1 ? "file" : "files")});
+  if (total && stats.limitedFiles) parts.push({text: stats.limitedFiles + " not compared"});
   return parts;
 };
 export function changeCounts(stats, total = false) {
@@ -161,7 +164,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   const markChanged = (state, head) => {
     state.latestHead = head;
     state.card.querySelector(".repository-head-change").hidden = true;
-    if (active?.state === state) active.changed.hidden = !head || active.historyHead === head;
+    if (active?.state === state) active.changed.hidden = Boolean(active.kind) || !head || active.historyHead === head;
   };
   const observeHead = (state, head, ticket) => {
     if (!head || ticket < (state.observedAt || 0)) return;
@@ -249,6 +252,23 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     } catch (error) { if (!paused && !destroyed && generation === readGeneration) showFailure(state.card.querySelector("[data-repository-commits]"), error); return false; }
     finally { loadingHistory(state, false); }
   };
+  const captureWorktree = async (state, kind) => {
+    const controls = [...state.card.querySelectorAll("[data-review-worktree]")];
+    controls.forEach(control => { control.disabled = true; });
+    try {
+      const payload = await read(url("comparison", state.id), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind})});
+      navigate({repository: state.id, snapshot: payload.snapshot, kind, view: "diff", layout: readMode()});
+    } catch (error) {
+      if (review.hidden) showFailure(state.card.querySelector("[data-repository-commits]"), error);
+      else {
+        review.querySelector("[data-worktree-capture-error]")?.remove();
+        const notice = node("p", "notice warning", error.message);
+        notice.dataset.worktreeCaptureError = "";
+        review.prepend(notice);
+      }
+    }
+    finally { controls.forEach(control => { control.disabled = false; }); }
+  };
   const flushHistories = async () => {
     historyScheduled = false;
     if (paused || destroyed) return;
@@ -294,6 +314,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       if (blob.limited) lines.push(label + ": preview omitted (limit: 512 KiB or 12,000 lines; " + blob.bytes.toLocaleString() + " bytes)");
       if (blob.missingNewline) lines.push(label + ": no newline at end of file");
     }
+    if (file.warning) lines.push(file.warning);
     return lines;
   };
   const selectedFile = selected => selected.sections.get(route.file) ||
@@ -518,7 +539,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     element.classList.remove("repository-review-open"); onComparisonChange(false);
     if (update) setRoute({layout: readMode()});
   };
-  const comparisonTitle = (state, commit) => state.name + (commit ? " · " + short(commit.sha) : " · Branch comparison");
+  const comparisonTitle = (state, commit, kind = "") => state.name + (kind ? " · " + (kind === "staged" ? "Staged changes" : "Unstaged changes") : commit ? " · " + short(commit.sha) : " · Branch comparison");
   const commitDetails = (title, commit, pair) => {
     if (commit) {
       const identity = node("div", "repository-commit-detail-identity");
@@ -556,13 +577,16 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     initialTitle.append(node("h2", "", comparisonTitle(state, hint)));
     review.replaceChildren(button("← Repositories", () => closeReview()), initialTitle, node("p", "muted", "Loading comparison…"));
     try {
-      const payload = await read(url("comparison", state.id, {review: requested.review, commit: requested.commit, file: requested.file}), {signal: abort.signal});
+      const payload = await read(url("comparison", state.id, {review: requested.review, snapshot: requested.snapshot, commit: requested.commit, file: requested.file}), {signal: abort.signal});
       if (ticket !== sequence || destroyed) return;
       const heading = node("div", "repository-review-heading");
-      const title = node("h2", "repository-review-title", comparisonTitle(state, payload.commit || hint));
+      const title = node("h2", "repository-review-title", comparisonTitle(state, payload.commit || hint, payload.kind));
       title.title = title.textContent;
       const details = node("div", "repository-comparison-details");
-      commitDetails(details, payload.commit || hint, payload.pair);
+      if (payload.ephemeral) {
+        details.append(node("p", "muted repository-pair", (payload.kind === "staged" ? "HEAD → Index" : "Index → Working tree") +
+          " · HEAD " + short(payload.sourceHead) + " · Captured " + new Date(payload.capturedAt).toLocaleString()));
+      } else commitDetails(details, payload.commit || hint, payload.pair);
       details.append(counts(node("p", "repository-comparison-stats"), payload.stats, true));
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
@@ -598,6 +622,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       const changed = node("div", "notice warning repository-comparison-changed"); changed.hidden = true;
       changed.append(node("span", "", "The branch has changed. This view keeps the revisions shown above."),
         button("Refresh comparison", async () => { if (await loadHistory(state, 0, true)) navigate(comparisonRoute(state)); }));
+      if (payload.ephemeral) heading.append(button("Recapture " + payload.kind + " changes", () => captureWorktree(state, payload.kind)));
       const lineNotice = node("p", "notice warning"); lineNotice.hidden = true;
       const body = node("div", "repository-review-body");
       const fileList = node("nav", "repository-file-list"); fileList.setAttribute("aria-label", "Changed files");
@@ -656,7 +681,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         toggle.setAttribute("aria-controls", fileBody.id);
         fileBody.append(fileMetadata, host);
         section.append(fileTitle, fileBody); scroll.append(section);
-        const choiceKey = [state.id, payload.pair.base, payload.pair.head, file.id].join(":");
+        const choiceKey = [state.id, payload.ephemeral ? payload.snapshot : payload.pair.base, payload.pair.head, file.id].join(":");
         const record = {file, nav, fileLink, diffLink, versions, section, fileTitle, toggle, body: fileBody, choiceKey,
           metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, rendered: false,
           rendering: false, failure: null, failureKind: null};
@@ -686,8 +711,20 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       body.append(fileList, scroll);
       review.replaceChildren(heading, changed, lineNotice);
       if (payload.pair.warning) review.append(node("p", "notice warning", payload.pair.warning));
+      if (payload.unverifiedSubmodules?.length) {
+        const notice = node("div", "notice warning");
+        notice.append(node("p", "", `The portal did not inspect the working state of ${payload.unverifiedSubmodules.length} ${payload.unverifiedSubmodules.length === 1 ? "submodule" : "submodules"}. These entries are excluded from the changed-file count.`));
+        const details = node("details"); details.append(node("summary", "", "Submodule index identities"));
+        const list = node("ul");
+        for (const submodule of payload.unverifiedSubmodules) {
+          const item = node("li");
+          item.append(node("code", "", submodule.path), " · ", node("code", "", submodule.mode + " " + submodule.object));
+          list.append(item);
+        }
+        details.append(list); notice.append(details); review.append(notice);
+      }
       review.append(body);
-      active = {state, pair: payload.pair, snapshot: payload.snapshot, review: payload.review, commit: requested.commit,
+      active = {state, pair: payload.pair, snapshot: payload.snapshot, review: payload.review, commit: requested.commit, kind: payload.kind,
         historyHead: payload.historyHead || state.pair?.head || payload.pair.head, changed, controls, lineNotice,
         fileList, scroll, sections, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
       opening = null;
@@ -705,13 +742,18 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
       markChanged(state, state.latestHead);
       await applyView(true);
-      if (!payload.files.length) scroll.append(node("p", "empty", "No changed files between these revisions."));
+      if (!payload.files.length) scroll.append(node("p", "empty", payload.ephemeral ? "No changes in this snapshot." : "No changed files between these revisions."));
     } catch (error) {
-      if (ticket === sequence && error.name !== "AbortError") review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", error.message));
+      if (ticket === sequence && error.name !== "AbortError") {
+        review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", error.message));
+        if (requested.snapshot && error.status === 409) for (const kind of requested.kind ? [requested.kind] : ["staged", "unstaged"]) {
+          review.append(button("Recapture " + kind + " changes", () => captureWorktree(state, kind)));
+        }
+      }
     }
   };
   const restore = (hint = null, revealTree = false) => {
-    if (!route.repository || !route.review) { closeReview(false); return; }
+    if (!route.repository || (!route.review && !route.snapshot)) { closeReview(false); return; }
     const state = states.get(route.repository);
     if (!state) {
       ++sequence; destroyEditors(); active = null; overview.hidden = true; review.hidden = false;
@@ -719,7 +761,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", "This repository is not available in this session."));
       return;
     }
-    if (active && active.state === state && active.review === route.review && active.commit === route.commit) void applyView(revealTree);
+    if (active && active.state === state && active.review === route.review && (!route.snapshot || active.snapshot === route.snapshot) && active.commit === route.commit) void applyView(revealTree);
     else void openComparison(state, hint);
   };
   function navigate(next, hint = null) {
@@ -741,6 +783,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       event.preventDefault(); navigate(comparisonRoute(state));
     });
     card.querySelector("[data-review-refresh]").addEventListener("click", () => loadHistory(state, 0, true));
+    for (const control of card.querySelectorAll("[data-review-worktree]")) control.addEventListener("click", () => captureWorktree(state, control.dataset.reviewWorktree));
     queueHistory(state);
   };
   for (const card of overview.querySelectorAll("[data-repository-id]")) hydrate(card);

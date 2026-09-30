@@ -32,7 +32,7 @@
             {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{else}}<span>{{end}}<span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code>{{if .URL}}</a>{{else}}</span>{{end}}{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .OriginError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
             </div>
             <section class="repository-history" aria-label="Local commits">
-              <div class="repository-review-actions"><button type="button" data-review-branch disabled>Compare</button><button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
+              <div class="repository-review-actions"><button type="button" data-review-branch disabled>Compare</button>{{if not $.Session.Archived}}<button type="button" class="quiet" data-review-worktree="staged">Staged changes</button><button type="button" class="quiet" data-review-worktree="unstaged">Unstaged changes</button>{{end}}<button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
               <p class="repository-head-change notice warning" hidden>The branch has changed. Refresh commits to review it.</p>
               <div data-repository-commits><p class="muted">Loading local commits…</p></div>
             </section>

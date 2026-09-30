@@ -16,7 +16,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], batches = [];
-    let inFlight = 0, maxInFlight = 0, firstBatchesHeld = true, failedOnce = false;
+    let inFlight = 0, maxInFlight = 0, firstBatchesHeld = true, failedOnce = false, worktreeCaptures = 0, expireWorktree = false;
     page.on("pageerror", error => errors.push(error.message));
     await page.route("**/static/review-editor.js", route => route.fulfill({contentType: "text/javascript", body: `
       export function createReviewEditor({parent, after}) {
@@ -39,6 +39,21 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       }
       if (operation === "repository-states") return route.fulfill({json: {repositories: [{repository: "fixture", head: pair("review-a").head}]}});
       if (operation === "repository-comparison") {
+        if (route.request().method() === "POST") {
+          const {kind} = route.request().postDataJSON();
+          assert.equal(kind, "unstaged");
+          worktreeCaptures++;
+          return route.fulfill({json: {snapshot: `ephemeral-${worktreeCaptures}`, kind, ephemeral: true}});
+        }
+        const ephemeral = url.searchParams.get("snapshot");
+        if (ephemeral) {
+          if (expireWorktree) return route.fulfill({status: 409, json: {error: "This snapshot has expired. Capture the changes again."}});
+          const changedFiles = ephemeral === "ephemeral-2" ? [] : [file(0)];
+          return route.fulfill({json: {snapshot: ephemeral, review: "", kind: "unstaged", ephemeral: true,
+            capturedAt: "2026-09-30T12:00:00Z", sourceHead: "a".repeat(40), pair: pair("review-a"),
+            stats: {files: changedFiles.length, additions: changedFiles.length, deletions: changedFiles.length, binaryFiles: 0}, files: changedFiles,
+            unverifiedSubmodules: [{path: "nested/module", mode: "160000", object: "f".repeat(40)}]}});
+        }
         const review = url.searchParams.get("review") || "review-a";
         const count = review === "review-a" ? 12 : 1;
         return route.fulfill({json: {snapshot: review.replace("review", "snapshot"), review,
@@ -77,7 +92,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       section.innerHTML = `<div class="section-heading"><span>1</span></div><div class="repo-grid">
         <article class="panel repo-card" data-repository-id="fixture" data-repository-name="Fixture" data-repository-head="${"b".repeat(40)}">
           <div data-repository-status></div><div class="repository-history"><div class="repository-review-actions">
-            <button data-review-branch>Compare</button><button data-review-refresh>Refresh commits</button>
+            <button data-review-branch>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button>
           </div><p class="repository-head-change" hidden></p><div data-repository-commits></div></div>
         </article></div>`;
       document.body.append(section);
@@ -129,6 +144,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
 
     const navigate = review => page.evaluate(value => {
       const url = new URL(location.href); url.searchParams.set("tab", "repositories");
+      url.searchParams.delete("snapshot"); url.searchParams.delete("kind");
       url.searchParams.set("repository", "fixture"); url.searchParams.set("review", value);
       history.pushState(null, "", url); dispatchEvent(new PopStateEvent("popstate"));
     }, review);
@@ -144,6 +160,25 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await expect.poll(() => inFlight).toBe(0);
     await expect(fixture.locator(".fixture-editor")).toContainText("snapshot-b file 0");
     assert.equal(await fixture.locator(".repository-file-section").count(), 1);
+    await fixture.getByRole("button", {name: "← Repositories"}).first().click();
+    await fixture.locator('[data-review-worktree="unstaged"]').click();
+    await expect(fixture.locator(".repository-review-title").last()).toContainText("Unstaged changes");
+    const submoduleNotice = fixture.locator(".repository-comparison > .notice.warning:has(> details):visible");
+    await expect(submoduleNotice).toContainText("did not inspect the working state of 1 submodule");
+    await expect(fixture.locator(".repository-comparison-stats")).toContainText("1 changed file");
+    assert.equal(new URL(page.url()).searchParams.get("snapshot"), "ephemeral-1");
+    assert.equal(new URL(page.url()).searchParams.has("review"), false);
+    await fixture.getByRole("button", {name: "Recapture unstaged changes"}).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-2");
+    assert.equal(worktreeCaptures, 2);
+    await expect(fixture.locator(".repository-file-section")).toHaveCount(0);
+    await expect(submoduleNotice).toContainText("did not inspect the working state of 1 submodule");
+    await expect(fixture.locator(".repository-comparison-stats")).toContainText("0 changed files");
+    const expiredURL = page.url();
+    expireWorktree = true;
+    await navigate("review-b");
+    await page.evaluate(href => { history.pushState(null, "", href); dispatchEvent(new PopStateEvent("popstate")); }, expiredURL);
+    await expect(fixture.getByRole("button", {name: "Recapture unstaged changes"})).toBeVisible();
     assert.deepEqual(errors, []);
   } finally {
     releaseFirstBatches(); releaseSlow();

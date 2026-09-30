@@ -32,13 +32,15 @@ const (
 var ErrReviewLimit = errors.New("repository data exceeds the review limit")
 
 type ReviewReader struct {
-	Workspace string
-	Timeout   time.Duration
-	Jobs      chan struct{}
-	Provider  OriginProvider
+	Workspace   string
+	Timeout     time.Duration
+	Jobs        chan struct{}
+	Provider    OriginProvider
+	captureHook func() // test seam before the final mutable-state recheck
 }
 type ReviewRepository struct {
 	Name, ID, GitHub, Directory, Head, DefaultRef, InitialBase string
+	Worktree                                                   string
 	Archived                                                   bool
 	Origin                                                     *Origin
 }
@@ -75,19 +77,28 @@ type ReviewFile struct {
 	NewObject string `json:"-"`
 	Additions *int64 `json:"additions"`
 	Deletions *int64 `json:"deletions"`
+	Limited   bool   `json:"limited,omitempty"`
+	Warning   string `json:"warning,omitempty"`
 }
 type ReviewStats struct {
-	Files       int   `json:"files"`
-	Additions   int64 `json:"additions"`
-	Deletions   int64 `json:"deletions"`
-	BinaryFiles int   `json:"binaryFiles"`
+	Files                int   `json:"files"`
+	Additions            int64 `json:"additions"`
+	Deletions            int64 `json:"deletions"`
+	BinaryFiles          int   `json:"binaryFiles"`
+	LimitedFiles         int   `json:"limitedFiles,omitempty"`
+	LineCountsIncomplete bool  `json:"lineCountsIncomplete,omitempty"`
 }
 
 func FileStats(files []ReviewFile) ReviewStats {
 	stats := ReviewStats{Files: len(files)}
 	for _, file := range files {
 		if file.Additions == nil || file.Deletions == nil {
-			stats.BinaryFiles++
+			if file.Limited {
+				stats.LimitedFiles++
+				stats.LineCountsIncomplete = true
+			} else {
+				stats.BinaryFiles++
+			}
 		} else {
 			stats.Additions += *file.Additions
 			stats.Deletions += *file.Deletions
@@ -221,6 +232,7 @@ func (r ReviewReader) Resolve(ctx context.Context, slug string, item session.Rep
 		if err != nil || actualCommon != common {
 			return result, errors.New("worktree belongs to another repository")
 		}
+		result.Worktree = worktree
 		out, err = r.git(ctx, worktree, 8192, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(HEAD)", "--count=1", "--", "refs/heads/"+item.Branch)
 		if err != nil {
 			return result, errors.New("cannot resolve registered feature branch")

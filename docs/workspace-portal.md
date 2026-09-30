@@ -83,6 +83,33 @@ browser memory; the existing per-file preview limits still apply. The browser's
 native Find searches rendered CodeMirror content, which can virtualize lines
 and hide unchanged regions, so it may miss text outside the visible diff.
 
+An active repository card can capture **Staged changes** from HEAD to the index
+and **Unstaged changes** from the index to working files, including non-ignored
+untracked files. If a file changed in both layers, the index version appears
+between them. Capturing changes does not stage or discard files. Snapshot links
+last only while the portal process retains them and cannot be saved as durable
+comparison IDs. An open snapshot keeps its captured content when the repository
+changes; an expired link returns a conflict and must be recaptured. Archived
+repositories show committed comparisons only. Untracked content is available
+through an authorized review snapshot, not the source viewer.
+
+Before publishing, capture checks HEAD, index entries and bytes, non-ignored
+untracked paths, and candidate file identities again. It refuses conflicts,
+sparse or skip-worktree entries, unsafe paths, and special files. Split indexes
+use Git's read-only expanded view; unsupported records fail rather than produce
+a guessed comparison. The process keeps at most 32 snapshots, with 64 MiB of
+admitted raw previews per snapshot and 256 MiB total. File previews remain
+limited to 512 KiB and 12,000 lines per version; comparisons remain limited to
+5,000 files. A working file over 512 KiB has frozen metadata and a **not
+compared** notice, without an exact content diff or line count. The response
+marks aggregate line counts incomplete. Unchanged large files are not opened
+for preview. Candidate discovery uses read-only index stat records without
+running configured clean filters; racy index timestamps remain candidates.
+Staged gitlink changes retain their commit identities. Unstaged capture does
+not inspect nested submodule worktrees. It lists each indexed gitlink's frozen
+path, mode, and object ID separately, outside changed-file totals. The list
+does not claim that a submodule is dirty.
+
 Repository registrations can include `github: owner/name`. The GitHub origin
 validates that value, builds HTTPS links, and loads the remote branch, exact
 head, and workflow runs. If a GitHub lookup fails, local commits and diffs

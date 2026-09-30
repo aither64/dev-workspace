@@ -27,24 +27,28 @@ type repositoryReviewSnapshot struct {
 	mu                                 sync.Mutex
 	Commits                            map[string]string
 	Branch                             bool
+	Worktree                           *repository.WorktreeCapture
+	Readers                            int
 }
 type repositoryReviewService struct {
-	reader        repository.ReviewReader
-	lifetime      context.Context
-	directory     string
-	mu            sync.Mutex
-	snapshots     map[string]*repositoryReviewSnapshot
-	requests      chan struct{}
-	cacheMu       sync.Mutex
-	cache         map[string]*list.Element
-	cacheLRU      *list.List
-	cacheBytes    int
-	calls         map[string]*reviewCacheCall
-	discoveryMu   sync.Mutex
-	discovery     map[string][]session.Repository
-	discoveryErr  error
-	discoveryAt   time.Time
-	discoveryWait chan struct{}
+	reader                repository.ReviewReader
+	lifetime              context.Context
+	directory             string
+	mu                    sync.Mutex
+	snapshots             map[string]*repositoryReviewSnapshot
+	worktreeBytes         int64
+	reservedWorktreeBytes int64
+	requests              chan struct{}
+	cacheMu               sync.Mutex
+	cache                 map[string]*list.Element
+	cacheLRU              *list.List
+	cacheBytes            int
+	calls                 map[string]*reviewCacheCall
+	discoveryMu           sync.Mutex
+	discovery             map[string][]session.Repository
+	discoveryErr          error
+	discoveryAt           time.Time
+	discoveryWait         chan struct{}
 }
 
 func (s *Server) reviews() *repositoryReviewService {
@@ -59,7 +63,7 @@ func (s *repositoryReviewService) put(snapshot *repositoryReviewSnapshot) (*repo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.snapshots {
-		if existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA {
+		if existing.Worktree == nil && existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA {
 			existing.Created = time.Now()
 			return existing, nil
 		}
@@ -74,11 +78,17 @@ func (s *repositoryReviewService) put(snapshot *repositoryReviewSnapshot) (*repo
 	if len(s.snapshots) >= 32 {
 		var oldest *repositoryReviewSnapshot
 		for _, item := range s.snapshots {
-			if oldest == nil || item.Created.Before(oldest.Created) {
+			if item.Readers == 0 && (oldest == nil || item.Created.Before(oldest.Created)) {
 				oldest = item
 			}
 		}
+		if oldest == nil {
+			return nil, repository.ErrReviewLimit
+		}
 		delete(s.snapshots, oldest.ID)
+		if oldest.Worktree != nil {
+			s.worktreeBytes -= oldest.Worktree.RawBytes
+		}
 	}
 	s.snapshots[snapshot.ID] = snapshot
 	return snapshot, nil
@@ -192,17 +202,22 @@ type reviewPreview struct {
 	Content repository.ReviewContent `json:"content"`
 }
 type reviewComparisonResponse struct {
-	Origin       *repository.Origin       `json:"origin,omitempty"`
-	Review       string                   `json:"review"`
-	Snapshot     string                   `json:"snapshot"`
-	HistoryHead  string                   `json:"historyHead"`
-	Pair         repository.ReviewPair    `json:"pair"`
-	Name         string                   `json:"name"`
-	Commit       *repository.ReviewCommit `json:"commit"`
-	Stats        repository.ReviewStats   `json:"stats"`
-	Files        []repository.ReviewFile  `json:"files"`
-	Preview      *reviewPreview           `json:"preview"`
-	PreviewError string                   `json:"previewError,omitempty"`
+	Origin               *repository.Origin             `json:"origin,omitempty"`
+	Review               string                         `json:"review"`
+	Snapshot             string                         `json:"snapshot"`
+	Kind                 string                         `json:"kind,omitempty"`
+	CapturedAt           *time.Time                     `json:"capturedAt,omitempty"`
+	Ephemeral            bool                           `json:"ephemeral,omitempty"`
+	SourceHead           string                         `json:"sourceHead,omitempty"`
+	UnverifiedSubmodules []repository.WorktreeSubmodule `json:"unverifiedSubmodules,omitempty"`
+	HistoryHead          string                         `json:"historyHead"`
+	Pair                 repository.ReviewPair          `json:"pair"`
+	Name                 string                         `json:"name"`
+	Commit               *repository.ReviewCommit       `json:"commit"`
+	Stats                repository.ReviewStats         `json:"stats"`
+	Files                []repository.ReviewFile        `json:"files"`
+	Preview              *reviewPreview                 `json:"preview"`
+	PreviewError         string                         `json:"previewError,omitempty"`
 }
 
 func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, parts []string) bool {
@@ -226,7 +241,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	// A GET without a durable review ID was not a comparison operation before
 	// durable links; retain its old method response for existing clients.
-	if operation == "repository-comparison" && r.Method == http.MethodGet && r.URL.Query().Get("review") == "" {
+	if operation == "repository-comparison" && r.Method == http.MethodGet && r.URL.Query().Get("review") == "" && r.URL.Query().Get("snapshot") == "" {
 		w.Header().Set("Allow", "POST")
 		s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "A comparison link requires a review ID."})
 		return true
@@ -290,6 +305,17 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 			s.writeReviewError(w, summary, reviewError(409, "This review expired. Reopen its comparison link."))
 			return true
 		}
+		if snapshot.Worktree != nil {
+			if err := s.authorizeWorktreeSnapshot(ctx, summary, registration, snapshot); err != nil {
+				s.writeReviewError(w, summary, err)
+				return true
+			}
+			if !service.leaseWorktree(snapshot) {
+				s.writeReviewError(w, summary, expiredWorktreeReview())
+				return true
+			}
+			defer service.releaseWorktree(snapshot)
+		}
 		if operation == "repository-files" {
 			s.repositoryFilesBatch(w, r.WithContext(ctx), summary, snapshot)
 			return true
@@ -305,9 +331,10 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	var commitSHA, fileID string
 	if r.Method == http.MethodPost {
 		var body struct {
-			Snapshot string `json:"snapshot"`
-			Commit   string `json:"commit,omitempty"`
-			File     string `json:"file,omitempty"`
+			Snapshot string          `json:"snapshot"`
+			Commit   string          `json:"commit,omitempty"`
+			File     string          `json:"file,omitempty"`
+			Kind     json.RawMessage `json:"kind,omitempty"`
 		}
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 		decoder.DisallowUnknownFields()
@@ -319,9 +346,33 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 			s.writeReviewError(w, summary, reviewError(400, "Invalid comparison request"))
 			return true
 		}
+		if len(body.Kind) > 0 {
+			var kind string
+			if json.Unmarshal(body.Kind, &kind) != nil || kind != "staged" && kind != "unstaged" || body.Snapshot != "" || body.Commit != "" || body.File != "" {
+				s.writeReviewError(w, summary, reviewError(400, "Invalid worktree comparison request"))
+				return true
+			}
+			snapshot, err = s.captureWorktreeReview(ctx, summary, registration, scope, kind)
+			if err != nil {
+				s.writeReviewError(w, summary, err)
+				return true
+			}
+			defer service.releaseWorktree(snapshot)
+			payload, err := s.reviewComparison(ctx, summary, registration, snapshot, "", "")
+			if err != nil {
+				s.writeReviewError(w, summary, err)
+			} else {
+				s.writeJSON(w, 200, payload)
+			}
+			return true
+		}
 		snapshot = service.get(body.Snapshot, summary.Slug, repoID, scope)
 		if snapshot == nil {
 			s.writeReviewError(w, summary, reviewError(409, "This review expired. Reload the repository history to open it again."))
+			return true
+		}
+		if snapshot.Worktree != nil {
+			s.writeReviewError(w, summary, reviewError(400, "Use the snapshot URL to reopen working changes"))
 			return true
 		}
 		if body.Commit != "" {
@@ -336,6 +387,26 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 			commitSHA = snapshot.CommitSHA
 		}
 		fileID = body.File
+	} else if token := r.URL.Query().Get("snapshot"); token != "" {
+		if r.URL.Query().Get("review") != "" || r.URL.Query().Get("commit") != "" {
+			s.writeReviewError(w, summary, reviewError(400, "Invalid worktree comparison link"))
+			return true
+		}
+		snapshot = service.get(token, summary.Slug, repoID, scope)
+		if snapshot == nil || snapshot.Worktree == nil {
+			s.writeReviewError(w, summary, expiredWorktreeReview())
+			return true
+		}
+		if err := s.authorizeWorktreeSnapshot(ctx, summary, registration, snapshot); err != nil {
+			s.writeReviewError(w, summary, err)
+			return true
+		}
+		if !service.leaseWorktree(snapshot) {
+			s.writeReviewError(w, summary, expiredWorktreeReview())
+			return true
+		}
+		defer service.releaseWorktree(snapshot)
+		fileID = r.URL.Query().Get("file")
 	} else {
 		snapshot, err = s.restoreReview(ctx, summary, registration, scope, r.URL.Query().Get("review"))
 		if err != nil {
@@ -358,6 +429,9 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 	service := s.reviews()
 	repoID := repository.ReviewID(registration.Name)
 	snapshot := service.get(snapshotID, summary.Slug, repoID, scope)
+	if snapshot != nil && snapshot.Worktree != nil {
+		return reviewHistoryResponse{}, expiredWorktreeReview()
+	}
 	if snapshot == nil {
 		if snapshotID != "" {
 			return reviewHistoryResponse{}, reviewError(409, "This review expired. Reload the repository history to open it again.")
@@ -438,11 +512,21 @@ func (s *Server) restoreReview(ctx context.Context, summary *session.Summary, re
 }
 
 func (service *repositoryReviewService) comparisonFiles(ctx context.Context, snapshot *repositoryReviewSnapshot) ([]repository.ReviewFile, error) {
+	if snapshot.Worktree != nil {
+		return snapshot.Worktree.Files, nil
+	}
 	return cachedReview(ctx, service, "files\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) ([]repository.ReviewFile, error) {
 		return service.reader.Files(ctx, snapshot.Repo, snapshot.Pair)
 	})
 }
 func (service *repositoryReviewService) fileContent(ctx context.Context, snapshot *repositoryReviewSnapshot, id string) (repository.ReviewContent, error) {
+	if snapshot.Worktree != nil {
+		content, ok := snapshot.Worktree.Contents[id]
+		if !ok {
+			return repository.ReviewContent{}, reviewError(404, "File is not part of this comparison")
+		}
+		return content, nil
+	}
 	files, err := service.comparisonFiles(ctx, snapshot)
 	if err != nil {
 		return repository.ReviewContent{}, err
@@ -460,6 +544,23 @@ func (service *repositoryReviewService) fileContent(ctx context.Context, snapsho
 
 func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary, registration session.Repository, snapshot *repositoryReviewSnapshot, commitSHA, fileID string) (reviewComparisonResponse, error) {
 	service := s.reviews()
+	if snapshot.Worktree != nil {
+		capture := snapshot.Worktree
+		response := reviewComparisonResponse{Snapshot: snapshot.ID, Kind: capture.Kind, CapturedAt: &capture.CapturedAt, Ephemeral: true,
+			SourceHead: capture.SourceHead, Name: registration.Name, Pair: snapshot.Pair, Files: capture.Files,
+			Stats: repository.FileStats(capture.Files), Origin: snapshot.Repo.Origin, UnverifiedSubmodules: capture.UnverifiedSubmodules}
+		if fileID == "" && len(capture.Files) > 0 && !capture.Files[0].LargeDiff() {
+			fileID = capture.Files[0].ID
+		}
+		if fileID != "" {
+			content, err := service.fileContent(ctx, snapshot, fileID)
+			if err != nil {
+				return response, err
+			}
+			response.Preview = &reviewPreview{File: fileID, Content: content}
+		}
+		return response, nil
+	}
 	historyHead := snapshot.Pair.Head
 	var commit *repository.ReviewCommit
 	if commitSHA != "" {
