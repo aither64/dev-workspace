@@ -22,7 +22,10 @@ class WorkspaceHostTest < Minitest::Test
       %w[workspace-host workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
         FileUtils.cp(File.join(source, name), File.join(packaged_libexec, name))
       end
-      FileUtils.cp(File.join(source, 'dev-session'), File.join(packaged_session, 'dev-session'))
+      public_wrapper = File.join(packaged_session, 'dev-session')
+      File.write(public_wrapper, "#!/bin/sh\nexit 0\n")
+      wrapped_source = File.join(packaged_session, '.dev-session-wrapped')
+      FileUtils.cp(File.join(source, 'dev-session'), wrapped_source)
       %w[workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
         File.symlink(File.join('..', name), File.join(packaged_session, name))
       end
@@ -35,6 +38,20 @@ class WorkspaceHostTest < Minitest::Test
         output, error, status = Open3.capture3(RbConfig.ruby, '-e', script, host_path)
         assert(status.success?, "#{layout}: #{output}#{error}")
       end
+      File.unlink(wrapped_source)
+      missing_source = <<~RUBY
+        load ARGV.fetch(0)
+        begin
+          DevWorkspaceHost::Host.allocate.send(:with_verified_archive_recovery, {}, 'example', {}, {}, {})
+          abort 'missing Ruby source passed'
+        rescue DevWorkspaceHost::Error => error
+          abort error.message unless error.message.include?('Ruby source is unavailable')
+        end
+        abort 'public wrapper was loaded as Ruby' if defined?(DevSession::Runner)
+      RUBY
+      output, error, status = Open3.capture3(RbConfig.ruby, '-e', missing_source,
+                                             File.join(packaged_libexec, 'workspace-host'))
+      assert(status.success?, "missing wrapped source: #{output}#{error}")
     end
   end
 
