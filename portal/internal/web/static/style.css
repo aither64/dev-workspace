@@ -187,9 +187,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .chat-heading h2 { margin: 0; font-size: 1rem; }
 .conversation-connection { flex: none; font-size: .8rem; margin: .5rem 0 0; }
 .conversation-connection button { margin-left: .5rem; padding: .3rem .5rem; }
-.history-controls { display: flex; align-items: center; gap: .65rem; padding: .45rem 0; color: var(--muted); font-size: .8rem; }
+.transcript-history { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+.history-controls { position: absolute; z-index: 1; top: .2rem; left: 0; right: 0; display: flex; align-items: center; justify-content: center; gap: .65rem; padding: .45rem 0; color: var(--muted); font-size: .8rem; pointer-events: none; }
 .history-controls[hidden], .lane-status[hidden] { display: none; }
-.history-controls button { padding: .35rem .6rem; font-size: .8rem; }
+.history-controls button { padding: .35rem .6rem; font-size: .8rem; pointer-events: auto; }
 .lane-status { margin: .25rem 0; color: var(--warning); font-size: .8rem; }
 .chat-panel.active { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0 clamp(.7rem, 2.5vw, 2.5rem); overflow: hidden; }
 .transcript-filters { display: flex; gap: .35rem; margin: 0 auto 0 .5rem; }
@@ -201,6 +202,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .chat-heading { display: flex; align-items: center; gap: .5rem; }
 .chat-heading .transcript-filters { margin-left: .5rem; margin-right: 0; }
 .transcript { flex: 1; overflow-y: auto; min-height: 0; padding: 1.2rem .3rem; overscroll-behavior: contain; overflow-anchor: none; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: .7rem; }
+.transcript-history .transcript { padding-top: 3rem; }
 .message p:first-child { margin-top: 0; }
 .message p:last-child { margin-bottom: 0; }
 .message pre { overflow-x: auto; white-space: pre-wrap; }

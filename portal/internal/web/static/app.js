@@ -2607,7 +2607,7 @@
   const pagingHelpersAvailable = hasTranscriptPagingHelpers(conversationAssets);
   const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory() : null;
   let pagingUnavailable = !pagingHelpersAvailable;
-  let historyRead = null, historyRetryTimer = null, historyError = "";
+  let historyRead = null, historyRetryTimer = null, historyError = "", historyFailure = null;
   let metadataRetryTimer = null, metadataRetryDelay = 2000;
   let latestThreadPayload = null;
   let transcriptFilter = "messages";
@@ -2819,13 +2819,57 @@
   let transcriptUserScroll = false;
   let transcriptScrollTimer = null;
   let transcriptPointerDown = false;
+  let scrollbarPointer = null, scrollbarFresh = false, scrollbarLastTop = 0;
   let transcriptTouchY = null;
+  // A directional input can authorize one read; follow-tail's 800 ms flag cannot.
+  let historyInput = null, historyInputFrame = null, historyInputTimer = null;
+  let startOlderHistoryRead = () => {};
+  const historyScrollTop = () => Math.max(0, transcript.scrollTop);
+  const clearHistoryInput = () => {
+    historyInput = null;
+    if (historyInputFrame !== null) cancelAnimationFrame(historyInputFrame);
+    if (historyInputTimer !== null) clearTimeout(historyInputTimer);
+    historyInputFrame = null; historyInputTimer = null;
+    scrollbarFresh = false;
+  };
+  const resetHistoryNavigation = () => {
+    clearHistoryInput();
+    scrollbarLastTop = historyScrollTop();
+  };
+  const canReadOlderHistory = () => transcriptInitialized && transcript.clientHeight > 0 &&
+    !document.hidden && !pageReads.paused && !historyRead && !historyFailure && !historyError &&
+    !pagingUnavailable && transcriptHistory?.hasOlder && transcriptHistory.olderCursor &&
+    !transcriptHistory.gap && typeof client.threadPage === "function";
+  const checkHistoryInput = (input) => {
+    if (historyInput !== input) return;
+    const position = historyScrollTop();
+    if (!canReadOlderHistory() || position > input.startTop) { clearHistoryInput(); return; }
+    if (position < input.startTop && position <= 200) {
+      clearHistoryInput();
+      startOlderHistoryRead();
+    }
+  };
+  const upwardHistoryInput = () => {
+    if (!canReadOlderHistory()) { clearHistoryInput(); return; }
+    const position = historyScrollTop();
+    clearHistoryInput();
+    if (position <= 200) { startOlderHistoryRead(); return; }
+    const input = {startTop: position};
+    historyInput = input;
+    historyInputFrame = requestAnimationFrame(() => {
+      historyInputFrame = null;
+      checkHistoryInput(input);
+    });
+    historyInputTimer = setTimeout(clearHistoryInput, 800);
+  };
   const followTranscript = () => {
+    resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     view.follow = true;
     transcriptUserScroll = false;
     if (transcriptScrollTimer !== null) clearTimeout(transcriptScrollTimer);
     transcript.scrollTop = transcript.scrollHeight;
+    scrollbarLastTop = historyScrollTop();
     document.getElementById("new-output").hidden = true;
   };
   const beginTranscriptScroll = (pause = false) => {
@@ -2835,45 +2879,90 @@
     transcriptScrollTimer = setTimeout(() => { transcriptUserScroll = false; }, 800);
   };
   transcript.tabIndex = 0;
-  transcript.addEventListener("wheel", (event) => beginTranscriptScroll(event.deltaY < 0), {passive: true});
+  transcript.addEventListener("wheel", (event) => {
+    const upward = event.deltaY < 0 && !event.ctrlKey;
+    beginTranscriptScroll(upward);
+    if (upward) upwardHistoryInput();
+    else if (event.deltaY > 0) clearHistoryInput();
+  }, {passive: true});
   transcript.addEventListener("touchstart", (event) => {
-    transcriptTouchY = event.touches[0]?.clientY ?? null;
+    clearHistoryInput();
+    transcriptTouchY = event.touches.length === 1 ? event.touches[0].clientY : null;
     beginTranscriptScroll();
   }, {passive: true});
   transcript.addEventListener("touchmove", (event) => {
-    const position = event.touches[0]?.clientY ?? null;
-    beginTranscriptScroll(position !== null && transcriptTouchY !== null && position > transcriptTouchY);
+    const position = event.touches.length === 1 ? event.touches[0].clientY : null;
+    const upward = position !== null && transcriptTouchY !== null && position > transcriptTouchY;
+    beginTranscriptScroll(upward);
+    if (upward) upwardHistoryInput();
+    else clearHistoryInput();
     transcriptTouchY = position;
   }, {passive: true});
+  transcript.addEventListener("touchcancel", () => { transcriptTouchY = null; clearHistoryInput(); });
   transcript.addEventListener("pointerdown", () => {
     transcriptPointerDown = true;
     beginTranscriptScroll();
   });
-  addEventListener("pointerup", () => { transcriptPointerDown = false; });
-  addEventListener("pointercancel", () => { transcriptPointerDown = false; });
+  document.addEventListener("pointerdown", (event) => {
+    const bounds = transcript.getBoundingClientRect();
+    scrollbarPointer = (event.pointerType === "mouse" || event.pointerType === "pen") &&
+      event.clientX >= bounds.right - 22 && event.clientX <= bounds.right &&
+      event.clientY >= bounds.top && event.clientY <= bounds.bottom &&
+      transcript.scrollHeight > transcript.clientHeight ? event.pointerId : null;
+    scrollbarLastTop = historyScrollTop();
+    scrollbarFresh = scrollbarPointer !== null && Boolean(canReadOlderHistory());
+  }, true);
+  addEventListener("pointermove", (event) => {
+    if (event.pointerId === scrollbarPointer && event.buttons && canReadOlderHistory()) scrollbarFresh = true;
+  });
+  const endTranscriptPointer = () => {
+    transcriptPointerDown = false; scrollbarPointer = null; scrollbarFresh = false;
+  };
+  addEventListener("pointerup", endTranscriptPointer);
+  addEventListener("pointercancel", endTranscriptPointer);
+  addEventListener("blur", () => { endTranscriptPointer(); clearHistoryInput(); });
   transcript.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey ||
+        event.target.isContentEditable || event.target.closest("input, textarea, select, button, [contenteditable]")) return;
     if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
-      beginTranscriptScroll(["ArrowUp", "PageUp", "Home"].includes(event.key));
+      const upward = ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
+        (event.key === " " && event.shiftKey);
+      beginTranscriptScroll(upward);
+      if (upward) upwardHistoryInput();
+      else clearHistoryInput();
     }
   });
   document.getElementById("new-output")?.addEventListener("click", followTranscript);
   transcript.addEventListener("scroll", () => {
     if (!transcript.clientHeight) return;
+    const position = historyScrollTop();
+    const upwardScrollbarDrag = scrollbarPointer !== null && scrollbarFresh && position < scrollbarLastTop;
+    scrollbarLastTop = position;
     const view = transcriptViews.get(transcriptFilter);
     view.follow = transcriptFollowOnScroll(view.follow, transcript, transcriptUserScroll || transcriptPointerDown);
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
     if (shouldFollowTranscript(transcript)) document.getElementById("new-output").hidden = true;
+    if (upwardScrollbarDrag && position <= 200 && canReadOlderHistory()) {
+      clearHistoryInput();
+      startOlderHistoryRead();
+    } else if (historyInput) checkHistoryInput(historyInput);
   });
   const transcriptResize = new ResizeObserver(() => {
+    resetHistoryNavigation();
     if (transcript.clientHeight && transcriptViews.get(transcriptFilter).follow) transcript.scrollTop = transcript.scrollHeight;
+    scrollbarLastTop = historyScrollTop();
   });
   transcriptResize.observe(transcript);
   document.addEventListener("session-section-change", (event) => {
     if (event.detail !== "codex") return;
+    resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     transcript.scrollTop = view.follow ? transcript.scrollHeight : view.scrollTop;
+    scrollbarLastTop = historyScrollTop();
   });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) resetHistoryNavigation(); });
+  addEventListener("pagehide", resetHistoryNavigation);
 
   const updateMessageActions = () => {
     const sendButton = document.getElementById("message-send");
@@ -3057,6 +3146,7 @@
   };
 
   const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
+    resetHistoryNavigation();
     const oldNodes = new Map([...transcript.children].filter((node) => node.dataset.transcriptEntryKey)
       .map((node) => [node.dataset.transcriptEntryKey, node]));
     const oldDates = new Map([...transcript.children].filter((node) => node.dataset.transcriptDateKey)
@@ -3116,6 +3206,7 @@
       transcript.scrollTop += currentAnchor.getBoundingClientRect().top - anchorTop;
     } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, transcript.scrollHeight - previousHeight);
     else transcript.scrollTop = previousTop;
+    scrollbarLastTop = historyScrollTop();
   };
 
   const saveTranscriptView = () => {
@@ -3128,6 +3219,7 @@
     button.addEventListener("click", () => {
       const nextFilter = button.dataset.transcriptFilter;
       if (!transcriptViews.has(nextFilter) || nextFilter === transcriptFilter) return;
+      resetHistoryNavigation();
       saveTranscriptView();
       transcriptFilter = nextFilter;
       document.querySelectorAll("[data-transcript-filter]").forEach((candidate) => {
@@ -3139,6 +3231,7 @@
       renderTranscriptEntries(transcriptEntries, view.disclosures);
       transcript.scrollTop = !view.initialized || view.follow ? transcript.scrollHeight : view.scrollTop;
       view.scrollTop = transcript.scrollTop;
+      scrollbarLastTop = historyScrollTop();
       view.initialized = true;
       const newOutput = document.getElementById("new-output");
       if (newOutput) newOutput.hidden = true;
@@ -3146,20 +3239,17 @@
   });
 
   const historyControls = document.getElementById("history-controls");
-  const loadOlderButton = document.getElementById("load-older");
   const repairHistoryButton = document.getElementById("repair-history");
   const historyStatus = document.getElementById("history-status");
   const renderHistoryControls = () => {
     if (!historyControls) return;
-    const older = transcriptHistory?.hasOlder && !transcriptHistory.gap && !pagingUnavailable;
-    loadOlderButton.hidden = !older;
-    loadOlderButton.disabled = Boolean(historyRead);
-    repairHistoryButton.hidden = !transcriptHistory?.gap && !historyError;
+    resetHistoryNavigation();
+    repairHistoryButton.hidden = !historyFailure && !(transcriptHistory?.gap && !pagingUnavailable);
     repairHistoryButton.disabled = Boolean(historyRead);
-    historyStatus.textContent = historyRead ? "Loading history…" :
+    historyStatus.textContent = historyRead ? "Loading earlier messages…" :
       (historyError || (transcriptHistory?.gap ? "Checking earlier messages…" :
         pagingUnavailable ? "Older history is unavailable on this server." : ""));
-    historyControls.hidden = !older && !historyStatus.textContent && repairHistoryButton.hidden;
+    historyControls.hidden = !historyStatus.textContent && repairHistoryButton.hidden;
   };
   const observePageReceipts = (entries, threadID) => {
     void markTranscriptMessagesObserved(new Map(pendingMessages), entries).then((observed) => {
@@ -3180,6 +3270,7 @@
     if (currentThreadId && currentThreadId !== payload.threadId) {
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
       pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
+      historyError = ""; historyFailure = null;
     }
     currentThreadId = payload.threadId;
     loadMessageReceipts();
@@ -3204,7 +3295,16 @@
     if (kind === "newest") {
       latestThreadPayload = payload;
       pagingUnavailable = !pagingHelpersAvailable || Boolean(payload.legacy);
-      historyError = "";
+      if (historyFailure) {
+        if (pagingUnavailable || update.reset || historyFailure.threadId !== currentThreadId ||
+            historyFailure.kind === "repair" && !transcriptHistory?.gap ||
+            historyFailure.kind === "older" && !transcriptHistory?.hasOlder) historyFailure = null;
+        else if (transcriptHistory.gap) {
+          historyFailure = {kind: "repair", threadId: currentThreadId,
+            repairVersion: transcriptHistory.repairVersion};
+        }
+      }
+      if (!historyFailure) historyError = "";
       recoverPlanAttempts(payload.latestTurnId);
       const threadStatus = payload.status;
       threadActive = threadStatus === "active";
@@ -3239,11 +3339,13 @@
     if (!transcriptHistory || historyRead || pageReads.paused || document.hidden || pagingUnavailable || typeof client.threadPage !== "function") return;
     const cursor = kind === "older" ? transcriptHistory.olderCursor : transcriptHistory.repairCursor;
     if (!cursor) return;
+    resetHistoryNavigation();
     const threadID = currentThreadId;
     const readVersion = transcriptHistory.repairVersion;
     const read = pageReads.begin(35_000);
     historyRead = true;
     historyError = "";
+    historyFailure = null;
     renderHistoryControls();
     try {
       const page = await conversationAssets.readTranscriptPage(client, {
@@ -3263,7 +3365,12 @@
         pagingUnavailable = true;
         historyError = "Older history is unavailable on this server.";
         scheduleRefresh(0);
-      } else historyError = "Earlier messages could not be loaded. Retry.";
+      } else {
+        historyError = "Earlier messages could not be loaded. Retry.";
+        historyFailure = {kind, threadId: threadID, repairVersion: readVersion};
+        if (historyRetryTimer !== null) clearTimeout(historyRetryTimer);
+        historyRetryTimer = null;
+      }
     } finally {
       read.finish();
       historyRead = null;
@@ -3271,19 +3378,28 @@
       if (!historyError && transcriptHistory.gap && transcriptHistory.repairCursor) scheduleHistoryRepair(40);
     }
   };
+  startOlderHistoryRead = () => { void runHistoryRead("older"); };
+  const canRepairHistory = () => transcriptHistory?.gap && transcriptHistory.repairCursor &&
+    !historyError && !historyFailure && !pageReads.paused && !document.hidden && !pagingUnavailable;
   const scheduleHistoryRepair = (delay = 40) => {
-    if (!transcriptHistory?.gap || !transcriptHistory.repairCursor || historyRetryTimer !== null || historyError ||
-        pageReads.paused || document.hidden || pagingUnavailable) return;
+    if (!canRepairHistory() || historyRetryTimer !== null) return;
     historyRetryTimer = setTimeout(() => {
       historyRetryTimer = null;
+      if (!canRepairHistory()) return;
       if (historyRead) scheduleHistoryRepair(100);
       else void runHistoryRead("repair");
     }, delay);
   };
-  loadOlderButton?.addEventListener("click", () => { void runHistoryRead("older"); });
   repairHistoryButton?.addEventListener("click", () => {
-    historyError = "";
-    if (transcriptHistory?.repairCursor) scheduleHistoryRepair(0);
+    if (historyRead) return;
+    const retryKind = historyFailure?.kind;
+    if (retryKind) {
+      const kind = transcriptHistory?.gap ? "repair" : retryKind;
+      const cursor = kind === "repair" ? transcriptHistory?.repairCursor : transcriptHistory?.olderCursor;
+      if (cursor) { void runHistoryRead(kind); return; }
+      if (transcriptHistory?.gap || transcriptHistory?.hasOlder) return;
+      historyFailure = null; historyError = "";
+    } else if (transcriptHistory?.repairCursor) scheduleHistoryRepair(0);
     else scheduleRefresh(0);
     renderHistoryControls();
   });

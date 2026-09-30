@@ -70,9 +70,11 @@ redirect to the viewer. The original conversation text remains unchanged.
 ## Conversation history in the portal
 
 The Codex tab reads the newest 100 transcript items on first load for the lead,
-team members and archived sessions. **Load older** fetches another page. Items
-already on screen retain their DOM nodes as new output arrives; loading older
-items keeps the reader's scroll position. If more than one page arrives while a
+team members and archived sessions. Moving upward within 200 pixels of the
+transcript top loads one older page, including when the view cannot scroll any
+farther. Another page requires another upward action. Items already on screen
+retain their DOM nodes as new output arrives; loading older items keeps the
+reader's scroll position. If more than one page arrives while a
 browser is disconnected, the tab reads bounded pages until the new and retained
 history meet. An active item that has moved out of the newest page is also
 checked for its final update.
@@ -87,12 +89,17 @@ legacy read succeeds. Authorization failures, timeouts and invalid cursors
 remain errors. A changed cursor keeps loaded messages visible while a fresh
 bounded history repair checks their continuity.
 
+The centered history row shows loading progress and a Retry control after a
+page read fails. Automatic loading pauses until Retry repeats the failed older
+page or continuity repair. An expired cursor prompts reconnection and a check
+of retained history. Servers without paging keep the existing legacy behavior.
+
 Requests, queued messages and activity timing refresh separately from the
 transcript. A slow queue reconciliation does not delay the first conversation
 page. A failed request or queue refresh keeps the last visible result and shows
 a retry control. Transcript receipt and upload clearing require positive
-server evidence across all retained pages, including messages loaded through
-**Load older**. While the server is still checking conversation metadata, the
+server evidence across all retained pages, including automatically loaded older
+messages. While the server is still checking conversation metadata, the
 mode is shown as pending and plan actions stay hidden. The tab retries metadata
 reads with backoff. Activity reads have a five-second budget while active and
 a thirty-second budget while idle; focus and reconnection prompt a fresh read.
