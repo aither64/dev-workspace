@@ -72,6 +72,12 @@
         host-module = import ./nix/tests/host-module.nix {
           inherit pkgs nixpkgs self;
         };
+        host-auth-benchmark = pkgs.runCommand "dev-workspace-host-auth-benchmark" { } ''
+          ${pkgs.python3}/bin/python3 ${./test/host_auth_benchmark.py} \
+            --htpasswd ${pkgs.apacheHttpd}/bin/htpasswd \
+            --apache-version ${nixpkgs.lib.escapeShellArg pkgs.apacheHttpd.version}
+          touch "$out"
+        '';
         host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
           inherit pkgs self;
         };

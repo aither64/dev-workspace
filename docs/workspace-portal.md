@@ -413,6 +413,25 @@ checks certificate/key pairs and requested names, and verifies leaves using
 only the local CA. A weekly system service renews certificates and reloads
 nginx. Retained PKI state, TLS generations and migration markers are not removed.
 
+`services.dev-workspaces.auth.bcryptCost` sets the work factor for the generated
+nginx Basic Auth hash. It accepts integers from 4 through 17 and defaults to 12.
+The reconciler accepts only a hash with the declared two-digit encoded cost and
+the current username and password. It creates a new salted hash when the cost
+changes, while keeping the password, CA and TLS files. Repeating reconciliation
+at the same cost preserves the htpasswd bytes and inode.
+
+A lower cost is suitable only when the password is an independently generated,
+secret 64-hex value from `openssl rand -hex 32`. The random credential supplies
+the guessing resistance, but lowering the cost still makes each guess cheaper.
+Do not apply this exception to human-chosen or reused passwords. Deploy the
+module revision and its cost setting together because an older module cannot
+evaluate the new option. A compatible older system generation regenerates its
+declared cost after rollback, changing the hash bytes without rotating the
+password. Let any in-flight reconciler from the previous generation finish
+before switching, then rerun the selected generation and check its encoded cost.
+If generation fails, the existing complete htpasswd remains in place; repair
+the declaration or roll back and retry reconciliation.
+
 The firewall stays closed unless `services.dev-workspaces.firewall.sourceRanges`
 contains an allowed network.
 

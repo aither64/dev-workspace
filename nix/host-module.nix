@@ -58,6 +58,12 @@ let
   lockDirectory = managedDirectories.lock;
   passwordDirectory = managedDirectories.password;
   authDirectory = managedDirectories.authentication;
+  bcryptCost =
+    let
+      decimal = toString cfg.auth.bcryptCost;
+    in
+    if cfg.auth.bcryptCost < 10 then "0${decimal}" else decimal;
+  authPattern = "^[^:]+:" + "\\$2[aby]\\$" + bcryptCost + "\\$[./A-Za-z0-9]{53}$";
   publicCaDirectory = managedDirectories.publicCa;
   internalManagedDirectories = [
     "${cfg.tls.caStateDirectory}/authority"
@@ -168,7 +174,7 @@ let
       install_managed_directory ${lib.escapeShellArg publicCaDirectory} root root 755
 
       # shellcheck disable=SC2016
-      auth_pattern='^[^:]+:\$2[aby]\$12\$[./A-Za-z0-9]{53}$'
+      auth_pattern=${lib.escapeShellArg authPattern}
 
       auth_file_valid() {
         local candidate entry shape_tmp
@@ -253,7 +259,7 @@ let
       auth_directory=${lib.escapeShellArg authDirectory}
       if ! auth_file_valid "$auth_file"; then
         auth_tmp=$(mktemp "$(dirname "$auth_file")/.htpasswd.XXXXXX")
-        htpasswd -niBC 12 "$auth_user" < "$password_file" > "$auth_tmp"
+        htpasswd -niBC ${bcryptCost} "$auth_user" < "$password_file" > "$auth_tmp"
         chown root:${lib.escapeShellArg nginxGroup} "$auth_tmp"
         chmod 0640 "$auth_tmp"
         if ! auth_file_valid "$auth_tmp"; then
@@ -452,6 +458,11 @@ in
       description = "Regular root-owned lock file directly below /run/lock.";
     };
     auth = {
+      bcryptCost = lib.mkOption {
+        type = lib.types.ints.between 4 17;
+        default = 12;
+        description = "Bcrypt work factor for the generated nginx Basic Auth hash.";
+      };
       user = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;

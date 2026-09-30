@@ -18,6 +18,7 @@ pkgs.testers.runNixOSTest {
         "legacy-workspace.example.test"
         "extra-workspace.example.test"
       ];
+      specialisation.cost5.configuration.services.dev-workspaces.auth.bcryptCost = lib.mkForce 5;
       systemd.services.fixture-router = {
         wantedBy = [ "multi-user.target" ];
         serviceConfig = {
@@ -42,6 +43,7 @@ pkgs.testers.runNixOSTest {
         };
       };
       environment.systemPackages = [
+        pkgs.apacheHttpd
         pkgs.curl
         pkgs.openssl
       ];
@@ -78,7 +80,22 @@ pkgs.testers.runNixOSTest {
 
     def assert_endpoint():
         assert machine.succeed(f"{curl} -o /dev/null -w '%{{http_code}}' {endpoint}").strip() == "401"
+        assert machine.succeed(
+            f"{curl} --user developer:incorrect -o /dev/null -w '%{{http_code}}' {endpoint}"
+        ).strip() == "401"
         assert machine.succeed(f'{curl} --user "developer:$(cat {password})" {endpoint}').strip() == "ready"
+
+    def assert_auth_cost(cost):
+        machine.succeed(
+            "grep -Eq '^developer:\\$2[aby]\\$" + cost +
+            f"\\$[./A-Za-z0-9]{{53}}$' {auth}; "
+            f"test $(grep -c . {auth}) -eq 1; "
+            f"test $(stat -c %U:%G:%a {auth}) = root:nginx:640; "
+            f"htpasswd -vi {auth} developer < {password} >/dev/null 2>&1"
+        )
+
+    def auth_state():
+        return machine.succeed(f"sha256sum {auth}; stat -c %i {auth}")
 
     def assert_leaf_valid():
         assert re.fullmatch(r"pairs/pair-[0-9]+-[0-9]+", current_target())
@@ -100,6 +117,7 @@ pkgs.testers.runNixOSTest {
             f"test $(stat -c %U:%G:%a {tls}/current/server-key.pem) = root:nginx:640"
         )
         assert_endpoint()
+        assert_auth_cost("12")
         reconcile_once()
         assert hashes(preserved) == initial_preserved
         assert hashes(f"{tls}/current/server.pem {tls}/current/server-key.pem") == initial_leaf
@@ -189,5 +207,128 @@ pkgs.testers.runNixOSTest {
         after_rollback = current_target()
         reconcile_once()
         assert current_target() == after_rollback
+
+    with subtest("cost-only system switches regenerate once without changing credentials or TLS"):
+        stable_outputs = hashes(
+            f"{password} {authority}/ca-key.pem {authority}/ca.pem {public_ca} "
+            f"{tls}/current/server.pem {tls}/current/server-key.pem"
+        )
+        stable_target = current_target()
+        password_inode = machine.succeed(f"stat -c %i {password}").strip()
+        assert_auth_cost("12")
+        before_cost5 = auth_state()
+        machine.succeed(f"{initial_system}/specialisation/cost5/bin/switch-to-configuration test")
+        assert_auth_cost("05")
+        assert_endpoint()
+        assert auth_state() != before_cost5
+        assert hashes(
+            f"{password} {authority}/ca-key.pem {authority}/ca.pem {public_ca} "
+            f"{tls}/current/server.pem {tls}/current/server-key.pem"
+        ) == stable_outputs
+        assert current_target() == stable_target
+        assert machine.succeed(f"stat -c %i {password}").strip() == password_inode
+        at_cost5 = auth_state()
+        reconcile_once()
+        assert auth_state() == at_cost5
+
+        machine.succeed(f"{initial_system}/bin/switch-to-configuration test")
+        assert_auth_cost("12")
+        assert_endpoint()
+        at_cost12 = auth_state()
+        assert at_cost12 != at_cost5
+        reconcile_once()
+        assert auth_state() == at_cost12
+
+        machine.succeed(f"{initial_system}/specialisation/cost5/bin/switch-to-configuration test")
+        assert_auth_cost("05")
+        assert_endpoint()
+        at_cost5_again = auth_state()
+        assert at_cost5_again != at_cost12
+        reconcile_once()
+        assert auth_state() == at_cost5_again
+        assert hashes(
+            f"{password} {authority}/ca-key.pem {authority}/ca.pem {public_ca} "
+            f"{tls}/current/server.pem {tls}/current/server-key.pem"
+        ) == stable_outputs
+        assert current_target() == stable_target
+        assert machine.succeed(f"stat -c %i {password}").strip() == password_inode
+
+    with subtest("wrong or malformed current-cost hashes are replaced through the same password"):
+        for variant in ["2a", "2b", "2y"]:
+            machine.succeed(
+                "sed 's/\\$2[aby]\\$/\\$" + variant +
+                f"\\$/' {auth} > /tmp/variant-auth; "
+                "chown root:nginx /tmp/variant-auth; chmod 0640 /tmp/variant-auth"
+            )
+            supported, _ = machine.execute(
+                f"htpasswd -vi /tmp/variant-auth developer < {password} >/dev/null 2>&1"
+            )
+            if supported == 0:
+                machine.succeed(f"mv -T /tmp/variant-auth {auth}")
+                accepted = auth_state()
+                reconcile_once()
+                assert_auth_cost("05")
+                assert auth_state() == accepted
+            else:
+                machine.succeed("rm /tmp/variant-auth")
+        for mutation in [
+            f"sed 's/^developer:/other:/' {auth} > /tmp/changed-auth",
+            f"sed 's/\\$2[aby]\\$/\\$5\\$/' {auth} > /tmp/changed-auth",
+            f"cp {auth} /tmp/changed-auth; printf 'other:invalid\\n' >> /tmp/changed-auth",
+            f"htpasswd -niBC 04 developer < {password} > /tmp/changed-auth",
+            f"htpasswd -niBC 12 developer < {password} > /tmp/changed-auth",
+            "printf '%s\\n' '0000000000000000000000000000000000000000000000000000000000000000' "
+            "| htpasswd -niBC 05 developer > /tmp/changed-auth",
+        ]:
+            machine.succeed(mutation)
+            machine.succeed(
+                f"chown root:nginx /tmp/changed-auth; chmod 0640 /tmp/changed-auth; "
+                f"mv -T /tmp/changed-auth {auth}"
+            )
+            reconcile_once()
+            assert_auth_cost("05")
+            assert_endpoint()
+        machine.succeed(f"cp -a {auth} /tmp/original-auth; chmod 0644 {auth}")
+        reconcile_once()
+        assert_auth_cost("05")
+        machine.succeed(f"mv {auth} /tmp/replaced-auth; ln -s /tmp/replaced-auth {auth}")
+        machine.fail(reconcile)
+        machine.succeed(f"rm {auth}; mv /tmp/replaced-auth {auth}")
+        reconcile_once()
+        assert_auth_cost("05")
+
+    with subtest("failed generation preserves the old complete auth file"):
+        machine.succeed(f"htpasswd -niBC 12 developer < {password} > /tmp/changed-auth")
+        machine.succeed(
+            f"chown root:nginx /tmp/changed-auth; chmod 0640 /tmp/changed-auth; "
+            f"mv -T /tmp/changed-auth {auth}"
+        )
+        before_failure = auth_state()
+        machine.fail(f"bash -c 'ulimit -f 0; {reconcile}'")
+        assert auth_state() == before_failure
+        assert_auth_cost("12")
+        reconcile_once()
+        assert_auth_cost("05")
+
+    with subtest("concurrent readers see complete old or new auth files"):
+        machine.succeed(f"htpasswd -niBC 12 developer < {password} > /tmp/changed-auth")
+        machine.succeed(
+            f"chown root:nginx /tmp/changed-auth; chmod 0640 /tmp/changed-auth; "
+            f"mv -T /tmp/changed-auth {auth}"
+        )
+        reader = (
+            "stop=/tmp/auth-reader-stop; ready=/tmp/auth-reader-ready; "
+            "rm -f $stop $ready; trap 'touch $stop' EXIT; ("
+            "touch $ready; "
+            "while test ! -e $stop; do "
+            f"grep -Eq '^developer:\\$2[aby]\\$(05|12)\\$[./A-Za-z0-9]{{53}}$' {auth} "
+            "|| exit 1; "
+            "done) & reader=$!; "
+            "while test ! -e $ready; do sleep 0.01; done; "
+            f"{reconcile}; touch $stop; wait $reader; rm $stop $ready"
+        )
+        machine.succeed("bash -e -c " + shlex.quote(reader))
+        assert_auth_cost("05")
+        assert_endpoint()
   '';
 }
