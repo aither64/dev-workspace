@@ -11,6 +11,61 @@ import (
 	"time"
 )
 
+func TestSessionPageUsesStoredRepositoriesWithoutDiscovery(t *testing.T) {
+	server := newTestServer(t)
+	tracking := filepath.Join(server.config.Workspace, "work", "example")
+	if err := os.MkdirAll(tracking, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "schema: 1\nslug: example\nrepositories:\n  - name: stored\n    project: stored\n    branch: feature\n"
+	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, tracking, "active")
+	if err := os.MkdirAll(filepath.Join(server.config.Workspace, "repos", "broken.git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("session page = %d: %s", page.Code, page.Body.String())
+	}
+	if body := page.Body.String(); !strings.Contains(body, "<h3>stored</h3>") ||
+		strings.Contains(body, "Some live worktrees could not be verified") {
+		t.Fatalf("initial repository section = %s", body)
+	}
+	service := server.reviews()
+	service.discoveryMu.Lock()
+	discoveryAt := service.discoveryAt
+	service.discoveryMu.Unlock()
+	if !discoveryAt.IsZero() {
+		t.Fatal("initial page invoked live repository discovery")
+	}
+
+	details := httptest.NewRecorder()
+	server.Handler().ServeHTTP(details, httptest.NewRequest(http.MethodGet, "/api/sessions/example/details", nil))
+	if details.Code != http.StatusOK {
+		t.Fatalf("session details = %d: %s", details.Code, details.Body.String())
+	}
+	var payload struct {
+		RepositoriesHTML string `json:"repositoriesHTML"`
+	}
+	if err := json.Unmarshal(details.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload.RepositoriesHTML, "<h3>stored</h3>") ||
+		!strings.Contains(payload.RepositoriesHTML, "Some live worktrees could not be verified") {
+		t.Fatalf("details did not refresh repository warnings: %s", payload.RepositoriesHTML)
+	}
+	service.discoveryMu.Lock()
+	discoveryAt = service.discoveryAt
+	service.discoveryMu.Unlock()
+	if discoveryAt.IsZero() {
+		t.Fatal("details refresh did not invoke live repository discovery")
+	}
+}
+
 func TestSessionDetailsDiscoversLateWorktreesAndCuratedArtifacts(t *testing.T) {
 	server := newTestServer(t)
 	tracking := filepath.Join(server.config.Workspace, "work", "example")

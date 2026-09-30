@@ -1015,15 +1015,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	}
 	lifecycleTargetID, lifecycleIdentityErr := lifecycleTargetIdentity(summary)
 	s.normalizeInteractivity(r.Context(), summary)
-	var discoveryErr error
-	if !summary.Archived {
-		var repositories []session.Repository
-		repositories, discoveryErr = s.activeRepositories(r.Context(), summary)
-		summary.Repositories = repositories
-		if discoveryErr != nil {
-			s.config.Logger.Printf("discover repositories for %s: %v", summary.Slug, discoveryErr)
-		}
-	}
 	data := pageData{
 		BaseURL: s.config.BaseURL, Session: summary,
 		CreationDate: time.Now().Format(time.DateOnly), MaxMessageBytes: session.MaxMessageBytes,
@@ -1066,12 +1057,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	data.PendingLifecycle, err = session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil {
 		data.Error = "Session lifecycle state is unsafe: " + err.Error()
-	}
-	if discoveryErr != nil {
-		if data.Error != "" {
-			data.Error += "; "
-		}
-		data.Error += "Some live worktrees could not be verified: " + discoveryErr.Error()
 	}
 	data.Repositories = s.repository.Skeleton(summary.Slug, summary.Repositories, summary.Archived)
 	data.Clusters, err = s.clusters.InspectContext(r.Context(), summary.Slug)

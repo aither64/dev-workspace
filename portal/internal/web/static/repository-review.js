@@ -725,6 +725,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   return {
     updateHTML(html) {
       const candidate = node("div"); candidate.innerHTML = html;
+      const warning = candidate.querySelector(":scope > .notice.warning");
       const incoming = new Map([...candidate.querySelectorAll("[data-repository-id]")].map(card => [card.dataset.repositoryId, card]));
       for (const [id, state] of states) {
         const fresh = incoming.get(id);
@@ -737,6 +738,10 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
       let grid = overview.querySelector(".repo-grid");
       if (!grid) { overview.replaceChildren(...candidate.childNodes); grid = overview.querySelector(".repo-grid"); }
+      else {
+        overview.querySelector(":scope > .notice.warning")?.remove();
+        if (warning) overview.prepend(warning);
+      }
       for (const card of incoming.values()) { grid?.append(card); hydrate(card); }
       const heading = overview.querySelector(".section-heading span"); if (heading) heading.textContent = String(states.size);
       if (states.size) grid?.querySelector(":scope > .empty")?.remove();
