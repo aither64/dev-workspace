@@ -295,16 +295,18 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   };
   const selectedFile = selected => selected.sections.get(route.file) ||
     (!route.file ? selected.sections.values().next().value : null);
-  const trimEditors = (selected, current = null) => {
-    const mounted = [...selected.sections.values()].filter(record => record.editor || record.content).sort((a, b) => a.used - b.used);
-    let count = mounted.length;
-    for (const record of mounted) {
-      if (count <= 8) break;
-      if (record === selectedFile(selected) || record === current) continue;
-      record.host.style.minHeight = Math.max(160, record.host.getBoundingClientRect().height) + "px";
-      ++record.generation; record.editor?.destroy(); record.editor = null; record.content = null; count--;
-      record.host.replaceChildren(node("p", "muted", "Scroll here to load this comparison."));
-    }
+  const updateLoadAll = selected => {
+    if (!selected.loadAllButton) return;
+    const records = [...selected.sections.values()];
+    const completed = records.filter(record => record.rendered).length;
+    const failures = records.filter(record => record.failure).length;
+    selected.loadAllStatus.textContent = selected.loadAllActive ?
+      `${completed}/${records.length} diffs loaded${failures ? ` · ${failures} failed` : ""}` : "";
+    const idle = selected.jobs === 0 && !selected.fileQueue.size && !records.some(record => record.rendering);
+    selected.loadAllButton.textContent = idle && failures && completed + failures === records.length ?
+      "Retry failed diffs" : idle && completed + failures < records.length && selected.loadAllActive ?
+      "Load remaining diffs" : "Load all diffs";
+    selected.loadAllButton.disabled = selected.loadAllActive && !idle;
   };
   const fileRoute = (file, changes = {}) => {
     const next = {...route, file: file.id, line: null, ...changes};
@@ -345,7 +347,6 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   };
   const renderFile = async (selected, record) => {
     if (!record.content || record.collapsed || active !== selected || paused) return;
-    trimEditors(selected, record);
     const fileView = route.view === "file" && record === selectedFile(selected);
     const version = fullFileVersion(record.file, route.version);
     const editorMode = fileView ? "file" : route.layout;
@@ -353,17 +354,21 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     if (record.editor && record.editorKey === key) return;
     const content = record.content;
     const generation = ++record.generation;
+    record.rendered = false; record.rendering = false;
     record.editor?.destroy(); record.editor = null; record.editorKey = key;
     record.host.replaceChildren();
     const blobs = fileView ? [version === "old" ? content.before : content.after] : [content.before, content.after];
-    if (blobs.some(blob => blob.binary || blob.limited)) {
+    if (blobs.some(blob => blob.binary || blob.limited || blob.kind === "submodule")) {
       record.host.style.minHeight = "0px";
       record.host.append(node("p", "muted", "Text preview is unavailable for this file. Review the metadata above or inspect it locally."));
+      record.rendered = true; updateLoadAll(selected);
       return;
     }
     if (!fileView && !content.diff) {
       record.host.style.minHeight = "0px";
       record.host.append(node("p", "notice warning", content.diffError || "The exact diff is unavailable. Reload this page to try again, or use View file."));
+      record.failure = content.diffError || "The exact diff is unavailable";
+      record.failureKind = "server"; updateLoadAll(selected);
       return;
     }
     record.host.append(node("p", "muted", "Loading file view…"));
@@ -378,21 +383,29 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         lineURL: (side, number) => reviewURL(location.href, fileRoute(record.file, {line: {side, number}})),
         onLineSelect: (side, number) => navigate(fileRoute(record.file, {line: {side, number}})),
       });
-      record.used = performance.now();
+      record.rendering = true;
       void record.editor.ready.then(() => {
         if (active !== selected || generation !== record.generation) return;
-        trimEditors(selected);
+        record.rendering = false; record.rendered = true; record.failure = null; record.failureKind = null; updateLoadAll(selected);
         const destination = selectedFile(selected);
         if (selected.pendingNavigation && destination?.editor) {
           requestAnimationFrame(() => { if (active === selected && selected.pendingNavigation) void reveal(selected, destination); });
         }
+      }).catch(error => {
+        if (active !== selected || generation !== record.generation) return;
+        record.editor?.destroy(); record.editor = null;
+        record.rendering = false; record.failure = error.message; record.failureKind = "render";
+        showFailure(record.host, error); updateLoadAll(selected);
       });
     } catch (error) {
-      if (active === selected && generation === record.generation) showFailure(record.host, error);
+      if (active === selected && generation === record.generation) {
+        record.rendering = false; record.failure = error.message; record.failureKind = "render";
+        showFailure(record.host, error); updateLoadAll(selected);
+      }
     }
   };
   const assignContent = (record, content) => {
-    record.content = content; record.metadata.replaceChildren();
+    record.content = content; record.failure = null; record.failureKind = null; record.metadata.replaceChildren();
     for (const line of metadata(record.file, content)) record.metadata.append(node("p", "", line));
   };
   const pumpFiles = selected => {
@@ -400,6 +413,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     while (selected.jobs < 2 && selected.fileQueue.size) {
       const batch = [...selected.fileQueue].filter(record => !record.collapsed).slice(0, 4);
       if (!batch.length) break;
+      const generation = readGeneration;
       batch.forEach(record => selected.fileQueue.delete(record));
       selected.jobs++;
       void (async () => {
@@ -410,32 +424,37 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
           await Promise.all(batch.map(async record => {
             const result = results.get(record.file.id);
             if (!result || result.error) throw Object.assign(new Error(result?.error || "File content is unavailable."), {record});
-            if (record.collapsed) return;
             assignContent(record, result.content);
+            if (record.collapsed) return;
             if (!record.section.hidden) await renderFile(selected, record);
           }).map(promise => promise.catch(error => {
-            if (error.record) showFailure(error.record.host, error);
+            if (error.record) { error.record.failure = error.message; error.record.failureKind = "server"; showFailure(error.record.host, error); }
             else throw error;
           })));
         } catch (error) {
-          if (active === selected && !paused && error.name !== "AbortError") for (const record of batch) if (!record.content && !record.collapsed) showFailure(record.host, error);
+          if (active === selected && generation !== readGeneration && !selected.abort.signal.aborted) {
+            for (const record of batch) if (!record.content && !record.collapsed) selected.fileQueue.add(record);
+          }
+          else if (active === selected && error.name !== "AbortError") for (const record of batch) if (!record.content && !record.collapsed) {
+            record.failure = error.message; record.failureKind = "server"; showFailure(record.host, error);
+          }
         } finally {
           selected.jobs--;
           for (const record of batch) { record.loading = false; record.resolveLoad?.(); record.resolveLoad = null; }
-          if (active === selected) { trimEditors(selected); pumpFiles(selected); }
+          if (active === selected) { updateLoadAll(selected); setTimeout(() => pumpFiles(selected), 0); }
         }
       })();
     }
   };
   const loadFile = (selected, record, priority = false) => {
-    if (record.collapsed || paused) return Promise.resolve();
-    record.used = performance.now();
+    if (record.collapsed || paused || (record.failure && !priority)) return Promise.resolve();
     if (record.content) return renderFile(selected, record);
     if (record.loading) {
       if (priority && selected.fileQueue.has(record)) selected.fileQueue = new Set([record, ...selected.fileQueue]);
       return record.loadPromise;
     }
     record.loading = true;
+    record.failure = null;
     record.host.replaceChildren(node("p", "muted", "Loading file…"));
     record.loadPromise = new Promise(resolve => { record.resolveLoad = resolve; });
     selected.fileQueue = new Set(priority ? [record, ...selected.fileQueue] : [...selected.fileQueue, record]);
@@ -449,9 +468,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     record.toggle.setAttribute("aria-expanded", String(!collapsed));
     record.toggle.textContent = collapsed ? (largeDiff(record.file) ? "Show large diff" : "Show diff") : "Hide diff";
     if (collapsed) {
-      ++record.generation; record.editor?.destroy(); record.editor = null; record.content = null;
       if (selected?.fileQueue.delete(record)) { record.loading = false; record.resolveLoad?.(); record.resolveLoad = null; }
-      record.host.replaceChildren(node("p", "muted", "Scroll here to load this comparison."));
     }
   };
   const applyView = async (revealTree = false) => {
@@ -484,7 +501,12 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     selected.treeFile = record.file.id;
     if ((revealTree && (route.file || route.line)) || route.view === "file") setCollapsed(selected, record, false);
     const others = [...selected.sections.values()].filter(item => item !== record && !item.section.hidden && item.content);
-    void Promise.all(others.map(item => renderFile(selected, item)));
+    void (async () => {
+      for (let offset = 0; offset < others.length && active === selected; offset += 4) {
+        await Promise.all(others.slice(offset, offset + 4).map(item => renderFile(selected, item)));
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    })();
     await loadFile(selected, record, true);
     if (active === selected && selected.pendingNavigation) await reveal(selected, record);
   };
@@ -548,7 +570,28 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         });
         option.dataset.layout = value; controls.append(option);
       }
-      heading.append(button("← Repositories", () => closeReview()), title, copy(() => location.href, "Copy comparison link"), controls);
+      const loadAllButton = button("Load all diffs", () => {
+        const selected = active;
+        if (!selected || selected.state !== state) return;
+        const allSettled = [...selected.sections.values()].every(record => record.rendered || record.failure);
+        const retry = selected.loadAllActive && allSettled && [...selected.sections.values()].some(record => record.failure);
+        selected.loadAllActive = true;
+        if (route.view === "file") navigate({...route, view: "diff", version: ""});
+        for (const record of selected.sections.values()) {
+          if (retry && !record.failure) continue;
+          if (record.failure) {
+            if (record.failureKind === "server") record.content = null;
+            record.failure = null; record.failureKind = null; record.rendered = false;
+          }
+          setCollapsed(selected, record, false);
+          void loadFile(selected, record);
+        }
+        updateLoadAll(selected);
+      });
+      const loadAllStatus = node("span", "muted repository-load-all-status");
+      loadAllStatus.setAttribute("role", "status");
+      heading.append(button("← Repositories", () => closeReview()), title, copy(() => location.href, "Copy comparison link"), controls,
+        loadAllButton, loadAllStatus);
       const changed = node("div", "notice warning repository-comparison-changed"); changed.hidden = true;
       changed.append(node("span", "", "The branch has changed. This view keeps the revisions shown above."),
         button("Refresh comparison", async () => { if (await loadHistory(state, 0, true)) navigate(comparisonRoute(state)); }));
@@ -612,7 +655,8 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         section.append(fileTitle, fileBody); scroll.append(section);
         const choiceKey = [state.id, payload.pair.base, payload.pair.head, file.id].join(":");
         const record = {file, nav, fileLink, diffLink, versions, section, fileTitle, toggle, body: fileBody, choiceKey,
-          metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, used: 0};
+          metadata: fileMetadata, host, editor: null, content: null, generation: 0, loading: false, rendered: false,
+          rendering: false, failure: null, failureKind: null};
         sections.set(file.id, record);
         setCollapsed(null, record, requested.file === file.id ? false : collapseChoices.get(choiceKey) ?? largeDiff(file), false);
       }
@@ -642,7 +686,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       review.append(body);
       active = {state, pair: payload.pair, snapshot: payload.snapshot, review: payload.review, commit: requested.commit,
         historyHead: payload.historyHead || state.pair?.head || payload.pair.head, changed, controls, lineNotice,
-        fileList, scroll, sections, abort, fileQueue: new Set(), jobs: 0};
+        fileList, scroll, sections, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
       opening = null;
       const selected = active;
       if (payload.preview && sections.has(payload.preview.file) && !sections.get(payload.preview.file).collapsed) assignContent(sections.get(payload.preview.file), payload.preview.content);
@@ -656,7 +700,6 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       for (const event of ["wheel", "touchstart", "pointerdown", "keydown"]) {
         scroll.addEventListener(event, () => { selected.pendingNavigation = false; }, {passive: true});
       }
-      scroll.addEventListener("scroll", () => { if (active === selected) trimEditors(selected); }, {passive: true});
       markChanged(state, state.latestHead);
       await applyView(true);
       if (!payload.files.length) scroll.append(node("p", "empty", "No changed files between these revisions."));

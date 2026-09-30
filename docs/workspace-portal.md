@@ -67,6 +67,22 @@ Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
+## Repository comparisons
+
+An open comparison retains loaded file content and editors while the repository
+card refreshes or the reader scrolls. Collapsing a file hides its editor without
+discarding the loaded result. Changing the layout or file version may recreate
+an editor from retained content. Closing or replacing the comparison releases
+these results.
+
+**Load all diffs** expands every listed file and uses the same bounded queue as
+scroll loading: two concurrent requests with up to four files each. Progress
+shows completed files and failures, and Retry repeats only failed files. Binary
+and limited previews complete with metadata. Loading every diff can use more
+browser memory; the existing per-file preview limits still apply. The browser's
+native Find searches rendered CodeMirror content, which can virtualize lines
+and hide unchanged regions, so it may miss text outside the visible diff.
+
 ## Conversation history in the portal
 
 The Codex tab reads the newest 100 transcript items on first load for the lead,
