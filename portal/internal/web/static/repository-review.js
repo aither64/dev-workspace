@@ -170,6 +170,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   const renderHistory = (state, payload) => {
     state.snapshot = payload.snapshot; state.review = payload.review;
     state.pair = payload.pair; state.page = payload.history.page;
+    state.origin = payload.origin || null;
     const branch = state.card.querySelector("[data-review-branch]");
     const compare = link("Compare", reviewURL(location.href, comparisonRoute(state)),
       () => navigate(comparisonRoute(state)));
@@ -200,7 +201,9 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       if (commit.url) {
         const external = node("a", "repository-commit-link", "↗");
         external.href = commit.url; external.target = "_blank"; external.rel = "noreferrer";
-        external.title = "View commit on GitHub"; external.setAttribute("aria-label", "View commit " + short(commit.sha) + " on GitHub");
+        const originLabel = state.origin?.label || "repository origin";
+        external.title = "View commit on " + originLabel;
+        external.setAttribute("aria-label", "View commit " + short(commit.sha) + " on " + originLabel);
         identity.append(external);
       }
       row.append(subjectGroup, identity); item.prepend(row); list.append(item);

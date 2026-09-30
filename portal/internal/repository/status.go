@@ -2,10 +2,8 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +27,6 @@ const (
 )
 
 var gitObjectPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
-var githubPartPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type Run struct {
 	WorkflowName string `json:"workflowName"`
@@ -40,22 +37,25 @@ type Run struct {
 }
 
 type Status struct {
-	ReviewID      string `json:"reviewId"`
-	Name          string `json:"name"`
-	Project       string `json:"project"`
-	GitHub        string `json:"github,omitempty"`
-	Branch        string `json:"branch,omitempty"`
-	DefaultBranch string `json:"defaultBranch,omitempty"`
-	HeadSHA       string `json:"headSha,omitempty"`
-	LocalHeadSHA  string `json:"localHeadSha,omitempty"`
-	RemoteHeadSHA string `json:"remoteHeadSha,omitempty"`
-	PushStatus    string `json:"pushStatus,omitempty"`
-	StatusError   string `json:"statusError,omitempty"`
-	CompareURL    string `json:"compareUrl,omitempty"`
-	BranchURL     string `json:"branchUrl,omitempty"`
-	ActionsURL    string `json:"actionsUrl,omitempty"`
-	GitHubError   string `json:"githubError,omitempty"`
-	Runs          []Run  `json:"runs,omitempty"`
+	ReviewID      string       `json:"reviewId"`
+	Name          string       `json:"name"`
+	Project       string       `json:"project"`
+	GitHub        string       `json:"github,omitempty"`
+	Origin        *Origin      `json:"origin,omitempty"`
+	OriginLinks   *OriginLinks `json:"originLinks,omitempty"`
+	OriginError   string       `json:"originError,omitempty"`
+	Branch        string       `json:"branch,omitempty"`
+	DefaultBranch string       `json:"defaultBranch,omitempty"`
+	HeadSHA       string       `json:"headSha,omitempty"`
+	LocalHeadSHA  string       `json:"localHeadSha,omitempty"`
+	RemoteHeadSHA string       `json:"remoteHeadSha,omitempty"`
+	PushStatus    string       `json:"pushStatus,omitempty"`
+	StatusError   string       `json:"statusError,omitempty"`
+	CompareURL    string       `json:"compareUrl,omitempty"`
+	BranchURL     string       `json:"branchUrl,omitempty"`
+	ActionsURL    string       `json:"actionsUrl,omitempty"`
+	GitHubError   string       `json:"githubError,omitempty"`
+	Runs          []Run        `json:"runs,omitempty"`
 	baseSHA       string
 	immutable     bool
 	worktree      string
@@ -65,6 +65,7 @@ type Runner struct {
 	GH             string
 	Workspace      string
 	CommandTimeout time.Duration
+	Provider       OriginProvider
 }
 
 // Inspect derives archived links from immutable manifest records. For active
@@ -72,12 +73,14 @@ type Runner struct {
 // checked-out feature head with GitHub's authoritative branch head.
 func (r Runner) Skeleton(slug string, repositories []session.Repository, immutable bool) []Status {
 	statuses := make([]Status, 0, len(repositories))
+	provider := r.originProvider()
 	for _, item := range repositories {
 		status := Status{
 			ReviewID: ReviewID(item.Name), Name: item.Name, Project: item.Project, GitHub: item.GitHub, Branch: item.Branch,
 			DefaultBranch: item.DefaultBranch, HeadSHA: item.FinalHeadSHA,
 			baseSHA: item.InitialBaseSHA, immutable: immutable,
 		}
+		status.resolveOrigin(provider)
 		if !immutable {
 			status.PushStatus = PushStatusUnknown
 			if workspace, err := canonicalPath(r.Workspace); err != nil {
@@ -88,7 +91,7 @@ func (r Runner) Skeleton(slug string, repositories []session.Repository, immutab
 				status.worktree = filepath.Join(workspace, "worktrees", slug, item.Name)
 			}
 		}
-		status.updateLinks()
+		status.updateLinks(provider)
 		statuses = append(statuses, status)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
@@ -130,6 +133,9 @@ func (r Runner) Enrich(ctx context.Context, status *Status) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	provider := r.originProvider()
+	status.resolveOrigin(provider)
+	status.updateLinks(provider)
 
 	if status.immutable {
 		r.enrichArchived(ctx, status)
@@ -143,43 +149,46 @@ type localResult struct {
 	worktree string
 	err      error
 }
-
-type githubResult struct {
-	defaultBranch string
-	remoteHead    string
-	err           error
+type originResult struct {
+	result OriginRepository
+	err    error
 }
 
 func (r Runner) enrichActive(ctx context.Context, status *Status) {
+	provider := r.originProvider()
 	localChannel := make(chan localResult, 1)
 	go func() {
 		head, err := r.resolveLocalHead(ctx, status)
 		localChannel <- localResult{head: head, worktree: status.worktree, err: err}
 	}()
 
-	githubChannel := make(chan githubResult, 1)
-	if status.GitHub == "" {
-		githubChannel <- githubResult{err: errors.New("GitHub repository is not recorded")}
+	originChannel := make(chan originResult, 1)
+	if status.Origin == nil && status.OriginError != "" {
+		originChannel <- originResult{err: errors.New(status.OriginError)}
 	} else {
-		go func() { githubChannel <- r.githubRepository(ctx, status) }()
+		go func() {
+			result, err := provider.Repository(ctx, status.Origin, status.Branch)
+			originChannel <- originResult{result: result, err: err}
+		}()
 	}
 
 	local := <-localChannel
-	remote := <-githubChannel
+	remote := <-originChannel
 	if local.err != nil {
 		status.StatusError = conciseError(local.err, nil)
 	} else {
 		status.LocalHeadSHA = local.head
 	}
 	if remote.err != nil {
-		status.GitHubError = conciseError(remote.err, nil)
+		status.setOriginError(conciseError(remote.err, nil))
 	} else {
-		if remote.defaultBranch != "" {
-			status.DefaultBranch = remote.defaultBranch
+		status.setOriginError("")
+		if remote.result.DefaultBranch != "" {
+			status.DefaultBranch = remote.result.DefaultBranch
 		}
-		status.RemoteHeadSHA = remote.remoteHead
+		status.RemoteHeadSHA = remote.result.HeadSHA
 	}
-	status.updateLinks()
+	status.updateLinks(provider)
 
 	if local.err != nil || remote.err != nil {
 		return
@@ -196,17 +205,17 @@ func (r Runner) enrichActive(ctx context.Context, status *Status) {
 
 	pushStatus, err := r.compareHeads(ctx, local.worktree, status.LocalHeadSHA, status.RemoteHeadSHA)
 	if err != nil {
-		pushStatus, err = r.compareHeadsOnGitHub(ctx, status)
+		pushStatus, err = provider.CompareHeads(ctx, status.Origin, status.LocalHeadSHA, status.RemoteHeadSHA)
 	}
 	if err != nil {
-		status.StatusError = "compare local and GitHub heads: " + conciseError(err, nil)
+		status.StatusError = "compare local and " + status.Origin.Label + " heads: " + conciseError(err, nil)
 		return
 	}
 	status.PushStatus = pushStatus
 }
 
 func (r Runner) enrichArchived(ctx context.Context, status *Status) {
-	if status.Branch == "" || status.HeadSHA == "" {
+	if status.Origin == nil || status.Branch == "" || status.HeadSHA == "" {
 		return
 	}
 	r.loadRuns(ctx, status, status.HeadSHA)
@@ -296,55 +305,6 @@ func (r Runner) expectedCommonDir(project string) (string, error) {
 	return resolved, nil
 }
 
-func (r Runner) githubRepository(ctx context.Context, status *Status) githubResult {
-	owner, name, ok := strings.Cut(status.GitHub, "/")
-	if !ok || !githubPartPattern.MatchString(owner) || !githubPartPattern.MatchString(name) {
-		return githubResult{err: errors.New("invalid GitHub repository")}
-	}
-	query := `query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} ref(qualifiedName:$qualifiedName){target{oid}}}}`
-	output, err := r.command(
-		ctx, r.gh(), "api", "graphql",
-		"-f", "query="+query,
-		"-f", "owner="+owner,
-		"-f", "name="+name,
-		"-f", "qualifiedName=refs/heads/"+status.Branch,
-	)
-	if err != nil {
-		return githubResult{err: commandError(ctx, err, output)}
-	}
-	var response struct {
-		Data struct {
-			Repository *struct {
-				DefaultBranchRef *struct {
-					Name string `json:"name"`
-				} `json:"defaultBranchRef"`
-				Ref *struct {
-					Target struct {
-						OID string `json:"oid"`
-					} `json:"target"`
-				} `json:"ref"`
-			} `json:"repository"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(output, &response); err != nil {
-		return githubResult{err: fmt.Errorf("decode GitHub repository status: %w", err)}
-	}
-	if response.Data.Repository == nil {
-		return githubResult{err: errors.New("GitHub repository is unavailable")}
-	}
-	result := githubResult{}
-	if response.Data.Repository.DefaultBranchRef != nil {
-		result.defaultBranch = response.Data.Repository.DefaultBranchRef.Name
-	}
-	if response.Data.Repository.Ref != nil {
-		result.remoteHead = response.Data.Repository.Ref.Target.OID
-		if !gitObjectPattern.MatchString(result.remoteHead) {
-			return githubResult{err: errors.New("GitHub returned an invalid branch head")}
-		}
-	}
-	return result
-}
-
 func (r Runner) compareHeads(ctx context.Context, worktree, localHead, remoteHead string) (string, error) {
 	ancestor, err := r.isAncestor(ctx, worktree, remoteHead, localHead)
 	if err != nil {
@@ -375,59 +335,14 @@ func (r Runner) isAncestor(ctx context.Context, worktree, ancestor, descendant s
 	return false, commandError(ctx, err, output)
 }
 
-func (r Runner) compareHeadsOnGitHub(ctx context.Context, status *Status) (string, error) {
-	endpoint := fmt.Sprintf(
-		"repos/%s/compare/%s...%s", status.GitHub, status.LocalHeadSHA, status.RemoteHeadSHA,
-	)
-	output, err := r.command(ctx, r.gh(), "api", endpoint, "--jq", "{status: .status}")
-	if err != nil {
-		return "", commandError(ctx, err, output)
-	}
-	var response struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(output, &response); err != nil {
-		return "", fmt.Errorf("decode GitHub comparison: %w", err)
-	}
-	switch response.Status {
-	case "ahead":
-		return PushStatusRemoteAhead, nil
-	case "behind":
-		return PushStatusNotPushed, nil
-	case "diverged":
-		return PushStatusDivergent, nil
-	default:
-		return "", fmt.Errorf("GitHub returned comparison status %q", response.Status)
-	}
-}
-
 func (r Runner) loadRuns(ctx context.Context, status *Status, exactHead string) {
-	args := []string{
-		"run", "list", "-R", status.GitHub, "--branch", status.Branch, "--limit", "100",
-		"--json", "workflowName,status,conclusion,headSha,url",
-	}
-	if exactHead != "" {
-		args = append(args, "--commit", exactHead)
-	}
-	output, err := r.command(ctx, r.gh(), args...)
+	runs, err := r.originProvider().Workflows(ctx, status.Origin, status.Branch, exactHead)
 	if err != nil {
-		status.GitHubError = conciseError(commandError(ctx, err, output), nil)
+		status.setOriginError(conciseError(err, nil))
 		return
 	}
-	var runs []Run
-	if err := json.Unmarshal(output, &runs); err != nil {
-		status.GitHubError = fmt.Sprintf("decode workflow runs: %v", err)
-		return
-	}
-	if exactHead == "" {
-		status.Runs = runs
-		return
-	}
-	for _, run := range runs {
-		if run.HeadSHA == exactHead {
-			status.Runs = append(status.Runs, run)
-		}
-	}
+	status.setOriginError("")
+	status.Runs = runs
 }
 
 func (r Runner) command(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -443,37 +358,39 @@ func (r Runner) gh() string {
 
 func (status *Status) recordContextError(err error) {
 	if status.immutable {
-		status.GitHubError = err.Error()
+		status.setOriginError(err.Error())
 	} else {
 		status.StatusError = err.Error()
 	}
 }
 
-func (status *Status) updateLinks() {
-	if status.GitHub == "" {
+func (status *Status) resolveOrigin(provider OriginProvider) {
+	origin, err := provider.Resolve(status.GitHub)
+	status.Origin = origin
+	if err != nil {
+		status.setOriginError(err.Error())
+	}
+}
+
+func (status *Status) setOriginError(message string) {
+	status.OriginError = message
+	status.GitHubError = message // Existing JSON clients use githubError.
+}
+
+func (status *Status) updateLinks(provider OriginProvider) {
+	status.CompareURL = ""
+	status.BranchURL = ""
+	status.ActionsURL = ""
+	status.OriginLinks = nil
+	if status.Origin == nil {
 		return
 	}
-	base := "https://github.com/" + status.GitHub
-	if status.immutable {
-		status.CompareURL = ""
-		status.BranchURL = ""
-		if status.baseSHA != "" && status.HeadSHA != "" {
-			status.CompareURL = base + "/compare/" + url.PathEscape(status.baseSHA) + "..." + url.PathEscape(status.HeadSHA)
-			status.BranchURL = base + "/tree/" + url.PathEscape(status.HeadSHA)
-		}
-	} else {
-		status.CompareURL = ""
-		status.BranchURL = ""
-		if status.Branch != "" {
-			status.BranchURL = base + "/tree/" + url.PathEscape(status.Branch)
-			if status.DefaultBranch != "" {
-				status.CompareURL = base + "/compare/" + url.PathEscape(status.DefaultBranch) + "..." + url.PathEscape(status.Branch)
-			}
-		}
-	}
-	if status.Branch != "" {
-		status.ActionsURL = base + "/actions?query=" + url.QueryEscape("branch:"+status.Branch)
-	}
+	links := provider.Links(status.Origin, status.Branch, status.DefaultBranch,
+		status.baseSHA, status.HeadSHA, status.immutable)
+	status.OriginLinks = &links
+	status.CompareURL = links.CompareURL
+	status.BranchURL = links.BranchURL
+	status.ActionsURL = links.WorkflowsURL
 }
 
 func canonicalPath(path string) (string, error) {

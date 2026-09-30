@@ -175,6 +175,7 @@ func (s *Server) writeReviewError(w http.ResponseWriter, summary *session.Summar
 
 type reviewHistoryResponse struct {
 	Repository   string                   `json:"repository,omitempty"`
+	Origin       *repository.Origin       `json:"origin,omitempty"`
 	Review       string                   `json:"review"`
 	Snapshot     string                   `json:"snapshot"`
 	Pair         repository.ReviewPair    `json:"pair"`
@@ -191,6 +192,7 @@ type reviewPreview struct {
 	Content repository.ReviewContent `json:"content"`
 }
 type reviewComparisonResponse struct {
+	Origin       *repository.Origin       `json:"origin,omitempty"`
 	Review       string                   `json:"review"`
 	Snapshot     string                   `json:"snapshot"`
 	HistoryHead  string                   `json:"historyHead"`
@@ -400,7 +402,7 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		snapshot.Commits[commit.ID] = commit.SHA
 	}
 	snapshot.mu.Unlock()
-	response := reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history}
+	response := reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history, Origin: snapshot.Repo.Origin}
 	totals, err := cachedReview(ctx, service, "summary\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) (reviewHistorySummary, error) {
 		count, err := service.reader.CommitCount(ctx, snapshot.Repo, snapshot.Pair)
 		if err != nil {
@@ -495,7 +497,7 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, snapshot.Repo.ID, err)
 		}
 	}
-	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files}
+	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files, Origin: snapshot.Repo.Origin}
 	if fileID == "" && len(files) > 0 && !files[0].LargeDiff() {
 		fileID = files[0].ID
 	}

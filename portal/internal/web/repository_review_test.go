@@ -138,6 +138,36 @@ func TestRepositoryReviewHTTPImmutablePairAndOpaqueIdentities(t *testing.T) {
 		t.Fatalf("comparison write without origin = %d", w.Code)
 	}
 }
+
+func TestRepositoryReviewAddsOriginWithoutChangingLocalHistory(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	manifest := filepath.Join(s.config.Workspace, "work", "example", "portal.yml")
+	data, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, append(data, []byte("    github: example/project\n")...), 0644); err != nil {
+		t.Fatal(err)
+	}
+	query := "?repository=" + repository.ReviewID("project")
+	history := reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200)
+	var origin repository.Origin
+	if err := json.Unmarshal(history["origin"], &origin); err != nil ||
+		origin.Provider != "github" || origin.Repository != "example/project" {
+		t.Fatalf("history origin = %#v, %v", origin, err)
+	}
+	var commits repository.ReviewHistory
+	if err := json.Unmarshal(history["history"], &commits); err != nil || len(commits.Commits) != 1 ||
+		!strings.HasPrefix(commits.Commits[0].URL, origin.URL+"/commit/") {
+		t.Fatalf("local history and origin commit link = %#v, %v", commits, err)
+	}
+	comparison := reviewRequest(t, s, "POST", "/api/sessions/example/repository-comparison"+query,
+		fmt.Sprintf(`{"snapshot":%q}`, reviewString(t, history["snapshot"])), 200)
+	if string(comparison["origin"]) != string(history["origin"]) {
+		t.Fatalf("comparison origin differs: history %s, comparison %s", history["origin"], comparison["origin"])
+	}
+}
+
 func TestRepositoryReviewSavedHistorySurvivesRestartAndIntegration(t *testing.T) {
 	s, bare, _, base := reviewWebFixture(t)
 	endpoint := "/api/sessions/example/repository-history?repository=" + repository.ReviewID("project")

@@ -1836,7 +1836,9 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 	server.render(response, "session", pageData{
 		Session: &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true},
 		Repositories: []repository.Status{{
-			Name: "workspace", Branch: "feature", DefaultBranch: "master",
+			Name: "workspace", GitHub: "example/workspace", Branch: "feature", DefaultBranch: "master",
+			Origin:       &repository.Origin{Provider: "github", Repository: "example/workspace", Label: "GitHub", URL: "https://github.com/example/workspace"},
+			OriginLinks:  &repository.OriginLinks{RepositoryURL: "https://github.com/example/workspace"},
 			LocalHeadSHA: strings.Repeat("a", 40), RemoteHeadSHA: strings.Repeat("b", 40),
 			PushStatus: repository.PushStatusDivergent,
 			Runs: []repository.Run{
@@ -1858,7 +1860,7 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
-		"Local HEAD", "GitHub HEAD", "Diverged", `data-cluster-service-tab="0"`,
+		"Local HEAD", "GitHub HEAD", "Diverged", `href="https://github.com/example/workspace"`, `data-cluster-service-tab="0"`,
 		`data-cluster-service-panel="0"`, `<div class="service-link"><span>Link</span>`,
 		`href="https://webui.example.test/" target="_blank" rel="noreferrer">https://webui.example.test/</a>`, "Administrator",
 		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
@@ -2145,7 +2147,8 @@ func TestWorkflowLookupErrorDoesNotClaimThereAreNoRuns(t *testing.T) {
 		Session: &session.Summary{Manifest: session.Manifest{Slug: "example"}},
 		Repositories: []repository.Status{{
 			Name: "workspace", PushStatus: repository.PushStatusExactlyPushed,
-			GitHubError: "request timed out",
+			Origin:      &repository.Origin{Provider: "github", Repository: "example/workspace", Label: "GitHub", URL: "https://github.com/example/workspace"},
+			OriginError: "request timed out", GitHubError: "request timed out",
 		}},
 	})
 	body := response.Body.String()

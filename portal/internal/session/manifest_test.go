@@ -116,6 +116,36 @@ func TestSharedValidManifestFixturesAreAccepted(t *testing.T) {
 	}
 }
 
+func TestRepositoryManifestKeepsGitHubFieldAndRejectsOriginKey(t *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		file    string
+		prepare func(string) string
+	}{
+		{"schema 1", "portal-manifest-valid.yml", func(data string) string { return data }},
+		{"schema 2", "portal-manifest-valid-creating-schema2.yml", func(data string) string {
+			return strings.Replace(data, "repositories: []", "repositories:\n  - name: example\n    project: example\n    github: example-org/example\n    branch: feature\n    default_branch: master\n    initial_base_sha: "+strings.Repeat("a", 40), 1)
+		}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "fixtures", fixture.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := fixture.prepare(string(data))
+			var manifest Manifest
+			if err := decodeManifest([]byte(original), &manifest); err != nil ||
+				len(manifest.Repositories) != 1 || manifest.Repositories[0].GitHub != "example-org/example" {
+				t.Fatalf("legacy github field = %#v, %v", manifest.Repositories, err)
+			}
+			var unsupported Manifest
+			if err := decodeManifest([]byte(strings.Replace(original, "github:", "origin:", 1)), &unsupported); err == nil {
+				t.Fatal("new origin key changed the strict manifest schema")
+			}
+		})
+	}
+}
+
 func TestInitialGoalAttemptMarkerIsLimitedToInFlightSchema(t *testing.T) {
 	attempted := true
 	for _, testCase := range []struct {

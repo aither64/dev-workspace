@@ -35,10 +35,12 @@ type ReviewReader struct {
 	Workspace string
 	Timeout   time.Duration
 	Jobs      chan struct{}
+	Provider  OriginProvider
 }
 type ReviewRepository struct {
 	Name, ID, GitHub, Directory, Head, DefaultRef, InitialBase string
 	Archived                                                   bool
+	Origin                                                     *Origin
 }
 type ReviewPair struct {
 	Base      string `json:"base"`
@@ -178,6 +180,8 @@ func (r ReviewReader) git(ctx context.Context, dir string, limit int, args ...st
 
 func (r ReviewReader) Resolve(ctx context.Context, slug string, item session.Repository, archived bool) (ReviewRepository, error) {
 	result := ReviewRepository{Name: item.Name, ID: ReviewID(item.Name), GitHub: item.GitHub, InitialBase: item.InitialBaseSHA, Archived: archived}
+	// A missing or invalid remote cannot prevent local object review.
+	result.Origin, _ = r.originProvider().Resolve(item.GitHub)
 	if !session.ValidSlug(slug) || !session.ValidSlug(item.Name) || !session.ValidSlug(item.Project) {
 		return result, errors.New("invalid repository registration")
 	}
@@ -338,7 +342,7 @@ func (r ReviewReader) History(ctx context.Context, repo ReviewRepository, pair R
 	if len(out) == 0 {
 		return result, nil
 	}
-	result.Commits, err = parseReviewCommits(out, repo.GitHub)
+	result.Commits, err = parseReviewCommits(out, repo.Origin, r.originProvider())
 	if err != nil {
 		return result, err
 	}
@@ -364,7 +368,7 @@ func (r ReviewReader) CommitCount(ctx context.Context, repo ReviewRepository, pa
 
 const reviewCommitFormat = "%H%x00%P%x00%an%x00%aI%x00%s%x00%b%x00%B"
 
-func parseReviewCommits(out []byte, github string) ([]ReviewCommit, error) {
+func parseReviewCommits(out []byte, origin *Origin, provider OriginProvider) ([]ReviewCommit, error) {
 	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
 	if len(fields)%7 != 0 {
 		return nil, errors.New("unexpected Git history format")
@@ -379,9 +383,7 @@ func parseReviewCommits(out []byte, github string) ([]ReviewCommit, error) {
 		if c.Parents == nil {
 			c.Parents = []string{}
 		}
-		if validReviewGitHub(github) {
-			c.URL = "https://github.com/" + github + "/commit/" + sha
-		}
+		c.URL = provider.CommitURL(origin, sha)
 		result = append(result, c)
 	}
 	return result, nil
@@ -423,7 +425,7 @@ func (r ReviewReader) ComparisonCommit(ctx context.Context, repo ReviewRepositor
 	if err != nil {
 		return ReviewCommit{}, err
 	}
-	commits, err := parseReviewCommits(out, repo.GitHub)
+	commits, err := parseReviewCommits(out, repo.Origin, r.originProvider())
 	if err != nil {
 		return ReviewCommit{}, err
 	}
@@ -432,11 +434,6 @@ func (r ReviewReader) ComparisonCommit(ctx context.Context, repo ReviewRepositor
 	}
 	return commits[0], nil
 }
-func validReviewGitHub(value string) bool {
-	owner, name, ok := strings.Cut(value, "/")
-	return ok && githubPartPattern.MatchString(owner) && githubPartPattern.MatchString(name)
-}
-
 func (r ReviewReader) CommitPair(ctx context.Context, repo ReviewRepository, commit ReviewCommit) (ReviewPair, error) {
 	pair := ReviewPair{Head: commit.SHA, BaseLabel: "Parent of commit " + commit.SHA[:10]}
 	if len(commit.Parents) > 0 {

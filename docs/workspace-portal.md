@@ -83,6 +83,19 @@ browser memory; the existing per-file preview limits still apply. The browser's
 native Find searches rendered CodeMirror content, which can virtualize lines
 and hide unchanged regions, so it may miss text outside the visible diff.
 
+Repository registrations can include `github: owner/name`. The GitHub origin
+validates that value, builds HTTPS links, and loads the remote branch, exact
+head, and workflow runs. If a GitHub lookup fails, local commits and diffs
+remain available and the card shows the error. Without a GitHub registration,
+local review remains available without external links or remote status.
+
+Repository status JSON retains `github`, `githubError`, `compareUrl`,
+`branchUrl`, and `actionsUrl`. It adds `origin`, `originError`, and `originLinks`;
+history and comparison responses also include `origin` when available. The
+manifest schemas, CLI registration flags, and saved review IDs remain unchanged.
+Older portal versions can read the same manifests and saved comparisons. GitHub
+is the only supported origin; there is no runtime origin URL or plugin setting.
+
 ## Conversation history in the portal
 
 The Codex tab reads the newest 100 transcript items on first load for the lead,
