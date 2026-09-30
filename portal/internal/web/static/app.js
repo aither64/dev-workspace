@@ -1723,28 +1723,41 @@
       applyTeamLeadSettings(teamSelect);
     });
   });
-  const applyMemberDefaults = () => {
+  const updateAddMemberEligibility = () => {
+    const form = document.querySelector('[data-direct-team-form][data-action="add"]');
+    if (!form || !models.length) return;
+    const model = models.find(candidate => candidate.model === form.elements.model.value);
+    const supported = model?.supportedReasoningEfforts?.some(option => option.reasoningEffort === form.elements.effort.value);
+    const submit = form.querySelector('[type="submit"]');
+    if (submit && !form.dataset.teamSubmitting) submit.disabled = !supported;
+  };
+  const applyMemberDefaults = (force = false) => {
     const memberDefaults = document.getElementById("team-role-defaults");
     const addMemberForm = document.querySelector('[data-direct-team-form][data-action="add"]');
     if (!memberDefaults || !addMemberForm || !models.length) return;
-    const preset = memberDefaults.dataset.currentPreset || memberDefaults.dataset.defaultPreset;
+    if (!force && addMemberForm.dataset.teamDirty === "true") { updateAddMemberEligibility(); return; }
     const role = addMemberForm.elements.role.value.trim();
-    const defaults = Array.from(memberDefaults.querySelectorAll("[data-preset][data-role]"))
-      .find((entry) => entry.dataset.preset === preset && entry.dataset.role === role);
+    const defaults = Array.from(memberDefaults.querySelectorAll("[data-role]"))
+      .find((entry) => entry.dataset.role === role);
     const modelSelect = addMemberForm.elements.model;
     const effortSelect = addMemberForm.elements.effort;
     if (defaults && Array.from(modelSelect.options).some((option) => option.value === defaults.dataset.model)) {
       modelSelect.value = defaults.dataset.model;
       populateEfforts(modelSelect, effortSelect, defaults.dataset.effort);
+      if (effortSelect.value !== defaults.dataset.effort) restoreDraftSelect(effortSelect, defaults.dataset.effort, "Role reasoning effort is unavailable");
+      updateAddMemberEligibility();
       return;
     }
     // A role absent from this preset has no preset settings: require an explicit
     // model choice instead of silently taking Codex's global default.
     modelSelect.selectedIndex = -1;
     populateEfforts(modelSelect, effortSelect);
+    if (defaults?.dataset.model) restoreDraftSelect(modelSelect, defaults.dataset.model, "Role model is unavailable");
+    updateAddMemberEligibility();
   };
   document.addEventListener("change", (event) => {
-    if (event.target.matches('[data-direct-team-form][data-action="add"] [name="role"]')) applyMemberDefaults();
+    if (event.target.matches('[data-direct-team-form][data-action="add"] [name="role"]')) applyMemberDefaults(true);
+    if (event.target.matches('[data-direct-team-form][data-action="add"] [name="model"], [data-direct-team-form][data-action="add"] [name="effort"]')) updateAddMemberEligibility();
   });
   document.querySelectorAll("[data-team-catalog-acknowledge]").forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
@@ -1854,6 +1867,7 @@
       form.dataset.teamDirty = "true";
       if (status) status.textContent = error.message;
       controls.forEach(control => { control.disabled = false; });
+      if (action === "add") updateAddMemberEligibility();
     }
   });
   document.addEventListener("change", (event) => {

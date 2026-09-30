@@ -48,7 +48,7 @@ func (stub *teamModelCatalogStub) ListModels(context.Context) ([]codex.Model, er
 	return stub.models, stub.err
 }
 
-func TestTeamMemberSettingsRequireAnExplicitLivePair(t *testing.T) {
+func TestTeamMemberSettingsAcceptOptionalAddPairAndValidateExplicitPair(t *testing.T) {
 	catalog := func() *teamModelCatalogStub {
 		return &teamModelCatalogStub{models: []codex.Model{
 			{Model: "member-model", DisplayName: "Member model", SupportedReasoningEfforts: []codex.ReasoningEffortOption{
@@ -60,6 +60,9 @@ func TestTeamMemberSettingsRequireAnExplicitLivePair(t *testing.T) {
 		for _, requested := range []codex.ThreadSettings{
 			{}, {Model: "member-model"}, {ReasoningEffort: "high"},
 		} {
+			if command == "add" && requested == (codex.ThreadSettings{}) {
+				continue
+			}
 			t.Run(command+"/missing-pair", func(t *testing.T) {
 				client := catalog()
 				_, err := resolveTeamMemberSettings(context.Background(), client, command, requested.Model, requested.ReasoningEffort)
@@ -72,6 +75,13 @@ func TestTeamMemberSettingsRequireAnExplicitLivePair(t *testing.T) {
 			})
 		}
 	}
+	t.Run("add uses role defaults when both omitted", func(t *testing.T) {
+		client := catalog()
+		settings, err := resolveTeamMemberSettings(context.Background(), client, "add", "", "")
+		if err != nil || settings != (codex.ThreadSettings{}) || client.calls != 0 {
+			t.Fatalf("optional add settings = %#v, error = %v, calls = %d", settings, err, client.calls)
+		}
+	})
 
 	t.Run("accepts advertised pair", func(t *testing.T) {
 		client := catalog()

@@ -247,29 +247,35 @@ func validateCatalogInstructions(catalog *agentteams.Catalog, teamID, roleName s
 	return fmt.Errorf("catalog has no instructions for %s/%s", teamID, roleName)
 }
 
-func catalogRole(catalog *agentteams.Catalog, teamID, role string, managed bool) (agentteams.Role, error) {
+type ResolvedRole struct {
+	agentteams.Role
+	Source string
+}
+
+// ResolveRole uses the same policy order for browser defaults and member creation.
+func ResolveRole(catalog *agentteams.Catalog, teamID, role string, managed bool) (ResolvedRole, error) {
 	if catalog == nil {
 		if managed {
-			return agentteams.Role{}, errors.New("installed team catalog is required to add a member")
+			return ResolvedRole{}, errors.New("installed team catalog is required to add a member")
 		}
 		// Unmanaged installations have no pinned catalog. Keep their supported
 		// direct roles explicit, rather than creating an ungoverned thread.
 		switch role {
 		case "architect":
-			return agentteams.Role{Behavior: "designer", Access: "read_only"}, nil
+			return ResolvedRole{Role: agentteams.Role{Behavior: "designer", Access: "read_only"}, Source: "unmanaged"}, nil
 		case "implementer":
-			return agentteams.Role{Behavior: "implementer", Access: "workspace_write"}, nil
+			return ResolvedRole{Role: agentteams.Role{Behavior: "implementer", Access: "workspace_write"}, Source: "unmanaged"}, nil
 		case "reviewer":
-			return agentteams.Role{Behavior: "reviewer", Access: "read_only"}, nil
+			return ResolvedRole{Role: agentteams.Role{Behavior: "reviewer", Access: "read_only"}, Source: "unmanaged"}, nil
 		default:
-			return agentteams.Role{}, errors.New("team role has no policy; choose architect, implementer, or reviewer")
+			return ResolvedRole{}, errors.New("team role has no policy; choose architect, implementer, or reviewer")
 		}
 	}
 	if !digestPattern.MatchString(catalog.CatalogDigest) {
-		return agentteams.Role{}, errors.New("installed team catalog has no valid digest")
+		return ResolvedRole{}, errors.New("installed team catalog has no valid digest")
 	}
 	if role == "lead" || role == "team_lead" {
-		return agentteams.Role{}, errors.New("lead cannot be added as a member")
+		return ResolvedRole{}, errors.New("lead cannot be added as a member")
 	}
 	find := func(id string) (agentteams.Role, bool, error) {
 		team, ok := catalog.Teams[id]
@@ -308,10 +314,10 @@ func catalogRole(catalog *agentteams.Catalog, teamID, role string, managed bool)
 		seen[id] = true
 		found, ok, err := find(id)
 		if err != nil {
-			return agentteams.Role{}, err
+			return ResolvedRole{}, err
 		}
 		if ok {
-			return found, nil
+			return ResolvedRole{Role: found, Source: id}, nil
 		}
 	}
 	ids := make([]string, 0, len(catalog.Teams))
@@ -322,25 +328,35 @@ func catalogRole(catalog *agentteams.Catalog, teamID, role string, managed bool)
 	}
 	sort.Strings(ids)
 	var found *agentteams.Role
+	var source string
 	for _, id := range ids {
 		candidate, ok, err := find(id)
 		if err != nil {
-			return agentteams.Role{}, err
+			return ResolvedRole{}, err
 		}
 		if !ok {
 			continue
 		}
 		if found != nil && (found.Behavior != candidate.Behavior || found.Purpose != candidate.Purpose ||
-			found.Instructions != candidate.Instructions || found.Access != candidate.Access) {
-			return agentteams.Role{}, fmt.Errorf("team role %s has conflicting catalog policies", role)
+			found.Instructions != candidate.Instructions || found.Access != candidate.Access ||
+			found.Model != candidate.Model || found.Effort != candidate.Effort) {
+			return ResolvedRole{}, fmt.Errorf("team role %s has conflicting catalog policies", role)
 		}
 		copy := candidate
-		found = &copy
+		if found == nil {
+			found = &copy
+			source = id
+		}
 	}
 	if found == nil {
-		return agentteams.Role{}, fmt.Errorf("team role %s has no pinned catalog policy", role)
+		return ResolvedRole{}, fmt.Errorf("team role %s has no pinned catalog policy", role)
 	}
-	return *found, nil
+	return ResolvedRole{Role: *found, Source: source}, nil
+}
+
+func catalogRole(catalog *agentteams.Catalog, teamID, role string, managed bool) (agentteams.Role, error) {
+	resolved, err := ResolveRole(catalog, teamID, role, managed)
+	return resolved.Role, err
 }
 
 // PresetsFromCatalog projects the installed site policy into real persistent
@@ -764,11 +780,17 @@ type Client interface {
 }
 
 type Service struct {
-	Store     *Store
-	Client    Client
-	Workspace string
-	Catalog   *agentteams.Catalog
+	Store            *Store
+	Client           Client
+	Workspace        string
+	Catalog          *agentteams.Catalog
+	ValidateSettings func(context.Context, codex.ThreadSettings) error
 }
+
+type MemberSettingsError struct{ Err error }
+
+func (failure *MemberSettingsError) Error() string { return failure.Err.Error() }
+func (failure *MemberSettingsError) Unwrap() error { return failure.Err }
 
 // memberTurnPolicy binds the report tool to the exact roster identity on each
 // resume before a member turn. A thread ID is unavailable during thread/start
@@ -817,12 +839,27 @@ func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, 
 	if service.Store == nil || service.Client == nil || !rolePattern.MatchString(role) || role == "lead" {
 		return Member{}, errors.New("invalid team member request")
 	}
+	if (model == "") != (effort == "") {
+		return Member{}, &MemberSettingsError{Err: errors.New("model and reasoning effort must be selected together")}
+	}
 	var pending Member
 	err := service.Store.withOperationLock(ctx, slug, func() error {
 		_, err := service.Store.Update(ctx, slug, rootThreadID, true, func(roster *Roster) error {
-			policyRole, err := catalogRole(service.Catalog, roster.PresetID, role, roster.PresetID != "")
+			policyRole, err := ResolveRole(service.Catalog, roster.PresetID, role, roster.PresetID != "")
 			if err != nil {
 				return err
+			}
+			selectedModel, selectedEffort := model, effort
+			if selectedModel == "" {
+				selectedModel, selectedEffort = policyRole.Model, policyRole.Effort
+				if selectedModel == "" || selectedEffort == "" {
+					return &MemberSettingsError{Err: errors.New("role has no model and reasoning effort; choose both explicitly")}
+				}
+			}
+			if service.ValidateSettings != nil {
+				if err := service.ValidateSettings(ctx, codex.ThreadSettings{Model: selectedModel, ReasoningEffort: selectedEffort}); err != nil {
+					return &MemberSettingsError{Err: err}
+				}
 			}
 			var next uint64
 			occupied := make(map[string]bool, len(roster.Members))
@@ -846,7 +883,7 @@ func (service Service) Add(ctx context.Context, slug, rootThreadID, cwd string, 
 				catalogDigest = service.Catalog.CatalogDigest
 			}
 			pending = Member{Address: fmt.Sprintf("%s%d", role, next), Role: role, Index: next,
-				Model: model, Effort: effort, Behavior: policyRole.Behavior, Purpose: policyRole.Purpose,
+				Model: selectedModel, Effort: selectedEffort, Behavior: policyRole.Behavior, Purpose: policyRole.Purpose,
 				Instructions: policyRole.Instructions, Access: policyRole.Access,
 				PolicyCatalogDigest: catalogDigest,
 				State:               "creating", AddedAt: time.Now().UTC()}

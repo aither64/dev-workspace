@@ -229,8 +229,14 @@ that saved selection.
 
 After creation, the Team tab can add, remove, and configure members, and
 inspect their messages. Model and reasoning settings apply to a member's next
-turn. Its add selector lists every role in the installed catalog. If a role is
-outside the current preset, choose its model and reasoning effort explicitly.
+turn. Its add selector lists every role in the installed catalog and starts
+with that role's model and effort from the retained preset, the installed
+development default, or the installed default team. An explicit selection stays
+in place during status refresh. Both add settings may be omitted in the HTTP
+API or CLI to use those role defaults; supplying only one is invalid. Without
+an installed catalog, add requires both settings explicitly. Existing rosters
+keep their saved settings.
+
 Removed members stay in a collapsed history section. The Codex tab can
 switch between `lead` and ready members to show each complete conversation;
 direct messages use the member's current role policy and model settings. Work
@@ -265,6 +271,7 @@ The CLI uses the same record:
 ```sh
 dev-session team list example
 dev-session team preset example delegated
+dev-session team add example implementer
 dev-session team add example architect --model gpt-6-sol --effort xhigh
 dev-session team configure example architect0 --model gpt-6-sol --effort high
 dev-session team update-access example architect0 --access workspace_write

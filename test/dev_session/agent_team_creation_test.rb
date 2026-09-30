@@ -681,6 +681,34 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_team_add_accepts_omitted_pair_and_rejects_partial_or_empty_flags
+    with_workspace do |workspace|
+      slug = '2026-09-22-optional-team-settings'
+      calls = []
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:select_tmux_for_slug!) { |_selected| nil }
+        define_method(:reject_conflicting_lifecycle_journal!) { |_selected| nil }
+        define_method(:invoke_team_command) do |_selected, **options|
+          calls << options
+          'ok'
+        end
+      end
+      runner = runner_class.new(workspace:, tmux: InertTmux.new, out: StringIO.new,
+                                err: StringIO.new, today: Date.new(2026, 9, 22),
+                                env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') },
+                                cwd: workspace, portal_command: ['workspace-portal-test'])
+      runner.ensure_tracking_files(slug)
+      assert_equal('ok', runner.team(slug, action: 'add', role: 'implementer'))
+      assert_nil(calls.first[:model])
+      assert_nil(calls.first[:effort])
+      [{model: 'gpt-6-sol'}, {effort: 'high'}, {model: '', effort: 'high'},
+       {model: 'gpt-6-sol', effort: ''}].each do |pair|
+        assert_raises(DevSession::Error) { runner.team(slug, action: 'add', role: 'implementer', **pair) }
+      end
+      assert_equal(1, calls.length)
+    end
+  end
+
   private
 
   def managed_runner_for(workspace)

@@ -31,6 +31,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestTeamRequestPreservesOptionalSettingsPairPresence(t *testing.T) {
+	for _, test := range []struct {
+		body                string
+		model, effort, null bool
+	}{
+		{`{"action":"add","role":"implementer"}`, false, false, false},
+		{`{"action":"add","role":"implementer","model":"x","reasoningEffort":"high"}`, true, true, false},
+		{`{"action":"add","role":"implementer","model":""}`, true, false, false},
+		{`{"action":"add","role":"implementer","model":null,"reasoningEffort":null}`, true, true, true},
+	} {
+		var request teamRequestBody
+		if err := json.Unmarshal([]byte(test.body), &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.modelProvided != test.model || request.effortProvided != test.effort || request.settingsNull != test.null {
+			t.Fatalf("%s: presence = %v/%v, null = %v", test.body, request.modelProvided, request.effortProvided, request.settingsNull)
+		}
+	}
+	var request teamRequestBody
+	if err := json.Unmarshal([]byte(`{"action":"add","unexpected":true}`), &request); err == nil {
+		t.Fatal("unknown team field accepted")
+	}
+}
+
 func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "transition.lock")
 	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)

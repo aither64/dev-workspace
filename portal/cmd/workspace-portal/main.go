@@ -356,6 +356,9 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 	if command != "add" && command != "configure" {
 		return codex.ThreadSettings{Model: model, ReasoningEffort: effort}, nil
 	}
+	if command == "add" && model == "" && effort == "" {
+		return codex.ThreadSettings{}, nil
+	}
 	if model == "" || effort == "" {
 		return codex.ThreadSettings{}, fmt.Errorf("team %s requires --model and --effort", command)
 	}
@@ -477,7 +480,15 @@ func teamCommand(args []string) error {
 		"DEV_SESSION_SLUG": *slug, "DEV_SESSION_WORKSPACE": *workspace, "DEV_SESSION_WORK_DIR": *cwd,
 		"DEV_SESSION_REQUIRE_RUNTIME": "1", "DEV_SESSION_CODEX_SOCKET": *socket,
 	}
-	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog}
+	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog,
+		ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
+			models, err := client.ListModels(ctx)
+			if err != nil {
+				return fmt.Errorf("load live Codex models: %w", err)
+			}
+			_, err = workspacecodex.ResolveNewThreadSettings(models, settings)
+			return err
+		}}
 	var presetSpec teamruntime.Preset
 	if command == "apply-preset" {
 		if *presetFile == "" {

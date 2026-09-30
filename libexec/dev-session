@@ -219,7 +219,7 @@ module DevSession
       dev-session team list <name-or-slug> [--as-is]
 	  dev-session team preset <name-or-slug> <package-team-id> [--as-is]
         [--model MODEL] [--effort EFFORT]
-      dev-session team add <name-or-slug> <role> --model MODEL --effort EFFORT [--as-is]
+      dev-session team add <name-or-slug> <role> [--model MODEL --effort EFFORT] [--as-is]
       dev-session team configure <name-or-slug> <address> --model MODEL --effort EFFORT [--as-is]
       dev-session team update-access <name-or-slug> <address> --access read_only|workspace_write [--as-is]
       dev-session team remove <name-or-slug> <address> [--as-is]
@@ -1468,6 +1468,13 @@ module DevSession
 
     def team(slug, action:, preset: nil, role: nil, address: nil, access: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
       raise Error, 'workspace-portal is required for team controls' unless @portal_command && !@portal_command.empty?
+	  if %w[add configure].include?(action)
+		provided = [model, effort].map { |value| !value.nil? }
+		if provided.uniq.length > 1 || (provided.first && [model, effort].any? { |value| value.strip.empty? }) ||
+		   (action == 'configure' && !provided.first)
+		  raise Error, '--model and --effort must be selected together for team settings'
+		end
+	  end
 	  member_address = @env[ENV_MEMBER_ADDRESS]
 	  if member_address && !member_address.empty?
 		unless slug == @env[ENV_SLUG]

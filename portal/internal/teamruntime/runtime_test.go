@@ -503,6 +503,66 @@ func TestAddSkipsAddressUsedByAnotherRoleEvenWhenRemoved(t *testing.T) {
 	}
 }
 
+func TestAddResolvesRolePairBeforeCreatingMember(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	development := "development"
+	catalog := &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1),
+		DefaultDevelopmentTeam: &development, DefaultTeam: "general", Teams: map[string]agentteams.Team{
+			"development": {Roles: map[string]agentteams.Role{"implementer": {
+				Model: "development-model", Effort: "high", Behavior: "implementer", Access: "workspace_write",
+			}}},
+			"general": {Roles: map[string]agentteams.Role{"implementer": {
+				Model: "general-model", Effort: "low", Behavior: "implementer", Access: "workspace_write",
+			}}},
+		}}
+	validated := 0
+	service := Service{Store: store, Client: &testClient{}, Workspace: workspace, Catalog: catalog,
+		ValidateSettings: func(_ context.Context, settings codex.ThreadSettings) error {
+			validated++
+			if settings.Model != "development-model" || settings.ReasoningEffort != "high" {
+				return errors.New("wrong role pair")
+			}
+			return nil
+		}}
+	role, err := ResolveRole(catalog, "", "implementer", false)
+	if err != nil || role.Source != development || role.Model != "development-model" {
+		t.Fatalf("role = %#v, %v", role, err)
+	}
+	for _, pair := range [][2]string{{"development-model", ""}, {"", "high"}} {
+		if _, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+			"implementer", pair[0], pair[1]); err == nil {
+			t.Fatalf("partial pair %#v accepted", pair)
+		}
+	}
+	if _, err := store.Load("one", "root-one"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial pair wrote roster: %v", err)
+	}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "", "")
+	if err != nil || member.Model != "development-model" || member.Effort != "high" || validated != 1 {
+		t.Fatalf("default member = %#v, validated = %d, error = %v", member, validated, err)
+	}
+	stored, err := store.Load("one", "root-one")
+	if err != nil || stored.Members[0].Model != member.Model || stored.Members[0].Effort != member.Effort {
+		t.Fatalf("saved role pair = %#v, %v", stored, err)
+	}
+}
+
+func TestRoleFallbackRejectsModelDisagreement(t *testing.T) {
+	catalog := &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"one": {Roles: map[string]agentteams.Role{"analyst": {Model: "first", Effort: "high", Behavior: "general", Purpose: "general", Instructions: "Analyze.", Access: "read_only"}}},
+		"two": {Roles: map[string]agentteams.Role{"analyst": {Model: "second", Effort: "high", Behavior: "general", Purpose: "general", Instructions: "Analyze.", Access: "read_only"}}},
+	}}
+	_, err := ResolveRole(catalog, "", "analyst", false)
+	if err == nil || !strings.Contains(err.Error(), "conflicting catalog policies") {
+		t.Fatalf("role conflict = %v", err)
+	}
+}
+
 func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
@@ -1852,11 +1912,11 @@ func TestRosterAddressesAndAssignmentsAreSessionScoped(t *testing.T) {
 	client := &testClient{}
 	service := Service{Store: store, Client: client, Workspace: workspace}
 	environment := map[string]string{"DEV_SESSION_SLUG": "one"}
-	first, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), environment, "implementer", "", "")
+	first, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), environment, "implementer", "gpt-6-sol", "high")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := service.Add(context.Background(), "two", "root-two", filepath.Join(workspace, "work", "two"), environment, "implementer", "", "")
+	second, err := service.Add(context.Background(), "two", "root-two", filepath.Join(workspace, "work", "two"), environment, "implementer", "gpt-6-sol", "high")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1882,7 +1942,7 @@ func TestRemovedMemberStaysRemovedAcrossLifecycleAndFork(t *testing.T) {
 	}
 	client := &testClient{}
 	service := Service{Store: store, Client: client, Workspace: workspace}
-	if _, err := service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "implementer", "", ""); err != nil {
+	if _, err := service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.Remove(context.Background(), "source", "root-source", "implementer0"); err != nil {
@@ -1905,7 +1965,7 @@ func TestRemovedMemberStaysRemovedAcrossLifecycleAndFork(t *testing.T) {
 	if len(destination.Members) != 1 || destination.Members[0].State != "removed" || destination.Members[0].Thread != "" {
 		t.Fatalf("removed destination member = %#v", destination.Members)
 	}
-	if _, err := service.Add(context.Background(), "target", "root-target", filepath.Join(workspace, "work", "target"), nil, "implementer", "", ""); err != nil {
+	if _, err := service.Add(context.Background(), "target", "root-target", filepath.Join(workspace, "work", "target"), nil, "implementer", "gpt-6-sol", "high"); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.Load("target", "root-target")
@@ -2533,7 +2593,7 @@ func TestAssignRequiresStableCallerMessageID(t *testing.T) {
 	}
 	client := &testClient{}
 	service := Service{Store: store, Client: client, Workspace: workspace}
-	_, err = service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "reviewer", "", "")
+	_, err = service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "reviewer", "gpt-6-sol", "high")
 	if err != nil {
 		t.Fatal(err)
 	}

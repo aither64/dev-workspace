@@ -212,6 +212,7 @@ type pageData struct {
 	RemovedMembers    []teamruntime.Member
 	TeamPresets       []teamruntime.Preset
 	TeamRoles         []teamRoleOption
+	TeamRoleDefaults  []teamRoleDefault
 	ReadyMembers      []teamruntime.Member
 	SelectedMember    string
 	SelectedThreadID  string
@@ -222,6 +223,33 @@ type pageData struct {
 type teamRoleOption struct {
 	ID    string
 	Label string
+}
+
+type teamRoleDefault struct {
+	Role string `json:"role"`
+	Model string `json:"model"`
+	Effort string `json:"reasoningEffort"`
+	Source string `json:"source"`
+}
+
+func (s *Server) roleDefaults(roster *teamruntime.Roster, roles []teamRoleOption) []teamRoleDefault {
+	var catalog *agentteams.Catalog
+	if s.installedTeams != nil && s.installedTeams.Managed {
+		catalog = s.installedTeams.Catalog
+	}
+	teamID := ""
+	if roster != nil {
+		teamID = roster.PresetID
+	}
+	defaults := make([]teamRoleDefault, 0, len(roles))
+	for _, role := range roles {
+		resolved, err := teamruntime.ResolveRole(catalog, teamID, role.ID, teamID != "")
+		if err != nil {
+			continue
+		}
+		defaults = append(defaults, teamRoleDefault{Role: role.ID, Model: resolved.Model, Effort: resolved.Effort, Source: resolved.Source})
+	}
+	return defaults
 }
 
 func teamRoles(presets []teamruntime.Preset) []teamRoleOption {
@@ -1029,6 +1057,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.RemovedMembers = removedTeamMembers(roster)
 	}
 	data.TeamRoles = teamRoles(data.TeamPresets)
+	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	data.SelectedThreadID = summary.Codex.ThreadID
 	data.ConversationID = summary.Slug
 	if data.DirectTeam != nil {
@@ -1128,6 +1157,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		}
 	}
 	data.TeamRoles = teamRoles(data.TeamPresets)
+	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render repositories"})
@@ -1745,16 +1775,39 @@ func (s *Server) sessionAPIForSummary(
 }
 
 type teamRequestBody struct {
-	Action    string `json:"action"`
-	Preset    string `json:"preset"`
-	Role      string `json:"role"`
-	Address   string `json:"address"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Message   string `json:"message"`
-	MessageID string `json:"messageId"`
-	Model     string `json:"model"`
-	Effort    string `json:"reasoningEffort"`
+	Action         string `json:"action"`
+	Preset         string `json:"preset"`
+	Role           string `json:"role"`
+	Address        string `json:"address"`
+	From           string `json:"from"`
+	To             string `json:"to"`
+	Message        string `json:"message"`
+	MessageID      string `json:"messageId"`
+	Model          string `json:"model"`
+	Effort         string `json:"reasoningEffort"`
+	modelProvided  bool
+	effortProvided bool
+	settingsNull   bool
+}
+
+func (request *teamRequestBody) UnmarshalJSON(data []byte) error {
+	type wire teamRequestBody
+	var decoded wire
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, decoded.modelProvided = fields["model"]
+	_, decoded.effortProvided = fields["reasoningEffort"]
+	decoded.settingsNull = bytes.Equal(bytes.TrimSpace(fields["model"]), []byte("null")) ||
+		bytes.Equal(bytes.TrimSpace(fields["reasoningEffort"]), []byte("null"))
+	*request = teamRequestBody(decoded)
+	return nil
 }
 
 func (s *Server) teamEnvironment(summary *session.Summary) map[string]string {
@@ -1792,7 +1845,9 @@ func (s *Server) teamService() (teamruntime.Service, error) {
 	if err != nil {
 		return teamruntime.Service{}, err
 	}
-	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace}
+	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace, ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
+		return s.validateModelSettings(ctx, settings, false)
+	}}
 	if s.installedTeams != nil && s.installedTeams.Managed {
 		service.Catalog = s.installedTeams.Catalog
 	}
@@ -1820,7 +1875,9 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster, "presets": s.directTeamPresets()})
+		presets := s.directTeamPresets()
+		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster, "presets": presets,
+			"roleDefaults": s.roleDefaults(roster, teamRoles(presets))})
 		return
 	}
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
@@ -1885,13 +1942,17 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		if request.Action == "add" || request.Action == "configure" {
 			request.Model = strings.TrimSpace(request.Model)
 			request.Effort = strings.TrimSpace(request.Effort)
-			if request.Model == "" || request.Effort == "" {
+			if request.settingsNull || request.modelProvided != request.effortProvided ||
+				(request.modelProvided && (request.Model == "" || request.Effort == "")) ||
+				(request.Action == "configure" && !request.modelProvided) {
 				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "choose a model and reasoning effort for this member"})
 				return
 			}
-			if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}, false); err != nil {
-				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
+			if request.modelProvided {
+				if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}, false); err != nil {
+					s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
 			}
 		}
 		switch request.Action {
@@ -1918,7 +1979,12 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		}
 	}
 	if err != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		var settingsError *teamruntime.MemberSettingsError
+		status := http.StatusConflict
+		if errors.As(err, &settingsError) {
+			status = http.StatusBadRequest
+		}
+		s.writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	roster, rosterErr := s.loadTeamRoster(summary)
