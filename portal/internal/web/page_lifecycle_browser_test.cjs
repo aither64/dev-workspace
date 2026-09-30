@@ -65,11 +65,11 @@ const baseURL = process.argv[2];
         document.dispatchEvent(new Event("visibilitychange"));
       });
       failActivity = true;
+      const beforeWake = activity;
       await page.evaluate(() => {
         Object.defineProperty(document, "hidden", {configurable: true, value: false});
         document.dispatchEvent(new Event("visibilitychange"));
       });
-      const beforeWake = activity;
       await expect.poll(() => activity).toBeGreaterThan(beforeWake);
       await page.waitForTimeout(1500);
       await expect(page.locator("#codex-work-elapsed")).not.toContainText("unavailable");
