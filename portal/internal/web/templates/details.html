@@ -17,7 +17,7 @@
               {{if .DefaultBranch}}<dt>Default branch</dt><dd><code>{{.DefaultBranch}}</code></dd>{{end}}
             </dl>
             <nav class="link-row">
-              {{if .OriginLinks}}{{if .OriginLinks.RepositoryURL}}<a href="{{.OriginLinks.RepositoryURL}}" target="_blank" rel="noreferrer">{{.Origin.Label}} ↗</a>{{end}}{{end}}
+              {{if .OriginLinks}}{{if .OriginLinks.RepositoryURL}}<a href="{{.OriginLinks.RepositoryURL}}" target="_blank" rel="noreferrer">Origin ↗</a>{{end}}{{end}}
               {{if $.Session.Archived}}
                 {{if .OriginLinks}}{{if .OriginLinks.CompareURL}}<a href="{{.OriginLinks.CompareURL}}" target="_blank" rel="noreferrer" aria-label="Compare on {{.Origin.Label}}">Compare ↗</a>{{end}}{{end}}
                 {{if .OriginLinks}}{{if .OriginLinks.BranchURL}}<a href="{{.OriginLinks.BranchURL}}" target="_blank" rel="noreferrer">Final revision</a>{{end}}{{end}}
