@@ -13,9 +13,29 @@ class WorkspaceHostTest < Minitest::Test
       end
       abort 'dev-session was not loaded for recovery' unless defined?(DevSession::Runner)
     RUBY
-    host_path = File.expand_path('../../libexec/workspace-host', __dir__)
-    output, error, status = Open3.capture3(RbConfig.ruby, '-e', script, host_path)
-    assert(status.success?, "#{output}#{error}")
+    source = File.expand_path('../../libexec', __dir__)
+    Dir.mktmpdir('workspace-host-package-layout') do |root|
+      packaged_libexec = File.join(root, 'libexec')
+      packaged_session = File.join(packaged_libexec, 'workspace-portal')
+      package_contract = File.join(root, 'share', 'workspace-portal')
+      FileUtils.mkdir_p([packaged_session, package_contract])
+      %w[workspace-host workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
+        FileUtils.cp(File.join(source, name), File.join(packaged_libexec, name))
+      end
+      FileUtils.cp(File.join(source, 'dev-session'), File.join(packaged_session, 'dev-session'))
+      %w[workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
+        File.symlink(File.join('..', name), File.join(packaged_session, name))
+      end
+      FileUtils.cp(File.expand_path('../../portal/internal/session/runtime-contract.json', __dir__),
+                   File.join(package_contract, 'runtime-contract.json'))
+      {
+        source: File.join(source, 'workspace-host'),
+        packaged: File.join(packaged_libexec, 'workspace-host')
+      }.each do |layout, host_path|
+        output, error, status = Open3.capture3(RbConfig.ruby, '-e', script, host_path)
+        assert(status.success?, "#{layout}: #{output}#{error}")
+      end
+    end
   end
 
   module RecoveryBehavior

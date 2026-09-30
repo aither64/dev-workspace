@@ -767,7 +767,11 @@ module DevWorkspaceHost
     end
 
     def with_verified_archive_recovery(entry, slug, journal, runtime, environment)
-      load File.expand_path('dev-session', __dir__) unless defined?(DevSession::Runner)
+      unless defined?(DevSession::Runner)
+        source_path = File.expand_path('dev-session', __dir__)
+        packaged_path = File.expand_path('workspace-portal/dev-session', __dir__)
+        load(File.file?(source_path) ? source_path : packaged_path)
+      end
       verifier = DevSession::Runner.new(
         workspace: entry.fetch('root'), authority_dir: runtime.fetch(:authority),
         tmux_socket: runtime.fetch(:tmux), codex_socket: runtime.fetch(:codex),

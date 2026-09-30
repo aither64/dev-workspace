@@ -1533,10 +1533,11 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 		}
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
 		for _, member := range roster.Members {
-			if member.State == "archived" || member.State == "removed" {
+			if member.State == "removed" {
 				continue
 			}
-			if member.State != "ready" || member.Thread == "" || member.RetireIntent != "" {
+			if (member.State != "ready" && member.State != "archived") || member.Thread == "" ||
+				(member.State == "ready" && member.RetireIntent != "") {
 				return fmt.Errorf("member %s has no retained archive-ready identity", member.Address)
 			}
 			archived, err := service.archivedMemberThread(ctx, member, cwd)

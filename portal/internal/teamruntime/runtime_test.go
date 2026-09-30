@@ -1007,6 +1007,87 @@ func TestRequireArchivedAllUsesRetainedIdentityWithoutDiscovery(t *testing.T) {
 	}
 }
 
+func TestRequireArchivedAllRechecksArchivedRosterIdentity(t *testing.T) {
+	for _, failure := range []string{"active", "missing", "wrong cwd", "wrong project"} {
+		t.Run(failure, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &testClient{}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			cwd := filepath.Join(workspace, "work", "one")
+			member, err := service.Add(context.Background(), "one", "root-one", cwd, nil,
+				"implementer", "gpt-6-sol", "high")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+				roster.Members[0].State = "archived"
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.archived = map[string]bool{member.Thread: true}
+			client.hideThreads = true
+			listedBefore := client.listCalls
+			if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err != nil {
+				t.Fatalf("exact archived member was refused: %v", err)
+			}
+			switch failure {
+			case "active":
+				client.archived[member.Thread] = false
+			case "missing":
+				client.threads = nil
+			case "wrong cwd":
+				client.threads[0].Cwd = filepath.Join(workspace, "work", "other")
+			case "wrong project":
+				wrong := "00000000-0000-7000-8000-000000000999"
+				client.threads[0].ProjectID = &wrong
+			}
+			if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("archived roster entry passed without exact archive evidence")
+			}
+			if client.listCalls != listedBefore {
+				t.Fatal("archived roster proof used thread/list discovery")
+			}
+		})
+	}
+}
+
+func TestRequireArchivedAllKeepsRemovedAndRootOnlySemantics(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("root-only session: %v", err)
+	}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil,
+		"implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+		now := time.Now().UTC()
+		roster.Members[0].State = "removed"
+		roster.Members[0].RemovedAt = &now
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.threads = nil
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("removed member %s changed final proof semantics: %v", member.Address, err)
+	}
+}
+
 func TestRemoveDeletesOnlyEmptyUnmaterializedMember(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
