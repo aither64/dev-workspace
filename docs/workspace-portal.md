@@ -89,6 +89,15 @@ legacy read succeeds. Authorization failures, timeouts and invalid cursors
 remain errors. A changed cursor keeps loaded messages visible while a fresh
 bounded history repair checks their continuity.
 
+In lead and member conversations, model and reasoning changes stay in a draft
+until **Apply** sends the pair as one settings update. **Cancel** restores the
+most recent server-confirmed pair. A dirty draft survives polling, reconnects
+and page reloads in that browser tab.
+
+Active or unknown turn state blocks editing but keeps an existing draft. A
+failed or uncertain update also keeps the draft and rereads the thread before
+another attempt. The controls never send a compensating update automatically.
+
 The centered history row shows loading progress and a Retry control after a
 page read fails. Automatic loading pauses until Retry repeats the failed older
 page or continuity repair. An expired cursor prompts reconnection and a check

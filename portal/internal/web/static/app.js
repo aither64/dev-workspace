@@ -1453,6 +1453,10 @@
   const conversationID = body.dataset.conversationId || body.dataset.session || "";
   const selectedMember = body.dataset.selectedMember || "";
   let threadActive = false;
+  let threadIdle = false;
+  let liveSettingsSaving = false;
+  let settingsWriteGeneration = 0;
+  let liveSettingsController = null;
   const teamSelects = Array.from(document.querySelectorAll("[data-team-select]"));
 
   const updateTeamDescription = (teamSelect) => {
@@ -1624,6 +1628,7 @@
   const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
+      if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
       const effortSelect = pairedEffortSelect(modelSelect);
       const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
       const retainedValue = modelSelect.dataset.currentValue || "";
@@ -1657,6 +1662,7 @@
       const active = button.dataset.codexMode === currentMode;
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
+      button.disabled = liveSettingsSaving;
     });
     restoreManagedCreationDrafts();
     updateCreationCLI();
@@ -1707,10 +1713,12 @@
   const bindModelSelects = (root = document) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       modelSelect.addEventListener("change", () => {
+        if (modelSelect.id === "codex-model") { liveSettingsController?.modelChanged(); return; }
         modelSelect.dataset.userEdited = "true";
         populateEfforts(modelSelect, pairedEffortSelect(modelSelect));
       });
       pairedEffortSelect(modelSelect)?.addEventListener("change", (event) => {
+        if (modelSelect.id === "codex-model") { liveSettingsController?.effortChanged(); return; }
         event.currentTarget.dataset.userEdited = "true";
       });
     });
@@ -2981,13 +2989,15 @@
   const updateMessageActions = () => {
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !composerUploadReady; }
-    if (queueButton) queueButton.disabled = !composerUploadReady;
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !composerUploadReady || liveSettingsSaving; }
+    if (queueButton) queueButton.disabled = !composerUploadReady || liveSettingsSaving;
     if (queueButton) queueButton.hidden = !threadActive;
+    if (queueStart) queueStart.disabled = threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(threadActive);
   };
 
   const saveCollaborationMode = async (mode) => {
+    if (liveSettingsSaving) return;
     const controls = Array.from(document.querySelectorAll(
       "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
     ));
@@ -2996,6 +3006,8 @@
       const saved = await client.settings(undefined, undefined, mode);
       currentModel = saved.model;
       currentEffort = saved.reasoningEffort;
+      ++settingsWriteGeneration;
+      liveSettingsController?.confirm(saved.model, saved.reasoningEffort);
       currentMode = saved.collaborationMode || currentMode;
       applyCurrentSettings();
       scheduleRefresh(0);
@@ -3323,8 +3335,14 @@
       const threadStatus = payload.status;
       threadActive = threadStatus === "active";
       updateCodexWork(threadActive);
-      currentModel = payload.model || currentModel;
-      currentEffort = payload.reasoningEffort || currentEffort;
+      if ((payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration &&
+          typeof payload.model === "string" && typeof payload.reasoningEffort === "string" &&
+          payload.model && payload.reasoningEffort) {
+        currentModel = payload.model;
+        currentEffort = payload.reasoningEffort;
+        liveSettingsController?.confirm(currentModel, currentEffort);
+      }
+      threadIdle = threadStatus === "idle";
       currentMode = payload.collaborationMode || "";
       applyCurrentSettings();
       const modeStatus = document.getElementById("codex-mode-status");
@@ -3866,7 +3884,7 @@
     if (queueStart) {
       queueStart.dataset.queuedSubmissionId = entries[0]?.id || "";
       queueStart.hidden = threadActive;
-      queueStart.disabled = threadActive || queueStartInFlight;
+      queueStart.disabled = threadActive || queueStartInFlight || liveSettingsSaving;
     }
   };
 
@@ -3960,6 +3978,7 @@
     let queueAttemptStorage = null;
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
+      if (liveSettingsSaving) return;
       const message = textarea.value.trim();
       if (!message && !composerUploads.count()) return;
       let attachments;
@@ -4054,6 +4073,7 @@
   }
 
   queueStart?.addEventListener("click", async () => {
+    if (liveSettingsSaving) return;
     const queuedSubmissionId = queueStart.dataset.queuedSubmissionId;
     if (!queuedSubmissionId) return;
     queueStartInFlight = true;
@@ -4225,26 +4245,104 @@
   const liveModelSelect = document.getElementById("codex-model");
   const liveEffortSelect = document.getElementById("codex-effort");
   const liveSettingsStatus = document.getElementById("codex-settings-status");
-  const saveLiveSettings = async () => {
-    if (!interactive || !liveModelSelect || !liveEffortSelect || threadActive) return;
-    liveModelSelect.disabled = true;
-    liveEffortSelect.disabled = true;
-    if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings";
+  if (liveModelSelect && liveEffortSelect) {
+    const applyButton = document.getElementById("codex-settings-apply");
+    const cancelButton = document.getElementById("codex-settings-cancel");
+    const storageKey = `workspace-portal.settings-draft.${location.origin}.${slug}.${conversationID}.${currentThreadId}`;
+    let storage = null, savedDraft = null;
     try {
-      const saved = await client.settings(liveModelSelect.value, liveEffortSelect.value);
-      currentModel = saved.model;
-      currentEffort = saved.reasoningEffort;
-      if (liveSettingsStatus) liveSettingsStatus.textContent = "Codex settings saved";
-      scheduleRefresh(0);
-    } catch (error) {
-      if (liveSettingsStatus) liveSettingsStatus.textContent = "Codex settings were not saved";
-      alert(error.message);
-    } finally {
-      applyCurrentSettings();
-    }
-  };
-  liveModelSelect?.addEventListener("change", () => { void saveLiveSettings(); });
-  liveEffortSelect?.addEventListener("change", () => { void saveLiveSettings(); });
+      storage = sessionStorage;
+      const candidate = JSON.parse(storage.getItem(storageKey) || "null");
+      if (candidate && typeof candidate.model === "string" && candidate.model.length <= 128 &&
+          typeof candidate.effort === "string" && candidate.effort.length <= 128) savedDraft = candidate;
+    } catch (_) { /* The controls still work without browser storage. */ }
+    const draft = {model: savedDraft?.model || "", effort: savedDraft?.effort || ""};
+    let dirty = Boolean(savedDraft), saving = false, writeGeneration = 0, notice = "";
+    const persist = () => {
+      if (!storage || draft.model.length > 128 || draft.effort.length > 128) return;
+      try { storage.setItem(storageKey, JSON.stringify(draft)); } catch (_) {}
+    };
+    const clearStored = () => { try { storage?.removeItem(storageKey); } catch (_) {} };
+    const validPair = () => models.some(model => model.model === draft.model &&
+      model.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort));
+    liveSettingsController = {
+      render() {
+        if (!models.length) return;
+        restoreDraftSelect(liveModelSelect, draft.model, "Selected model is unavailable");
+        if (draft.model) liveModelSelect.value = draft.model;
+        else liveModelSelect.selectedIndex = -1;
+        populateEfforts(liveModelSelect, liveEffortSelect, draft.effort);
+        restoreDraftSelect(liveEffortSelect, draft.effort, "Selected reasoning effort is unavailable");
+        if (draft.effort) liveEffortSelect.value = draft.effort;
+        else liveEffortSelect.selectedIndex = -1;
+        const editable = interactive && threadIdle && !saving;
+        liveModelSelect.disabled = !editable;
+        liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
+        applyButton.disabled = !editable || !dirty || !validPair();
+        cancelButton.disabled = saving || !dirty;
+        if (liveSettingsStatus && !saving) liveSettingsStatus.textContent = notice || (dirty ? "Codex settings have unsaved changes" : "");
+      },
+      confirm(model, effort) {
+        if (!model || !effort) return;
+        currentModel = model; currentEffort = effort;
+        if (!dirty && !saving) { draft.model = model; draft.effort = effort; }
+        this.render();
+      },
+      modelChanged() {
+        draft.model = liveModelSelect.value;
+        const selected = models.find(model => model.model === draft.model);
+        if (!selected?.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort)) {
+          draft.effort = selected?.defaultReasoningEffort || "";
+        }
+        notice = ""; dirty = true; persist(); this.render();
+      },
+      effortChanged() {
+        draft.effort = liveEffortSelect.value;
+        notice = ""; dirty = true; persist(); this.render();
+      },
+      cancel() {
+        if (saving) return;
+        draft.model = currentModel; draft.effort = currentEffort;
+        notice = ""; dirty = false; clearStored(); this.render();
+      },
+      async apply() {
+        if (!interactive || !threadIdle || saving || !dirty || !validPair()) return;
+        const selected = {model: draft.model, effort: draft.effort};
+        saving = true; liveSettingsSaving = true; const attempt = ++writeGeneration;
+        if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings…";
+        this.render(); updateMessageActions(); applyCurrentSettings();
+        try {
+          const saved = await client.settings(selected.model, selected.effort);
+          if (attempt !== writeGeneration) return;
+          if (saved.model !== selected.model || saved.reasoningEffort !== selected.effort) {
+            throw new Error("Codex returned different settings; check the current thread before retrying.");
+          }
+          ++settingsWriteGeneration;
+          currentModel = saved.model; currentEffort = saved.reasoningEffort;
+          draft.model = saved.model; draft.effort = saved.reasoningEffort;
+          notice = ""; dirty = false; clearStored(); scheduleRefresh(0);
+        } catch (error) {
+          try {
+            const observed = await client.thread();
+            if (observed.model && observed.reasoningEffort) {
+              currentModel = observed.model; currentEffort = observed.reasoningEffort;
+              if (observed.model === selected.model && observed.reasoningEffort === selected.effort) {
+                ++settingsWriteGeneration;
+                notice = ""; dirty = false; clearStored(); scheduleRefresh(0);
+              }
+            }
+          } catch (_) { /* Keep the draft if the write outcome cannot be read. */ }
+          if (dirty) notice = `The settings update could not be confirmed: ${error.message}`;
+        } finally {
+          saving = false; liveSettingsSaving = false;
+          this.render(); updateMessageActions(); applyCurrentSettings();
+        }
+      },
+    };
+    applyButton?.addEventListener("click", () => { void liveSettingsController.apply(); });
+    cancelButton?.addEventListener("click", () => liveSettingsController.cancel());
+    liveSettingsController.render();
+  }
 
   const forkDialog = document.getElementById("fork-dialog");
   const forkForm = document.getElementById("fork-form");
@@ -4307,8 +4405,12 @@
   let lastSyncStatus = "";
   sync = conversationAssets.createConversationSync({
     live: interactive, eventsPath: interactive ? client.eventsPath() : null,
-    read: signal => pagingHelpersAvailable ?
-      conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal}),
+    read: signal => {
+      const settingsGeneration = settingsWriteGeneration;
+      const reading = pagingHelpersAvailable ?
+        conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal});
+      return reading.then(payload => ({...payload, settingsGeneration}));
+    },
     apply: (thread, {isCurrent}) => {
       const wasActive = threadActive;
       renderThread(thread, isCurrent);
