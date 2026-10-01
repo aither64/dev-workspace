@@ -214,9 +214,17 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
       await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeEnabled();
       await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
       await expect(technical).toBeHidden();
+      const hold = page.getByRole("checkbox", {name: "Keep open", exact: true});
+      await expect(hold).toBeChecked();
       failHold = true;
-      await page.getByRole("checkbox", {name: "Keep open", exact: true}).uncheck();
-      await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeChecked();
+      const [failedHoldResponse] = await Promise.all([
+        page.waitForResponse(response => new URL(response.url()).pathname === "/api/sessions/example/auto-archive" &&
+          response.request().method() === "POST"),
+        hold.click(),
+      ]);
+      assert.equal(failedHoldResponse.request().postDataJSON().hold, false);
+      assert.equal(failedHoldResponse.status(), 503);
+      await expect(hold).toBeChecked();
       await expect(page.locator("#auto-archive-status")).toContainText("Could not confirm the Keep open change");
       await expect(technical.locator("pre")).toContainText("Fixture hold failure");
       for (const fixture of [{enabled: false, eligible_at: "2026-09-21T18:01:59Z"}, {}, {enabled: true, tier: "complete", result: "deferred", blockers: ["unknown <script>diagnostic</script>"]}]) {
