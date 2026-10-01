@@ -40,6 +40,10 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await expect(page.locator("#lifecycle-operation-detail")).toContainText("since the last completed step");
       await expect(page.locator("#message-form")).toHaveCount(0);
       const initial = await banner.textContent();
+      const operationDetail = page.locator("#lifecycle-operation-detail");
+      const responseFor = endpoint => page.waitForResponse(response =>
+        new URL(response.url()).pathname === `/api/sessions/example/${endpoint}` &&
+        response.request().method() === "GET");
       const wake = async () => page.evaluate(() => {
         window.archiveTestOffset += 31_000;
         document.dispatchEvent(new Event("visibilitychange"));
@@ -49,13 +53,17 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await expect(page.locator("#settings")).toBeVisible();
       assert.equal(reads, 1);
       offline = true;
+      const offlineOperationResponse = responseFor("operation");
       await wake();
       await expect.poll(() => reads).toBe(2);
+      assert.equal((await (await offlineOperationResponse).json()).state, "paused");
       await expect(page.locator("#auto-archive-status")).toContainText("Could not refresh");
       assert.equal(await banner.textContent(), initial);
       offline = false; held = true;
+      const heldOperationResponse = responseFor("operation");
       await wake();
       await expect.poll(() => reads).toBe(3);
+      assert.equal((await (await heldOperationResponse).json()).state, "paused");
       await page.evaluate(() => {
         document.dispatchEvent(new Event("visibilitychange"));
         window.dispatchEvent(new Event("pageshow"));
@@ -64,22 +72,38 @@ const {chromium, firefox, expect} = require("@playwright/test");
       held = false; release();
       await expect(page.locator("#auto-archive-status")).toBeHidden();
       failure.operation.id = "b".repeat(64);
+      const priorClearedDetail = await operationDetail.textContent();
+      operation = {...operation, updatedAt: "2026-09-16T13:07:17Z"};
+      const clearedOperationResponse = responseFor("operation");
       await wake();
+      assert.equal((await (await clearedOperationResponse).json()).state, "paused");
       await expect(banner).toBeHidden();
+      await expect(operationDetail).not.toHaveText(priorClearedDetail);
       failure.operation.id = "a".repeat(64);
       // Hidden pages do not poll. Waking after the deadline refreshes the warning.
       await page.evaluate(() => Object.defineProperty(document, "hidden", {configurable: true, value: true}));
       const hiddenReads = reads;
       await wake();
       assert.equal(reads, hiddenReads);
+      const previousPausedDetail = await operationDetail.textContent();
+      operation = {...operation, updatedAt: "2026-09-16T13:12:17Z"};
+      const pausedOperationResponse = responseFor("operation");
+      const resumedArchiveResponse = responseFor("auto-archive");
       await page.evaluate(() => {
         Object.defineProperty(document, "hidden", {configurable: true, value: false});
         document.dispatchEvent(new Event("visibilitychange"));
       });
+      const [pausedOperation, resumedArchive] = await Promise.all([pausedOperationResponse, resumedArchiveResponse]);
+      assert.equal((await pausedOperation.json()).state, "paused");
+      assert.equal((await resumedArchive.json()).operation.id, "a".repeat(64));
       await expect(banner).toBeVisible();
+      await expect(operationDetail).not.toHaveText(previousPausedDetail);
+      await expect(operationDetail).toContainText("Paused");
       operation = {...operation, state: "running"};
+      const runningOperationResponse = responseFor("operation");
       await wake();
-      await expect(page.locator("#lifecycle-operation-detail")).toContainText("Running");
+      assert.equal((await (await runningOperationResponse).json()).state, "running");
+      await expect(operationDetail).toContainText("Running");
       await expect(banner).toContainText("Last automatic attempt failed");
       // Completion must clear the historical warning and reload the final page.
       operation = {...operation, state: "complete"};
