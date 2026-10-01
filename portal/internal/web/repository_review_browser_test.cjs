@@ -90,6 +90,9 @@ const fs = require("node:fs");
     }
     focus() { globalThis.document.activeElement = this; }
     replaceChildren(...children) {
+      if (this !== globalThis.document?.activeElement && this.contains(globalThis.document?.activeElement)) {
+        globalThis.document.activeElement = null;
+      }
       for (const child of this.childNodes) child.parentNode = null;
       this.childNodes = []; this.append(...children);
     }
@@ -112,6 +115,7 @@ const fs = require("node:fs");
     }
     matches(selector) {
       if (selector === "[data-repository-id]") return Boolean(this.dataset.repositoryId);
+      if (selector === "a[href]") return this.tag === "a" && Boolean(this.href);
       if (/^\[data-[a-z-]+\]$/.test(selector)) {
         const key = selector.slice(6, -1).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
         return Object.hasOwn(this.dataset, key);
@@ -120,7 +124,11 @@ const fs = require("node:fs");
       return selector === this.tag;
     }
     addEventListener() {}
-    get innerHTML() { return this._html || ""; }
+    getAttribute(name) { return name === "href" ? this.href || null : null; }
+    get innerHTML() {
+      return this._html ?? this.childNodes.map(child =>
+        [child.tag, child.className, child.textContent, child.href || "", child.innerHTML].join(":")).join("|");
+    }
     set innerHTML(html) {
       this._html = html;
       const warning = /<p class="notice warning">([^<]*)<\/p>/.exec(html)?.[1];
@@ -144,7 +152,10 @@ const fs = require("node:fs");
       const workflowSummary = new FakeElement("summary");
       workflowSummary.append(new FakeElement("span", "", statusText));
       const workflowRuns = new FakeElement("div"); workflowRuns.dataset.repositoryWorkflowRuns = "";
-      workflowRuns.append(new FakeElement("span", "", "run " + statusText));
+      const runText = statusText === "running head" ? "run running" : "run " + statusText;
+      const run = new FakeElement("a", "", runText);
+      run.href = "https://github.com/example/project/actions/runs/" + (statusText === "run missing" ? "2" : "1");
+      workflowRuns.append(run);
       workflows.append(workflowSummary, workflowRuns); status.append(workflows);
     }
     const branch = new FakeElement("button"), refresh = new FakeElement("button");
@@ -202,10 +213,25 @@ const fs = require("node:fs");
     assert.equal(originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]"), retainedWorkflow);
     assert.equal(retainedWorkflow.querySelector("summary"), retainedWorkflowSummary);
     assert.equal(retainedWorkflowSummary.querySelector("span").textContent, "running");
-    assert.equal(retainedWorkflow.querySelector("[data-repository-workflow-runs]").querySelector("span").textContent, "run running");
+    const runBody = retainedWorkflow.querySelector("[data-repository-workflow-runs]");
+    assert.equal(runBody.querySelector("a[href]").textContent, "run running");
     assert.equal(retainedWorkflow.open, true);
     assert.equal(globalThis.document.activeElement, retainedWorkflowSummary);
     assert.equal(overview.querySelector(".section-heading span").textContent, "1");
+    const originalRun = runBody.querySelector("a[href]"); originalRun.focus();
+    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure", "running head"));
+    assert.equal(runBody.querySelector("a[href]"), originalRun, "unchanged run body replaced its link");
+    assert.equal(globalThis.document.activeElement, originalRun);
+    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure", "running changed"));
+    const changedRun = runBody.querySelector("a[href]");
+    assert.notEqual(changedRun, originalRun);
+    assert.equal(changedRun.getAttribute("href"), originalRun.getAttribute("href"));
+    assert.equal(changedRun.textContent, "run running changed");
+    assert.equal(globalThis.document.activeElement, changedRun);
+    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure", "run missing"));
+    assert.equal(runBody.querySelector("a[href]").getAttribute("href"),
+      "https://github.com/example/project/actions/runs/2");
+    assert.equal(globalThis.document.activeElement, retainedWorkflowSummary);
     mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: second failure", "unavailable"));
     assert.equal(overview.childNodes.filter(child => child.matches(".notice.warning")).length, 1);
     assert.equal(overview.querySelector(":scope > .notice.warning")?.textContent,

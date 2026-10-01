@@ -852,19 +852,28 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         if (oldStatus && newStatus && oldStatus.innerHTML !== newStatus.innerHTML) {
           const oldWorkflow = oldStatus.querySelector("[data-repository-workflows]");
           const newWorkflow = newStatus.querySelector("[data-repository-workflows]");
-          let focusedWorkflowSummary = null;
+          let focusAfterRefresh = null;
           if (oldWorkflow && newWorkflow) {
             const oldSummary = oldWorkflow.querySelector("summary");
             const newSummary = newWorkflow.querySelector("summary");
-            if (oldSummary === document.activeElement) focusedWorkflowSummary = oldSummary;
+            if (oldSummary === document.activeElement) focusAfterRefresh = oldSummary;
             if (oldSummary && newSummary) oldSummary.replaceChildren(...newSummary.childNodes);
             const oldRuns = oldWorkflow.querySelector("[data-repository-workflow-runs]");
             const newRuns = newWorkflow.querySelector("[data-repository-workflow-runs]");
-            if (oldRuns && newRuns) oldRuns.replaceChildren(...newRuns.childNodes);
+            if (oldRuns && newRuns) {
+              const focusedRun = [...oldRuns.querySelectorAll("a[href]")].find(link => link === document.activeElement);
+              if (focusedRun) focusAfterRefresh = focusedRun;
+              if (oldRuns.innerHTML !== newRuns.innerHTML) {
+                const focusedURL = focusedRun?.getAttribute("href");
+                oldRuns.replaceChildren(...newRuns.childNodes);
+                if (focusedRun) focusAfterRefresh = [...oldRuns.querySelectorAll("a[href]")]
+                  .find(link => link.getAttribute("href") === focusedURL) || oldSummary;
+              }
+            }
             newWorkflow.replaceWith(oldWorkflow);
           }
           oldStatus.replaceChildren(...newStatus.childNodes);
-          focusedWorkflowSummary?.focus({preventScroll: true});
+          focusAfterRefresh?.focus({preventScroll: true});
         }
         // Details HTML can predate the latest history read. Poll heads separately.
         incoming.delete(id);

@@ -7,12 +7,12 @@ const workflowCounters = version => ["Total", "Queued", "Running", "Successful",
   const value = index === 0 || index === 3 ? version + 1 : 0;
   return `<span class="repository-workflow-counter ${label.toLowerCase()}" role="group" aria-label="${label} workflow runs: ${value}" title="Fixture ${label}">${label} <strong>${value}</strong></span>`;
 }).join("");
-const workflowMarkup = (version, mode) => mode === "runs" ?
-  `<details class="repository-workflows" data-repository-workflows><summary>Workflows <span class="repository-workflow-counters">${workflowCounters(version)}</span></summary><div data-repository-workflow-runs>Fixture run ${version}</div></details>` :
+const workflowMarkup = (version, mode, bodyVersion, runURL) => mode === "runs" ?
+  `<details class="repository-workflows" data-repository-workflows><summary>Workflows <span class="repository-workflow-counters">${workflowCounters(version)}</span></summary><div data-repository-workflow-runs><a href="${runURL}">Fixture run ${bodyVersion}</a></div></details>` :
   `<p class="repository-workflows-compact" role="note" aria-label="Fixture ${mode}" title="Fixture ${mode}">Workflows · ${mode === "zero" ? "0 total" : "unavailable"}</p>`;
-const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second"].map(name =>
+const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' + ["project", "second"].map(name =>
   `<article class="panel repo-card" data-repository-id="${name}" data-repository-name="${name}" data-repository-head="${head}">` +
-  `<div data-repository-status>${name} ${version}${workflowMarkup(version, mode)}</div>` +
+  `<div data-repository-status>${name} ${version}${workflowMarkup(version, mode, bodyVersion, runURL)}</div>` +
   '<div class="repository-review-actions"><button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button></div>' +
   '<p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details></article>'
 ).join("") + '</div>';
@@ -27,7 +27,8 @@ const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second
       let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
       let failArchive = false, failHold = false, failActivity = false, failCapture = false, repositoryVersion = 0, captureCount = 0;
-      let workflowMode = "runs";
+      let workflowMode = "runs", workflowBodyVersion = 0;
+      let workflowRunURL = "https://github.com/example/project/actions/runs/1";
       let reviewStyleHeld = true;
       await page.route(/\/static\/repository-review\.css\?v=3$/, async route => {
         if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
@@ -61,7 +62,7 @@ const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second
             currentState: activityState, workingMs: 30000, waitingMs: 10000,
             stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
           }});
-          case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion, workflowMode), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
+          case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion, workflowMode, workflowBodyVersion, workflowRunURL), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
           case "repository-histories": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, pair, review: "frozen", snapshot: "history-" + repository, history: {commits: [], page: 0, hasMore: false}, summary: {commitCount: 0, stats: {files: 0, additions: 0, deletions: 0}}}))}});
           case "repository-states": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, head}))}});
           case "repository-comparison": {
@@ -161,7 +162,7 @@ const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second
         window.retainedWorkflow = document.querySelector("#repositories [data-repository-workflows]");
         window.retainedWorkflowSummary = window.retainedWorkflow.querySelector("summary");
       });
-      repositoryVersion++;
+      repositoryVersion++; workflowBodyVersion++;
       await expect.poll(async () => {
         await page.evaluate(() => dispatchEvent(new Event("focus")));
         return firstCard.locator("[data-repository-status]").textContent();
@@ -172,23 +173,50 @@ const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second
       await expect(workflows.locator('[aria-label="Total workflow runs: 2"]')).toBeVisible();
       assert(await page.evaluate(() => window.retainedWorkflow === document.querySelector("#repositories [data-repository-workflows]") &&
         window.retainedWorkflowSummary === window.retainedWorkflow.querySelector("summary")), "status refresh replaced workflow disclosure");
-      workflowMode = "unavailable";
+      const runLink = workflows.locator("[data-repository-workflow-runs] a");
+      await runLink.focus();
+      await expect(runLink).toBeFocused();
+      await page.evaluate(() => {
+        window.retainedRunLink = document.querySelector("#repositories [data-repository-workflow-runs] a");
+      });
       repositoryVersion++;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(firstCard.locator("[data-repository-status]")).toContainText("project 2");
+      assert(await page.evaluate(() => window.retainedRunLink === document.querySelector("#repositories [data-repository-workflow-runs] a") &&
+        document.activeElement === window.retainedRunLink), "unchanged workflow run link lost identity or focus");
+      repositoryVersion++; workflowBodyVersion++;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 3");
+      assert(await page.evaluate(() => {
+        const refreshed = document.querySelector("#repositories [data-repository-workflow-runs] a");
+        window.refreshedRunLink = refreshed;
+        return refreshed !== window.retainedRunLink && refreshed.getAttribute("href") === window.retainedRunLink.getAttribute("href") &&
+          document.activeElement === refreshed;
+      }), "changed workflow run link did not restore focus by URL");
+      repositoryVersion++; workflowBodyVersion++;
+      workflowRunURL = "https://github.com/example/project/actions/runs/2";
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 4");
+      assert(await page.evaluate(() => window.refreshedRunLink !== document.querySelector("#repositories [data-repository-workflow-runs] a") &&
+        document.activeElement === window.retainedWorkflowSummary), "removed workflow run link did not focus the summary");
+      await expect(workflows).toHaveAttribute("open", "");
+      workflowMode = "unavailable";
+      repositoryVersion++;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 5");
       await expect(firstCard.locator(".repository-workflows-compact")).toHaveText("Workflows · unavailable");
       await expect(workflows).toHaveCount(0);
       await expect(history).toHaveAttribute("open", "");
       workflowMode = "zero";
       repositoryVersion++;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
-      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 3");
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 6");
       await expect(firstCard.locator(".repository-workflows-compact")).toHaveText("Workflows · 0 total");
       await expect(workflows).toHaveCount(0);
       workflowMode = "runs";
       repositoryVersion++;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
-      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 4");
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 7");
       await expect(workflows).not.toHaveAttribute("open");
       assert(await page.evaluate(() => window.retainedWorkflow !== document.querySelector("#repositories [data-repository-workflows]")),
         "workflow disclosure persisted through compact states");
