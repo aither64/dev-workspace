@@ -268,12 +268,31 @@ const server = http.createServer((req, res) => {
     shortFiles = true;
     await page.setViewportSize({width: 1600, height: 5000});
     await page.reload();
-    await page.waitForFunction(() => document.querySelectorAll(".review-code-view").length >= 6);
+    const firstShortEditor = '.repository-file-section[data-file-id="0"] .review-code-view';
+    await page.locator(firstShortEditor).waitFor();
+    const firstShortText = await page.locator(firstShortEditor).textContent();
+    assert.match(firstShortText, /after 35/, "first short diff did not render its changed text");
+    await page.evaluate(selector => { window.firstShortEditor = document.querySelector(selector); }, firstShortEditor);
+    await page.getByRole("button", {name: "Load all diffs", exact: true}).click();
+    await page.waitForFunction(expected =>
+      document.querySelectorAll(".review-code-view").length === expected &&
+      document.querySelector(".repository-load-all-status")?.textContent === `${expected}/${expected} diffs loaded`, files.length);
+    assert(await page.evaluate(selector => document.querySelector(selector) === window.firstShortEditor, firstShortEditor),
+      "Load all replaced the first editor");
+    await page.setViewportSize({width: 1600, height: 900});
+    await page.locator('.repository-file-section[data-file-id="29"]').scrollIntoViewIfNeeded();
+    assert(await pane.evaluate(el => el.scrollTop > 0 &&
+      el.querySelector('.repository-file-section[data-file-id="0"]').getBoundingClientRect().bottom <= el.getBoundingClientRect().top),
+      "last short diff did not scroll away from the first");
+    await page.locator('.repository-file-section[data-file-id="0"]').scrollIntoViewIfNeeded();
+    assert(await page.evaluate(selector => document.querySelector(selector) === window.firstShortEditor, firstShortEditor),
+      "scrolling away and back replaced the first editor");
+    assert.equal(await page.locator(firstShortEditor).textContent(), firstShortText,
+      "scrolling away and back changed the first diff text");
     await page.waitForFunction(() => [...document.querySelectorAll(".review-syntax-status")].every(el => el.textContent !== "Highlighting…"));
-    const retained = await page.evaluate(() => document.querySelectorAll(".review-code-view").length);
-    assert(retained <= 8, "many short diffs exceeded the eight-file mount bound: " + retained);
-    assert.equal(await page.locator(".review-syntax-status").count(), 0, "bounded editors lost syntax highlighting");
-    assert(await page.locator('.repository-file-section[data-file-id="0"] .review-code-view').count(), "selected file was evicted");
+    assert.equal(await page.locator(".review-syntax-status").count(), 0, "retained editors lost syntax highlighting");
+    assert.equal(await page.locator(".review-code-view").count(), files.length, "Load all did not retain every short diff");
+    await page.setViewportSize({width: 1600, height: 5000});
     fixtureMode = "large";
     const largeURL = origin + "/example/?tab=repositories&repository=project&review=frozen&layout=unified";
     const beforeLargeCalls = calls.length;
@@ -286,8 +305,22 @@ const server = http.createServer((req, res) => {
     assert(!calls.slice(beforeLargeCalls).some(call => call.operation === "repository-files"), "large diff fetched automatically");
     await firstFile.locator('.repository-file-toggle').click();
     await firstFile.locator('.cm-editor').waitFor();
+    const largeEditorText = await firstFile.locator('.cm-line').first().textContent();
+    assert.match(largeEditorText, /new/, "expanded large diff did not render its content");
+    await page.evaluate(() => { window.largeEditor = document.querySelector('.repository-file-section[data-file-id="0"] .cm-editor'); });
+    const loadedLargeFileCalls = calls.filter(call => call.operation === "repository-files" && call.files.includes("0")).length;
     await firstFile.locator('.repository-file-toggle').click();
-    assert.equal(await firstFile.locator('.cm-editor').count(), 0, "collapse retained an editor");
+    assert.equal(await firstFile.locator('.cm-editor').count(), 1, "collapse discarded the loaded editor");
+    assert(await firstFile.locator('.cm-editor').isHidden(), "collapsed editor remained visible");
+    await firstFile.locator('.repository-file-toggle').click();
+    assert(await firstFile.locator('.cm-editor').isVisible(), "reopened editor remained hidden");
+    assert(await page.evaluate(() => document.querySelector('.repository-file-section[data-file-id="0"] .cm-editor') === window.largeEditor),
+      "reopening replaced the loaded editor");
+    assert.equal(await firstFile.locator('.cm-line').first().textContent(), largeEditorText,
+      "reopening changed the loaded diff content");
+    assert.equal(calls.filter(call => call.operation === "repository-files" && call.files.includes("0")).length,
+      loadedLargeFileCalls, "reopening fetched the loaded diff again");
+    await firstFile.locator('.repository-file-toggle').click();
     await page.getByRole("button", {name: "Split", exact: true}).click();
     assert.equal(await firstFile.locator('.repository-file-toggle').getAttribute("aria-expanded"), "false", "layout lost collapsed choice");
     await page.locator('.repository-file[data-file-id="0"]').click();
@@ -376,7 +409,7 @@ const server = http.createServer((req, res) => {
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({result: "passed", calls: calls.length, checks: ["batched histories", "automatic refresh with stale responses", "message and copy controls",
       "inline first file", "full file versions", "cold immutable links", "both line anchor sides", "unified collapsed target",
-      "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "eight-file mount bound", "lazy editor and syntax assets",
+      "browser history", "file statuses and counts", "branch movement", "responsive layout", "readonly", "strict CSP", "retained real editors", "lazy editor and syntax assets",
       "directory tree and keyboard", "collapse preservation and ancestor reveal", "path clipboard", "colored counts", "back-to-diff arrow", "parent and root navigation", "scrolling details and compact toolbar", "implicit comparison entry", "large diff 2000/2001 boundary", "collapse and explicit expansion", "Git-exact OAuth2 counts in both layouts", "shared split context expansion", "sticky file transitions in both layouts", "mobile long paths and visible linked lines in all views"]}));
   } finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
 })().catch(error => {console.error(error); process.exitCode = 1; server.close();});
