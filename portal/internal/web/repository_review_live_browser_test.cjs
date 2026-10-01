@@ -48,18 +48,19 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
         const ephemeral = url.searchParams.get("snapshot");
         if (ephemeral) {
           if (expireWorktree) return route.fulfill({status: 409, json: {error: "This snapshot has expired. Capture the changes again."}});
-          const changedFiles = ephemeral === "ephemeral-2" ? [] : [file(0)];
+          const changedFiles = ["ephemeral-2", "ephemeral-4"].includes(ephemeral) ? [] : ephemeral === "ephemeral-3" ? null : [file(0)];
           return route.fulfill({json: {snapshot: ephemeral, review: "", kind: "unstaged", ephemeral: true,
             capturedAt: "2026-09-30T12:00:00Z", sourceHead: "a".repeat(40), pair: pair("review-a"),
-            stats: {files: changedFiles.length, additions: changedFiles.length, deletions: changedFiles.length, binaryFiles: 0}, files: changedFiles,
+            stats: {files: changedFiles?.length || 0, additions: changedFiles?.length || 0, deletions: changedFiles?.length || 0, binaryFiles: 0}, files: changedFiles,
             unverifiedSubmodules: [{path: "nested/module", mode: "160000", object: "f".repeat(40)}]}});
         }
         const review = url.searchParams.get("review") || "review-a";
-        const count = review === "review-a" ? 12 : 1;
+        if (review === "review-error") return route.fulfill({status: 503, json: {error: "Fixture comparison failed"}});
+        const count = review === "review-a" ? 12 : review === "review-empty" || review === "review-null" ? 0 : 1;
         return route.fulfill({json: {snapshot: review.replace("review", "snapshot"), review,
           pair: pair(review), historyHead: pair(review).head,
           stats: {files: count, additions: count * 2001, deletions: 0, binaryFiles: 0},
-          files: Array.from({length: count}, (_, index) => file(index))}});
+          files: review === "review-null" ? null : review === "review-bad" ? {} : Array.from({length: count}, (_, index) => file(index))}});
       }
       if (operation !== "repository-files") return route.continue();
       const snapshot = url.searchParams.get("snapshot");
@@ -172,6 +173,8 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-2");
     assert.equal(worktreeCaptures, 2);
     await expect(fixture.locator(".repository-file-section")).toHaveCount(0);
+    await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
+    await expect(fixture.locator(".repository-review-heading button").filter({hasText: "Load all diffs"})).toBeHidden();
     await expect(submoduleNotice).toContainText("did not inspect the working state of 1 submodule");
     await expect(fixture.locator(".repository-comparison-stats")).toContainText("0 changed files");
     const expiredURL = page.url();
@@ -179,6 +182,32 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await navigate("review-b");
     await page.evaluate(href => { history.pushState(null, "", href); dispatchEvent(new PopStateEvent("popstate")); }, expiredURL);
     await expect(fixture.getByRole("button", {name: "Recapture unstaged changes"})).toBeVisible();
+    const beforeEmptyBatches = batches.length;
+    for (const review of ["review-empty", "review-null"]) {
+      await navigate(review);
+      await expect(fixture.locator(".repository-file-section")).toHaveCount(0);
+      await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changed files between these revisions.");
+      await expect(fixture.locator(".repository-review-heading button").filter({hasText: "Load all diffs"})).toBeHidden();
+      await fixture.getByRole("button", {name: "← Repositories"}).first().click();
+      await expect(fixture.locator(".repository-overview")).toBeVisible();
+    }
+    assert.equal(batches.length, beforeEmptyBatches, "empty committed reviews requested no file previews");
+    for (const [review, message] of [["review-bad", "Invalid comparison files."], ["review-error", "Fixture comparison failed"]]) {
+      await navigate(review);
+      await expect(fixture.locator(".repository-comparison > .notice.warning")).toHaveText(message);
+      await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveCount(0);
+      await fixture.getByRole("button", {name: "← Repositories"}).first().click();
+    }
+    expireWorktree = false;
+    await fixture.locator('[data-review-worktree="unstaged"]').click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-3");
+    await expect(fixture.locator(".repository-file-section")).toHaveCount(0);
+    await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
+    await expect(fixture.locator(".repository-review-heading button").filter({hasText: "Load all diffs"})).toBeHidden();
+    await fixture.getByRole("button", {name: "Recapture unstaged changes"}).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-4");
+    await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
+    assert.equal(batches.length, beforeEmptyBatches, "empty working reviews requested no file previews");
     assert.deepEqual(errors, []);
   } finally {
     releaseFirstBatches(); releaseSlow();

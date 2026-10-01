@@ -69,6 +69,14 @@ redirect to the viewer. The original conversation text remains unchanged.
 
 ## Repository comparisons
 
+Successful comparison responses always include `files` as a JSON array. An
+empty staged or unstaged snapshot, committed branch comparison, or commit diff
+uses `files: []` with zero changed-file statistics and no preview. An empty
+snapshot keeps its capture identity and supports recapture. The browser also
+accepts `files: null` from an older portal generation as an empty list; other malformed
+values and HTTP failures remain errors. Empty views issue no file-preview
+requests. Unverified submodule identities remain separate from changed files.
+
 An open comparison retains loaded file content and editors while the repository
 card refreshes or the reader scrolls. Collapsing a file hides its editor without
 discarding the loaded result. Changing the layout or file version may recreate

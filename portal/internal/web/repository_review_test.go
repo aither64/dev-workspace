@@ -81,6 +81,58 @@ func reviewString(t *testing.T, value json.RawMessage) string {
 	}
 	return result
 }
+func reviewFilesArray(t *testing.T, payload map[string]json.RawMessage) []repository.ReviewFile {
+	t.Helper()
+	raw, ok := payload["files"]
+	if !ok || len(raw) == 0 || raw[0] != '[' {
+		t.Fatalf("comparison files must be a JSON array, got %s", raw)
+	}
+	var files []repository.ReviewFile
+	if err := json.Unmarshal(raw, &files); err != nil {
+		t.Fatal(err)
+	}
+	if files == nil {
+		t.Fatal("comparison files decoded to nil")
+	}
+	return files
+}
+
+func TestRepositoryReviewEmptyCommittedComparisonsEncodeArrays(t *testing.T) {
+	s, _, worktree, base := reviewWebFixture(t)
+	query := "?repository=" + repository.ReviewID("project")
+	endpoint := "/api/sessions/example/repository-"
+	runWebGit(t, "-C", worktree, "reset", "--hard", base)
+	history := reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200)
+	snapshot := reviewString(t, history["snapshot"])
+	review := reviewString(t, history["review"])
+	for _, payload := range []map[string]json.RawMessage{
+		reviewRequest(t, s, "POST", endpoint+"comparison"+query, fmt.Sprintf(`{"snapshot":%q}`, snapshot), 200),
+		reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+review, "", 200),
+	} {
+		if len(reviewFilesArray(t, payload)) != 0 || string(payload["preview"]) != "null" {
+			t.Fatalf("empty branch comparison = %v", payload)
+		}
+	}
+	runWebGit(t, "-C", worktree, "commit", "--allow-empty", "-m", "empty")
+	commitHistory := reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200)
+	var page repository.ReviewHistory
+	if err := json.Unmarshal(commitHistory["history"], &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Commits) != 1 {
+		t.Fatalf("empty commit history = %#v", page)
+	}
+	commit := reviewRequest(t, s, "POST", endpoint+"comparison"+query,
+		fmt.Sprintf(`{"snapshot":%q,"commit":%q}`, reviewString(t, commitHistory["snapshot"]), page.Commits[0].ID), 200)
+	if len(reviewFilesArray(t, commit)) != 0 || string(commit["preview"]) != "null" {
+		t.Fatalf("empty commit comparison = %v", commit)
+	}
+	linked := reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+reviewString(t, commitHistory["review"])+"&commit="+page.Commits[0].SHA, "", 200)
+	if len(reviewFilesArray(t, linked)) != 0 || string(linked["preview"]) != "null" {
+		t.Fatalf("linked empty commit comparison = %v", linked)
+	}
+	reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+reviewString(t, commitHistory["review"])+"&commit="+page.Commits[0].SHA+"&file=missing", "", 404)
+}
 func TestRepositoryReviewHTTPImmutablePairAndOpaqueIdentities(t *testing.T) {
 	s, _, worktree, _ := reviewWebFixture(t)
 	endpoint := "/api/sessions/example/repository-"

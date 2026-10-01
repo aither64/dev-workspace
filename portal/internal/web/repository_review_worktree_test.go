@@ -22,6 +22,27 @@ func putTestWorktreeSnapshot(s *repositoryReviewService, snapshot *repositoryRev
 	return s.putWorktree(snapshot, reservation)
 }
 
+func TestWorktreeReviewEmptySnapshotsEncodeArrays(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	endpoint := "/api/sessions/example/repository-comparison?repository=" + repository.ReviewID("project")
+	for _, kind := range []string{"staged", "unstaged"} {
+		payload := reviewRequest(t, s, "POST", endpoint, fmt.Sprintf(`{"kind":%q}`, kind), 200)
+		if len(reviewFilesArray(t, payload)) != 0 || string(payload["preview"]) != "null" || reviewString(t, payload["kind"]) != kind {
+			t.Fatalf("empty %s capture = %v", kind, payload)
+		}
+		var stats repository.ReviewStats
+		if err := json.Unmarshal(payload["stats"], &stats); err != nil || stats.Files != 0 {
+			t.Fatalf("empty %s stats = %#v, %v", kind, stats, err)
+		}
+		snapshot := reviewString(t, payload["snapshot"])
+		restored := reviewRequest(t, s, "GET", endpoint+"&snapshot="+snapshot, "", 200)
+		if len(reviewFilesArray(t, restored)) != 0 || reviewString(t, restored["snapshot"]) != snapshot || reviewString(t, restored["kind"]) != kind || string(restored["preview"]) != "null" {
+			t.Fatalf("restored empty %s snapshot = %v", kind, restored)
+		}
+		reviewRequest(t, s, "GET", endpoint+"&snapshot="+snapshot+"&file=missing", "", 404)
+	}
+}
+
 func TestWorktreeReviewHTTPIsEphemeralAndKeepsCommittedLinks(t *testing.T) {
 	s, _, worktree, _ := reviewWebFixture(t)
 	query := "?repository=" + repository.ReviewID("project")
@@ -283,6 +304,9 @@ func TestWorktreeSubmoduleNoticeIsSnapshotMetadata(t *testing.T) {
 	query := "?repository=" + repository.ReviewID("project")
 	endpoint := "/api/sessions/example/repository-comparison" + query
 	payload := reviewRequest(t, s, "POST", endpoint, `{"kind":"unstaged"}`, 200)
+	if len(reviewFilesArray(t, payload)) != 0 {
+		t.Fatalf("unverified submodule claimed changed files: %v", payload["files"])
+	}
 	var submodules []repository.WorktreeSubmodule
 	if err := json.Unmarshal(payload["unverifiedSubmodules"], &submodules); err != nil {
 		t.Fatal(err)
@@ -297,6 +321,9 @@ func TestWorktreeSubmoduleNoticeIsSnapshotMetadata(t *testing.T) {
 	token := reviewString(t, payload["snapshot"])
 	runWebGit(t, "-C", worktree, "update-index", "--force-remove", "module")
 	restored := reviewRequest(t, s, "GET", endpoint+"&snapshot="+token, "", 200)
+	if len(reviewFilesArray(t, restored)) != 0 {
+		t.Fatalf("restored submodule snapshot claimed changed files: %v", restored["files"])
+	}
 	if string(restored["unverifiedSubmodules"]) != string(payload["unverifiedSubmodules"]) {
 		t.Fatal("submodule metadata followed index")
 	}

@@ -542,12 +542,19 @@ func (service *repositoryReviewService) fileContent(ctx context.Context, snapsho
 	return repository.ReviewContent{}, reviewError(404, "File is not part of this comparison")
 }
 
+func comparisonResponseFiles(files []repository.ReviewFile) []repository.ReviewFile {
+	if files == nil {
+		return []repository.ReviewFile{}
+	}
+	return files
+}
+
 func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary, registration session.Repository, snapshot *repositoryReviewSnapshot, commitSHA, fileID string) (reviewComparisonResponse, error) {
 	service := s.reviews()
 	if snapshot.Worktree != nil {
 		capture := snapshot.Worktree
 		response := reviewComparisonResponse{Snapshot: snapshot.ID, Kind: capture.Kind, CapturedAt: &capture.CapturedAt, Ephemeral: true,
-			SourceHead: capture.SourceHead, Name: registration.Name, Pair: snapshot.Pair, Files: capture.Files,
+			SourceHead: capture.SourceHead, Name: registration.Name, Pair: snapshot.Pair, Files: comparisonResponseFiles(capture.Files),
 			Stats: repository.FileStats(capture.Files), Origin: snapshot.Repo.Origin, UnverifiedSubmodules: capture.UnverifiedSubmodules}
 		if fileID == "" && len(capture.Files) > 0 && !capture.Files[0].LargeDiff() {
 			fileID = capture.Files[0].ID
@@ -598,7 +605,7 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, snapshot.Repo.ID, err)
 		}
 	}
-	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: files, Origin: snapshot.Repo.Origin}
+	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: comparisonResponseFiles(files), Origin: snapshot.Repo.Origin}
 	if fileID == "" && len(files) > 0 && !files[0].LargeDiff() {
 		fileID = files[0].ID
 	}

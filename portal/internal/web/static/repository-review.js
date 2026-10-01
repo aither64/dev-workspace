@@ -579,6 +579,8 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     try {
       const payload = await read(url("comparison", state.id, {review: requested.review, snapshot: requested.snapshot, commit: requested.commit, file: requested.file}), {signal: abort.signal});
       if (ticket !== sequence || destroyed) return;
+      const files = payload.files ?? [];
+      if (!Array.isArray(files)) throw new Error("Invalid comparison files.");
       const heading = node("div", "repository-review-heading");
       const title = node("h2", "repository-review-title", comparisonTitle(state, payload.commit || hint, payload.kind));
       title.title = title.textContent;
@@ -615,6 +617,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         }
         updateLoadAll(selected);
       });
+      loadAllButton.hidden = files.length === 0;
       const loadAllStatus = node("span", "muted repository-load-all-status");
       loadAllStatus.setAttribute("role", "status");
       heading.append(button("← Repositories", () => closeReview()), title, copy(() => location.href, "Copy comparison link"), controls,
@@ -630,7 +633,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       scroll.append(details);
       const sections = new Map();
       const tree = {directories: new Map(), files: []};
-      for (const file of payload.files) {
+      for (const file of files) {
         const [kind, label] = fileStatus(file.status);
         const nav = link("", reviewURL(location.href, fileRoute(file)), () => navigate(fileRoute(file)), "repository-file");
         nav.dataset.fileId = file.id;
@@ -742,7 +745,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
       markChanged(state, state.latestHead);
       await applyView(true);
-      if (!payload.files.length) scroll.append(node("p", "empty", payload.ephemeral ? "No changes in this snapshot." : "No changed files between these revisions."));
+      if (!files.length) scroll.append(node("p", "empty", payload.ephemeral ? "No changes in this snapshot." : "No changed files between these revisions."));
     } catch (error) {
       if (ticket === sequence && error.name !== "AbortError") {
         review.replaceChildren(button("← Repositories", () => closeReview()), node("p", "notice warning", error.message));
