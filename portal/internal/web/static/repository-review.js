@@ -102,7 +102,7 @@ export const largeDiff = file => Number.isFinite(file.additions) && Number.isFin
 
 export function mount({slug, nonce, element, createCopyButton, onComparisonChange = () => {}}) {
   if (!document.querySelector('link[data-repository-review-styles]')) {
-    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css";
+    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css?v=1";
     sheet.dataset.repositoryReviewStyles = "true"; document.head.append(sheet);
   }
   const preload = () => {
@@ -254,12 +254,17 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   };
   const captureWorktree = async (state, kind) => {
     const controls = [...state.card.querySelectorAll("[data-review-worktree]")];
+    state.card.querySelector("[data-worktree-capture-error]")?.remove();
     controls.forEach(control => { control.disabled = true; });
     try {
       const payload = await read(url("comparison", state.id), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({kind})});
       navigate({repository: state.id, snapshot: payload.snapshot, kind, view: "diff", layout: readMode()});
     } catch (error) {
-      if (review.hidden) showFailure(state.card.querySelector("[data-repository-commits]"), error);
+      if (review.hidden) {
+        const notice = node("p", "notice warning", error.message);
+        notice.dataset.worktreeCaptureError = "";
+        state.card.querySelector(".repository-review-actions").after(notice);
+      }
       else {
         review.querySelector("[data-worktree-capture-error]")?.remove();
         const notice = node("p", "notice warning", error.message);

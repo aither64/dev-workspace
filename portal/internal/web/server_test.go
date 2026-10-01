@@ -1879,6 +1879,49 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 	}
 }
 
+func TestSessionRepositoryActionsStayOutsideClosedLocalHistory(t *testing.T) {
+	for _, archived := range []bool{false, true} {
+		t.Run(fmt.Sprintf("archived=%t", archived), func(t *testing.T) {
+			server := newTestServer(t)
+			response := httptest.NewRecorder()
+			server.render(response, "session", pageData{
+				Session:      &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: archived},
+				Repositories: []repository.Status{{ReviewID: repository.ReviewID("project"), Name: "project", Branch: "feature"}},
+			})
+			body := response.Body.String()
+			start := strings.Index(body, `<article class="panel repo-card"`)
+			if start < 0 {
+				t.Fatalf("repository card missing: %s", body)
+			}
+			card := body[start:]
+			end := strings.Index(card, "</article>")
+			if end < 0 {
+				t.Fatal("repository card did not close")
+			}
+			card = card[:end]
+			disclosure := strings.Index(card, `<details class="repository-history">`)
+			actions := strings.Index(card, `class="repository-review-actions"`)
+			if disclosure < 0 || actions < 0 || actions > disclosure || !strings.Contains(card[disclosure:], "<summary>Local commits</summary>") || !strings.Contains(card[disclosure:], "data-repository-commits") {
+				t.Fatalf("closed history/action structure is wrong: %s", card)
+			}
+			for _, selector := range []string{"data-review-branch", "data-review-refresh"} {
+				if position := strings.Index(card, selector); position < actions || position > disclosure {
+					t.Fatalf("%s is inside history: %s", selector, card)
+				}
+			}
+			for _, selector := range []string{`data-review-worktree="staged"`, `data-review-worktree="unstaged"`} {
+				position := strings.Index(card, selector)
+				if archived && position >= 0 || !archived && (position < actions || position > disclosure) {
+					t.Fatalf("working action %s has wrong visibility: %s", selector, card)
+				}
+			}
+			if position := strings.Index(card, "repository-head-change"); position < actions || position > disclosure {
+				t.Fatalf("head notice is hidden with history: %s", card)
+			}
+		})
+	}
+}
+
 func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

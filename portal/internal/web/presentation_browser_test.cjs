@@ -3,17 +3,28 @@ const assert = require("node:assert/strict");
 const {chromium, firefox, expect} = require("@playwright/test");
 const baseURL = process.argv[2];
 const head = "b".repeat(40), base = "a".repeat(40);
-const cards = '<div class="repo-grid"><article class="panel repo-card" data-repository-id="project" data-repository-name="project" data-repository-head="' + head + '"><div data-repository-status>project</div><section class="repository-history"><div class="repository-review-actions"><button data-review-branch disabled>Compare</button><button data-review-refresh>Refresh commits</button></div><p class="repository-head-change" hidden></p><div data-repository-commits></div></section></article></div>';
+const cards = version => '<div class="repo-grid">' + ["project", "second"].map(name =>
+  `<article class="panel repo-card" data-repository-id="${name}" data-repository-name="${name}" data-repository-head="${head}">` +
+  `<div data-repository-status>${name} ${version}</div>` +
+  '<div class="repository-review-actions"><button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button></div>' +
+  '<p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details></article>'
+).join("") + '</div>';
 (async () => {
   for (const engine of [chromium, firefox]) {
     const browser = await engine.launch({headless: true, ...(engine === chromium ? {channel: "chromium"} : {})});
+    let releaseReviewStyle = () => {};
     try {
       const page = await browser.newPage({ignoreHTTPSErrors: true, viewport: {width: 1440, height: 720}});
       const errors = [];
       const diagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
       let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
-      let failArchive = false, failHold = false, failActivity = false;
+      let failArchive = false, failHold = false, failActivity = false, failCapture = false, repositoryVersion = 0, captureCount = 0;
+      let reviewStyleHeld = true;
+      await page.route(/\/static\/repository-review\.css\?v=1$/, async route => {
+        if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
+        await route.continue();
+      });
       let threadStatus = "idle", activityState = "idle", pending = [];
       const blockingPrompt = {
         id: "request-1", token: "token-1", method: "item/tool/requestUserInput", kind: "userInput",
@@ -42,15 +53,41 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
             currentState: activityState, workingMs: 30000, waitingMs: 10000,
             stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
           }});
-          case "details": return route.fulfill({json: {repositoriesHTML: cards, artifactsHTML: "", repositoryCount: 1, artifactCount: 0, clusterCount: 0}});
-          case "repository-histories": return route.fulfill({json: {repositories: [{repository: "project", pair, review: "frozen", history: {commits: [], page: 0, hasMore: false}}]}});
-          case "repository-states": return route.fulfill({json: {repositories: [{repository: "project", head}]}});
-          case "repository-comparison": return route.fulfill({json: {pair, review: "frozen", files: [], stats: {files: 0}}});
+          case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
+          case "repository-histories": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, pair, review: "frozen", snapshot: "history-" + repository, history: {commits: [], page: 0, hasMore: false}}))}});
+          case "repository-states": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, head}))}});
+          case "repository-comparison": {
+            if (route.request().method() === "POST") {
+              if (failCapture) return route.fulfill({status: 503, json: {error: "Fixture capture failed"}});
+              return route.fulfill({json: {snapshot: "staged-" + (++captureCount), kind: "staged", ephemeral: true}});
+            }
+            const snapshot = new URL(route.request().url()).searchParams.get("snapshot");
+            return route.fulfill({json: snapshot ? {snapshot, kind: "staged", ephemeral: true, capturedAt: "2026-10-01T12:00:00Z", sourceHead: head, pair, files: [], stats: {files: 0}} : {pair, review: "frozen", files: [], stats: {files: 0}}});
+          }
           default: return route.continue();
         }
       });
       const sidebar = page.locator(".workspace-sidebar");
       const width = async value => expect.poll(async () => Math.round((await sidebar.boundingBox()).width)).toBe(value);
+      const repositoryLayout = () => page.evaluate(() => {
+        const grid = document.querySelector("#repositories .repo-grid");
+        const bounds = element => {
+          const box = element.getBoundingClientRect();
+          return {x: box.x, y: box.y, width: box.width, height: box.height, right: box.right};
+        };
+        return {grid: bounds(grid), viewport: innerWidth, cards: [...grid.querySelectorAll(".repo-card")].map(card => ({
+          ...bounds(card), actions: [...card.querySelectorAll(".repository-review-actions > *")].map(action => Math.round(action.getBoundingClientRect().top)),
+        }))};
+      });
+      const assertRepositoryLayout = (layout, desktop) => {
+        assert.equal(layout.cards.length, 2);
+        assert.ok(Math.abs(layout.cards[0].width - layout.grid.width) <= 2, "first card must span its grid row");
+        assert.ok(Math.abs(layout.cards[1].width - layout.grid.width) <= 2, "second card must span its grid row");
+        assert.ok(Math.abs(layout.cards[0].x - layout.cards[1].x) <= 2 && layout.cards[1].y >= layout.cards[0].y + layout.cards[0].height - 1,
+          "repository cards must stack vertically");
+        assert.ok(layout.cards.every(card => card.right <= layout.viewport + 1), "repository card must fit the viewport");
+        if (desktop) assert.equal(new Set(layout.cards[0].actions).size, 1, "desktop repository actions must share one row");
+      };
       const expireAutoArchiveCache = () => page.evaluate(() => {
         const wallNow = Date.now;
         Date.now = () => wallNow() + 31_000;
@@ -64,6 +101,41 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await expect(waitingIndicator).toBeVisible();
       await width(250);
+      const repositoryCards = page.locator("#repositories .repo-card");
+      await expect(repositoryCards).toHaveCount(2);
+      const firstCard = repositoryCards.first(), history = firstCard.locator(".repository-history");
+      await expect(history).not.toHaveAttribute("open");
+      await expect(firstCard.locator("[data-review-branch]")).toHaveAttribute("href", /review=frozen/);
+      for (const label of ["Compare", "Staged changes", "Unstaged changes", "Refresh commits"]) {
+        await expect(firstCard.locator(".repository-review-actions").getByText(label, {exact: true})).toBeVisible();
+      }
+      assertRepositoryLayout(await repositoryLayout(), true);
+      reviewStyleHeld = false; releaseReviewStyle();
+      await expect.poll(() => page.locator('link[data-repository-review-styles]').evaluate(link => Boolean(link.sheet))).toBe(true);
+      assertRepositoryLayout(await repositoryLayout(), true);
+      await page.setViewportSize({width: 600, height: 720});
+      assertRepositoryLayout(await repositoryLayout(), false);
+      await page.setViewportSize({width: 1440, height: 720});
+      failCapture = true;
+      await firstCard.locator('[data-review-worktree="staged"]').click();
+      await expect(firstCard.locator("[data-worktree-capture-error]")).toHaveText("Fixture capture failed");
+      await expect(firstCard.locator("[data-worktree-capture-error]")).toBeVisible();
+      await expect(history).not.toHaveAttribute("open");
+      failCapture = false;
+      await firstCard.locator('[data-review-worktree="staged"]').click();
+      await expect(page.locator("#repositories .repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
+      await expect(firstCard.locator("[data-worktree-capture-error]")).toHaveCount(0);
+      await page.getByRole("button", {name: "← Repositories", exact: true}).click();
+      await history.locator("summary").click();
+      await expect(history).toHaveAttribute("open", "");
+      repositoryVersion++;
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        return firstCard.locator("[data-repository-status]").textContent();
+      }).toBe("project 1");
+      await expect(history).toHaveAttribute("open", "");
+      await page.reload();
+      await expect(page.locator("#repositories .repository-history").first()).not.toHaveAttribute("open");
       await page.evaluate(() => dispatchEvent(new Event("pagehide")));
       await expect(waitingIndicator).toBeHidden();
       await page.reload();
@@ -93,7 +165,7 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await expect(waitingIndicator).toBeHidden();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex");
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
-      await page.locator("[data-review-branch]").click();
+      await page.locator("[data-review-branch]").first().click();
       await expect(page.locator(".repository-review-heading")).toBeVisible();
       await width(58);
       const limits = page.locator(".codex-limits-toggle");
@@ -169,6 +241,6 @@ const cards = '<div class="repo-grid"><article class="panel repo-card" data-repo
       await expect(page.locator("#codex-limits-panel")).toBeVisible();
       assert.deepEqual(errors, []);
       console.log(engine.name() + ": comparison-only compact sidebar, limits, keyboard navigation and archival presentation passed");
-    } finally { await browser.close(); }
+    } finally { releaseReviewStyle(); await browser.close(); }
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

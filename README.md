@@ -127,11 +127,15 @@ replacing that session.
 
 ## Repository review
 
-The Repositories tab lists local feature commits, including commits that have
-not been pushed. Use the ellipsis after a subject to expand its message, select
-the subject to review the commit and full message, or choose **Compare** for the
-whole branch. Copy icons copy full commit hashes. The external arrow opens the
-commit on GitHub. A compact toolbar keeps navigation and layout controls visible.
+The Repositories tab shows one full-width card per repository. **Compare**,
+**Staged changes**, **Unstaged changes**, and **Refresh commits** stay visible
+above **Local commits**, which starts closed while history loads in the
+background. It stays open during status refreshes for the same card; a full page
+reload closes it. Local history includes commits that have not been pushed.
+Use the ellipsis after a subject to expand its message, select the subject to
+review the commit and full message, or choose **Compare** for the whole branch.
+Copy icons copy full commit hashes. The external arrow opens the commit on
+GitHub. A compact toolbar keeps navigation and layout controls visible.
 The full commit message, metadata, parent links and comparison totals scroll with
 the diffs. Opening a commit starts at its message; a file or line link jumps to
 that target.

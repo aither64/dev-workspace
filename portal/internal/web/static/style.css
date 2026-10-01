@@ -115,6 +115,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .copy-row input { margin: 0; font-family: ui-monospace, monospace; }
 .copy-row button { flex: none; }
 .repo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1rem; }
+#repositories .repo-grid { grid-template-columns: minmax(0, 1fr); }
 .repo-card h3 { margin: 0; }
 .repo-card dl { display: grid; grid-template-columns: auto 1fr; gap: .4rem .9rem; margin: 1rem 0; }
 .repo-card dt { color: var(--muted); }

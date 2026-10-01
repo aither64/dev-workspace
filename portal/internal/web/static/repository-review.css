@@ -1,7 +1,9 @@
-#repositories .repo-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 1rem; }
+#repositories .repo-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 1rem; }
 #repositories .repo-card { min-width: 0; }
 .repository-review-actions, .repository-pagination, .repository-mode-controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .repository-history { margin-top: 1rem; border-top: 1px solid var(--line, #283241); padding-top: 1rem; }
+.repository-history > summary { cursor: pointer; font-weight: 600; }
+.repository-history > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .repository-review-actions { margin-bottom: .8rem; }
 .repository-commit-list { list-style: none; margin: 0; padding: 0; }
 .repository-commit { border-bottom: 1px solid var(--line, #283241); padding: .5rem 0; }

@@ -115,10 +115,19 @@ const fs = require("node:fs");
     const card = new FakeElement("article", "repo-card"); card.dataset.repositoryId = "stored";
     const status = new FakeElement("div");
     const branch = new FakeElement("button"), refresh = new FakeElement("button");
+    const actions = new FakeElement("div", "repository-review-actions"); actions.append(branch, refresh);
+    const headNotice = new FakeElement("p", "repository-head-change"); headNotice.hidden = true;
+    const history = new FakeElement("details", "repository-history");
+    const commits = new FakeElement("div");
+    history.append(new FakeElement("summary", "", "Local commits"), commits);
+    card.append(status, actions, headNotice, history);
     card.querySelector = selector => ({
       "[data-repository-status]": status,
       "[data-review-branch]": branch,
       "[data-review-refresh]": refresh,
+      "[data-repository-commits]": commits,
+      ".repository-head-change": headNotice,
+      ".repository-history": history,
     })[selector] || null;
     return card;
   };
@@ -139,11 +148,15 @@ const fs = require("node:fs");
     mounted = mount({slug: "example", element});
     const overview = element.childNodes[0];
     const originalCard = overview.querySelectorAll("[data-repository-id]")[0];
+    const retainedHistory = originalCard.querySelector(".repository-history");
+    retainedHistory.open = true;
     const detailsHTML = warning => `${warning ? `<p class="notice warning">${warning}</p>` : ""}<div class="section-heading"><span>1</span></div><div class="repo-grid"><article data-repository-id="stored"></article></div>`;
     mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure"));
     assert.equal(overview.querySelector(":scope > .notice.warning")?.textContent,
       "Some live worktrees could not be verified: first failure");
     assert.equal(overview.querySelectorAll("[data-repository-id]")[0], originalCard);
+    assert.equal(originalCard.querySelector(".repository-history"), retainedHistory);
+    assert.equal(retainedHistory.open, true);
     assert.equal(overview.querySelector(".section-heading span").textContent, "1");
     mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: second failure"));
     assert.equal(overview.childNodes.filter(child => child.matches(".notice.warning")).length, 1);

@@ -16,9 +16,9 @@ const calls = [], assets = [];
 const cards = '<div class="section-heading"><h2>Repositories</h2><span>4</span></div><div class="repo-grid">' +
   ["project", "second", "third", "fourth"].map(name => '<article class="panel repo-card" data-repository-id="' + name +
     '" data-repository-name="' + name + '" data-repository-head="' + head +
-    '"><div data-repository-status><h3>' + name + '</h3></div><section class="repository-history"><div class="repository-review-actions">' +
-    '<button data-review-branch disabled>Compare</button><button data-review-refresh>Refresh commits</button></div>' +
-    '<p class="repository-head-change" hidden>Branch changed</p><div data-repository-commits></div></section></article>').join("") + "</div>";
+    '"><div data-repository-status><h3>' + name + '</h3></div><div class="repository-review-actions">' +
+    '<button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button></div>' +
+    '<p class="repository-head-change" hidden>Branch changed</p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details></article>').join("") + "</div>";
 const files = Array.from({length: 30}, (_, index) => ({id: String(index), path: "src/file-" + index + ".nix",
   status: index === 1 ? "A" : index === 2 ? "D" : "M", oldMode: index === 1 ? "000000" : "100644",
   newMode: index === 2 ? "000000" : "100644", additions: index === 2 ? 0 : 1, deletions: index === 1 ? 0 : 1}));
@@ -63,7 +63,7 @@ const server = http.createServer((req, res) => {
   const json = value => send("application/json", JSON.stringify(value));
   if (url.pathname === "/example/") {
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'nonce-teststyle123'; connect-src 'self'");
-    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/copy.css">' +
+    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css?v=1"><link rel="stylesheet" href="/copy.css">' +
       '<link rel="stylesheet" href="/harness.css"><section id="repositories" class="tab-panel active">' + cards +
       '</section><script type="module" src="/entry.js"></script>');
   }
@@ -112,16 +112,18 @@ const server = http.createServer((req, res) => {
       Object.defineProperty(navigator, "clipboard", {value: {writeText: async value => {window.copiedText = value;}}});
     });
     await page.goto(origin + "/example/");
+    await page.locator('.repository-history').first().locator('summary').click();
     await page.locator(".repository-commit").first().waitFor();
     await page.waitForLoadState("networkidle");
     assert(!assets.includes("review-editor.js"), "overview eagerly loaded the editor");
     assert(!assets.includes("review-highlight-worker.js"), "overview eagerly loaded syntax grammars");
     assert.equal(calls.filter(call => call.operation === "repository-histories").length, 1);
-    assert.equal(await page.locator(".repo-grid").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length), 2);
+    assert.equal(await page.locator(".repo-grid").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length), 1);
     await page.getByRole("button", {name: "Show commit message", exact: true}).first().click();
     assert(await page.locator(".repository-commit-message").first().isVisible());
     await page.evaluate(() => {window.originalCommit = document.querySelector(".repository-commit"); window.review.updateHTML(window.cardMarkup);});
     assert(await page.evaluate(() => document.querySelector(".repository-commit") === window.originalCommit));
+    assert(await page.locator('.repository-history').first().evaluate(el => el.open), "retained history disclosure closed on refresh");
     await page.getByRole("button", {name: "Copy commit hash", exact: true}).first().click();
     assert.equal(await page.evaluate(() => window.copiedText), originalHead);
     const commitLink = await page.locator(".repository-commit-subject").first().getAttribute("href");
@@ -316,7 +318,8 @@ const server = http.createServer((req, res) => {
     // A newer head observation must win over an in-flight older history batch.
     fixtureMode = "normal"; shortFiles = false;
     await page.goto(origin + "/example/");
-    await page.locator(".repository-commit").first().waitFor();
+    await page.locator(".repository-commit").first().waitFor({state: "attached"});
+    assert.equal(await page.locator('.repository-history').first().evaluate(el => el.open), false, "reload retained disclosure state");
     holdNextHistory = true; head = "d".repeat(40);
     await page.evaluate(() => document.dispatchEvent(new CustomEvent("session-section-change", {detail: "repositories"})));
     while (!releaseHistory) await new Promise(resolve => setTimeout(resolve, 10));

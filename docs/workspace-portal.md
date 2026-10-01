@@ -69,6 +69,13 @@ redirect to the viewer. The original conversation text remains unchanged.
 
 ## Repository comparisons
 
+The repository overview puts each card on its own row. The review controls
+stay visible above **Local commits**. That disclosure starts closed, but local
+history loads in the background so Compare becomes
+available without opening it. It stays open during status refreshes while the
+card is retained; a full page reload closes it. Capture failures
+appear next to the actions even when history is closed.
+
 Successful comparison responses always include `files` as a JSON array. An
 empty staged or unstaged snapshot, committed branch comparison, or commit diff
 uses `files: []` with zero changed-file statistics and no preview. An empty

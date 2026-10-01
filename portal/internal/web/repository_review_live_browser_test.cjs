@@ -16,7 +16,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], batches = [];
-    let inFlight = 0, maxInFlight = 0, firstBatchesHeld = true, failedOnce = false, worktreeCaptures = 0, expireWorktree = false;
+    let inFlight = 0, maxInFlight = 0, firstBatchesHeld = true, failedOnce = false, worktreeCaptures = 0, expireWorktree = false, failCapture = false;
     page.on("pageerror", error => errors.push(error.message));
     await page.route("**/static/review-editor.js", route => route.fulfill({contentType: "text/javascript", body: `
       export function createReviewEditor({parent, after}) {
@@ -42,6 +42,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
         if (route.request().method() === "POST") {
           const {kind} = route.request().postDataJSON();
           assert.equal(kind, "unstaged");
+          if (failCapture) return route.fulfill({status: 503, json: {error: "Fixture capture failed"}});
           worktreeCaptures++;
           return route.fulfill({json: {snapshot: `ephemeral-${worktreeCaptures}`, kind, ephemeral: true}});
         }
@@ -92,17 +93,18 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       section.style.cssText = "position:fixed;inset:0;z-index:1000;background:white;overflow:auto";
       section.innerHTML = `<div class="section-heading"><span>1</span></div><div class="repo-grid">
         <article class="panel repo-card" data-repository-id="fixture" data-repository-name="Fixture" data-repository-head="${"b".repeat(40)}">
-          <div data-repository-status></div><div class="repository-history"><div class="repository-review-actions">
-            <button data-review-branch>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button>
-          </div><p class="repository-head-change" hidden></p><div data-repository-commits></div></div>
+          <div data-repository-status></div><div class="repository-review-actions">
+            <button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button>
+          </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=5");
+      const {mount} = await import("/static/repository-review.js?v=6");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
     const fixture = page.locator("#fixture-repositories");
-    await expect(fixture.locator("[data-review-branch]")).toHaveText("Compare");
+    await expect(fixture.locator(".repository-history")).not.toHaveAttribute("open");
+    await expect(fixture.locator("[data-review-branch]")).toHaveAttribute("href", /review=review-a/);
     await fixture.locator("[data-review-branch]").click();
     await expect(fixture.locator(".repository-file-section")).toHaveCount(12);
     const loadAll = fixture.getByRole("button", {name: "Load all diffs"});
@@ -198,9 +200,16 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveCount(0);
       await fixture.getByRole("button", {name: "← Repositories"}).first().click();
     }
-    expireWorktree = false;
+    failCapture = true;
+    await fixture.locator('[data-review-worktree="unstaged"]').click();
+    await expect(fixture.locator("[data-worktree-capture-error]")).toHaveText("Fixture capture failed");
+    await expect(fixture.locator("[data-worktree-capture-error]")).toBeVisible();
+    await expect(fixture.locator(".repository-history")).not.toHaveAttribute("open");
+    await expect(fixture.locator(".repository-history [data-worktree-capture-error]")).toHaveCount(0);
+    failCapture = false; expireWorktree = false;
     await fixture.locator('[data-review-worktree="unstaged"]').click();
     await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-3");
+    await expect(fixture.locator("[data-worktree-capture-error]")).toHaveCount(0);
     await expect(fixture.locator(".repository-file-section")).toHaveCount(0);
     await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
     await expect(fixture.locator(".repository-review-heading button").filter({hasText: "Load all diffs"})).toBeHidden();
