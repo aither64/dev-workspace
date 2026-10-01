@@ -21,7 +21,7 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
       let failArchive = false, failHold = false, failActivity = false, failCapture = false, repositoryVersion = 0, captureCount = 0;
       let reviewStyleHeld = true;
-      await page.route(/\/static\/repository-review\.css\?v=1$/, async route => {
+      await page.route(/\/static\/repository-review\.css\?v=2$/, async route => {
         if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
         await route.continue();
       });
@@ -86,7 +86,8 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
         assert.ok(Math.abs(layout.cards[0].x - layout.cards[1].x) <= 2 && layout.cards[1].y >= layout.cards[0].y + layout.cards[0].height - 1,
           "repository cards must stack vertically");
         assert.ok(layout.cards.every(card => card.right <= layout.viewport + 1), "repository card must fit the viewport");
-        if (desktop) assert.equal(new Set(layout.cards[0].actions).size, 1, "desktop repository actions must share one row");
+        if (desktop) assert.equal(new Set(layout.cards[0].actions).size, 1,
+          `desktop repository actions must share one row (card ${Math.round(layout.cards[0].width)}px, tops ${layout.cards[0].actions.join(", ")})`);
       };
       const expireAutoArchiveCache = () => page.evaluate(() => {
         const wallNow = Date.now;

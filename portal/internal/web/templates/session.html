@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=4">
-  <link rel="stylesheet" href="/static/style.css?v=1">
+  <link rel="stylesheet" href="/static/style.css?v=2">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=2">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -204,7 +204,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=16" defer></script>
+  <script src="/static/app.js?v=17" defer></script>
 </body>
 </html>
 {{end}}

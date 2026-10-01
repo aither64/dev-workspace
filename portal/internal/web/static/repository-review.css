@@ -1,6 +1,8 @@
 #repositories .repo-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 1rem; }
 #repositories .repo-card { min-width: 0; }
 .repository-review-actions, .repository-pagination, .repository-mode-controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+#repositories .repository-review-actions { align-items: stretch; }
+#repositories .repository-review-actions > * { white-space: nowrap; }
 .repository-history { margin-top: 1rem; border-top: 1px solid var(--line, #283241); padding-top: 1rem; }
 .repository-history > summary { cursor: pointer; font-weight: 600; }
 .repository-history > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

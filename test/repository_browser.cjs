@@ -63,7 +63,7 @@ const server = http.createServer((req, res) => {
   const json = value => send("application/json", JSON.stringify(value));
   if (url.pathname === "/example/") {
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'nonce-teststyle123'; connect-src 'self'");
-    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css?v=1"><link rel="stylesheet" href="/copy.css">' +
+    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css?v=2"><link rel="stylesheet" href="/copy.css">' +
       '<link rel="stylesheet" href="/harness.css"><section id="repositories" class="tab-panel active">' + cards +
       '</section><script type="module" src="/entry.js"></script>');
   }

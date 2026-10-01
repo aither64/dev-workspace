@@ -102,7 +102,7 @@ export const largeDiff = file => Number.isFinite(file.additions) && Number.isFin
 
 export function mount({slug, nonce, element, createCopyButton, onComparisonChange = () => {}}) {
   if (!document.querySelector('link[data-repository-review-styles]')) {
-    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css?v=1";
+    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css?v=2";
     sheet.dataset.repositoryReviewStyles = "true"; document.head.append(sheet);
   }
   const preload = () => {

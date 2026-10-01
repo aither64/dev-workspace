@@ -98,7 +98,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=6");
+      const {mount} = await import("/static/repository-review.js?v=7");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
