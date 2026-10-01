@@ -17,6 +17,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], batches = [];
     let inFlight = 0, maxInFlight = 0, firstBatchesHeld = true, failedOnce = false, worktreeCaptures = 0, expireWorktree = false, failCapture = false;
+    let historyMode = "zero";
     page.on("pageerror", error => errors.push(error.message));
     await page.route("**/static/review-editor.js", route => route.fulfill({contentType: "text/javascript", body: `
       export function createReviewEditor({parent, after}) {
@@ -31,11 +32,21 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       const url = new URL(route.request().url());
       const operation = url.pathname.split("/").at(-1);
       if (operation === "repository-histories" || operation === "repository-history") {
+        if (historyMode === "request-error") return route.fulfill({status: 503, json: {error: "Fixture history failed"}});
+        if (historyMode === "batch-error" && operation === "repository-histories") {
+          return route.fulfill({json: {repositories: url.searchParams.getAll("repository").map(repository =>
+            ({repository, error: "Fixture batch history failed"}))}});
+        }
         const review = "review-a";
-        const result = {repository: "fixture", snapshot: "snapshot-a", review, pair: pair(review),
-          history: {page: 0, hasMore: false, commits: []},
-          summary: {commitCount: 0, stats: {files: 12, additions: 24012, deletions: 0}}};
-        return route.fulfill({json: operation === "repository-histories" ? {repositories: [result]} : result});
+        const commitCount = historyMode === "one" ? 1 : historyMode === "multi" ? 83 : 0;
+        const result = repository => ({repository, snapshot: "snapshot-a", review, pair: pair(review),
+          history: {page: 0, hasMore: historyMode === "multi", commits: commitCount ? [{id: "first", sha: pair(review).head, subject: "First-page commit"}] : []},
+          ...(historyMode === "missing" ? {summaryError: "Fixture totals unavailable"} :
+            {summary: {commitCount, stats: {files: historyMode === "zero" ? 0 : 12,
+              additions: historyMode === "zero" ? 0 : 24012, deletions: 0, binaryFiles: historyMode === "multi" ? 1 : 0}}}),
+          ...(historyMode === "conflict" ? {summaryError: "Fixture contradictory totals"} : {})});
+        return route.fulfill({json: operation === "repository-histories" ?
+          {repositories: url.searchParams.getAll("repository").map(result)} : result(url.searchParams.get("repository"))});
       }
       if (operation === "repository-states") return route.fulfill({json: {repositories: [{repository: "fixture", head: pair("review-a").head}]}});
       if (operation === "repository-comparison") {
@@ -95,15 +106,53 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
         <article class="panel repo-card" data-repository-id="fixture" data-repository-name="Fixture" data-repository-head="${"b".repeat(40)}">
           <div data-repository-status></div><div class="repository-review-actions">
             <button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button>
-          </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details>
+          </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=7");
+      const {mount} = await import("/static/repository-review.js?v=8");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
     const fixture = page.locator("#fixture-repositories");
     await expect(fixture.locator(".repository-history")).not.toHaveAttribute("open");
+    const history = fixture.locator(".repository-history");
+    const summary = history.locator("summary");
+    const totals = summary.locator("[data-repository-history-summary]");
+    await expect(totals).toContainText("0 commits · 0 changed files");
+    await expect(history.locator("[data-repository-commits] .repository-history-summary")).toHaveCount(0);
+    await summary.click();
+    await page.evaluate(() => {
+      window.fixtureHistory = document.querySelector("#fixture-repositories .repository-history");
+      window.fixtureHistorySummary = window.fixtureHistory.querySelector("summary");
+    });
+    historyMode = "one";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toContainText("1 commit · 12 changed files");
+    historyMode = "multi";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toContainText("83 commits · 12 changed files");
+    await expect(totals).toContainText("1 binary file");
+    await expect(history.locator(".repository-commit")).toHaveCount(1);
+    assert(await page.evaluate(() => document.querySelector("#fixture-repositories .repository-history") === window.fixtureHistory &&
+      document.querySelector("#fixture-repositories .repository-history > summary") === window.fixtureHistorySummary));
+    await expect(history).toHaveAttribute("open", "");
+    historyMode = "missing";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toHaveText("Totals unavailable");
+    await expect(history.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture totals unavailable");
+    historyMode = "conflict";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toHaveText("Totals unavailable");
+    await expect(history.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture contradictory totals");
+    historyMode = "request-error";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toHaveText("Totals unavailable");
+    await expect(history.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture history failed");
+    historyMode = "zero";
+    await summary.click();
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toContainText("0 commits · 0 changed files");
+    await expect(history).not.toHaveAttribute("open");
     await expect(fixture.locator("[data-review-branch]")).toHaveAttribute("href", /review=review-a/);
     await fixture.locator("[data-review-branch]").click();
     await expect(fixture.locator(".repository-file-section")).toHaveCount(12);
@@ -217,6 +266,27 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await expect.poll(() => new URL(page.url()).searchParams.get("snapshot")).toBe("ephemeral-4");
     await expect(fixture.locator(".repository-file-scroll > .empty")).toHaveText("No changes in this snapshot.");
     assert.equal(batches.length, beforeEmptyBatches, "empty working reviews requested no file previews");
+    const addHistoryCard = id => page.evaluate(value => {
+      const overview = document.querySelector("#fixture-repositories .repository-overview");
+      const candidate = overview.cloneNode(true);
+      const card = candidate.querySelector('[data-repository-id="fixture"]').cloneNode(true);
+      card.dataset.repositoryId = value;
+      card.dataset.repositoryName = value;
+      card.querySelector("[data-repository-history-summary]").textContent = "Loading totals…";
+      card.querySelector("[data-repository-commits]").replaceChildren();
+      candidate.querySelector(".repo-grid").append(card);
+      window.fixtureReview.updateHTML(candidate.innerHTML);
+    }, id);
+    historyMode = "batch-error";
+    await addHistoryCard("fixture-batch");
+    const batchCard = fixture.locator('[data-repository-id="fixture-batch"]');
+    await expect(batchCard.locator("[data-repository-history-summary]")).toHaveText("Totals unavailable");
+    await expect(batchCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture batch history failed");
+    historyMode = "request-error";
+    await addHistoryCard("fixture-whole");
+    const wholeCard = fixture.locator('[data-repository-id="fixture-whole"]');
+    await expect(wholeCard.locator("[data-repository-history-summary]")).toHaveText("Totals unavailable");
+    await expect(wholeCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture history failed");
     assert.deepEqual(errors, []);
   } finally {
     releaseFirstBatches(); releaseSlow();

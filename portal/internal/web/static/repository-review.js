@@ -102,7 +102,7 @@ export const largeDiff = file => Number.isFinite(file.additions) && Number.isFin
 
 export function mount({slug, nonce, element, createCopyButton, onComparisonChange = () => {}}) {
   if (!document.querySelector('link[data-repository-review-styles]')) {
-    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css?v=2";
+    const sheet = node("link"); sheet.rel = "stylesheet"; sheet.href = "/static/repository-review.css?v=3";
     sheet.dataset.repositoryReviewStyles = "true"; document.head.append(sheet);
   }
   const preload = () => {
@@ -170,6 +170,22 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     if (!head || ticket < (state.observedAt || 0)) return;
     state.observedAt = ticket; markChanged(state, head);
   };
+  const historySummaryTarget = state => {
+    const heading = state.card.querySelector(".repository-history")?.querySelector("summary");
+    if (!heading) return null;
+    let target = heading.querySelector("[data-repository-history-summary]");
+    if (!target) {
+      target = node("span", "repository-history-summary muted", "Loading totals…");
+      target.dataset.repositoryHistorySummary = "";
+      heading.append(" ", target);
+    }
+    return target;
+  };
+  const historyFailure = (state, error) => {
+    const summary = historySummaryTarget(state);
+    if (summary) { summary.classList.add("muted"); summary.textContent = "Totals unavailable"; }
+    showFailure(state.card.querySelector("[data-repository-commits]"), error);
+  };
   const renderHistory = (state, payload) => {
     state.snapshot = payload.snapshot; state.review = payload.review;
     state.pair = payload.pair; state.page = payload.history.page;
@@ -211,18 +227,21 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
       row.append(subjectGroup, identity); item.prepend(row); list.append(item);
     }
+    const summary = historySummaryTarget(state);
+    const available = !payload.summaryError && payload.summary &&
+      Number.isSafeInteger(payload.summary.commitCount) && payload.summary.stats;
+    if (summary) {
+      summary.replaceChildren();
+      if (available) summary.classList.remove("muted"); else summary.classList.add("muted");
+      if (available) {
+        const total = payload.summary.commitCount;
+        summary.append(total.toLocaleString() + (total === 1 ? " commit" : " commits") + " · ");
+        counts(summary, payload.summary.stats, true);
+      } else summary.textContent = "Totals unavailable";
+    }
     target.replaceChildren(node("p", "muted repository-history-base", short(payload.pair.base) + " → " +
       short(payload.pair.head) + " · " + payload.pair.baseLabel));
-    if (payload.summary) {
-      const total = payload.summary.commitCount;
-      const summary = node("p", "repository-history-summary", total.toLocaleString() + (total === 1 ? " commit" : " commits") + " · ");
-      counts(summary, payload.summary.stats, true);
-      target.prepend(summary);
-    } else {
-      const summary = node("p", "muted repository-history-summary", "Totals unavailable.");
-      if (payload.summaryError) summary.append(" " + payload.summaryError);
-      target.prepend(summary);
-    }
+    if (!available) target.append(node("p", "notice warning", payload.summaryError || "Comparison totals are unavailable."));
     if (payload.pair.warning) target.append(node("p", "notice warning", payload.pair.warning));
     target.append(list);
     if (!payload.history.commits.length) target.append(node("p", "muted", "No commits in this comparison."));
@@ -249,7 +268,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       if (refresh && state.latestHead !== payload.pair.head) { state.refreshAgain = true; return false; }
       renderHistory(state, payload);
       return true;
-    } catch (error) { if (!paused && !destroyed && generation === readGeneration) showFailure(state.card.querySelector("[data-repository-commits]"), error); return false; }
+    } catch (error) { if (!paused && !destroyed && generation === readGeneration) historyFailure(state, error); return false; }
     finally { loadingHistory(state, false); }
   };
   const captureWorktree = async (state, kind) => {
@@ -290,7 +309,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         for (const state of batch) {
           if (!states.has(state.id) || destroyed || paused || generation !== readGeneration) continue;
           const result = results.get(state.id);
-          if (!result || result.error) showFailure(state.card.querySelector("[data-repository-commits]"), new Error(result?.error || "Repository history is unavailable."));
+          if (!result || result.error) historyFailure(state, new Error(result?.error || "Repository history is unavailable."));
           else {
             observeHead(state, result.pair.head, ticket);
             if (state.latestHead === result.pair.head) renderHistory(state, result);
@@ -298,7 +317,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
           }
         }
       } catch (error) {
-        if (!paused && !destroyed && generation === readGeneration) for (const state of batch) showFailure(state.card.querySelector("[data-repository-commits]"), error);
+        if (!paused && !destroyed && generation === readGeneration) for (const state of batch) historyFailure(state, error);
       } finally { batch.forEach(state => loadingHistory(state, false)); }
     }
   };
@@ -786,6 +805,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     const state = {id, name: card.dataset.repositoryName, card, snapshot: null, review: null, pair: null,
       latestHead: card.dataset.repositoryHead || "", loading: false};
     states.set(id, state);
+    historySummaryTarget(state);
     card.querySelector("[data-review-branch]").addEventListener("click", event => {
       if (!state.review || !normalClick(event)) return;
       event.preventDefault(); navigate(comparisonRoute(state));
@@ -829,7 +849,23 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         if (!fresh) { state.card.remove(); states.delete(id); if (active?.state === state) restore(); continue; }
         const oldStatus = state.card.querySelector("[data-repository-status]");
         const newStatus = fresh.querySelector("[data-repository-status]");
-        if (oldStatus && newStatus && oldStatus.innerHTML !== newStatus.innerHTML) oldStatus.replaceChildren(...newStatus.childNodes);
+        if (oldStatus && newStatus && oldStatus.innerHTML !== newStatus.innerHTML) {
+          const oldWorkflow = oldStatus.querySelector("[data-repository-workflows]");
+          const newWorkflow = newStatus.querySelector("[data-repository-workflows]");
+          let focusedWorkflowSummary = null;
+          if (oldWorkflow && newWorkflow) {
+            const oldSummary = oldWorkflow.querySelector("summary");
+            const newSummary = newWorkflow.querySelector("summary");
+            if (oldSummary === document.activeElement) focusedWorkflowSummary = oldSummary;
+            if (oldSummary && newSummary) oldSummary.replaceChildren(...newSummary.childNodes);
+            const oldRuns = oldWorkflow.querySelector("[data-repository-workflow-runs]");
+            const newRuns = newWorkflow.querySelector("[data-repository-workflow-runs]");
+            if (oldRuns && newRuns) oldRuns.replaceChildren(...newRuns.childNodes);
+            newWorkflow.replaceWith(oldWorkflow);
+          }
+          oldStatus.replaceChildren(...newStatus.childNodes);
+          focusedWorkflowSummary?.focus({preventScroll: true});
+        }
         // Details HTML can predate the latest history read. Poll heads separately.
         incoming.delete(id);
       }

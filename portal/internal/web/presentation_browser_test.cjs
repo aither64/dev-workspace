@@ -3,11 +3,18 @@ const assert = require("node:assert/strict");
 const {chromium, firefox, expect} = require("@playwright/test");
 const baseURL = process.argv[2];
 const head = "b".repeat(40), base = "a".repeat(40);
-const cards = version => '<div class="repo-grid">' + ["project", "second"].map(name =>
+const workflowCounters = version => ["Total", "Queued", "Running", "Successful", "Failed"].map((label, index) => {
+  const value = index === 0 || index === 3 ? version + 1 : 0;
+  return `<span class="repository-workflow-counter ${label.toLowerCase()}" role="group" aria-label="${label} workflow runs: ${value}" title="Fixture ${label}">${label} <strong>${value}</strong></span>`;
+}).join("");
+const workflowMarkup = (version, mode) => mode === "runs" ?
+  `<details class="repository-workflows" data-repository-workflows><summary>Workflows <span class="repository-workflow-counters">${workflowCounters(version)}</span></summary><div data-repository-workflow-runs>Fixture run ${version}</div></details>` :
+  `<p class="repository-workflows-compact" role="note" aria-label="Fixture ${mode}" title="Fixture ${mode}">Workflows · ${mode === "zero" ? "0 total" : "unavailable"}</p>`;
+const cards = (version, mode) => '<div class="repo-grid">' + ["project", "second"].map(name =>
   `<article class="panel repo-card" data-repository-id="${name}" data-repository-name="${name}" data-repository-head="${head}">` +
-  `<div data-repository-status>${name} ${version}</div>` +
+  `<div data-repository-status>${name} ${version}${workflowMarkup(version, mode)}</div>` +
   '<div class="repository-review-actions"><button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button></div>' +
-  '<p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details></article>'
+  '<p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details></article>'
 ).join("") + '</div>';
 (async () => {
   for (const engine of [chromium, firefox]) {
@@ -20,8 +27,9 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
       let archive = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z", eligible_at: "2026-09-21T18:01:59Z",
         blockers: ["Session has uncommitted worktree changes.", diagnostic]};
       let failArchive = false, failHold = false, failActivity = false, failCapture = false, repositoryVersion = 0, captureCount = 0;
+      let workflowMode = "runs";
       let reviewStyleHeld = true;
-      await page.route(/\/static\/repository-review\.css\?v=2$/, async route => {
+      await page.route(/\/static\/repository-review\.css\?v=3$/, async route => {
         if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
         await route.continue();
       });
@@ -53,8 +61,8 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
             currentState: activityState, workingMs: 30000, waitingMs: 10000,
             stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
           }});
-          case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
-          case "repository-histories": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, pair, review: "frozen", snapshot: "history-" + repository, history: {commits: [], page: 0, hasMore: false}}))}});
+          case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion, workflowMode), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
+          case "repository-histories": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, pair, review: "frozen", snapshot: "history-" + repository, history: {commits: [], page: 0, hasMore: false}, summary: {commitCount: 0, stats: {files: 0, additions: 0, deletions: 0}}}))}});
           case "repository-states": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, head}))}});
           case "repository-comparison": {
             if (route.request().method() === "POST") {
@@ -77,6 +85,10 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
         };
         return {grid: bounds(grid), viewport: innerWidth, cards: [...grid.querySelectorAll(".repo-card")].map(card => ({
           ...bounds(card), actions: [...card.querySelectorAll(".repository-review-actions > *")].map(action => Math.round(action.getBoundingClientRect().top)),
+          actionMargin: getComputedStyle(card.querySelector(".repository-review-actions")).marginTop,
+          actionGap: getComputedStyle(card.querySelector(".repository-review-actions")).gap,
+          actionSeparation: card.querySelector(".repository-review-actions").getBoundingClientRect().top -
+            card.querySelector("[data-repository-status]").getBoundingClientRect().bottom,
         }))};
       });
       const assertRepositoryLayout = (layout, desktop) => {
@@ -86,6 +98,11 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
         assert.ok(Math.abs(layout.cards[0].x - layout.cards[1].x) <= 2 && layout.cards[1].y >= layout.cards[0].y + layout.cards[0].height - 1,
           "repository cards must stack vertically");
         assert.ok(layout.cards.every(card => card.right <= layout.viewport + 1), "repository card must fit the viewport");
+        for (const card of layout.cards) {
+          assert.equal(card.actionMargin, "16px", "repository actions need 1rem top spacing");
+          assert.equal(card.actionGap, "8px", "repository actions need .5rem gaps");
+          assert.ok(card.actionSeparation >= 15, "repository actions overlap the status and workflow summary");
+        }
         if (desktop) assert.equal(new Set(layout.cards[0].actions).size, 1,
           `desktop repository actions must share one row (card ${Math.round(layout.cards[0].width)}px, tops ${layout.cards[0].actions.join(", ")})`);
       };
@@ -105,7 +122,11 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
       const repositoryCards = page.locator("#repositories .repo-card");
       await expect(repositoryCards).toHaveCount(2);
       const firstCard = repositoryCards.first(), history = firstCard.locator(".repository-history");
+      const workflows = firstCard.locator("[data-repository-workflows]");
       await expect(history).not.toHaveAttribute("open");
+      await expect(workflows).not.toHaveAttribute("open");
+      await expect(history.locator("[data-repository-history-summary]")).toContainText("0 commits · 0 changed files");
+      await expect(workflows.locator("summary [role='group']")).toHaveCount(5);
       await expect(firstCard.locator("[data-review-branch]")).toHaveAttribute("href", /review=frozen/);
       for (const label of ["Compare", "Staged changes", "Unstaged changes", "Refresh commits"]) {
         await expect(firstCard.locator(".repository-review-actions").getByText(label, {exact: true})).toBeVisible();
@@ -129,14 +150,52 @@ const cards = version => '<div class="repo-grid">' + ["project", "second"].map(n
       await page.getByRole("button", {name: "← Repositories", exact: true}).click();
       await history.locator("summary").click();
       await expect(history).toHaveAttribute("open", "");
+      await workflows.locator("summary").focus();
+      await page.keyboard.press("Enter");
+      await expect(workflows).toHaveAttribute("open", "");
+      await page.keyboard.press("Space");
+      await expect(workflows).not.toHaveAttribute("open");
+      await page.keyboard.press("Space");
+      await expect(workflows).toHaveAttribute("open", "");
+      await page.evaluate(() => {
+        window.retainedWorkflow = document.querySelector("#repositories [data-repository-workflows]");
+        window.retainedWorkflowSummary = window.retainedWorkflow.querySelector("summary");
+      });
       repositoryVersion++;
       await expect.poll(async () => {
         await page.evaluate(() => dispatchEvent(new Event("focus")));
         return firstCard.locator("[data-repository-status]").textContent();
-      }).toBe("project 1");
+      }).toContain("project 1");
+      await expect(history).toHaveAttribute("open", "");
+      await expect(workflows).toHaveAttribute("open", "");
+      await expect(workflows.locator("summary")).toBeFocused();
+      await expect(workflows.locator('[aria-label="Total workflow runs: 2"]')).toBeVisible();
+      assert(await page.evaluate(() => window.retainedWorkflow === document.querySelector("#repositories [data-repository-workflows]") &&
+        window.retainedWorkflowSummary === window.retainedWorkflow.querySelector("summary")), "status refresh replaced workflow disclosure");
+      workflowMode = "unavailable";
+      repositoryVersion++;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 2");
+      await expect(firstCard.locator(".repository-workflows-compact")).toHaveText("Workflows · unavailable");
+      await expect(workflows).toHaveCount(0);
+      await expect(history).toHaveAttribute("open", "");
+      workflowMode = "zero";
+      repositoryVersion++;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 3");
+      await expect(firstCard.locator(".repository-workflows-compact")).toHaveText("Workflows · 0 total");
+      await expect(workflows).toHaveCount(0);
+      workflowMode = "runs";
+      repositoryVersion++;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(firstCard.locator("[data-repository-status]")).toContainText("project 4");
+      await expect(workflows).not.toHaveAttribute("open");
+      assert(await page.evaluate(() => window.retainedWorkflow !== document.querySelector("#repositories [data-repository-workflows]")),
+        "workflow disclosure persisted through compact states");
       await expect(history).toHaveAttribute("open", "");
       await page.reload();
       await expect(page.locator("#repositories .repository-history").first()).not.toHaveAttribute("open");
+      await expect(page.locator("#repositories [data-repository-workflows]").first()).not.toHaveAttribute("open");
       await page.evaluate(() => dispatchEvent(new Event("pagehide")));
       await expect(waitingIndicator).toBeHidden();
       await page.reload();

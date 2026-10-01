@@ -65,14 +65,30 @@ const fs = require("node:fs");
       };
     }
     append(...children) {
-      for (const child of children) { child.remove(); this.childNodes.push(child); child.parentNode = this; }
+      for (let child of children) {
+        if (typeof child === "string") child = new FakeElement("#text", "", child);
+        child.remove(); this.childNodes.push(child); child.parentNode = this;
+      }
     }
     prepend(child) { child.remove(); this.childNodes.unshift(child); child.parentNode = this; }
     remove() {
       if (!this.parentNode) return;
+      if (this.contains(globalThis.document?.activeElement)) globalThis.document.activeElement = null;
       this.parentNode.childNodes.splice(this.parentNode.childNodes.indexOf(this), 1);
       this.parentNode = null;
     }
+    contains(other) {
+      for (let current = other; current; current = current.parentNode) if (current === this) return true;
+      return false;
+    }
+    replaceWith(replacement) {
+      if (!this.parentNode) return;
+      const parent = this.parentNode;
+      replacement.remove();
+      parent.childNodes[parent.childNodes.indexOf(this)] = replacement;
+      replacement.parentNode = parent; this.parentNode = null;
+    }
+    focus() { globalThis.document.activeElement = this; }
     replaceChildren(...children) {
       for (const child of this.childNodes) child.parentNode = null;
       this.childNodes = []; this.append(...children);
@@ -96,6 +112,10 @@ const fs = require("node:fs");
     }
     matches(selector) {
       if (selector === "[data-repository-id]") return Boolean(this.dataset.repositoryId);
+      if (/^\[data-[a-z-]+\]$/.test(selector)) {
+        const key = selector.slice(6, -1).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+        return Object.hasOwn(this.dataset, key);
+      }
       if (selector.startsWith(".")) return selector.slice(1).split(".").every(name => this.classList.contains(name));
       return selector === this.tag;
     }
@@ -104,16 +124,29 @@ const fs = require("node:fs");
     set innerHTML(html) {
       this._html = html;
       const warning = /<p class="notice warning">([^<]*)<\/p>/.exec(html)?.[1];
+      const statusText = /data-status="([^"]+)"/.exec(html)?.[1] || "initial";
       const heading = new FakeElement("div", "section-heading");
       heading.append(new FakeElement("span", "", "1"));
       const grid = new FakeElement("div", "repo-grid");
-      if (html.includes('data-repository-id="stored"')) grid.append(repositoryCard());
+      if (html.includes('data-repository-id="stored"')) grid.append(repositoryCard(statusText));
       this.replaceChildren(...(warning ? [new FakeElement("p", "notice warning", warning)] : []), heading, grid);
     }
   }
-  const repositoryCard = () => {
+  const repositoryCard = statusText => {
     const card = new FakeElement("article", "repo-card"); card.dataset.repositoryId = "stored";
-    const status = new FakeElement("div");
+    const status = new FakeElement("div"); status._html = statusText;
+    if (["unavailable", "zero"].includes(statusText)) {
+      status.append(new FakeElement("p", "repository-workflows-compact",
+        "Workflows · " + (statusText === "zero" ? "0 total" : "unavailable")));
+    } else {
+      const workflows = new FakeElement("details", "repository-workflows"); workflows.dataset.repositoryWorkflows = "";
+      workflows.open = false;
+      const workflowSummary = new FakeElement("summary");
+      workflowSummary.append(new FakeElement("span", "", statusText));
+      const workflowRuns = new FakeElement("div"); workflowRuns.dataset.repositoryWorkflowRuns = "";
+      workflowRuns.append(new FakeElement("span", "", "run " + statusText));
+      workflows.append(workflowSummary, workflowRuns); status.append(workflows);
+    }
     const branch = new FakeElement("button"), refresh = new FakeElement("button");
     const actions = new FakeElement("div", "repository-review-actions"); actions.append(branch, refresh);
     const headNotice = new FakeElement("p", "repository-head-change"); headNotice.hidden = true;
@@ -136,6 +169,7 @@ const fs = require("node:fs");
   globalThis.document = {
     querySelector: () => ({}), createElement: tag => new FakeElement(tag),
     addEventListener() {}, removeEventListener() {},
+    activeElement: null,
   };
   globalThis.location = {href: "https://workspace.example.test/example/?tab=repositories"};
   globalThis.localStorage = {getItem: () => null};
@@ -149,21 +183,54 @@ const fs = require("node:fs");
     const overview = element.childNodes[0];
     const originalCard = overview.querySelectorAll("[data-repository-id]")[0];
     const retainedHistory = originalCard.querySelector(".repository-history");
+    const retainedHistorySummary = retainedHistory.querySelector("summary");
+    const historyTotals = retainedHistorySummary.querySelector("[data-repository-history-summary]");
+    assert.equal(historyTotals?.textContent, "Loading totals…");
     retainedHistory.open = true;
-    const detailsHTML = warning => `${warning ? `<p class="notice warning">${warning}</p>` : ""}<div class="section-heading"><span>1</span></div><div class="repo-grid"><article data-repository-id="stored"></article></div>`;
-    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure"));
+    const retainedWorkflow = originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]");
+    const retainedWorkflowSummary = retainedWorkflow.querySelector("summary");
+    retainedWorkflow.open = true; retainedWorkflowSummary.focus();
+    const detailsHTML = (warning, status) => `${warning ? `<p class="notice warning">${warning}</p>` : ""}<div class="section-heading"><span>1</span></div><div class="repo-grid"><article data-repository-id="stored" data-status="${status}"></article></div>`;
+    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: first failure", "running"));
     assert.equal(overview.querySelector(":scope > .notice.warning")?.textContent,
       "Some live worktrees could not be verified: first failure");
     assert.equal(overview.querySelectorAll("[data-repository-id]")[0], originalCard);
     assert.equal(originalCard.querySelector(".repository-history"), retainedHistory);
+    assert.equal(retainedHistory.querySelector("summary"), retainedHistorySummary);
+    assert.equal(retainedHistorySummary.querySelector("[data-repository-history-summary]"), historyTotals);
     assert.equal(retainedHistory.open, true);
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]"), retainedWorkflow);
+    assert.equal(retainedWorkflow.querySelector("summary"), retainedWorkflowSummary);
+    assert.equal(retainedWorkflowSummary.querySelector("span").textContent, "running");
+    assert.equal(retainedWorkflow.querySelector("[data-repository-workflow-runs]").querySelector("span").textContent, "run running");
+    assert.equal(retainedWorkflow.open, true);
+    assert.equal(globalThis.document.activeElement, retainedWorkflowSummary);
     assert.equal(overview.querySelector(".section-heading span").textContent, "1");
-    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: second failure"));
+    mounted.updateHTML(detailsHTML("Some live worktrees could not be verified: second failure", "unavailable"));
     assert.equal(overview.childNodes.filter(child => child.matches(".notice.warning")).length, 1);
     assert.equal(overview.querySelector(":scope > .notice.warning")?.textContent,
       "Some live worktrees could not be verified: second failure");
-    mounted.updateHTML(detailsHTML(""));
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]"), null);
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector(".repository-workflows-compact").textContent,
+      "Workflows · unavailable");
+    assert.equal(retainedWorkflow.parentNode, null);
+    mounted.updateHTML(detailsHTML("", "zero"));
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]"), null);
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector(".repository-workflows-compact").textContent,
+      "Workflows · 0 total");
     assert.equal(overview.querySelector(":scope > .notice.warning"), null);
+    mounted.updateHTML(detailsHTML("", "returned"));
+    const returnedWorkflow = originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]");
+    assert(returnedWorkflow && returnedWorkflow !== retainedWorkflow);
+    assert.equal(returnedWorkflow.open, false);
+    assert.equal(originalCard.querySelector(".repository-history"), retainedHistory);
+    assert.equal(retainedHistory.open, true);
+    const returnedSummary = returnedWorkflow.querySelector("summary");
+    mounted.updateHTML(detailsHTML("", "returned again"));
+    assert.equal(originalCard.querySelector("[data-repository-status]").querySelector("[data-repository-workflows]"), returnedWorkflow);
+    assert.equal(returnedWorkflow.querySelector("summary"), returnedSummary);
+    assert.equal(returnedSummary.querySelector("span").textContent, "returned again");
+    assert.equal(returnedWorkflow.open, false);
   } finally {
     mounted?.destroy();
     for (const [name, value] of Object.entries(previous)) {

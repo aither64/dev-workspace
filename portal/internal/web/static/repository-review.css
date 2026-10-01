@@ -1,11 +1,23 @@
 #repositories .repo-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 1rem; }
 #repositories .repo-card { min-width: 0; }
 .repository-review-actions, .repository-pagination, .repository-mode-controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
-#repositories .repository-review-actions { align-items: stretch; }
+#repositories .repository-review-actions { align-items: stretch; margin-top: 1rem; }
 #repositories .repository-review-actions > * { white-space: nowrap; }
 .repository-history { margin-top: 1rem; border-top: 1px solid var(--line, #283241); padding-top: 1rem; }
 .repository-history > summary { cursor: pointer; font-weight: 600; }
 .repository-history > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.repository-workflows, .repository-workflows-compact { margin-top: 1rem; border-top: 1px solid var(--line, #283241); padding-top: 1rem; }
+.repository-workflows-compact { margin-bottom: 0; color: var(--muted); font-size: .85rem; }
+.repository-workflows > summary { cursor: pointer; font-weight: 600; }
+.repository-workflows > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.repository-history-summary { margin-left: .4rem; font-size: .8rem; font-weight: 400; }
+.repository-workflow-counters { display: inline-flex; flex-wrap: wrap; gap: .25rem .6rem; margin-left: .5rem; vertical-align: middle; }
+.repository-workflow-counter { display: inline-flex; gap: .2rem; align-items: baseline; color: var(--muted); font-size: .76rem; font-weight: 500; white-space: nowrap; }
+.repository-workflow-counter strong { font-weight: 700; font-variant-numeric: tabular-nums; }
+.repository-workflow-counter.queued { color: var(--warning); }
+.repository-workflow-counter.running { color: #8fc7ff; }
+.repository-workflow-counter.successful { color: var(--accent); }
+.repository-workflow-counter.failed { color: var(--danger); }
 .repository-review-actions { margin-bottom: .8rem; }
 .repository-commit-list { list-style: none; margin: 0; padding: 0; }
 .repository-commit { border-bottom: 1px solid var(--line, #283241); padding: .5rem 0; }

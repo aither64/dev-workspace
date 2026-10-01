@@ -130,8 +130,11 @@ replacing that session.
 The Repositories tab shows one full-width card per repository. **Compare**,
 **Staged changes**, **Unstaged changes**, and **Refresh commits** stay visible
 above **Local commits**, which starts closed while history loads in the
-background. It stays open during status refreshes for the same card; a full page
-reload closes it. Local history includes commits that have not been pushed.
+background. Its summary shows the complete base-to-head commit count and net
+diffstat, including unpushed commits. It shows **Loading totals…** until the
+totals arrive, or **Totals unavailable** if they cannot be loaded. If only the
+totals fail, the commit list and **Compare** remain usable. The disclosure stays
+open during status refreshes for the same card; a full page reload closes it.
 Use the ellipsis after a subject to expand its message, select the subject to
 review the commit and full message, or choose **Compare** for the whole branch.
 Copy icons copy full commit hashes. The external arrow opens the commit on
@@ -140,12 +143,24 @@ The full commit message, metadata, parent links and comparison totals scroll wit
 the diffs. Opening a commit starts at its message; a file or line link jumps to
 that target.
 
-Each repository card shows the commit count for its complete comparison and
-the net lines added and deleted, including unpushed commits. These totals use
-the same revisions as the commit list and **Compare**. Binary files contribute
-to the changed-file count without a line count. **Refresh commits** updates the
-list and totals together. Pagination appears only when there is another page
-to visit. If totals are unavailable, the commit list remains usable.
+The totals cover the full comparison, using the same revisions as the commit
+list and **Compare**. Binary files contribute to the changed-file count without
+a line count. **Refresh commits** updates the list and totals together.
+Pagination appears only when there is another page to visit.
+
+When a repository with an origin has workflow runs, its card shows a closed
+**Workflows** disclosure. Its counters read Total, Queued, Running, Successful
+and Failed. Total counts
+the runs returned for the exact selected revision, up to 100, including skipped
+and neutral results. Queued includes requested, waiting and pending runs; Failed
+includes cancelled and other unsuccessful terminal results. Skipped and neutral
+runs appear only in Total, so the other counters need not add up to Total.
+Expanding the disclosure shows each run's original status, conclusion, workflow
+name and link. Its open state survives a same-card refresh and resets on a full
+page reload. A successful lookup with no runs shows **Workflows · 0 total** in
+place of the disclosure. A pending or failed lookup shows **Workflows ·
+unavailable**, with any origin error shown on the card. When runs return after
+either compact state, the disclosure starts closed again.
 
 Parent hashes open the parent's full commit page. Merge commits link each parent
 and show their diff against the first parent. Parent navigation can continue

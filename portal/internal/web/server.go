@@ -226,8 +226,8 @@ type teamRoleOption struct {
 }
 
 type teamRoleDefault struct {
-	Role string `json:"role"`
-	Model string `json:"model"`
+	Role   string `json:"role"`
+	Model  string `json:"model"`
 	Effort string `json:"reasoningEffort"`
 	Source string `json:"source"`
 }
@@ -381,7 +381,8 @@ func New(config Config) (*Server, error) {
 			}
 			return value
 		},
-		"timeAgo": timeAgo,
+		"timeAgo":         timeAgo,
+		"workflowSummary": workflowSummary,
 	}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, err

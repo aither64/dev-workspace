@@ -29,12 +29,18 @@
             </nav>
             {{if .StatusError}}<p class="notice warning">Repository: {{.StatusError}}</p>{{end}}
             {{if .OriginError}}<p class="notice warning">{{if .Origin}}{{.Origin.Label}}{{else}}Repository origin{{end}}: {{.OriginError}}</p>{{end}}
-            {{if .Runs}}<div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{else}}<span>{{end}}<span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code>{{if .URL}}</a>{{else}}</span>{{end}}{{end}}</div>{{else if and (eq .PushStatus "exactly-pushed") (not .OriginError)}}<p class="muted revision-note">No workflow runs for this revision.</p>{{end}}
+            {{$workflows := workflowSummary .}}{{if $workflows.Show}}{{if $workflows.HasRuns}}
+            <details class="repository-workflows" data-repository-workflows>
+              <summary>Workflows <span class="repository-workflow-counters">{{range $workflows.Counters}}<span class="repository-workflow-counter {{.Class}}" role="group" aria-label="{{.AccessibleLabel}}" title="{{.Title}}"><span>{{.Label}}</span> <strong>{{.Value}}</strong></span>{{end}}</span></summary>
+              <div class="repository-workflow-body" data-repository-workflow-runs>
+                <div class="runs"><h4>Workflows for this revision</h4>{{range .Runs}}{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noreferrer">{{else}}<span>{{end}}<span class="run-state {{if .Conclusion}}{{.Conclusion}}{{else}}{{.Status}}{{end}}" title="Status: {{.Status}}{{if .Conclusion}}; conclusion: {{.Conclusion}}{{end}}">{{if .Conclusion}}{{.Conclusion}}{{else if eq .Status "in_progress"}}in progress{{else}}{{.Status}}{{end}}</span>{{.WorkflowName}} <code>{{shortSHA .HeadSHA}}</code>{{if .URL}}</a>{{else}}</span>{{end}}{{end}}</div>
+              </div>
+            </details>{{else}}<p class="repository-workflows-compact" role="note" aria-label="{{$workflows.CompactLabel}}" title="{{$workflows.CompactTitle}}">{{$workflows.CompactText}}</p>{{end}}{{end}}
             </div>
             <div class="repository-review-actions"><button type="button" data-review-branch disabled>Compare</button>{{if not $.Session.Archived}}<button type="button" class="quiet" data-review-worktree="staged">Staged changes</button><button type="button" class="quiet" data-review-worktree="unstaged">Unstaged changes</button>{{end}}<button type="button" class="quiet" data-review-refresh>Refresh commits</button></div>
             <p class="repository-head-change notice warning" hidden>The branch has changed. Refresh commits to review it.</p>
             <details class="repository-history">
-              <summary>Local commits</summary>
+              <summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary>
               <div data-repository-commits><p class="muted">Loading local commits…</p></div>
             </details>
           </article>

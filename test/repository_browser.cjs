@@ -13,12 +13,18 @@ let head = originalHead, shortFiles = false, fixtureMode = "normal";
 let holdNextHistory = false, releaseHistory;
 const reported = JSON.parse(fs.readFileSync(path.join(root, "portal/review-ui/fixtures/oauth2.json"), "utf8"));
 const calls = [], assets = [];
+const workflowCounters = ["Total", "Queued", "Running", "Successful", "Failed"].map(label => {
+  const count = ["Total", "Successful"].includes(label) ? 1 : 0;
+  return '<span class="repository-workflow-counter ' + label.toLowerCase() + '" role="group" aria-label="' + label +
+    ' workflow runs: ' + count + '" title="Fixture ' + label + '">' + label + ' <strong>' + count + '</strong></span>';
+}).join("");
 const cards = '<div class="section-heading"><h2>Repositories</h2><span>4</span></div><div class="repo-grid">' +
   ["project", "second", "third", "fourth"].map(name => '<article class="panel repo-card" data-repository-id="' + name +
     '" data-repository-name="' + name + '" data-repository-head="' + head +
-    '"><div data-repository-status><h3>' + name + '</h3></div><div class="repository-review-actions">' +
+    '"><div data-repository-status><h3>' + name + '</h3><details class="repository-workflows" data-repository-workflows><summary>Workflows <span class="repository-workflow-counters">' + workflowCounters +
+    '</span></summary><div data-repository-workflow-runs>Fixture successful run</div></details></div><div class="repository-review-actions">' +
     '<button data-review-branch disabled>Compare</button><button data-review-worktree="staged">Staged changes</button><button data-review-worktree="unstaged">Unstaged changes</button><button data-review-refresh>Refresh commits</button></div>' +
-    '<p class="repository-head-change" hidden>Branch changed</p><details class="repository-history"><summary>Local commits</summary><div data-repository-commits></div></details></article>').join("") + "</div>";
+    '<p class="repository-head-change" hidden>Branch changed</p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details></article>').join("") + "</div>";
 const files = Array.from({length: 30}, (_, index) => ({id: String(index), path: "src/file-" + index + ".nix",
   status: index === 1 ? "A" : index === 2 ? "D" : "M", oldMode: index === 1 ? "000000" : "100644",
   newMode: index === 2 ? "000000" : "100644", additions: index === 2 ? 0 : 1, deletions: index === 1 ? 0 : 1}));
@@ -56,18 +62,19 @@ const parentCommit = {...commit, sha: base, parents: [rootCommit.sha], message: 
 const sideCommit = {...parentCommit, sha: "d".repeat(40), message: "Side branch\n"};
 const commits = new Map([commit, parentCommit, sideCommit, rootCommit].map(item => [item.sha, item]));
 const history = repository => ({repository, review: "frozen", snapshot: "snapshot", pair: {base, head, baseLabel: "Merge base"},
-  history: {commits: [commit], page: 0, hasMore: false}});
+  history: {commits: [commit], page: 0, hasMore: false},
+  summary: {commitCount: 1, stats: {files: 30, additions: 29, deletions: 29, binaryFiles: 0}}});
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://fixture");
   const send = (type, data) => {res.setHeader("Content-Type", type); res.end(data);};
   const json = value => send("application/json", JSON.stringify(value));
   if (url.pathname === "/example/") {
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'nonce-teststyle123'; connect-src 'self'");
-    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css?v=2"><link rel="stylesheet" href="/copy.css">' +
+    return send("text/html", '<!doctype html><link rel="stylesheet" href="/static/style.css?v=3"><link rel="stylesheet" href="/copy.css">' +
       '<link rel="stylesheet" href="/harness.css"><section id="repositories" class="tab-panel active">' + cards +
       '</section><script type="module" src="/entry.js"></script>');
   }
-  if (url.pathname === "/entry.js") return send("text/javascript", "import {mount} from '/static/repository-review.js';" +
+  if (url.pathname === "/entry.js") return send("text/javascript", "import {mount} from '/static/repository-review.js?v=8';" +
     "import {createCopyButton} from '/conversation.js';window.cardMarkup=" + JSON.stringify(cards) +
     ";window.review=mount({slug:'example',nonce:'teststyle123',createCopyButton,element:document.getElementById('repositories')});");
   if (url.pathname === "/harness.css") return send("text/css", "html,body{height:100%;margin:0}#repositories{height:100%;}");
@@ -114,6 +121,9 @@ const server = http.createServer((req, res) => {
     await page.goto(origin + "/example/");
     await page.locator('.repository-history').first().locator('summary').click();
     await page.locator(".repository-commit").first().waitFor();
+    assert((await page.locator('[data-repository-history-summary]').first().textContent()).includes("1 commit · 30 changed files"));
+    assert.equal(await page.locator('.repository-history [data-repository-commits] .repository-history-summary').count(), 0);
+    assert.equal(await page.locator('[data-repository-workflows]').first().evaluate(el => el.open), false);
     await page.waitForLoadState("networkidle");
     assert(!assets.includes("review-editor.js"), "overview eagerly loaded the editor");
     assert(!assets.includes("review-highlight-worker.js"), "overview eagerly loaded syntax grammars");
@@ -121,9 +131,18 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator(".repo-grid").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length), 1);
     await page.getByRole("button", {name: "Show commit message", exact: true}).first().click();
     assert(await page.locator(".repository-commit-message").first().isVisible());
-    await page.evaluate(() => {window.originalCommit = document.querySelector(".repository-commit"); window.review.updateHTML(window.cardMarkup);});
+    await page.locator('[data-repository-workflows]').first().locator('summary').click();
+    await page.evaluate(() => {
+      window.originalCommit = document.querySelector(".repository-commit");
+      window.originalWorkflow = document.querySelector("[data-repository-workflows]");
+      window.originalWorkflowSummary = window.originalWorkflow.querySelector("summary");
+      window.review.updateHTML(window.cardMarkup);
+    });
     assert(await page.evaluate(() => document.querySelector(".repository-commit") === window.originalCommit));
     assert(await page.locator('.repository-history').first().evaluate(el => el.open), "retained history disclosure closed on refresh");
+    assert(await page.evaluate(() => window.originalWorkflow === document.querySelector("[data-repository-workflows]") &&
+      window.originalWorkflowSummary === window.originalWorkflow.querySelector("summary") && window.originalWorkflow.open),
+    "retained workflow disclosure closed or changed on refresh");
     await page.getByRole("button", {name: "Copy commit hash", exact: true}).first().click();
     assert.equal(await page.evaluate(() => window.copiedText), originalHead);
     const commitLink = await page.locator(".repository-commit-subject").first().getAttribute("href");

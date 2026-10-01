@@ -1870,8 +1870,8 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 		`data-cluster-service-panel="0"`, `<div class="service-link"><span>Link</span>`,
 		`href="https://webui.example.test/" target="_blank" rel="noreferrer">https://webui.example.test/</a>`, "Administrator",
 		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
-		`class="run-state queued">queued</span>queued workflow`,
-		`class="run-state in_progress">in progress</span>running workflow`,
+		`class="run-state queued" title="Status: queued">queued</span>queued workflow`,
+		`class="run-state in_progress" title="Status: in_progress">in progress</span>running workflow`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("session page lacks %q: %s", marker, body)
@@ -1901,7 +1901,9 @@ func TestSessionRepositoryActionsStayOutsideClosedLocalHistory(t *testing.T) {
 			card = card[:end]
 			disclosure := strings.Index(card, `<details class="repository-history">`)
 			actions := strings.Index(card, `class="repository-review-actions"`)
-			if disclosure < 0 || actions < 0 || actions > disclosure || !strings.Contains(card[disclosure:], "<summary>Local commits</summary>") || !strings.Contains(card[disclosure:], "data-repository-commits") {
+			if disclosure < 0 || actions < 0 || actions > disclosure ||
+				!strings.Contains(card[disclosure:], `<summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary>`) ||
+				!strings.Contains(card[disclosure:], "data-repository-commits") {
 				t.Fatalf("closed history/action structure is wrong: %s", card)
 			}
 			for _, selector := range []string{"data-review-branch", "data-review-refresh"} {

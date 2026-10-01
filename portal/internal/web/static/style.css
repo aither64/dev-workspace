@@ -116,8 +116,20 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .copy-row button { flex: none; }
 .repo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1rem; }
 #repositories .repo-grid { grid-template-columns: minmax(0, 1fr); }
-#repositories .repository-review-actions { display: flex; gap: .5rem; align-items: stretch; flex-wrap: wrap; margin-bottom: .8rem; }
+#repositories .repository-review-actions { display: flex; gap: .5rem; align-items: stretch; flex-wrap: wrap; margin: 1rem 0 .8rem; }
 #repositories .repository-review-actions > * { white-space: nowrap; }
+#repositories .repository-history, #repositories .repository-workflows, #repositories .repository-workflows-compact { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+#repositories .repository-workflows-compact { margin-bottom: 0; color: var(--muted); font-size: .85rem; }
+#repositories .repository-history > summary, #repositories .repository-workflows > summary { cursor: pointer; font-weight: 600; }
+#repositories .repository-history > summary:focus-visible, #repositories .repository-workflows > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#repositories .repository-history-summary { margin-left: .4rem; font-size: .8rem; font-weight: 400; }
+#repositories .repository-workflow-counters { display: inline-flex; flex-wrap: wrap; gap: .25rem .6rem; margin-left: .5rem; vertical-align: middle; }
+#repositories .repository-workflow-counter { display: inline-flex; gap: .2rem; align-items: baseline; color: var(--muted); font-size: .76rem; font-weight: 500; white-space: nowrap; }
+#repositories .repository-workflow-counter strong { font-weight: 700; font-variant-numeric: tabular-nums; }
+#repositories .repository-workflow-counter.queued { color: var(--warning); }
+#repositories .repository-workflow-counter.running { color: #8fc7ff; }
+#repositories .repository-workflow-counter.successful { color: var(--accent); }
+#repositories .repository-workflow-counter.failed { color: var(--danger); }
 .repo-card h3 { margin: 0; }
 .repo-card dl { display: grid; grid-template-columns: auto 1fr; gap: .4rem .9rem; margin: 1rem 0; }
 .repo-card dt { color: var(--muted); }

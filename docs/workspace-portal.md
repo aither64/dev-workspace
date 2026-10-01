@@ -70,11 +70,29 @@ redirect to the viewer. The original conversation text remains unchanged.
 ## Repository comparisons
 
 The repository overview puts each card on its own row. The review controls
-stay visible above **Local commits**. That disclosure starts closed, but local
-history loads in the background so Compare becomes
-available without opening it. It stays open during status refreshes while the
-card is retained; a full page reload closes it. Capture failures
-appear next to the actions even when history is closed.
+stay visible above **Local commits**. Its closed summary shows the commit count
+and net changed-file, line and binary counts for the complete frozen base/head
+comparison. Local history loads in the background so **Compare** becomes
+available without opening it. The summary shows **Loading totals…** until the
+totals arrive, or **Totals unavailable** if they cannot be loaded. If only the
+totals fail, the commit list and **Compare** remain usable. The disclosure stays
+open during status refreshes while the card is retained; a full page reload
+closes it. Capture failures appear next to the actions even when history is
+closed.
+
+When a repository with an origin has workflow runs, its card shows a closed
+**Workflows** disclosure with fixed Total, Queued, Running, Successful and Failed
+counters. Total is the
+number of runs returned for the exact selected revision, up to 100; it includes
+skipped and neutral results. Queued includes requested, waiting and pending
+runs. Failed includes cancelled and other unsuccessful terminal results,
+including completed runs without a successful conclusion. Skipped and neutral
+runs count only toward Total. Expanding the disclosure keeps each returned
+run's original status, conclusion, workflow name and link. Its open state
+survives refreshes of the same card and resets on a full page reload. A
+successful empty lookup shows **Workflows · 0 total** without a disclosure;
+missing or failed lookup data shows **Workflows · unavailable**, with any origin
+error shown on the card. A later nonempty result starts a new closed disclosure.
 
 Successful comparison responses always include `files` as a JSON array. An
 empty staged or unstaged snapshot, committed branch comparison, or commit diff
