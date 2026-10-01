@@ -74,7 +74,7 @@ const server = http.createServer((req, res) => {
       '<link rel="stylesheet" href="/harness.css"><section id="repositories" class="tab-panel active">' + cards +
       '</section><script type="module" src="/entry.js"></script>');
   }
-  if (url.pathname === "/entry.js") return send("text/javascript", "import {mount} from '/static/repository-review.js?v=8';" +
+  if (url.pathname === "/entry.js") return send("text/javascript", "import {mount} from '/static/repository-review.js?v=9';" +
     "import {createCopyButton} from '/conversation.js';window.cardMarkup=" + JSON.stringify(cards) +
     ";window.review=mount({slug:'example',nonce:'teststyle123',createCopyButton,element:document.getElementById('repositories')});");
   if (url.pathname === "/harness.css") return send("text/css", "html,body{height:100%;margin:0}#repositories{height:100%;}");
