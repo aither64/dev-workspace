@@ -106,9 +106,9 @@ func (c *Client) RecoverCreatingThreadWithSettingsResolver(
 	)
 }
 
-// RecoverCreatingThreadWithPolicyAndSettingsResolver applies the accepted
-// thread policy to an existing candidate without resolving or replacing its
-// saved model and reasoning effort. Only a new replacement calls the resolver.
+// RecoverCreatingThreadWithPolicyAndSettingsResolver retains an unmaterialized
+// candidate's start-time policy and refreshes a materialized candidate's policy
+// without replacing its saved model or effort. Only a new root calls the resolver.
 func (c *Client) RecoverCreatingThreadWithPolicyAndSettingsResolver(
 	ctx context.Context,
 	threadID, cwd string,
@@ -116,10 +116,162 @@ func (c *Client) RecoverCreatingThreadWithPolicyAndSettingsResolver(
 	policy codex.ThreadPolicy,
 	resolveSettings func() (codex.ThreadSettings, error),
 ) (string, error) {
-	candidates := make(map[string]struct{})
-	loaded, err := c.LoadedThreadIDs(ctx)
+	return c.RecoverCreatingThreadWithOptions(ctx, threadID, cwd, environment, policy, resolveSettings, RecoveryOptions{})
+}
+
+// RecoveryOptions contains only application-validated roster identities. The
+// composition layer holds the team operation lock until discovery has finished.
+type RecoveryOptions struct {
+	ExcludedThreads map[string]string // exact thread ID -> retained project ID (empty for legacy members)
+	RetainedRoster  bool
+	BeforeCreate    func() // releases the roster operation lock before any new thread
+}
+
+func (c *Client) RecoverCreatingThreadWithOptions(
+	ctx context.Context, threadID, cwd string, environment map[string]string,
+	policy codex.ThreadPolicy, resolveSettings func() (codex.ThreadSettings, error), options RecoveryOptions,
+) (string, error) {
+	candidates, err := c.creationCandidates(ctx, threadID, cwd, options)
 	if err != nil {
 		return "", err
+	}
+	for candidateID, candidate := range candidates {
+		if candidateID != threadID && options.RetainedRoster {
+			return "", errors.New("retained team roster prevents root thread replacement")
+		}
+		if candidate.ForkedFromID != "" {
+			return "", errors.New("refusing a fork as a creation replacement")
+		}
+		materialized, err := c.HistoryMaterialized(ctx, candidateID, cwd)
+		if err != nil {
+			return "", err
+		}
+		if candidateID != threadID && materialized {
+			return "", errors.New("refusing a different materialized Codex thread as a creation replacement")
+		}
+		if candidateID != threadID {
+			if err := c.requireMissingCreationThread(ctx, threadID, cwd); err != nil {
+				return "", err
+			}
+		}
+		if !materialized {
+			// Selected Codex requires a rollout even to resume a loaded thread.
+			// This proven fresh root still has its original policy and environment.
+			return candidateID, nil
+		}
+		return c.ResumeThreadWithSettings(ctx, candidateID, cwd, environment, codex.ThreadSettings{Policy: policy})
+	}
+	if options.RetainedRoster {
+		return "", errors.New("retained team roster prevents root thread replacement")
+	}
+	if err := c.requireMissingCreationThread(ctx, threadID, cwd); err != nil {
+		return "", err
+	}
+	settings, err := resolveSettings()
+	if err != nil {
+		return "", err
+	}
+	if options.BeforeCreate != nil {
+		options.BeforeCreate()
+	}
+	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
+}
+
+func (c *Client) requireMissingCreationThread(ctx context.Context, threadID, cwd string) error {
+	if threadID == "" {
+		return nil
+	}
+	// Filtered discovery cannot establish that a recorded ID with changed
+	// cwd/source is gone. Only an exact not-found result permits replacement.
+	metadata, err := c.ReadThreadMetadata(ctx, threadID, false)
+	if err == nil {
+		if metadata.Cwd != cwd || !workspaceThread(metadata.Source) {
+			return errors.New("recorded creation thread has the wrong identity")
+		}
+		return errors.New("recorded creation thread is absent from complete discovery")
+	}
+	if !codex.IsThreadNotFound(err, threadID) {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) RecoverForkThread(
+	ctx context.Context, sourceThreadID, cwd string, environment map[string]string, settings codex.ThreadSettings,
+) (string, error) {
+	return c.RecoverForkThreadWithOptions(ctx, sourceThreadID, cwd, environment, settings, RecoveryOptions{})
+}
+
+func (c *Client) RecoverForkThreadWithOptions(
+	ctx context.Context, sourceThreadID, cwd string, environment map[string]string, settings codex.ThreadSettings, options RecoveryOptions,
+) (string, error) {
+	candidates, err := c.creationCandidates(ctx, "", cwd, options)
+	if err != nil {
+		return "", err
+	}
+	for _, candidate := range candidates {
+		if candidate.ForkedFromID != sourceThreadID {
+			return "", errors.New("existing Codex thread does not match the requested conversation fork")
+		}
+		if err := c.RequireThreadTurnsIdle(ctx, candidate.ID); err != nil {
+			return "", err
+		}
+		return c.ResumeThreadWithSettings(ctx, candidate.ID, cwd, environment, settings)
+	}
+	if options.RetainedRoster {
+		return "", errors.New("retained team roster prevents root thread replacement")
+	}
+	if options.BeforeCreate != nil {
+		options.BeforeCreate()
+	}
+	return c.ForkThread(ctx, sourceThreadID, cwd, environment, settings)
+}
+
+func recoveryIdentityEqual(left, right codex.ThreadMetadata) bool {
+	project := func(value *string) string {
+		if value == nil {
+			return ""
+		}
+		return *value
+	}
+	return left.ID == right.ID && left.Cwd == right.Cwd &&
+		workspaceThread(left.Source) == workspaceThread(right.Source) &&
+		left.ForkedFromID == right.ForkedFromID && project(left.ProjectID) == project(right.ProjectID)
+}
+
+func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string, options RecoveryOptions) (map[string]codex.ThreadMetadata, error) {
+	candidates := map[string]codex.ThreadMetadata{}
+	var refusal error
+	ambiguous := func() error {
+		return fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
+	}
+	merge := func(candidate codex.ThreadMetadata) error {
+		if candidate.ID == "" {
+			return errors.New("thread discovery returned an empty identity")
+		}
+		if project, excluded := options.ExcludedThreads[candidate.ID]; excluded {
+			if candidate.Cwd != cwd || (project != "" && (candidate.ProjectID == nil || *candidate.ProjectID != project)) {
+				refusal = errors.New("retained member thread has the wrong cwd or project identity")
+				return refusal
+			}
+			return nil
+		}
+		if candidate.Cwd != cwd || !workspaceThread(candidate.Source) {
+			return errors.New("thread discovery returned an invalid creation candidate")
+		}
+		if previous, exists := candidates[candidate.ID]; exists && !recoveryIdentityEqual(previous, candidate) {
+			refusal = errors.New("thread discovery returned contradictory creation identities")
+			return refusal
+		}
+		candidates[candidate.ID] = candidate
+		if len(candidates) > 1 {
+			return ambiguous()
+		}
+		return nil
+	}
+	loaded, err := c.LoadedThreadIDs(ctx)
+	if err != nil {
+		return nil, err
 	}
 	for _, loadedID := range loaded {
 		metadata, err := c.ReadThreadMetadata(ctx, loadedID, false)
@@ -128,79 +280,93 @@ func (c *Client) RecoverCreatingThreadWithPolicyAndSettingsResolver(
 			if listErr == nil && !slices.Contains(current, loadedID) {
 				continue
 			}
-			return "", err
+			return nil, err
 		}
-		if loadedID == threadID && (metadata.Cwd != cwd || !workspaceThread(metadata.Source)) {
-			return "", errors.New("recorded creation thread has the wrong identity")
+		if loadedID == recordedID && (metadata.Cwd != cwd || !workspaceThread(metadata.Source)) {
+			return nil, errors.New("recorded creation thread has the wrong identity")
 		}
-		if metadata.Cwd == cwd && workspaceThread(metadata.Source) {
-			candidates[loadedID] = struct{}{}
+		_, member := options.ExcludedThreads[loadedID]
+		if member || (metadata.Cwd == cwd && workspaceThread(metadata.Source)) {
+			if err := merge(metadata); err != nil {
+				return nil, err
+			}
 		}
 	}
-	listed, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
-		Cwd: cwd, SourceKinds: []string{threadSourceKind}, Limit: 2, SortDirection: "asc",
-	})
-	if err != nil {
-		return "", err
-	}
-	if next != nil {
-		return "", fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
-	}
-	for _, candidate := range listed {
-		if candidate.ID == "" || candidate.Cwd != cwd {
-			return "", errors.New("thread/list returned an invalid creation candidate")
+	scan := func(indexed bool) error {
+		seenCursors := map[string]bool{}
+		seenRows := map[string]codex.ThreadMetadata{}
+		cursor := ""
+		rows := 0
+		archived := false
+		for page := 0; page < 64; page++ {
+			listed, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
+				Cwd: cwd, SourceKinds: []string{threadSourceKind}, Archived: &archived,
+				Limit: 100, SortDirection: "asc", Cursor: cursor, UseStateDBOnly: indexed,
+			})
+			if err != nil {
+				return err
+			}
+			rows += len(listed)
+			if rows > 4096 {
+				return errors.New("thread discovery exceeded its row bound")
+			}
+			for _, row := range listed {
+				if row.ID == "" || row.Cwd != cwd || !workspaceThread(row.Source) {
+					return errors.New("thread/list returned an invalid creation candidate")
+				}
+				if previous, exists := seenRows[row.ID]; exists {
+					if !recoveryIdentityEqual(previous, row) {
+						return errors.New("thread/list returned contradictory creation rows")
+					}
+					continue
+				}
+				seenRows[row.ID] = row
+				candidate := row
+				if indexed {
+					candidate, err = c.ReadThreadMetadata(ctx, row.ID, false)
+					if err != nil {
+						return err
+					}
+					if candidate.ID == recordedID && (candidate.Cwd != cwd || !workspaceThread(candidate.Source)) {
+						refusal = errors.New("recorded creation thread has the wrong identity")
+						return refusal
+					}
+					if project, member := options.ExcludedThreads[candidate.ID]; member && (candidate.Cwd != cwd || (project != "" && (candidate.ProjectID == nil || *candidate.ProjectID != project))) {
+						refusal = errors.New("retained member thread has the wrong cwd or project identity")
+						return refusal
+					}
+					if !recoveryIdentityEqual(row, candidate) {
+						return errors.New("thread index returned stale creation identity")
+					}
+				}
+				if err := merge(candidate); err != nil {
+					return err
+				}
+			}
+			if next == nil || *next == "" {
+				return nil
+			}
+			if seenCursors[*next] {
+				return errors.New("thread/list repeated a creation cursor")
+			}
+			seenCursors[*next] = true
+			cursor = *next
 		}
-		candidates[candidate.ID] = struct{}{}
+		return errors.New("thread discovery exceeded its page bound")
+	}
+	// The index can prove ambiguity early, but even a positive page cannot prove
+	// uniqueness. Every adoption or replacement still requires complete discovery.
+	_ = scan(true)
+	if refusal != nil {
+		return nil, refusal
 	}
 	if len(candidates) > 1 {
-		return "", fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
+		return nil, ambiguous()
 	}
-	for candidateID := range candidates {
-		materialized, err := c.HistoryMaterialized(ctx, candidateID, cwd)
-		if err != nil {
-			return "", err
-		}
-		if candidateID != threadID && materialized {
-			return "", errors.New("refusing a different materialized Codex thread as a creation replacement")
-		}
-		if !materialized && policy == (codex.ThreadPolicy{}) {
-			return candidateID, nil
-		}
-		return c.ResumeThreadWithSettings(ctx, candidateID, cwd, environment, codex.ThreadSettings{Policy: policy})
+	if err := scan(false); err != nil {
+		return nil, err
 	}
-	settings, err := resolveSettings()
-	if err != nil {
-		return "", err
-	}
-	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
-}
-
-func (c *Client) RecoverForkThread(
-	ctx context.Context,
-	sourceThreadID, cwd string,
-	environment map[string]string,
-	settings codex.ThreadSettings,
-) (string, error) {
-	threads, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
-		Cwd: cwd, SourceKinds: []string{threadSourceKind}, Limit: 2, SortDirection: "asc",
-	})
-	if err != nil {
-		return "", err
-	}
-	if len(threads) > 1 || next != nil {
-		return "", fmt.Errorf("multiple Codex threads use fork directory %s; refusing ambiguous recovery", cwd)
-	}
-	if len(threads) == 0 {
-		return c.ForkThread(ctx, sourceThreadID, cwd, environment, settings)
-	}
-	candidate := threads[0]
-	if candidate.ID == "" || candidate.Cwd != cwd || candidate.ForkedFromID != sourceThreadID {
-		return "", errors.New("existing Codex thread does not match the requested conversation fork")
-	}
-	if err := c.RequireThreadTurnsIdle(ctx, candidate.ID); err != nil {
-		return "", err
-	}
-	return c.ResumeThreadWithSettings(ctx, candidate.ID, cwd, environment, settings)
+	return candidates, nil
 }
 
 func (c *Client) ResolveForkSettings(

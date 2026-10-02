@@ -142,7 +142,7 @@ class DevSessionTest < Minitest::Test
   # double makes that ordering and recovery contract observable without
   # simulating the runtime implementation itself.
   class DirectCreationScenario < ManagedCreationScenario
-    attr_accessor :catalog_preset
+    attr_accessor :catalog_preset, :lose_root_response
     attr_reader :applied_presets, :member_threads, :root_settings
 
     def initialize
@@ -154,6 +154,26 @@ class DevSessionTest < Minitest::Test
     def root_created!(model, effort)
       @events << :root_created
       @root_settings = [model, effort]
+    end
+
+    def root_thread_response(argv)
+      model = argv.fetch(argv.index('--model') + 1)
+      effort = argv.fetch(argv.index('--effort') + 1)
+      instructions = argv.fetch(argv.index('--lead-instructions') + 1)
+      if @root_settings
+        raise 'lost root retry skipped recovery' unless argv.include?('--recover-creating')
+        raise 'lost root retry changed frozen settings' unless @root_settings == [model, effort]
+        raise 'lost root retry changed frozen instructions' unless @root_instructions == instructions
+
+        @events << :root_adopted
+      else
+        raise 'fresh root unexpectedly used recovery' if argv.include?('--recover-creating')
+
+        root_created!(model, effort)
+        @root_instructions = instructions
+        raise DevSession::Error, 'successful root helper JSON was lost' if lose_root_response
+      end
+      [JSON.generate('threadId' => 'thread-direct'), '', nil]
     end
 
     def apply_preset_response(argv)
@@ -194,6 +214,8 @@ class DevSessionTest < Minitest::Test
       @commands << argv
       if argv[1] == 'team-preset'
         [JSON.generate(@scenario.catalog_preset), '', nil]
+      elsif argv[1, 2] == ['thread', 'create']
+        @scenario.root_thread_response(argv)
       elsif argv[1, 2] == ['team', 'apply-preset']
         @scenario.apply_preset_response(argv)
       elsif argv[1, 2] == ['thread', 'ensure-initial']
@@ -384,6 +406,104 @@ class DevSessionTest < Minitest::Test
       assert_equal(preset, journal.fetch('direct_team'))
       assert_equal('model-lead', journal.fetch('model'))
       assert_equal('high', journal.fetch('effort'))
+    end
+  end
+
+  # Use the real Ruby helper invocation while retaining the existing in-memory
+  # tmux and team doubles. The Go protocol fixture owns the no-resume proof.
+  class LostRootDirectCreationRunner < DirectCreationRunner
+    private
+
+    def create_portal_thread(slug, **keywords)
+      DevSession::Runner.instance_method(:create_portal_thread).bind_call(self, slug, **keywords)
+    end
+  end
+
+  def test_direct_creation_adopts_lost_unmaterialized_root_before_members_and_one_goal
+    with_workspace do |workspace|
+      slug = '2026-09-22-lost-direct-root'
+      goal = File.join(workspace, 'direct-goal.txt')
+      File.write(goal, "Start the frozen Full team.\n")
+      preset = recovery_direct_team_preset
+      preset_path = File.join(workspace, 'direct-team.json')
+      File.write(preset_path, JSON.generate(preset))
+      File.chmod(0o600, preset_path)
+      scenario = DirectCreationScenario.new
+      scenario.lose_root_response = true
+      runner = direct_creation_runner(workspace, scenario, runner_class: LostRootDirectCreationRunner)
+
+      error = assert_raises(DevSession::Error) { start_direct_creation(runner, slug, goal, preset_path, exclusive: true) }
+      assert_includes(error.message, 'successful root helper JSON was lost')
+      partial = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_nil(partial.dig('codex', 'thread_id'))
+      refute(partial.dig('creation', 'initial_goal_attempted'))
+      assert_empty(scenario.member_threads)
+      assert_equal(0, scenario.turn_starts)
+
+      retry_runner = direct_creation_runner(workspace, scenario, runner_class: LostRootDirectCreationRunner)
+      start_direct_creation(retry_runner, slug, goal, preset_path, exclusive: true)
+      start_direct_creation(retry_runner, slug, goal, preset_path, exclusive: true)
+
+      assert_equal(1, scenario.events.count(:root_created))
+      assert_equal(1, scenario.events.count(:root_adopted))
+      assert_operator(scenario.events.index(:root_adopted), :<, scenario.events.index(:members_ready))
+      assert_operator(scenario.events.index(:members_ready), :<, scenario.events.index(:ensure_initial))
+      assert_equal(['model-lead', 'high'], scenario.root_settings)
+      assert_equal(%w[architect0 implementer0], scenario.member_threads.keys)
+      assert_equal(1, scenario.turn_starts)
+      assert_equal(1, scenario.ensure_commands.length)
+      assert_includes(scenario.ensure_commands.first, '--start-unmaterialized')
+      complete = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('thread-direct', complete.dig('codex', 'thread_id'))
+      assert_equal('ready', complete.dig('creation', 'state'))
+      refute(complete.fetch('creation').key?('initial_goal_attempted'))
+      assert(complete.dig('creation', 'initial_goal_sent'))
+      journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+      assert_equal(preset, journal.fetch('direct_team'))
+      assert_equal('ready', journal.fetch('state'))
+    end
+  end
+
+  def test_adopted_root_does_not_repeat_an_uncertain_initial_goal
+    [:response_lost_unmaterialized, :response_lost_materialized_exact,
+     :response_lost_materialized_different].each do |outcome|
+      with_workspace do |workspace|
+        slug = '2026-09-22-uncertain-direct-goal'
+        goal = File.join(workspace, 'direct-goal.txt')
+        File.write(goal, "Start the frozen Full team.\n")
+        preset_path = File.join(workspace, 'direct-team.json')
+        File.write(preset_path, JSON.generate(recovery_direct_team_preset))
+        File.chmod(0o600, preset_path)
+        scenario = DirectCreationScenario.new
+        scenario.lose_root_response = true
+        scenario.queue_send(outcome)
+        runner = direct_creation_runner(workspace, scenario, runner_class: LostRootDirectCreationRunner)
+        assert_raises(DevSession::Error) { start_direct_creation(runner, slug, goal, preset_path, exclusive: true) }
+
+        retry_runner = direct_creation_runner(workspace, scenario, runner_class: LostRootDirectCreationRunner)
+        assert_raises(DevSession::Error) { start_direct_creation(retry_runner, slug, goal, preset_path, exclusive: true) }
+        manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+        attempted = YAML.safe_load(File.read(manifest_path))
+        assert_equal('thread-direct', attempted.dig('codex', 'thread_id'))
+        assert(attempted.dig('creation', 'initial_goal_attempted'))
+        refute(attempted.dig('creation', 'initial_goal_sent'))
+        retained_members = scenario.member_threads.dup
+
+        if outcome == :response_lost_materialized_exact
+          start_direct_creation(retry_runner, slug, goal, preset_path, exclusive: true)
+          assert_equal('ready', YAML.safe_load(File.read(manifest_path)).dig('creation', 'state'))
+        else
+          error = assert_raises(DevSession::Error) { start_direct_creation(retry_runner, slug, goal, preset_path, exclusive: true) }
+          expected = outcome == :response_lost_unmaterialized ? 'may already have been accepted' : 'different initial goal'
+          assert_includes(error.message, expected)
+          assert(YAML.safe_load(File.read(manifest_path)).dig('creation', 'initial_goal_attempted'))
+        end
+        assert_equal(1, scenario.events.count(:root_created))
+        assert_equal(retained_members, scenario.member_threads)
+        assert_equal(1, scenario.turn_starts)
+        assert_includes(scenario.ensure_commands.first, '--start-unmaterialized')
+        refute_includes(scenario.ensure_commands.last, '--start-unmaterialized')
+      end
     end
   end
 
@@ -723,8 +843,18 @@ class DevSessionTest < Minitest::Test
     )
   end
 
-  def direct_creation_runner(workspace, scenario)
-    DirectCreationRunner.new(
+  def recovery_direct_team_preset
+    preset = direct_team_preset
+    preset['leadInstructions'] = 'Coordinate the frozen team and wait for the initial request.'
+    preset.fetch('members').each do |member|
+      member['purpose'] = member.fetch('behavior') == 'designer' ? 'design' : 'implementation'
+      member['instructions'] = 'Wait for the lead assignment.'
+    end
+    preset
+  end
+
+  def direct_creation_runner(workspace, scenario, runner_class: DirectCreationRunner)
+    runner_class.new(
       workspace:,
       authority_dir: File.join(workspace, 'runtime-authority'),
       tmux: InertTmux.new,
@@ -739,7 +869,7 @@ class DevSessionTest < Minitest::Test
     )
   end
 
-  def start_direct_creation(runner, slug, goal, preset_path)
+  def start_direct_creation(runner, slug, goal, preset_path, exclusive: false)
     runner.start(
       slug,
       as_is: true,
@@ -748,6 +878,7 @@ class DevSessionTest < Minitest::Test
       run_codex: true,
       goal_file: goal,
       json: true,
+      exclusive:,
       team_preset: preset_path,
       model: 'model-lead',
       effort: 'high'

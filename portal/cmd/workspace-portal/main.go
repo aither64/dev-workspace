@@ -623,6 +623,7 @@ func threadCommand(args []string) error {
 	inputFile := flags.String("input-file", "", "file containing a message")
 	leadInstructions := flags.String("lead-instructions", "", "frozen lead role instructions")
 	requireRuntime := flags.Bool("require-runtime", false, "require complete deployed runtime provenance")
+	fresh := flags.Bool("fresh", false, "direct fork for a locked first invocation")
 	recoverCreating := flags.Bool("recover-creating", false, "reconcile a creating thread by working directory")
 	recoverArchived := flags.Bool("recover-archived", false, "restore the exact thread retained by revived tracking")
 	startUnmaterialized := flags.Bool("start-unmaterialized", false, "allow the first turn on a proven fresh thread")
@@ -719,9 +720,10 @@ func threadCommand(args []string) error {
 				err = client.ReconcileThreadInstructionsWithPolicy(ctx, id, settings.Policy)
 			}
 		} else if *recoverCreating {
-			id, err = client.RecoverCreatingThreadWithPolicyAndSettingsResolver(
-				ctx, *threadID, *cwd, runtime.environment(), settings.Policy, resolveSettings,
-			)
+			id, err = withCreationRoster(ctx, *userStateRoot, *workspace, *sessionSlug, *threadID,
+				func(options workspacecodex.RecoveryOptions) (string, error) {
+					return client.RecoverCreatingThreadWithOptions(ctx, *threadID, *cwd, runtime.environment(), settings.Policy, resolveSettings, options)
+				})
 		} else {
 			if *threadID == "" {
 				settings, err = resolveSettings()
@@ -746,10 +748,17 @@ func threadCommand(args []string) error {
 		if !*requireRuntime || !runtime.complete() || *threadID == "" {
 			return errors.New("thread fork requires a source thread and complete runtime provenance")
 		}
-		id, err := client.RecoverForkThread(
-			ctx, *threadID, *cwd, runtime.environment(),
-			rootThreadSettings(*model, *effort, runtime.Slug, runtime.Workspace, *leadInstructions),
-		)
+		settings := rootThreadSettings(*model, *effort, runtime.Slug, runtime.Workspace, *leadInstructions)
+		var id string
+		var err error
+		if *fresh {
+			id, err = client.ForkThread(ctx, *threadID, *cwd, runtime.environment(), settings)
+		} else {
+			id, err = withCreationRoster(ctx, *userStateRoot, *workspace, *sessionSlug, "",
+				func(options workspacecodex.RecoveryOptions) (string, error) {
+					return client.RecoverForkThreadWithOptions(ctx, *threadID, *cwd, runtime.environment(), settings, options)
+				})
+		}
 		if err != nil {
 			return err
 		}
@@ -977,4 +986,49 @@ func readAgentTeamsRequest(input io.Reader) ([]byte, error) {
 
 func canonicalAbsolutePath(path string) bool {
 	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path
+}
+
+// withCreationRoster binds exclusions to the independently recorded root. A
+// roster cannot supply its own root identity when the manifest has lost it.
+func withCreationRoster(ctx context.Context, stateRoot, workspace, slug, rootID string,
+	run func(workspacecodex.RecoveryOptions) (string, error),
+) (string, error) {
+	options := workspacecodex.RecoveryOptions{}
+	if stateRoot == "" {
+		return "", errors.New("creation recovery requires the selected user state root")
+	}
+	store, err := teamruntime.NewStore(stateRoot, workspace)
+	if err != nil {
+		return "", err
+	}
+	release, err := store.LockOperation(ctx, slug)
+	if err != nil {
+		return "", err
+	}
+	locked := true
+	unlock := func() {
+		if locked {
+			locked = false
+			release()
+		}
+	}
+	defer unlock()
+	roster, err := store.Load(slug, rootID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("validate retained creation roster: %w", err)
+	}
+	options.BeforeCreate = unlock
+	if roster != nil {
+		if rootID == "" {
+			return "", errors.New("retained roster has no independently recorded root")
+		}
+		options.RetainedRoster = true
+		options.ExcludedThreads = map[string]string{}
+		for _, member := range roster.Members {
+			if member.Thread != "" {
+				options.ExcludedThreads[member.Thread] = member.ProjectID
+			}
+		}
+	}
+	return run(options)
 }

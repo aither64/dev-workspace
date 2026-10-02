@@ -105,15 +105,20 @@ records its ID, assigns the session name, and sends the initial request. It
 waits until the App Server has persisted the rollout and verifies the exact
 first user message before it opens the terminal Codex client. Once that check
 passes, the thread ID is authoritative and the helper resumes that exact
-thread while refreshing its working directory and runtime environment. While
-an exclusive creation journal
-is still `creating` and its initial goal is unsent, the helper reconciles the
-unique working directory instead. It resumes the sole candidate, or replaces a
-recorded memory-only thread that vanished during an App Server restart. It
-refuses multiple candidates and never replaces a ready thread. Before the one
-allowed initial `turn/start`, it records a durable attempt marker. A retry of
-the same unmaterialized thread fails closed until exact matching history appears
-or an App Server restart permits a fresh creation replacement. Existing plan
+thread while refreshing its working directory and runtime environment. When an
+exclusive creation journal is still `creating` and its initial goal is unsent, a
+retry reconciles the unique working directory instead. After complete discovery,
+it adopts a sole validated unmaterialized root with the policy and environment
+installed by its original `thread/start`. It does not resume that root: selected
+Codex requires a persisted rollout even when the thread is still loaded. The
+first allowed initial request materializes it. A materialized retained root
+resumes with refreshed policy and environment, preserving its saved model and
+reasoning effort. Recovery can replace a recorded memory-only thread whose
+disappearance is proved after an App Server restart. It refuses multiple
+candidates and never replaces a ready thread. Before the one allowed initial
+`turn/start`, it records a durable attempt marker. A retry of the same
+unmaterialized thread fails closed until exact matching history appears or an
+App Server restart permits a fresh creation replacement. Existing plan
 and state files are never overwritten. New state files begin with exact YAML
 front matter containing `lifecycle: active`; that
 anchored field is the only lifecycle authority. An
@@ -810,6 +815,26 @@ the lock directory after the manifest reaches `ready`, allowing the
 HTTP result to be replayed without repeating a known initial turn. The portal
 passes a full dated slug with `--as-is`, preserving request identity across
 midnight.
+
+A first start, approved-plan session or fork can submit its root request directly
+when the destination is proven empty under the existing creation and slug locks.
+The proof excludes tracking, worktrees, creation/fork/start journals, tmux,
+runtime authority and a retained team roster, and the invocation must publish
+its create-only journal before submitting the request. This decision exists
+only in that process. A retry always returns to conservative discovery, even
+when the earlier process stopped before its first App Server request.
+
+Recovery checks loaded threads and a bounded database-only index, then completes
+the filesystem-backed discovery before adopting a root or creating a replacement.
+An empty or nonempty index cannot prove completeness. Confirmed duplicate roots
+refuse early; failures, stale rows or index pagination limits fall back to the
+complete scan. A failed or incomplete scan never authorizes replacement. Only
+exact thread IDs from the validated retained roster are excluded, with matching
+cwd and retained project identity. The roster is checked against the independently
+recorded root while its operation lock is held. A retained roster prevents
+replacement of its missing root. Unknown same-directory project threads remain
+root candidates. Existing roots retain their captured settings and the durable
+initial-goal attempt marker; only a proven different replacement resets it.
 
 Fork creation uses the same identity rule through a short-lived fork journal.
 It records the validated source thread before creating destination tracking, so

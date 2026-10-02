@@ -13,7 +13,7 @@ class DevSessionTest < Minitest::Test
       portal_command = [
         RbConfig.ruby,
         '-e',
-        "require 'json'; puts JSON.generate(threadId: 'thread-123')"
+        "require 'json'; abort 'fresh creation selected discovery' if ARGV.include?('--recover-creating'); puts JSON.generate(threadId: 'thread-123')"
       ]
       session = DevSession::Tmux::Session.new(
         id: '$created',
@@ -201,7 +201,8 @@ class DevSessionTest < Minitest::Test
         )
         live = false
         runner_class = Class.new(DevSession::Runner) do
-          define_method(:create_portal_thread) do |*_args, **_kwargs|
+          define_method(:create_portal_thread) do |*_args, **keywords|
+            raise 'fresh approved plan selected recovery' if keywords[:recover_creating]
             created << 'plan-thread'
             'plan-thread'
           end

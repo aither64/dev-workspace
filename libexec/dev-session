@@ -770,6 +770,10 @@ module DevSession
           prepare_portal_creation_receipt!(
             receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:, team_binding:, direct_team:
           )
+          # Only this locked invocation can prove that no prior submitter exists.
+          # Publishing the journal destroys freshness for every subsequent retry.
+          fresh_creation = run_codex && goal_file && lifecycle_operation.nil? &&
+                           fresh_creation_destination?(slug)
           creation_journal = prepare_creation_journal(
             slug,
             goal_file,
@@ -900,7 +904,7 @@ module DevSession
               end
             end
           end
-          recovering_creation = run_codex &&
+          recovering_creation = !fresh_creation && run_codex &&
                                 creation_journal&.fetch('state', nil) == 'creating' &&
                                 manifest.dig('creation', 'state') == 'creating' &&
                                 !manifest.dig('creation', 'initial_goal_sent')
@@ -944,7 +948,7 @@ module DevSession
             thread_id = create_portal_thread(
               slug,
               persisted_thread_id: persisted_thread,
-              recover_creating: allow_empty_thread,
+              recover_creating: allow_empty_thread || (creation_journal && !fresh_creation && persisted_thread.nil?),
               recover_archived: recover_archived_thread,
               model:,
               effort:,
@@ -1223,6 +1227,7 @@ module DevSession
             resolved_model = fork_journal.fetch('model')
             resolved_effort = fork_journal.fetch('effort')
           end
+          fresh_fork = false
           unless fork_journal
             if archived_slug_known?(destination_slug)
               raise Error,
@@ -1231,6 +1236,7 @@ module DevSession
             if slug_state_exists?(destination_slug)
               raise Error, "dev session already exists: #{destination_slug}"
             end
+            fresh_fork = fresh_creation_destination?(destination_slug)
             fork_journal = prepare_fork_journal!(
               destination_slug,
               source_slug,
@@ -1284,6 +1290,7 @@ module DevSession
             thread_id = create_portal_fork(
               destination_slug,
               source_manifest.dig('codex', 'thread_id'),
+              fresh: fresh_fork,
               model: fork_journal.fetch('model'),
               effort: fork_journal.fetch('effort'),
               lead_instructions: frozen_direct_team_lead_instructions(
@@ -2670,6 +2677,15 @@ module DevSession
         return candidate if File.file?(candidate) && File.executable?(candidate)
       end
       nil
+    end
+
+    def fresh_creation_destination?(slug)
+      !slug_state_exists?(slug) &&
+        !path_exists?(creation_journal_file(slug)) &&
+        !path_exists?(fork_journal_file(slug)) &&
+        !path_exists?(start_journal_file(slug)) &&
+        (!@authority_dir || !path_exists?(authority_file(slug))) &&
+        !direct_team_state_present?(slug)
     end
 
     def slug_state_exists?(slug)
@@ -4152,7 +4168,7 @@ module DevSession
       end
 
       environment = session_environment(slug)
-      command = [*@portal_command, 'thread', 'create']
+      command = [*@portal_command, 'thread', 'create', '--user-state-root', @workspace_state_root]
       THREAD_ENV_ARGUMENTS.each do |name, argument|
         command += [argument, environment.fetch(name)] if environment.key?(name)
       end
@@ -4175,7 +4191,7 @@ module DevSession
       raise Error, "workspace-portal returned invalid JSON: #{e.message}"
     end
 
-    def create_portal_fork(slug, source_thread_id, model: nil, effort: nil, lead_instructions: nil)
+    def create_portal_fork(slug, source_thread_id, fresh: false, model: nil, effort: nil, lead_instructions: nil)
       unless @portal_command && !@portal_command.empty?
         raise Error, 'workspace-portal is required to fork a Codex conversation'
       end
@@ -4186,6 +4202,7 @@ module DevSession
       THREAD_ENV_ARGUMENTS.each do |name, argument|
         command += [argument, environment.fetch(name)] if environment.key?(name)
       end
+      command << '--fresh' if fresh
       command << '--require-runtime' if environment[ENV_REQUIRE_RUNTIME] == '1'
       command += ['--model', model] if model
       command += ['--effort', effort] if effort

@@ -149,7 +149,8 @@ class DevSessionTest < Minitest::Test
       commands = File.readlines(log, chomp: true)
       creation_commands = commands.select { |line| line.start_with?('thread create ') }
       assert_equal(2, creation_commands.length)
-      creation_commands.each { |line| assert_includes(line, '--recover-creating') }
+      refute_includes(creation_commands.fetch(0), '--recover-creating')
+      assert_includes(creation_commands.fetch(1), '--recover-creating')
       refute_includes(creation_commands.fetch(0), '--thread-id')
       assert_includes(creation_commands.fetch(1), '--thread-id thread-retry')
       assert_equal(1, commands.count { |line| line.start_with?('thread set-name ') })
@@ -520,9 +521,9 @@ class DevSessionTest < Minitest::Test
       assert_equal('ready', authority.fetch('state'))
       commands = File.readlines(log, chomp: true)
       assert_equal(2, commands.count { |line| line.start_with?('thread create ') })
-      commands.select { |line| line.start_with?('thread create ') }.each do |line|
-        assert_includes(line, '--recover-creating')
-      end
+      creation_commands = commands.select { |line| line.start_with?('thread create ') }
+      refute_includes(creation_commands.fetch(0), '--recover-creating')
+      assert_includes(creation_commands.fetch(1), '--recover-creating')
       assert(commands.any? do |line|
         line.start_with?('thread ensure-initial ') &&
           line.include?('--thread-id thread-replacement') &&
@@ -715,8 +716,9 @@ class DevSessionTest < Minitest::Test
       creation_commands = File.readlines(invocation_log, chomp: true)
                               .select { |line| line.include?('thread create') }
       assert_equal(2, creation_commands.length)
+      refute_includes(creation_commands.fetch(0), '--recover-creating')
+      assert_includes(creation_commands.fetch(1), '--recover-creating')
       creation_commands.each do |command|
-        assert_includes(command, '--recover-creating')
         assert_includes(command, "--cwd #{File.join(workspace, 'work', slug)}")
         assert_includes(command, "--workspace #{workspace}")
         assert_includes(command, "--session-slug #{slug}")

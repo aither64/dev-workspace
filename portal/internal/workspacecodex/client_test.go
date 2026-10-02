@@ -425,8 +425,15 @@ func TestRecoverForkThreadResumesMatchingPersistedFork(t *testing.T) {
 		if err := handshake(connection); err != nil {
 			return err
 		}
+		loaded, err := readObject(connection)
+		if err != nil || loaded["method"] != "thread/loaded/list" {
+			return fmt.Errorf("fork loaded lookup: %#v, %v", loaded, err)
+		}
+		if err := writeObject(connection, map[string]any{"id": loaded["id"], "result": map[string]any{"data": []any{}}}); err != nil {
+			return err
+		}
 		for index := 0; index < 3; index++ {
-			request, err := readObject(connection)
+			request, err := readAfterEmptyRecoveryIndex(connection)
 			if err != nil {
 				return err
 			}
@@ -438,7 +445,7 @@ func TestRecoverForkThreadResumesMatchingPersistedFork(t *testing.T) {
 				}
 				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
 					"data": []any{map[string]any{
-						"id": "thread-fork", "cwd": "/workspace/work/fork", "forkedFromId": "thread-source",
+						"id": "thread-fork", "cwd": "/workspace/work/fork", "forkedFromId": "thread-source", "source": "vscode",
 					}},
 				}})
 			case 1:
@@ -637,7 +644,7 @@ func TestRecoverCreatingThreadIgnoresLoadedStructuredSources(t *testing.T) {
 			return err
 		}
 		for index := 0; index < 4; index++ {
-			request, err := readObject(connection)
+			request, err := readAfterEmptyRecoveryIndex(connection)
 			if err != nil {
 				return err
 			}
@@ -923,64 +930,236 @@ func TestRetireThreadArchivesAFreshThreadWithoutARollout(t *testing.T) {
 	}
 }
 
-func TestRecoverCreatingThreadRestoresPolicyBeforeFirstRequest(t *testing.T) {
-	cwd := "/workspace/work/example"
-	rollout := filepath.Join(t.TempDir(), "not-yet-materialized.jsonl")
-	environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace", "DEV_SESSION_SLUG": "example"}
-	policy := codex.ThreadPolicy{DeveloperInstructions: "Frozen lead role instructions."}
-	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
-		if err := handshake(connection); err != nil {
-			return err
+// This is the selected 0.160 boundary: read can describe a loaded root before
+// its rollout exists, while resume fails even though start installed its policy.
+func TestRecoverCreatingThreadAdoptsLoadedUnmaterializedRootWithoutResume(t *testing.T) {
+	for _, recordedID := range []string{"", "thread-existing"} {
+		name := "lost helper response"
+		if recordedID != "" {
+			name = "recorded root"
 		}
-		for _, method := range []string{"thread/loaded/list", "thread/list", "thread/read", "thread/resume"} {
-			request, err := readObject(connection)
-			if err != nil || request["method"] != method {
-				return fmt.Errorf("expected %s: %#v, %v", method, request, err)
-			}
-			var result map[string]any
-			switch method {
-			case "thread/loaded/list":
-				result = map[string]any{"data": []any{}, "nextCursor": nil}
-			case "thread/list":
-				result = map[string]any{"data": []any{map[string]any{"id": "thread-existing", "cwd": cwd}}, "nextCursor": nil}
-			case "thread/read":
-				result = map[string]any{"thread": freshThreadMetadata("thread-existing", cwd, rollout)}
-			case "thread/resume":
-				params := request["params"].(map[string]any)
-				if params["developerInstructions"] != policy.DeveloperInstructions || params["model"] != nil {
-					return fmt.Errorf("retry did not restore only the saved policy: %#v", params)
+		t.Run(name, func(t *testing.T) {
+			cwd := "/workspace/work/example"
+			rollout := filepath.Join(t.TempDir(), "not-yet-materialized.jsonl")
+			environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace", "DEV_SESSION_SLUG": "example"}
+			policy := recoveryFixturePolicy()
+			done := make(chan struct{})
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				defer close(done)
+				defer connection.CloseNow()
+				if err := handshake(connection); err != nil {
+					return err
 				}
-				config := params["config"].(map[string]any)
-				if _, ok := config["model_reasoning_effort"]; ok {
-					return fmt.Errorf("retry replaced saved reasoning effort: %#v", config)
+				methods := []string{"thread/start", "thread/loaded/list", "thread/read", "thread/list", "thread/list", "thread/list", "thread/read"}
+				for step := 0; ; step++ {
+					request, err := readObject(connection)
+					if err != nil {
+						if step == len(methods) {
+							return nil
+						}
+						return err
+					}
+					if request["method"] == "thread/resume" {
+						// Return the real selected-server failure promptly, then fail the fixture.
+						_ = writeObject(connection, map[string]any{"id": request["id"], "error": map[string]any{
+							"code": -32600, "message": "no rollout found for thread id thread-existing",
+						}})
+						return errors.New("unmaterialized adoption attempted thread/resume")
+					}
+					if step >= len(methods) || request["method"] != methods[step] {
+						return fmt.Errorf("unexpected recovery request at step %d: %#v", step, request)
+					}
+					params := request["params"].(map[string]any)
+					var result map[string]any
+					switch step {
+					case 0:
+						if err := checkRecoveryFixturePolicy(params, environment, policy); err != nil {
+							return err
+						}
+						if params["cwd"] != cwd || params["model"] != "frozen-full-lead" || params["config"].(map[string]any)["model_reasoning_effort"] != "xhigh" {
+							return fmt.Errorf("original root settings changed: %#v", params)
+						}
+						result = map[string]any{"thread": freshThreadMetadata("thread-existing", cwd, rollout)}
+					case 1:
+						result = map[string]any{"data": []any{"thread-existing"}}
+					case 2, 6:
+						if params["threadId"] != "thread-existing" {
+							return fmt.Errorf("wrong recovery read: %#v", params)
+						}
+						result = map[string]any{"thread": freshThreadMetadata("thread-existing", cwd, rollout)}
+					case 3, 4, 5:
+						if params["cwd"] != cwd || params["archived"] != false || params["sortDirection"] != "asc" || fmt.Sprint(params["sourceKinds"]) != "[vscode]" {
+							return fmt.Errorf("recovery discovery filters changed: %#v", params)
+						}
+						if step == 3 && params["useStateDbOnly"] != true {
+							return fmt.Errorf("missing index pass: %#v", params)
+						}
+						if step > 3 {
+							if _, exists := params["useStateDbOnly"]; exists {
+								return fmt.Errorf("missing filesystem pass: %#v", params)
+							}
+						}
+						if step == 5 && params["cursor"] != "last" {
+							return fmt.Errorf("filesystem discovery did not finish pagination: %#v", params)
+						}
+						result = map[string]any{"data": []any{}}
+						if step == 4 {
+							result["nextCursor"] = "last"
+						}
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return err
+					}
 				}
-				set := config["shell_environment_policy"].(map[string]any)["set"].(map[string]any)
-				if set["DEV_SESSION_SLUG"] != "example" {
-					return fmt.Errorf("retry omitted the session environment: %#v", set)
-				}
-				result = map[string]any{"thread": map[string]any{"id": "thread-existing", "cwd": cwd}}
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{DeveloperInstructions: recoveryFixtureLifecycleInstructions})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := client.StartThreadWithSettings(ctx, cwd, environment, codex.ThreadSettings{
+				Model: "frozen-full-lead", ReasoningEffort: "xhigh", Policy: policy,
+			}); err != nil {
+				t.Fatal(err)
 			}
-			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
-				return err
+			resolved := false
+			id, err := client.RecoverCreatingThreadWithPolicyAndSettingsResolver(ctx, recordedID, cwd, environment, policy,
+				func() (codex.ThreadSettings, error) {
+					resolved = true
+					return codex.ThreadSettings{}, errors.New("current model catalog changed")
+				},
+			)
+			if err != nil || id != "thread-existing" || resolved {
+				t.Fatalf("loaded-root adoption = %q, resolved=%t, error=%v", id, resolved, err)
 			}
-		}
-		return nil
-	})
-	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
-	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	resolved := false
-	id, err := client.RecoverCreatingThreadWithPolicyAndSettingsResolver(
-		ctx, "thread-existing", cwd, environment, policy,
-		func() (codex.ThreadSettings, error) {
-			resolved = true
-			return codex.ThreadSettings{}, errors.New("current model catalog changed")
-		},
-	)
-	if err != nil || id != "thread-existing" || resolved {
-		t.Fatalf("frozen candidate recovery = %q, resolved=%t, error=%v", id, resolved, err)
+			client.Close()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				t.Fatal("recovery fixture did not finish")
+			}
+		})
 	}
+}
+
+func TestRecoverCreatingThreadRefusesUnprovableUnmaterializedRoot(t *testing.T) {
+	const cwd = "/workspace/work/example"
+	for _, test := range []struct {
+		name, field, failure, want string
+		value                      any
+		missing                    bool
+	}{
+		{name: "wrong history ID", field: "id", value: "other", want: "wrong thread"},
+		{name: "wrong history cwd", field: "cwd", value: "/wrong", want: "wrong working directory"},
+		{name: "wrong history source", field: "source", value: "cli", want: "not a fresh idle"},
+		{name: "fork root", field: "forkedFromId", value: "source", want: "refusing a fork"},
+		{name: "missing path", field: "path", missing: true, want: "no rollout path"},
+		{name: "invalid path", field: "path", value: "relative.jsonl", want: "invalid rollout path"},
+		{name: "ephemeral root", field: "ephemeral", value: true, want: "not a fresh idle"},
+		{name: "missing ephemeral", field: "ephemeral", missing: true, want: "not a fresh idle"},
+		{name: "missing history mode", field: "historyMode", missing: true, want: "not a fresh idle"},
+		{name: "nonempty preview", field: "preview", value: "accepted request", want: "not a fresh idle"},
+		{name: "active root", field: "status", value: map[string]any{"type": "active"}, want: "not a fresh idle"},
+		{name: "missing turns", field: "turns", missing: true, want: "not a fresh idle"},
+		{name: "nonempty turns", field: "turns", value: []any{map[string]any{"id": "turn"}}, want: "not a fresh idle"},
+		{name: "selected read storage error", failure: "no rollout found for thread id thread-existing", want: "no rollout found"},
+		{name: "unknown read error", failure: "unexpected read failure", want: "unexpected read failure"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rollout := filepath.Join(t.TempDir(), "missing.jsonl")
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				defer connection.CloseNow()
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				reads, fullScans := 0, 0
+				for {
+					request, err := readObject(connection)
+					if err != nil {
+						return nil
+					}
+					params := request["params"].(map[string]any)
+					response := map[string]any{"id": request["id"]}
+					switch request["method"] {
+					case "thread/loaded/list":
+						response["result"] = map[string]any{"data": []any{"thread-existing"}}
+					case "thread/list":
+						if params["useStateDbOnly"] != true {
+							fullScans++
+						}
+						response["result"] = map[string]any{"data": []any{}}
+					case "thread/read":
+						reads++
+						metadata := freshThreadMetadata("thread-existing", cwd, rollout)
+						if reads > 1 || test.field == "forkedFromId" {
+							if fullScans != 1 && reads > 1 {
+								return errors.New("history proof preceded complete discovery")
+							}
+							if test.failure != "" {
+								response["error"] = map[string]any{"code": -32600, "message": test.failure}
+								break
+							}
+							if test.missing {
+								delete(metadata, test.field)
+							} else {
+								metadata[test.field] = test.value
+							}
+						}
+						response["result"] = map[string]any{"thread": metadata}
+					default:
+						return fmt.Errorf("unproven root caused a mutation: %#v", request)
+					}
+					if err := writeObject(connection, response); err != nil {
+						return err
+					}
+				}
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			resolved := false
+			id, err := client.RecoverCreatingThreadWithPolicyAndSettingsResolver(ctx, "thread-existing", cwd, nil, recoveryFixturePolicy(),
+				func() (codex.ThreadSettings, error) { resolved = true; return codex.ThreadSettings{}, nil })
+			if err == nil || !strings.Contains(err.Error(), test.want) || id != "" || resolved {
+				t.Fatalf("unprovable adoption = %q, %v; resolved = %t", id, err, resolved)
+			}
+		})
+	}
+}
+
+const recoveryFixtureLifecycleInstructions = "Completing work, preparing a handoff, or setting " +
+	"lifecycle state does not authorize archiving, deleting, stopping, finalizing, removing, " +
+	"invoking private lifecycle helpers, or scheduling delayed or background cleanup for this " +
+	"session. Perform a session lifecycle action only when the user explicitly requests that " +
+	"exact action for this exact session in the current conversation; otherwise leave the " +
+	"session open."
+
+func recoveryFixturePolicy() codex.ThreadPolicy {
+	policy := LeadThreadPolicy("example", "/workspace", "Coordinate the frozen Full team and wait for the initial request.")
+	policy.MCPServer = &codex.ThreadMCPServer{Name: "team", Command: "/package/bin/workspace-portal", Args: []string{"team-mcp", "--slug", "example"}, Tool: "report_to_lead"}
+	return policy
+}
+
+func checkRecoveryFixturePolicy(params map[string]any, environment map[string]string, policy codex.ThreadPolicy) error {
+	if params["developerInstructions"] != recoveryFixtureLifecycleInstructions+"\n\n"+policy.DeveloperInstructions {
+		return fmt.Errorf("root lifecycle or frozen lead instructions changed: %#v", params)
+	}
+	config := params["config"].(map[string]any)
+	set := config["shell_environment_policy"].(map[string]any)["set"].(map[string]any)
+	if len(set) != len(environment) {
+		return fmt.Errorf("root environment changed: %#v", set)
+	}
+	for key, value := range environment {
+		if set[key] != value {
+			return fmt.Errorf("root environment %s changed: %#v", key, set)
+		}
+	}
+	server := config["mcp_servers"].(map[string]any)["team"].(map[string]any)
+	tools := server["tools"].(map[string]any)
+	if server["command"] != policy.MCPServer.Command || fmt.Sprint(server["args"]) != "[team-mcp --slug example]" || server["required"] != true || fmt.Sprint(server["enabled_tools"]) != "[report_to_lead]" || tools["report_to_lead"].(map[string]any)["approval_mode"] != "approve" {
+		return fmt.Errorf("root MCP binding changed: %#v", server)
+	}
+	return nil
 }
 
 func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T) {
@@ -996,11 +1175,13 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		"DEV_SESSION_PORTAL_BASE_URL": "https://workspace.example",
 		"DEV_SESSION_URL":             "https://workspace.example/example/",
 	}
+	policy := recoveryFixturePolicy()
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		defer connection.CloseNow()
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		request, err := readObject(connection)
+		request, err := readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/loaded/list" {
 			return fmt.Errorf("expected persisted thread/loaded/list: %v", err)
 		}
@@ -1009,18 +1190,18 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/list" {
 			return fmt.Errorf("expected persisted thread/list: %v", err)
 		}
 		if err := writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
-				"id": "thread-original", "cwd": "/workspace/work/example",
+				"id": "thread-original", "cwd": "/workspace/work/example", "source": "vscode",
 			}}},
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/read" {
 			return fmt.Errorf("expected persisted thread/read: %v", err)
 		}
@@ -1031,7 +1212,7 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/resume" {
 			return fmt.Errorf("expected persisted thread/resume: %v", err)
 		}
@@ -1039,6 +1220,12 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		if params["threadId"] != "thread-original" ||
 			params["cwd"] != "/workspace/work/example" || params["excludeTurns"] != true {
 			return fmt.Errorf("invalid persisted resume params: %#v", params)
+		}
+		if err := checkRecoveryFixturePolicy(params, environment, policy); err != nil {
+			return err
+		}
+		if _, exists := params["model"]; exists {
+			return fmt.Errorf("persisted thread model was overwritten: %#v", params)
 		}
 		config := params["config"].(map[string]any)
 		if _, ok := config["model"]; ok {
@@ -1054,17 +1241,17 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 		}
 		return writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"thread": map[string]any{
-				"id": "thread-original", "cwd": "/workspace/work/example",
+				"id": "thread-original", "cwd": "/workspace/work/example", "source": "vscode",
 			}},
 		})
 	})
-	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{DeveloperInstructions: recoveryFixtureLifecycleInstructions})
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resolverCalled := false
-	id, err := client.RecoverCreatingThreadWithSettingsResolver(
-		ctx, "thread-original", "/workspace/work/example", environment,
+	id, err := client.RecoverCreatingThreadWithPolicyAndSettingsResolver(
+		ctx, "thread-original", "/workspace/work/example", environment, policy,
 		func() (codex.ThreadSettings, error) {
 			resolverCalled = true
 			return codex.ThreadSettings{}, errors.New("the old model is no longer in the catalog")
@@ -1086,7 +1273,7 @@ func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testi
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		request, err := readObject(connection)
+		request, err := readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/loaded/list" {
 			return fmt.Errorf("expected restart thread/loaded/list: %v", err)
 		}
@@ -1095,7 +1282,7 @@ func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testi
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/list" {
 			return fmt.Errorf("expected restart thread/list: %v", err)
 		}
@@ -1104,7 +1291,16 @@ func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testi
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
+		if err != nil || request["method"] != "thread/read" || request["params"].(map[string]any)["threadId"] != "thread-vanished" {
+			return fmt.Errorf("expected exact missing-root check: %#v, %v", request, err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "error": map[string]any{"code": -32001, "message": "thread not found"},
+		}); err != nil {
+			return err
+		}
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/start" {
 			return fmt.Errorf("expected replacement thread/start: %v", err)
 		}
@@ -1145,7 +1341,7 @@ func TestRecoverCreatingThreadRefusesAmbiguousDirectoryCandidates(t *testing.T) 
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		loaded, err := readObject(connection)
+		loaded, err := readAfterEmptyRecoveryIndex(connection)
 		if err != nil || loaded["method"] != "thread/loaded/list" {
 			return fmt.Errorf("expected thread/loaded/list: %v", err)
 		}
@@ -1154,7 +1350,7 @@ func TestRecoverCreatingThreadRefusesAmbiguousDirectoryCandidates(t *testing.T) 
 		}); err != nil {
 			return err
 		}
-		listed, err := readObject(connection)
+		listed, err := readAfterEmptyRecoveryIndex(connection)
 		if err != nil || listed["method"] != "thread/list" {
 			return fmt.Errorf("expected thread/list: %v", err)
 		}
@@ -1184,7 +1380,7 @@ func TestRecoverCreatingThreadRejectsDifferentMaterializedCandidate(t *testing.T
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		request, err := readObject(connection)
+		request, err := readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/loaded/list" {
 			return fmt.Errorf("expected thread/loaded/list: %v", err)
 		}
@@ -1193,18 +1389,18 @@ func TestRecoverCreatingThreadRejectsDifferentMaterializedCandidate(t *testing.T
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/list" {
 			return fmt.Errorf("expected thread/list: %v", err)
 		}
 		if err := writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
-				"id": "thread-unrelated", "cwd": "/workspace/work/example",
+				"id": "thread-unrelated", "cwd": "/workspace/work/example", "source": "vscode",
 			}}},
 		}); err != nil {
 			return err
 		}
-		request, err = readObject(connection)
+		request, err = readAfterEmptyRecoveryIndex(connection)
 		if err != nil || request["method"] != "thread/read" {
 			return fmt.Errorf("expected thread/read: %v", err)
 		}
@@ -1323,4 +1519,22 @@ func writeObject(connection *websocket.Conn, value any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return connection.Write(ctx, websocket.MessageText, data)
+}
+
+// Older history-policy fixtures deliberately exercise a missing index. They
+// still assert the complete-scan request and all subsequent ownership checks.
+func readAfterEmptyRecoveryIndex(connection *websocket.Conn) (map[string]any, error) {
+	for {
+		request, err := readObject(connection)
+		if err != nil {
+			return nil, err
+		}
+		params, _ := request["params"].(map[string]any)
+		if request["method"] != "thread/list" || params["useStateDbOnly"] != true {
+			return request, nil
+		}
+		if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"data": []any{}}}); err != nil {
+			return nil, err
+		}
+	}
 }

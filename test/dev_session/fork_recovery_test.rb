@@ -92,6 +92,7 @@ class DevSessionTest < Minitest::Test
       preflight = commands.find { |line| line.start_with?('thread resolve-fork-settings ') }
       assert_includes(preflight, '--thread-id thread-source')
       command = commands.find { |line| line.start_with?('thread fork ') }
+      assert_includes(command, '--fresh')
       assert_includes(command, '--thread-id thread-source')
       assert_includes(command, '--model gpt-test')
       assert_includes(command, '--effort xhigh')
@@ -214,8 +215,10 @@ class DevSessionTest < Minitest::Test
       source = setup.send(:ensure_portal_manifest, source_slug)
       source['codex'] = { 'thread_id' => 'thread-source' }
       setup.send(:write_portal_manifest, source_slug, source)
+      first_fresh = nil
       crashing_class = Class.new(DevSession::Runner) do
-        define_method(:create_portal_fork) do |*_arguments, **_keywords|
+        define_method(:create_portal_fork) do |*_arguments, **keywords|
+          first_fresh = keywords.fetch(:fresh)
           raise DevSession::Error, 'simulated crash before forked thread creation'
         end
       end
@@ -239,6 +242,7 @@ class DevSessionTest < Minitest::Test
         )
       end
       journal_path = setup.send(:fork_journal_file, destination_slug)
+      assert_equal(true, first_fresh)
       assert(File.file?(journal_path))
       journal = JSON.parse(File.read(journal_path))
       assert_equal('thread-source', journal.fetch('source_thread_id'))
@@ -256,9 +260,11 @@ class DevSessionTest < Minitest::Test
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
       forked_from_thread = nil
+      retry_fresh = nil
       retry_class = Class.new(DevSession::Runner) do
-        define_method(:create_portal_fork) do |_slug, source_thread_id, **_keywords|
+        define_method(:create_portal_fork) do |_slug, source_thread_id, **keywords|
           forked_from_thread = source_thread_id
+          retry_fresh = keywords.fetch(:fresh)
           'thread-fork'
         end
         define_method(:name_portal_thread) { |*_arguments| nil }
@@ -303,6 +309,7 @@ class DevSessionTest < Minitest::Test
       assert_equal(destination_slug, result.fetch('slug'))
       assert_equal(source_slug, result.fetch('forkedFrom'))
       assert_equal('thread-source', forked_from_thread)
+      assert_equal(false, retry_fresh)
       refute(File.exist?(journal_path))
       refute(File.exist?(File.join(workspace, 'work', '2026-06-07-retry')))
     end
