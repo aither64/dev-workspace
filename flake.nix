@@ -22,6 +22,7 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
+      mkCodexPackage = import ./nix/codex-package.nix;
       mkPackage =
         {
           activationEnvironmentAliases ? [ ],
@@ -33,7 +34,10 @@
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
           src = self;
-          codex = llm-agents.packages.${pkgs.system}.codex;
+          codex = mkCodexPackage {
+            inherit pkgs;
+            codex = llm-agents.packages.${pkgs.system}.codex;
+          };
           codexWebSrc = codex-web;
           codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
           inherit
@@ -52,6 +56,7 @@
       lib = {
         inherit
           hostPaths
+          mkCodexPackage
           mkPackage
           runtimeAuthorityCorpus
           runtimeContract
@@ -68,6 +73,10 @@
         program = "${devWorkspace}/bin/workspace-host";
       };
       checks.${system} = {
+        codex-package = import ./nix/tests/codex-package.nix {
+          inherit mkCodexPackage pkgs;
+          codex = llm-agents.packages.${system}.codex;
+        };
         package = devWorkspace;
         host-module = import ./nix/tests/host-module.nix {
           inherit pkgs nixpkgs self;

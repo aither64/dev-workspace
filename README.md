@@ -5,6 +5,8 @@ session CLI, browser portal, user-profile runtime, workspace registry and an
 extension interface for development-cluster helpers. The package pins
 its own Codex build, so one profile generation always contains a tested portal
 and App Server pair.
+The [Codex package contract](docs/codex-package.md) describes its runtime layout,
+native daemon copies and dependency retention.
 
 The repository was extracted from a larger development-workspace application.
 Session records and local worktrees remain in each configured workspace.
@@ -75,6 +77,10 @@ provider IDs; it cannot supply executable paths. A downstream can also pass an
 explicit `teamConfig` to generate an immutable agent-team catalog; see the
 [portal guide](docs/workspace-portal.md#installed-team-policy) for its package-time
 contract.
+
+`lib.mkCodexPackage { pkgs; codex; }` assembles the selected upstream Codex
+output into a complete runtime package. `lib.mkPackage` uses it for the bundled
+Codex; other consumers can use the same helper for their system command.
 
 A workspace declares its portal identity and optional providers in
 `.dev-workspace.json`:

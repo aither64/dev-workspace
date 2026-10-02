@@ -763,6 +763,9 @@ pairs, and restore the clients. A compatible profile update that finds an
 active turn is retried every five minutes. Use `--no-codex` to start a shell in
 the left pane instead.
 
+The [Codex package contract](codex-package.md) describes the assembled runtime
+and the GC roots that retain dependencies needed by native daemon copies.
+
 For sessions started with `--team`, the installed team policy supplies the
 lead and member model and reasoning effort. The lead can override both settings
 together; member settings remain those of the selected team. The same
