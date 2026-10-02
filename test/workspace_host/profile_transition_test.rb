@@ -391,6 +391,119 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_policy_two_predecessor_adopts_a_schema_one_policy_three_package
+    with_cluster_transition_policy(2) do
+      with_transition_host do |host, paths|
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        cluster = recorded_cluster!(host)
+        host.candidate = make_package(paths.fetch(:root), 'package-policy-three', transition_policy: 3)
+        probe_cluster_adoption!(host.candidate)
+
+        assert_equal(1, DevWorkspaceHost::RUNTIME_CONTRACT.fetch('developmentClusterStateSchema'))
+        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        assert_equal(1, host.send(:profile_generation))
+        assert(File.file?(File.join(cluster, 'adoption-called')))
+      end
+    end
+  end
+
+  def test_policy_three_refuses_policy_two_before_adoption_or_profile_changes
+    [false, true].each do |held|
+      with_transition_host do |host, paths|
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        previous = File.realpath(host.instance_variable_get(:@profile))
+        cluster = recorded_cluster!(host)
+        if held
+          File.write(File.join(cluster, 'maintenance-hold.json'), JSON.generate(
+            'version' => 1, 'mode' => 'maintenance', 'phase' => 'held'
+          ))
+        end
+        original_files = Dir.children(cluster).to_h { |name| [name, File.binread(File.join(cluster, name))] }
+        host.candidate = make_package(paths.fetch(:root), 'package-old-policy', transition_policy: 2)
+        probe_cluster_adoption!(host.candidate)
+        host.events.clear
+
+        assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        assert_equal(previous, File.realpath(host.instance_variable_get(:@profile)))
+        assert_equal(1, host.send(:profile_generation))
+        refute(host.events.any? { |event| %i[sessions_quiesced profile_set consumers_restarted].include?(event.first) })
+        refute(File.exist?(File.join(cluster, 'adoption-called')))
+        assert_equal(original_files, Dir.children(cluster).to_h { |name| [name, File.binread(File.join(cluster, name))] })
+        assert_includes(host.instance_variable_get(:@err).string, 'no compatible cluster-state contract')
+        assert_includes(host.instance_variable_get(:@err).string, 'preserve retained cluster state and select a reviewed compatible package')
+        refute_includes(host.instance_variable_get(:@err).string, 'reset these clusters first')
+      end
+    end
+  end
+
+  def test_policy_three_still_defers_equal_and_newer_candidates_to_provider_adoption
+    [3, 4].each do |policy|
+      with_transition_host do |host, paths|
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        cluster = recorded_cluster!(host)
+        host.candidate = make_package(paths.fetch(:root), 'package-refused-adoption', transition_policy: policy)
+        probe_cluster_adoption!(host.candidate, exit_status: 1)
+
+        assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        assert(File.file?(File.join(cluster, 'adoption-called')))
+        refute(File.exist?(host.instance_variable_get(:@profile)))
+        refute_includes(host.events, [:sessions_quiesced])
+      end
+    end
+  end
+
+  def test_candidate_activation_refuses_policy_two_before_provider_adoption
+    with_transition_host do |host, paths|
+      cluster = recorded_cluster!(host)
+      package = make_package(paths.fetch(:root), 'package-old-activation', transition_policy: 2)
+      probe_cluster_adoption!(package)
+      environment = host.instance_variable_get(:@env).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+      error_output = StringIO.new
+      activation = ActivationGuardHost.new(package:, env: environment, out: StringIO.new, err: error_output)
+
+      assert_equal(1, activation.run('workspace-host', ['_activate']))
+      refute(activation.configured)
+      refute(File.exist?(File.join(cluster, 'adoption-called')))
+      assert_includes(error_output.string, 'no compatible cluster-state contract')
+    end
+  end
+
+  def test_policy_three_does_not_restrict_old_policy_when_no_cluster_state_exists
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      host.candidate = make_package(paths.fetch(:root), 'package-no-clusters', transition_policy: 2)
+
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(1, host.send(:profile_generation))
+    end
+  end
+
+  def test_policy_three_keeps_schema_metadata_and_malformed_contract_refusals
+    [
+      '{',
+      { 'developmentClusterStateSchema' => 2 },
+      { 'trackingMaxBytes' => 1 },
+      { 'developmentClusterTransitionPolicy' => '3' }
+    ].each do |invalid|
+      with_transition_host do |host, paths|
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        cluster = recorded_cluster!(host)
+        package = make_package(paths.fetch(:root), 'package-invalid-contract', transition_policy: 3)
+        contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
+        value = invalid.is_a?(Hash) ? JSON.generate(JSON.parse(File.binread(contract)).merge(invalid)) : invalid
+        File.write(contract, value)
+        probe_cluster_adoption!(package)
+        host.candidate = package
+
+        assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        refute(File.exist?(host.instance_variable_get(:@profile)))
+        refute(File.exist?(File.join(cluster, 'adoption-called')))
+        refute_includes(host.events, [:sessions_quiesced])
+      end
+    end
+  end
+
   def test_switch_refuses_unadoptable_precontract_cluster_state
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
@@ -689,6 +802,37 @@ class WorkspaceHostTest < Minitest::Test
       refute_nil(host.send(:pending_codex_update))
       assert_equal(restarts_before + 1, host.events.count { |event| event == [:consumers_restarted] })
     end
+  end
+
+  private
+
+  def recorded_cluster!(host)
+    workspace = host.send(:registry).entries.fetch(0).fetch('root')
+    cluster = File.join(workspace, '.dev-clusters', 'beta', 'clusters', '2026-09-07-contract-state')
+    FileUtils.mkdir_p(cluster)
+    File.write(File.join(cluster, 'socket-dir'), "/tmp/workspace-scoped-socket\n")
+    cluster
+  end
+
+  def probe_cluster_adoption!(package, exit_status: 0)
+    helper = File.join(package, 'libexec/workspace-portal/beta-devcluster')
+    File.write(helper, <<~SH)
+      #!/bin/sh
+      [ "$1" = transition-adopt ] || exit 1
+      printf 'adoption attempted\\n' > "$DEVCLUSTER_WORKSPACE/.dev-clusters/beta/clusters/$2/adoption-called"
+      exit #{exit_status}
+    SH
+  end
+
+  # Model the predecessor's declared policy with the unchanged host algorithm.
+  def with_cluster_transition_policy(policy)
+    original = DevWorkspaceHost::RUNTIME_CONTRACT
+    DevWorkspaceHost.send(:remove_const, :RUNTIME_CONTRACT)
+    DevWorkspaceHost.const_set(:RUNTIME_CONTRACT, original.merge('developmentClusterTransitionPolicy' => policy).freeze)
+    yield
+  ensure
+    DevWorkspaceHost.send(:remove_const, :RUNTIME_CONTRACT)
+    DevWorkspaceHost.const_set(:RUNTIME_CONTRACT, original)
   end
 
 end

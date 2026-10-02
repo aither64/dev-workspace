@@ -218,8 +218,36 @@ an older package; recover by repeating the same switch or selecting a newer
 package. Commands waiting on a transition lock reject a generation change and
 must be run again.
 
+### Cluster transition policy
+
+The runtime contract uses development-cluster state schema 1 and transition
+policy 3. A package switch with any registered cluster state requires the target
+to declare the same schema and tracking limit, and an equal or newer transition
+policy. The check runs before provider adoption, session quiescing or profile
+selection, and repeats during activation. Each candidate provider must also
+accept the retained cluster through `transition-adopt`.
+
+Policy 3 supports packages whose providers preserve a retained-disk maintenance
+hold and its copy receipt. Publish and activate the complete runtime/provider
+composition; raising the policy number alone does not add provider support.
+Schema-1 clusters can move forward from policy 2 without disk conversion or
+reset when the candidate provider accepts their state.
+
+An ordinary switch from policy 3 to policy 2 refuses while any registered
+development-cluster state exists. This conservative limit applies even after a
+maintenance hold has finished, and to state owned by another provider. Do not
+reset retained clusters to bypass it. Recover with the same or a newer reviewed
+package that understands the maintenance state. With no cluster state, this
+particular check does not restrict the target policy; other checks still apply.
+
+Old package binaries, including their `--from-candidate` recovery and store
+helpers, cannot prove a newer maintenance hold. Invoking them is outside the
+supported recovery procedure. The policy gate protects normal transitions;
+it does not make every historical binary enforce the current contract.
+
 If the installed `workspace-host switch` cannot parse valid persisted state,
-run the candidate's explicit recovery entry from the source checkout:
+run a reviewed candidate that understands that state through its explicit
+recovery entry from the source checkout:
 
 ```sh
 nix run .#workspace-host -- switch --source "$PWD" --from-candidate

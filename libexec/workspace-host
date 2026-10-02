@@ -2315,7 +2315,7 @@ module DevWorkspaceHost
         raise Error,
               "workspace package transition is blocked by development cluster state: " \
               "#{clusters.join(', ')}; target package has no compatible cluster-state contract; " \
-              'reset these clusters first or select a compatible package'
+              'preserve retained cluster state and select a reviewed compatible package'
       end
       clusters.each do |identity|
         workspace_name, kind, slug = identity.split('/', 3)

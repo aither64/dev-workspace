@@ -1,6 +1,6 @@
 {
   "developmentClusterStateSchema": 1,
-  "developmentClusterTransitionPolicy": 2,
+  "developmentClusterTransitionPolicy": 3,
   "runtimeAuthorityIdentityPolicy": 1,
   "agentTeamRegistration": {
     "helperSchema": 1,
