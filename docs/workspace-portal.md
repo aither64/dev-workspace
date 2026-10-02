@@ -490,6 +490,48 @@ The catalog defines a verification watcher separately from the team. The
 site selects its model and effort for each fresh, operation-scoped subagent;
 it is not a persistent team member.
 
+## Session creation progress
+
+The creation page polls the existing receipt once per second and shows the
+current conversation, recovery, member, prompt, terminal or verification stage.
+The elapsed clock measures the whole accepted attempt. A completed stage can
+show its own duration; nested durations overlap and must not be added. Team
+members still initialize sequentially before the root receives its initial
+request. A recovery scan can take longer than a fresh creation.
+
+The portal enables the private stderr transport only for creation with
+`DEV_WORKSPACE_CREATION_PROGRESS=1`. The Ruby helper consumes this flag and
+explicitly enables it on relevant nested thread/team commands; it does not save
+it in tmux, Codex settings, journals or manifests. Older helpers that emit no
+progress continue with the broad initialization phase. JSON stdout and ordinary
+diagnostic stderr keep their existing contracts.
+
+A frame consists of the record separator byte `0x1e`, the exact ASCII prefix
+`DEV_WORKSPACE_CREATION_PROGRESS/1 `, one UTF-8 JSON object, and LF. A complete
+frame is at most 4096 bytes. It contains only `stage`, `event`, `elapsedMs` and
+optional `member`. Stages are `prepare`, `conversation`, `recovery_loaded`,
+`recovery_index`, `recovery_scan`, `team_member`, `prompt`, `terminal` and
+`evidence`; events are `begin` and `finish`. `elapsedMs` is an integer from zero
+through 86400000, zero at begin and a process-local stage duration at finish.
+An optional member is a validated roster address of at most 128 ASCII bytes.
+Frames contain no request text, instructions, paths or tool output.
+
+Both nested Ruby capture and the creation-specific Go runner drain stdout and
+stderr concurrently. Parsers support split and multiple frames, reject duplicate
+or unknown fields and invalid values, and drain oversized records through their
+newline before recognizing later frames. Candidate buffers and rejected-frame
+diagnostics are bounded. Invalid or truncated frames do not change phase or
+replace the child exit status; valid frames already forwarded by Ruby are not
+repeated in a failure diagnostic.
+
+Each event is bound by the subprocess callback to its workspace, slug, receipt
+ID and attempt. Under the portal's operation lock, it changes only the current
+running receipt's phase and update time. Duplicate phases are coalesced and an
+attempt permits at most 256 phase writes. Terminal states and newer attempts
+ignore delayed events. Progress cannot mark a receipt ready, change captured
+settings or replace goal-attempt evidence. Ready still requires the normal
+stdout result, matching durable creation proof and upload binding.
+
 ## Host module
 
 `nixosModules.host` configures the privileged nginx and TLS substrate. Its

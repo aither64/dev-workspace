@@ -21,6 +21,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -780,6 +781,7 @@ type Client interface {
 }
 
 type Service struct {
+	Progress         creationprogress.Observer
 	Store            *Store
 	Client           Client
 	Workspace        string
@@ -981,11 +983,13 @@ func (service Service) ApplyPreset(ctx context.Context, slug, rootThreadID, cwd 
 	}
 	created := make([]Member, 0, len(expected))
 	for _, member := range expected {
+		finish := creationprogress.Begin(service.Progress, "team_member", member.Address)
 		member, err := service.RetryCreating(ctx, slug, rootThreadID, cwd, environment, member.Address)
 		if err != nil {
 			return created, err
 		}
 		created = append(created, member)
+		finish()
 	}
 	return created, nil
 }
@@ -1049,9 +1053,11 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 		return nil, err
 	}
 	for _, member := range preset.Members {
+		finish := creationprogress.Begin(service.Progress, "team_member", member.Address)
 		if _, err := service.RetryCreating(ctx, slug, rootThreadID, cwd, environment, member.Address); err != nil {
 			return nil, err
 		}
+		finish()
 	}
 	return service.Store.Load(slug, rootThreadID)
 }
@@ -2229,6 +2235,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		if old.Thread == "" {
 			return nil, fmt.Errorf("fork source member %s has no thread", old.Address)
 		}
+		finish := creationprogress.Begin(service.Progress, "team_member", member.Address)
 		threadID := member.Thread
 		if threadID == "" {
 			// thread/fork cannot carry a deterministic projectId. A cwd and
@@ -2313,6 +2320,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		}); err != nil {
 			return nil, err
 		}
+		finish()
 	}
 	return service.Store.Load(slug, rootThreadID)
 }

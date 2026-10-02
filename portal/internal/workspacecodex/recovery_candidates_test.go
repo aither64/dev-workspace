@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/coder/websocket"
 )
 
@@ -137,7 +138,13 @@ func TestCreationRecoveryRequiresCompleteDiscovery(t *testing.T) {
 			defer client.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			var stages []string
 			options := test.options
+			options.Progress = func(event creationprogress.Event) {
+				if event.Event == "begin" {
+					stages = append(stages, event.Stage)
+				}
+			}
 			candidates, err := client.creationCandidates(ctx, "root", cwd, options)
 			if test.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantError) {
@@ -147,7 +154,7 @@ func TestCreationRecoveryRequiresCompleteDiscovery(t *testing.T) {
 				t.Fatalf("candidates = %#v, %v", candidates, err)
 			}
 			if scans.Load() != int32(test.wantScans) {
-				t.Fatalf("full scans = %d", scans.Load())
+				t.Fatalf("full scans = %d; stages = %v", scans.Load(), stages)
 			}
 		})
 	}

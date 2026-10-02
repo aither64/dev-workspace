@@ -20,6 +20,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -690,6 +691,60 @@ func (s *Server) updateCreation(receipt creationReceipt) error {
 	return nil
 }
 
+func creationPhase(event creationprogress.Event) string {
+	labels := map[string]string{
+		"prepare": "Preparing session", "conversation": "Initializing conversation",
+		"recovery_loaded": "Checking open conversations", "recovery_index": "Checking saved conversations",
+		"recovery_scan": "Scanning conversation history", "team_member": "Initializing team member",
+		"prompt": "Saving initial request", "terminal": "Preparing terminal", "evidence": "Verifying session",
+	}
+	label := labels[event.Stage]
+	if event.Member != "" {
+		label += " " + event.Member
+	}
+	if event.Event == "finish" {
+		return fmt.Sprintf("%s completed (%.1f s).", label, float64(event.ElapsedMs)/1000)
+	}
+	return label + "…"
+}
+
+func (s *Server) creationProgressObserver(receipt creationReceipt) creationprogress.Observer {
+	updates := 0
+	warned := false
+	return func(event creationprogress.Event) {
+		if !event.Valid() {
+			return
+		}
+		s.operationMu.Lock()
+		defer s.operationMu.Unlock()
+		if updates >= 256 {
+			return
+		}
+		current, exists := s.creations[receipt.Request.Slug]
+		if !exists || current.Workspace != receipt.Workspace || current.Workspace != s.config.Workspace ||
+			current.Request.Slug != receipt.Request.Slug || current.ReceiptID != receipt.ReceiptID ||
+			current.Attempt != receipt.Attempt || current.State != "running" {
+			return
+		}
+		phase := creationPhase(event)
+		if current.Phase == phase {
+			return
+		}
+		updates++
+		// Merge into the current receipt; never replay captured settings or authority.
+		current.Phase = phase
+		current.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if err := s.saveCreation(current); err != nil {
+			if !warned {
+				s.config.Logger.Printf("save creation progress for %s: %v", receipt.Request.Slug, err)
+				warned = true
+			}
+			return
+		}
+		s.creations[receipt.Request.Slug] = current
+	}
+}
+
 func (s *Server) runCreation(receipt creationReceipt) {
 	defer s.operationWG.Done()
 	err := s.initializeCreation(&receipt)
@@ -899,7 +954,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	if request.Source != "" {
 		args = append(args, "--expected-source", request.Source, "--expected-source-thread", request.SourceThreadID, "--expected-source-identity", request.SourceIdentity)
 	}
-	stdout, stderr, err := s.runDevSessionWithTransition(ctx, 210*time.Second, transition, args...)
+	stdout, stderr, err := s.runCreationCommand(ctx, 210*time.Second, transition, s.creationProgressObserver(*receipt), args...)
 	if err != nil {
 		if s.proveCreation(*receipt) == nil {
 			return s.bindCreationUploads(ctx, *receipt)

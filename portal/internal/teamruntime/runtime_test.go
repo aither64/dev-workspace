@@ -16,6 +16,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
@@ -2323,7 +2324,8 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &testClient{nameFailure: true}
-	service := Service{Store: store, Client: client, Workspace: workspace}
+	var events []creationprogress.Event
+	service := Service{Store: store, Client: client, Workspace: workspace, Progress: func(event creationprogress.Event) { events = append(events, event) }}
 	preset := Preset{ID: "delivery", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
 		LeadModel: "gpt-6-sol", LeadEffort: "xhigh", LeadInstructions: "Coordinate the delivery.", Members: []MemberSpec{
 			{Role: "implementer", Address: "implementer0", Model: "gpt-6-sol", Effort: "xhigh", Behavior: "implementer",
@@ -2341,6 +2343,9 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 	ready, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", cwd, nil, preset)
 	if err != nil || len(ready.Members) != 1 || ready.Members[0].State != "ready" || client.next != 1 {
 		t.Fatalf("resumed preset = %#v, starts %d, error %v", ready, client.next, err)
+	}
+	if len(events) != 3 || events[0].Event != "begin" || events[1].Event != "begin" || events[2].Event != "finish" || events[2].Member != "implementer0" {
+		t.Fatalf("partial preset progress = %#v", events)
 	}
 	if len(client.starts) != 1 || client.starts[0].Model != "gpt-6-sol" || client.starts[0].ReasoningEffort != "xhigh" {
 		t.Fatalf("member settings = %#v", client.starts)
@@ -2620,7 +2625,8 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &testClient{}
-	service := Service{Store: store, Client: client, Workspace: workspace}
+	var events []creationprogress.Event
+	service := Service{Store: store, Client: client, Workspace: workspace, Progress: func(event creationprogress.Event) { events = append(events, event) }}
 	sourceCwd := filepath.Join(workspace, "work", "source")
 	for _, role := range []string{"architect", "reviewer"} {
 		if _, err := service.Add(context.Background(), "source", "root-source", sourceCwd, nil, role, "gpt-6-sol", "xhigh"); err != nil {
@@ -2641,6 +2647,9 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 	environment := map[string]string{"DEV_SESSION_SLUG": "target", "DEV_SESSION_MEMBER_ADDRESS": "lead"}
 	if _, err := service.Fork(context.Background(), source, "target", "root-target", filepath.Join(workspace, "work", "target"), environment); err != nil {
 		t.Fatal(err)
+	}
+	if len(events) != 4 || events[0].Member != "architect0" || events[0].Event != "begin" || events[1].Event != "finish" || events[2].Member != "reviewer0" || events[2].Event != "begin" || events[3].Event != "finish" {
+		t.Fatalf("sequential fork progress = %#v", events)
 	}
 	if len(client.forkEnvs) != 2 || client.forkEnvs[0]["DEV_SESSION_MEMBER_ADDRESS"] != "architect0" ||
 		client.forkEnvs[1]["DEV_SESSION_MEMBER_ADDRESS"] != "reviewer0" {

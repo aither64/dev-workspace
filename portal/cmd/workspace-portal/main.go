@@ -22,6 +22,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -480,7 +481,7 @@ func teamCommand(args []string) error {
 		"DEV_SESSION_SLUG": *slug, "DEV_SESSION_WORKSPACE": *workspace, "DEV_SESSION_WORK_DIR": *cwd,
 		"DEV_SESSION_REQUIRE_RUNTIME": "1", "DEV_SESSION_CODEX_SOCKET": *socket,
 	}
-	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog,
+	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog,
 		ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
 			models, err := client.ListModels(ctx)
 			if err != nil {
@@ -993,7 +994,7 @@ func canonicalAbsolutePath(path string) bool {
 func withCreationRoster(ctx context.Context, stateRoot, workspace, slug, rootID string,
 	run func(workspacecodex.RecoveryOptions) (string, error),
 ) (string, error) {
-	options := workspacecodex.RecoveryOptions{}
+	options := workspacecodex.RecoveryOptions{Progress: creationprogress.FromEnvironment()}
 	if stateRoot == "" {
 		return "", errors.New("creation recovery requires the selected user state root")
 	}

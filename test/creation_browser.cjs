@@ -16,7 +16,10 @@ const managedPolicy = (digest) => `<input type="hidden" name="catalogDigest" val
   <label>Lead model<select name="model" data-model-select data-managed-lead-override><option value="">Selected team default</option></select></label>
   <label>Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option></select></label>`;
 const index = () => `<!doctype html><body data-index><form id="new-session-form"><input name="creation_date" value="2026-09-13"><input name="name" required><textarea name="goal" required></textarea>${managedPolicy(catalog.current)}<input name="uploadScope"><div id="creation-uploads"></div><span id="creation-upload-controls"></span><p id="new-session-progress" hidden></p><button type="submit">Create session</button></form><script src="/static/app.js"></script>`;
-const planPage = (turnID, digest) => `<!doctype html><body data-session="source" data-thread-id="thread-1" data-interactive="true"><div id="conversation-connection"></div><div id="codex-status"></div><div id="transcript"></div><div id="pending"></div><button id="new-output" type="button" hidden>New output</button><section id="plan-actions" data-plan-turn-id="${turnID}" data-plan-sha256="${digest}"><button id="plan-implement-new" type="button">Implement in a new session</button></section><form id="message-form"><textarea name="message"></textarea><div id="message-uploads"></div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button"></button><button id="interrupt" type="button">Interrupt</button></form><dialog id="plan-session-dialog"><form id="plan-session-form"><input name="creationDate" value="2026-09-13"><input name="name" required>${managedPolicy(catalog.current)}<p id="plan-session-progress" hidden></p><button type="submit">Create session</button></form></dialog><script>document.getElementById("plan-actions").planText = "Approved plan";</script><script src="/static/app.js"></script>`;
+const planPage = (turnID, digest) => `<!doctype html><body data-session="source" data-thread-id="thread-1" data-interactive="true"><div id="conversation-connection"></div><div id="codex-status"></div><div id="transcript"></div>
+<p id="pending-status" class="lane-status" role="status"><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>
+<p id="queue-status" class="lane-status" role="status"><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>
+<button id="new-output" type="button" hidden>New output</button><section id="plan-actions" data-plan-turn-id="${turnID}" data-plan-sha256="${digest}"><button id="plan-implement-new" type="button">Implement in a new session</button></section><form id="message-form"><textarea name="message"></textarea><div id="message-uploads"></div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button"></button><button id="interrupt" type="button">Interrupt</button></form><dialog id="plan-session-dialog"><form id="plan-session-form"><input name="creationDate" value="2026-09-13"><input name="name" required>${managedPolicy(catalog.current)}<p id="plan-session-progress" hidden></p><button type="submit">Create session</button></form></dialog><script>document.getElementById("plan-actions").planText = "Approved plan";</script><script src="/static/app.js"></script>`;
 const creation = `<!doctype html><body data-creation="2026-09-13-example"><h1 id="creation-title"></h1><p id="creation-phase"></p><p id="creation-error"></p><button id="creation-retry">Retry initialization</button><p id="creation-elapsed"></p><p><a id="creation-source" hidden>Return to the source session</a></p><p id="creation-leave-note">You can leave this page while initialization continues.</p><section id="creation-request-panel"><span id="creation-request-copy"></span><pre id="creation-request"></pre></section><script src="/static/creation.js"></script>`;
 const server = http.createServer(async (req,res) => {
  const url = new URL(req.url,"http://fixture");
@@ -175,6 +178,17 @@ const server = http.createServer(async (req,res) => {
   // it is intentionally absent from native FormData: no override is sent.
   assert.deepEqual(submissions.at(-1),{creation_date:"2026-09-13",name:"example",goal:prompt,catalogDigest:"b".repeat(64),team:"solo",model:"",uploadScope:""});
   assert.equal(await page.evaluate(()=>sessionStorage.getItem("workspace-portal.creation-draft")),null);
+
+  // Existing polling renders live nested stages and the total receipt clock.
+  receipt.state="running"; receipt.error=""; receipt.startedAt=new Date(Date.now()-6500).toISOString();
+  receipt.phase="Initializing team member architect0…";
+  await page.waitForFunction(()=>document.querySelector("#creation-phase").textContent==="Initializing team member architect0…");
+  assert.equal(await page.locator("#creation-title").textContent(),"Creating session");
+  assert.match(await page.locator("#creation-elapsed").textContent(),/^Elapsed: 0m [6-9]s$/);
+  assert(await page.locator("#creation-retry").isHidden());
+  receipt.phase="Initializing team member architect0 completed (1.2 s).";
+  await page.waitForFunction(()=>document.querySelector("#creation-phase").textContent.includes("completed (1.2 s)"));
+  assert.equal(new URL(page.url()).pathname,receipt.url);
 
   // A pre-effect plan failure has no destination session. Its status remains
   // visible, links back to the source, and cannot follow conflict's canonical

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 )
 
 const threadSourceKind = "vscode"
@@ -125,6 +126,7 @@ type RecoveryOptions struct {
 	ExcludedThreads map[string]string // exact thread ID -> retained project ID (empty for legacy members)
 	RetainedRoster  bool
 	BeforeCreate    func() // releases the roster operation lock before any new thread
+	Progress        creationprogress.Observer
 }
 
 func (c *Client) RecoverCreatingThreadWithOptions(
@@ -269,6 +271,7 @@ func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string,
 		}
 		return nil
 	}
+	finish := creationprogress.Begin(options.Progress, "recovery_loaded", "")
 	loaded, err := c.LoadedThreadIDs(ctx)
 	if err != nil {
 		return nil, err
@@ -292,7 +295,13 @@ func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string,
 			}
 		}
 	}
+	finish()
 	scan := func(indexed bool) error {
+		stage := "recovery_scan"
+		if indexed {
+			stage = "recovery_index"
+		}
+		finish := creationprogress.Begin(options.Progress, stage, "")
 		seenCursors := map[string]bool{}
 		seenRows := map[string]codex.ThreadMetadata{}
 		cursor := ""
@@ -344,6 +353,7 @@ func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string,
 				}
 			}
 			if next == nil || *next == "" {
+				finish()
 				return nil
 			}
 			if seenCursors[*next] {

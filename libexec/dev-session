@@ -251,6 +251,95 @@ module DevSession
     end
   end
 
+  CREATION_PROGRESS_ENV = 'DEV_WORKSPACE_CREATION_PROGRESS'
+  CREATION_PROGRESS_PREFIX = "\x1eDEV_WORKSPACE_CREATION_PROGRESS/1 ".b.freeze
+  CREATION_PROGRESS_STAGES = %w[prepare conversation recovery_loaded recovery_index recovery_scan team_member prompt terminal evidence].freeze
+
+  # Candidate records are bounded independently of ordinary diagnostics. A bad
+  # record never stops pipe draining or changes the child command's exit status.
+  class CreationProgressDecoder
+    attr_reader :diagnostics
+
+    def initialize(output)
+      @output = output
+      @diagnostics = ''.b
+      @pending = ''.b
+      @discard = false
+      @rejected_bytes = 0
+      @warned = false
+    end
+
+    def feed(data)
+      data.each_byte do |byte|
+        if @discard
+          @discard = false if byte == 10
+          next
+        end
+        if @pending.empty? && byte != 30
+          @diagnostics << byte
+          next
+        end
+        @pending << byte
+        if @pending.bytesize > 4096
+          @pending.clear
+          @discard = byte != 10
+          notice
+          next
+        end
+        next unless byte == 10
+
+        frame = @pending
+        @pending = ''.b
+        if valid_frame?(frame)
+          @output.write(frame)
+          @output.flush if @output.respond_to?(:flush)
+        else
+          reject(frame)
+        end
+      end
+    end
+
+    def finish
+      reject(@pending) unless @pending.empty?
+      @pending.clear
+      @diagnostics.force_encoding(Encoding.default_external)
+    end
+
+    private
+
+    def valid_frame?(frame)
+      return false unless frame.start_with?(CREATION_PROGRESS_PREFIX)
+      data = frame.byteslice(CREATION_PROGRESS_PREFIX.bytesize...-1).force_encoding(Encoding::UTF_8)
+      return false unless data.valid_encoding?
+      event = JSON.parse(data, object_class: StrictJSONHash)
+      return false unless event.is_a?(Hash) && (event.keys - %w[stage event elapsedMs member]).empty?
+      return false unless CREATION_PROGRESS_STAGES.include?(event['stage']) && %w[begin finish].include?(event['event'])
+      elapsed = event['elapsedMs']
+      return false unless elapsed.is_a?(Integer) && elapsed.between?(0, 86_400_000)
+      return false if event['event'] == 'begin' && elapsed != 0
+      return true unless event.key?('member')
+      event['stage'] == 'team_member' && event['member'].is_a?(String) &&
+        event['member'].match?(/\A[a-z][a-z0-9]{0,127}\z/)
+    rescue JSON::ParserError
+      false
+    end
+
+    def reject(frame)
+      if @rejected_bytes + frame.bytesize <= 16 * 1024
+        @diagnostics << frame
+        @rejected_bytes += frame.bytesize
+      else
+        notice
+      end
+    end
+
+    def notice
+      return if @warned
+      @warned = true
+      @diagnostics << "[invalid or oversized creation progress records omitted]\n"
+    end
+  end
+
   class CommandRunner
     def with_output(out)
       previous = @out
@@ -283,13 +372,55 @@ module DevSession
 	  descriptor_options[:stdin_data] = input unless input.nil?
       arguments = env ? [env, *command] : command
       arguments << descriptor_options unless descriptor_options.empty?
-      stdout, stderr, status = Open3.capture3(*arguments)
+      if env && env[CREATION_PROGRESS_ENV] == '1'
+        descriptor_options.delete(:stdin_data)
+        stdout, stderr, status = capture_progress(arguments, input)
+      else
+        stdout, stderr, status = Open3.capture3(*arguments)
+      end
 
       unless allow_failure || status.success?
         raise CommandError.new(argv, status, stdout, stderr)
       end
 
       [stdout, stderr, status]
+    end
+
+    def capture_progress(arguments, input)
+      Open3.popen3(*arguments) do |stdin, stdout, stderr, process|
+        readers = []
+        begin
+          writer = Thread.new do
+            begin
+              stdin.write(input) unless input.nil?
+            rescue Errno::EPIPE
+              # The child may reject the request before reading input.
+            ensure
+              stdin.close
+            end
+          end
+          output = Thread.new { stdout.read }
+          errors = Thread.new do
+            decoder = CreationProgressDecoder.new(@err)
+            begin
+              loop { decoder.feed(stderr.readpartial(16 * 1024)) }
+            rescue EOFError
+              decoder.finish
+            end
+          end
+          readers = [writer, output, errors]
+          readers.each { |thread| thread.report_on_exception = false }
+          status = process.value
+          writer.value
+          [output.value, errors.value, status]
+        ensure
+          if process.alive?
+            Process.kill('TERM', process.pid) rescue Errno::ESRCH
+          end
+          [stdin, stdout, stderr].each { |pipe| pipe.close unless pipe.closed? }
+          readers.each(&:join)
+        end
+      end
     end
 
     def run(argv, env: nil, pass_fds: [])
@@ -586,6 +717,8 @@ module DevSession
       end
       @workspace = File.realpath(expanded_workspace)
       @env = env.to_h
+      @creation_progress = @env.delete(CREATION_PROGRESS_ENV) == '1'
+      ENV.delete(CREATION_PROGRESS_ENV) if @creation_progress
       @state_home = File.expand_path(
         env.fetch('XDG_STATE_HOME', File.join(Dir.home, '.local', 'state'))
       )
@@ -763,6 +896,7 @@ module DevSession
         runtime_journal = nil
 
         selected_session = with_slug_lock(slug) do
+          preparation_started = creation_progress_begin('prepare')
           select_tmux_for_slug!(slug)
           if lifecycle_operation == 'revive'
             prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
@@ -904,6 +1038,7 @@ module DevSession
               end
             end
           end
+          creation_progress_finish('prepare', preparation_started)
           recovering_creation = !fresh_creation && run_codex &&
                                 creation_journal&.fetch('state', nil) == 'creating' &&
                                 manifest.dig('creation', 'state') == 'creating' &&
@@ -983,6 +1118,7 @@ module DevSession
                   "existing tmux session does not use the recorded Codex endpoint; " \
                   "stop it before enabling portal interaction: #{slug}"
           end
+          terminal_started = creation_progress_begin('terminal')
           selected = if selected
                        selected = ensure_managed_session!(slug, session: selected)
                        if run_codex
@@ -1008,6 +1144,7 @@ module DevSession
 
           selected = sync_slug(slug, require_session: true, session: selected)
           manifest = load_portal_manifest(portal_file(slug), required: true)
+          creation_progress_finish('terminal', terminal_started)
           trusted_thread_id = thread_id
 	  apply_direct_team_preset!(slug, thread_id, direct_team) if goal_pending && direct_team
           if goal_pending && !manifest.fetch('creation').key?('initial_goal_attempted')
@@ -1046,6 +1183,7 @@ module DevSession
           # slug lock is released. The initial turn can safely invoke workspace
           # helpers while duplicate creation and destructive lifecycle commands
           # remain excluded by the host-only creation lock.
+          prompt_started = creation_progress_begin('prompt')
           send_portal_goal(
             slug,
             thread_id,
@@ -1072,6 +1210,7 @@ module DevSession
             current
           end
         end
+        creation_progress_finish('prompt', prompt_started) if goal_pending
         if receipt
           with_slug_lock(slug) do
             write_portal_creation_evidence!(receipt, slug, selected_session)
@@ -1129,6 +1268,7 @@ module DevSession
         creation_receipt_id, creation_evidence,
         expected_source:, expected_source_thread:, expected_source_identity:
       )
+      preparation_started = creation_progress_begin('prepare')
       destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
       journal = load_fork_journal(destination_slug)
       verify_creation_source!(receipt) if receipt && receipt['source'] && journal.nil?
@@ -1168,6 +1308,7 @@ module DevSession
         effort:,
         receipt:
       ))
+        creation_progress_finish('prepare', preparation_started)
         write_fork_result(recovered, destination_slug, source_slug, json:)
         return
       end
@@ -1258,6 +1399,7 @@ module DevSession
           unless Dir.children(worktrees_dir(destination_slug)).empty?
             raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
           end
+          creation_progress_finish('prepare', preparation_started)
           selected = cleanup_session(destination_slug)
           delete_session_authority(destination_slug) if @selected_authority && selected.nil?
           if selected
@@ -1275,9 +1417,11 @@ module DevSession
             end
           end
           if selected
+            terminal_started = creation_progress_begin('terminal')
             selected = ensure_managed_session!(destination_slug, session: selected)
             selected = reconcile_native_client!(destination_slug, selected)
             write_session_authority(destination_slug, selected, state: 'ready')
+            creation_progress_finish('terminal', terminal_started)
 			fork_team_members!(source_slug, destination_slug)
             write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
             delete_fork_journal(destination_slug)
@@ -1304,6 +1448,7 @@ module DevSession
           if @portal_command && codex_provenance_configured?
             require_portal_thread_materialized(destination_slug, thread_id)
           end
+          terminal_started = creation_progress_begin('terminal')
           selected = create_tmux_session(
             destination_slug,
             run_codex: true,
@@ -1315,6 +1460,7 @@ module DevSession
             raise Error, "created tmux session does not match fork identity for #{destination_slug}"
           end
           write_session_authority(destination_slug, selected, state: 'ready')
+          creation_progress_finish('terminal', terminal_started)
 		  fork_team_members!(source_slug, destination_slug)
           write_portal_creation_evidence!(receipt, destination_slug, selected) if receipt
           delete_fork_journal(destination_slug)
@@ -1561,7 +1707,7 @@ module DevSession
         output, = if action == 'assign'
                     @command_runner.capture(command, input: message.to_s)
                   else
-                    @command_runner.capture(command)
+                    action == 'fork' ? creation_capture(command) : @command_runner.capture(command)
                   end
       rescue Error => e
         raise Error, "#{e.message}\nIf it may have been sent, retry with --message-id #{message_id}" if action == 'assign' && message_id
@@ -2688,6 +2834,24 @@ module DevSession
         !direct_team_state_present?(slug)
     end
 
+    def creation_capture(command)
+      @command_runner.capture(command, env: @creation_progress ? { CREATION_PROGRESS_ENV => '1' } : nil)
+    end
+
+    def creation_progress_begin(stage)
+      return unless @creation_progress
+      @err.write(CREATION_PROGRESS_PREFIX + JSON.generate(stage:, event: 'begin', elapsedMs: 0) + "\n")
+      @err.flush if @err.respond_to?(:flush)
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def creation_progress_finish(stage, started)
+      return unless started
+      elapsed = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).to_i
+      @err.write(CREATION_PROGRESS_PREFIX + JSON.generate(stage:, event: 'finish', elapsedMs: elapsed) + "\n")
+      @err.flush if @err.respond_to?(:flush)
+    end
+
     def slug_state_exists?(slug)
       lifecycle_journal_exists = LIFECYCLE_JOURNAL_NAMES.keys.any? do |command|
         path_exists?(lifecycle_journal_file(slug, command))
@@ -3604,6 +3768,7 @@ module DevSession
     end
 
     def write_portal_creation_evidence!(receipt, slug, selected)
+      evidence_started = creation_progress_begin('evidence')
       manifest = load_portal_manifest(portal_file(slug), required: true)
       binding = receipt.fetch('binding')
       unless selected && selected.codex_thread_id == manifest.dig('codex', 'thread_id') &&
@@ -3651,6 +3816,7 @@ module DevSession
 		)
 	  end
       write_creation_journal(receipt.fetch('evidence'), evidence, create: false)
+      creation_progress_finish('evidence', evidence_started)
     end
 
     def creation_journal_file(slug)
@@ -4167,6 +4333,7 @@ module DevSession
         return nil
       end
 
+      conversation_started = creation_progress_begin('conversation')
       environment = session_environment(slug)
       command = [*@portal_command, 'thread', 'create', '--user-state-root', @workspace_state_root]
       THREAD_ENV_ARGUMENTS.each do |name, argument|
@@ -4179,13 +4346,14 @@ module DevSession
       command += ['--model', model] if model
       command += ['--effort', effort] if effort
       command += ['--lead-instructions', lead_instructions] if lead_instructions
-      stdout, _stderr, _status = @command_runner.capture(command)
+      stdout, _stderr, _status = creation_capture(command)
       result = JSON.parse(stdout)
       thread_id = result['threadId']
       unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
         raise Error, 'workspace-portal returned an invalid Codex thread id'
       end
 
+      creation_progress_finish('conversation', conversation_started)
       thread_id
     rescue JSON::ParserError => e
       raise Error, "workspace-portal returned invalid JSON: #{e.message}"
@@ -4196,6 +4364,7 @@ module DevSession
         raise Error, 'workspace-portal is required to fork a Codex conversation'
       end
 
+      conversation_started = creation_progress_begin('conversation')
       environment = session_environment(slug)
       command = [*@portal_command, 'thread', 'fork', '--thread-id', source_thread_id,
                  '--user-state-root', @workspace_state_root]
@@ -4207,13 +4376,14 @@ module DevSession
       command += ['--model', model] if model
       command += ['--effort', effort] if effort
       command += ['--lead-instructions', lead_instructions] if lead_instructions
-      stdout, _stderr, _status = @command_runner.capture(command)
+      stdout, _stderr, _status = creation_capture(command)
       result = JSON.parse(stdout)
       thread_id = result['threadId']
       unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
         raise Error, 'workspace-portal returned an invalid Codex thread id'
       end
 
+      creation_progress_finish('conversation', conversation_started)
       thread_id
     rescue JSON::ParserError => e
       raise Error, "workspace-portal returned invalid JSON: #{e.message}"
@@ -4356,7 +4526,7 @@ module DevSession
 		'--preset-file', snapshot.path
 	  ]
 	  command += ['--socket', @codex_socket] if @codex_socket
-	  stdout, _stderr, _status = @command_runner.capture(command)
+	  stdout, _stderr, _status = creation_capture(command)
 	  result = JSON.parse(stdout)
 	  unless result.is_a?(Hash) && result['rootThreadId'] == root_thread_id && result['slug'] == slug
 		raise Error, 'workspace-portal returned an invalid direct team roster'

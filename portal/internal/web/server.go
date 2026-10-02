@@ -30,6 +30,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -1355,6 +1356,27 @@ func (s *Server) runDevSessionWithTransition(
 		command.Env = append(os.Environ(), "DEV_WORKSPACE_TRANSITION_LOCK_FD=3")
 	}
 	return runDevSessionCommand(commandCtx, command)
+}
+
+// Creation alone opts into ephemeral stderr progress. exec.Wait joins the
+// stderr copy goroutine before this returns, so no callback outlives the result.
+func (s *Server) runCreationCommand(parent context.Context, timeout time.Duration, transition *os.File,
+	observer creationprogress.Observer, args ...string,
+) (string, string, error) {
+	commandCtx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	command := exec.Command(s.config.DevSession, args...)
+	command.Env = append(os.Environ(), creationprogress.Environment+"=1")
+	if transition != nil {
+		command.ExtraFiles = []*os.File{transition}
+		command.Env = append(command.Env, "DEV_WORKSPACE_TRANSITION_LOCK_FD=3")
+	}
+	var stdout, stderr bytes.Buffer
+	decoder := creationprogress.NewDecoder(&stderr, observer)
+	command.Stdout, command.Stderr = &stdout, decoder
+	err := processgroup.Run(commandCtx, command)
+	_ = decoder.Close()
+	return stdout.String(), stderr.String(), err
 }
 
 func runDevSessionCommand(commandCtx context.Context, command *exec.Cmd) (string, string, error) {
