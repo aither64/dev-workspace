@@ -1,3 +1,13 @@
+# Work around missing complete-package metadata/resources in llm-agents, as
+# required by the upstream native daemon, without changing Codex Rust code:
+# https://github.com/numtide/llm-agents.nix/issues/9887
+# https://github.com/numtide/llm-agents.nix/pull/9889
+# https://github.com/openai/codex/issues/48050
+# Remove only when the selected llm-agents output is complete and daemon-copyable
+# with materialized helpers; migrate workspace and system consumers to it first.
+# Require existing startup/resume/fork, manifest/helper/copy and closure-retention
+# checks, preserving roots/dependencies and regression coverage. Issue closure or
+# a newer CLI version alone is insufficient. See ../docs/codex-package.md.
 { pkgs, codex }:
 let
   inherit (pkgs) lib;

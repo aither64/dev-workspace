@@ -10,6 +10,23 @@ System configurations can pass their selected Codex output to the same helper.
 Each consumer supplies its own `pkgs`, so equal Codex versions can have different
 dependency closures.
 
+## Upstream packaging and removal
+
+The helper is a downstream workaround for missing complete-package metadata
+and resources in the selected llm-agents output. It leaves Codex Rust code
+unchanged. The complete-package layout is required by the upstream native daemon. See
+[llm-agents issue #9887](https://github.com/numtide/llm-agents.nix/issues/9887),
+[the proposed complete-layout packaging in PR #9889](https://github.com/numtide/llm-agents.nix/pull/9889)
+and [Codex issue #48050](https://github.com/openai/codex/issues/48050).
+
+Remove the helper only when the selected llm-agents Codex output itself provides
+a complete, daemon-copyable package with materialized helpers. Both workspace
+and system consumers must use that output directly and pass the existing
+normal-startup, resume/fork, manifest/helper/copy and closure-retention checks.
+Issue closure or a newer CLI version alone is insufficient. Migrate both
+consumers before removing the helper. Preserve retained roots and their
+dependencies, and keep the regression coverage.
+
 ## Runtime layout
 
 The package has these paths:
