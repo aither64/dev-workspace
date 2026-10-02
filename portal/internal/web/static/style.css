@@ -255,6 +255,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .chat-form textarea { margin: 0 0 .7rem; min-height: 3.5rem; max-height: min(25dvh, 14rem); }
 .chat-actions > div { display: flex; gap: .55rem; }
 .chat-actions .composer-controls { display: flex; gap: .55rem; }
+#codex-settings-status { overflow-wrap: anywhere; }
+#codex-settings-status:empty { display: none; }
 .pending { display: grid; gap: .6rem; }
 .approval { border: 1px solid #66532e; border-radius: 10px; padding: .75rem; background: #211d14; }
 .approval pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 190px; overflow-y: auto; }
@@ -350,6 +352,12 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .index-page { overflow-y: auto; align-content: start; padding: clamp(1rem, 4vw, 3rem); }
 .index-page .new-session { grid-template-columns: minmax(0, 1fr); max-width: 800px; width: 100%; justify-self: center; gap: 1.25rem; }
 .index-page .new-session p { line-height: 1.5; }
+
+@media (min-width: 981px) {
+  .chat-actions .composer-controls { flex: 1; min-width: 0; justify-content: flex-end; flex-wrap: wrap; }
+  .composer-controls .compact-select { flex: 1 1 min-content; }
+  .chat-actions > div > button { padding: .5rem .65rem; font-size: .8rem; }
+}
 
 @media (max-width: 980px) {
   .chat-actions, .chat-actions .composer-controls { flex-wrap: wrap; }

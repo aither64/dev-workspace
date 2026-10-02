@@ -4280,7 +4280,7 @@
         liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
         applyButton.disabled = !editable || !dirty || !validPair();
         cancelButton.disabled = saving || !dirty;
-        if (liveSettingsStatus && !saving) liveSettingsStatus.textContent = notice || (dirty ? "Codex settings have unsaved changes" : "");
+        if (liveSettingsStatus && !saving) liveSettingsStatus.textContent = notice;
       },
       confirm(model, effort) {
         if (!model || !effort) return;
