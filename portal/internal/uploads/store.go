@@ -9,13 +9,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -38,11 +41,44 @@ func DefaultLimits() conversation.UploadLimits {
 }
 
 type Store struct {
-	Directory    string
-	Workspace    string
-	UploadLimits conversation.UploadLimits
-	MinFreeBytes uint64
-	Now          func() time.Time
+	Directory          string
+	Workspace          string
+	UploadLimits       conversation.UploadLimits
+	MinFreeBytes       uint64
+	Now                func() time.Time
+	catalogUnconfirmed atomic.Bool // Decisions are made under the catalog lock.
+	directorySync      func(string) error
+}
+
+var ErrPersistenceUnconfirmed = errors.New("upload catalog persistence is unconfirmed")
+
+func (store *Store) syncCatalogDirectory() error {
+	if store.directorySync != nil {
+		return store.directorySync(store.Directory)
+	}
+	dir, err := os.Open(store.Directory)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// Called inside the catalog transaction, including unchanged claim replay.
+func (store *Store) confirmCatalog() error {
+	file, err := os.OpenFile(filepath.Join(store.Directory, "catalog.json"), os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err == nil {
+		err = file.Sync()
+		file.Close()
+	}
+	if err == nil {
+		err = store.syncCatalogDirectory()
+	}
+	store.catalogUnconfirmed.Store(err != nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPersistenceUnconfirmed, err)
+	}
+	return nil
 }
 
 type Scope struct {
@@ -174,6 +210,11 @@ func (store *Store) transaction(ctx context.Context, fn func(*catalog) (bool, er
 			return errors.New("invalid upload record")
 		}
 	}
+	if store.catalogUnconfirmed.Load() {
+		if err := store.confirmCatalog(); err != nil {
+			return err
+		}
+	}
 	originalRecords, originalChunks := catalogSize(&data)
 	compacted := store.compact(&data)
 	changed, err := fn(&data)
@@ -207,12 +248,8 @@ func (store *Store) transaction(ctx context.Context, fn func(*catalog) (bool, er
 	if err = os.Rename(temp.Name(), path); err != nil {
 		return err
 	}
-	dir, err := os.Open(store.Directory)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	store.catalogUnconfirmed.Store(true)
+	return store.confirmCatalog()
 }
 
 func catalogSize(data *catalog) (records, chunks int) {
@@ -353,7 +390,12 @@ func (store *Store) AdoptInitial(ctx context.Context, digest, slug, thread, epoc
 				continue
 			}
 			scope := data.Scopes[entry.Scope]
-			if scope.Deleted || (!scope.Draft && (scope.Slug != slug || scope.Thread != thread || scope.Epoch != epoch)) {
+			if strings.HasPrefix(entry.Attempt, "preparation:") {
+				if err := preparationClaimConflict(data, entry.Scope, key); err != nil {
+					return false, err
+				}
+			}
+			if scope.Deleted || (scope.Slug != "" && (scope.Slug != slug || scope.Epoch != epoch)) || (!scope.Draft && scope.Thread != thread) {
 				return false, problem(409, "Initial attachment ownership changed")
 			}
 			scope.Draft = false
@@ -498,6 +540,9 @@ func (backend *Backend) Create(ctx context.Context, request conversation.UploadR
 		}
 		// Recover an existing client identity before applying current admission
 		// rules: older versions may have accepted names we now reject.
+		if err := preparationMutation(data, backend.ScopeID); err != nil {
+			return false, err
+		}
 		// Names are display metadata. filePath derives storage paths from a generated
 		// ID and a restricted extension, even when a name contains path separators.
 		if request.Name == "" {
@@ -575,6 +620,9 @@ func (backend *Backend) Append(ctx context.Context, id string, offset int64, che
 		return result, problem(400, "Upload chunk size or checksum is invalid")
 	}
 	err = store.transaction(ctx, func(data *catalog) (bool, error) {
+		if err := preparationMutation(data, backend.ScopeID); err != nil {
+			return false, err
+		}
 		record, ok := data.Files[id]
 		if !ok || record.Scope != backend.ScopeID {
 			return false, problem(404, "File is unavailable")
@@ -613,6 +661,9 @@ func (backend *Backend) Complete(ctx context.Context, id string) (conversation.U
 	var result conversation.Upload
 	store := backend.Store
 	err := store.transaction(ctx, func(data *catalog) (bool, error) {
+		if err := preparationMutation(data, backend.ScopeID); err != nil {
+			return false, err
+		}
 		record, ok := data.Files[id]
 		if !ok || record.Scope != backend.ScopeID {
 			return false, problem(404, "File is unavailable")
@@ -710,6 +761,9 @@ func (backend *Backend) Delete(ctx context.Context, id string, confirmed bool) e
 		defer release()
 	}
 	err := store.transaction(ctx, func(data *catalog) (bool, error) {
+		if err := preparationMutation(data, backend.ScopeID); err != nil {
+			return false, err
+		}
 		record, ok := data.Files[id]
 		if !ok || !accessible(data, backend.ScopeID, id) {
 			return false, problem(404, "File is unavailable")
@@ -761,77 +815,198 @@ func (backend *Backend) Delete(ctx context.Context, id string, confirmed bool) e
 	return store.reclaim(ctx)
 }
 
-func (backend *Backend) Prepare(ctx context.Context, kind, attempt, text string, ids []string) (string, error) {
-	store := backend.Store
-	var wire string
-	text = strings.TrimSpace(text)
-	if len(ids) > store.UploadLimits.Files {
-		return "", problem(400, "Too many files for one prompt")
+// preparationMutation is checked inside the catalog transaction, after any
+// caller-side lock. Pending request ownership uses existing schema-1 fields.
+func preparationMutation(data *catalog, scopeID string) error {
+	if !data.Scopes[scopeID].Draft {
+		return nil
 	}
+	for _, entry := range data.Submissions {
+		if entry.Scope == scopeID && entry.Kind == "initial" &&
+			strings.HasPrefix(entry.Attempt, "preparation:") && entry.State == "pending" {
+			return problem(409, "Initial files belong to an accepted session request")
+		}
+	}
+	return nil
+}
+
+func (backend *Backend) Prepare(ctx context.Context, kind, attempt, text string, ids []string) (string, error) {
+	var wire string
+	err := backend.Store.transaction(ctx, func(data *catalog) (bool, error) {
+		if err := preparationMutation(data, backend.ScopeID); err != nil {
+			return false, err
+		}
+		var changed bool
+		var err error
+		wire, changed, err = backend.Store.prepareSubmission(data, backend.ScopeID, kind, attempt, strings.TrimSpace(text), ids, false)
+		return changed, err
+	})
+	return wire, err
+}
+
+// ClaimPreparation atomically freezes one exclusive initial submission. Older
+// collectors retain its pending files without understanding its request ID.
+func (store *Store) ClaimPreparation(ctx context.Context, requestID, scopeID, text string, ids []string) (string, error) {
+	if len(ids) == 0 {
+		return strings.TrimSpace(text), nil
+	}
+	if !idPattern.MatchString(requestID) {
+		return "", problem(400, "Invalid session request identity")
+	}
+	var wire string
 	err := store.transaction(ctx, func(data *catalog) (bool, error) {
-		key := backend.ScopeID + "/" + kind + "/" + attempt
-		if previous, ok := data.Submissions[key]; ok {
-			if previous.Text != text || !slices.Equal(previous.Files, ids) {
-				return false, problem(409, "Submission identity was reused with different attachments or text")
+		var changed bool
+		var err error
+		wire, changed, err = store.preparePreparation(data, requestID, scopeID, text, ids)
+		if err == nil && !changed {
+			err = store.confirmCatalog()
+		}
+		return changed, err
+	})
+	return wire, err
+}
+
+// ValidatePreparation checks the same ready-file and exclusive-scope rules
+// before an intent is persisted. ClaimPreparation rechecks them atomically.
+func (store *Store) ValidatePreparation(ctx context.Context, requestID, scopeID, text string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return store.transaction(ctx, func(data *catalog) (bool, error) {
+		// Compaction may save this transaction even when validation reports no
+		// changes. Isolate the claim and file timestamps until intent is durable.
+		candidate := *data
+		candidate.Files = maps.Clone(data.Files)
+		candidate.Submissions = maps.Clone(data.Submissions)
+		_, _, err := store.preparePreparation(&candidate, requestID, scopeID, text, ids)
+		return false, err
+	})
+}
+
+func (store *Store) preparePreparation(data *catalog, requestID, scopeID, text string, ids []string) (string, bool, error) {
+	key := scopeID + "/initial/preparation:" + requestID
+	if previous, ok := data.Submissions[key]; ok {
+		if err := preparationClaimConflict(data, scopeID, key); err != nil {
+			return "", false, err
+		}
+		if previous.Text != text || !slices.Equal(previous.Files, ids) || (previous.State != "pending" && previous.State != "observed") {
+			return "", false, problem(409, "Initial attachment request changed")
+		}
+		return previous.Wire, false, nil
+	}
+	scope, ok := data.Scopes[scopeID]
+	if !ok || scope.Deleted || !scope.Draft || scope.Slug != "" {
+		return "", false, problem(409, "Initial attachment scope is unavailable")
+	}
+	if err := preparationMutation(data, scopeID); err != nil {
+		return "", false, err
+	}
+	for _, sub := range data.Submissions {
+		if sub.Scope == scopeID && sub.State != "cancelled" {
+			return "", false, problem(409, "Initial files already belong to another submission")
+		}
+	}
+	return store.prepareSubmission(data, scopeID, "initial", "preparation:"+requestID, text, ids, true)
+}
+
+func preparationClaimConflict(data *catalog, scopeID, ownerKey string) error {
+	scope, ok := data.Scopes[scopeID]
+	if !ok || scope.Deleted {
+		return problem(409, "Initial attachment ownership changed")
+	}
+	if scope.Draft {
+		for key, sub := range data.Submissions {
+			if key != ownerKey && sub.Scope == scopeID && sub.State != "cancelled" {
+				return problem(409, "Initial files have a competing submission")
 			}
-			if previous.State != "prepared" && previous.State != "cancelled" {
-				wire = previous.Wire
-				return false, nil
-			}
 		}
-		if len(ids) == 0 {
-			wire = text
-			return false, nil
+	}
+	return nil
+}
+
+func (store *Store) BindPreparation(ctx context.Context, requestID, scopeID, wire, slug, epoch string) error {
+	return store.transaction(ctx, func(data *catalog) (bool, error) {
+		key := scopeID + "/initial/preparation:" + requestID
+		if err := preparationClaimConflict(data, scopeID, key); err != nil {
+			return false, err
 		}
-		if len(data.Submissions) >= maxRecords {
-			return false, problem(507, "Too many stored attachment submissions")
+		entry, ok := data.Submissions[key]
+		scope := data.Scopes[scopeID]
+		if !ok || entry.Wire != wire || (entry.State != "pending" && entry.State != "observed") || scope.Deleted ||
+			(scope.Slug != "" && (scope.Slug != slug || scope.Epoch != epoch)) {
+			return false, problem(409, "Initial attachment ownership changed")
 		}
-		descriptions := []struct {
+		scope.Slug, scope.Epoch = slug, epoch
+		data.Scopes[scopeID] = scope
+		return true, nil
+	})
+}
+
+func (store *Store) prepareSubmission(data *catalog, scopeID, kind, attempt, text string, ids []string, pending bool) (wire string, changed bool, err error) {
+	if len(ids) > store.UploadLimits.Files {
+		return "", false, problem(400, "Too many files for one prompt")
+	}
+	key := scopeID + "/" + kind + "/" + attempt
+	if previous, ok := data.Submissions[key]; ok {
+		if previous.Text != text || !slices.Equal(previous.Files, ids) {
+			return "", false, problem(409, "Submission identity was reused with different attachments or text")
+		}
+		if previous.State != "prepared" && previous.State != "cancelled" {
+			wire = previous.Wire
+			return wire, false, nil
+		}
+	}
+	if len(ids) == 0 {
+		wire = strings.TrimSpace(text)
+		return wire, false, nil
+	}
+	if len(data.Submissions) >= maxRecords {
+		return "", false, problem(507, "Too many stored attachment submissions")
+	}
+	descriptions := []struct {
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+		Path string `json:"path"`
+	}{}
+	var total int64
+	seen := map[string]bool{}
+	for _, id := range ids {
+		record, ok := data.Files[id]
+		if !ok || !accessible(data, scopeID, id) || record.State != "ready" || seen[id] {
+			return "", false, problem(400, "An attachment is unavailable, incomplete or repeated")
+		}
+		seen[id] = true
+		total += record.Size
+		if total > store.UploadLimits.PromptBytes {
+			return "", false, problem(413, "Attachments exceed the prompt size limit")
+		}
+		info, err := os.Lstat(store.filePath(record, false))
+		if err != nil || !info.Mode().IsRegular() || info.Size() != record.Size {
+			return "", false, problem(409, "An uploaded file is unavailable")
+		}
+		descriptions = append(descriptions, struct {
 			Name string `json:"name"`
 			Size int64  `json:"size"`
 			Path string `json:"path"`
-		}{}
-		var total int64
-		seen := map[string]bool{}
-		for _, id := range ids {
-			record, ok := data.Files[id]
-			if !ok || !accessible(data, backend.ScopeID, id) || record.State != "ready" || seen[id] {
-				return false, problem(400, "An attachment is unavailable, incomplete or repeated")
-			}
-			seen[id] = true
-			total += record.Size
-			if total > store.UploadLimits.PromptBytes {
-				return false, problem(413, "Attachments exceed the prompt size limit")
-			}
-			info, err := os.Lstat(store.filePath(record, false))
-			if err != nil || !info.Mode().IsRegular() || info.Size() != record.Size {
-				return false, problem(409, "An uploaded file is unavailable")
-			}
-			descriptions = append(descriptions, struct {
-				Name string `json:"name"`
-				Size int64  `json:"size"`
-				Path string `json:"path"`
-			}{record.Name, record.Size, store.filePath(record, false)})
-		}
-		encoded, _ := json.MarshalIndent(descriptions, "", "  ")
-		wire = strings.TrimSpace(text + "\n\nAttached local files (inputs; keep these files outside version control):\n" + string(encoded))
-		if len(wire) > session.MaxMessageBytes {
-			return false, problem(413, "Message and attachment references exceed the prompt limit")
-		}
-		data.Submissions[key] = submission{Scope: backend.ScopeID, Kind: kind, Attempt: attempt, Text: text, Wire: wire, Files: append([]string(nil), ids...), State: "pending"}
-		if kind == "initial" {
-			entry := data.Submissions[key]
-			entry.State = "prepared"
-			data.Submissions[key] = entry
-		}
-		for _, id := range ids {
-			record := data.Files[id]
-			record.Updated = store.Now()
-			data.Files[id] = record
-		}
-		return true, nil
-	})
-	return wire, err
+		}{record.Name, record.Size, store.filePath(record, false)})
+	}
+	encoded, _ := json.MarshalIndent(descriptions, "", "  ")
+	wire = strings.TrimSpace(text + "\n\nAttached local files (inputs; keep these files outside version control):\n" + string(encoded))
+	if len(wire) > session.MaxMessageBytes {
+		return "", false, problem(413, "Message and attachment references exceed the prompt limit")
+	}
+	data.Submissions[key] = submission{Scope: scopeID, Kind: kind, Attempt: attempt, Text: text, Wire: wire, Files: append([]string(nil), ids...), State: "pending"}
+	if kind == "initial" && !pending {
+		entry := data.Submissions[key]
+		entry.State = "prepared"
+		data.Submissions[key] = entry
+	}
+	for _, id := range ids {
+		record := data.Files[id]
+		record.Updated = store.Now()
+		data.Files[id] = record
+	}
+	return wire, true, nil
 }
 
 func (backend *Backend) ObserveTranscript(ctx context.Context, transcript *codex.Transcript) error {
