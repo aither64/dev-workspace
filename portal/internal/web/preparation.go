@@ -149,9 +149,7 @@ func (s *Server) preparationRoute(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, status)
 		return
 	}
-	// Browser endpoint wiring is a separate implementation unit. The existing
-	// progress template already renders accepted text safely before JS loads.
-	s.render(w, "creation", pageData{InitialRequest: status.InitialRequest, Session: &session.Summary{Manifest: session.Manifest{Slug: id}}})
+	s.render(w, "creation", pageData{InitialRequest: status.InitialRequest, Preparation: &status})
 }
 
 func (s *Server) preparationStatus(id string) (preparationStatus, bool) {

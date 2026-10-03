@@ -1323,127 +1323,179 @@
     const eligible = creationSubmitEligible({
       uploadReady: state.uploadReady,
       recoveryPending: managedFormRecoveryPending(form),
-      inFlight: state.inFlight,
+      inFlight: state.inFlight || form.dataset.requestLocked === "true" || state.storageReady === false,
     });
     managedFormSubmitButtons(form).forEach((button) => { button.disabled = !eligible; });
     return eligible;
   };
+  let initializeNewSession = () => {};
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
-    let creationUploads = null;
-    const updateCreationSubmitEligibility = (changes = {}) => updateManagedFormSubmitEligibility(form, changes);
-    let creationDraftStorage;
-    const creationDraftKey = "workspace-portal.creation-draft";
-    try { creationDraftStorage = globalThis.sessionStorage; } catch (_) {}
-    const saveCreationDraft = () => {
-      const policy = managedDraftPolicyForStorage(form, {
-        model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
-        team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
+    initializeNewSession = () => {
+      if (!form) return;
+      let creationUploads = null, savedRequest = null, recovering = false;
+      const progress = document.getElementById("new-session-progress");
+      const recovery = document.getElementById("new-session-recovery");
+      const recoverButton = document.getElementById("new-session-recover");
+      const separateRequest = document.getElementById("new-session-separate");
+      const readFields = () => ({
+        name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
+        ...managedDraftPolicyForStorage(form, {
+          model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
+          team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
+        }),
       });
-      const draft = normalizeCreationDraft({
-        name: form.elements.name.value, goal: form.elements.goal.value,
-        date: form.elements.creation_date.value,
-        ...policy,
-      }, "new");
-      if (draft) {
-        creationDraft = draft;
-        storeCreationDraft(creationDraftStorage, creationDraftKey, draft, "new");
-      }
-    };
-    if (form) {
+      const showFailure = (error) => {
+        progress.hidden = false; progress.textContent = error.message;
+        if (savedRequest && savedRequest.draft.body !== null) {
+          recovery.hidden = false;
+          recovery.querySelector("[data-request-identity]").textContent = `Saved request: ${savedRequest.draft.requestId}`;
+          if (separateRequest) {
+            separateRequest.hidden = false;
+            separateRequest.querySelector("[data-saved-request-text]").value = savedRequest.draft.goal;
+          }
+        } else if (error.requestId) {
+          recovery.hidden = false;
+          recovery.querySelector("[data-request-identity]").textContent = `Saved request: ${error.requestId}. Enable browser storage and reload this tab to recover.`;
+          recoverButton.disabled = true;
+        }
+      };
+      const lockRequest = () => {
+        if (savedRequest) creationDraft = savedRequest.draft;
+        const locked = Boolean(savedRequest && savedRequest.draft.body !== null);
+        const migrationNotice = document.getElementById("creation-draft-notice");
+        if (migrationNotice) migrationNotice.hidden = locked || !creationDraft?.migratedUploads;
+        form.dataset.requestLocked = String(locked);
+        form.querySelectorAll("input, textarea, select").forEach((field) => {
+          if (locked) field.disabled = true;
+        });
+        creationUploads?.lock(locked);
+        updateManagedFormSubmitEligibility(form, {inFlight: locked});
+        recovery.hidden = !locked;
+        if (locked) recovery.querySelector("[data-request-identity]").textContent = `Saved request: ${savedRequest.draft.requestId}`;
+      };
+      const saveCreationDraft = () => {
+        if (!savedRequest || savedRequest.draft.body !== null) return;
+        try {
+          savedRequest.update(readFields());
+          creationDraft = savedRequest.draft;
+          updateManagedFormSubmitEligibility(form, {storageReady: true});
+        } catch (error) {
+          updateManagedFormSubmitEligibility(form, {storageReady: false}); showFailure(error);
+        }
+      };
+      persistCreationDraft = saveCreationDraft;
       updateCreationCLI = () => {
         const output = form.querySelector("[data-cli-command]");
         if (!output) return;
+        const team = form.elements.team?.selectedOptions?.[0];
+        const defaultPair = !form.elements.model.value && !form.elements.effort.value;
         const command = creationCLICommand({
           name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
-          model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
+          model: defaultPair ? team?.dataset.leadModel : form.elements.model.value,
+          effort: defaultPair ? team?.dataset.leadEffort : form.elements.effort.value,
         });
-        output.value = command || "Choose a short name, model and reasoning effort.";
+        output.value = command || (form.elements.name.value.trim() ?
+          "Choose a model and reasoning effort for the CLI command." :
+          "Enter a custom short name in Options to copy a CLI command.");
         output.parentElement.querySelector("[data-copy]").disabled = !command || managedFormRecoveryPending(form);
       };
-      persistCreationDraft = saveCreationDraft;
-      creationDraft = loadCreationDraft(creationDraftStorage, creationDraftKey, "new");
-      if (creationDraft) {
-        form.elements.name.value = creationDraft.name;
-        form.elements.goal.value = creationDraft.goal;
-        form.elements.creation_date.value = creationDraft.date;
+      const followAccepted = () => {
+        const destination = savedRequest.clearAccepted();
+        indexNavigationPending = true;
+        if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+        window.location.assign(destination);
+      };
+      const recoverRequest = async () => {
+        if (!savedRequest || savedRequest.draft.body === null || recovering) return;
+        recovering = true; recoverButton.disabled = true;
+        progress.hidden = false; progress.textContent = "Checking the saved session request…";
+        try { await savedRequest.submit(); followAccepted(); }
+        catch (error) { showFailure(error); }
+        finally { recovering = false; recoverButton.disabled = false; lockRequest(); }
+      };
+      recoverButton.addEventListener("click", recoverRequest);
+      let storage;
+      try {
+        storage = globalThis.sessionStorage;
+        savedRequest = sessionPreparation.createRequestDraft({storage, fields: readFields(), fetch: fetch.bind(globalThis),
+          legacyStorage: () => globalThis.localStorage});
+        creationDraft = savedRequest.draft;
+        for (const [key, name] of [["name", "name"], ["goal", "goal"], ["date", "creation_date"]]) {
+          form.elements[name].value = creationDraft[key];
+        }
+        restoreManagedCreationDraft(form, creationDraft);
+        updateManagedFormSubmitEligibility(form, {storageReady: true, uploadReady: false});
+        lockRequest();
+      } catch (error) {
+        updateManagedFormSubmitEligibility(form, {storageReady: false});
+        showFailure(error); return;
       }
       form.addEventListener("input", () => { saveCreationDraft(); updateCreationCLI(); });
+      // Run after the model/team control listeners have set their paired values.
       form.addEventListener("change", () => { saveCreationDraft(); updateCreationCLI(); });
       updateCreationCLI();
-    }
-    if (form) {
-      const uploadRoot = document.getElementById("creation-uploads");
-      const storage = globalThis.localStorage;
-      const scopeKey = "workspace-portal.creation-upload-scope";
       const initCreationUploads = async () => {
+        if (savedRequest.draft.body !== null) {
+          // Recovery must not depend on upload or model catalogs being readable.
+          form.elements.uploadScope.value = savedRequest.draft.scope?.id || "";
+          document.getElementById("creation-uploads").textContent = savedRequest.draft.attachmentIds.length ?
+            `Files selected for this request: ${savedRequest.draft.attachmentIds.length}.` : "";
+          void recoverRequest();
+          return;
+        }
         try {
-          let scope = JSON.parse(storage.getItem(scopeKey) || "null");
+          let scope = savedRequest.draft.scope;
           if (scope) {
-            try { await request(scope.url); } catch (error) { if (error.status === 404) scope = null; else throw error; }
+            try { await request(scope.url); }
+            catch (error) { if (error.status === 404) scope = null; else throw error; }
           }
           if (!scope) {
             scope = await request("/api/upload-drafts", {method: "POST", body: "{}"});
-            storage.setItem(scopeKey, JSON.stringify(scope));
+            savedRequest.bindScope(scope);
           }
-          creationUploads = conversationAssets.mountUploads(uploadRoot, {
+          creationUploads = conversationAssets.mountUploads(document.getElementById("creation-uploads"), {
             basePath: scope.url, dropTarget: form, storage,
             controlsRoot: document.getElementById("creation-upload-controls"),
             storageKey: `workspace-portal.upload-draft.${scope.id}`,
             onChange: ({ready, count}) => {
               form.elements.goal.required = !count;
-              updateCreationSubmitEligibility({uploadReady: ready});
+              updateManagedFormSubmitEligibility(form, {uploadReady: ready});
             },
           });
           form.elements.uploadScope.value = scope.id;
           await creationUploads.initialized;
-          updateCreationSubmitEligibility({uploadReady: creationUploads.ready()});
-        } catch (error) { uploadRoot.textContent = error.message; uploadRoot.hidden = false; }
+          updateManagedFormSubmitEligibility(form, {uploadReady: creationUploads.ready()});
+        } catch (error) {
+          // Text-only creation remains possible when no files were selected.
+          // An existing scope can contain saved files and must stay recoverable.
+          updateManagedFormSubmitEligibility(form, {uploadReady: !savedRequest.draft.scope});
+          showFailure(error);
+        }
       };
       void initCreationUploads();
-    }
-    form?.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      if (managedFormRecoveryPending(form)) return;
-      saveCreationDraft();
-      if (!updateCreationSubmitEligibility({uploadReady: !creationUploads || creationUploads.ready()})) return;
-      form.querySelectorAll('input[name="attachmentIds"]').forEach((input) => input.remove());
-      for (const id of creationUploads?.ids() || []) {
-        const input = document.createElement("input"); input.type = "hidden"; input.name = "attachmentIds"; input.value = id; form.append(input);
-      }
-      creationUploads?.lock(true);
-      indexNavigationPending = true;
-      if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
-      updateCreationSubmitEligibility({inFlight: true});
-      const progress = document.getElementById("new-session-progress");
-      const creationProgress = timedProgress(progress, "Creating session");
-      try {
-        const response = await fetch("/sessions", {
-          method: "POST", credentials: "same-origin",
-          headers: {Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-          body: new URLSearchParams(new FormData(form)),
-        });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(result.error || `Unable to create session (${response.status}).`);
-        if (!result.receiptId || !/^\/[A-Za-z0-9][A-Za-z0-9_-]*\/$/.test(result.url)) {
-          throw new Error("Unable to confirm session creation. Retry with the saved request.");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (form.dataset.requestLocked === "true" || managedFormRecoveryPending(form) || recovering) return;
+        saveCreationDraft();
+        if (!updateManagedFormSubmitEligibility(form, creationUploads ? {uploadReady: creationUploads.ready()} : {})) return;
+        recovering = true; recoverButton.disabled = true;
+        updateManagedFormSubmitEligibility(form, {inFlight: true});
+        const creationProgress = timedProgress(progress, "Preparing session");
+        try {
+          const pending = savedRequest.submit(creationUploads?.ids() || [], Boolean(form.elements.team));
+          lockRequest();
+          await pending;
+          creationProgress.stop(); followAccepted();
+        } catch (error) {
+          creationProgress.fail(error.message); showFailure(error);
+        } finally {
+          recovering = false; recoverButton.disabled = false; lockRequest();
         }
-        try { creationDraftStorage?.removeItem(creationDraftKey); } catch (_) {}
-        creationProgress.stop();
-        window.location.assign(result.url);
-      } catch (failure) {
-        creationProgress.fail(failure.message);
-        indexNavigationPending = false;
-        creationUploads?.lock(false);
-        updateCreationSubmitEligibility({
-          inFlight: false, uploadReady: !creationUploads || creationUploads.ready(),
-        });
-        void refreshIndexStatus();
-      }
-    });
+      });
+    };
     void refreshIndexStatus();
   }
-
   let models = [];
   let collaborationModes = [];
   let currentModel = "";
@@ -1474,7 +1526,15 @@
     const selected = teamSelect.selectedOptions[0];
     const modelSelect = form?.elements.model;
     const effortSelect = form?.elements.effort;
-    if (!selected || !modelSelect || !effortSelect || !models.length) return;
+    if (!selected || !modelSelect || !effortSelect) return;
+    if (form.id === "new-session-form") {
+      if (form.dataset.requestLocked === "true") return;
+      modelSelect.value = "";
+      populateEfforts(modelSelect, effortSelect);
+      effortSelect.value = "";
+      return;
+    }
+    if (!models.length) return;
     const model = selected.dataset.leadModel || "";
     if (Array.from(modelSelect.options).some((option) => option.value === model)) modelSelect.value = model;
     else modelSelect.selectedIndex = -1;
@@ -1572,6 +1632,18 @@
 
   const restoreManagedCreationDraft = (form, draft) => {
     if (!form || !draft) return;
+    if (form.id === "new-session-form") {
+      // An attempted request is independent of the current installed catalog.
+      if (form.dataset.requestLocked === "true" || draft.body !== null) form.dataset.requestLocked = "true";
+      else if (restoreManagedCatalogRecovery(form, draft)?.catalogChanged) return;
+      if (form.elements.catalogDigest) form.elements.catalogDigest.value = draft.catalogDigest;
+      restoreDraftSelect(form.elements.team, draft.team, "Saved team");
+      if (form.elements.team) updateTeamDescription(form.elements.team);
+      restoreDraftSelect(form.elements.model, draft.model, "Saved model");
+      if (form.dataset.requestLocked !== "true") populateEfforts(form.elements.model, form.elements.effort, draft.effort);
+      restoreDraftSelect(form.elements.effort, draft.effort, "Saved reasoning effort");
+      return;
+    }
     const catalogDigest = form.elements.catalogDigest;
     const recovery = restoreManagedCatalogRecovery(form, draft);
     if (recovery?.catalogChanged) return;
@@ -1600,6 +1672,8 @@
 
   const populateEfforts = (modelSelect, effortSelect, selected = "") => {
     if (!effortSelect) return;
+    const newSession = modelSelect.closest("form")?.id === "new-session-form";
+    if (newSession && modelSelect.closest("form").dataset.requestLocked === "true") return;
     const model = models.find((candidate) => candidate.model === modelSelect.value);
     const existingSettings = modelSelect.dataset.existingSettings === "true";
     effortSelect.replaceChildren();
@@ -1620,13 +1694,14 @@
     if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
       effortSelect.value = desired;
     }
-    effortSelect.disabled = !model || (threadActive && existingSettings);
+    effortSelect.disabled = newSession ? false : !model || (threadActive && existingSettings);
   };
 
   const pairedEffortSelect = (modelSelect) => modelSelect.id === "codex-model" ?
     document.getElementById("codex-effort") : modelSelect.closest("form")?.elements.effort;
   const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
+      if (modelSelect.closest("form")?.id === "new-session-form") return;
       if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
       if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
       const effortSelect = pairedEffortSelect(modelSelect);
@@ -1674,6 +1749,7 @@
     try {
       if (!models.length) models = await request("/api/models");
       for (const modelSelect of modelSelects) {
+        if (modelSelect.closest("form")?.dataset.requestLocked === "true") continue;
         const allowDefault = !modelSelect.required;
         modelSelect.replaceChildren();
         if (allowDefault) {
@@ -1699,6 +1775,7 @@
       restoreManagedCreationDrafts();
     } catch (_error) {
       for (const modelSelect of modelSelects) {
+        if (modelSelect.closest("form")?.id === "new-session-form") continue;
         modelSelect.replaceChildren();
         const option = document.createElement("option");
         option.value = "";
@@ -1706,7 +1783,9 @@
         modelSelect.append(option);
         modelSelect.disabled = true;
       }
-      for (const effortSelect of effortSelects) effortSelect.disabled = true;
+      for (const effortSelect of effortSelects) {
+        if (effortSelect.closest("form")?.id !== "new-session-form") effortSelect.disabled = true;
+      }
     }
   };
 
@@ -1772,13 +1851,14 @@
       if (checkbox.checked) acknowledgeManagedCatalogRecovery(checkbox.closest("form"));
     });
   });
+  initializeNewSession();
   restoreManagedCreationDrafts();
   if (document.querySelector("[data-model-select]")) loadModels();
 
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy]");
     if (!button) return;
-    const input = button.parentElement.querySelector("input");
+    const input = button.parentElement.querySelector("input, textarea");
     await navigator.clipboard.writeText(input.value);
     const old = button.textContent;
     button.textContent = "Copied";

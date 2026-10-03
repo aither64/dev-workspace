@@ -4,20 +4,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.Session.Slug}} · Workspace</title>
+  <title>{{if .Preparation}}New session{{else}}{{.Session.Slug}}{{end}} · Workspace</title>
   <link rel="stylesheet" href="/static/style.css?v=3">
   <link rel="stylesheet" href="/codex/assets/conversation.css">
 </head>
-<body data-creation="{{.Session.Slug}}">
+<body{{if .Preparation}} data-preparation="{{.Preparation.RequestID}}" data-receipt-id="{{.Preparation.ReceiptID}}" data-accepted-at="{{.Preparation.StartedAt}}"{{else}} data-creation="{{.Session.Slug}}"{{end}}>
   <main class="page">
     <a href="/">Workspace</a>
-    <h1>{{.Session.Slug}}</h1>
+    <h1>{{if .Preparation}}New session{{else}}{{.Session.Slug}}{{end}}</h1>
     <section class="panel" aria-labelledby="creation-title">
       <h2 id="creation-title">Creating session</h2>
       <p id="creation-phase" role="status" aria-live="polite">Loading initialization status…</p>
       <p id="creation-elapsed" role="timer"></p>
       <p id="creation-error" class="notice error" hidden></p>
-      <button id="creation-retry" type="button" hidden>Retry initialization</button>
+      <button id="creation-retry" type="button" hidden>{{if .Preparation}}Retry creation{{else}}Retry initialization{{end}}</button>
       <p><a id="creation-source" hidden>Return to the source session</a></p>
       <p id="creation-leave-note">You can leave this page while initialization continues.</p>
     </section>
@@ -26,7 +26,8 @@
       <pre class="creation-request" id="creation-request">{{.InitialRequest}}</pre>
     </section>
   </main>
-  <script src="/static/creation.js" defer></script>
+  <script src="/static/preparation.js?v=2" defer></script>
+  <script src="/static/creation.js?v=2" defer></script>
 </body>
 </html>
 {{end}}

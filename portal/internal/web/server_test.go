@@ -1748,11 +1748,14 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	server.render(response, "index", data)
 	body := response.Body.String()
 	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`, `data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
-		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required`,
-		`Lead reasoning effort<select name="effort" data-effort-select required`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
+		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select><option value="">Selected team default</option>`,
+		`Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("new session omitted %q", marker)
 		}
+	}
+	if strings.Contains(body, `name="model" data-model-select required`) || strings.Contains(body, `name="effort" data-effort-select required`) {
+		t.Fatal("managed New session requires overrides instead of accepting installed team defaults")
 	}
 	if strings.Contains(body, `Advanced lead override`) || strings.Contains(body, `Configured default`) {
 		t.Fatal("new session still exposes an ambiguous lead override")
@@ -1779,7 +1782,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"deleteDialog.showModal()", `lifecycleKind === "revive" && needsOptions`,
 		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
 		"renderIndexOperations(payload.operations)", "indexNavigationPending = true",
-		`timedProgress(progress, "Creating session")`, `operation")}/retry`, "fork-progress",
+		`timedProgress(progress, "Preparing session")`, `operation")}/retry`, "fork-progress",
 	} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client does not contain %q", marker)

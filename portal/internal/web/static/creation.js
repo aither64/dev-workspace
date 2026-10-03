@@ -1,8 +1,32 @@
 (async () => {
   "use strict";
+  const phaseLabel = (next) => ({
+    accepting: "Saving the request and files…",
+    naming: "Choosing a session name…",
+    reserving: "Reserving the session name…",
+    initializing: "Initializing the session…",
+    stopped: "Session preparation stopped.",
+  }[next.phase] || "Preparing the session…");
+  const preparationProgress = (next, identity, helpers) => {
+    if (!helpers.acceptedStatus(next, identity.requestId, identity.receiptId) ||
+        next.startedAt !== identity.startedAt) throw new Error("The saved session request identity changed. Keep this page for recovery.");
+    const destination = helpers.sessionURL(next);
+    if (next.state === "ready" && !destination) throw new Error("Unable to confirm the recorded session destination.");
+    return {
+      destination,
+      phase: next.phase === "initializing" && typeof next.detail === "string" && next.detail ? next.detail : phaseLabel(next),
+      retry: ["failed", "paused"].includes(next.state),
+      stopped: ["gone", "conflict", "cancelled"].includes(next.state),
+    };
+  };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {phaseLabel, preparationProgress}; return;
+  }
   const slug = document.body.dataset.creation;
-  if (!slug) return;
-  const endpoint = `/api/sessions/${encodeURIComponent(slug)}/creation`;
+  const requestId = document.body.dataset.preparation;
+  if (!slug && !requestId) return;
+  const identity = {requestId, receiptId: document.body.dataset.receiptId, startedAt: document.body.dataset.acceptedAt};
+  const endpoint = requestId ? `/api/session-creations/${requestId}` : `/api/sessions/${encodeURIComponent(slug)}/creation`;
   const title = document.getElementById("creation-title");
   const phase = document.getElementById("creation-phase");
   const error = document.getElementById("creation-error");
@@ -18,8 +42,7 @@
       getText: () => initialRequest.textContent, label: "Copy initial request",
     }));
   }).catch(() => {});
-  let receipt;
-  let retrying = false;
+  let receipt, retrying = false, stopped = false;
   async function request(url, options) {
     const response = await fetch(url, {credentials: "same-origin", cache: "no-store", ...options});
     const result = await response.json();
@@ -27,49 +50,50 @@
     return result;
   }
   function render(next) {
+    const presentation = requestId ? preparationProgress(next, identity, sessionPreparation) : null;
+    if (receipt && next.attempt < receipt.attempt) return;
     receipt = next;
-    if (next.initialRequest) {
+    if (typeof next.initialRequest === "string") {
       if (initialRequest.textContent !== next.initialRequest) initialRequest.textContent = next.initialRequest;
-      requestPanel.hidden = false;
+      requestPanel.hidden = !next.initialRequest;
     }
-    if (next.state === "ready" || next.state === "conflict") {
-      window.location.replace(`/${encodeURIComponent(slug)}/`);
-      return;
-    }
-    title.textContent = next.state === "running" ? "Creating session" :
+    const destination = requestId ? presentation.destination :
+      (["ready", "conflict"].includes(next.state) ? `/${encodeURIComponent(slug)}/` : "");
+    if (destination) { stopped = true; window.location.replace(destination); return; }
+    stopped = Boolean(presentation?.stopped);
+    title.textContent = ["running", "accepting", "handed_off"].includes(next.state) ? "Creating session" :
+      next.state === "gone" ? "Session is no longer available" :
+      next.state === "conflict" ? "Session request needs attention" :
       next.state === "cancelled" ? "Session was not created" : "Initialization stopped";
-    leaveNote.hidden = next.state === "cancelled";
-    phase.textContent = next.phase;
-    const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(next.startedAt)) / 1000));
+    leaveNote.hidden = stopped || next.state === "cancelled";
+    phase.textContent = requestId ? presentation.phase : next.phase;
+    const startedAt = requestId ? identity.startedAt : next.startedAt;
+    const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000));
     elapsed.textContent = Number.isFinite(seconds) ? `Elapsed: ${Math.floor(seconds / 60)}m ${seconds % 60}s` : "";
-    source.hidden = !next.sourceUrl || next.state === "running";
-    if (next.sourceUrl && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/$/.test(next.sourceUrl)) source.href = next.sourceUrl;
+    const sourceURL = !requestId && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/$/.test(next.sourceUrl || "") ? next.sourceUrl : "";
+    source.hidden = !sourceURL || next.state === "running";
+    if (sourceURL) source.href = sourceURL;
+    else source.removeAttribute("href");
     error.textContent = next.error || "";
     error.hidden = !next.error;
-    retry.hidden = !["failed", "paused"].includes(next.state);
+    retry.hidden = requestId ? !presentation.retry : !["failed", "paused"].includes(next.state);
     retry.disabled = retrying;
   }
   async function poll() {
     try { render(await request(endpoint)); }
-    catch (failure) {
-      error.textContent = failure.message;
-      error.hidden = false;
-    }
-    finally { window.setTimeout(poll, 1000); }
+    catch (failure) { error.textContent = failure.message; error.hidden = false; }
+    finally { if (!stopped) window.setTimeout(poll, 1000); }
   }
   retry.addEventListener("click", async () => {
-    if (!receipt || retrying) return;
-    retrying = true;
-    retry.disabled = true;
+    if (!receipt || retrying || stopped) return;
+    retrying = true; retry.disabled = true;
     try {
       render(await request(`${endpoint}/retry`, {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({receiptId: receipt.receiptId, attempt: receipt.attempt}),
       }));
-    } catch (failure) {
-      error.textContent = failure.message;
-      error.hidden = false;
-    } finally { retrying = false; retry.disabled = false; }
+    } catch (failure) { error.textContent = failure.message; error.hidden = false; }
+    finally { retrying = false; retry.disabled = false; }
   });
   poll();
 })();

@@ -524,7 +524,21 @@ The [session preparation contract](session-preparations.md) describes
 request-ID admission, automatic-name fallback, receipt handoff, upload
 ownership and recovery for New session API callers.
 
-The creation page polls the existing receipt once per second and shows the
+New session needs an initial request or attachments and a starting team. Options
+contains a custom short name and advanced lead settings. An empty custom name
+generates a dated name; the CLI preview asks for an explicit name. Installed
+team defaults remain available when model discovery fails.
+
+The browser saves each New session request and its file selection in its own
+tab. After
+an uncertain submission, inputs stay locked and Recover saved request checks
+the same operation before resending identical input. Keep that tab open if
+browser storage fails. The preparation page shows the accepted prompt before
+scripts load, tracks naming through initialization, and redirects only after
+the exact recorded session is ready. Fork and plan forms retain their existing
+explicit-name flow.
+
+The legacy creation page polls its receipt once per second and shows the
 current conversation, recovery, member, prompt, terminal or verification stage.
 The elapsed clock measures the whole accepted attempt. A completed stage can
 show its own duration; nested durations overlap and must not be added. Team

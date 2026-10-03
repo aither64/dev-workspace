@@ -196,6 +196,7 @@ type hostProfileIdentity struct {
 
 type pageData struct {
 	InitialRequest    string
+	Preparation       *preparationStatus
 	StyleNonce        string
 	BaseURL           string
 	DisplayLabel      string
