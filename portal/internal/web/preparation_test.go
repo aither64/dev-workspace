@@ -786,6 +786,64 @@ func TestSessionPreparationMappingBoundsAndInterruptedMove(t *testing.T) {
 	}
 }
 
+func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	record := fixturePreparation(t, server, 91, "paused")
+	record.Snapshot.Input.RawPrompt = "  <script>alert('prompt')</script>\nSecond line & last.\n "
+	record.Snapshot.Goal = record.Snapshot.Input.RawPrompt
+	record.InputDigest = inputPreparationDigest(record.Snapshot.Input)
+	record.SnapshotDigest = preparationDigest(record.Snapshot)
+	if err := server.savePreparation(record); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/creations/"+record.RequestID+"/", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK {
+		t.Fatalf("preparation page = %d: %s", response.Code, body)
+	}
+	for _, expected := range []string{
+		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
+		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
+		`/static/preparation.js?v=2`, `/static/creation.js?v=2`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("preparation page omits %q", expected)
+		}
+	}
+	for _, forbidden := range []string{`data-creation=`, `<script>alert`, `<h1>` + record.RequestID + `</h1>`} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("preparation page exposes %q", forbidden)
+		}
+	}
+}
+
+func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusOK {
+		t.Fatalf("index = %d: %s", response.Code, body)
+	}
+	if strings.Contains(body, `name="name" required`) || !strings.Contains(body, `name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*"`) {
+		t.Fatal("New session must permit an empty name and retain explicit-name limits")
+	}
+	prompt, options, name := strings.Index(body, `name="goal"`), strings.Index(body, `<summary>Options</summary>`), strings.Index(body, `name="name"`)
+	if prompt < 0 || options < prompt || name < options {
+		t.Fatal("initial request must precede optional settings")
+	}
+	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=2`) {
+		t.Fatal("index is missing durable-request recovery controls")
+	}
+	if !strings.Contains(body, `href="/" target="_blank" rel="noopener noreferrer"`) || !strings.Contains(body, `Copy saved text`) || !strings.Contains(body, `The original request may still finish.`) {
+		t.Fatal("separate request must preserve recovery and open without an opener")
+	}
+}
+
 func getPreparation(t *testing.T, server *Server, id string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()

@@ -43,6 +43,67 @@ identity remains reserved. Repeating the identical submission confirms the
 published write and repairs its pending admission; retry uses the current
 receipt and attempt. Other HTTP failures do not establish this recovery state.
 
+## Browser drafts and progress
+
+New session puts the initial request first, with team selection available below
+it. Options contains the optional custom short name and advanced lead settings.
+Leaving the name empty requests an automatic dated name. Custom names retain
+their case, underscores, syntax and 48-character limit. A request may contain
+only attachments. The CLI preview requires a custom name; CLI, fork and plan
+session naming are unchanged.
+
+For a managed team, leaving both lead settings empty uses the installed team
+defaults captured by admission. Model discovery is needed to offer new explicit
+overrides, but its failure does not prevent admission with team defaults or
+recovery with already saved exact overrides. Initialization checks captured
+settings against live availability without choosing another model or effort.
+
+The browser verifies a random version-4 request ID in the tab's sessionStorage
+before sending. Its version-2 tab draft retains text, date, settings, upload
+scope and the exact serialized submission body, including field presence and
+ordered attachment IDs. The first attempt saves that body before POST. A lost
+response, HTTP failure or reload keeps the inputs and uploads locked. Recover
+saved request checks status first; a missing operation permits only identical
+resubmission of the saved body. A 503 with the exact saved `requestId` and
+`code: "preparation_persistence_unconfirmed"` also permits identical recovery
+POST after the status lookup. Other 503 responses do not. Neither path permits
+editing or recycling that ID.
+
+After an attempted submission fails, **Start a separate request** opens the
+current form in a new tab without an opener. The original request may still
+finish; this action does not cancel or replace it. The original tab retains its
+exact request, settings and file selection for recovery. **Copy saved text**
+copies its raw prompt. The new tab uses current settings, a new request ID and a
+fresh file scope. Copying text, reattaching files and submitting are deliberate
+steps; nothing transfers or submits automatically. A restored attempted draft
+retains its original recovery behavior, even in the new tab.
+
+Each draft owns a separate upload scope and stores its selection in the same
+tab. Fresh tabs do not reuse the older shared localStorage scope pointer.
+Older unsubmitted text/settings drafts receive a new request ID; older shared
+upload pointers/selections are left untouched without assigning their ownership
+to the new draft. When an older draft has cached file-selection evidence, the
+form asks you to attach those files again. Unsubmitted server files still follow
+their normal expiry rules. Reattach the originals to select them for that request.
+Attempted drafts cannot be migrated to a different request or reconstructed from
+current catalog choices.
+
+Acceptance and storage cleanup are separate checks. Only a response identifying
+this request, exact receipt, attempt and preparation URL can clear its draft and
+scope/selection pointers. Removal is verified by readback. Storage failure
+keeps the recoverable identity visible; keep the tab open and restore browser
+storage before retrying. No failure deletes files or sends a legacy name-only
+request. An unreadable attempted draft is retained for diagnosis.
+
+The preparation page renders the accepted raw prompt as escaped text before
+scripts load. It polls once per second, shows naming, reservation and initialization
+progress and measures elapsed time from original acceptance across retries.
+Retry sends the current exact receipt ID and attempt. Navigation requires a
+ready status with the original request/receipt identity and an exact dated
+same-origin session path. Gone, replaced, conflicting and cancelled operations
+stay on their preparation page. The legacy slug-based initialization page
+continues to serve forks, plan sessions and explicit-name callers.
+
 ## Naming and reservation
 
 The portal owns one naming-only Codex App Server for its service lifetime.

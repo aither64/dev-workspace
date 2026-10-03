@@ -116,6 +116,7 @@ const conversationModulePath = process.argv[4];
 if (!conversationModulePath) throw new Error("browser contract test requires the shared browser module");
 
 (async () => {
+await require("./preparation_browser_contract_test.cjs")();
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
 assert.equal(hasTranscriptPagingHelpers(conversationAssets), true);
 assert.equal(hasTranscriptPagingHelpers({
