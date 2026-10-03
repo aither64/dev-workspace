@@ -353,6 +353,9 @@ func (client *testClient) SendWithOptions(_ context.Context, thread, text, messa
 		close(client.sendEntered)
 		<-client.releaseSend
 	}
+	// This mutex protects recording only, never the serialization handshake.
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.sends = append(client.sends, thread+"\n"+text)
 	client.messageIDs = append(client.messageIDs, messageID)
 	client.options = append(client.options, options)
@@ -361,12 +364,16 @@ func (client *testClient) SendWithOptions(_ context.Context, thread, text, messa
 }
 
 func (client *testClient) CompactAcceptedSendOptions(prefix string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.compactPrefixes = append(client.compactPrefixes, prefix)
 	client.ledgerEvents = append(client.ledgerEvents, "compact")
 	return client.compactError
 }
 
 func (client *testClient) ClearRetiredThreadAttempts(threadID string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.clearedThreads = append(client.clearedThreads, threadID)
 	client.ledgerEvents = append(client.ledgerEvents, "clear")
 	return client.clearError
