@@ -199,7 +199,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-FPPfUiYlZCg+RHKz/Vm1C6MobX2pk+QeUhv7CEz00d8=";
+  vendorHash = "sha256-KlckfIvbzTtFvu31Fd5T/GYM/V7Es8Ks7yv/HZwEhOU=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}
@@ -279,6 +279,8 @@ buildGoModule {
       case "$source" in *_test.go) continue ;; esac
       install -m644 "$source" "$out/share/workspace-portal/codex/"
     done
+    install -m644 ${codexWebSrc}/codex/ephemeral_policy.json \
+      "$out/share/workspace-portal/codex/ephemeral_policy.json"
     ${contractPython}/bin/python3 "$out/share/workspace-portal/codex_protocol_contract.py" \
       --coverage-only "$out/share/workspace-portal/codex/client.go"
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
