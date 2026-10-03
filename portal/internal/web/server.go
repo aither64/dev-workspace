@@ -89,8 +89,8 @@ type Config struct {
 	Codex              codexController
 	VerifyThread       func(context.Context, string, string) error
 	ReadThread         func(context.Context, string) (codex.Transcript, error)
-	// SessionNamer is an isolated text-only boundary. A nil adapter uses the
-	// deterministic fallback until the model utility's isolation is established.
+	// SessionNamer injects the isolated naming boundary in tests. Normal server
+	// construction uses the trusted application socket; no socket uses fallback.
 	SessionNamer func(context.Context, string) (string, error)
 }
 
@@ -409,6 +409,9 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		cancelOperations()
 		return nil, err
+	}
+	if config.SessionNamer == nil && config.CodexSocket != "" {
+		config.SessionNamer = normalSessionNamer(config.CodexSocket, operationStore)
 	}
 	server := &Server{
 		uploadCreationMu: conversation.NewMutationLock(),

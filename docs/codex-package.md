@@ -110,3 +110,31 @@ journals and retained Codex roots. See the [portal recovery guide](workspace-por
 for the supported entry points. System recovery uses its retained system
 generation; whether an older Codex can read newer state must be established
 separately on disposable state before using that recovery path.
+
+## Session naming release boundary
+
+The portal's session namer uses the application's trusted App Server socket with
+exact `gpt-6-luna`/`low`. Its private ephemeral helper has a fixed per-call policy;
+it does not patch Codex, change the model catalog or rewrite shared Codex home.
+Global user instructions remain trusted serving-instance policy. File/network
+action tools and project/workspace/team/skill injection must be excluded;
+questions fail immediately. Pure clock may remain.
+
+Before enabling a candidate deployment, run the codex-web protocol corpus and
+fixed restriction-key/type validator against that candidate's generated App
+Server schema and `core/config.schema.json`. After mandatory review, run the
+tagged exact-binary mock-provider fixture described in codex-web's technical
+reference. Record the exact native binary hash, assembled package/profile and
+unchanged model metadata, actual advertised tool schemas, forbidden dispatch,
+question rejection and ephemeral teardown evidence. Missing prerequisites or
+unsupported behavior block release. Deterministic fallback after a helper error
+does not establish isolation.
+
+MCP names are captured once per bounded naming call. Pause/stop naming through
+the existing portal service or supported package transition before changing MCP
+configuration. Finish that reconfiguration while no naming call is active;
+fresh calls capture and disable all literal names then present. This support
+condition does not include deliberate administrator reconfiguration during a
+call. Use the existing service/package procedures, without a global config
+lease or another process manager. Package-generation cancellation must prevent
+the old worker from committing a fallback or reservation.

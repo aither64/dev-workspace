@@ -45,16 +45,41 @@ receipt and attempt. Other HTTP failures do not establish this recovery state.
 
 ## Naming and reservation
 
-An optional text-only naming adapter receives at most 8192 raw UTF-8 bytes and
+Normal server construction installs a text-only naming adapter on the trusted
+application App Server socket. An injected adapter remains available for tests.
+The adapter receives at most 8192 raw UTF-8 bytes and
 returns one JSON object containing only `name`. A generated name must contain
 three to six lowercase ASCII alphanumeric words separated by hyphens and fit
 within 48 bytes. The adapter must honor cancellation and the ten-second deadline,
 including queue time. No more than two adapter calls run concurrently per
 workspace. Attachment names, paths and contents are excluded.
 
-Naming adapters must disable tools that access files or networks and reject
-questions immediately. A pure clock tool may remain. Validate that boundary
-against the exact serving binary before enabling an adapter.
+The adapter calls codex-web's public `RunEphemeralTurn` with exactly
+`gpt-6-luna`/`low`, fixed instructions and a bounded name schema. Each call uses
+an empty private mode-0700 cwd outside the workspace and a separate mode-0600
+instruction override file containing exactly codex-web's
+`EphemeralInstructionFileContent`. The adapter writes that provider-owned constant
+once to its unique `instructions.txt` file and keeps it unchanged through helper
+teardown. Both file overrides use that path: the pinned server requires readable,
+nonempty contents even when explicit naming instructions take precedence. The
+fixed text also supplies the compact-file prompt; it does not disable compaction.
+The call supplies no attachments or team policy.
+The worker retains ownership of the whole deadline and concurrency limit.
+Scratch state is removed after the call; durable session state is untouched.
+
+The helper disables file/network action tools and rejects questions immediately.
+Actual server requests with IDs receive `-32601`; async question/delivery
+notifications fail without a fabricated response or UI admission. A pure clock
+may remain. Global user instructions remain trusted serving-instance policy.
+When a turn/start reply is lost, a matching early notification may identify the
+owned turn solely for interruption within the original deadline. It cannot
+authorize success; missing or conflicting identity is not adopted. Unsubscribe
+alone does not stop a running turn.
+Operators must pause/stop naming through existing service/package procedures
+before MCP reconfiguration, then let fresh calls capture all new literal server
+names. Validate actual tool schemas, hostile dispatch, both question paths and
+teardown against the exact candidate binary before live enablement. Fake client
+tests and deterministic fallback do not prove model isolation.
 
 With no adapter, or after an unavailable/invalid result, naming uses the first
 nonempty line: lowercase, Unicode diacritic decomposition, removal of combining
