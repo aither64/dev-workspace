@@ -89,6 +89,9 @@ type Config struct {
 	Codex              codexController
 	VerifyThread       func(context.Context, string, string) error
 	ReadThread         func(context.Context, string) (codex.Transcript, error)
+	// SessionNamer is an isolated text-only boundary. A nil adapter uses the
+	// deterministic fallback until the model utility's isolation is established.
+	SessionNamer func(context.Context, string) (string, error)
 }
 
 type cachedRepositories struct {
@@ -141,42 +144,47 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
-	uploadCreationMu conversation.MutationLocker
-	uploadStore      *uploads.Store
-	uploadHandler    http.Handler
-	reviewOnce       sync.Once
-	reviewService    *repositoryReviewService
-	activity         *activityMonitor
-	config           Config
-	hostProfile      hostProfileIdentity
-	templates        *template.Template
-	markdown         goldmark.Markdown
-	sanitizer        *bluemonday.Policy
-	repository       repository.Runner
-	repositoryMu     sync.Mutex
-	repositoryCache  map[string]cachedRepositories
-	indexStatusMu    sync.Mutex
-	indexStatusCache cachedIndexStatus
-	indexStatusWait  chan struct{}
-	codexLimitsMu    sync.Mutex
-	codexLimitsCache codexLimitsSnapshot
-	codexLimitsWait  *codexLimitsCall
-	messageMu        sync.Mutex
-	messageLocks     map[string]conversation.MutationLocker
-	clusters         cluster.Runner
-	operationMu      sync.Mutex
-	creations        map[string]creationReceipt
-	operations       map[string]lifecycleOperation
-	operationStore   *lifecycleOperationStore
-	operationContext context.Context
-	cancelOperations context.CancelFunc
-	operationWG      sync.WaitGroup
-	closing          bool
-	stopOnce         sync.Once
-	stopping         chan struct{}
-	conversation     http.Handler
-	trustedOrigins   []string
-	installedTeams   *agentteams.Installed
+	uploadCreationMu       conversation.MutationLocker
+	uploadStore            *uploads.Store
+	uploadHandler          http.Handler
+	reviewOnce             sync.Once
+	reviewService          *repositoryReviewService
+	activity               *activityMonitor
+	config                 Config
+	hostProfile            hostProfileIdentity
+	templates              *template.Template
+	markdown               goldmark.Markdown
+	sanitizer              *bluemonday.Policy
+	repository             repository.Runner
+	repositoryMu           sync.Mutex
+	repositoryCache        map[string]cachedRepositories
+	indexStatusMu          sync.Mutex
+	indexStatusCache       cachedIndexStatus
+	indexStatusWait        chan struct{}
+	codexLimitsMu          sync.Mutex
+	codexLimitsCache       codexLimitsSnapshot
+	codexLimitsWait        *codexLimitsCall
+	messageMu              sync.Mutex
+	messageLocks           map[string]conversation.MutationLocker
+	clusters               cluster.Runner
+	operationMu            sync.Mutex
+	creations              map[string]creationReceipt
+	preparations           map[string]sessionPreparation
+	preparationUnconfirmed map[string]string
+	preparationWork        map[string]preparationWork
+	preparationSync        func(string) error
+	namingSlots            chan struct{}
+	operations             map[string]lifecycleOperation
+	operationStore         *lifecycleOperationStore
+	operationContext       context.Context
+	cancelOperations       context.CancelFunc
+	operationWG            sync.WaitGroup
+	closing                bool
+	stopOnce               sync.Once
+	stopping               chan struct{}
+	conversation           http.Handler
+	trustedOrigins         []string
+	installedTeams         *agentteams.Installed
 }
 
 type hostProfileIdentity struct {
@@ -417,6 +425,11 @@ func New(config Config) (*Server, error) {
 		stopping:         make(chan struct{}),
 		trustedOrigins:   trustedOrigins,
 		installedTeams:   installedTeams,
+		namingSlots:      make(chan struct{}, 2),
+	}
+	if err := server.loadPreparations(); err != nil {
+		cancelOperations()
+		return nil, err
 	}
 	if err := server.loadCreations(); err != nil {
 		cancelOperations()
@@ -433,6 +446,10 @@ func New(config Config) (*Server, error) {
 	}
 	server.conversation = conversationHandler
 	if err := server.initUploads(); err != nil {
+		cancelOperations()
+		return nil, err
+	}
+	if err := server.reconcilePreparations(); err != nil {
 		cancelOperations()
 		return nil, err
 	}
@@ -582,6 +599,7 @@ func (s *Server) Close() {
 		s.cancelOperations()
 		s.operationMu.Unlock()
 		s.operationWG.Wait()
+		s.pausePreparationsOnClose()
 	})
 }
 
@@ -598,6 +616,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("/", s.route)
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if looksLikePreparationPath(r.URL) && !validPreparationPath(r.URL) {
+			http.NotFound(w, r)
+			return
+		}
 		if s.invalidSourceRequest(r) {
 			http.NotFound(w, r)
 			return
@@ -621,6 +643,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch {
+	case strings.HasPrefix(r.URL.Path, "/creations/") || strings.HasPrefix(r.URL.Path, "/api/session-creations/"):
+		s.preparationRoute(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		s.index(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/upload-drafts":
@@ -1255,6 +1279,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
 	if err := r.ParseForm(); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "invalid form")
+		return
+	}
+	if _, present := r.Form["clientRequestId"]; present {
+		s.createPreparation(w, r)
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))

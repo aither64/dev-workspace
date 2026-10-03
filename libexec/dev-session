@@ -896,6 +896,7 @@ module DevSession
         runtime_journal = nil
 
         selected_session = with_slug_lock(slug) do
+          guard_portal_preparation_reservation!(slug, receipt)
           preparation_started = creation_progress_begin('prepare')
           select_tmux_for_slug!(slug)
           if lifecycle_operation == 'revive'
@@ -1272,11 +1273,10 @@ module DevSession
       destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
       journal = load_fork_journal(destination_slug)
       verify_creation_source!(receipt) if receipt && receipt['source'] && journal.nil?
-      if receipt
-        with_creation_lock(destination_slug) do
-          with_slug_lock(destination_slug) do
-            prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:)
-          end
+      with_creation_lock(destination_slug) do
+        with_slug_lock(destination_slug) do
+          guard_portal_preparation_reservation!(destination_slug, receipt)
+          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:) if receipt
         end
       end
       journal = load_fork_journal(destination_slug)
@@ -1351,6 +1351,7 @@ module DevSession
 
       destination_session = with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
+          guard_portal_preparation_reservation!(destination_slug, receipt)
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
           require_current_portal_creation!(receipt, destination_slug, model:, effort:) if receipt
@@ -3537,6 +3538,56 @@ module DevSession
         'agent_team_binding' => team_binding,
         'agent_team_binding_digest' => binding_digest
       }.compact
+    end
+
+    # Called only under creation-then-slug locks. Compact mappings never reserve
+    # a name and live in a separate directory, so this scan stays bounded.
+    def guard_portal_preparation_reservation!(slug, receipt)
+      return unless @workspace_state_root
+      workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      root = File.join(@workspace_state_root, 'portal', workspace_id)
+      pending = File.join(root, 'session-preparations')
+      if path_exists?(pending)
+        unless File.directory?(pending) && !File.symlink?(pending) && File.stat(pending).mode & 0o777 == 0o700
+          raise Error, 'portal session preparation directory must be private'
+        end
+        files = Dir.children(pending).reject { |name| name.start_with?('.') && name.end_with?('.tmp') }
+        raise Error, 'too many unfinished portal session preparations' if files.length > 512
+        files.each do |name|
+          unless name.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json\z/)
+            raise Error, 'invalid portal preparation filename'
+          end
+          record_path = File.join(pending, name)
+          raise Error, 'portal session preparation is a symlink' if File.symlink?(record_path)
+          record = read_private_json_object(record_path, 'portal session preparation', max_size: 2 * (12 * MAX_MESSAGE_BYTES + 16_384) + 16_384, mode: 0o600)
+          unless record['schema'] == 1 && record['workspace'] == workspace && record['requestId'] == name.delete_suffix('.json') &&
+                 record['receiptId'].is_a?(String) && record['receiptId'].match?(/\A[0-9a-f]{64}\z/) &&
+                 record['inputVersion'] == 1 && record['inputDigest'].is_a?(String) && record['inputDigest'].match?(/\A[0-9a-f]{64}\z/) &&
+                 %w[accepting running paused failed handed_off terminal].include?(record['state'])
+            raise Error, 'invalid portal session preparation identity'
+          end
+          next if record['state'] == 'terminal' || record['slug'] != slug
+          unless record['epoch'].is_a?(String) && record['epoch'].match?(/\A[0-9a-f]{64}\z/) && record['handoff'].is_a?(Hash) && record.dig('handoff', 'slug') == slug
+            raise Error, 'invalid portal preparation reservation'
+          end
+          unless receipt && receipt['receipt_id'] == record['receiptId']
+            raise Error, "session name is reserved by an accepted portal request: #{slug}"
+          end
+        end
+      end
+      receipt_path = File.join(root, 'creations', "#{slug}.json")
+      return unless path_exists?(receipt_path)
+      raise Error, 'portal creation receipt is a symlink' if File.symlink?(receipt_path)
+      current = read_private_json_object(receipt_path, 'portal creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384, mode: 0o600)
+      unless [1, 2, 3].include?(current['schema']) && current['workspace'] == workspace && current['request'].is_a?(Hash) && current.dig('request', 'slug') == slug &&
+             current['receiptId'].is_a?(String) && current['receiptId'].match?(/\A[0-9a-f]{64}\z/) &&
+             %w[running paused failed ready conflict cancelled].include?(current['state'])
+        raise Error, 'invalid portal creation reservation'
+      end
+      return if %w[ready conflict cancelled].include?(current['state'])
+      unless receipt && receipt['receipt_id'] == current['receiptId']
+        raise Error, "session creation belongs to another portal request: #{slug}"
+      end
     end
 
     def verify_creation_source!(receipt)

@@ -16,6 +16,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
+	"golang.org/x/sys/unix"
 )
 
 func (s *Server) initUploads() error {
@@ -207,10 +208,24 @@ func (s *Server) retainCreationUploads(ctx context.Context) error {
 }
 
 func (s *Server) collectUploads(ctx context.Context) error {
+	_, unlockTransition, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlockTransition()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
 	if err := s.uploadCreationMu.Lock(ctx); err != nil {
 		return err
 	}
 	defer s.uploadCreationMu.Unlock()
+	s.operationMu.Lock()
+	err = s.reconcilePreparationsLocked(ctx)
+	s.operationMu.Unlock()
+	if err != nil {
+		return err
+	}
 	if err := s.retainCreationUploads(ctx); err != nil {
 		return err
 	}

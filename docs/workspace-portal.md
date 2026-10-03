@@ -520,6 +520,10 @@ it is not a persistent team member.
 
 ## Session creation progress
 
+The [session preparation contract](session-preparations.md) describes
+request-ID admission, automatic-name fallback, receipt handoff, upload
+ownership and recovery for New session API callers.
+
 The creation page polls the existing receipt once per second and shows the
 current conversation, recovery, member, prompt, terminal or verification stage.
 The elapsed clock measures the whole accepted attempt. A completed stage can

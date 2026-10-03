@@ -285,27 +285,47 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error) {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	return s.installCreationLocked(request, "", "", false)
+}
+
+// Exact-owner installation must not retire or adopt an equal-content receipt.
+// Call with operationMu and, for preparations, both destination locks held.
+func (s *Server) installCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
 	if s.closing {
 		return creationReceipt{}, errors.New("portal is stopping; retry shortly")
 	}
-	if err := s.retireAbsentCreation(request.Slug); err != nil {
-		return creationReceipt{}, err
+	if receiptID == "" {
+		if err := s.retireAbsentCreation(request.Slug); err != nil {
+			return creationReceipt{}, err
+		}
 	}
 	if previous, ok := s.creations[request.Slug]; ok {
 		same := sameCreationRequest(previous.Request, request) &&
 			previous.Schema != 2 &&
 			(previous.Schema != 3 || (request.directTeam != nil && previous.DirectTeam != nil && reflect.DeepEqual(*previous.DirectTeam, *request.directTeam) &&
 				previous.Model == request.directTeam.LeadModel && previous.Effort == request.directTeam.LeadEffort))
-		if same {
+		if same && (receiptID == "" || (previous.ReceiptID == receiptID && previous.DeletionHistorySHA256 == expectedEpoch && previous.Workspace == s.config.Workspace)) {
 			return previous, nil
 		}
 		return creationReceipt{}, errors.New("this session name belongs to a different creation request")
 	}
-	lock, err := session.LockRuntimeShared(s.config.AuthorityDir, request.Slug)
-	if err != nil {
-		return creationReceipt{}, err
+	if !destinationLocked {
+		creationLock, err := session.LockCreation(s.config.AuthorityDir, request.Slug)
+		if err != nil {
+			return creationReceipt{}, err
+		}
+		defer creationLock.Close()
+		lock, err := session.LockRuntimeExclusive(s.config.AuthorityDir, request.Slug)
+		if err != nil {
+			return creationReceipt{}, err
+		}
+		defer lock.Close()
 	}
-	defer lock.Close()
+	for _, preparation := range s.preparations {
+		if preparation.State != "terminal" && preparation.Slug == request.Slug && preparation.ReceiptID != receiptID {
+			return creationReceipt{}, errors.New("session name belongs to an accepted request")
+		}
+	}
 	for _, root := range []string{"work", "archive", "worktrees"} {
 		if _, err := os.Lstat(filepath.Join(s.config.Workspace, root, request.Slug)); err == nil {
 			return creationReceipt{}, errors.New("session name already exists")
@@ -327,9 +347,16 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 	if err != nil {
 		return creationReceipt{}, err
 	}
-	id := make([]byte, 32)
-	if _, err := rand.Read(id); err != nil {
-		return creationReceipt{}, err
+	if receiptID != "" {
+		if !messageDigestPattern.MatchString(receiptID) || history != expectedEpoch {
+			return creationReceipt{}, errors.New("session reservation identity changed")
+		}
+	} else {
+		id := make([]byte, 32)
+		if _, err := rand.Read(id); err != nil {
+			return creationReceipt{}, err
+		}
+		receiptID = hex.EncodeToString(id)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	schema := 1
@@ -343,7 +370,7 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 		}
 		schema = 3
 	}
-	receipt := creationReceipt{Schema: schema, Workspace: s.config.Workspace, Request: request, ReceiptID: hex.EncodeToString(id),
+	receipt := creationReceipt{Schema: schema, Workspace: s.config.Workspace, Request: request, ReceiptID: receiptID,
 		DeletionHistorySHA256: history, Attempt: 1, State: "running", Phase: "Checking session settings…", StartedAt: now, UpdatedAt: now}
 	if schema == 3 {
 		preset := *request.directTeam
@@ -529,29 +556,33 @@ func (s *Server) retryCreation(w http.ResponseWriter, r *http.Request, slug stri
 	if !s.decodeJSON(w, r, &body) {
 		return
 	}
+	receipt, status, err := s.retryCreationReceipt(slug, body.ReceiptID, body.Attempt)
+	if err != nil {
+		s.writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, status, receipt.status())
+}
+
+func (s *Server) retryCreationReceipt(slug, receiptID string, attempt int) (creationReceipt, int, error) {
 	receipt, ok := s.currentCreation(slug)
 	if !ok {
-		http.NotFound(w, r)
-		return
+		return creationReceipt{}, http.StatusNotFound, errors.New("session creation was not found")
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	current := s.creations[slug]
-	if body.ReceiptID != current.ReceiptID || body.Attempt != current.Attempt || receipt.ReceiptID != current.ReceiptID {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Creation status changed. Reload before retrying."})
-		return
+	if receiptID != current.ReceiptID || attempt != current.Attempt || receipt.ReceiptID != current.ReceiptID {
+		return creationReceipt{}, http.StatusConflict, errors.New("Creation status changed. Reload before retrying.")
 	}
 	if current.State == "conflict" || current.State == "cancelled" {
-		s.writeJSON(w, http.StatusConflict, current.status())
-		return
+		return current, http.StatusConflict, nil
 	}
 	if current.State == "running" || current.State == "ready" {
-		s.writeJSON(w, http.StatusAccepted, current.status())
-		return
+		return current, http.StatusAccepted, nil
 	}
 	if s.closing {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Portal is stopping. Retry shortly."})
-		return
+		return creationReceipt{}, http.StatusServiceUnavailable, errors.New("Portal is stopping. Retry shortly.")
 	}
 	current.Attempt++
 	current.State = "running"
@@ -559,13 +590,12 @@ func (s *Server) retryCreation(w http.ResponseWriter, r *http.Request, slug stri
 	current.Phase = "Checking recorded request…"
 	current.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := s.saveCreation(current); err != nil {
-		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+		return creationReceipt{}, http.StatusInternalServerError, err
 	}
 	s.creations[slug] = current
 	s.operationWG.Add(1)
 	go s.runCreation(current)
-	s.writeJSON(w, http.StatusAccepted, current.status())
+	return current, http.StatusAccepted, nil
 }
 
 // A receipt alone is never evidence that a CLI operation completed. The CLI
@@ -688,7 +718,7 @@ func (s *Server) updateCreation(receipt creationReceipt) error {
 		return err
 	}
 	s.creations[receipt.Request.Slug] = receipt
-	return nil
+	return s.compactPreparationsLocked(receipt)
 }
 
 func creationPhase(event creationprogress.Event) string {
