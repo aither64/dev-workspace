@@ -524,6 +524,13 @@ The [session preparation contract](session-preparations.md) describes
 request-ID admission, automatic-name fallback, receipt handoff, upload
 ownership and recovery for New session API callers.
 
+Automatic naming uses a private Codex child owned by the portal service, with a
+fixed original catalog and `gpt-5.5`/`low`. Ordinary conversations keep their
+existing socket and dynamic model catalog. If the naming child is unavailable,
+creation uses the deterministic prompt-based name. Its supported profile,
+shutdown ownership and native diagnostic retention are described in the
+[preparation contract](session-preparations.md#naming-and-reservation).
+
 The creation page polls the existing receipt once per second and shows the
 current conversation, recovery, member, prompt, terminal or verification stage.
 The elapsed clock measures the whole accepted attempt. A completed stage can

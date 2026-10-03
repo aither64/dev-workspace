@@ -45,16 +45,86 @@ receipt and attempt. Other HTTP failures do not establish this recovery state.
 
 ## Naming and reservation
 
-An optional text-only naming adapter receives at most 8192 raw UTF-8 bytes and
+The portal owns one naming-only Codex App Server for its service lifetime.
+The text-only adapter uses that private socket; ordinary conversations keep
+their existing App Server and dynamic catalog. An injected adapter remains
+available for tests. Startup, readiness or runtime failure leaves naming
+unavailable and uses the existing deterministic fallback.
+The adapter receives at most 8192 raw UTF-8 bytes and
 returns one JSON object containing only `name`. A generated name must contain
 three to six lowercase ASCII alphanumeric words separated by hyphens and fit
 within 48 bytes. The adapter must honor cancellation and the ten-second deadline,
 including queue time. No more than two adapter calls run concurrently per
 workspace. Attachment names, paths and contents are excluded.
 
-Naming adapters must disable tools that access files or networks and reject
-questions immediately. A pure clock tool may remain. Validate that boundary
-against the exact serving binary before enabling an adapter.
+The adapter calls codex-web's public `RunEphemeralTurn` with exactly
+`gpt-5.5`/`low`, fixed instructions and a bounded name schema. Each call uses
+an empty private mode-0700 cwd outside the workspace and a separate mode-0600
+instruction override file containing exactly codex-web's
+`EphemeralInstructionFileContent`. The adapter writes that provider-owned constant
+once to its unique `instructions.txt` file and keeps it unchanged through helper
+teardown. Both file overrides use that path: the pinned server requires readable,
+nonempty contents even when explicit naming instructions take precedence. The
+fixed text also supplies the compact-file prompt; it does not disable compaction.
+The call supplies no attachments or team policy.
+The worker retains ownership of the whole deadline and concurrency limit.
+Scratch state is removed after the call; durable session state is untouched.
+
+The child uses the package's pinned native Codex executable and full unchanged
+original model catalog at `share/workspace-portal/codex-models.json`. A startup
+`model_catalog_json` CLI override selects the native static catalog manager;
+ordinary catalog refresh cannot replace it. The helper validates the immutable
+file and requires `config/read` to identify its exact path with `sessionFlags`
+origin before creating a thread. A model name or a path written to user config
+after startup cannot establish that profile. See the provider's
+[ephemeral utility contract](https://github.com/aither64/codex-web/blob/master/docs/reference.md#ephemeral-utility-turns)
+for the file digest, supported pair and preflight rules.
+
+The portal starts this child once, with its existing host-selected Codex home
+and account/provider environment, strict config loading and native remote
+control disabled for the child. It copies no credentials and does not change
+ordinary remote enrollment. Startup runs in an empty private cwd; global user
+policy remains trusted. A failed or exited child is not respawned or replaced
+by the ordinary socket. Restart the portal through the existing service/package
+procedure to create another lifetime.
+
+On shutdown, the portal stops admissions and cancels/waits its workers while
+the child remains available for helper cleanup. It then terminates and joins
+only the owned process group before returning. A two-second graceful stop is
+followed by group kill if needed. Repeated cleanup is safe, including early
+child exit and constructor/listener/HTTP failure. The managed service's cgroup
+is the final boundary after forced parent exit; a manual uncontained launcher
+does not provide that boundary. Temporary child socket/cwd state is removed
+after the owned process has been joined.
+
+The helper disables file/network action tools and rejects questions immediately.
+Actual server requests with IDs receive `-32601`; async question/delivery
+notifications fail without a fabricated response or UI admission. The supported
+Direct profile exposes no model tools, including clock and JavaScript exec/wait.
+CodeModeOnly utility models are unsupported because the pinned protocol cannot
+terminate their yielded cells after a completed turn.
+Global user instructions remain trusted serving-instance policy.
+When a turn/start reply is lost, a matching early notification may identify the
+owned turn solely for interruption within the original deadline. It cannot
+authorize success; missing or conflicting identity is not adopted. Unsubscribe
+alone does not stop a running turn.
+Operators must pause/stop naming through existing service/package procedures
+before MCP reconfiguration, then let fresh calls capture all new literal server
+names. Validate actual tool schemas, hostile dispatch, both question paths and
+teardown against the exact candidate binary before live enablement. Fake client
+tests and deterministic fallback do not prove model isolation.
+
+Native ephemeral mode omits resumable conversations but its diagnostic SQLite
+logger can retain plaintext copies of the naming input and thread/turn identities
+in `logs_2.sqlite` under the configured SQLite home. The portal keeps that existing
+local logger enabled. The naming input is limited to the first 8192 raw UTF-8
+bytes and excludes attachment names, paths and contents. Codex 0.160.0 prunes
+rows older than ten days at startup; this is not a guaranteed erasure deadline.
+Accepted preparation requests and normal session history retain their existing
+persistence contracts. Portal operational logs contain outcome and duration,
+without prompt text or model output.
+Changing authentication, provider configuration, managed policy or the fixed
+resource requires restarting the naming child through the portal procedure.
 
 With no adapter, or after an unavailable/invalid result, naming uses the first
 nonempty line: lowercase, Unicode diacritic decomposition, removal of combining

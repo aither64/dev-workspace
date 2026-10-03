@@ -5,6 +5,7 @@
   buildNpmPackage,
   coreutils,
   codex,
+  codexModelCatalog,
   codexWebSrc,
   codexWebVersion,
   git,
@@ -258,6 +259,7 @@ buildGoModule {
   postInstall = ''
     mkdir -p "$out/libexec/workspace-portal" "$out/share/dev-workspace"
     ln -s ${codex} "$out/libexec/codex"
+    install -Dm444 ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
     install -Dm755 ${src}/libexec/dev-session \
       "$out/libexec/workspace-portal/dev-session"
     install -Dm755 ${src}/libexec/workspace-host \
@@ -361,6 +363,9 @@ buildGoModule {
     test -f "$out/share/dev-workspace/extensions.json"
     test -f "$out/share/dev-workspace/package.json"
     test -x "$out/bin/workspace-portal"
+    cmp ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
+    test "$(sha256sum "$out/share/workspace-portal/codex-models.json" | cut -d' ' -f1)" = fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b
+    test "$("$out/libexec/codex/libexec/codex/bin/codex" --version)" = "codex-cli 0.160.0"
     mkdir -p "$TMPDIR/agent-team-state" "$TMPDIR/agent-team-workspace"
     printf '{"schema":1}\n' | ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/bin/workspace-portal" agent-teams registration \

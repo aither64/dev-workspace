@@ -110,3 +110,52 @@ journals and retained Codex roots. See the [portal recovery guide](workspace-por
 for the supported entry points. System recovery uses its retained system
 generation; whether an older Codex can read newer state must be established
 separately on disposable state before using that recovery path.
+
+## Session naming release boundary
+
+The portal's session namer uses a portal-owned, naming-only App Server with
+exact `gpt-5.5`/`low`. The package installs the full unchanged original
+`codex.src/codex-rs/models-manager/models.json` as
+`share/workspace-portal/codex-models.json`. A startup CLI override selects the
+native static models manager for this child; the ordinary App Server retains
+its dynamic catalog. The helper checks the immutable file and startup
+`sessionFlags` origin before inference. It does not patch Codex, edit model
+entries or rewrite shared Codex home.
+Global user instructions remain trusted serving-instance policy. File/network
+action tools and project/workspace/team/skill injection must be excluded;
+questions fail immediately. The supported Direct profile exposes no model tools.
+CodeModeOnly models are unsupported because yielded cells can survive completed
+turns without a supported scoped stop/join operation.
+
+Before enabling a candidate deployment, run the codex-web protocol corpus and
+fixed restriction-key/type validator against that candidate's generated App
+Server schema and `core/config.schema.json`. After mandatory review, run the
+tagged exact-binary mock-provider fixture described in codex-web's technical
+reference. Record the exact native binary hash, assembled package/profile and
+unchanged model metadata, actual advertised tool schemas, forbidden dispatch,
+question rejection and ephemeral teardown evidence. Include the startup
+catalog path/origin, local-only child launch and actual managed-service
+start/loss/stop/forced-exit checks with ordinary-daemon continuity. The real
+positive naming canary must use this same child profile and obtain a valid model
+result within the ten-second budget. Missing prerequisites or
+unsupported behavior block release. Deterministic fallback after a helper error
+does not establish isolation.
+
+The child reads the existing host-selected account/provider configuration and
+uses the pinned version's local-only launch marker; credentials are not copied
+into a new home or passed in argv. The portal owns its process group and join,
+including early child exit and portal failure. Native ephemeral storage excludes
+resumable conversations but its separate SQLite diagnostics can retain input
+and identity in plaintext. The existing local logger remains enabled, and its
+startup pruning does not guarantee an erasure deadline. See the
+[preparation contract](session-preparations.md#naming-and-reservation) for runtime
+ownership, naming-input bounds and native logging semantics.
+
+MCP names are captured once per bounded naming call. Pause/stop naming through
+the existing portal service or supported package transition before changing MCP
+configuration. Finish that reconfiguration while no naming call is active;
+fresh calls capture and disable all literal names then present. This support
+condition does not include deliberate administrator reconfiguration during a
+call. Use the existing service/package procedures, without a global config
+lease or another process manager. Package-generation cancellation must prevent
+the old worker from committing a fallback or reservation.

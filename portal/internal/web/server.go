@@ -64,33 +64,35 @@ type codexController interface {
 }
 
 type Config struct {
-	ObserveActivity    bool
-	CollectUploads     bool
-	Workspace          string
-	BaseURL            string
-	TrustedOrigins     []string
-	DisplayLabel       string
-	HostLabel          string
-	SSHHost            string
-	DevSession         string
-	HostProfile        string
-	GH                 string
-	Tmux               string
-	AuthorityDir       string
-	TransitionLock     string
-	CodexSocket        string
-	CodexVersion       string
-	ClusterProviders   []cluster.Provider
-	UserStateRoot      string
-	PackageRoot        string
-	WorkspaceName      string
-	RegistrationMarker string
-	Logger             *log.Logger
-	Codex              codexController
-	VerifyThread       func(context.Context, string, string) error
-	ReadThread         func(context.Context, string) (codex.Transcript, error)
-	// SessionNamer is an isolated text-only boundary. A nil adapter uses the
-	// deterministic fallback until the model utility's isolation is established.
+	ObserveActivity        bool
+	CollectUploads         bool
+	Workspace              string
+	BaseURL                string
+	TrustedOrigins         []string
+	DisplayLabel           string
+	HostLabel              string
+	SSHHost                string
+	DevSession             string
+	HostProfile            string
+	GH                     string
+	Tmux                   string
+	AuthorityDir           string
+	TransitionLock         string
+	NamingSocket           string
+	NamingModelCatalogFile string
+	CodexSocket            string
+	CodexVersion           string
+	ClusterProviders       []cluster.Provider
+	UserStateRoot          string
+	PackageRoot            string
+	WorkspaceName          string
+	RegistrationMarker     string
+	Logger                 *log.Logger
+	Codex                  codexController
+	VerifyThread           func(context.Context, string, string) error
+	ReadThread             func(context.Context, string) (codex.Transcript, error)
+	// SessionNamer injects the isolated naming boundary in tests. Normal server
+	// construction uses the owned naming socket/catalog; missing inputs use fallback.
 	SessionNamer func(context.Context, string) (string, error)
 }
 
@@ -409,6 +411,9 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		cancelOperations()
 		return nil, err
+	}
+	if config.SessionNamer == nil && config.NamingSocket != "" && config.NamingModelCatalogFile != "" {
+		config.SessionNamer = normalSessionNamer(config.NamingSocket, config.NamingModelCatalogFile, operationStore)
 	}
 	server := &Server{
 		uploadCreationMu: conversation.NewMutationLock(),

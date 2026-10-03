@@ -276,6 +276,14 @@ func serve(args []string) error {
 		}
 	}
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
+	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	naming := startNamingRuntime(options.packageRoot, options.unixSocket, logger)
+	defer naming.Close()
+	var namingSocket, namingCatalog string
+	if naming != nil {
+		namingSocket, namingCatalog = naming.socket, naming.catalog
+	}
 	codexClient := newCodexClient(options.codexSocket, options.workspace)
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
@@ -288,6 +296,7 @@ func serve(args []string) error {
 		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
 		PackageRoot: options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
 		CodexSocket: options.codexSocket, CodexVersion: options.codexVersion,
+		NamingSocket: namingSocket, NamingModelCatalogFile: namingCatalog,
 		ClusterProviders: options.clusterProviders,
 		Logger:           logger, Codex: codexClient,
 	})
@@ -300,12 +309,23 @@ func serve(args []string) error {
 		return err
 	}
 	defer listener.Close()
+	return servePortalHTTP(stopContext, application, listener, logger, options.baseURL)
+}
+
+// All HTTP exit paths close application workers before serve's owned-child
+// defer runs. Constructor/listener errors use the same outer defer ordering.
+func servePortalHTTP(stopContext context.Context, application *portalweb.Server, listener net.Listener, logger *log.Logger, baseURL string) error {
+	defer application.Close()
 	httpServer := &http.Server{Handler: application.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024}
-	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	shutdownDone := make(chan error, 1)
 	go func() {
-		<-stopContext.Done()
+		select {
+		case <-stopContext.Done():
+		case <-serveDone:
+			return
+		}
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 130*time.Second)
 		defer cancel()
 		httpShutdown := make(chan error, 1)
@@ -313,8 +333,8 @@ func serve(args []string) error {
 		application.Close()
 		shutdownDone <- <-httpShutdown
 	}()
-	logger.Printf("listening on %s for %s", listener.Addr(), options.baseURL)
-	err = httpServer.Serve(listener)
+	logger.Printf("listening on %s for %s", listener.Addr(), baseURL)
+	err := httpServer.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
 	}
