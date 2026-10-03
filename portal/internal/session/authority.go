@@ -43,6 +43,20 @@ func (l *RuntimeLock) Close() error {
 // LockRuntimeShared serializes browser mutations with lifecycle commands for
 // one session. The lock lives outside the LXC-writable workspace.
 func LockRuntimeShared(directory, slug string) (*RuntimeLock, error) {
+	return lockRuntime(directory, slug, ".lock", unix.LOCK_SH)
+}
+
+// LockCreation and LockRuntimeExclusive use the CLI's creation-then-session
+// lock order when reserving a destination that does not yet have an authority.
+func LockCreation(directory, slug string) (*RuntimeLock, error) {
+	return lockRuntime(directory, slug, ".creation.lock", unix.LOCK_EX)
+}
+
+func LockRuntimeExclusive(directory, slug string) (*RuntimeLock, error) {
+	return lockRuntime(directory, slug, ".lock", unix.LOCK_EX)
+}
+
+func lockRuntime(directory, slug, suffix string, mode int) (*RuntimeLock, error) {
 	if directory == "" || !ValidSlug(slug) {
 		return nil, errors.New("runtime locking is not configured")
 	}
@@ -52,11 +66,11 @@ func LockRuntimeShared(directory, slug string) (*RuntimeLock, error) {
 	}
 	defer unix.Close(directoryFD)
 
-	session, err := openOwnedLock(directoryFD, slug+".lock")
+	session, err := openOwnedLock(directoryFD, slug+suffix)
 	if err != nil {
 		return nil, fmt.Errorf("open runtime session lock: %w", err)
 	}
-	if err := unix.Flock(int(session.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+	if err := unix.Flock(int(session.Fd()), mode|unix.LOCK_NB); err != nil {
 		session.Close()
 		return nil, fmt.Errorf("session is changing: %w", err)
 	}

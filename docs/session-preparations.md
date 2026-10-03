@@ -1,0 +1,169 @@
+# Session preparation requests
+
+New-session callers can submit a canonical random version-4 UUID in
+`clientRequestId` with `POST /sessions`. A short `name` is optional on this path.
+The server saves the accepted request before asynchronous naming and ordinary
+session initialization. Explicit-name requests without an ID retain their
+existing behavior. Forks, plan sessions and CLI name syntax are unchanged.
+
+## Admission and replay
+
+The frozen input contains the original UTF-8 prompt, ordered attachment IDs,
+upload scope, date, normalized custom name, submitted team/model values and
+their presence, and an exact resolved team preset. Presets include member and
+lead settings and instructions. For managed selections, admission validates
+local structure and policy; the initialization worker checks live model/effort
+availability. It never replaces unavailable captured settings with defaults.
+
+A versioned input digest binds the request ID. Repeating the same ID and input
+returns the original operation before consulting current catalog or upload
+state. Changing prompt whitespace, attachment order, scope, date or settings
+returns a conflict. Different IDs are separate requests even with equal prompt
+text.
+Repeating POST does not retry a failed operation.
+
+JSON acceptance is HTTP 202 with `requestId`, `receiptId`, `attempt`, `url`,
+state, phase, timestamps and `initialRequest`. Form callers receive a 303 to
+`/creations/<request-id>/`. The initial request is the raw textual prompt,
+independent of attachment-expanded text sent to the session. The preparation
+page renders it before browser scripts load.
+
+`GET /api/session-creations/<request-id>` returns current progress and, after
+exact receipt installation, a server-generated `canonicalUrl` and final slug.
+`POST /api/session-creations/<request-id>/retry` requires the current
+`receiptId` and `attempt`; stale offers conflict. Before handoff a retry starts
+a new preparation attempt, or resumes an attempt already published but not
+launched. After handoff the ordinary creation receipt owns
+attempts and progress. These endpoints require canonical unescaped UUID paths;
+mutations retain the portal's exact-origin and package-generation checks.
+
+An unconfirmed preparation or upload-claim write returns HTTP 503 with the
+exact `requestId` and `code: "preparation_persistence_unconfirmed"`. The saved
+identity remains reserved. Repeating the identical submission confirms the
+published write and repairs its pending admission; retry uses the current
+receipt and attempt. Other HTTP failures do not establish this recovery state.
+
+## Naming and reservation
+
+An optional text-only naming adapter receives at most 8192 raw UTF-8 bytes and
+returns one JSON object containing only `name`. A generated name must contain
+three to six lowercase ASCII alphanumeric words separated by hyphens and fit
+within 48 bytes. The adapter must honor cancellation and the ten-second deadline,
+including queue time. No more than two adapter calls run concurrently per
+workspace. Attachment names, paths and contents are excluded.
+
+Naming adapters must disable tools that access files or networks and reject
+questions immediately. A pure clock tool may remain. Validate that boundary
+against the exact serving binary before enabling an adapter.
+
+With no adapter, or after an unavailable/invalid result, naming uses the first
+nonempty line: lowercase, Unicode diacritic decomposition, removal of combining
+marks, then up to six ASCII alphanumeric words joined with hyphens. Other
+characters separate words. Truncation keeps whole words; if the first word
+cannot fit or no words remain, the name is `session`. Attachment-only prompts
+skip the adapter. Operational logs contain duration and outcome codes, not
+prompt text or model output.
+
+The selected base is saved before reservation. Automatic collisions add `-2`,
+`-3` and subsequent suffixes, truncating whole words to retain the 48-byte limit.
+Custom-name collisions fail. A frozen final slug never changes on retry.
+Reservation shares creation-then-session locks with the CLI and excludes
+tracking, archives, worktrees, receipts, other preparations, journals and
+runtime/team state. Lock contention and unreadable occupancy stop the attempt.
+An unrelated CLI start or fork cannot claim a frozen portal destination.
+
+## Durable state and uploads
+
+Version-1 preparation records live in private `session-preparations/` files
+beside ordinary portal state. They preserve the full input, team snapshot,
+digests, naming result, predetermined receipt ID, final handoff request and
+deletion-history epoch while recovery can still need them. File replacement
+and directory moves are atomic and synced. A successful rename followed by a
+sync error reserves the exact published record. Until required directory syncs
+succeed, admission and status return the request-bound persistence error above;
+no receipt replacement, upload release or new side effect is allowed.
+Same-process recovery confirms the published bytes before advancing.
+
+Private in-memory dispatch bookkeeping separates a pending launch from a
+dispatched worker. Identical submission repairs a pending admission launch once,
+with the original receipt and attempt. A retry that published its incremented
+attempt before a sync error exposes that current attempt after confirmation;
+retrying it launches the pending worker without another increment. A worker
+that already stopped after later I/O instead exposes stopped progress for an
+explicit retry. Confirmation alone never repeats its naming call. Explicit retry
+retains any published base and reservation; ordinary restart still pauses work.
+Existing creation receipts, manifests, lifecycle journals and upload catalogs
+retain their schemas.
+
+At most 512 unfinished requests and 10,000 total admitted replay identities are
+allowed. Mapping capacity is reserved on admission. Full records are bounded
+to twice the existing receipt byte limit plus 16 KiB; compact mappings are
+bounded to 2 KiB. The aggregate limit reserves those maxima. Admission rejects
+new IDs at capacity and retains existing identities.
+
+Attachment acceptance validates ready files before saving an intent, then
+revalidates and atomically claims the draft scope in the existing schema-1
+catalog using an initial submission with
+`attempt: preparation:<request-id>` and `state: pending`. Pending retention
+protects accepted files even before a slug exists. Another request or legacy
+submission cannot reuse the scope. Every catalog mutation checks ownership
+inside its transaction. Replaying an existing pending claim confirms catalog
+file and directory durability before acceptance advances. Unconfirmed catalog
+or preparation writes abort collection and retain selected files and ownership
+evidence. For a confirmed accepting intent, collection completes the attachment
+claim before allowing expiry to run; it leaves dispatch pending for the original
+POST or explicit retry. If the claim cannot be completed, collection aborts.
+Empty attachment selections do not claim a draft.
+
+After reservation the same scope receives the final slug and epoch. Ordinary
+creation proof transfers it to the final thread through the existing initial
+attachment binding. Retention is continuous across that transfer. Reconciliation
+runs before collection; it does not discard unresolved ownership based on age.
+If an older writer adds a competing submission while the draft is accepted,
+new recovery fails that preparation and retains both ownership evidence and
+selected files. It does not silently pick an owner or release pending retention.
+
+## Recovery and older packages
+
+A saved intent without a catalog claim is not completed acceptance. Recovery
+finishes the same intent or reports unavailable files. A pending claim without
+an acceptance response resumes from the frozen snapshot. Restart pauses naming;
+explicit retry uses any saved base and reservation. Shutdown cancellation never
+commits a fallback merely because the server is stopping.
+
+Receipt installation checks the exact predetermined ID, request, resolved team
+and epoch. An equal-content receipt belonging to another request is a conflict.
+A crash between receipt installation and handoff recording adopts only that
+exact receipt, without launching another worker.
+
+Terminal operations compact to immutable input-digest/receipt/slug/epoch/outcome
+mappings in `session-preparation-mappings/` before ordinary receipt retirement.
+Retirement also waits for confirmation of an already published mapping and both
+directories after its move; an earlier failed sync cannot be bypassed by replay.
+The CLI scans only unfinished records. A crash after compact replacement but
+before the directory move remains recoverable. Receipt eviction or later
+session deletion never allows the same request ID to initialize again.
+
+Older packages ignore the preparation files and retain schema-1 pending uploads.
+They cannot resume preparation progress, and older CLI code cannot honor the
+new destination reservations. Newer recovery refuses a competing destination
+created by that code. Compatible forward updates restore
+the new endpoints and recovery. Workspace application switches remain
+forward-only; operational recovery uses a newer package with the required
+behavior and state readers.
+
+## Focused compatibility fixture
+
+After mandatory review, run `bash test/preparation_compatibility.sh` from the
+repository's Nix environment. The runner extracts only portal source from exact
+baseline `924c0ec28c41dd8b56aaf17f2212b302ca614899` into a temporary directory.
+It never switches an installed package. Three nonzero Go selectors write a
+current pre-slug claim, execute the baseline reader/collector and mutation APIs,
+then restart current recovery against the resulting catalog.
+
+The baseline phase verifies pending-file retention and refused deletion/append
+of selected completed uploads. It also executes baseline Create/Append/Complete
+for a new file and Prepare for a competing submission. The final phase requires
+current recovery and retry to refuse the conflict before naming/reservation,
+preserve selected bytes and retain both submission records. Fixture code alone
+is not passing compatibility evidence; record its actual execution separately.

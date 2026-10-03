@@ -185,6 +185,9 @@ func (s *Server) retireIdleCreation(receipt creationReceipt) error {
 // Call with operationMu held. Removing the receipt last keeps an interrupted
 // retirement recoverable; a ready receipt no longer needs CLI binding evidence.
 func (s *Server) retireCreation(receipt creationReceipt) error {
+	if err := s.compactPreparationsLocked(receipt); err != nil {
+		return err
+	}
 	for _, path := range []string{s.creationEvidencePath(receipt) + ".request", s.creationEvidencePath(receipt), s.creationPath(receipt.Request.Slug)} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("retire creation receipt: %w", err)
