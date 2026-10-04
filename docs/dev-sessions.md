@@ -522,13 +522,14 @@ order:
 | Session | Inactivity | Outcome |
 | --- | --- | --- |
 | Explicit `lifecycle: complete` | 1 day | Complete |
-| Active, with all registered branches merged | 7 days | Complete |
+| Active, with all registered and additional feature branches merged | 7 days | Complete |
 | Active, with no registered repositories or owned worktrees | 14 days | Abandoned |
 
 The completed outcomes require the same exact local/remote merge proofs as
 manual archival. Removing a worktree does not remove its registered branch or
 qualify the session for the 14-day rule. Already abandoned sessions require
-manual archival. The archive retains the conversation, tracking and branches.
+manual archival. Auxiliary-only checkouts do not qualify an active session for
+the empty rule. The archive retains the conversation, tracking and branches.
 
 New conversation activity, content changes to plan/state or declared artifacts,
 repository registrations and feature-head changes restart inactivity. Dirty
@@ -612,9 +613,10 @@ must still be an ancestor of `origin/<default_branch>`. The command reports
 every branch whose merge status cannot be proven. A squash merge or partial
 cherry-pick does not satisfy this rule, and a branch with feature commits still
 requires a matching remote ref. Coordination-only initiatives
-with no registered branches remain valid. Legacy live worktrees without
-`portal.yml` are inferred from their canonical bare repository and checked as
-branches. `--abandoned` skips only this merge proof. A retry fetches and
+with no registered branches remain valid. Legacy records with live worktrees
+need normal manifest registrations before starting complete archival. Pending
+older journals retain their existing recovery checks. `--abandoned` skips only
+publication and merge proof. A retry fetches and
 reproves the exact heads stored in the archive journal before every remaining
 destructive phase; another merged commit on the feature branch cannot replace
 the head originally approved for archival.
@@ -628,6 +630,12 @@ worktrees without force, atomically moves tracking into `archive/`, commits
 only the tracking transition, retires the Codex thread, and removes the tmux
 session and authority. Branches are retained. The host-wide transition gate
 prevents portal mutations and cluster starts from racing this operation.
+
+Archive cleanup also inventories nested and detached Git-registered checkouts.
+Detached commits need existing retained refs; empty containers are removed only
+with `rmdir`. Its private sealed cleanup sidecar survives interruptions alongside
+the ordinary archive journal. See [archive cleanup and recovery](session-archive-recovery.md)
+for the ownership checks, prepared intents and supported old-journal recovery.
 
 Each irreversible phase is journaled in private runtime state. If a command or
 deployment interruption stops the operation, run the same `archive` command

@@ -283,6 +283,11 @@ private lifecycle executor with only the portal helper replaced by the candidate
 helper. A failed retry leaves the journal in place. Members completed before an
 interruption remain archived and are rechecked on the next retry.
 
+New archive operations also seal a private cleanup sidecar. Finish these through
+their capable ordinary executor; narrow recovery that delegates to an older
+selected executor refuses them. [Archive cleanup and recovery](session-archive-recovery.md)
+describes prepared intents, retry proof and the old no-sidecar compatibility path.
+
 ## Extension catalog
 
 Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`
