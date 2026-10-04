@@ -46,8 +46,8 @@ class WorkspaceHostTest < Minitest::Test
 
     private
 
-    def exec_with_workspace(entry, command, *arguments)
-      @captured = [@env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name')), command, arguments]
+    def exec(environment, command, *arguments)
+      @captured = [environment, command, arguments]
     end
   end
 

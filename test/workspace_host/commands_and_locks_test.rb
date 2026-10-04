@@ -68,6 +68,7 @@ class WorkspaceHostTest < Minitest::Test
       end
       environment, command, arguments = host.captured
       assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
+      assert_equal(File.join(directory, '.codex'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
       assert_equal('dev-session', File.basename(command))
       assert_includes(arguments, root)
       assert_includes(arguments, File.join(runtime, 'example-workspace', 'app-server.sock'))
@@ -78,6 +79,72 @@ class WorkspaceHostTest < Minitest::Test
       assert_operator(token_index, :<, arguments.index('--'))
       assert_match(/\A[0-9a-f]{64}\z/, arguments.fetch(token_index + 1))
       assert_equal('list', arguments.last)
+    end
+  end
+
+  def test_ordinary_dispatch_passes_the_selected_codex_home_and_inherited_environment
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'config', 'registry.json')
+      selected_home = File.join(directory, 'selected-codex-home')
+      configured_home = File.join(directory, 'codex-home')
+      FileUtils.mkdir_p(selected_home)
+      File.symlink(selected_home, configured_home)
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
+        aliases: [], replace: false
+      )
+      inherited = install_source_profile(host_environment(directory, config:)).merge(
+        'CODEX_HOME' => configured_home,
+        'DEV_WORKSPACE_CODEX_HOME' => File.join(directory, 'stale-codex-home'),
+        'DEV_SESSION_SLUG' => '2026-09-06-test',
+        'DEV_SESSION_WORKSPACE' => root,
+        'DISPATCH_MARKER' => 'inherited-value'
+      )
+      host = CapturingHost.new(env: inherited, out: StringIO.new, err: StringIO.new)
+      package = File.realpath(inherited.fetch('DEV_WORKSPACES_PROFILE'))
+      expected_options = {
+        '--workspace' => root,
+        '--expected-host-generation' => package,
+        '--host-profile' => inherited.fetch('DEV_WORKSPACES_PROFILE'),
+        '--expected-host-profile-token' => host.send(:profile_link_token),
+        '--transition-lock' => File.join(directory, 'state/transition.lock'),
+        '--codex-socket' => File.join(directory, 'runtime/example-workspace/app-server.sock'),
+        '--portal-command' => File.join(package, 'bin/workspace-portal')
+      }
+
+      [['list'], ['archive', '2026-09-06-test', '--as-is']].each do |request|
+        assert_equal(0, host.run('dev-session', ['--workspace', 'example-workspace', *request]))
+        environment, command, arguments = host.captured
+        assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
+        assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+        inherited.each do |key, value|
+          next if key == 'DEV_WORKSPACE_CODEX_HOME'
+
+          assert_equal(value, environment.fetch(key), key)
+        end
+        assert_equal(File.join(package, 'libexec/workspace-portal/dev-session'), command)
+        expected_options.each do |option, value|
+          option_index = arguments.index(option)
+          assert_operator(option_index, :<, arguments.index('--'), option)
+          assert_equal(value, arguments.fetch(option_index + 1), option)
+        end
+        assert_equal(request, arguments.drop(arguments.index('--') + 1))
+      end
+    end
+  end
+
+  def test_exec_with_workspace_keeps_the_default_environment_for_existing_callers
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      inherited = { 'HOME' => directory, 'DISPATCH_MARKER' => 'inherited-value' }
+      host = CapturingHost.new(env: inherited, out: StringIO.new, err: StringIO.new)
+
+      host.send(:exec_with_workspace, { 'name' => 'example-workspace' }, '/command', 'argument')
+
+      assert_equal(
+        [inherited.merge('DEV_WORKSPACE_NAME' => 'example-workspace'), '/command', ['argument']],
+        host.captured
+      )
     end
   end
 
@@ -330,6 +397,10 @@ class WorkspaceHostTest < Minitest::Test
       codex = File.join(directory, 'codex')
       File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
       File.chmod(0o755, codex)
+      selected_home = File.join(directory, 'selected-codex-home')
+      configured_home = File.join(directory, 'codex-home')
+      FileUtils.mkdir_p(selected_home)
+      File.symlink(selected_home, configured_home)
       DevWorkspaceHost::Registry.new(config).register(
         name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
         aliases: [], replace: false
@@ -347,6 +418,9 @@ class WorkspaceHostTest < Minitest::Test
           'DEV_WORKSPACES_STATE' => state,
           'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
           'DEV_WORKSPACES_SYSTEM_CODEX' => codex,
+          'CODEX_HOME' => configured_home,
+          'DEV_WORKSPACE_CODEX_HOME' => File.join(directory, 'stale-codex-home'),
+          'DISPATCH_MARKER' => 'inherited-value',
           'DEV_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
         },
         out: StringIO.new,
@@ -359,7 +433,12 @@ class WorkspaceHostTest < Minitest::Test
       ), error_output.string)
       environment, command, arguments = host.captured
       assert_equal(owner.fileno.to_s, environment.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD'))
+      assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
+      assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(configured_home, environment.fetch('CODEX_HOME'))
+      assert_equal('inherited-value', environment.fetch('DISPATCH_MARKER'))
       assert_equal('dev-session', File.basename(command))
+      assert_equal(root, arguments.fetch(arguments.index('--workspace') + 1))
       refute_includes(arguments, '--transition-lock')
     ensure
       owner&.flock(File::LOCK_UN)
@@ -438,7 +517,9 @@ class WorkspaceHostTest < Minitest::Test
           ['--workspace', 'example-workspace', 'archive', '2026-09-06-test', '--as-is']
         )
       )
-      _environment, command, arguments = host.captured
+      environment, command, arguments = host.captured
+      assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
+      assert_equal(File.join(directory, '.codex'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
       assert_equal('dev-session', File.basename(command))
       assert_includes(arguments, '--transition-lock')
       assert_equal(['archive', '2026-09-06-test', '--as-is'], arguments.last(3))

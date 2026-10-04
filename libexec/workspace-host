@@ -1102,10 +1102,10 @@ module DevWorkspaceHost
           )
           system_env!(environment, command, *arguments)
         else
-          _environment, private_command, arguments = dev_session_invocation(
+          environment, private_command, arguments = dev_session_invocation(
             entry, argv, transition_lock: true
           )
-          exec_with_workspace(entry, private_command, *arguments)
+          exec_with_workspace(entry, private_command, *arguments, environment:)
         end
         return
       end
@@ -1114,7 +1114,7 @@ module DevWorkspaceHost
         argv,
         transition_lock: true
       )
-      exec_with_workspace(entry, private_command, *arguments)
+      exec_with_workspace(entry, private_command, *arguments, environment:)
     end
 
     def dev_session_invocation(entry, argv, transition_lock:, package: package_root)
@@ -2894,8 +2894,8 @@ module DevWorkspaceHost
       File.expand_path('..', File.dirname(path))
     end
 
-    def exec_with_workspace(entry, command, *argv)
-      environment = @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
+    def exec_with_workspace(entry, command, *argv, environment: @env.to_h)
+      environment = environment.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'))
       exec(environment, command, *argv)
     end
 
