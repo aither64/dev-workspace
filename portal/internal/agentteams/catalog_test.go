@@ -299,6 +299,16 @@ func TestDevelopmentTeamAcceptsPurposeBasedCustomRoles(t *testing.T) {
 	if !validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
 		t.Fatal("purpose-based role names were rejected")
 	}
+	// Lead-owned design uses the same development contract without a designer.
+	leadOwned := team
+	leadOwned.DesignOwner = "team_lead"
+	leadOwned.MaxOpenAgents = 2
+	leadOwned.Roles = map[string]Role{
+		"team_lead": team.Roles["team_lead"], "coder": team.Roles["coder"], "auditor": team.Roles["auditor"],
+	}
+	if !validTeam("lead_designed", leadOwned, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
+		t.Fatal("lead-owned development without a designer was rejected")
+	}
 	team.Roles["bad_name"] = team.Roles["architect"]
 	if validTeam("custom", team, Capacity{RequiredNativeChildThreads: 3}, catalog.WorkPolicy) {
 		t.Fatal("non-addressable role name was accepted")

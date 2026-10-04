@@ -347,18 +347,35 @@ thread identity; browser input cannot claim to be a member.
 The installed workspace policy supplies three starting teams: Solo (`solo`),
 Full team (`delegated`), and Lead-designed team (`lead_designed`). Their role
 lists and exact lead model and reasoning effort appear on the new-session
-screen. Full team has `lead`, `architect0`, `implementer0`, and `reviewer0`;
-Lead-designed team omits the architect. The selected team and its member
-settings are saved with the creation receipt. Member threads are created before
-the lead receives the initial request. A failed creation can be retried with
-that saved selection.
+screen. Solo has only the lead, which investigates, designs and edits
+application code without automatic specialists. Full team has `lead`,
+`architect0`, `implementer0`, and `reviewer0`, with architect-owned design and
+delegated application implementation. Lead-designed has `lead`, `implementer0`
+and `reviewer0`; the lead writes the substantive design brief and delegates
+application implementation. Catalog prompts own these mode-specific policies.
+The selected team and its member settings are saved with the creation receipt.
+Member threads are created before the lead receives the initial request. A
+failed creation can be retried with that saved selection.
+
+Final review starts after the substantive deliverable is complete, all intended
+changes are committed and quick checks pass, before long integration tests.
+Completed substantive documentation and configuration changes are included.
+Routine planning, investigation, findings, session tracking and evidence alone never trigger
+automatic review. Earlier review requires an explicit user request, is advisory,
+and does not replace final review. A preset reviewer receives no automatic
+assignment. See the [session guide](dev-sessions.md#team-members) for orchestration.
 
 After creation, the Team tab can add, remove, and configure members, and
-inspect their messages. Model and reasoning settings apply to a member's next
-turn. Its add selector lists every role in the installed catalog and starts
-with that role's model and effort from the retained preset, the installed
-development default, or the installed default team. An explicit selection stays
-in place during status refresh. Both add settings may be omitted in the HTTP
+inspect their messages. Adding, replacing or reconfiguring members requires
+explicit user direction; agents do not automatically grow a Solo roster or add
+a designer to a Lead-designed team. The mandatory-review workflow uses a
+temporary independent final reviewer when no eligible retained reviewer exists,
+including Solo; the separate long-check watcher is also outside the roster.
+Neither changes the persistent team. Model and reasoning settings apply to a
+member's next turn. Its add selector lists every role in the installed catalog
+and starts with that role's model and effort from the retained preset, the
+installed development default, or the installed default team. An explicit
+selection stays in place during status refresh. Both add settings may be omitted in the HTTP
 API or CLI to use those role defaults; supplying only one is invalid. Without
 an installed catalog, add requires both settings explicitly. Existing rosters
 keep their saved settings.
@@ -438,9 +455,12 @@ created expanded receipts require the newer package and are not readable by an
 older package; this is a forward-only
 package transition. Host package-switch checks accept both legacy and expanded
 snapshots, including an architect's saved read-only or workspace-write access;
-they do not replace saved policy with current catalog defaults. Team mutations
-remain unavailable until the creation
-receipt is ready. If a member's App Server
+they do not replace saved policy with current catalog defaults.
+An older Lead-designed snapshot can therefore retain an architect even when the
+current catalog omits that role. Shared workspace rules and installed skills
+change globally, so they can conflict with saved prompts; no prompt refresh or
+existing-roster rewrite accompanies catalog changes. Team mutations remain
+unavailable until the creation receipt is ready. If a member's App Server
 start has an uncertain outcome, retry reconciles its registered App Server
 project and refuses to start another thread when the result is ambiguous. Each
 member's project is created with a durable idempotency key derived from the

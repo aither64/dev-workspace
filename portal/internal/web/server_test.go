@@ -1743,11 +1743,15 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 		BaseURL: "https://workspace.example.test", CreationDate: "2026-09-22",
 		AgentTeams: &agentTeamsPage{Managed: true, DefaultTeam: "delegated", CatalogDigest: strings.Repeat("a", 64),
 			Teams: []agentTeamRow{{Name: "delegated", Label: "Full team", Description: "Separate design and review",
-				MemberCount: 4, RoleSummary: "1 lead, 1 architect, 1 implementer, 1 reviewer", LeadModel: "gpt-6-sol", LeadEffort: "high"}}},
+				MemberCount: 4, RoleSummary: "1 lead, 1 architect, 1 implementer, 1 reviewer", LeadModel: "gpt-6-sol", LeadEffort: "high"},
+				{Name: "solo", Label: "Solo", MemberCount: 1, RoleSummary: "1 lead", LeadModel: "model-solo", LeadEffort: "high"},
+				{Name: "lead_designed", Label: "Lead-designed team", MemberCount: 3, RoleSummary: "1 lead, 1 implementer, 1 reviewer", LeadModel: "model-lead", LeadEffort: "xhigh"}}},
 	}
 	server.render(response, "index", data)
 	body := response.Body.String()
-	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`, `data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
+	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`,
+		`Solo (1): 1 lead</option>`, `Lead-designed team (3): 1 lead, 1 implementer, 1 reviewer</option>`,
+		`data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
 		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select><option value="">Selected team default</option>`,
 		`Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
 		if !strings.Contains(body, marker) {
@@ -1763,8 +1767,11 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	data.Session = &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true}
 	response = httptest.NewRecorder()
 	server.render(response, "session", data)
-	if !strings.Contains(response.Body.String(), `Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`) {
-		t.Fatal("plan-to-new-session dialog omitted the total member count")
+	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`,
+		`Solo (1): 1 lead</option>`, `Lead-designed team (3): 1 lead, 1 implementer, 1 reviewer</option>`} {
+		if !strings.Contains(response.Body.String(), marker) {
+			t.Fatalf("plan-to-new-session dialog omitted %q", marker)
+		}
 	}
 }
 

@@ -2197,6 +2197,31 @@ func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) 
 	}
 }
 
+func TestCatalogPresetProjectsLeadOwnedDevelopmentWithoutDesigner(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"lead_designed": {DesignOwner: "team_lead", MaxOpenAgents: 2, Mode: "development", TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead":   {Model: "model-lead", Effort: "xhigh", Purpose: "lead", Instructions: "Write the design brief and delegate implementation."},
+			"implementer": {Model: "model-implementer", Effort: "xhigh", Behavior: "implementer", Purpose: "implementation", Instructions: "Follow the lead-owned brief.", Access: "workspace_write"},
+			"reviewer":    {Model: "model-reviewer", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Instructions: "Review the completed deliverable.", Access: "read_only"},
+		}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "lead_designed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.Name != "Lead-designed team" || preset.MemberCount() != 3 ||
+		preset.RoleSummary() != "1 lead, 1 implementer, 1 reviewer" ||
+		!reflect.DeepEqual(preset.Roles, []string{"lead", "implementer0", "reviewer0"}) ||
+		preset.LeadModel != "model-lead" || preset.LeadEffort != "xhigh" ||
+		preset.LeadInstructions != catalog.Teams["lead_designed"].Roles["team_lead"].Instructions {
+		t.Fatalf("lead-owned preset projection = %#v", preset)
+	}
+	if preset.Members[0].Instructions != "Follow the lead-owned brief." ||
+		preset.Members[0].Access != "workspace_write" || preset.Members[1].Access != "read_only" {
+		t.Fatalf("lead-owned member policies = %#v", preset.Members)
+	}
+}
+
 func TestCatalogPresetProjectsCustomRole(t *testing.T) {
 	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
 		"custom": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
@@ -2265,6 +2290,10 @@ func TestSoloCatalogPresetSerializesEmptyMembers(t *testing.T) {
 	preset, err := FindCatalogPreset(catalog, "solo")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if preset.MemberCount() != 1 || preset.RoleSummary() != "1 lead" ||
+		!reflect.DeepEqual(preset.Roles, []string{"lead"}) {
+		t.Fatalf("solo role projection = %#v", preset)
 	}
 	data, err := json.Marshal(preset)
 	if err != nil {
@@ -2807,7 +2836,13 @@ func TestForkKnownThreadRetryUsesFrozenSnapshot(t *testing.T) {
 	}
 	client := &testClient{}
 	service := Service{Store: store, Client: client, Workspace: workspace}
-	_, err = service.Add(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, "reviewer", "gpt-6-sol", "xhigh")
+	preset := Preset{ID: "lead_designed", CatalogDigest: fmt.Sprintf("%064x", 1), TeamDigest: fmt.Sprintf("%064x", 2),
+		LeadModel: "model-lead", LeadEffort: "xhigh", LeadInstructions: "Original architect-led instructions.", Members: []MemberSpec{
+			{Role: "architect", Address: "architect0", Model: "model-design", Effort: "xhigh", Behavior: "designer", Purpose: "design", Instructions: "Original design brief.", Access: "workspace_write"},
+			{Role: "implementer", Address: "implementer0", Model: "model-implementation", Effort: "xhigh", Behavior: "implementer", Purpose: "implementation", Instructions: "Follow the architect brief.", Access: "workspace_write"},
+			{Role: "reviewer", Address: "reviewer0", Model: "model-review", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Instructions: "Original review instructions.", Access: "read_only"},
+		}}
+	_, err = service.ApplyPresetSpec(context.Background(), "source", "root-source", filepath.Join(workspace, "work", "source"), nil, preset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2821,11 +2856,26 @@ func TestForkKnownThreadRetryUsesFrozenSnapshot(t *testing.T) {
 		t.Fatal("expected name failure")
 	}
 	partial, err := store.Load("target", "root-target")
-	if err != nil || partial.Members[0].Thread != "thread-2" || partial.Members[0].State != "creating" {
+	if err != nil || partial.Members[0].Thread != "thread-4" || partial.Members[0].State != "creating" {
 		t.Fatalf("partial fork = %#v, %v", partial, err)
 	}
+	service.Catalog = &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 3), Teams: map[string]agentteams.Team{
+		"lead_designed": {DesignOwner: "team_lead", Roles: map[string]agentteams.Role{
+			"team_lead":   {Instructions: "New lead-owned instructions."},
+			"implementer": {Instructions: "Follow the lead brief."}, "reviewer": {Instructions: "New review instructions."},
+		}},
+	}}
 	ready, err := service.Fork(context.Background(), source, "target", "root-target", cwd, nil)
-	if err != nil || ready.Members[0].State != "ready" || client.next != 2 || ready.ForkSource.Members[0].Model != "gpt-6-sol" {
+	if err != nil || ready.Members[0].State != "ready" || client.next != 6 || len(ready.Members) != 3 ||
+		ready.PresetID != "lead_designed" || ready.LeadInstructions != source.LeadInstructions ||
+		ready.ForkSource.Members[0].Model != "model-design" {
 		t.Fatalf("known-thread fork retry = %#v, starts %d, error %v", ready, client.next, err)
+	}
+	for i, member := range ready.Members {
+		original := source.Members[i]
+		if member.Address != original.Address || member.Instructions != original.Instructions ||
+			member.Model != original.Model || member.Effort != original.Effort || member.Access != original.Access {
+			t.Fatalf("fork changed retained member policy: %#v, source %#v", member, original)
+		}
 	}
 }

@@ -340,19 +340,42 @@ settings still apply. Fork, archive, delete, and revive
 apply the corresponding Codex operation to all roster members with the root
 session.
 
-The root conversation is the team lead in both the portal and tmux. For each
-new substantive work item, it checks the current roster, assigns nontrivial
-design to a ready member with design purpose and separable implementation to a
-ready member with implementation purpose, then integrates their reports. It
-handles short or dependent steps itself and uses the applicable mandatory-review
-workflow for a retained reviewer. Member addresses and settings are read from
-the live roster, so later team changes
-apply without restarting the lead. Selecting a team creates no automatic work
-assignments. The portal binds the lead conversation to its exact workspace and
-session. This binding and the configured lead instructions are attached before
-the first user request, with no extra model turn. An existing idle root
-conversation receives the same lead policy when the portal reconciles its
-instructions; active turns are left alone until they finish.
+The root conversation is the lead in both the portal and tmux. The selected
+catalog prompt and retained instructions determine design and application
+ownership. A Solo lead can investigate, design and edit application code without
+automatic specialists. A Lead-designed lead owns the design brief and assigns
+application work to an implementer; a Full-team lead assigns nontrivial design
+to its design-purpose member and application work to its implementation-purpose
+member. The design owner writes the design and verification brief before
+substantive implementation. Implementers accept either an architect-owned or
+lead-owned brief; bounded small edits can use a direct lead brief.
+
+For each new substantive team work item, the lead checks the current roster,
+uses ready members with saved settings and suitable access, then integrates
+their reports. It handles short or dependent coordination steps itself. Adding,
+replacing or reconfiguring members requires explicit user direction. Manual
+team controls remain available, and user-directed team changes apply without
+restarting the lead. Selecting a team creates no automatic work assignments.
+
+The applicable mandatory-review workflow runs final independent review after
+the intended substantive deliverable is complete, all intended changes are
+committed and quick checks pass, before long integration tests. Completed
+substantive documentation and configuration deliverables remain in scope.
+Routine planning, investigation, findings, session tracking and evidence alone
+never trigger automatic review. Earlier review requires an explicit user
+request, is advisory, and does not replace final review. Having a reviewer in
+the preset creates no assignment. Solo uses a temporary standalone final
+reviewer without adding a persistent member. The workflow retains whole-branch
+history and migration gates and its narrow-fix policy.
+
+The portal binds the lead conversation to its exact workspace and session
+before the first user request, with no extra model turn. Reconciliation retains
+the saved lead prompt, including an older preset's instructions; active turns
+are left alone until they finish. Catalog updates change new-session defaults.
+Retries and forks keep the saved lineup, prompts, models, efforts and access.
+Shared workspace instructions and installed skills change globally and can
+conflict with older saved prompts; updating them does not refresh those prompts
+or mutate existing rosters.
 
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.

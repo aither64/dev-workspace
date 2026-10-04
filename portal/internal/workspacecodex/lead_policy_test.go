@@ -16,6 +16,13 @@ func TestLeadPolicyBindsSessionWithoutReplacingFrozenRoleInstructions(t *testing
 			t.Errorf("lead policy missing %q", expected)
 		}
 	}
+	_, retained, found := strings.Cut(policy.DeveloperInstructions, "\n\n")
+	if !found || retained != roleInstructions {
+		t.Fatalf("binding rewrote frozen instructions: %q", retained)
+	}
+	if LeadThreadPolicy("", "", roleInstructions).DeveloperInstructions != roleInstructions {
+		t.Fatal("unbound policy rewrote frozen instructions")
+	}
 	if strings.Contains(LeadThreadPolicy("", "", "").DeveloperInstructions, slug) {
 		t.Fatal("legacy policy unexpectedly has a session binding")
 	}

@@ -621,9 +621,15 @@ class DevSessionTest < Minitest::Test
       File.chmod(0o755, portal)
       scenario = DirectCreationScenario.new
       original = direct_team_preset
+      original['id'] = 'lead_designed'
+      original['roles'] << 'reviewer0'
+      original['members'] << {
+        'role' => 'reviewer', 'address' => 'reviewer0', 'behavior' => 'reviewer',
+        'access' => 'read_only', 'model' => 'model-reviewer', 'reasoningEffort' => 'xhigh'
+      }
       original['leadInstructions'] = 'Original frozen lead instructions.'
       original['members'].each do |member|
-        member['purpose'] = { 'designer' => 'design', 'implementer' => 'implementation' }.fetch(member['behavior'])
+        member['purpose'] = { 'designer' => 'design', 'implementer' => 'implementation', 'reviewer' => 'review' }.fetch(member['behavior'])
         member['instructions'] = "Original frozen #{member['role']} instructions."
       end
       scenario.catalog_preset = original
@@ -641,14 +647,17 @@ class DevSessionTest < Minitest::Test
       first = create_runner.call(first_commands)
       start = lambda do |runner, model|
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: true,
-          goal_file: goal, json: true, team: 'delegated', model:, effort: 'high')
+          goal_file: goal, json: true, team: 'lead_designed', model:, effort: 'high')
       end
       assert_raises(DevSession::Error) { start.call(first, 'model-lead') }
       assert(first_commands.commands.any? { |command| command[1] == 'team-preset' })
 
       changed = JSON.parse(JSON.generate(original))
       changed['leadInstructions'] = 'New catalog instructions.'
-      changed['members'].first['instructions'] = 'New member instructions.'
+      changed['members'].reject! { |member| member['role'] == 'architect' }
+      changed['roles'].delete('architect0')
+      changed['members'].first['instructions'] = 'Follow the new lead-owned brief.'
+      changed['leadEffort'] = 'xhigh'
       scenario.catalog_preset = changed
       retry_commands = DirectCreationCommandRunner.new(scenario)
       retry_runner = create_runner.call(retry_commands)
@@ -658,6 +667,7 @@ class DevSessionTest < Minitest::Test
 
       refute(retry_commands.commands.any? { |command| command[1] == 'team-preset' })
       assert_equal([original, original], scenario.applied_presets)
+      assert_equal(%w[architect0 implementer0 reviewer0], scenario.member_threads.keys.sort)
       assert_equal(1, scenario.turn_starts)
     end
   end
