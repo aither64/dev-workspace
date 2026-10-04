@@ -17,6 +17,7 @@ import (
 
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"golang.org/x/sys/unix"
 )
 
@@ -146,7 +147,7 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 		return errors.New("preparation snapshot digest mismatch")
 	}
 	input := record.Snapshot.Input
-	if !utf8.ValidString(input.RawPrompt) || len(input.RawPrompt) > session.MaxMessageBytes || len(input.Attachments) > 10 ||
+	if !utf8.ValidString(input.RawPrompt) || len(input.RawPrompt) > session.MaxMessageBytes || len(input.Attachments) > uploads.DefaultPromptFiles ||
 		(strings.TrimSpace(input.RawPrompt) == "" && len(input.Attachments) == 0) {
 		return errors.New("invalid preparation prompt")
 	}

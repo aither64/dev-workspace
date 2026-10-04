@@ -237,7 +237,7 @@ files to become ready before creating a session, sending, steering or queuing
 a prompt. A prompt can contain files without text. Codex receives their local
 paths, including for images.
 
-The limits are 1 GiB per file, 10 files and 2 GiB per prompt, 10 GiB per session,
+The limits are 1 GiB per file, 50 files and 2 GiB per prompt, 10 GiB per session,
 and 100 GiB per workspace. Uploads use 4 MiB chunks with SHA-256 checksums. The
 browser transfers two files at once; the server admits eight concurrent chunks.
 Reservations account for unfinished transfers and retain 1 GiB of free disk
@@ -245,6 +245,12 @@ space. Metadata is limited to 16 MiB and 10,000 records per catalog category, wi
 1 MiB reserved for recovery updates. Expired empty drafts and obsolete records
 are reclaimed. Sent history remains until its session and fork references are
 deleted.
+
+The prompt text and generated file references must together fit within 20,000
+UTF-8 bytes. Long filenames, JSON escaping and storage paths consume that bound,
+so some selections of 50 files need a shorter prompt or fewer files. The encoded
+creation form also retains its 61,024-byte request limit. These limits do not
+truncate references or omit selected files.
 
 A reload keeps selected files. To resume an unfinished upload, choose the same
 file; the browser verifies its uploaded prefix before continuing. Unsubmitted

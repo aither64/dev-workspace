@@ -39,7 +39,7 @@
     if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
-        !Array.isArray(value.attachmentIds) || value.attachmentIds.length > 10 ||
+        !Array.isArray(value.attachmentIds) || value.attachmentIds.length > 50 ||
         value.attachmentIds.some((id) => typeof id !== "string" || !uuid.test(id)) ||
         new Set(value.attachmentIds).size !== value.attachmentIds.length ||
         (value.body !== null && typeof value.body !== "string") ||

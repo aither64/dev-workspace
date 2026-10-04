@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -63,6 +64,74 @@ func status(t *testing.T, err error, want int) {
 	var target *conversation.UploadError
 	if !errors.As(err, &target) || target.Status != want {
 		t.Fatalf("error=%v, want status %d", err, want)
+	}
+}
+
+func TestDefaultPromptFilesSubmissionAndPreparation(t *testing.T) {
+	store, backend := fixture(t)
+	store.UploadLimits = DefaultLimits()
+	if backend.Limits().Files != 50 {
+		t.Fatalf("default prompt files=%d", backend.Limits().Files)
+	}
+	ctx := context.Background()
+	ids := make([]string, 51)
+	for i := range ids {
+		ids[i] = create(t, backend, fmt.Sprintf("file-%02d.txt", i), []byte("x")).ID
+	}
+	for _, kind := range []string{"send", "steer", "queue"} {
+		t.Run(kind, func(t *testing.T) {
+			attempt, _ := newID()
+			_, err := backend.Prepare(ctx, kind, attempt, "prompt", ids)
+			status(t, err, 400)
+			wire, err := backend.Prepare(ctx, kind, attempt, "prompt", ids[:50])
+			if err != nil || strings.Count(wire, `"name":`) != 50 {
+				t.Fatalf("50-file submission: %v, references=%d", err, strings.Count(wire, `"name":`))
+			}
+			again, err := backend.Prepare(ctx, kind, attempt, "prompt", ids[:50])
+			if err != nil || again != wire {
+				t.Fatal("submission replay changed wire text", err)
+			}
+		})
+	}
+	draft, err := store.NewDraft(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draftBackend := &Backend{Store: store, ScopeID: draft.ID}
+	for i := range ids {
+		ids[i] = create(t, draftBackend, fmt.Sprintf("draft-%02d.txt", i), []byte("x")).ID
+	}
+	requestID, _ := newID()
+	status(t, store.ValidatePreparation(ctx, requestID, draft.ID, "prompt", ids), 400)
+	if err := store.ValidatePreparation(ctx, requestID, draft.ID, "prompt", ids[:50]); err != nil {
+		t.Fatal(err)
+	}
+	wire, err := store.ClaimPreparation(ctx, requestID, draft.ID, "prompt", ids[:50])
+	if err != nil || strings.Count(wire, `"name":`) != 50 {
+		t.Fatal("50-file preparation claim", err)
+	}
+	again, err := store.ClaimPreparation(ctx, requestID, draft.ID, "prompt", ids[:50])
+	if err != nil || again != wire {
+		t.Fatal("preparation replay changed wire text", err)
+	}
+}
+
+func TestDefaultPromptFilesRetainsByteAndReferenceBounds(t *testing.T) {
+	store, backend := fixture(t)
+	store.UploadLimits = DefaultLimits()
+	ids := []string{create(t, backend, "first.txt", []byte("ab")).ID, create(t, backend, "second.txt", []byte("cd")).ID}
+	store.UploadLimits.PromptBytes = 3
+	_, err := backend.Prepare(context.Background(), "send", "byte-bound", "", ids)
+	status(t, err, 413)
+	store.UploadLimits = DefaultLimits()
+	ids = nil
+	for i := 0; i < 50; i++ {
+		ids = append(ids, create(t, backend, fmt.Sprintf("%02d-%s.txt", i, strings.Repeat("\\", 240)), nil).ID)
+	}
+	_, err = backend.Prepare(context.Background(), "send", "reference-bound", "", ids)
+	status(t, err, 413)
+	if !strings.Contains(err.Error(), "references exceed the prompt limit") {
+		t.Fatalf("wrong reference-bound failure: %v", err)
 	}
 }
 

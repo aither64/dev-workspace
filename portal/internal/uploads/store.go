@@ -34,10 +34,13 @@ const maxCatalogBytes = 16 << 20
 const maxRecords = 10000
 const draftLifetime = 7 * 24 * time.Hour
 
+// DefaultPromptFiles bounds ordinary prompts and durable session preparations.
+const DefaultPromptFiles = 50
+
 var idPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func DefaultLimits() conversation.UploadLimits {
-	return conversation.UploadLimits{FileBytes: 1 << 30, PromptBytes: 2 << 30, SessionBytes: 10 << 30, WorkspaceBytes: 100 << 30, ChunkBytes: 4 << 20, Files: 10}
+	return conversation.UploadLimits{FileBytes: 1 << 30, PromptBytes: 2 << 30, SessionBytes: 10 << 30, WorkspaceBytes: 100 << 30, ChunkBytes: 4 << 20, Files: DefaultPromptFiles}
 }
 
 type Store struct {

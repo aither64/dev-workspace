@@ -82,6 +82,42 @@ module.exports = async () => {
     assert.equal(calls[1][1].body, firstBody); assert.equal(request.draft.requestId, id);
     assert.throws(() => request.update({name:"new"}), /Recover/);
   });
+  await test("50-file attempted draft survives reload and 404 recovery with exact body and cleanup", async () => {
+    const ids = Array.from({length:50}, (_,i) => `00000000-0000-4000-8000-${String(i+100).padStart(12,"0")}`);
+    const saved = storage(); let firstBody;
+    const original = helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>id,
+      fetch:async (_,options)=>{firstBody=options.body;throw Error("lost response");}});
+    original.bindScope(scope);
+    saved.setItem(`workspace-portal.upload-draft.${scope.id}`,JSON.stringify(ids.map(id=>({id,state:"ready"}))));
+    await assert.rejects(original.submit(ids,true),/lost response/);
+    assert.deepEqual(new URLSearchParams(firstBody).getAll("attachmentIds"),ids);
+    const calls=[];
+    const restored=helpers.createRequestDraft({storage:saved,fields:{...fields,goal:"changed"},randomUUID:()=>assert.fail("new identity"),
+      fetch:async (url,options)=>{calls.push([url,options]);return url==="/sessions" ? response(status,202) : response({},404);}});
+    assert.deepEqual(restored.draft.attachmentIds,ids);assert.equal(restored.draft.body,firstBody);
+    await restored.submit();
+    assert.deepEqual(calls.map(([url])=>url),[`/api/session-creations/${id}`,"/sessions"]);
+    assert.equal(calls[1][1].body,firstBody);assert.equal(restored.draft.requestId,id);
+    assert.equal(restored.draft.accepted.receiptId,status.receiptId);
+    assert.equal(restored.clearAccepted(),status.url);
+    assert.equal(saved.getItem(helpers.draftKey),null);assert.equal(saved.getItem(`workspace-portal.upload-draft.${scope.id}`),null);
+  });
+  await test("51-file, duplicate, malformed and body-mismatched drafts are rejected", async () => {
+    const ids=Array.from({length:51},(_,i)=>`00000000-0000-4000-8000-${String(i+100).padStart(12,"0")}`);
+    for(const invalid of [ids,[ids[0],ids[0]],["invalid"]]) {
+      const request=helpers.createRequestDraft({storage:storage(),fields,randomUUID:()=>id,fetch:()=>assert.fail("invalid POST")});
+      request.bindScope(scope);await assert.rejects(request.submit(invalid,true),/snapshot is invalid/);
+      assert.equal(helpers.normalizeDraft(request.draft),null);
+    }
+    const saved=storage();
+    const request=helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>id,fetch:async()=>{throw Error("lost");}});
+    request.bindScope(scope);await assert.rejects(request.submit(ids.slice(0,50),true),/lost/);
+    const mismatched=request.draft;
+    mismatched.attachmentIds.reverse();
+    saved.setItem(helpers.draftKey,JSON.stringify(mismatched));
+    assert.equal(helpers.normalizeDraft(mismatched),null);
+    assert.throws(()=>helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>assert.fail("replacement")}),/unreadable/);
+  });
   await test("only an exact request-bound persistence 503 permits frozen POST repair", async () => {
     for (const failure of [
       {requestId:otherID,code:"preparation_persistence_unconfirmed"},

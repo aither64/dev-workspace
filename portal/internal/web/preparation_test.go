@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -379,6 +380,116 @@ func TestSessionPreparationUploadAdmissionIntentRecoveryAndReplay(t *testing.T) 
 	}
 	if err := os.WriteFile(catalog, encoded, 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSessionPreparationFiftyFilesRecoveryAndCompaction(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	ctx := context.Background()
+	server.uploadStore.MinFreeBytes = 0
+	scope, err := server.uploadStore.NewDraft(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &uploads.Backend{Store: server.uploadStore, ScopeID: scope.ID}
+	ids := make([]string, 51)
+	for i := range ids {
+		file, err := backend.Create(ctx, conversation.UploadRequest{ClientID: preparationTestID(1000 + i), Name: fmt.Sprintf("f-%02d.txt", i), Size: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backend.Complete(ctx, file.ID); err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = file.ID
+	}
+	if response := postPreparation(t, server, preparationTestID(2), "prompt", "", url.Values{"uploadScope": {scope.ID}, "attachmentIds": ids}); response.Code != 409 {
+		t.Fatalf("51-file admission=%d %s", response.Code, response.Body.String())
+	}
+	entered := make(chan struct{})
+	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+		close(entered)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	id, prompt := preparationTestID(1), " raw fifty-file request "
+	extra := url.Values{"uploadScope": {scope.ID}, "attachmentIds": ids[:50]}
+	response := postPreparation(t, server, id, prompt, "", extra)
+	if response.Code != 202 {
+		t.Fatalf("50-file admission=%d %s", response.Code, response.Body.String())
+	}
+	<-entered
+	server.Close()
+	record, err := readPreparation(server.preparationPath(id, false), server.config.Workspace)
+	if err != nil || record.Snapshot == nil || !slices.Equal(record.Snapshot.Input.Attachments, ids[:50]) ||
+		strings.Count(record.Snapshot.Goal, `"name":`) != 50 {
+		t.Fatalf("50-file durable snapshot: %v", err)
+	}
+	wire, receiptID := record.Snapshot.Goal, record.ReceiptID
+	// The full reader, independently of the store, must reject 51 attachments.
+	bad := record
+	snapshot := *record.Snapshot
+	snapshot.Input.Attachments = ids
+	bad.Snapshot, bad.InputDigest, bad.SnapshotDigest = &snapshot, inputPreparationDigest(snapshot.Input), preparationDigest(&snapshot)
+	if err := validatePreparation(bad, server.config.Workspace); err == nil {
+		t.Fatal("preparation reader accepted 51 attachments")
+	}
+	restarted, err := New(server.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	current, ok := restarted.preparationStatus(id)
+	if !ok || current.State != "paused" || current.RequestID != id || current.ReceiptID != receiptID || current.Attempt != 1 {
+		t.Fatalf("50-file recovery=%#v", current)
+	}
+	status := httptest.NewRecorder()
+	restarted.Handler().ServeHTTP(status, httptest.NewRequest("GET", "/api/session-creations/"+id, nil))
+	if status.Code != 200 || !strings.Contains(status.Body.String(), receiptID) {
+		t.Fatalf("recovered status=%d %s", status.Code, status.Body.String())
+	}
+	if replay := postPreparation(t, restarted, id, prompt, "", extra); replay.Code != 202 {
+		t.Fatalf("identical replay=%d %s", replay.Code, replay.Body.String())
+	}
+	reordered := append([]string(nil), ids[:50]...)
+	reordered[0], reordered[1] = reordered[1], reordered[0]
+	for _, changed := range []struct {
+		prompt string
+		ids    []string
+	}{{prompt + "changed", ids[:50]}, {prompt, reordered}} {
+		if conflict := postPreparation(t, restarted, id, changed.prompt, "", url.Values{"uploadScope": {scope.ID}, "attachmentIds": changed.ids}); conflict.Code != 409 {
+			t.Fatalf("changed input=%d %s", conflict.Code, conflict.Body.String())
+		}
+	}
+	restarted.config.SessionNamer = func(context.Context, string) (string, error) { return `{"name":"fifty-file-recovery"}`, nil }
+	retry := postCreation(t, restarted, "/api/session-creations/"+id+"/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receiptID), "application/json")
+	if retry.Code != 202 {
+		t.Fatalf("retry=%d %s", retry.Code, retry.Body.String())
+	}
+	result := awaitPreparation(t, restarted, id)
+	if result.State != "handed_off" || result.ReceiptID != receiptID || result.Attempt != 2 || result.Snapshot.Goal != wire ||
+		!slices.Equal(result.Snapshot.Input.Attachments, ids[:50]) {
+		t.Fatalf("retry changed frozen request: %#v", result)
+	}
+	receipt := awaitCreation(t, restarted, result.Slug)
+	if receipt.Goal != wire || receipt.ReceiptID != receiptID {
+		t.Fatal("creation handoff changed wire text or receipt")
+	}
+	receipt.State, receipt.Validated, receipt.Error = "ready", true, ""
+	if err := restarted.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	writeCreationProof(t, restarted, receipt)
+	if err := restarted.retireCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	compact, err := readPreparation(restarted.preparationPath(id, true), restarted.config.Workspace)
+	if err != nil || compact.State != "terminal" || compact.Snapshot != nil || compact.Handoff != nil || compact.ReceiptID != receiptID {
+		t.Fatalf("50-file terminal compaction=%#v %v", compact, err)
+	}
+	if _, err := os.Stat(restarted.preparationPath(id, false)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("full snapshot remains after compaction", err)
 	}
 }
 
@@ -807,7 +918,7 @@ func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing
 	for _, expected := range []string{
 		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
 		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
-		`/static/preparation.js?v=2`, `/static/creation.js?v=2`,
+		`/static/preparation.js?v=3`, `/static/creation.js?v=2`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("preparation page omits %q", expected)
@@ -836,7 +947,7 @@ func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
 	if prompt < 0 || options < prompt || name < options {
 		t.Fatal("initial request must precede optional settings")
 	}
-	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=2`) {
+	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=3`) {
 		t.Fatal("index is missing durable-request recovery controls")
 	}
 	if !strings.Contains(body, `href="/" target="_blank" rel="noopener noreferrer"`) || !strings.Contains(body, `Copy saved text`) || !strings.Contains(body, `The original request may still finish.`) {

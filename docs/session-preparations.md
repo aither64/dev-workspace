@@ -275,7 +275,32 @@ The CLI scans only unfinished records. A crash after compact replacement but
 before the directory move remains recoverable. Receipt eviction or later
 session deletion never allows the same request ID to initialize again.
 
-Older packages ignore the preparation files and retain schema-1 pending uploads.
+The default preparation bound is 50 ordered attachments, matching the upload
+store's prompt limit and the browser's version-2 draft validation. Existing
+records and drafts remain readable without a schema change. Refresh browser
+assets to recover requests with more than 10 files; a new browser still respects
+the file limit advertised by an older backend.
+
+The preceding preparation reader accepts at most 10 attachments in a full
+snapshot. It rejects unfinished records with 11 to 50 files even though their
+schema is unchanged. Data compatibility with that reader requires finishing or
+recovering those requests with a reader that supports 50 files, then confirming
+that normal terminal compaction has durably moved their snapshot-free mappings
+to `session-preparation-mappings/`. A ready receipt or handoff alone does not
+prove compaction. Ready compaction still requires creation proof and upload
+binding. Clear attempted browser drafts through normal identity-confirmed
+acceptance and storage cleanup. Do not delete or hand-edit unfinished records,
+discard drafts or release uploads to force compatibility. Unresolved requests
+that cannot compact require retaining a compatible reader. Completed sessions
+and upload catalogs keep their existing formats; the older store again limits
+new submissions and some submission replays to 10 files.
+
+These are data compatibility prerequisites. Workspace package switches remain
+forward-only; recovery retains the current package or uses a newer compatible
+one.
+
+Packages predating request-ID preparation ignore the preparation files and
+retain schema-1 pending uploads.
 They cannot resume preparation progress, and older CLI code cannot honor the
 new destination reservations. Newer recovery refuses a competing destination
 created by that code. Compatible forward updates restore
@@ -298,3 +323,10 @@ for a new file and Prepare for a competing submission. The final phase requires
 current recovery and retry to refuse the conflict before naming/reservation,
 preserve selected bytes and retain both submission records. Fixture code alone
 is not passing compatibility evidence; record its actual execution separately.
+
+That baseline predates the preparation reader, so this fixture does not prove
+the 10-to-50 attachment boundary. After review, assess that boundary with an
+isolated reader from the immediately preceding source revision: an unfinished
+snapshot containing more than 10 files must fail, while its normally compacted
+terminal mapping must remain readable. Do not switch the installed runtime to
+an older package for this test.
