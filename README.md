@@ -232,7 +232,11 @@ content available when selected.
 ## Prompt attachments
 
 Drag files into the prompt area or choose **Attach files**. File cards show
-transfer progress and let you retry or remove a file. Wait for all selected
+transfer progress and let you retry or remove a file. Above the cards, a summary
+shows the selected count and full total size, with the completed count while
+uploads remain unfinished. Files stay in the summary until removed. The New
+session form shows every card in page flow; conversation upload lists scroll
+within their existing height limit. Wait for all selected
 files to become ready before creating a session, sending, steering or queuing
 a prompt. A prompt can contain files without text. Codex receives their local
 paths, including for images.

@@ -37,7 +37,7 @@
   const initialRequest = document.getElementById("creation-request");
   const requestPanel = document.getElementById("creation-request-panel");
   // The prompt is server-rendered, so asset or polling failures cannot hide it.
-  void import("/codex/assets/conversation.js").then(({createCopyButton}) => {
+  void import("/codex/assets/conversation.js?v=12").then(({createCopyButton}) => {
     document.getElementById("creation-request-copy").append(createCopyButton({
       getText: () => initialRequest.textContent, label: "Copy initial request",
     }));

@@ -5,8 +5,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{if .Preparation}}New session{{else}}{{.Session.Slug}}{{end}} · Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=3">
-  <link rel="stylesheet" href="/codex/assets/conversation.css">
+  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
 </head>
 <body{{if .Preparation}} data-preparation="{{.Preparation.RequestID}}" data-receipt-id="{{.Preparation.ReceiptID}}" data-accepted-at="{{.Preparation.StartedAt}}"{{else}} data-creation="{{.Session.Slug}}"{{end}}>
   <main class="page">
@@ -27,7 +27,7 @@
     </section>
   </main>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/creation.js?v=2" defer></script>
+  <script src="/static/creation.js?v=3" defer></script>
 </body>
 </html>
 {{end}}

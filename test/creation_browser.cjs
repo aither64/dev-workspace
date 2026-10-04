@@ -13,8 +13,11 @@ assert(fs.existsSync(process.env.CHROMIUM_EXECUTABLE),"Explicit Chromium executa
 const prompt = "Keep this request <script>window.promptInjected=true</script>\nSecond line.";
 const catalog = {current: "a".repeat(64)};
 let failure = "network-before", modelsUnavailable = true, submissions = [], retries = [], statusReads = [];
-const operations = new Map(), scopes = new Map();
-const limits = {fileBytes: 1048576, promptBytes: 10485760, files: 10, chunkBytes: 4096};
+const operations = new Map(), scopes = new Map(), removableScopes = new Set();
+let holdCompletions = false;
+const completionWaiters = [];
+const conversationFiles = Array.from({length:50}, (_,i) => ({id:randomUUID(), clientId:randomUUID(), name:`conversation-${i}-${"long-name-".repeat(20)}.txt`, size:1024, state:"ready"}));
+const limits = {fileBytes: 1048576, promptBytes: 10485760, files: 50, chunkBytes: 4096};
 const legacy = {slug:"2026-09-13-example",url:"/2026-09-13-example/",receiptId:"legacy-receipt",attempt:1,state:"failed",phase:"Initialization stopped",error:"context deadline exceeded",initialRequest:prompt,startedAt:new Date().toISOString()};
 const escape = text => text.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
 const managedPolicy = (digest, lead = true) => `<input type="hidden" name="catalogDigest" value="${digest}">
@@ -22,12 +25,13 @@ const managedPolicy = (digest, lead = true) => `<input type="hidden" name="catal
 <p data-team-description></p><p data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed.</p>
 <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>`;
 const settings = `<label>Lead model<select name="model" data-model-select><option value="">Selected team default</option></select></label><label>Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option></select></label>`;
-const index = () => `<!doctype html><body data-index><form id="new-session-form"><input name="creation_date" type="hidden" value="2026-09-13"><textarea name="goal" required></textarea>${managedPolicy(catalog.current)}<details><summary>Options</summary><input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*">${settings}<div><input data-cli-command readonly><button type="button" data-copy disabled>Copy</button></div></details><p id="creation-draft-notice" hidden>Files from an older draft need to be attached again to this request.</p><input name="uploadScope" type="hidden"><div id="creation-uploads"></div><span id="creation-upload-controls"></span><p id="new-session-progress" hidden></p><div id="new-session-recovery" hidden><p data-request-identity></p><button type="button" id="new-session-recover">Recover saved request</button><div id="new-session-separate" hidden><p>The original request may still finish.</p><div><textarea data-saved-request-text readonly></textarea><button type="button" data-copy>Copy saved text</button></div><a href="/" target="_blank" rel="noopener noreferrer">Start a separate request</a></div></div><button type="submit" disabled>Create session</button></form><script src="/static/preparation.js"></script><script src="/static/app.js"></script>`;
-const planPage = (turnID, digest) => `<!doctype html><body data-session="source" data-thread-id="thread-1" data-interactive="true"><div id="conversation-connection"></div><div id="codex-status"></div><div id="transcript"></div>
+const styles = (conversation = false) => `<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">${conversation ? '<link rel="stylesheet" href="/codex/assets/conversation.css?v=5">' : ""}<link rel="stylesheet" href="/static/style.css?v=4"><link rel="stylesheet" href="/codex/assets/uploads.css?v=3"></head>`;
+const index = () => `<!doctype html>${styles()}<body data-index><div class="workspace-shell index-shell"><aside class="workspace-sidebar index-sidebar"><h1>Workspace</h1></aside><main class="page index-page"><section class="panel new-session"><h2>New session</h2><form id="new-session-form" class="stack"><input name="creation_date" type="hidden" value="2026-09-13"><textarea name="goal" required></textarea>${managedPolicy(catalog.current)}<details><summary>Options</summary><input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*">${settings}<div><input data-cli-command readonly><button type="button" data-copy disabled>Copy</button></div></details><p id="creation-draft-notice" hidden>Files from an older draft need to be attached again to this request.</p><input name="uploadScope" type="hidden"><div id="creation-uploads"></div><p id="new-session-progress" hidden></p><div id="new-session-recovery" hidden><p data-request-identity></p><button type="button" id="new-session-recover">Recover saved request</button><div id="new-session-separate" hidden><p>The original request may still finish.</p><div><textarea data-saved-request-text readonly></textarea><button type="button" data-copy>Copy saved text</button></div><a href="/" target="_blank" rel="noopener noreferrer">Start a separate request</a></div></div><div class="creation-actions"><span id="creation-upload-controls"></span><button type="submit" disabled>Create session</button></div></form></section></main></div><script src="/static/preparation.js?v=3"></script><script src="/static/app.js?v=22"></script>`;
+const planPage = (turnID, digest) => `<!doctype html>${styles(true)}<body data-session="source" data-thread-id="thread-1" data-interactive="true"><div id="conversation-connection"></div><div id="codex-status"></div><div id="transcript"></div>
 <p id="pending-status" class="lane-status" role="status"><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>
 <p id="queue-status" class="lane-status" role="status"><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>
-<button id="new-output" type="button" hidden>New output</button><section id="plan-actions" data-plan-turn-id="${turnID}" data-plan-sha256="${digest}"><button id="plan-implement-new" type="button">Implement in a new session</button></section><form id="message-form"><textarea name="message"></textarea><div id="message-uploads"></div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button"></button><button id="interrupt" type="button">Interrupt</button></form><dialog id="plan-session-dialog"><form id="plan-session-form"><input name="creationDate" value="2026-09-13"><input name="name" required>${managedPolicy(catalog.current, false)}${settings}<p id="plan-session-progress" hidden></p><button type="submit">Create session</button></form></dialog><script>document.getElementById("plan-actions").planText="Approved plan";</script><script src="/static/app.js"></script>`;
-const creation = record => `<!doctype html><body ${record.requestId ? `data-preparation="${record.requestId}" data-receipt-id="${record.receiptId}" data-accepted-at="${record.startedAt}"` : `data-creation="${record.slug}"`}><h1 id="creation-title"></h1><p id="creation-phase"></p><p id="creation-error"></p><button id="creation-retry" hidden>${record.requestId ? "Retry creation" : "Retry initialization"}</button><p id="creation-elapsed"></p><p><a id="creation-source" hidden>Return to the source session</a></p><p id="creation-leave-note">You can leave this page while initialization continues.</p><section id="creation-request-panel"><span id="creation-request-copy"></span><pre id="creation-request">${escape(record.initialRequest)}</pre></section><script src="/static/preparation.js"></script><script src="/static/creation.js"></script>`;
+<button id="new-output" type="button" hidden>New output</button><section id="plan-actions" data-plan-turn-id="${turnID}" data-plan-sha256="${digest}"><button id="plan-implement-new" type="button">Implement in a new session</button></section><form id="message-form"><textarea name="message"></textarea><div id="message-uploads"></div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button"></button><button id="interrupt" type="button">Interrupt</button></form><dialog id="plan-session-dialog"><form id="plan-session-form"><input name="creationDate" value="2026-09-13"><input name="name" required>${managedPolicy(catalog.current, false)}${settings}<p id="plan-session-progress" hidden></p><button type="submit">Create session</button></form></dialog><script>document.getElementById("plan-actions").planText="Approved plan";</script><script src="/static/app.js?v=22"></script>`;
+const creation = record => `<!doctype html>${styles(true)}<body ${record.requestId ? `data-preparation="${record.requestId}" data-receipt-id="${record.receiptId}" data-accepted-at="${record.startedAt}"` : `data-creation="${record.slug}"`}><h1 id="creation-title"></h1><p id="creation-phase"></p><p id="creation-error"></p><button id="creation-retry" hidden>${record.requestId ? "Retry creation" : "Retry initialization"}</button><p id="creation-elapsed"></p><p><a id="creation-source" hidden>Return to the source session</a></p><p id="creation-leave-note">You can leave this page while initialization continues.</p><section id="creation-request-panel"><span id="creation-request-copy"></span><pre id="creation-request">${escape(record.initialRequest)}</pre></section><script src="/static/preparation.js?v=3"></script><script src="/static/creation.js?v=3"></script>`;
 const server = http.createServer(async (req,res) => {
  const url = new URL(req.url,"http://fixture");
  const send = (type,data,status=200) => {res.writeHead(status,{"Content-Type":type});res.end(data);};
@@ -42,8 +46,8 @@ const server = http.createServer(async (req,res) => {
   const record=operations.get(url.pathname.split("/")[2]);
   return record ? send("text/html",creation(record)) : json({},404);
  }
- if(url.pathname.startsWith("/static/"))return send("text/javascript",fs.readFileSync(path.join(root,"portal/internal/web/static",path.basename(url.pathname))));
- if(url.pathname.startsWith("/codex/assets/"))return send("text/javascript",fs.readFileSync(path.join(provider,"conversation/assets",path.basename(url.pathname))));
+ if(url.pathname.startsWith("/static/"))return send(url.pathname.endsWith(".css") ? "text/css" : "text/javascript",fs.readFileSync(path.join(root,"portal/internal/web/static",path.basename(url.pathname))));
+ if(url.pathname.startsWith("/codex/assets/"))return send(url.pathname.endsWith(".css") ? "text/css" : "text/javascript",fs.readFileSync(path.join(provider,"conversation/assets",path.basename(url.pathname))));
  if(url.pathname==="/sessions") {
   const raw=await body(),fields=Object.fromEntries(new URLSearchParams(raw));submissions.push({method:req.method,raw,fields});
   if(failure==="network-before")return req.socket.destroy();
@@ -84,9 +88,10 @@ const server = http.createServer(async (req,res) => {
   }
   const file=files.find(file=>file.id===fileID);
   if(req.method==="PATCH") {const chunk=await body();file.offset+=Buffer.byteLength(chunk);file.checksums.push(req.headers["upload-checksum"]);return json(file);}
-  if(req.method==="POST") {file.state="ready";return json(file);}
-  if(req.method==="DELETE")return json({error:"No fixture deletion authorized"},409);
+  if(req.method==="POST") {if(holdCompletions)await new Promise(resolve=>completionWaiters.push(resolve));file.state="ready";return json(file);}
+  if(req.method==="DELETE") {if(!removableScopes.has(part))return json({error:"No fixture deletion authorized"},409);files.splice(files.indexOf(file),1);return json({});}
  }
+ if(url.pathname==="/uploads/s-source" && req.method==="GET")return json({files:conversationFiles,limits});
  if(url.pathname==="/api/sessions/source/operation")return json({state:"idle"});
  if(url.pathname==="/api/sessions/source/thread")return;
  return json({error:"Fixture endpoint unavailable"},503);
@@ -276,6 +281,69 @@ const server = http.createServer(async (req,res) => {
   await cleanup.evaluate(()=>{Storage.prototype.removeItem=window.restoreRemove;});
   await cleanup.getByRole("button",{name:"Recover saved request"}).click();
   await cleanup.waitForURL(origin+`/creations/${cleanupID}/`);assert.equal(submissions.length,cleanupPosts);
+
+  // Load the actual host/provider CSS in production order. The existing page
+  // scroll container owns the expanded creation list, including narrow layouts.
+  for(const width of [1280,375]) {
+   const layout=await context.newPage();layout.on("pageerror",error=>errors.push(error.message));
+   await layout.setViewportSize({width,height:800});await layout.goto(origin);await ready(layout);
+   assert(await layout.locator("#creation-uploads").isHidden());
+   const files=Array.from({length:50},(_,i)=>({name:`file-${String(i).padStart(2,"0")}-${"long-name-".repeat(20)}.txt`,mimeType:"text/plain",buffer:Buffer.alloc(1024,65)}));
+   const selection=(await draft(layout)).scope.id;removableScopes.add(selection);
+   holdCompletions=true;
+   await layout.locator('input[type="file"]').setInputFiles(files);
+   await layout.waitForFunction(()=>document.querySelector("#creation-uploads .codex-upload-summary")?.textContent==="50 files · 50 KiB total · 0 of 50 complete");
+   assert(await layout.getByRole("button",{name:"Create session"}).isDisabled());
+   await layout.waitForFunction(()=>[...document.querySelectorAll("#creation-uploads progress")].some(progress=>progress.value===progress.max));
+   holdCompletions=false;completionWaiters.splice(0).forEach(resolve=>resolve());
+   await layout.waitForFunction(()=>document.querySelector("#creation-uploads .codex-upload-summary")?.textContent==="50 files · 50 KiB total"&&!document.querySelector('#new-session-form button[type="submit"]').disabled);
+   const dimensions=await layout.locator("#creation-uploads").evaluate(root=>({maxHeight:getComputedStyle(root).maxHeight,overflowY:getComputedStyle(root).overflowY,clientHeight:root.clientHeight,scrollHeight:root.scrollHeight}));
+   assert.equal(dimensions.maxHeight,"none");assert.equal(dimensions.overflowY,"visible");
+   assert(dimensions.clientHeight>192);assert(dimensions.scrollHeight<=dimensions.clientHeight+1);
+   assert(await layout.locator(".index-page").evaluate(page=>page.scrollHeight>page.clientHeight));
+   assert.equal(await layout.locator("#creation-uploads .codex-attachment").count(),50);
+   const removals=layout.locator('#creation-uploads button[aria-label^="Remove "]');
+   assert.equal(await removals.count(),50);
+   for(let i=0;i<50;i++) {
+    const remove=removals.nth(i);await remove.scrollIntoViewIfNeeded();
+    const box=await remove.boundingBox();assert(box&&box.y>=0&&box.y+box.height<=800,`unreachable file action ${i} at width ${width}`);
+    assert(await remove.isEnabled());
+   }
+   const submit=layout.getByRole("button",{name:"Create session"});await submit.scrollIntoViewIfNeeded();
+   const submitBox=await submit.boundingBox();assert(submitBox&&submitBox.y>=0&&submitBox.y+submitBox.height<=800);
+   await layout.locator('input[type="file"]').setInputFiles({name:"file-51.txt",mimeType:"text/plain",buffer:Buffer.alloc(1024)});
+   assert.match(await layout.locator("#creation-uploads .codex-upload-notice").textContent(),/exceeds/);
+   assert.equal(await layout.locator("#creation-uploads .codex-upload-summary").textContent(),"50 files · 50 KiB total");
+   assert.equal(scopes.get(selection).length,50);
+   await removals.first().click();
+   await layout.waitForFunction(()=>document.querySelector("#creation-uploads .codex-upload-summary")?.textContent==="49 files · 49 KiB total");
+   await layout.locator('input[type="file"]').setInputFiles(files[0]);
+   await layout.waitForFunction(()=>document.querySelector("#creation-uploads .codex-upload-summary")?.textContent==="50 files · 50 KiB total");
+   await layout.reload();await ready(layout);
+   assert.equal(await layout.locator("#creation-uploads .codex-upload-summary").textContent(),"50 files · 50 KiB total");
+   failure="network-before";await layout.getByRole("button",{name:"Create session"}).click();
+   await layout.waitForFunction(()=>!document.querySelector("#new-session-recovery").hidden&&!document.querySelector("#new-session-recover").disabled);
+   const attempted=await draft(layout);assert.equal(attempted.attachmentIds.length,50);
+   assert.equal(new URLSearchParams(attempted.body).getAll("attachmentIds").length,50);
+   failure="none";await layout.reload();await layout.waitForURL(origin+`/creations/${attempted.requestId}/`);
+   const attempts=submissions.filter(submission=>submission.fields.clientRequestId===attempted.requestId);
+   assert(attempts.length>=2);assert(attempts.every(submission=>submission.raw===attempted.body));
+   assert(statusReads.includes(attempted.requestId));
+   assert.equal(await draft(layout),null);
+   assert.equal(await layout.evaluate(id=>sessionStorage.getItem(`workspace-portal.upload-draft.${id}`),selection),null);
+   assert.equal(scopes.get(selection).length,50);await layout.close();
+
+   const conversation=await context.newPage();conversation.on("pageerror",error=>errors.push(error.message));
+   await conversation.setViewportSize({width,height:800});
+   await conversation.addInitScript(files=>localStorage.setItem("workspace-portal.upload-draft.source.thread-1",JSON.stringify(files)),conversationFiles);
+   await conversation.goto(origin+"/source/");
+   await conversation.waitForFunction(()=>document.querySelectorAll("#message-uploads .codex-attachment").length===50);
+   const capped=await conversation.locator("#message-uploads").evaluate(root=>({maxHeight:getComputedStyle(root).maxHeight,overflowY:getComputedStyle(root).overflowY,clientHeight:root.clientHeight,scrollHeight:root.scrollHeight,rem:parseFloat(getComputedStyle(document.documentElement).fontSize)}));
+   assert.equal(capped.maxHeight,`${12*capped.rem}px`);assert.equal(capped.overflowY,"auto");
+   assert(capped.clientHeight<=12*capped.rem+1);assert(capped.scrollHeight>capped.clientHeight);
+   assert.equal(await conversation.locator("#message-uploads .codex-upload-summary").textContent(),"50 files · 50 KiB total");
+   await conversation.close();
+  }
   modelsUnavailable=false;
   // Plan drafts use an immutable plan identity, so unrelated plan proposals
   // never restore or overwrite this selected team and lead override.
@@ -323,6 +391,6 @@ const server = http.createServer(async (req,res) => {
   assert.equal(await page.locator("#creation-source").getAttribute("href"),"/source/");
   assert(await page.locator("#creation-retry").isHidden());assert(await page.locator("#creation-leave-note").isHidden());
   assert.deepEqual(errors,[]);
-  console.log("Creation browser acceptance passed: generated/custom names, immutable recovery, tab scopes, attachment-only, storage, progress and legacy plans/receipts");
+  console.log("Creation browser acceptance passed: generated/custom names, immutable 50-file recovery, desktop/narrow creation CSS, conversation cap, full-size summary, 51-file rejection, tab scopes, attachment-only, storage, progress and legacy plans/receipts");
  } finally {await browser.close();server.close();}
 })().catch(error=>{console.error(error);server.close();process.exitCode=1;});

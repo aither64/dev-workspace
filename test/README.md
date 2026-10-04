@@ -50,3 +50,13 @@ its conversation assets. Run `node test/creation_browser.cjs` from the runtime
 repository root. This fixture performs no model inference. The separate
 `team_settings_browser_test.cjs` is also a real browser suite, invoked through
 the opt-in `TestQuestionBrowser` entry; it is not a pure Node quick check.
+
+The fixture loads the actual host and provider stylesheets in their production
+order. At 1280px and 375px widths it checks 50 cards with long filenames: the
+creation root has no internal vertical scrollbar, every removal action and
+Create session can be reached by scrolling the page, and the conversation root
+retains its 12rem cap. It verifies full total size before completion
+acknowledgement, removal/restoration, file 51 rejection and exact-body recovery
+of a 50-file request after response loss. These assertions need the matching
+provider source with the shared selection summary; syntax checks alone do not
+establish layout acceptance.
