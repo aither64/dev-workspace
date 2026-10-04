@@ -272,16 +272,25 @@ nix run .#workspace-host -- recover-archive \
   --source "$PWD" --workspace NAME --session SLUG
 ```
 
-This command is not a general lifecycle override. It accepts only an exact
-archive journal at `tracking_committed`, keeps the selected profile and Codex
-generation unchanged, and verifies the committed archive tracking while holding
-the normal session locks. It first proves the retained root. It then reconciles
-already archived team members and archives only retained, materialized active
-members that pass the normal idle and submission checks. A final exact proof
-must cover every member before the command invokes the selected package's
+This command accepts only an exact archive journal without a cleanup sidecar at
+`tracking_committed`, keeps the selected profile and Codex generation unchanged,
+and verifies the committed archive tracking while holding the normal session
+locks. The candidate validates the selected executable's version and generated
+protocol contract; a compatible selected 0.160.0 needs no upgrade. It first
+proves an active idle or already archived retained root and
+the exact retained team, refusing unknown active same-directory threads. It then
+reconciles already archived team members and archives only retained, materialized
+active members that pass the normal idle and submission checks. A final exact
+proof must cover every member before the command invokes the selected package's
 private lifecycle executor with only the portal helper replaced by the candidate
 helper. A failed retry leaves the journal in place. Members completed before an
 interruption remain archived and are rechecked on the next retry.
+
+Archived proof requires the exact retained `vscode` identity to be unloaded;
+an archived but loaded conversation still blocks recovery. The
+[recovery guide](session-archive-recovery.md#retained-conversations-and-selected-executor-recovery)
+explains the repeated public proof and dormant native queue rows that a later
+explicit resume can make runnable.
 
 New archive operations also seal a private cleanup sidecar. Finish these through
 their capable ordinary executor; narrow recovery that delegates to an older

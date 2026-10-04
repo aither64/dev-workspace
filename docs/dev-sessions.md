@@ -621,15 +621,19 @@ reproves the exact heads stored in the archive journal before every remaining
 destructive phase; another merged commit on the feature branch cannot replace
 the head originally approved for archival.
 
-Before changing state, `archive` proves the lead and every ready team member
-have no active turn, pending request, or queued message; verifies the tracking commit and clean attached
-worktrees; checks the atomic move; and verifies that the shared workspace can
-make an exact-path commit. It then quiesces the terminal client, releases both
-development cluster types, records immutable repository heads, removes
-worktrees without force, atomically moves tracking into `archive/`, commits
-only the tracking transition, retires the Codex thread, and removes the tmux
-session and authority. Branches are retained. The host-wide transition gate
-prevents portal mutations and cluster starts from racing this operation.
+Before changing state, `archive` verifies the exact retained root and every
+nonremoved team member, including already archived conversations. It checks for
+active turns, pending requests, runnable queued input and unresolved submission
+attempts, and refuses active same-directory threads outside that retained set.
+It verifies the tracking commit and clean worktrees, checks the atomic move, and verifies
+that the shared workspace can make an exact-path commit. It then quiesces the
+terminal client, releases both development cluster types, records immutable
+repository heads, removes worktrees without force, atomically moves tracking
+into `archive/`, commits only the tracking transition, archives and verifies
+retained members, retires
+the root Codex thread, and removes the tmux session and authority. Branches are
+retained. The host-wide transition gate prevents portal mutations and cluster
+starts from racing this operation.
 
 Archive cleanup also inventories nested and detached Git-registered checkouts.
 Detached commits need existing retained refs; empty containers are removed only
@@ -669,11 +673,14 @@ nix run .#workspace-host -- recover-archive \
   --source "$PWD" --workspace NAME --session SLUG
 ```
 
-The candidate must match `--source` and the selected runtime contract. The
-entry accepts only the existing `tracking_committed` archive journal and keeps
-the selected profile unchanged. Under the journal's normal locks, it verifies
-the committed tracking, proves the retained root, and reconciles the retained
-team. It archives only materialized active members that pass the ordinary idle
+The candidate must match `--source` and the selected runtime contract. It checks
+the selected Codex executable's version and generated protocol contract,
+including compatible 0.160.0 installations, without changing that executable.
+Recovery accepts only an existing `tracking_committed` archive journal without
+a cleanup sidecar and keeps the selected profile unchanged. Under the journal's
+normal locks, it verifies the committed tracking, an active idle or already
+archived retained root, and the exact retained set. It reconciles the retained
+team and archives only materialized active members that pass the ordinary idle
 and submission checks, then proves every member archived before the selected
 package's lifecycle executor finishes the journal. It cannot force an archive,
 replace or recreate a member, change the recorded mode, or recover another
