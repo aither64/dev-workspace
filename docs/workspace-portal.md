@@ -297,6 +297,69 @@ their capable ordinary executor; narrow recovery that delegates to an older
 selected executor refuses them. [Archive cleanup and recovery](session-archive-recovery.md)
 describes prepared intents, retry proof and the old no-sidecar compatibility path.
 
+## Browser lifecycle confirmation and recovery
+
+Archive, revive, delete and Keep open use target identity version 2. The target
+contains the canonical workspace, slug, tracking location (`work` or `archive`),
+tracking directory device/inode and retained root conversation, including an
+explicit absent root. Adding artifacts, changing settings or atomically writing
+`portal.yml` leaves the target stable. Replacing the directory or root, or moving
+tracking between lifecycle locations, changes it.
+
+The page refreshes its current target through operation, session details and
+archival settings snapshots. Opening a confirmation captures that snapshot;
+background refresh cannot change an already displayed confirmation silently.
+The server checks the confirmed target under the transition gate and again
+before launching the command. A changed target returns `target_changed` and the
+current session summary. The page shows fresh confirmation without replaying
+the action. Keep open restores the confirmed checkbox value and requires another
+explicit choice. Fresh deletion confirmation resets the force checkbox.
+
+Lifecycle receipts keep schema 1. New receipts add `targetIdentityVersion: 2`
+and an internal attempt counter. Retries retain the same receipt ID; receipt ID
+and attempt together reject a late subprocess result. Optional target location
+and journal proof metadata bind reconciliation to the existing receipt. The
+receipt owns the operation; current-target snapshots refresh the page. Older
+receipts without the new fields remain readable; an older portal that does not
+understand the additive fields can refuse them. Package selection remains
+forward-only.
+
+A matching accepted journal owns retry through its operation ID and immutable
+journal evidence. Progress writes and documented deletion force/inventory updates
+do not change that evidence. Tracking may move while the original receipt target
+stays unchanged; the ordinary command still owns complete journal and tracking
+validation. An expected journal that is missing cannot be adopted or superseded.
+Completion reconciliation requires the receipt's exact directory/root binding
+as well as terminal lifecycle. A replacement with the same slug and terminal
+state cannot complete an older receipt. Deletion retains its exact operation-ID
+and completion-marker proof.
+
+A predecessor receipt without a version and without a journal converts only
+when recomputing its original hash gives an exact positive match. A mismatch is
+unverifiable, including after a harmless ctime change. Fresh confirmation can
+replace only the exact failed pre-journal receipt ID; under lock, a changed
+receipt, an accepted journal or a missing expected journal refuses replacement.
+It cannot change the target of an operation that already started.
+
+Manifestless legacy revive can create a root inside its owning command. A
+successful command result completes the original receipt. If the portal restarts
+after the command removes its journal but before that result is saved, the new
+root prevents same-target completion proof. The receipt remains failed with a
+missing expected journal; terminal active state alone cannot repair it, and
+fresh confirmation cannot replace it. Inspect the failed receipt and keep its
+ownership records and original root binding intact.
+Legacy normalization can establish the active session's metadata, but cannot
+certify the lost command result, rebind this receipt or bypass its ordinary
+pending-operation checks.
+
+The temporary predecessor lifecycle conversion is owned by portal lifecycle
+maintainers. Remove it only after an inventory finds no dependent unversioned
+receipts and no supported package/import path that can introduce them again.
+Creation's separate source-proof hash remains supported and is not migrated by
+this lifecycle conversion. An already open predecessor JavaScript bundle is not
+hot upgraded; it may need a normal reload after a stale-target refusal. Pages
+loaded with the new bundle perform the refresh and confirmation flow in place.
+
 ## Extension catalog
 
 Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`
