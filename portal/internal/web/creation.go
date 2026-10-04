@@ -278,7 +278,9 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 	if authority.State != "ready" || authority.CodexThreadID != source.Codex.ThreadID || authority.CodexSocketPath != s.config.CodexSocket {
 		return nil, "", fmt.Errorf("%w: source session runtime identity changed", errSourceIdentityChanged)
 	}
-	identity, err := lifecycleTargetIdentity(source)
+	// Creation receipts and the CLI source proof retain their existing hash;
+	// lifecycle target versioning does not migrate that separate contract.
+	identity, err := legacyLifecycleTargetIdentity(source)
 	return source, identity, err
 }
 

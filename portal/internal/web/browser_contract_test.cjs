@@ -21,7 +21,7 @@ const {
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
-  lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
+  createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
   renderCollaborationModes, storeCreationDraft, creationCLICommand,
 } = require("./static/app.js");
@@ -488,6 +488,29 @@ assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
   kind: "archive", state: "failed", receiptId: "receipt-1",
   options: {targetId: "target-a", mode: "abandoned"},
 }), "none");
+// A page loaded with the new bundle refreshes its target without changing an
+// already displayed confirmation. Settings/status snapshots share the owner.
+const browserTargets = createLifecycleTargetState({targetId: "target-a", targetIdentityVersion: 2, slug: "example", threadId: "root-a"});
+const originalConfirmation = browserTargets.confirmation();
+browserTargets.refresh({targetId: "target-a", targetIdentityVersion: 2, slug: "example", threadId: "root-a", lifecycle: "active"});
+assert(browserTargets.matches(originalConfirmation));
+browserTargets.refresh({targetId: "target-b", targetIdentityVersion: 2, slug: "example", threadId: "root-b", lifecycle: "active"});
+assert(!browserTargets.matches(originalConfirmation));
+assert.equal(originalConfirmation.threadId, "root-a");
+assert.equal(browserTargets.confirmation().threadId, "root-b");
+browserTargets.refresh({targetId: "unversioned-target"});
+assert.equal(browserTargets.current().targetId, "target-b");
+assert.equal(lifecycleOperationMatches("archive", "moved-target", "", {
+  kind: "archive", receiptId: "receipt-a", options: {targetId: "original-target", journalId: "journal-a", journalExpected: true},
+  currentTarget: {targetId: "moved-target", targetIdentityVersion: 2},
+}), true);
+assert.equal(lifecycleRecoveryAction("archive", {journalId: "journal-a", receiptId: "receipt-a"}, {
+  kind: "archive", receiptId: "receipt-a", state: "running", options: {journalId: "journal-a"},
+}), "monitor");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", receiptId: "receipt-a", state: "failed", code: "target_changed", options: completeArchiveRequest,
+  currentTarget: {targetId: "target-b", targetIdentityVersion: 2},
+}), "confirm");
 const renderedDiffs = fileChangeDiffs(JSON.stringify([{
   path: "portal/<script>alert(1)</script>.js",
   kind: "update",
@@ -933,6 +956,26 @@ if (!unitOnly) {
     "example", createRequest(emptyFetch), compatibilityConversation(emptyFetch),
   );
   assert.deepEqual(await legacyEmptyClient.pending(), []);
+
+  const changedTarget = {targetId: "target-current", targetIdentityVersion: 2, slug: "example", lifecycle: "active", threadId: "new-root"};
+  const rejectedLifecycleRequest = createRequest(async () => ({ok: false, status: 409,
+    json: async () => ({error: "Confirm the current session", code: "target_changed", currentTarget: changedTarget, receiptId: "failed-receipt"}),
+  }));
+  await assert.rejects(rejectedLifecycleRequest("/fixture"), error => error.code === "target_changed" &&
+    error.currentTarget.targetId === changedTarget.targetId && error.receiptId === "failed-receipt");
+  const explicitConfirmations = [];
+  const confirmationClient = createSessionClient("example", async (path, options) => {
+    explicitConfirmations.push({path, body: JSON.parse(options.body)});
+    return {state: "running", receiptId: "fresh-receipt"};
+  });
+  await confirmationClient.archive("abandoned", "target-current", "failed-receipt");
+  await confirmationClient.revive(true, "target-current", "failed-receipt");
+  await confirmationClient.deleteSession(true, "target-current", "failed-receipt");
+  assert.deepEqual(explicitConfirmations.map(request => request.body), [
+    {mode: "abandoned", targetId: "target-current", receiptId: "failed-receipt"},
+    {allowAbandoned: true, targetId: "target-current", receiptId: "failed-receipt"},
+    {force: true, targetId: "target-current", receiptId: "failed-receipt"},
+  ]);
 
   const modes = await client.modes();
   assert.deepEqual(modes.map((mode) => mode.mode), ["default", "plan"]);

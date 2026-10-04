@@ -123,26 +123,34 @@ type cachedIndexStatus struct {
 }
 
 type lifecycleOperation struct {
-	Slug      string                    `json:"slug,omitempty"`
-	Kind      string                    `json:"kind,omitempty"`
-	State     string                    `json:"state"`
-	Phase     string                    `json:"phase,omitempty"`
-	StartedAt string                    `json:"startedAt,omitempty"`
-	UpdatedAt string                    `json:"updatedAt,omitempty"`
-	Error     string                    `json:"error,omitempty"`
-	Redirect  string                    `json:"redirect,omitempty"`
-	ReceiptID string                    `json:"receiptId,omitempty"`
-	Options   lifecycleOperationOptions `json:"options,omitempty"`
+	Slug                  string                    `json:"slug,omitempty"`
+	Kind                  string                    `json:"kind,omitempty"`
+	State                 string                    `json:"state"`
+	Phase                 string                    `json:"phase,omitempty"`
+	StartedAt             string                    `json:"startedAt,omitempty"`
+	UpdatedAt             string                    `json:"updatedAt,omitempty"`
+	Error                 string                    `json:"error,omitempty"`
+	Redirect              string                    `json:"redirect,omitempty"`
+	ReceiptID             string                    `json:"receiptId,omitempty"`
+	TargetIdentityVersion int                       `json:"targetIdentityVersion,omitempty"`
+	Attempt               int                       `json:"attempt,omitempty"`
+	CurrentTarget         *lifecycleTargetSnapshot  `json:"currentTarget,omitempty"`
+	ErrorCode             string                    `json:"code,omitempty"`
+	Options               lifecycleOperationOptions `json:"options,omitempty"`
 }
 
 type lifecycleOperationOptions struct {
-	Mode            string `json:"mode,omitempty"`
-	AllowAbandoned  bool   `json:"allowAbandoned,omitempty"`
-	Force           bool   `json:"force,omitempty"`
-	TargetID        string `json:"targetId,omitempty"`
-	DeletedThreadID string `json:"deletedThreadId,omitempty"`
-	JournalID       string `json:"journalId,omitempty"`
-	JournalExpected bool   `json:"journalExpected,omitempty"`
+	Mode                  string `json:"mode,omitempty"`
+	AllowAbandoned        bool   `json:"allowAbandoned,omitempty"`
+	Force                 bool   `json:"force,omitempty"`
+	TargetID              string `json:"targetId,omitempty"`
+	DeletedThreadID       string `json:"deletedThreadId,omitempty"`
+	JournalID             string `json:"journalId,omitempty"`
+	JournalExpected       bool   `json:"journalExpected,omitempty"`
+	TargetLocation        string `json:"targetLocation,omitempty"`
+	JournalEvidence       string `json:"journalEvidence,omitempty"`
+	JournalTargetID       string `json:"journalTargetId,omitempty"`
+	JournalTargetLocation string `json:"journalTargetLocation,omitempty"`
 }
 
 type Server struct {
@@ -1218,6 +1226,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
+		"currentTarget":    s.lifecycleSnapshot(summary.Slug),
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
 		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
 		"teamHTML":     members.String(),
@@ -2089,8 +2098,9 @@ func (s *Server) teamThreadAPI(w http.ResponseWriter, r *http.Request, summary *
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug string) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var body struct {
-		Force    bool   `json:"force"`
-		TargetID string `json:"targetId"`
+		Force     bool   `json:"force"`
+		TargetID  string `json:"targetId"`
+		ReceiptID string `json:"receiptId"`
 	}
 	if !s.decodeJSON(w, r, &body) {
 		return
@@ -2117,7 +2127,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug stri
 		slug, false, body.TargetID, "",
 	)
 	if targetErr != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": targetErr.Error()})
+		s.writeLifecycleError(w, targetErr)
 		return
 	}
 	deletionJournalID, targetErr := newLifecycleOperationID()
@@ -2135,7 +2145,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request, slug stri
 	s.startLifecycleOperation(w, slug, "delete", "/", args, lifecycleOperationOptions{
 		Force: force, TargetID: deletionTargetID, DeletedThreadID: deletedThreadID,
 		JournalID: deletionJournalID,
-	}, "")
+	}, "", body.ReceiptID)
 }
 
 func newLifecycleOperationID() (string, error) {
@@ -2144,41 +2154,6 @@ func newLifecycleOperationID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(random), nil
-}
-
-func lifecycleTargetIdentity(summary *session.Summary) (string, error) {
-	if summary == nil || summary.Root == "" {
-		return "", errors.New("session tracking is missing")
-	}
-	tracking := filepath.Join(summary.Workspace, summary.Root, summary.Slug)
-	var stat unix.Stat_t
-	if err := unix.Lstat(tracking, &stat); err != nil {
-		return "", fmt.Errorf("inspect session tracking: %w", err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return "", errors.New("session tracking is not a directory")
-	}
-	identity := fmt.Sprintf(
-		"%s\x00%d\x00%d\x00%d\x00%d\x00%s", filepath.Clean(tracking), stat.Dev, stat.Ino,
-		stat.Ctim.Sec, stat.Ctim.Nsec, summary.Codex.ThreadID,
-	)
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity))), nil
-}
-
-func validateLifecycleTarget(
-	summary *session.Summary, expectedTargetID, action string,
-) (string, error) {
-	currentTargetID, err := lifecycleTargetIdentity(summary)
-	if err != nil {
-		return "", fmt.Errorf("verify %s target: %w", action, err)
-	}
-	if expectedTargetID == "" || expectedTargetID != currentTargetID {
-		return "", fmt.Errorf(
-			"This %s request does not match the current session. Reload the page and confirm it again.",
-			action,
-		)
-	}
-	return currentTargetID, nil
 }
 
 func (s *Server) revalidateLifecycleTarget(slug, kind, expectedTargetID string) error {
@@ -2482,8 +2457,9 @@ func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary 
 func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var body struct {
-		Mode     string `json:"mode"`
-		TargetID string `json:"targetId"`
+		Mode      string `json:"mode"`
+		TargetID  string `json:"targetId"`
+		ReceiptID string `json:"receiptId"`
 	}
 	if !s.decodeJSON(w, r, &body) {
 		return
@@ -2499,17 +2475,17 @@ func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *s
 		})
 		return
 	}
-	if summary.Archived {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already archived"})
-		return
-	}
 	if body.Mode != "complete" && body.Mode != "abandoned" {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select completed or abandoned archival"})
 		return
 	}
 	targetID, err := validateLifecycleTarget(summary, body.TargetID, "archive")
 	if err != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		s.writeLifecycleError(w, err)
+		return
+	}
+	if summary.Archived {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already archived"})
 		return
 	}
 	args := []string{"archive", summary.Slug, "--as-is", "--portal-authorized"}
@@ -2528,7 +2504,7 @@ func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *s
 		w, summary.Slug, "archive", "/", args,
 		lifecycleOperationOptions{
 			Mode: body.Mode, TargetID: targetID, JournalID: journalID,
-		}, "",
+		}, "", body.ReceiptID,
 	)
 }
 
@@ -2537,6 +2513,7 @@ func (s *Server) startRevive(w http.ResponseWriter, r *http.Request, summary *se
 	var body struct {
 		AllowAbandoned bool   `json:"allowAbandoned"`
 		TargetID       string `json:"targetId"`
+		ReceiptID      string `json:"receiptId"`
 	}
 	if !s.decodeJSON(w, r, &body) {
 		return
@@ -2552,17 +2529,17 @@ func (s *Server) startRevive(w http.ResponseWriter, r *http.Request, summary *se
 		})
 		return
 	}
+	targetID, err := validateLifecycleTarget(summary, body.TargetID, "revive")
+	if err != nil {
+		s.writeLifecycleError(w, err)
+		return
+	}
 	if !summary.Archived {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is already active"})
 		return
 	}
 	if summary.Lifecycle == "abandoned" && !body.AllowAbandoned {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirm that the abandoned session should be revived"})
-		return
-	}
-	targetID, err := validateLifecycleTarget(summary, body.TargetID, "revive")
-	if err != nil {
-		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	args := []string{"revive", summary.Slug, "--as-is", "--portal-authorized"}
@@ -2583,14 +2560,24 @@ func (s *Server) startRevive(w http.ResponseWriter, r *http.Request, summary *se
 			AllowAbandoned: body.AllowAbandoned || summary.Lifecycle == "abandoned",
 			TargetID:       targetID,
 			JournalID:      journalID,
-		}, "",
+		}, "", body.ReceiptID,
 	)
 }
 
 func (s *Server) startLifecycleOperation(
 	w http.ResponseWriter, slug, kind, redirect string, args []string,
-	options lifecycleOperationOptions, expectedReceiptID string,
+	options lifecycleOperationOptions, expectedReceiptID string, supersedeReceiptIDs ...string,
 ) {
+	_, unlock, gateErr := s.acquireTransition(unix.LOCK_SH)
+	if gateErr != nil {
+		s.writeLifecycleError(w, gateErr)
+		return
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		s.writeLifecycleError(w, err)
+		return
+	}
 	owner, err := session.PendingLifecycle(s.config.Workspace, slug)
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -2610,7 +2597,9 @@ func (s *Server) startLifecycleOperation(
 	}
 	operation, exists := s.operations[slug]
 	if expectedReceiptID != "" &&
-		(!exists || operation.ReceiptID != expectedReceiptID ||
+		(!exists || operation.ReceiptID != expectedReceiptID || operation.Kind != kind ||
+			operation.Options.JournalID != options.JournalID || operation.Options.Mode != options.Mode ||
+			operation.Options.AllowAbandoned != options.AllowAbandoned ||
 			(operation.State != "failed" && operation.State != "paused")) {
 		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusConflict, map[string]string{
@@ -2618,13 +2607,75 @@ func (s *Server) startLifecycleOperation(
 		})
 		return
 	}
+	if expectedReceiptID == "" && len(supersedeReceiptIDs) != 0 && supersedeReceiptIDs[0] != "" &&
+		(!exists || operation.ReceiptID != supersedeReceiptIDs[0] || operation.State != "failed" || operation.Options.JournalExpected) {
+		s.operationMu.Unlock()
+		s.writeLifecycleError(w, errors.New("The lifecycle receipt changed. Review the current operation before confirming again."))
+		return
+	}
 	if exists && operation.State == "running" {
 		s.operationMu.Unlock()
-		if operation.Kind != kind {
+		if operation.Kind != kind || operation.Options.TargetID != options.TargetID ||
+			operation.Options.Mode != options.Mode || operation.Options.Force != options.Force ||
+			operation.Options.AllowAbandoned != options.AllowAbandoned {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "another session operation is already running"})
 			return
 		}
 		s.writeJSON(w, http.StatusAccepted, operation)
+		return
+	}
+	progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+	if proofErr == nil {
+		if expectedReceiptID != "" {
+			proofErr = s.prepareLifecycleRetryLocked(&operation, progress)
+			if proofErr == nil {
+				// Preserve explicit force escalation after proving the stored receipt.
+				force := options.Force
+				options = operation.Options
+				options.Force = options.Force || force
+				if kind == "delete" && options.Force {
+					foundForce := false
+					for _, argument := range args {
+						if argument == "--force" {
+							foundForce = true
+						}
+					}
+					if !foundForce {
+						args = append(args, "--force")
+					}
+				}
+			}
+		} else {
+			supersede := ""
+			if len(supersedeReceiptIDs) != 0 {
+				supersede = supersedeReceiptIDs[0]
+			}
+			if progress != nil || (exists && operation.Options.JournalExpected) {
+				proofErr = errors.New("An accepted lifecycle journal cannot be replaced. Retry that operation.")
+			} else if supersede != "" {
+				if !exists || operation.ReceiptID != supersede || operation.State != "failed" {
+					proofErr = errors.New("The lifecycle receipt changed. Review the current operation before confirming again.")
+				}
+			} else if exists && operation.State != "complete" {
+				proofErr = errors.New("Retry the existing operation or explicitly confirm replacing its failed request.")
+			}
+			if proofErr == nil {
+				summary, findErr := session.Find(s.config.Workspace, slug)
+				proofErr = findErr
+				if proofErr == nil {
+					_, proofErr = validateLifecycleTarget(summary, options.TargetID, kind)
+					options.TargetLocation = summary.Root
+				}
+			}
+		}
+	}
+	if proofErr != nil {
+		var changed *lifecycleTargetChangedError
+		if errors.As(proofErr, &changed) && exists && operation.State == "failed" && !operation.Options.JournalExpected {
+			changed.ReceiptID = operation.ReceiptID
+		}
+		s.operationMu.Unlock()
+		s.writeLifecycleError(w, proofErr)
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -2632,17 +2683,30 @@ func (s *Server) startLifecycleOperation(
 	if expectedReceiptID != "" {
 		startedAt = operation.StartedAt
 	}
-	receiptID, err := newLifecycleOperationID()
-	if err != nil {
+	receiptID := operation.ReceiptID
+	var receiptErr error
+	if expectedReceiptID == "" {
+		receiptID, receiptErr = newLifecycleOperationID()
+	}
+	if receiptErr != nil {
 		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "unable to create the lifecycle operation",
 		})
 		return
 	}
+	attempt := 1
+	if expectedReceiptID != "" {
+		attempt = operation.Attempt + 1
+	}
+	version := lifecycleTargetIdentityVersion
+	if expectedReceiptID != "" {
+		version = operation.TargetIdentityVersion
+	}
 	operation = lifecycleOperation{
 		Slug: slug, Kind: kind, State: "running", Phase: "starting", Redirect: redirect,
 		StartedAt: startedAt, UpdatedAt: now, ReceiptID: receiptID, Options: options,
+		TargetIdentityVersion: version, Attempt: attempt,
 	}
 	if err := s.operationStore.canPersistTerminalOutcomes(s.operations, slug, operation); err != nil {
 		s.operationMu.Unlock()
@@ -2672,18 +2736,25 @@ func (s *Server) startLifecycleOperation(
 		} else {
 			completed.State = "failed"
 			completed.Error = boundedLifecycleError(err.Error())
+			var changed *lifecycleTargetChangedError
+			if errors.As(err, &changed) {
+				completed.ErrorCode = "target_changed"
+			}
 			if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
 				completed.Phase = progress.Phase
 				if completed.Options.JournalID != "" &&
 					completed.Options.JournalID == progress.JournalID {
-					completed.applyProgressOptions(*progress)
+					if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
+						completed.applyProgressOptions(*progress)
+						s.bindLifecycleJournalTarget(&completed, *progress)
+					}
 				}
 			}
 		}
 		s.operationMu.Lock()
 		current, ownsReceipt := s.operations[slug]
 		if !ownsReceipt || current.ReceiptID == "" ||
-			current.ReceiptID != completed.ReceiptID {
+			current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
 			s.config.Logger.Printf(
 				"discard stale %s operation result for %s", kind, slug,
 			)
@@ -2730,7 +2801,8 @@ func (s *Server) executeLifecycleOperation(
 	}
 	if options.JournalExpected {
 		if progress == nil || progress.Operation != kind ||
-			progress.JournalID == "" || progress.JournalID != options.JournalID {
+			progress.JournalID == "" || progress.JournalID != options.JournalID ||
+			(options.JournalEvidence != "" && options.JournalEvidence != progress.Evidence) {
 			return errors.New("The lifecycle operation changed. Reload the page before retrying it.")
 		}
 	} else if progress != nil {
@@ -2762,13 +2834,25 @@ func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
 	if err != nil {
 		if !ok {
 			operation = lifecycleOperation{
-				Slug: slug, State: "failed",
-				Error:     boundedLifecycleError("Session lifecycle state is unsafe: " + err.Error()),
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				Slug: slug,
 			}
 		}
+		operation.State = "failed"
+		operation.Error = boundedLifecycleError("Session lifecycle state is unsafe: " + err.Error())
+		operation.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	} else if !ok {
 		operation = lifecycleOperation{State: "idle"}
+	}
+	operation.CurrentTarget = s.lifecycleSnapshot(slug)
+	if operation.State == "failed" && !operation.Options.JournalExpected && operation.CurrentTarget != nil {
+		if summary, findErr := session.Find(s.config.Workspace, slug); findErr == nil {
+			if _, err := validateLifecycleReceiptTarget(summary, operation); err != nil {
+				var changed *lifecycleTargetChangedError
+				if errors.As(err, &changed) {
+					operation.ErrorCode = "target_changed"
+				}
+			}
+		}
 	}
 	s.writeJSON(w, http.StatusOK, operation)
 }
@@ -2784,7 +2868,7 @@ func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	operation, ok, err := s.lifecycleOperationForSlug(slug)
-	if err != nil && !ok {
+	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2837,20 +2921,11 @@ func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request,
 			})
 			return
 		}
-		operation.applyProgressOptions(*progress)
 	} else if operation.Options.JournalExpected {
 		s.writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "The lifecycle recovery journal is no longer available. Reload the workspace before retrying.",
 		})
 		return
-	}
-	if progress == nil && operation.Kind != "delete" {
-		if targetErr := s.revalidateLifecycleTarget(
-			slug, operation.Kind, operation.Options.TargetID,
-		); targetErr != nil {
-			s.writeJSON(w, http.StatusConflict, map[string]string{"error": targetErr.Error()})
-			return
-		}
 	}
 	if operation.Kind == "delete" && body.Force != nil && *body.Force {
 		operation.Options.Force = true
@@ -2868,7 +2943,7 @@ func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request,
 		}
 	case "delete":
 		deletionTargetID, deletedThreadID, targetErr := s.resolveDeletionTarget(
-			slug, owner == "delete", operation.Options.TargetID,
+			slug, true, operation.Options.TargetID,
 			operation.Options.DeletedThreadID,
 		)
 		if targetErr != nil {

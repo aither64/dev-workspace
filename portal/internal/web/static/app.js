@@ -6,7 +6,7 @@
       headers: {"Content-Type": "application/json", ...(options.headers || {})},
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
+    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; throw error; }
     return data;
   };
   const createSessionClient = (slug, request, conversation) => ({
@@ -35,14 +35,14 @@
       method: "POST", body: JSON.stringify({hold, targetId}),
     }),
     artifactPreview: (path) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`),
-    archive: (mode, targetId) => request(apiPath(slug, "archive"), {
-      method: "POST", body: JSON.stringify({mode, targetId}),
+    archive: (mode, targetId, receiptId) => request(apiPath(slug, "archive"), {
+      method: "POST", body: JSON.stringify({mode, targetId, ...(receiptId ? {receiptId} : {})}),
     }),
-    revive: (allowAbandoned, targetId) => request(apiPath(slug, "revive"), {
-      method: "POST", body: JSON.stringify({allowAbandoned, targetId}),
+    revive: (allowAbandoned, targetId, receiptId) => request(apiPath(slug, "revive"), {
+      method: "POST", body: JSON.stringify({allowAbandoned, targetId, ...(receiptId ? {receiptId} : {})}),
     }),
-    deleteSession: (force, targetId) => request(apiPath(slug, "delete"), {
-      method: "POST", body: JSON.stringify({force, targetId}),
+    deleteSession: (force, targetId, receiptId) => request(apiPath(slug, "delete"), {
+      method: "POST", body: JSON.stringify({force, targetId, ...(receiptId ? {receiptId} : {})}),
     }),
     operation: () => request(apiPath(slug, "operation")),
     retryOperation: (receiptId, journalId, force) => {
@@ -487,10 +487,11 @@
   };
   const lifecycleRecoveryAction = (kind, expected = {}, operation = {}) => {
     if (operation.kind !== kind || !operation.receiptId) return "none";
+    let unchanged = false;
     if (expected.journalId) {
       if (operation.options?.journalId !== expected.journalId) return "none";
       if (expected.receiptId && operation.receiptId === expected.receiptId &&
-          operation.state !== "complete") return "unchanged";
+          (operation.state === "failed" || operation.state === "paused")) unchanged = true;
     } else {
       if (!expected.targetId || operation.options?.targetId !== expected.targetId) return "none";
       if (kind === "archive" && operation.options?.mode !== expected.mode) return "none";
@@ -499,15 +500,29 @@
       if (kind === "delete" &&
           Boolean(operation.options?.force) !== Boolean(expected.force)) return "none";
     }
+    if (operation.code === "target_changed" && !operation.options?.journalExpected && operation.currentTarget?.targetIdentityVersion === 2) return "confirm";
+    if (unchanged) return "unchanged";
     if (operation.state === "complete") return "complete";
     if (operation.state === "running") return "monitor";
     if (operation.state === "failed" || operation.state === "paused") return "retry";
     return "none";
   };
+  const createLifecycleTargetState = (initial = {}) => {
+    let current = initial;
+    return {
+      refresh(snapshot) {
+        if (snapshot?.targetIdentityVersion === 2 && typeof snapshot.targetId === "string" && snapshot.targetId) current = {...snapshot};
+        return current;
+      },
+      current: () => ({...current}),
+      confirmation: () => ({...current}),
+      matches: confirmation => Boolean(confirmation?.targetId && confirmation.targetId === current.targetId),
+    };
+  };
   const lifecycleOperationMatches = (kind, targetId, pendingKind, operation = {}) => {
     if (operation.kind !== kind || !operation.receiptId) return false;
     if (targetId && operation.options?.targetId === targetId) return true;
-    return pendingKind === kind && Boolean(operation.options?.journalExpected) &&
+    return (pendingKind === kind || operation.currentTarget?.targetIdentityVersion === 2) && Boolean(operation.options?.journalExpected) &&
       Boolean(operation.options?.journalId);
   };
   const safeDiffPath = (value) => String(value || "unknown-file").replace(/[\r\n\t]/g, " ");
@@ -939,7 +954,7 @@
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
-      indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
+      indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash, sessionTabFromLocation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
@@ -963,7 +978,25 @@
   updateSidebar();
   document.querySelectorAll(".document").forEach(wrapMarkdownTables);
   const slug = body.dataset.session;
-  const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
+  let lifecycleTargetId = body.dataset.lifecycleTargetId || "";
+  const lifecycleTargets = createLifecycleTargetState({targetId: lifecycleTargetId, targetIdentityVersion: 2,
+    slug, lifecycle: body.dataset.lifecycle, archived: body.dataset.archived === "true", threadId: body.dataset.rootThreadId || ""});
+  const refreshLifecycleTarget = snapshot => {
+    if (!snapshot) return;
+    const current = lifecycleTargets.refresh(snapshot);
+    lifecycleTargetId = current.targetId;
+    body.dataset.lifecycleTargetId = current.targetId;
+    body.dataset.lifecycle = current.lifecycle;
+    const pending = body.dataset.pendingLifecycle || "";
+    const archive = document.getElementById("archive-session-open");
+    if (archive) archive.hidden = pending ? pending !== "archive" : current.archived;
+    const revive = document.getElementById("revive-session-open");
+    if (revive) revive.hidden = Boolean(pending) || !current.archived;
+    const hold = document.getElementById("auto-archive-hold-label");
+    if (hold) hold.hidden = current.archived;
+    const warning = document.getElementById("revive-abandoned-warning");
+    if (warning) warning.hidden = current.lifecycle !== "abandoned";
+  };
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
   const conversationAssets = await import("/codex/assets/conversation.js?v=12");
@@ -2027,6 +2060,7 @@
     autoArchiveDetails.querySelector("pre").textContent = diagnostics.join("\n\n");
   };
   const renderAutoArchive = (state) => {
+    refreshLifecycleTarget(state.currentTarget);
     lastAutoArchive = state;
     renderArchiveFailure();
     const presentation = autoArchivePresentation(state);
@@ -2091,14 +2125,18 @@
       }
       await autoArchiveLoading;
       await loadAutoArchive(true);
-      if (saveError) failAutoArchive(saveError, "Could not confirm the Keep open change. The checkbox shows the last confirmed setting.");
+      if (saveError?.code === "target_changed") {
+        refreshLifecycleTarget(saveError.currentTarget);
+        const current = lifecycleTargets.current();
+        failAutoArchive(saveError, `Session ${current.slug} is now ${current.lifecycle}. Review its current archival settings, then choose Keep open again.`);
+      } else if (saveError) failAutoArchive(saveError, "Could not confirm the Keep open change. The checkbox shows the last confirmed setting.");
     });
   }
   const lifecycleStatus = document.getElementById("lifecycle-operation-status");
   const lifecycleTitle = document.getElementById("lifecycle-operation-title");
   const lifecycleDetail = document.getElementById("lifecycle-operation-detail");
   const lifecycleRetry = document.getElementById("lifecycle-operation-retry");
-  const pendingLifecycle = body.dataset.pendingLifecycle || "";
+  let pendingLifecycle = body.dataset.pendingLifecycle || "";
   let lifecycleKind = pendingLifecycle;
   let lifecycleObservedAt = 0;
   let lifecycleClock = null;
@@ -2110,6 +2148,12 @@
   const operationForRetry = async (kind) => {
     let operation = lastLifecycleOperation;
     if (!lifecycleOperationBelongsToPage(kind, operation)) operation = await client.operation();
+    refreshLifecycleTarget(operation.currentTarget);
+    if (operation.code === "target_changed") {
+      const error = new Error(operation.error || "Review the current session and confirm it again.");
+      Object.assign(error, {code: "target_changed", currentTarget: operation.currentTarget, receiptId: operation.receiptId});
+      throw error;
+    }
     if (!lifecycleOperationBelongsToPage(kind, operation)) {
       throw new Error("This operation belongs to an older session. Reload the page before continuing.");
     }
@@ -2146,6 +2190,8 @@
   }
   const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
     if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
+    if (operation.options?.journalExpected) { pendingLifecycle = operation.kind; body.dataset.pendingLifecycle = pendingLifecycle; }
+    refreshLifecycleTarget(operation.currentTarget);
     lastLifecycleOperation = operation;
     renderArchiveFailure();
     if (!lifecycleObservedAt && operation.startedAt) {
@@ -2177,10 +2223,75 @@
       error: error || "The operation did not finish.",
     });
   };
+  let freshLifecycleConfirmation = null;
+  const lifecycleConfirmations = new Map();
+  const openLifecycleConfirmation = async (kind, snapshot = null, receiptId = "") => {
+    if (!snapshot) {
+      const operation = await client.operation();
+      refreshLifecycleTarget(operation.currentTarget);
+      if (operation.state !== "idle") showLifecycle(operation);
+      if (operation.state === "failed" && !operation.options?.journalExpected && operation.code === "target_changed") receiptId = operation.receiptId;
+    } else {
+      refreshLifecycleTarget(snapshot);
+      if (!receiptId) {
+        const operation = await client.operation();
+        if (operation.kind === kind && operation.state === "failed" && !operation.options?.journalExpected) receiptId = operation.receiptId;
+        if (operation.options?.journalExpected) {
+          showLifecycle(operation);
+          throw new Error("An accepted operation now owns this session. Use its Retry action.");
+        }
+      }
+    }
+    const dialog = document.getElementById(`${kind}-session-dialog`);
+    if (!dialog) throw new Error("Confirmation is unavailable for this operation.");
+    const current = lifecycleTargets.confirmation();
+    if ((kind === "archive" && current.archived) || (kind === "revive" && !current.archived)) {
+      failLifecycle(kind, `Session ${current.slug} is now ${current.lifecycle}. Choose an available action for the current session.`);
+      return;
+    }
+    lifecycleConfirmations.set(kind, current);
+    freshLifecycleConfirmation = {kind, receiptId};
+    if (kind === "delete" && (receiptId || snapshot)) document.getElementById("delete-session-form").elements.force.checked = false;
+    let summary = dialog.querySelector("[data-lifecycle-target-summary]");
+    if (!summary) {
+      summary = document.createElement("p"); summary.dataset.lifecycleTargetSummary = "";
+      dialog.querySelector("form").prepend(summary);
+    }
+    summary.textContent = `${current.slug}: ${current.archived ? "archived" : "active"} (${current.lifecycle}). ` +
+      (current.threadId ? `Conversation: ${current.threadId}.` : "No retained conversation.");
+    if (!dialog.open) dialog.showModal();
+  };
+  const recoverChangedLifecycleTarget = async (kind, error, resetControls) => {
+    if (error?.code !== "target_changed") return false;
+    stopLifecycleTimers(); setLifecycleActionsDisabled(false); resetControls();
+    try {
+      await openLifecycleConfirmation(kind, error.currentTarget, error.receiptId || "");
+    } catch (recoveryError) {
+      failLifecycle(kind, recoveryError.message, resetControls);
+    }
+    return true;
+  };
+  const confirmationForLifecycle = kind => {
+    const confirmation = lifecycleConfirmations.get(kind);
+    if (!lifecycleTargets.matches(confirmation)) {
+      const error = new Error("The session changed while confirmation was open. Review it again.");
+      Object.assign(error, {code: "target_changed", currentTarget: lifecycleTargets.current(),
+        receiptId: freshLifecycleConfirmation?.kind === kind ? freshLifecycleConfirmation.receiptId : ""});
+      throw error;
+    }
+    return confirmation;
+  };
   const adoptLifecycleAfterRequestFailure = async (kind, expected, error, resetControls) => {
+    if (await recoverChangedLifecycleTarget(kind, error, resetControls)) return;
+    error = error?.message || error;
     try {
       const operation = await client.operation();
+      refreshLifecycleTarget(operation.currentTarget);
       switch (lifecycleRecoveryAction(kind, expected, operation)) {
+        case "confirm":
+          await openLifecycleConfirmation(kind, operation.currentTarget, operation.receiptId);
+          resetControls();
+          return;
         case "complete":
           if (kind === "delete") clearBrowserThreadStorage(operation.options?.deletedThreadId);
           location.assign(operation.redirect || "/");
@@ -2273,9 +2384,9 @@
     }
     deleteForm.elements.force.checked = lifecycleOperationBelongsToPage("delete", operation) &&
       Boolean(operation.options?.force);
-    deleteDialog.showModal();
+    await openLifecycleConfirmation("delete");
   };
-  deleteOpen?.addEventListener("click", () => void openDeleteDialog());
+  deleteOpen?.addEventListener("click", () => void openDeleteDialog().catch(error => failLifecycle("delete", error.message)));
   deleteDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => deleteDialog.close());
   deleteForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2284,7 +2395,7 @@
     controls.forEach((control) => { control.disabled = true; });
     deleteDialog.close();
     const operation = lastLifecycleOperation;
-    const isRetry = lifecycleOperationBelongsToPage("delete", operation) &&
+    const isRetry = !freshLifecycleConfirmation?.receiptId && lifecycleOperationBelongsToPage("delete", operation) &&
       (operation.state === "failed" || operation.state === "paused");
     deleteRetryForce = deleteForm.elements.force.checked ||
       Boolean(isRetry && operation.options?.force);
@@ -2296,7 +2407,8 @@
           deleteRetryForce,
         );
       } else {
-        await client.deleteSession(deleteRetryForce, lifecycleTargetId);
+        const confirmation = confirmationForLifecycle("delete");
+        await client.deleteSession(deleteRetryForce, confirmation.targetId, freshLifecycleConfirmation?.receiptId);
       }
       location.assign("/");
     } catch (error) {
@@ -2307,7 +2419,7 @@
         targetId: lifecycleTargetId,
         force: deleteRetryForce,
       };
-      await adoptLifecycleAfterRequestFailure("delete", expected, error.message, resetControls);
+      await adoptLifecycleAfterRequestFailure("delete", expected, error, resetControls);
     }
   });
 
@@ -2408,6 +2520,7 @@
     try {
       const payload = await client.details({signal: read.signal});
       if (!read.isCurrent()) return;
+      refreshLifecycleTarget(payload.currentTarget);
       if (!releasingCluster && typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
@@ -2552,15 +2665,17 @@
         await adoptLifecycleAfterRequestFailure("archive", {
           journalId: operation.options.journalId,
           receiptId: operation.receiptId,
-        }, error.message, resetControl);
+        }, error, resetControl);
       } else {
-        failLifecycle("archive", error.message, resetControl);
+        if (!(await recoverChangedLifecycleTarget("archive", error, resetControl))) failLifecycle("archive", error.message, resetControl);
       }
     }
   };
   archiveOpen?.addEventListener("click", () => {
-    if (pendingLifecycle === "archive") void retryArchive();
-    else archiveDialog.showModal();
+    if (pendingLifecycle === "archive" || (lastLifecycleOperation.kind === "archive" &&
+        ["failed", "paused"].includes(lastLifecycleOperation.state) && lastLifecycleOperation.code !== "target_changed" &&
+        lifecycleOperationBelongsToPage("archive", lastLifecycleOperation))) void retryArchive();
+    else void openLifecycleConfirmation("archive").catch(error => failLifecycle("archive", error.message));
   });
   archiveDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => archiveDialog.close());
   archiveForm?.addEventListener("submit", async (event) => {
@@ -2576,7 +2691,8 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Archiving…";
     try {
-      await client.archive(mode, lifecycleTargetId);
+      const confirmation = confirmationForLifecycle("archive");
+      await client.archive(mode, confirmation.targetId, freshLifecycleConfirmation?.receiptId);
       archiveDialog.close();
       location.assign("/");
     } catch (error) {
@@ -2584,13 +2700,13 @@
       await adoptLifecycleAfterRequestFailure("archive", {
         targetId: lifecycleTargetId,
         mode,
-      }, error.message, resetControls);
+      }, error, resetControls);
     }
   });
 
   const reviveDialog = document.getElementById("revive-session-dialog");
   const reviveForm = document.getElementById("revive-session-form");
-  document.getElementById("revive-session-open")?.addEventListener("click", () => reviveDialog.showModal());
+  document.getElementById("revive-session-open")?.addEventListener("click", () => void openLifecycleConfirmation("revive").catch(error => failLifecycle("revive", error.message)));
   reviveDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => reviveDialog.close());
   reviveForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2603,7 +2719,8 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Reviving…";
     try {
-      await client.revive(body.dataset.lifecycle === "abandoned", lifecycleTargetId);
+      const confirmation = confirmationForLifecycle("revive");
+      await client.revive(confirmation.lifecycle === "abandoned", confirmation.targetId, freshLifecycleConfirmation?.receiptId);
       reviveDialog.close();
       location.assign("/");
     } catch (error) {
@@ -2611,7 +2728,7 @@
       await adoptLifecycleAfterRequestFailure("revive", {
         targetId: lifecycleTargetId,
         allowAbandoned: body.dataset.lifecycle === "abandoned",
-      }, error.message, resetControls);
+      }, error, resetControls);
     }
   });
   const reviveRetry = document.getElementById("revive-session-retry");
@@ -2638,9 +2755,9 @@
         await adoptLifecycleAfterRequestFailure("revive", {
           journalId: operation.options.journalId,
           receiptId: operation.receiptId,
-        }, error.message, resetControl);
+        }, error, resetControl);
       } else {
-        failLifecycle("revive", error.message, resetControl);
+        if (!(await recoverChangedLifecycleTarget("revive", error, resetControl))) failLifecycle("revive", error.message, resetControl);
       }
     }
   };
@@ -2648,10 +2765,10 @@
   lifecycleRetry?.addEventListener("click", () => {
     const needsOptions = !pendingLifecycle &&
       !lifecycleOperationBelongsToPage(lifecycleKind, lastLifecycleOperation);
-    if (lifecycleKind === "archive" && needsOptions) archiveDialog.showModal();
+    if (lifecycleKind === "archive" && (needsOptions || lastLifecycleOperation.code === "target_changed")) void openLifecycleConfirmation("archive").catch(error => failLifecycle("archive", error.message));
     else if (lifecycleKind === "archive") void retryArchive();
-    else if (lifecycleKind === "delete") void openDeleteDialog();
-    else if (lifecycleKind === "revive" && needsOptions) reviveDialog.showModal();
+    else if (lifecycleKind === "delete") void openDeleteDialog().catch(error => failLifecycle("delete", error.message));
+    else if (lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")) void openLifecycleConfirmation("revive").catch(error => failLifecycle("revive", error.message));
     else if (lifecycleKind === "revive") void retryRevive(lifecycleRetry);
   });
   // Worker diagnostics are historical evidence; they never replace a live retry.
@@ -2685,6 +2802,8 @@
     window.addEventListener("pagehide", () => { clearInterval(timer); timer = null; });
   }
   client.operation().then((operation) => {
+    refreshLifecycleTarget(operation.currentTarget);
+    if (operation.code === "target_changed") { lifecycleKind = operation.kind; showLifecycle(operation); return; }
     if (!pendingLifecycle && !lifecycleOperationBelongsToPage(operation.kind, operation)) return;
     if (operation.state === "running") {
       monitorLifecycle(operation.kind || pendingLifecycle, operation);

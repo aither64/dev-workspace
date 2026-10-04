@@ -96,6 +96,25 @@ func (store *lifecycleOperationStore) load() (map[string]lifecycleOperation, err
 	if payload.Schema != lifecycleOperationStoreSchema || payload.Workspace != store.workspace {
 		return nil, errors.New("lifecycle operation state has the wrong workspace identity")
 	}
+	// Absence retains predecessor receipts. Explicit null/zero is not a
+	// version or attempt and must not masquerade as an omitted optional field.
+	var shape struct {
+		Operations []map[string]json.RawMessage `json:"operations"`
+	}
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return nil, err
+	}
+	for _, fields := range shape.Operations {
+		for _, name := range []string{"targetIdentityVersion", "attempt"} {
+			if raw, present := fields[name]; present {
+				var value int
+				if string(raw) == "null" || json.Unmarshal(raw, &value) != nil || value < 1 ||
+					(name == "targetIdentityVersion" && value != lifecycleTargetIdentityVersion) {
+					return nil, fmt.Errorf("invalid optional lifecycle %s", name)
+				}
+			}
+		}
+	}
 	if len(payload.Operations) > maxLifecycleOperationRecords {
 		return nil, errors.New("lifecycle operation state has too many records")
 	}

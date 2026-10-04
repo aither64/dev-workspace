@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=4">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -32,7 +32,9 @@
     {{template "codex-limits"}}
     <div class="sidebar-actions">
       {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
-      {{if eq .PendingLifecycle "archive"}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Retry archive</span></button>{{else if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{else if not .PendingLifecycle}}{{if .Session.Archived}}<button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>{{else}}<button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Archive session</span></button>{{end}}{{end}}
+      <button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"{{if not (or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived)))}} hidden{{end}}><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">{{if eq .PendingLifecycle "archive"}}Retry archive{{else}}Archive session{{end}}</span></button>
+      <button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"{{if or .PendingLifecycle (not .Session.Archived)}} hidden{{end}}><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>
+      {{if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{end}}
       <button id="delete-session-open" type="button" class="danger" title="Delete session" aria-label="Delete session"><span class="rail-icon" aria-hidden="true">×</span><span class="rail-label">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</span></button>
       <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .Session.Interactive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
     </div>
@@ -58,8 +60,8 @@
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
           <div id="auto-archive-values" hidden></div>
           <details id="auto-archive-details" hidden><summary>Technical details</summary><pre></pre></details>
-          {{if not .Session.Archived}}<label class="checkbox"><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
-          <p class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>{{end}}
+          <label id="auto-archive-hold-label" class="checkbox"{{if .Session.Archived}} hidden{{end}}><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
+          <p class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>
         </section>
       </section>
 
@@ -181,7 +183,6 @@
     </form>
   </dialog>
   {{end}}
-  {{if or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived))}}
   <dialog id="archive-session-dialog">
     <form id="archive-session-form" class="stack">
       <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>This checks that Codex has no pending work, removes clean worktrees, releases development clusters, records the archive on workspace <code>master</code>, and stops the session runtime.</p></div>
@@ -189,15 +190,13 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" name="mode" value="abandoned" class="danger">Archive as abandoned</button><button type="submit" name="mode" value="complete">Archive completed session</button></div>
     </form>
   </dialog>
-  {{else if and (not .PendingLifecycle) .Session.Archived}}
   <dialog id="revive-session-dialog">
     <form id="revive-session-form" class="stack">
       <div><p class="eyebrow">Continue work</p><h2>Revive session</h2><p>This restores active tracking and the retained Codex conversation. Repository worktrees stay removed until you add them again.</p></div>
-      {{if eq .Session.Lifecycle "abandoned"}}<p class="notice warning">This session was explicitly abandoned. Reviving it reopens discarded work as an active initiative.</p>{{end}}
+      <p id="revive-abandoned-warning" class="notice warning"{{if ne .Session.Lifecycle "abandoned"}} hidden{{end}}>This session was explicitly abandoned. Reviving it reopens discarded work as an active initiative.</p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Revive session</button></div>
     </form>
   </dialog>
-  {{end}}
   <dialog id="delete-session-dialog">
     <form id="delete-session-form" class="stack">
       <div><p class="eyebrow danger-text">Destructive action</p><h2>Delete session</h2><p>This removes the session, worktrees, cluster state, and browser and terminal runtime. Git branches are retained. Tracking is moved to private recovery storage.</p></div>
@@ -205,7 +204,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=22" defer></script>
+  <script src="/static/app.js?v=23" defer></script>
 </body>
 </html>
 {{end}}

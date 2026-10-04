@@ -201,11 +201,21 @@ func TestLifecycleOperationReconcilesExternalSuccess(t *testing.T) {
 			if testCase.kind == "archive" {
 				options.Mode = "complete"
 			}
+			if testCase.tracking != "" {
+				// The receipt must bind the exact directory/root whose terminal
+				// state is being reconciled, not just the requested mode.
+				options.TargetID = deletionTargetForTest(t, server, "example")
+				options.TargetLocation = testCase.tracking
+			}
+			version := 0
+			if testCase.kind != "delete" {
+				version = 2
+			}
 			server.operationMu.Lock()
 			err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
 				Slug: "example", Kind: testCase.kind, State: "failed", Phase: "prepared",
 				StartedAt: now, UpdatedAt: now, Error: "old failure",
-				Redirect: operationRedirect("example", testCase.kind), Options: options,
+				Redirect: operationRedirect("example", testCase.kind), Options: options, TargetIdentityVersion: version,
 			})
 			server.operationMu.Unlock()
 			if err != nil {
@@ -626,11 +636,12 @@ func TestLifecycleOperationRetryUsesPersistedOptions(t *testing.T) {
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			options := testCase.options
 			options.TargetID = deletionTargetForTest(t, server, "example")
+			options.TargetLocation = testCase.tracking
 			operation := lifecycleOperation{
 				Slug: "example", Kind: testCase.kind, State: "failed", Phase: "prepared",
 				StartedAt: now, UpdatedAt: now, Error: "retry me",
 				Redirect:  operationRedirect("example", testCase.kind),
-				ReceiptID: strings.Repeat("d", 64), Options: options,
+				ReceiptID: strings.Repeat("d", 64), Options: options, TargetIdentityVersion: 2,
 			}
 			server.operationMu.Lock()
 			if err := server.replaceLifecycleOperationLocked("example", operation); err != nil {

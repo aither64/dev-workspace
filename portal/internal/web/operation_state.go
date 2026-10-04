@@ -43,6 +43,9 @@ func validateLifecycleOperation(operation lifecycleOperation) error {
 	if len(operation.Error) > maxLifecycleOperationErrorBytes || !utf8.ValidString(operation.Error) {
 		return errors.New("invalid operation error")
 	}
+	if operation.ErrorCode != "" && operation.ErrorCode != "target_changed" {
+		return errors.New("invalid lifecycle error code")
+	}
 	if operation.ReceiptID != "" && !messageDigestPattern.MatchString(operation.ReceiptID) {
 		return errors.New("invalid operation receipt identity")
 	}
@@ -53,9 +56,29 @@ func validateLifecycleOperation(operation lifecycleOperation) error {
 	if operation.Options.JournalExpected && journalID == "" {
 		return errors.New("expected lifecycle journal has no identity")
 	}
+	if operation.Attempt < 0 {
+		return errors.New("invalid lifecycle attempt")
+	}
+	if operation.TargetIdentityVersion != 0 && operation.TargetIdentityVersion != lifecycleTargetIdentityVersion {
+		return errors.New("unsupported lifecycle target identity version")
+	}
+	for _, digest := range []string{operation.Options.JournalEvidence, operation.Options.JournalTargetID} {
+		if digest != "" && !messageDigestPattern.MatchString(digest) {
+			return errors.New("invalid lifecycle proof identity")
+		}
+	}
+	for _, location := range []string{operation.Options.TargetLocation, operation.Options.JournalTargetLocation} {
+		if location != "" && location != "work" && location != "archive" {
+			return errors.New("invalid lifecycle target location")
+		}
+	}
 	targetID := operation.Options.TargetID
 	if targetID != "" && !messageDigestPattern.MatchString(targetID) {
 		return errors.New("invalid lifecycle target identity")
+	}
+	if operation.TargetIdentityVersion == lifecycleTargetIdentityVersion &&
+		(targetID == "" || operation.Options.TargetLocation == "") {
+		return errors.New("versioned lifecycle receipt has no target binding")
 	}
 	if operation.Redirect != "/" && operation.Redirect != "/"+operation.Slug+"/" {
 		return errors.New("invalid operation redirect")
@@ -108,6 +131,7 @@ func operationRedirect(slug, kind string) string {
 func (operation *lifecycleOperation) applyProgressOptions(progress session.LifecycleProgress) {
 	operation.Options.JournalID = progress.JournalID
 	operation.Options.JournalExpected = true
+	operation.Options.JournalEvidence = progress.Evidence
 	switch progress.Operation {
 	case "archive":
 		operation.Options.Mode = progress.Mode
@@ -148,7 +172,12 @@ func (s *Server) reconcileLifecycleOperationLocked(
 		}
 		if replace {
 			operation = operationFromProgress(slug, *progress)
+			s.bindLifecycleJournalTarget(&operation, *progress)
 		} else {
+			if operation.Options.JournalEvidence != "" && operation.Options.JournalEvidence != progress.Evidence {
+				return operation, true, errors.New("lifecycle journal immutable evidence changed")
+			}
+			s.bindLifecycleJournalTarget(&operation, *progress)
 			operation.Phase = progress.Phase
 			operation.UpdatedAt = progress.UpdatedAt.UTC().Format(time.RFC3339Nano)
 			operation.applyProgressOptions(*progress)
@@ -216,6 +245,25 @@ func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOpe
 	if err != nil {
 		return false, err
 	}
+	if operation.Kind != "delete" {
+		target, location := operation.Options.TargetID, operation.Options.TargetLocation
+		if operation.TargetIdentityVersion != lifecycleTargetIdentityVersion {
+			target, location = operation.Options.JournalTargetID, operation.Options.JournalTargetLocation
+			if operation.Options.JournalEvidence == "" {
+				return false, nil
+			}
+		}
+		if target == "" || location == "" {
+			return false, nil
+		}
+		actual, identityErr := lifecycleTargetIdentityAt(summary, location)
+		if identityErr != nil {
+			return false, identityErr
+		}
+		if actual != target {
+			return false, nil
+		}
+	}
 	switch operation.Kind {
 	case "archive":
 		return summary.Archived && summary.Terminal && summary.FinalizedAt != "" &&
@@ -254,6 +302,7 @@ func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
 			problems = append(problems, err)
 		}
 		if exists {
+			operation.CurrentTarget = s.lifecycleSnapshot(slug)
 			operations = append(operations, operation)
 		}
 	}

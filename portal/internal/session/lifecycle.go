@@ -1,6 +1,7 @@
 package session
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,15 @@ import (
 const maxLifecycleJournalBytes = 64 * 1024
 
 type LifecycleProgress struct {
-	Operation string    `json:"operation"`
-	Phase     string    `json:"phase"`
-	Mode      string    `json:"mode,omitempty"`
-	Force     bool      `json:"force,omitempty"`
-	JournalID string    `json:"journalId,omitempty"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Operation        string    `json:"operation"`
+	Phase            string    `json:"phase"`
+	Mode             string    `json:"mode,omitempty"`
+	Force            bool      `json:"force,omitempty"`
+	JournalID        string    `json:"journalId,omitempty"`
+	Evidence         string    `json:"-"`
+	RetainedThreadID *string   `json:"-"`
+	RootRecorded     bool      `json:"-"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 // PendingLifecycles discovers lifecycle journals, including deletions whose
@@ -231,9 +235,36 @@ func readLifecycleProgressFile(
 	if payload.Force != nil {
 		force = *payload.Force
 	}
+	// The command owns full journal validation and tracking projections. The
+	// portal binds retries to immutable journal bytes, excluding progress and
+	// the documented deletion force/inventory updates.
+	var immutable map[string]any
+	if err := json.Unmarshal(data, &immutable); err != nil {
+		return nil, false, err
+	}
+	delete(immutable, "phase")
+	if operation == "delete" {
+		for _, key := range []string{"state", "force", "git_tracked", "worktrees", "worktrees_sealed"} {
+			delete(immutable, key)
+		}
+	}
+	encoded, err := json.Marshal(immutable)
+	if err != nil {
+		return nil, false, err
+	}
+	var retained *string
+	root, rootRecorded := immutable["retained_thread_id"]
+	if rootRecorded && root != nil {
+		value, ok := root.(string)
+		if !ok || value == "" {
+			return nil, false, errors.New("lifecycle journal has an invalid retained root")
+		}
+		retained = &value
+	}
 	return &LifecycleProgress{
 		Operation: operation, Phase: payload.Phase, Mode: payload.Mode,
 		Force: force, JournalID: payload.OperationID, UpdatedAt: opened.ModTime(),
+		Evidence: fmt.Sprintf("%x", sha256.Sum256(encoded)), RetainedThreadID: retained, RootRecorded: rootRecorded,
 	}, true, nil
 }
 

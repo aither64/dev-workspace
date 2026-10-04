@@ -40,11 +40,8 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 		return
 	}
 	action := "status"
+	confirmedTargetID := ""
 	if r.Method == http.MethodPost {
-		if summary.Archived {
-			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "This session is already archived."})
-			return
-		}
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		var body struct {
 			Hold     *bool  `json:"hold"`
@@ -57,13 +54,25 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Choose whether to keep the session open."})
 			return
 		}
-		if _, err := validateLifecycleTarget(summary, body.TargetID, "archive"); err != nil {
-			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		var targetErr error
+		confirmedTargetID, targetErr = validateLifecycleTarget(summary, body.TargetID, "Keep open")
+		if targetErr != nil {
+			s.writeLifecycleError(w, targetErr)
+			return
+		}
+		if summary.Archived {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "This session is already archived."})
 			return
 		}
 		action = "release"
 		if *body.Hold {
 			action = "hold"
+		}
+	}
+	if r.Method == http.MethodPost {
+		if err := s.revalidateLifecycleTarget(slug, "Keep open", confirmedTargetID); err != nil {
+			s.writeLifecycleError(w, err)
+			return
 		}
 	}
 	var stdout, stderr string
@@ -82,5 +91,6 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 		s.writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Automatic archival returned an invalid result."})
 		return
 	}
+	result["currentTarget"] = s.lifecycleSnapshot(slug)
 	s.writeJSON(w, http.StatusOK, result)
 }

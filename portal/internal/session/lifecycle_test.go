@@ -84,6 +84,56 @@ func TestPendingLifecycleProgressReadsReviveOperationIdentity(t *testing.T) {
 	}
 }
 
+func TestPendingLifecycleProgressBindsImmutableEvidenceAcrossPhaseWrites(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "example.archive.json")
+	write := func(phase, thread string) {
+		t.Helper()
+		payload := fmt.Sprintf(`{"schema":2,"slug":"example","workspace":%q,"operation_id":%q,"mode":"complete","phase":%q,"retained_thread_id":%s,"target_tracking_sha256":%q}`,
+			workspace, strings.Repeat("a", 64), phase, thread, strings.Repeat("b", 64))
+		if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("prepared", `"root-a"`)
+	before, err := PendingLifecycleProgress(workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("tracking_committed", `"root-a"`)
+	after, err := PendingLifecycleProgress(workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Evidence == "" || before.Evidence != after.Evidence || !after.RootRecorded || after.RetainedThreadID == nil || *after.RetainedThreadID != "root-a" {
+		t.Fatalf("phase write changed journal ownership: %#v, %#v", before, after)
+	}
+	write("tracking_committed", `"root-b"`)
+	changed, err := PendingLifecycleProgress(workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Evidence == after.Evidence {
+		t.Fatal("root change retained journal evidence")
+	}
+	write("tracking_committed", `null`)
+	absent, err := PendingLifecycleProgress(workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absent.RootRecorded || absent.RetainedThreadID != nil {
+		t.Fatalf("root absence = %#v", absent)
+	}
+	write("tracking_committed", `{}`)
+	if _, err := PendingLifecycleProgress(workspace, "example"); err == nil {
+		t.Fatal("malformed retained root was accepted")
+	}
+}
+
 func TestPendingLifecycleProgressToleratesAtomicJournalReplacement(t *testing.T) {
 	workspace := t.TempDir()
 	root := filepath.Join(workspace, "worktrees", ".locks")
