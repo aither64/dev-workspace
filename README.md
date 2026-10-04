@@ -339,6 +339,15 @@ nix flake check --print-build-logs
 The package uses a Go portal, Ruby lifecycle helpers and shell-based cluster
 launchers. The flake supplies their build and test dependencies.
 
+For a focused Go package check from the source checkout, use:
+
+```sh
+nix develop --command go -C portal test -mod=readonly ./internal/teamruntime
+```
+
+The explicit `-mod=readonly` uses the pinned module files. The Nix package sets
+`GOFLAGS` to vendor mode, while the source checkout has no `portal/vendor`.
+
 CI runs package and focused checks on every push and pull request. On `master`
 and manual dispatch, it also runs a small NixOS VM test for activation,
 idempotency, nginx authentication, renewal, recovery and rollback. Dispatch

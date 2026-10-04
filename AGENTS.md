@@ -17,9 +17,13 @@ and host-deployment contracts. Keep those explanations current with the code.
 ## Development commands
 
 Use the repository's Nix environment. Run `nix flake check --print-build-logs`
-for the packaged suite. Focused checks may use `go test ./...` from `portal/`,
-the Ruby test files under `test/`, and `node --check` for browser JavaScript
-when their interpreters come from the flake.
+for the packaged suite. Focused checks may use `go test -mod=readonly ./...`
+from `portal/`, the Ruby test files under `test/`, and `node --check` for browser
+JavaScript when their interpreters come from the flake.
+
+For focused Go checks, pass `-mod=readonly` explicitly: the Nix package's
+`GOFLAGS` selects vendor mode, but the source checkout has no `portal/vendor`.
+Readonly mode uses the pinned module declarations and refuses updates to `go.mod`.
 
 Do not work around a missing ambient tool. Use `nix develop` or a suitable
 `nix shell` command.
