@@ -59,12 +59,13 @@ class WorkspaceHostTest < Minitest::Test
     attr_accessor :recovery_journal, :fail_recovery_preflight, :fail_recovery_executor,
                   :fail_recovery_team, :fail_recovery_verifier,
                   :fail_recovery_final_proof,
+                  :selected_recovery_version, :fail_recovery_contract,
                   :change_profile_before_lock
 
     private
 
     def codex_version(_command)
-      '0.155.0'
+      selected_recovery_version || '0.160.0'
     end
 
     def with_transition_lock(mode = File::LOCK_EX, &block)
@@ -83,7 +84,7 @@ class WorkspaceHostTest < Minitest::Test
 
         return ''
       end
-      return super unless argv.include?('require-archived')
+      return super unless (argv & %w[require-archive-ready require-archived]).any?
 
       events << [:archive_preflight, environment, argv]
       if fail_recovery_final_proof && events.count { |event| event.first == :archive_preflight } == 2
@@ -94,11 +95,17 @@ class WorkspaceHostTest < Minitest::Test
       ''
     end
 
-    def with_verified_archive_recovery(_entry, _slug, _journal, _runtime, _environment)
-      events << [:archive_tracking_verified]
+    def with_verified_archive_recovery(_entry, _slug, _journal, _runtime, _environment, selected_version:)
+      events << [:archive_tracking_verified, selected_version]
       raise DevWorkspaceHost::Error, 'injected tracking failure' if fail_recovery_verifier
 
       yield
+    end
+
+    def check_codex(command)
+      raise DevWorkspaceHost::Error, 'incompatible generated Codex contract' if fail_recovery_contract
+
+      super
     end
 
     def system_env_interactive!(environment, command, *arguments)
@@ -116,7 +123,9 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(%i[archive_tracking_verified archive_preflight archive_team archive_preflight archive_executor],
                    host.events.map(&:first).reject { |event| event == :codex_checked })
       preflights = host.events.select { |event| event.first == :archive_preflight }
-      assert_equal(%w[thread team], preflights.map { |event| event.fetch(2).fetch(1) })
+      assert_equal(%w[team team], preflights.map { |event| event.fetch(2).fetch(1) })
+      assert_equal(%w[require-archive-ready require-archived], preflights.map { |event| event.fetch(2).fetch(2) })
+      assert_equal('0.160.0', host.events.find { |event| event.first == :archive_tracking_verified }.fetch(1))
       assert(preflights.all? { |event| event.fetch(1).fetch('DEV_WORKSPACE_CODEX_HOME') == paths.fetch(:codex_home) })
       execution = host.events.find { |event| event.first == :archive_executor }
       refute_nil(execution)
@@ -142,6 +151,31 @@ class WorkspaceHostTest < Minitest::Test
       refute(File.exist?(paths.fetch(:creation)))
       assert_equal(0, recover_archive(host, paths))
       assert(host.events.any? { |event| event.first == :archive_executor })
+    end
+  end
+
+  def test_recover_archive_checks_the_selected_version_contract_without_a_profile_upgrade
+    %w[0.155.0 0.160.0].each do |version|
+      with_recovery_host do |host, paths|
+        host.selected_recovery_version = version
+        selected_codex = File.realpath(host.send(:active_codex))
+        token = host.send(:profile_link_token)
+        assert_equal(0, recover_archive(host, paths))
+        assert_equal(version, host.events.find { |event| event.first == :archive_tracking_verified }.fetch(1))
+        assert_equal(selected_codex, File.realpath(host.send(:active_codex)))
+        assert_equal(token, host.send(:profile_link_token))
+        assert_equal([:codex_checked, selected_codex], host.events.find { |event| event.first == :codex_checked })
+      end
+    end
+  end
+
+  def test_recover_archive_refuses_an_incompatible_generated_selected_contract_before_mutation
+    with_recovery_host do |host, paths|
+      host.fail_recovery_contract = true
+      assert_recovery_refused_before_proof(host, paths, 'generated protocol contract')
+      refute(host.events.any? { |event| event.first == :archive_tracking_verified })
+      host.fail_recovery_contract = false
+      assert_equal(0, recover_archive(host, paths))
     end
   end
 

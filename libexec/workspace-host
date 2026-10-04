@@ -664,6 +664,10 @@ module DevWorkspaceHost
       @out.puts "workspace package: #{candidate}"
     end
 
+    # Temporary recovery for exact old no-sidecar schema-2 tracking_committed
+    # journals, owned by generic lifecycle maintainers. Remove only after the
+    # docs/session-archive-recovery.md inventory proves zero dependent inputs
+    # and zero supported paths that can reintroduce them.
     def recover_archive(argv)
       options = {}
       parser = OptionParser.new do |opts|
@@ -696,9 +700,7 @@ module DevWorkspaceHost
       end
       require_archive_recovery_contract!(predecessor, candidate)
       selected_codex = File.realpath(active_codex)
-      unless codex_version(selected_codex) == '0.155.0'
-        raise Error, 'archive recovery requires the selected Codex 0.155.0 protocol'
-      end
+      selected_version = codex_version(selected_codex)
       check_codex(selected_codex)
       with_transition_lock do
         unless observed_token == profile_link_token && File.symlink?(@profile) &&
@@ -723,7 +725,7 @@ module DevWorkspaceHost
           'DEV_WORKSPACE_NAME' => entry.fetch('name'),
           'DEV_WORKSPACE_CODEX_HOME' => codex_home
         )
-        with_verified_archive_recovery(entry, slug, journal, runtime, environment) do
+        with_verified_archive_recovery(entry, slug, journal, runtime, environment, selected_version:) do
           current_path, current_journal = require_archive_recovery_journal!(entry, slug)
           current_manifest = read_portal_manifest(File.join(entry.fetch('root'), 'archive', slug, 'portal.yml'))
           unless current_path == journal_path && current_journal == journal && current_manifest == manifest &&
@@ -733,16 +735,13 @@ module DevWorkspaceHost
           end
           require_ready_archive_recovery_creation!(entry, slug, current_manifest.fetch('creation'))
           root_cwd = File.join(entry.fetch('root'), 'work', slug)
-          capture_env!(environment, helper, 'thread', 'require-archived',
-                       '--thread-id', journal.fetch('retained_thread_id'), '--cwd', root_cwd,
-                       '--socket', runtime.fetch(:codex), '--codex-home', codex_home,
-                       '--authority-dir', runtime.fetch(:authority))
           team_arguments = [
             '--user-state-root', @state, '--workspace', entry.fetch('root'),
             '--session-slug', slug, '--root-thread-id', journal.fetch('retained_thread_id'),
             '--cwd', root_cwd, '--socket', runtime.fetch(:codex), '--codex-home', codex_home,
             '--authority-dir', runtime.fetch(:authority)
           ]
+          capture_env!(environment, helper, 'team', 'require-archive-ready', *team_arguments)
           capture_env!(environment, helper, 'team', 'archive', '--retained-only', *team_arguments)
           capture_env!(environment, helper, 'team', 'require-archived', *team_arguments)
         end
@@ -766,7 +765,7 @@ module DevWorkspaceHost
       end
     end
 
-    def with_verified_archive_recovery(entry, slug, journal, runtime, environment)
+    def with_verified_archive_recovery(entry, slug, journal, runtime, environment, selected_version: nil)
       unless defined?(DevSession::Runner)
         source_path = File.expand_path('dev-session', __dir__)
         packaged_path = File.expand_path('workspace-portal/.dev-session-wrapped', __dir__)
@@ -781,7 +780,7 @@ module DevWorkspaceHost
         verifier = DevSession::Runner.new(
           workspace: entry.fetch('root'), authority_dir: runtime.fetch(:authority),
           tmux_socket: runtime.fetch(:tmux), codex_socket: runtime.fetch(:codex),
-          codex_command: active_codex, codex_version: '0.155.0',
+          codex_command: active_codex, codex_version: selected_version || codex_version(active_codex),
           env: environment, require_runtime: false
         )
         verifier.with_verified_committed_archive(slug, journal) { yield }
