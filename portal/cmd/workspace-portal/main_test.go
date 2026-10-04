@@ -568,6 +568,14 @@ func TestArchivePreflightCommandsRequireDeployedCodexHome(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "session authority") {
 		t.Fatalf("untrusted team home passed preflight: %v", err)
 	}
+	if err := teamCommand([]string{
+		"require-archive-ready", "--user-state-root", t.TempDir(), "--workspace", workspace,
+		"--session-slug", "example", "--root-thread-id", "11111111-1111-7111-8111-111111111111",
+		"--cwd", cwd, "--socket", socket, "--authority-dir", authority,
+		"--codex-home", filepath.Join(home, "other"),
+	}); err == nil || !strings.Contains(err.Error(), "session authority") {
+		t.Fatalf("untrusted archive-ready home passed preflight: %v", err)
+	}
 }
 
 func TestTeamRequireArchivedAcceptsRootOnlySession(t *testing.T) {

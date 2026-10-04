@@ -22,6 +22,10 @@ class DevSessionTest < Minitest::Test
     stamp = Time.now.to_i
     File.write(portal, <<~RUBY)
       require 'json'
+      if ARGV[0, 2] == ['team', 'require-archive-ready']
+        cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
+        abort 'Conversation has a queued message.' if File.exist?(File.join(cwd, 'busy'))
+      end
       exit 0 unless ARGV.first == 'thread'
       cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
       if ARGV[1] == 'observe'

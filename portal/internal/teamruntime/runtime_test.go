@@ -58,6 +58,7 @@ type testClient struct {
 	archiveResultError error
 	listPageSize       int
 	listCalls          int
+	listOptions        []codex.ThreadListOptions
 	emptyNextCursor    bool
 	ignoreListCwd      bool
 	lostStart          bool
@@ -65,7 +66,9 @@ type testClient struct {
 	hideThreads        bool
 	nameFailure        bool
 	idleError          error
+	idleErrors         map[string]error
 	idleChecks         []string
+	archiveIdleAfter   func(string)
 	verifyError        error
 	verified           []string
 	activeTurn         string
@@ -133,6 +136,8 @@ func (client *testClient) ListThreads(_ context.Context, options codex.ThreadLis
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.listCalls++
+	options.SourceKinds = append([]string(nil), options.SourceKinds...)
+	client.listOptions = append(client.listOptions, options)
 	if client.hideThreads {
 		return nil, nil, nil
 	}
@@ -212,6 +217,35 @@ func (client *testClient) ProveMaterializedActiveThread(_ context.Context, threa
 	}
 	return workspacecodex.ArchiveUnknown, errors.New("legacy retained member is not materialized")
 }
+func (client *testClient) RequireRootArchiveReady(ctx context.Context, threadID, cwd string) (workspacecodex.ArchiveState, error) {
+	state, err := client.ProveArchivedThread(ctx, threadID, cwd, "")
+	if err != nil {
+		return workspacecodex.ArchiveUnknown, err
+	}
+	metadata, err := client.ReadThreadMetadata(ctx, threadID, false)
+	if err != nil || metadata.Source != "vscode" {
+		return workspacecodex.ArchiveUnknown, errors.New("wrong root source")
+	}
+	if err := client.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
+		return workspacecodex.ArchiveUnknown, err
+	}
+	if err := client.RequireArchiveThreadIdle(ctx, threadID, cwd, state); err != nil {
+		return workspacecodex.ArchiveUnknown, err
+	}
+	return state, nil
+}
+func (client *testClient) RequireArchiveThreadIdle(ctx context.Context, threadID, cwd string, _ workspacecodex.ArchiveState) error {
+	if err := client.RequireThreadIdle(ctx, threadID, cwd); err != nil {
+		return err
+	}
+	if err := client.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
+		return err
+	}
+	if client.archiveIdleAfter != nil {
+		client.archiveIdleAfter(threadID)
+	}
+	return nil
+}
 func (client *testClient) ResumeThreadWithSettings(_ context.Context, thread, _ string, _ map[string]string, settings codex.ThreadSettings) (string, error) {
 	client.resumes = append(client.resumes, settings)
 	return thread, nil
@@ -249,6 +283,9 @@ func (client *testClient) RequireThreadIdle(_ context.Context, thread, cwd strin
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.idleChecks = append(client.idleChecks, thread+":"+cwd)
+	if err := client.idleErrors[thread]; err != nil {
+		return err
+	}
 	return client.idleError
 }
 func (client *testClient) RequireSubmissionAttemptsResolved(_ context.Context, thread string) error {
@@ -1052,7 +1089,6 @@ func TestRequireArchivedAllUsesRetainedIdentityWithoutDiscovery(t *testing.T) {
 	}
 	client.hideThreads = true
 	client.archived = map[string]bool{member.Thread: true}
-	client.unresolvedAttempts = map[string]bool{member.Thread: true}
 	listedBefore := client.listCalls
 	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err != nil {
 		t.Fatalf("omitted archived listing blocked exact preflight: %v", err)
@@ -1064,6 +1100,11 @@ func TestRequireArchivedAllUsesRetainedIdentityWithoutDiscovery(t *testing.T) {
 		t.Fatalf("read-only preflight mutated a member: archives=%#v resumes=%#v cleared=%#v",
 			client.archives, client.resumes, client.clearedThreads)
 	}
+	client.unresolvedAttempts = map[string]bool{member.Thread: true}
+	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err == nil {
+		t.Fatal("archived member's unresolved submission passed exact preflight")
+	}
+	delete(client.unresolvedAttempts, member.Thread)
 	client.archived[member.Thread] = false
 	if err := service.RequireArchivedAll(context.Background(), "one", "root-one"); err == nil {
 		t.Fatal("active retained member passed archive preflight")

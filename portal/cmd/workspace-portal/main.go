@@ -400,7 +400,7 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 // the same private roster and direct App Server thread operations.
 func teamCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archived|archive|retire|revive|fork")
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archive-ready|require-archived|archive|retire|revive|fork")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
@@ -564,6 +564,13 @@ func teamCommand(args []string) error {
 		result, err = service.Assign(ctx, *slug, *rootThread, *from, *to, *message, *model, *effort, *messageID)
 	case "require-idle":
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
+	case "require-archive-ready":
+		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
+			!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*authorityDir) ||
+			*cwd != filepath.Join(*workspace, "work", *slug) {
+			return errors.New("session archive preflight requires deployed Codex and session authority")
+		}
+		err = service.RequireArchiveReadyAll(ctx, *slug, *rootThread)
 	case "require-archived":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
 			!canonicalAbsolutePath(*socket) ||
@@ -606,7 +613,7 @@ func teamCommand(args []string) error {
 	}
 	if result == nil {
 		roster, loadErr := store.Load(*slug, *rootThread)
-		if (command == "require-archived" || command == "archive" && *retainedOnly) && errors.Is(loadErr, os.ErrNotExist) {
+		if (command == "require-archive-ready" || command == "require-archived" || command == "archive" && *retainedOnly) && errors.Is(loadErr, os.ErrNotExist) {
 			result = map[string]any{"roster": nil}
 		} else if loadErr != nil {
 			return loadErr

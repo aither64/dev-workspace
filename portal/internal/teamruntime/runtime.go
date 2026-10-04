@@ -756,6 +756,8 @@ type Client interface {
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error)
+	RequireRootArchiveReady(context.Context, string, string) (workspacecodex.ArchiveState, error)
+	RequireArchiveThreadIdle(context.Context, string, string, workspacecodex.ArchiveState) error
 	ProveMaterializedActiveThread(context.Context, string, string) (workspacecodex.ArchiveState, error)
 	ResumeThreadWithSettings(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
 	ForkThread(context.Context, string, string, map[string]string, codex.ThreadSettings) (string, error)
@@ -1590,6 +1592,104 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 			if !archived {
 				return fmt.Errorf("member %s is not archived", member.Address)
 			}
+			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
+			}
+		}
+		return nil
+	})
+}
+
+// RequireArchiveReadyAll owns the retained-set preflight for ordinary archive
+// and selected-executor recovery. It neither creates members nor changes the
+// roster, and discovery may only confirm identities already proved exactly.
+func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThreadID string) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		roster, err := service.Store.Load(slug, rootThreadID)
+		if errors.Is(err, os.ErrNotExist) {
+			roster = &Roster{}
+		} else if err != nil {
+			return err
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		rootState, err := service.Client.RequireRootArchiveReady(ctx, rootThreadID, cwd)
+		if err != nil {
+			return fmt.Errorf("verify retained root: %w", err)
+		}
+		if rootState != workspacecodex.ArchiveActive && rootState != workspacecodex.ArchiveFresh && rootState != workspacecodex.ArchiveArchived {
+			return errors.New("retained root has no proved archive state")
+		}
+		active := map[string]string{}
+		if rootState != workspacecodex.ArchiveArchived {
+			active[rootThreadID] = ""
+		}
+		for _, member := range roster.Members {
+			if member.State == "removed" {
+				continue
+			}
+			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			if err != nil {
+				return fmt.Errorf("verify retained %s: %w", member.Address, err)
+			}
+			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
+			}
+			state := workspacecodex.ArchiveActive
+			if archived {
+				state = workspacecodex.ArchiveArchived
+			}
+			if err := service.Client.RequireArchiveThreadIdle(ctx, member.Thread, cwd, state); err != nil {
+				return fmt.Errorf("member %s is not idle: %w", member.Address, err)
+			}
+			again, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			if err != nil {
+				return fmt.Errorf("recheck retained %s: %w", member.Address, err)
+			}
+			if again != archived {
+				return fmt.Errorf("member %s archive state changed during preflight", member.Address)
+			}
+			if !archived {
+				active[member.Thread] = member.ProjectID
+			}
+		}
+		// Explicitly request the complete selected source enum: omitted/empty
+		// filters hide noninteractive writers, even beside an archived root.
+		archived := false
+		seen, cursors := map[string]bool{}, map[string]bool{}
+		cursor := ""
+		for pages := 0; ; pages++ {
+			if pages > len(active) {
+				return errors.New("active archive discovery exceeded the retained set")
+			}
+			threads, next, err := service.Client.ListThreads(ctx, codex.ThreadListOptions{
+				Cwd: cwd, Archived: &archived, Limit: len(active) + 1, SortDirection: "asc", Cursor: cursor,
+				SourceKinds: workspacecodex.ArchiveDiscoverySourceKinds(),
+			})
+			if err != nil {
+				return fmt.Errorf("discover active archive conversations: %w", err)
+			}
+			for _, thread := range threads {
+				project, retained := active[thread.ID]
+				if !retained || seen[thread.ID] || thread.Cwd != cwd ||
+					(thread.ID == rootThreadID && thread.Source != "vscode") ||
+					(project != "" && (thread.ProjectID == nil || *thread.ProjectID != project)) {
+					return errors.New("unknown or changed Codex thread uses the session directory; refusing archive")
+				}
+				seen[thread.ID] = true
+			}
+			if next == nil {
+				break
+			}
+			if *next == "" || cursors[*next] {
+				return errors.New("active archive discovery returned an invalid cursor")
+			}
+			cursors[*next], cursor = true, *next
+		}
+		if len(seen) != len(active) {
+			return errors.New("a retained active conversation is absent from archive discovery")
 		}
 		return nil
 	})

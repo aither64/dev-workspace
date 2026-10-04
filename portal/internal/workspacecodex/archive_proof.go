@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/aither64/codex-web/codex"
@@ -19,6 +20,17 @@ import (
 )
 
 const archiveHeaderLimit = 1024 * 1024
+
+// ArchiveDiscoverySourceKinds is the complete selected 0.160.0 generated
+// ThreadSourceKind enum. Omitted/empty filters enumerate interactive sources
+// only. Keep this archive-only set aligned with the selected protocol; ordinary
+// RetireThread discovery deliberately retains its existing source policy.
+func ArchiveDiscoverySourceKinds() []string {
+	return []string{
+		"cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+		"subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+	}
+}
 
 var archiveThreadIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var archiveRolloutPattern = regexp.MustCompile(`^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
@@ -43,6 +55,24 @@ type ArchivedThreadIdentity struct {
 
 type ThreadMetadataReader interface {
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
+}
+
+// Bind the existing rollout proof to the metadata/status sampled for idle
+// checks, so its independent reads cannot prove a different path or project.
+type archiveIdleMetadataReader struct {
+	ThreadMetadataReader
+	metadata codex.ThreadMetadata
+}
+
+func (reader archiveIdleMetadataReader) ReadThreadMetadata(ctx context.Context, threadID string, excludeTurns bool) (codex.ThreadMetadata, error) {
+	metadata, err := reader.ThreadMetadataReader.ReadThreadMetadata(ctx, threadID, excludeTurns)
+	if err != nil {
+		return codex.ThreadMetadata{}, err
+	}
+	if !reflect.DeepEqual(metadata, reader.metadata) {
+		return codex.ThreadMetadata{}, errors.New("archived conversation metadata changed during idle proof")
+	}
+	return metadata, nil
 }
 
 func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expected ArchivedThreadIdentity) (ArchiveState, error) {
@@ -152,6 +182,107 @@ func (c *Client) ProveArchivedThread(ctx context.Context, threadID, cwd, project
 
 func (c *Client) ProveArchivedRootThread(ctx context.Context, threadID, cwd string) (ArchiveState, error) {
 	return c.proveArchivedThread(ctx, threadID, cwd, "", threadSourceKind, false)
+}
+
+// RequireRootArchiveReady is a read-only preflight. Archived roots retain
+// their exact rollout proof; active and fresh roots also need ordinary idle
+// proof. It does not relax RetireThread's independent directory discovery.
+func (c *Client) RequireRootArchiveReady(ctx context.Context, threadID, cwd string) (ArchiveState, error) {
+	state, err := c.ProveArchivedRootThread(ctx, threadID, cwd)
+	if err != nil {
+		return ArchiveUnknown, err
+	}
+	if err := c.RequireArchiveThreadIdle(ctx, threadID, cwd, state); err != nil {
+		return ArchiveUnknown, err
+	}
+	again, err := c.ProveArchivedRootThread(ctx, threadID, cwd)
+	if err != nil {
+		return ArchiveUnknown, fmt.Errorf("recheck retained root during archive preflight: %w", err)
+	}
+	if again != state {
+		return ArchiveUnknown, errors.New("retained root archive state changed during preflight")
+	}
+	return state, nil
+}
+
+// Positive archived/unloaded proof excludes currently runnable input. Native
+// archive can retain dormant queue rows, and queue/list rejects a cold archive.
+// A later explicit resume can make those rows runnable; this proof preserves them.
+func (c *Client) RequireArchiveThreadIdle(ctx context.Context, threadID, cwd string, state ArchiveState) error {
+	if state == ArchiveActive || state == ArchiveFresh {
+		return c.RequireThreadIdle(ctx, threadID, cwd)
+	}
+	if state != ArchiveArchived {
+		return errors.New("retained conversation has no proved archive state")
+	}
+	metadata, before, err := c.requireArchivedThreadUnloaded(ctx, threadID, cwd)
+	if err != nil {
+		return err
+	}
+	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
+		return fmt.Errorf("inspect archived conversation turns: %w", err)
+	}
+	prompts, err := c.PromptsWithItems(ctx, threadID)
+	if err != nil {
+		return fmt.Errorf("inspect archived conversation requests: %w", err)
+	}
+	if len(prompts) != 0 {
+		return errors.New("archived conversation has pending requests")
+	}
+	if err := c.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
+		return err
+	}
+	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
+		return fmt.Errorf("recheck archived conversation turns: %w", err)
+	}
+	again, after, err := c.requireArchivedThreadUnloaded(ctx, threadID, cwd)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(metadata, again) || !os.SameFile(before, after) ||
+		before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return errors.New("archived conversation changed during idle proof")
+	}
+	return nil
+}
+
+// LoadedThreadIDs omits internal native sources. Its absence proof is valid
+// here only for an exactly retained vscode thread with a proved archived file.
+func (c *Client) requireArchivedThreadUnloaded(ctx context.Context, threadID, cwd string) (codex.ThreadMetadata, os.FileInfo, error) {
+	metadata, err := c.ReadThreadMetadata(ctx, threadID, false)
+	if err != nil {
+		return codex.ThreadMetadata{}, nil, fmt.Errorf("read archived conversation status: %w", err)
+	}
+	if err := validateArchiveMetadata(metadata, ArchivedThreadIdentity{
+		ThreadID: threadID, Cwd: cwd, SourceKind: threadSourceKind,
+	}); err != nil {
+		return codex.ThreadMetadata{}, nil, err
+	}
+	if len(metadata.Status) != 1 || metadata.Status["type"] != "notLoaded" || metadata.Path == nil ||
+		!canonicalArchivePath(*metadata.Path) || !archivePathWithin(filepath.Join(c.CodexHome, "archived_sessions"), *metadata.Path) {
+		return codex.ThreadMetadata{}, nil, errors.New("archived conversation is not positively unloaded")
+	}
+	file, err := os.Lstat(*metadata.Path)
+	if err != nil || !file.Mode().IsRegular() {
+		return codex.ThreadMetadata{}, nil, errors.New("archived conversation file changed during idle proof")
+	}
+	state, err := ProveArchivedThread(ctx, archiveIdleMetadataReader{c.Client, metadata}, ArchivedThreadIdentity{
+		ThreadID: threadID, Cwd: cwd, CodexHome: c.CodexHome, SourceKind: threadSourceKind,
+	})
+	if err != nil {
+		return codex.ThreadMetadata{}, nil, fmt.Errorf("reprove archived conversation identity: %w", err)
+	}
+	if state != ArchiveArchived {
+		return codex.ThreadMetadata{}, nil, errors.New("retained conversation is no longer positively archived")
+	}
+	loaded, err := c.LoadedThreadIDs(ctx)
+	if err != nil {
+		return codex.ThreadMetadata{}, nil, fmt.Errorf("inspect loaded archived conversation: %w", err)
+	}
+	if slices.Contains(loaded, threadID) {
+		return codex.ThreadMetadata{}, nil, errors.New("archived conversation is still loaded")
+	}
+	return metadata, file, nil
 }
 
 func (c *Client) ProveMaterializedActiveThread(ctx context.Context, threadID, cwd string) (ArchiveState, error) {

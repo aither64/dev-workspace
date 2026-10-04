@@ -1683,7 +1683,7 @@ module DevSession
       unless root_thread.is_a?(String) && root_thread.match?(/\A[0-9A-Za-z-]+\z/)
         raise Error, "session has no valid lead Codex thread: #{slug}"
       end
-	  command = [*@portal_command, 'team', action,
+	  command = [*@portal_command, 'team', action == 'archive-retained' ? 'archive' : action,
                  '--user-state-root', @workspace_state_root,
                  '--workspace', workspace,
                  '--session-slug', slug,
@@ -1694,6 +1694,11 @@ module DevSession
 		command.concat(['--package-root', File.dirname(File.dirname(portal))])
 	  end
 	  command += ['--socket', @codex_socket] if @codex_socket
+      if %w[require-archive-ready require-archived archive-retained].include?(action)
+        command += ['--codex-home', @env['DEV_WORKSPACE_CODEX_HOME']] if @env['DEV_WORKSPACE_CODEX_HOME']
+        command += ['--authority-dir', @authority_dir] if @authority_dir
+      end
+      command << '--retained-only' if action == 'archive-retained'
 	  if action == 'preset'
 		preset_spec = resolve_current_direct_team!(preset, model:, effort:)
 		return apply_direct_team_preset!(slug, root_thread, preset_spec)
@@ -1737,7 +1742,7 @@ module DevSession
 
 	def sync_team_lifecycle!(slug, action)
 	  return unless @portal_command && !@portal_command.empty? && direct_team_state_present?(slug)
-	  return team(slug, action:, lifecycle: true) unless action == 'retire'
+	  return team(slug, action:, lifecycle: true) unless %w[retire archive-retained].include?(action)
 
 	  @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { team(slug, action:, lifecycle: true) }
 	end
@@ -1779,7 +1784,6 @@ module DevSession
           end
           prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
           automatic&.call(journal || prepared)
-          ensure_retirement_identity!(slug, cleanup_session(slug))
           unless journal
             source = validate_work_directory!(slug)
             destination = archive_dir(slug)
@@ -1799,7 +1803,8 @@ module DevSession
             end
             plan = cleanup.plan(inventory)
             proven_heads = mode == 'complete' ? inventory.fetch('registered_heads') : {}
-            ensure_portal_thread_idle!(slug, @selected_authority) unless automatic
+            ensure_archive_conversations_ready!(slug)
+            ensure_retirement_identity!(slug, cleanup_session(slug))
             validate_development_cluster_helpers!
             validate_archive_move_command!
             archive_root = File.join(workspace, 'archive')
@@ -1827,26 +1832,31 @@ module DevSession
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
           end
           recover_archive_phase!(slug, journal)
+          # Prove the journal's tracking before any retry reads its retained
+          # conversation. A replaced manifest must not select another root.
           if sidecar
+            # Reconcile proved path/registration absence before projecting
+            # tracking from the sealed heads after an interrupted removal.
             cleanup.revalidate!(sidecar, journal:)
+          elsif archive_phase_before?(journal, 'tracking_archived') && path_exists?(work_dir(slug))
+            verify_pending_archive_tracking!(slug, journal, prepare_cleanup(slug, force: false))
           else
+            verify_archived_tracking_tree!(slug, journal)
+          end
+          ensure_archive_conversations_ready!(slug) if archive_phase_before?(journal, 'thread_retired')
+          ensure_retirement_identity!(slug, cleanup_session(slug))
+          unless sidecar
             # Temporary compatibility: old schema-2 journals cannot adopt the
             # new auxiliary layout. Preserve their historical cleanup rules.
             validate_legacy_archive_cleanup!(slug, journal)
           end
-          if archive_phase_before?(journal, 'tracking_archived') && path_exists?(work_dir(slug))
-            verify_pending_archive_tracking!(
-              slug, journal, sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
-            )
-          end
-
           if archive_phase_before?(journal, 'quiesced')
             cleanup.revalidate!(sidecar, journal:) if sidecar
             plan = sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
             if mode == 'complete' && !sidecar
               reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads'))
             end
-            quiesce_and_require_idle!(slug, plan.session)
+            quiesce_and_require_idle!(slug, plan.session, archive: true)
             advance_archive!(slug, journal, 'quiesced')
           end
           if archive_phase_before?(journal, 'clusters_released')
@@ -1884,8 +1894,11 @@ module DevSession
           verify_committed_archive_tracking!(slug, journal)
           if archive_phase_before?(journal, 'thread_retired')
             cleanup.revalidate!(sidecar, journal:) if sidecar
+            ensure_archive_conversations_ready!(slug)
+			sync_team_lifecycle!(slug, 'archive-retained')
+			sync_team_lifecycle!(slug, 'require-archived')
+            ensure_archive_conversations_ready!(slug)
             retire_portal_thread!(slug, force: false)
-			sync_team_lifecycle!(slug, 'archive')
             advance_archive!(slug, journal, 'thread_retired')
           end
           if archive_phase_before?(journal, 'runtime_retired')
@@ -2124,7 +2137,7 @@ module DevSession
                        {}
                      end
       ensure_archive_root!
-      quiesced = quiesce_and_require_idle!(slug, plan.session)
+      quiesced = quiesce_and_require_idle!(slug, plan.session, archive: !journal.nil?)
       verify_proven_heads_unchanged!(slug, plan, proven_heads) if lifecycle == 'complete' && !cleanup
       finalize_portal_manifest(
         slug,
@@ -6649,8 +6662,10 @@ module DevSession
       cleanup.discard_completed!(sidecar, recorded_journal: journal) if cleanup
     end
 
-    # Temporary legacy archive recovery without a cleanup sidecar. Keep this
-    # adapter until no supported predecessor journal can require the old layout.
+    # Temporary old schema-2 archive recovery without a cleanup sidecar, owned
+    # by generic lifecycle maintainers. docs/session-archive-recovery.md owns
+    # removal: inventory must prove zero dependent inputs and zero supported
+    # paths that can reintroduce them.
     def validate_legacy_archive_cleanup!(slug, journal)
       plan = prepare_cleanup(slug, force: false)
       if !archive_phase_before?(journal, 'tracking_archived') && !plan.entries.empty?
@@ -8102,10 +8117,31 @@ module DevSession
       @command_runner.capture(command)
     end
 
-    def quiesce_and_require_idle!(slug, session)
+    def ensure_archive_conversations_ready!(slug)
+      tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
+      unless manifest&.dig('codex', 'thread_id')
+        raise Error, "archive team has no retained root: #{slug}" if direct_team_state_present?(slug)
+
+        return
+      end
+      unless @codex_socket && valid_socket_path?(@codex_socket)
+        raise Error, "Codex App Server socket is required for archive preflight: #{slug}"
+      end
+
+      @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) do
+        team(slug, action: 'require-archive-ready', lifecycle: true)
+      end
+    end
+
+    def quiesce_and_require_idle!(slug, session, archive: false)
       quiesced = quiesce_native_client!(slug, session)
-      ensure_portal_thread_idle!(slug, @selected_authority)
-      sync_team_lifecycle!(slug, 'require-idle')
+      if archive
+        ensure_archive_conversations_ready!(slug)
+      else
+        ensure_portal_thread_idle!(slug, @selected_authority)
+        sync_team_lifecycle!(slug, 'require-idle')
+      end
       quiesced
     rescue StandardError
       restore_native_client!(slug, quiesced) if quiesced
