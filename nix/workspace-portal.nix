@@ -272,6 +272,10 @@ buildGoModule {
       "$out/libexec/workspace-auto-archive.rb"
     ln -s ../workspace-auto-archive.rb \
       "$out/libexec/workspace-portal/workspace-auto-archive.rb"
+    install -Dm644 ${src}/libexec/workspace-archive-cleanup.rb \
+      "$out/libexec/workspace-archive-cleanup.rb"
+    ln -s ../workspace-archive-cleanup.rb \
+      "$out/libexec/workspace-portal/workspace-archive-cleanup.rb"
     install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
       "$out/share/workspace-portal/codex_protocol_contract.py"
     mkdir -p "$out/share/workspace-portal/codex"

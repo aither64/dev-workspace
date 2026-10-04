@@ -19,14 +19,14 @@ class WorkspaceHostTest < Minitest::Test
       packaged_session = File.join(packaged_libexec, 'workspace-portal')
       package_contract = File.join(root, 'share', 'workspace-portal')
       FileUtils.mkdir_p([packaged_session, package_contract])
-      %w[workspace-host workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
+      %w[workspace-host workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb].each do |name|
         FileUtils.cp(File.join(source, name), File.join(packaged_libexec, name))
       end
       public_wrapper = File.join(packaged_session, 'dev-session')
       File.write(public_wrapper, "#!/bin/sh\nexit 0\n")
       wrapped_source = File.join(packaged_session, '.dev-session-wrapped')
       FileUtils.cp(File.join(source, 'dev-session'), wrapped_source)
-      %w[workspace-profile-identity.rb workspace-auto-archive.rb].each do |name|
+      %w[workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb].each do |name|
         File.symlink(File.join('..', name), File.join(packaged_session, name))
       end
       FileUtils.cp(File.expand_path('../../portal/internal/session/runtime-contract.json', __dir__),
@@ -250,6 +250,15 @@ class WorkspaceHostTest < Minitest::Test
         File.write(conflict, '{}')
         assert_recovery_refused_before_proof(host, paths, name)
       end
+    end
+  end
+
+  def test_recover_archive_refuses_a_cleanup_sidecar_before_selected_executor_proof
+    with_recovery_host do |host, paths|
+      sidecar = File.join(File.dirname(paths.fetch(:journal)), "#{paths.fetch(:slug)}.archive-cleanup.json")
+      File.write(sidecar, '{}')
+      assert_recovery_refused_before_proof(host, paths, 'cleanup sidecar')
+      assert_equal('{}', File.binread(sidecar))
     end
   end
 

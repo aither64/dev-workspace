@@ -262,7 +262,9 @@ class DevSessionTest < Minitest::Test
     {
       'activity' => ->(workspace, slug) { File.write(File.join(workspace, 'work', slug, 'busy'), 'queued') },
       'worktree' => lambda do |workspace, slug|
-        FileUtils.mkdir_p(File.join(workspace, 'worktrees', slug, 'unexpected'))
+        directory = File.join(workspace, 'worktrees', slug, 'unexpected')
+        FileUtils.mkdir_p(directory)
+        File.write(File.join(directory, 'unmanaged.txt'), 'new unmanaged content')
       end
     }.each do |change, mutate|
       with_workspace do |workspace|

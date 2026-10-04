@@ -808,6 +808,10 @@ module DevWorkspaceHost
 
     def require_archive_recovery_journal!(entry, slug)
       root = File.join(entry.fetch('root'), 'worktrees', '.locks')
+      cleanup = File.join(root, "#{slug}.archive-cleanup.json")
+      if File.exist?(cleanup) || File.symlink?(cleanup)
+        raise Error, 'archive cleanup sidecar requires its capable ordinary executor'
+      end
       (LIFECYCLE_JOURNALS.map { |item| item.fetch('name') } - ['archive']).each do |name|
         raise Error, 'conflicting session lifecycle journal blocks archive recovery' if
           File.exist?(File.join(root, "#{slug}.#{name}.json")) ||
@@ -1938,13 +1942,17 @@ module DevWorkspaceHost
           slug = File.basename(path, '.start.json')
           "#{entry.fetch('name')}/#{slug} (start)"
         end
+        cleanup = Dir.glob(File.join(root, '*.archive-cleanup.json')).sort.map do |path|
+          slug = File.basename(path, '.archive-cleanup.json')
+          "#{entry.fetch('name')}/#{slug} (archive cleanup)"
+        end
         migrations = Dir.glob(
           File.join(root, "*#{AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix')}")
         ).sort.map do |path|
           slug = File.basename(path, AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix'))
           "#{entry.fetch('name')}/#{slug} (agent-teams migration)"
         end
-		lifecycle + creation + forks + starts + migrations + portal_creations
+		lifecycle + cleanup + creation + forks + starts + migrations + portal_creations
       end
       return if operations.empty?
 

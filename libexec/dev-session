@@ -15,6 +15,7 @@ require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-auto-archive'
+require_relative 'workspace-archive-cleanup'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -687,6 +688,7 @@ module DevSession
 
   class Runner
     include WorkspaceAutoArchive::Runner
+    include ArchiveCleanup::RunnerContext
     CleanupPlan = Struct.new(:session, :entries, :unexpected, keyword_init: true)
 
     attr_reader :workspace, :today
@@ -1765,7 +1767,18 @@ module DevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
           journal = load_archive_journal(slug, operation_id:)
-          automatic&.call(journal)
+          cleanup = ArchiveCleanup.new(self, slug)
+          sidecar = cleanup.load(journal:, operation_id:)
+          if sidecar && sidecar.fetch('mode') != mode
+            raise Error, "resuming archival of #{slug} requires mode #{sidecar.fetch('mode')}"
+          end
+          if sidecar && !journal && sidecar.fetch('completed')
+            cleanup.discard_completed!(sidecar)
+            @out.puts "archived session: #{slug}"
+            next
+          end
+          prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
+          automatic&.call(journal || prepared)
           ensure_retirement_identity!(slug, cleanup_session(slug))
           unless journal
             source = validate_work_directory!(slug)
@@ -1778,8 +1791,14 @@ module DevSession
                     "initiative lifecycle is #{lifecycle}; use the matching archive mode"
             end
             validate_tracking_committed!(slug)
-            plan = prepare_cleanup(slug, force: false)
-            proven_heads = mode == 'complete' ? prove_registered_branches_merged!(slug, plan) : {}
+            if sidecar
+              cleanup.revalidate!(sidecar, journal: prepared)
+              inventory = sidecar.fetch('inventory')
+            else
+              inventory = cleanup.prove(cleanup.discover, mode)
+            end
+            plan = cleanup.plan(inventory)
+            proven_heads = mode == 'complete' ? inventory.fetch('registered_heads') : {}
             ensure_portal_thread_idle!(slug, @selected_authority) unless automatic
             validate_development_cluster_helpers!
             validate_archive_move_command!
@@ -1790,24 +1809,41 @@ module DevSession
             end
             validate_tracking_transition_commit!(slug)
             sync_team_lifecycle!(slug, 'require-idle') if automatic
-            automatic&.call(nil)
-            journal = prepare_archive_journal!(
-              slug, mode, proven_heads, plan, operation_id:
-            )
+            automatic&.call(prepared)
+            if prepared
+              journal = prepared
+              write_lifecycle_journal(
+                lifecycle_journal_file(slug, 'archive'), journal, command: 'archive', create: true
+              )
+              announce_lifecycle_phase('archive', 'prepared')
+            else
+              journal = prepare_archive_journal!(
+                slug, mode, proven_heads, plan, operation_id:, cleanup:, inventory:
+              )
+              sidecar = cleanup.load(journal:)
+            end
           end
           unless journal.fetch('mode') == mode
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
           end
           recover_archive_phase!(slug, journal)
+          if sidecar
+            cleanup.revalidate!(sidecar, journal:)
+          else
+            # Temporary compatibility: old schema-2 journals cannot adopt the
+            # new auxiliary layout. Preserve their historical cleanup rules.
+            validate_legacy_archive_cleanup!(slug, journal)
+          end
           if archive_phase_before?(journal, 'tracking_archived') && path_exists?(work_dir(slug))
             verify_pending_archive_tracking!(
-              slug, journal, prepare_cleanup(slug, force: false)
+              slug, journal, sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
             )
           end
 
           if archive_phase_before?(journal, 'quiesced')
-            plan = prepare_cleanup(slug, force: false)
-            if mode == 'complete'
+            cleanup.revalidate!(sidecar, journal:) if sidecar
+            plan = sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
+            if mode == 'complete' && !sidecar
               reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads'))
             end
             quiesce_and_require_idle!(slug, plan.session)
@@ -1815,27 +1851,31 @@ module DevSession
           end
           if archive_phase_before?(journal, 'clusters_released')
             automatic&.call(journal)
-            plan = prepare_cleanup(slug, force: false)
-            reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete'
+            cleanup.revalidate!(sidecar, journal:) if sidecar
+            plan = sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
+            reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete' && !sidecar
             release_development_clusters!(slug, operation: 'archive')
             advance_archive!(slug, journal, 'clusters_released')
           end
           if archive_phase_before?(journal, 'tracking_archived')
             automatic&.call(journal)
-            plan = prepare_cleanup(slug, force: false)
-            reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete'
+            cleanup.revalidate!(sidecar, journal:) if sidecar
+            plan = sidecar ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
+            reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads')) if mode == 'complete' && !sidecar
             verify_pending_archive_tracking!(slug, journal, plan)
             set_tracking_lifecycle!(slug, mode)
             finalize_locked!(
               slug,
               announce: false,
               expected_proven_heads: journal.fetch('proven_heads'),
-              finalized_at: journal.fetch('finalized_at')
+              finalized_at: journal.fetch('finalized_at'),
+              cleanup: sidecar ? cleanup : nil, sidecar:, journal:
             )
             verify_archived_tracking_tree!(slug, journal)
             advance_archive!(slug, journal, 'tracking_archived')
           end
           if archive_phase_before?(journal, 'tracking_committed')
+            cleanup.revalidate!(sidecar, journal:) if sidecar
             verify_archived_tracking_tree!(slug, journal)
             verify_archived_proven_heads!(slug, journal) if mode == 'complete'
             commit_tracking_transition!(slug, direction: 'archive', mode:)
@@ -1843,16 +1883,18 @@ module DevSession
           end
           verify_committed_archive_tracking!(slug, journal)
           if archive_phase_before?(journal, 'thread_retired')
+            cleanup.revalidate!(sidecar, journal:) if sidecar
             retire_portal_thread!(slug, force: false)
 			sync_team_lifecycle!(slug, 'archive')
             advance_archive!(slug, journal, 'thread_retired')
           end
           if archive_phase_before?(journal, 'runtime_retired')
+            cleanup.revalidate!(sidecar, journal:) if sidecar
             verify_committed_archive_tracking!(slug, journal)
             retire_session_runtime!(slug, @tmux.session(slug))
             advance_archive!(slug, journal, 'runtime_retired')
           end
-          finish_archive_journal!(slug, journal)
+          finish_archive_journal!(slug, journal, cleanup: sidecar ? cleanup : nil, sidecar:)
           @out.puts "archived session: #{slug}"
         end
       end
@@ -2050,7 +2092,8 @@ module DevSession
       slug,
       announce: true,
       expected_proven_heads: nil,
-      finalized_at: nil
+      finalized_at: nil,
+      cleanup: nil, sidecar: nil, journal: nil
     )
       source = validate_work_directory!(slug)
       destination = archive_dir(slug)
@@ -2066,8 +2109,11 @@ module DevSession
       end
       validate_archive_move_command!
 
-      plan = prepare_cleanup(slug, force: false)
-      proven_heads = if lifecycle == 'complete'
+      cleanup.revalidate!(sidecar, journal:) if cleanup
+      plan = cleanup ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
+      proven_heads = if cleanup
+                       sidecar.fetch('inventory').fetch('registered_heads')
+                     elsif lifecycle == 'complete'
                        if expected_proven_heads
                          reprove_exact_heads_merged!(slug, plan, expected_proven_heads)
                          expected_proven_heads
@@ -2079,14 +2125,18 @@ module DevSession
                      end
       ensure_archive_root!
       quiesced = quiesce_and_require_idle!(slug, plan.session)
-      verify_proven_heads_unchanged!(slug, plan, proven_heads) if lifecycle == 'complete'
+      verify_proven_heads_unchanged!(slug, plan, proven_heads) if lifecycle == 'complete' && !cleanup
       finalize_portal_manifest(
         slug,
         plan,
         proven_heads:,
         finalized_at: finalized_at || Time.now.utc.iso8601
       )
-      execute_cleanup(slug, plan, force: false)
+      if cleanup
+        cleanup.remove!(sidecar, journal)
+      else
+        execute_cleanup(slug, plan, force: false)
+      end
       source = validate_work_directory!(slug)
       ensure_archive_root!
       atomic_archive_move!(source, destination)
@@ -5558,6 +5608,10 @@ module DevSession
 
     def reject_conflicting_lifecycle_journal!(slug, operation: nil)
       root = File.dirname(creation_journal_file(slug))
+      if path_exists?(ArchiveCleanup.new(self, slug).path) && operation != 'archive'
+        raise Error,
+              "session archive is unfinished: #{slug}; retry dev-session archive with the original options"
+      end
       if path_exists?(start_journal_file(slug)) && !%w[start revive].include?(operation)
         raise Error,
               "session start is unfinished: #{slug}; retry dev-session start with the original options"
@@ -6451,12 +6505,13 @@ module DevSession
       ]
     end
 
-    def verify_pending_archive_tracking!(slug, journal, plan)
+    def verify_pending_archive_tracking!(slug, journal, plan, final_heads: nil)
+      final_heads ||= ArchiveCleanup.new(self, slug).load(journal:)&.fetch('inventory')&.fetch('registered_heads')
       actual_digest, thread_id = archived_tracking_identity(
         slug,
         plan,
         journal.fetch('mode'),
-        journal.fetch('proven_heads'),
+        final_heads || journal.fetch('proven_heads'),
         journal.fetch('finalized_at')
       )
       unless actual_digest == journal.fetch('target_tracking_sha256') &&
@@ -6512,13 +6567,13 @@ module DevSession
       journal
     end
 
-    def prepare_archive_journal!(slug, mode, proven_heads, plan, operation_id: nil)
+    def prepare_archive_journal!(slug, mode, proven_heads, plan, operation_id: nil, cleanup: nil, inventory: nil)
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session archive operation identity'
       end
       finalized_at = Time.now.utc.iso8601
       target_tracking_sha256, retained_thread_id = archived_tracking_identity(
-        slug, plan, mode, proven_heads, finalized_at
+        slug, plan, mode, inventory ? inventory.fetch('registered_heads') : proven_heads, finalized_at
       )
       journal = {
         'schema' => 2,
@@ -6532,6 +6587,9 @@ module DevSession
         'retained_thread_id' => retained_thread_id,
         'target_tracking_sha256' => target_tracking_sha256
       }
+      # Sidecar first: a crash here reserves the exact prepared intent, while
+      # leaving the ordinary schema-2 journal's format and phase order intact.
+      cleanup.create(journal, inventory) if cleanup
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'archive'), journal, command: 'archive', create: true
       )
@@ -6580,13 +6638,59 @@ module DevSession
       end
     end
 
-    def finish_archive_journal!(slug, journal)
+    def finish_archive_journal!(slug, journal, cleanup: nil, sidecar: nil)
       if archive_phase_before?(journal, 'archived')
         advance_archive!(slug, journal, 'archived')
       end
+      cleanup.complete!(sidecar, journal) if cleanup
       path = lifecycle_journal_file(slug, 'archive')
       File.unlink(path)
       fsync_directory(File.dirname(path))
+      cleanup.discard_completed!(sidecar, recorded_journal: journal) if cleanup
+    end
+
+    # Temporary legacy archive recovery without a cleanup sidecar. Keep this
+    # adapter until no supported predecessor journal can require the old layout.
+    def validate_legacy_archive_cleanup!(slug, journal)
+      plan = prepare_cleanup(slug, force: false)
+      if !archive_phase_before?(journal, 'tracking_archived') && !plan.entries.empty?
+        raise Error, "worktrees appeared after legacy archive cleanup: #{slug}"
+      end
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      if manifest
+        names = manifest.fetch('repositories', []).map { |repository| repository.fetch('name') }
+        unless (plan.entries.map { |entry| entry.fetch(:name) } - names).empty?
+          raise Error, "legacy archive cannot adopt unregistered worktrees: #{slug}"
+        end
+      end
+    end
+
+    def require_completed_archive_retirement!(slug, journal, recorded_retirement: false)
+      if @tmux.session(slug) || @authority_dir && path_exists?(authority_file(slug))
+        raise Error, "completed archive runtime is still present: #{slug}"
+      end
+      # While the matching archived journal is still in this executor, its
+      # ordered retirement phases are the proof. A journal-less completed
+      # receipt must obtain a fresh read-only proof from the retained runtime.
+      return if recorded_retirement
+      thread_id = journal['retained_thread_id']
+      return if thread_id.nil? && !direct_team_state_present?(slug)
+      raise Error, "completed archive team has no retained root: #{slug}" unless thread_id
+      home = @env['DEV_WORKSPACE_CODEX_HOME']
+      unless @portal_command && @codex_socket && @authority_dir && home
+        raise Error, "completed archive retirement proof is unavailable: #{slug}"
+      end
+      arguments = [
+        '--cwd', work_dir(slug), '--socket', @codex_socket,
+        '--codex-home', home, '--authority-dir', @authority_dir
+      ]
+      @command_runner.capture([*@portal_command, 'thread', 'require-archived', '--thread-id', thread_id, *arguments])
+      if direct_team_state_present?(slug)
+        @command_runner.capture([
+          *@portal_command, 'team', 'require-archived', '--user-state-root', @workspace_state_root,
+          '--workspace', workspace, '--session-slug', slug, '--root-thread-id', thread_id, *arguments
+        ])
+      end
     end
 
     def load_revive_journal(slug, operation_id: nil)

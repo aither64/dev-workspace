@@ -39,6 +39,25 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_archive_cleanup_intent_blocks_host_mutations_without_a_lifecycle_journal
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      workspace = host.send(:registry).entries.fetch(0).fetch('root')
+      locks = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(locks)
+      intent = File.join(locks, '2026-06-06-pending.archive-cleanup.json')
+      File.write(intent, "{}\n")
+      host.events.clear
+
+      assert_equal(1, host.run('workspace-host', ['suspend']))
+      assert_equal(1, host.run('workspace-host', ['reconcile-codex']))
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(host.events.any? { |event| event.first == :sessions_quiesced })
+      assert_equal("{}\n", File.read(intent))
+    end
+  end
+
   private
 
   class CapturingHost < DevWorkspaceHost::Host

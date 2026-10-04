@@ -285,7 +285,7 @@ module WorkspaceAutoArchive
           # existing recovery checks, even if automatic archival was disabled.
           if operation['tier'] == 'empty' && File.directory?(work_dir(slug))
             manifest = load_portal_manifest(portal_file(slug), required: true)
-            unless manifest.fetch('repositories', []).empty? && worktree_entries(slug).empty?
+            unless manifest.fetch('repositories', []).empty? && DevSession::ArchiveCleanup.new(self, slug).discover.fetch('worktrees').empty?
               raise Error, 'the abandoned archive now contains repositories or worktrees'
             end
           end
@@ -298,7 +298,8 @@ module WorkspaceAutoArchive
         end
       end
       if !File.directory?(work_dir(slug)) && File.directory?(archive_dir(slug)) &&
-         !path_exists?(lifecycle_journal_file(slug, 'archive'))
+         !path_exists?(lifecycle_journal_file(slug, 'archive')) &&
+         !path_exists?(DevSession::ArchiveCleanup.new(self, slug).path)
         # The process can exit after finishing the archive but before recording
         # its result. A retained matching conversation proves the destination.
         manifest = load_portal_manifest(File.join(archive_dir(slug), 'portal.yml'), required: true)
@@ -320,7 +321,8 @@ module WorkspaceAutoArchive
       # No journal means no archive began: do not reserve a stale receipt across
       # a hold, policy change, manual operation, or new work.
       owned = begin
-        load_archive_journal(slug)&.fetch('operation_id') == operation['id']
+        load_archive_journal(slug)&.fetch('operation_id') == operation['id'] ||
+          DevSession::ArchiveCleanup.new(self, slug).load&.fetch('operation_id') == operation['id']
       rescue StandardError
         false
       end
@@ -343,8 +345,10 @@ module WorkspaceAutoArchive
       proof_error = nil
       if initial['eligible']
         begin
-          plan = prepare_cleanup(slug, force: false)
-          prove_registered_branches_merged!(slug, plan) unless initial['tier'] == 'empty'
+          cleanup = DevSession::ArchiveCleanup.new(self, slug)
+          inventory = cleanup.discover
+          cleanup.plan(inventory)
+          cleanup.prove(inventory, 'complete') unless initial['tier'] == 'empty'
         rescue StandardError => e
           proof_error = e
         end
@@ -391,20 +395,18 @@ module WorkspaceAutoArchive
         raise Error, 'Conversation activity is invalid or in the future.'
       end
       repositories = manifest.fetch('repositories', [])
-      entries = worktree_entries(slug)
-      unexpected = unexpected_worktree_entries(slug, entries)
-      raise Error, 'Session contains unmanaged worktree entries.' unless unexpected.empty?
+      cleanup = DevSession::ArchiveCleanup.new(self, slug)
+      inventory = cleanup.discover(clean: false)
+      entries = inventory.fetch('worktrees')
       heads = repositories.map do |repository|
         common = repository_common_dir(repository.fetch('project'))
         [repository.fetch('name'), resolve_commit(common, "refs/heads/#{repository.fetch('branch')}")]
       end
-      dirty = entries.any? do |entry|
-        validate_worktree_path!(slug, entry)
-        worktree_dirty?(entry.fetch(:path))
-      end
+      dirty = entries.any? { |entry| entry.fetch('dirty') }
+      additional_features = cleanup.additional_features?(inventory, repositories)
       tier = if lifecycle == 'complete'
                'complete'
-             elsif lifecycle == 'active' && !repositories.empty?
+             elsif lifecycle == 'active' && (!repositories.empty? || additional_features)
                'merged'
              elsif lifecycle == 'active' && entries.empty?
                'empty'
@@ -425,7 +427,7 @@ module WorkspaceAutoArchive
       end
       fingerprint = Digest::SHA256.hexdigest(JSON.generate([
         thread, activity.fetch('updatedAt'), lifecycle, repositories, heads,
-        entries.map { |entry| [entry[:name], entry[:path]] }.sort, dirty, contents,
+        entries.map { |entry| [entry.fetch('path'), entry.fetch('head')] }.sort, dirty, contents,
         manifest.fetch('artifacts', []), blockers,
         manifest.fetch('creation', {}).slice('tracking_origin', 'tracking_plan_sha256', 'tracking_state_sha256'),
         @selected_authority&.fetch('tmux_identity', nil)
