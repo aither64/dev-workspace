@@ -692,8 +692,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, mutate func()) {
-	unlock, err := s.lockTransition()
+func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, slug string, mutate func()) {
+	_, unlock, err := s.acquireTransitionContext(r.Context(), unix.LOCK_SH)
 	if err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "workspace runtime is changing; retry shortly")
 		return
@@ -704,6 +704,21 @@ func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, muta
 		return
 	}
 	mutate()
+}
+
+// Keep generation admission around durable result/reconciliation writes.
+func (s *Server) withCurrentGeneration(mutate func() error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
+	return mutate()
 }
 
 func (s *Server) lockTransition() (func(), error) {
@@ -1683,7 +1698,7 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
-		s.withPortalMutation(w, r, func() { s.sessionAPIResolved(w, r, parts) })
+		s.withPortalMutation(w, r, parts[0], func() { s.sessionAPIResolved(w, r, parts) })
 		return
 	}
 	s.sessionAPIResolved(w, r, parts)
@@ -1830,6 +1845,10 @@ func (s *Server) sessionAPIForSummary(
 			return
 		}
 		s.normalizeInteractivity(r.Context(), summary)
+		if err := s.requireOrdinaryRetainedMutation(r.Context(), summary); err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		if !summary.Interactive {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready for browser changes"})
 			return
@@ -1985,6 +2004,10 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		return
 	}
 	s.normalizeInteractivity(r.Context(), summary)
+	if err := s.requireOrdinaryRetainedMutation(r.Context(), summary); err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
 	if summary.Archived || !summary.Interactive {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready for team changes"})
 		return
@@ -2570,6 +2593,13 @@ func (s *Server) startLifecycleOperation(
 	w http.ResponseWriter, slug, kind, redirect string, args []string,
 	options lifecycleOperationOptions, expectedReceiptID string, supersedeReceiptIDs ...string,
 ) {
+	s.operationMu.Lock()
+	closing := s.closing
+	s.operationMu.Unlock()
+	if closing {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
+		return
+	}
 	_, unlock, gateErr := s.acquireTransition(unix.LOCK_SH)
 	if gateErr != nil {
 		s.writeLifecycleError(w, gateErr)
@@ -2763,7 +2793,9 @@ func (s *Server) startLifecycleOperation(
 			s.operationMu.Unlock()
 			return
 		}
-		if persistErr := s.replaceLifecycleOperationLocked(slug, completed); persistErr != nil {
+		if persistErr := s.withCurrentGeneration(func() error {
+			return s.replaceLifecycleOperationLocked(slug, completed)
+		}); persistErr != nil {
 			s.config.Logger.Printf("persist completed %s operation for %s: %v", kind, slug, persistErr)
 			completed.State = "failed"
 			completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
@@ -3111,8 +3143,10 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	// safe for passive transcript reads. Live host authority is still required
 	// for every control and mutation.
 	summary.Codex = persisted
-	creationReady := summary.Creation.State == "ready" &&
-		(summary.Creation.GoalSHA256 == "" || summary.Creation.InitialGoalSent)
+	creationReady := session.RequireRetainedReady(summary, s.config.CodexSocket) == nil
+	if !summary.HasCreation() && RequireObservationReceipts(summary, s.config.UserStateRoot, "", "") != nil {
+		creationReady = false
+	}
 	if summary.Archived || !creationReady || s.config.AuthorityDir == "" {
 		return
 	}
@@ -3142,6 +3176,63 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	summary.Interactive = true
 }
 
+// Creation-less interaction uses the same current public root/team proof as
+// observation. Busy is governed by the requested operation; unknown submissions
+// or another same-CWD identity never authorize a write.
+func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *session.Summary) error {
+	if summary.HasCreation() {
+		return nil
+	}
+	if summary.Archived || session.RequireRetainedReady(summary, s.config.CodexSocket) != nil {
+		return errors.New("ordinary retained conversation is not ready")
+	}
+	if err := RequireObservationReceipts(summary, s.config.UserStateRoot, "", ""); err != nil {
+		return err
+	}
+	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, summary.Slug, s.config.Workspace)
+	if err != nil || authority.State != "ready" || authority.CodexThreadID != summary.Codex.ThreadID ||
+		authority.CodexSocketPath != summary.Codex.SocketPath || authority.CodexClientVersion != summary.Codex.ClientVersion {
+		return errors.New("retained runtime authority changed")
+	}
+	if err := authority.VerifyTmux(ctx, s.config.Tmux); err != nil {
+		return err
+	}
+	identity, err := session.ObservationIdentity(summary.Workspace, summary.Slug, filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
+	if err != nil {
+		return err
+	}
+	service, err := s.teamService()
+	if err != nil {
+		return err
+	}
+	observation, err := service.ObserveRetained(ctx, summary.Slug, summary.Codex.ThreadID, identity)
+	if err != nil || !observation.ActivityKnown {
+		return errors.New("retained conversation or submission proof is unavailable")
+	}
+	for _, subject := range observation.Subjects {
+		if subject.Address == "lead" && subject.ArchiveState != "active" {
+			return errors.New("retained root is not a materialized active conversation")
+		}
+	}
+	again, err := session.Find(summary.Workspace, summary.Slug)
+	if err != nil || again.HasCreation() || again.Root != summary.Root || again.Codex != summary.Codex ||
+		session.RequireRetainedReady(again, s.config.CodexSocket) != nil {
+		return errors.New("ordinary retained tracking changed")
+	}
+	after, err := session.ObservationIdentity(summary.Workspace, summary.Slug, filepath.Join(summary.Workspace, again.Root, again.Slug), again.Codex.ThreadID)
+	if err != nil || after != identity {
+		return errors.New("retained tracking identity changed")
+	}
+	if err := RequireObservationReceipts(again, s.config.UserStateRoot, "", ""); err != nil {
+		return err
+	}
+	current, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, summary.Slug, s.config.Workspace)
+	if err != nil || current != authority {
+		return errors.New("retained runtime authority changed")
+	}
+	return current.VerifyTmux(ctx, s.config.Tmux)
+}
+
 func (s *Server) resolveConversation(
 	ctx context.Context, request conversation.ResolveRequest,
 ) (conversation.Target, error) {
@@ -3167,7 +3258,7 @@ func (s *Server) resolveConversation(
 		}
 	}
 	if request.Mutation {
-		unlock, err := s.lockTransitionContext(ctx)
+		_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 		if err != nil {
 			return conversation.Target{}, fmt.Errorf("lock workspace transition: %w", err)
 		}
@@ -3202,6 +3293,9 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, errors.New("session state changed")
 		}
 		s.normalizeInteractivity(ctx, summary)
+		if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
+			return conversation.Target{}, err
+		}
 	}
 	interactive := summary.Interactive
 	if request.Mutation && !interactive {

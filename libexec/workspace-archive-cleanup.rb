@@ -78,6 +78,23 @@ module DevSession
     WORKTREE_KEYS = %w[path project common_dir common_identity admin_dir admin_identity identity head branch dirty removed].freeze
     PROOF_KEYS = %w[kind name project common_dir common_identity origin branch default_branch head ref tip initial_base_sha allow_unpushed].freeze
 
+    # Structural input boundary shared with the reviewed migration plan. Actual
+    # registration, checkout and ref proof remains discover/revalidate here.
+    def self.discovery_shape?(inventory)
+      identity = ->(value) { value.is_a?(Hash) && value.keys.sort == %w[dev ino] && value.values.all? { |part| part.is_a?(Integer) && part >= 0 } }
+      relative = ->(value, empty = false) { value.is_a?(String) && (empty && value.empty? || !value.empty? && !value.start_with?('/') && !value.match?(/[[:cntrl:]]/) && value.split('/').none? { |part| part.empty? || %w[. .. .git].include?(part) }) }
+      inventory.is_a?(Hash) && inventory.keys.sort == %w[containers worktrees] &&
+        %w[worktrees containers].all? { |key| inventory[key].is_a?(Array) } &&
+        inventory['worktrees'].all? { |record| record.is_a?(Hash) && record.keys.sort == WORKTREE_KEYS.sort &&
+          relative.call(record['path']) && record['project'].is_a?(String) && record['project'].match?(/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/) &&
+          %w[common_dir admin_dir].all? { |key| record[key].is_a?(String) && record[key].start_with?('/') && !record[key].match?(/[[:cntrl:]]/) } &&
+          %w[identity common_identity admin_identity].all? { |key| identity.call(record[key]) } && record['head'].is_a?(String) && record['head'].match?(SHA) &&
+          (record['branch'].nil? || record['branch'].is_a?(String) && !record['branch'].empty? && !record['branch'].match?(/[[:cntrl:]]/)) &&
+          record['dirty'] == false && [true, false].include?(record['removed']) } &&
+        inventory['containers'].all? { |record| record.is_a?(Hash) && record.keys.sort == %w[identity path removed] && relative.call(record['path'], true) && identity.call(record['identity']) && [true, false].include?(record['removed']) } &&
+        %w[worktrees containers].all? { |key| inventory[key].map { |record| record['path'] }.uniq.length == inventory[key].length }
+    end
+
     def initialize(runner, slug)
       @runner = runner
       @slug = slug
@@ -118,6 +135,12 @@ module DevSession
       containers = []
       walk_containers(@group, worktrees.map { |record| absolute(record.fetch('path')) }, containers) if exists?(@group)
       { 'worktrees' => worktrees, 'containers' => containers.sort_by { |record| record.fetch('path') } }
+    end
+
+    # Read-only canonical discovery shared with legacy normalization. Aliases
+    # are deduplicated by the same common-directory owner as cleanup.
+    def repository_catalog
+      canonical_repositories.map { |project, common| { 'project' => project, 'common_dir' => common } }
     end
 
     def prove(inventory, mode)

@@ -787,6 +787,12 @@ class DevSessionTest < Minitest::Test
         cwd: workspace, portal_command: ['workspace-portal-test']
       )
       runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {
+        'thread_id' => 'direct-team-root', 'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.160.0'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
       workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
       receipt_path = File.join(
         runner.instance_variable_get(:@workspace_state_root), 'portal',
@@ -828,6 +834,12 @@ class DevSessionTest < Minitest::Test
                                 env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') },
                                 cwd: workspace, portal_command: ['workspace-portal-test'])
       runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {
+        'thread_id' => 'direct-team-root', 'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.160.0'
+      }
+      runner.send(:write_portal_manifest, slug, manifest)
       assert_equal('ok', runner.team(slug, action: 'add', role: 'implementer'))
       assert_nil(calls.first[:model])
       assert_nil(calls.first[:effort])

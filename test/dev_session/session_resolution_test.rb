@@ -191,8 +191,23 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
       out = StringIO.new
-      socket_path = '/run/user/1000/tmux-1000/default'
-      tmux = ManagedTmux.new(slug, workspace:, socket_path:)
+      # A genuinely fresh terminal fixture, rather than a manifestless live
+      # session that ordinary start must now refuse to adopt.
+      tmux_class = Class.new(PartialCreateTmux) do
+        def capture(*args, **options)
+          if args.first == 'split-window'
+            @split_attempts += 1
+            return ["%right#{@split_attempts}\n", '', nil]
+          end
+
+          super
+        end
+
+        def windows(_session)
+          []
+        end
+      end
+      tmux = tmux_class.new(slug, workspace:)
       runner = DevSession::Runner.new(
         workspace:,
         tmux:,
@@ -208,6 +223,11 @@ class DevSessionTest < Minitest::Test
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal(1, manifest['schema'])
       assert_equal(slug, manifest['slug'])
+      assert_equal([], manifest.fetch('repositories'))
+      assert_equal([], manifest.fetch('artifacts'))
+      refute(manifest.key?('codex'))
+      refute(manifest.key?('creation'))
+      refute(File.exist?(runner.send(:creation_journal_file, slug)))
       refute(manifest.key?('tmux'))
       assert_includes(out.string, "portal: https://workspace.example.test/#{slug}/")
     end

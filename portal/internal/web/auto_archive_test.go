@@ -18,7 +18,7 @@ func TestWorkspaceAutoArchiveReadsCachedEnvelopeWithoutScan(t *testing.T) {
 	command := filepath.Join(t.TempDir(), "dev-session")
 	payload, err := json.Marshal(map[string]any{"schema": 1, "workspace": server.config.Workspace,
 		"policy":   map[string]any{"enabled": false, "epoch": nil},
-		"sessions": []any{map[string]any{"slug": "malformed", "migration_needed": true}, map[string]any{"slug": "one", "activity_known": true}},
+		"sessions": []any{map[string]any{"slug": "malformed", "repair_needed": true}, map[string]any{"slug": "one", "activity_known": true}},
 		"counts":   map[string]any{"total": 2}})
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestWorkspaceAutoArchiveReadsCachedEnvelopeWithoutScan(t *testing.T) {
 	server.config.DevSession = command
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/auto-archive", nil))
-	if response.Code != 200 || !strings.Contains(response.Body.String(), `"migration_needed":true`) || !strings.Contains(response.Body.String(), `"slug":"one"`) {
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"repair_needed":true`) || !strings.Contains(response.Body.String(), `"slug":"one"`) {
 		t.Fatalf("workspace status=%d: %s", response.Code, response.Body.String())
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/auto-archive", strings.NewReader(`{}`))
@@ -44,6 +44,7 @@ func TestWorkspaceAutoArchiveReadsCachedEnvelopeWithoutScan(t *testing.T) {
 
 func TestAutoArchiveStatusAndHoldValidateSessionAndOrigin(t *testing.T) {
 	server := newTestServer(t)
+	defer server.Close()
 	directory := filepath.Join(server.config.Workspace, "work", "example")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		t.Fatal(err)
@@ -71,12 +72,16 @@ test "$3" = example || exit 5
 test "$4" = --as-is || exit 6
 test "$5" = --json || exit 7
 case "$2" in
-  status) printf '%s\n' '{"slug":"example","enabled":true,"hold":false}' ;;
-  hold) printf '%s\n' '{"slug":"example","hold":true}' ;;
-  release) printf '%s\n' '{"slug":"example","hold":false}' ;;
-  *) exit 8 ;;
-esac
 `
+	for _, action := range []string{"status", "hold", "release"} {
+		payload, err := json.Marshal(map[string]any{"schema": 1, "workspace": server.config.Workspace,
+			"slug": "example", "enabled": true, "hold": action == "hold"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		script += "  " + action + ") printf '%s\\n' '" + strings.ReplaceAll(string(payload), "'", "'\"'\"'") + "' ;;\n"
+	}
+	script += "  *) exit 8 ;;\nesac\n"
 	if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -102,5 +107,34 @@ esac
 		if test.code == 200 && !strings.Contains(response.Body.String(), `"slug":"example"`) {
 			t.Fatalf("invalid result: %s", response.Body.String())
 		}
+	}
+	for name, payload := range map[string]map[string]any{
+		"missing_schema":    {"workspace": server.config.Workspace, "slug": "example"},
+		"wrong_schema":      {"schema": 2, "workspace": server.config.Workspace, "slug": "example"},
+		"missing_workspace": {"schema": 1, "slug": "example"},
+		"wrong_workspace":   {"schema": 1, "workspace": "/foreign/workspace", "slug": "example"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' '"+strings.ReplaceAll(string(encoded), "'", "'\"'\"'")+"'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for _, body := range []string{"", `{"hold":true,"targetId":"` + target + `"}`, `{"hold":false,"targetId":"` + target + `"}`} {
+				method := http.MethodPost
+				if body == "" {
+					method = http.MethodGet
+				}
+				request := httptest.NewRequest(method, "/api/sessions/example/auto-archive", strings.NewReader(body))
+				request.Header.Set("Origin", server.config.BaseURL)
+				response := httptest.NewRecorder()
+				server.Handler().ServeHTTP(response, request)
+				if response.Code != http.StatusBadGateway {
+					t.Fatalf("%s %s accepted invalid envelope: %d: %s", method, body, response.Code, response.Body.String())
+				}
+			}
+		})
 	}
 }

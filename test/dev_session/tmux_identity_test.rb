@@ -354,7 +354,8 @@ class DevSessionTest < Minitest::Test
       assert_match(/changed during creation/, error.message)
       assert_includes(tmux.new_session_args, '-P')
       assert_includes(tmux.new_session_args, '#{session_id}')
-      assert_equal(2, tmux.name_lookups)
+      assert_equal(3, tmux.name_lookups)
+      assert_equal([false, false, false], tmux.name_lookup_states, 'name probes must all precede creation')
       assert_empty(tmux.mutations)
     end
   end
@@ -370,7 +371,8 @@ class DevSessionTest < Minitest::Test
       end
 
       assert_match(/session changed during operation/, error.message)
-      assert_equal(2, tmux.name_lookups)
+      assert_equal(3, tmux.name_lookups)
+      assert_equal([false, false, false], tmux.name_lookup_states, 'replacement must still be checked by exact created ID')
       refute(tmux.mutations.flatten.include?('$replacement:'))
     end
   end
@@ -381,6 +383,9 @@ class DevSessionTest < Minitest::Test
       out = StringIO.new
       tmux = ManagedTmux.new(slug, workspace:)
       runner = runner_for(workspace, tmux:, out:)
+
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
 
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
@@ -402,6 +407,9 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:, authority_dir:)
 
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
+
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
       authority = JSON.parse(
@@ -421,6 +429,9 @@ class DevSessionTest < Minitest::Test
         out = StringIO.new
         tmux = LegacyWorkspaceTmux.new(slug, workspace: alias_path)
         runner = runner_for(workspace, tmux:, out:)
+
+        runner.ensure_tracking_files(slug)
+        runner.send(:ensure_portal_manifest, slug, tracking_only: true)
 
         runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 

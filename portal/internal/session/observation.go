@@ -86,6 +86,26 @@ func RequireNormalizedThreadless(summary *Summary) error {
 	return nil
 }
 
+// RequireRetainedReady validates ordinary retained readiness. Native identity,
+// roster, authority and receipt proofs remain with their existing owners.
+func RequireRetainedReady(summary *Summary, socket string) error {
+	if summary == nil || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != socket ||
+		!validSocketPath(socket) || summary.Codex.ClientVersion == "" {
+		return errors.New("retained root and selected endpoint must be explicit")
+	}
+	if summary.HasCreation() {
+		if summary.Creation.State != "ready" || summary.Creation.GoalSHA256 != "" && !summary.Creation.InitialGoalSent {
+			return errors.New("present session creation evidence is unfinished")
+		}
+		return nil
+	}
+	if summary.Schema != 1 || summary.ForkedFrom != "" ||
+		!summary.scopeExplicit && (summary.Repositories == nil || summary.Artifacts == nil) {
+		return errors.New("creation-less retained tracking requires explicit ordinary scope")
+	}
+	return nil
+}
+
 // RequireNoRuntime samples only the host-selected authority and tmux socket.
 // Missing state is checked as filesystem absence; command/RPC errors never
 // stand for an empty server. No authority, client or pane is changed.

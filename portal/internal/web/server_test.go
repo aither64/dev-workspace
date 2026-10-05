@@ -330,7 +330,7 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	slug := "2026-09-06-lock-order"
 	tracking := filepath.Join(server.config.Workspace, "work", slug)
 	if err := os.MkdirAll(tracking, 0o755); err != nil {
@@ -410,7 +410,7 @@ func TestLifecycleOperationRejectsProfileSwitchWhileWaiting(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("MARKER", marker)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 
 			result := make(chan error, 1)
 			go func() {
@@ -485,7 +485,7 @@ func TestLifecycleOperationRechecksTheDeletionTargetBeforeTheCommand(t *testing.
 		t.Fatal(err)
 	}
 	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	err := server.runLifecycleOperation(
 		context.Background(), "example", "delete", []string{"delete", "example", "--as-is"},
 		lifecycleOperationOptions{TargetID: strings.Repeat("a", 64)},
@@ -1097,7 +1097,7 @@ func TestSessionCreationKeepsStandardOutputSeparateFromWarnings(t *testing.T) {
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/sessions",
@@ -1124,7 +1124,7 @@ func TestSessionCreationAcceptsMaximallyEncodedMessageAtPublishedLimit(t *testin
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	goal := strings.Repeat("é", session.MaxMessageBytes/len("é"))
 	form := url.Values{
 		"creation_date": {"2026-09-03"},
@@ -1361,7 +1361,7 @@ func TestSessionCreationPassesOnlyPublicArgumentsToTheInstalledCommand(t *testin
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	server.config.TransitionLock = filepath.Join(directory, "transition.lock")
 	if err := os.WriteFile(server.config.TransitionLock, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -1948,7 +1948,7 @@ func TestForkSessionInvokesUnifiedDevSessionCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	request := httptest.NewRequest(http.MethodPost, "/api/sessions/source/fork", strings.NewReader(
 		`{"name":"forked","creationDate":"2026-09-04"}`,
 	))
@@ -1990,7 +1990,7 @@ func TestCloseCancelsAndDrainsArchiveOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("STARTED", started)
-	server.config.DevSession = devSession
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, devSession)
 	summary, err := session.Find(server.config.Workspace, slug)
 	if err != nil {
 		t.Fatal(err)
@@ -2076,7 +2076,7 @@ exit 19
 	}
 	t.Setenv("STARTED", started)
 	t.Setenv("RELEASE", release)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	summary, err := session.Find(server.config.Workspace, slug)
 	if err != nil {
 		t.Fatal(err)
@@ -3126,7 +3126,7 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 	}
 	t.Setenv("ARGUMENTS", arguments)
 	t.Setenv("GOAL_COPY", goalCopy)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	plan := "1. Make the change.\n2. Test it."
 	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{LatestTurnID: "turn-plan",
 		ThreadID: "thread-1", Status: "idle", Model: "model-1", ReasoningEffort: "high",
@@ -3200,7 +3200,7 @@ func TestDeleteSessionUsesOneBrowserConfirmationAndTheDestructiveCLI(t *testing.
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	targetID := deletionTargetForTest(t, server, "example")
 	response := httptest.NewRecorder()
 	server.deleteSession(response, httptest.NewRequest(
@@ -3284,7 +3284,7 @@ func TestDeleteSessionRejectsAStalePageAndAcceptsTheCurrentTarget(t *testing.T) 
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	currentTargetID := deletionTargetForTest(t, server, "example")
 	if currentTargetID == deletedTargetID {
 		t.Fatal("recreated session retained its deletion identity")
@@ -3358,7 +3358,7 @@ func TestReadOnlySessionPageDeletionUsesThePersistedIdentity(t *testing.T) {
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	response := httptest.NewRecorder()
 	server.deleteSession(response, httptest.NewRequest(
 		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
@@ -3411,7 +3411,7 @@ func TestDeleteRetryRefusesARecreatedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	response := httptest.NewRecorder()
 	server.retryLifecycleOperation(response, httptest.NewRequest(
 		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
@@ -3464,7 +3464,7 @@ func TestDeleteRetryRequiresTheDisplayedReceiptBeforeAJournalExists(t *testing.T
 		t.Fatal(err)
 	}
 	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	for _, body := range []string{fmt.Sprintf(
 		`{"receiptId":%q}`, strings.Repeat("b", 64),
 	), fmt.Sprintf(
@@ -3519,7 +3519,7 @@ func TestDeleteJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *
 		t.Fatal(err)
 	}
 	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	lockPath := filepath.Join(t.TempDir(), "transition.lock")
 	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -3605,7 +3605,7 @@ func TestArchiveJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t 
 		t.Fatal(err)
 	}
 	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	lockPath := filepath.Join(t.TempDir(), "transition.lock")
 	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -3746,7 +3746,7 @@ func TestPreJournalLifecycleRetryRejectsReplacementTracking(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("INVOKED", invoked)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 			response := httptest.NewRecorder()
 			server.retryLifecycleOperation(response, httptest.NewRequest(
 				http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
@@ -3838,7 +3838,7 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("ARGUMENTS", arguments)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 			response := httptest.NewRecorder()
 			testCase.start(server, response, httptest.NewRequest(
 				http.MethodPost, "/", strings.NewReader(string(encodedBody)),
@@ -3898,7 +3898,7 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	lockPath := filepath.Join(t.TempDir(), "transition.lock")
 	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -3960,7 +3960,7 @@ func TestDeleteOperationRetryUsesTheJournaledForceSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	freshDelete := httptest.NewRecorder()
 	server.deleteSession(freshDelete, httptest.NewRequest(
 		http.MethodPost, "/", strings.NewReader(`{"force":false}`),
@@ -4018,7 +4018,7 @@ func TestDeleteOperationRetryCanUpgradeTheJournaledForceSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	operation, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists {
 		t.Fatalf("discover delete operation = %t, %v", exists, err)
@@ -4101,7 +4101,7 @@ exit 0
 	t.Setenv("DELETE_TRACKING", directory)
 	t.Setenv("DELETE_JOURNAL", journalPath)
 	t.Setenv("DELETE_JOURNAL_SOURCE", journalSource)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	handler := server.Handler()
 	targetID := deletionTargetForTest(t, server, "example")
 	request := func() *httptest.ResponseRecorder {
@@ -4336,7 +4336,7 @@ func newTestServerWithTrustedOrigins(t *testing.T, trustedOrigins []string) *Ser
 		Workspace:      workspace,
 		BaseURL:        "https://workspace.example.test",
 		TrustedOrigins: trustedOrigins,
-		DevSession:     "/run/current-system/sw/bin/dev-session",
+		DevSession:     fixtureDevSessionCommand(t, workspace, "/run/current-system/sw/bin/dev-session"),
 		HostProfile:    profile,
 		AuthorityDir:   authorityDir,
 		CodexSocket:    "/run/dev-workspace-codex/app-server.sock",
@@ -4593,5 +4593,111 @@ func TestTeamRolesIncludeConfiguredCustomRolesAcrossPresets(t *testing.T) {
 		if role.ID != want[index] {
 			t.Fatalf("role options = %#v", roles)
 		}
+	}
+}
+
+// Embed the existing production collaborator interface; only public reads used
+// by this admission test are replaced. No native persistence is fabricated.
+type ordinaryRetainedCodex struct {
+	*workspacecodex.Client
+	cwd                       string
+	unknown, unresolved, busy bool
+	drift                     func()
+}
+
+func (client *ordinaryRetainedCodex) ProveArchivedRootThread(context.Context, string, string) (workspacecodex.ArchiveState, error) {
+	return workspacecodex.ArchiveActive, nil
+}
+
+func (client *ordinaryRetainedCodex) ObserveThreadIdentity(_ context.Context, id, cwd, _ string, _ workspacecodex.ArchiveState) (workspacecodex.ThreadObservation, error) {
+	if client.unresolved {
+		return workspacecodex.ThreadObservation{}, errors.New("opaque submission proof failure")
+	}
+	if client.drift != nil {
+		client.drift()
+		client.drift = nil
+	}
+	diagnostics := []workspacecodex.ObservationDiagnostic{}
+	if client.busy {
+		diagnostics = append(diagnostics, workspacecodex.ObservationDiagnostic{Code: "queued_input", Category: "busy", Message: "Queued input."})
+	}
+	return workspacecodex.ThreadObservation{Schema: 1, ThreadID: id, Cwd: cwd, ActivityKnown: true, Idle: !client.busy, ActivityToken: strings.Repeat("a", 64), Diagnostics: diagnostics}, nil
+}
+
+func (client *ordinaryRetainedCodex) ListThreads(_ context.Context, options codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error) {
+	threads := []codex.ThreadMetadata{{ID: "thread-1", Cwd: client.cwd, Source: "vscode"}}
+	if client.unknown {
+		threads = append(threads, codex.ThreadMetadata{ID: "foreign", Cwd: client.cwd, Source: "exec"})
+	}
+	return threads, nil, nil
+}
+
+func (client *ordinaryRetainedCodex) LoadedThreadIDs(context.Context) ([]string, error) {
+	return []string{}, nil
+}
+
+func TestCreationlessConversationMutationRequiresCurrentRetainedProof(t *testing.T) {
+	for _, scenario := range []string{"idle", "known busy", "submission unknown", "unknown writer", "root drift", "creation receipt"} {
+		t.Run(scenario, func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			directory := filepath.Join(server.config.Workspace, "work", "example")
+			if err := os.MkdirAll(directory, 0755); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, "active")
+			manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: thread-1\n  socket_path: " + server.config.CodexSocket + "\n  client_version: 0.152.1\n"
+			manifestPath := filepath.Join(directory, "portal.yml")
+			if err := os.WriteFile(manifestPath, []byte(manifest), 0644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebRuntimeAuthority(t, server, "example")
+			client := &ordinaryRetainedCodex{cwd: directory, busy: scenario == "known busy", unresolved: scenario == "submission unknown", unknown: scenario == "unknown writer"}
+			server.config.Codex = client
+			if scenario == "root drift" {
+				client.drift = func() {
+					if err := os.WriteFile(manifestPath, []byte(strings.Replace(manifest, "thread-1", "replacement", 1)), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if scenario == "creation receipt" {
+				root := filepath.Join(server.operationStore.directory, "creations")
+				if err := os.MkdirAll(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "example.old.json"), []byte(`{"state":"ready"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The old migration wrapper queried this command for every mutation.
+			// Ordinary admission must use receipt/native owners without invoking it.
+			marker := filepath.Join(t.TempDir(), "unexpected-status")
+			command := filepath.Join(t.TempDir(), "dev-session")
+			if err := os.WriteFile(command, []byte("#!/bin/sh\ntouch '"+marker+"'\nexit 9\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			server.config.DevSession = command
+			target, err := server.resolveConversation(context.Background(), conversation.ResolveRequest{ID: "example", Mutation: true, Operation: "message"})
+			allowed := scenario == "idle" || scenario == "known busy"
+			if (err == nil) != allowed {
+				t.Fatalf("%s admission: %v", scenario, err)
+			}
+			if err == nil {
+				defer target.Release()
+				if target.ThreadID != "thread-1" || !target.Capabilities.Send {
+					t.Fatalf("lost ordinary retained root/control: %#v", target)
+				}
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("ordinary admission invoked migration status")
+			}
+			if scenario != "root drift" {
+				data, err := os.ReadFile(manifestPath)
+				if err != nil || string(data) != manifest {
+					t.Fatal("admission fabricated creation or changed tracking")
+				}
+			}
+		})
 	}
 }

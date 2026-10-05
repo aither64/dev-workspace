@@ -27,6 +27,7 @@ type ObservationSubject struct {
 	ActivityToken  string `json:"activityToken"`
 	LastActivityAt *int64 `json:"lastActivityAt"`
 	Idle           bool   `json:"idle"`
+	ArchiveState   string `json:"archiveState,omitempty"`
 }
 
 type Observation struct {
@@ -58,9 +59,9 @@ func retainedObservationIdentities(roster *Roster) [][3]string {
 	return identities
 }
 
-// ObserveRetained accepts an exact root already selected by a manifest or a
-// reviewed migration identity. The latter needs no temporary manifest and gets
-// the same roster, project, persistence and unknown-writer proofs.
+// ObserveRetained accepts an exact root already selected by its owning caller.
+// It proves the current roster, project, persistence and unknown-writer state;
+// it neither adopts a discovered root nor supplies creation provenance.
 func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, identity string) (Observation, error) {
 	if service.Store == nil || service.Client == nil {
 		return Observation{}, errors.New("retained observation runtime is unavailable")
@@ -94,6 +95,17 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 			active[rootThreadID] = ""
 		}
 		add := func(address, thread, project string, state workspacecodex.ArchiveState) error {
+			archiveState := ""
+			switch state {
+			case workspacecodex.ArchiveActive:
+				archiveState = "active"
+			case workspacecodex.ArchiveFresh:
+				archiveState = "fresh"
+			case workspacecodex.ArchiveArchived:
+				archiveState = "archived"
+			default:
+				return errors.New("retained archival state is unknown")
+			}
 			observation, err := observer.ObserveThreadIdentity(ctx, thread, cwd, project, state)
 			if err != nil {
 				return err
@@ -102,7 +114,7 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 				return errors.New("retained observation returned invalid subject evidence")
 			}
 			result.Subjects = append(result.Subjects, ObservationSubject{Address: address, ThreadID: thread, ProjectID: project,
-				ActivityToken: observation.ActivityToken, LastActivityAt: observation.LastActivityAt, Idle: observation.Idle})
+				ActivityToken: observation.ActivityToken, LastActivityAt: observation.LastActivityAt, Idle: observation.Idle, ArchiveState: archiveState})
 			result.Idle = result.Idle && observation.Idle
 			result.Diagnostics = append(result.Diagnostics, observation.Diagnostics...)
 			return nil
@@ -148,8 +160,14 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 		}
 		for _, member := range after.Members {
 			if member.State != "removed" {
-				if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+				archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+				if err != nil {
 					return err
+				}
+				for _, subject := range result.Subjects {
+					if subject.ThreadID == member.Thread && archived != (subject.ArchiveState == "archived") {
+						return errors.New("retained member archival state changed during observation")
+					}
 				}
 			}
 		}
@@ -169,7 +187,7 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 		if !allDates {
 			result.LastActivityAt = nil
 		}
-		result.ActivityToken = workspacecodex.ObservationToken([]any{1, identities, result.Subjects})
+		result.ActivityToken = retainedActivityToken(identities, result.Subjects)
 		return nil
 	})
 	if err != nil {
@@ -181,6 +199,16 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 		result.Unknown(code, "Exact retained conversation activity cannot be verified.")
 	}
 	return result, nil
+}
+
+// Archival state is separate identity evidence. Preserve the existing
+// semantic payload so adding this evidence never restarts ordinary grace.
+func retainedActivityToken(identities [][3]string, subjects []ObservationSubject) string {
+	activity := append([]ObservationSubject(nil), subjects...)
+	for i := range activity {
+		activity[i].ArchiveState = ""
+	}
+	return workspacecodex.ObservationToken([]any{1, identities, activity})
 }
 
 // RequireNoRoster treats even an empty retained roster as threadless residue.

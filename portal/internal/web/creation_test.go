@@ -798,7 +798,7 @@ printf '{"slug":"2026-09-12-plan-retry"}\n'
 	}
 	t.Setenv("CREATION_STARTED", started)
 	t.Setenv("CREATION_RELEASE", release)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	body := fmt.Sprintf(`{"action":"new","name":"plan-retry","creationDate":"2026-09-12","planTurnId":"approved","planText":%q,"planSha256":%q,"model":"model-1","reasoningEffort":"high"}`, plan, planDigest(plan))
 	response := postCreation(t, server, "/api/sessions/source/implement-plan", body, "application/json")
 	if response.Code != http.StatusAccepted {
@@ -904,7 +904,7 @@ func TestCreationReconcilesDeployedUntrimmedPlanReceipt(t *testing.T) {
 	if err := server.loadCreations(); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = filepath.Join(t.TempDir(), "must-not-run")
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, filepath.Join(t.TempDir(), "must-not-run"))
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/deployed-plan/creation", nil))
 	if response.Code != http.StatusOK {
@@ -1653,7 +1653,7 @@ func TestCreationBoundForkJournalRecoversWithoutItsSource(t *testing.T) {
 			t.Setenv("FORK_STARTED", marker)
 			t.Setenv("FORK_RELEASE", release)
 			t.Setenv("FORK_JOURNAL", journal)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 			response := postCreation(t, server, "/api/sessions/"+receipt.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receipt.ReceiptID), "application/json")
 			if response.Code != http.StatusAccepted {
 				t.Fatalf("retry: %d %s", response.Code, response.Body.String())
@@ -1739,7 +1739,7 @@ printf '{"slug":"2026-09-12-plan-recovery"}\n'
 			t.Setenv("PLAN_GOAL", goal)
 			t.Setenv("PLAN_STARTED", marker)
 			t.Setenv("PLAN_RELEASE", release)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 			response := postCreation(t, server, "/api/sessions/"+receipt.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receipt.ReceiptID), "application/json")
 			if response.Code != http.StatusAccepted {
 				t.Fatalf("retry: %d %s", response.Code, response.Body.String())

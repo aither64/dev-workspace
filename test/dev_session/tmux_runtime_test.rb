@@ -175,6 +175,8 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
       manifest['codex'] = {
@@ -304,6 +306,8 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
       manifest['codex'] = {
@@ -366,6 +370,8 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       assert_raises(DevSession::Error) do
         runner.recover_stale(slug, as_is: true)

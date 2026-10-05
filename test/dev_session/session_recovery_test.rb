@@ -337,6 +337,7 @@ class DevSessionTest < Minitest::Test
       )
       runner = runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
       session = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
         environment_slug: slug, socket_path: '/run/test.sock',

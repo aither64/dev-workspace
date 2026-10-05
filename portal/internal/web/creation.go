@@ -266,9 +266,7 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 	if owner != "" {
 		return nil, "", errors.New("source session is not ready for browser changes")
 	}
-	if source.Archived || source.Creation.State != "ready" ||
-		(source.Creation.GoalSHA256 != "" && !source.Creation.InitialGoalSent) || source.Codex.ThreadID == "" ||
-		source.Codex.SocketPath != s.config.CodexSocket {
+	if source.Archived || session.RequireRetainedReady(source, s.config.CodexSocket) != nil {
 		return nil, "", fmt.Errorf("%w: source session is not ready for browser changes", errSourceIdentityChanged)
 	}
 	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, slug, s.config.Workspace)
@@ -277,6 +275,11 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 	}
 	if authority.State != "ready" || authority.CodexThreadID != source.Codex.ThreadID || authority.CodexSocketPath != s.config.CodexSocket {
 		return nil, "", fmt.Errorf("%w: source session runtime identity changed", errSourceIdentityChanged)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := s.requireOrdinaryRetainedMutation(ctx, source); err != nil {
+		return nil, "", err
 	}
 	// Creation receipts and the CLI source proof retain their existing hash;
 	// lifecycle target versioning does not migrate that separate contract.
@@ -293,6 +296,8 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 // Exact-owner installation must not retire or adopt an equal-content receipt.
 // Call with operationMu and, for preparations, both destination locks held.
 func (s *Server) installCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
+	// Acceptance callers retain SH; a compatible SH status child needs no
+	// upgrade and acquires no lower locks already held by this caller.
 	if s.closing {
 		return creationReceipt{}, errors.New("portal is stopping; retry shortly")
 	}
@@ -474,8 +479,19 @@ func (s *Server) canonicalCreationConflict(receipt creationReceipt) string {
 }
 
 func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, admissionErr := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if admissionErr == nil {
+		defer unlock()
+		admissionErr = s.requireCurrentHostProfile()
+	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	if admissionErr != nil {
+		receipt, ok := s.creations[slug]
+		return receipt, ok
+	}
 	if err := s.retireAbsentCreation(slug); err != nil {
 		s.config.Logger.Printf("retire absent creation %s: %v", slug, err)
 	}
@@ -492,9 +508,6 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 			return receipt, true
 		}
 	} else if s.proveCreation(receipt) == nil {
-		if err := s.bindCreationUploads(s.operationContext, receipt); err != nil {
-			return receipt, true
-		}
 		receipt.State = "ready"
 		receipt.Phase = "Session is ready."
 		receipt.Error = ""
@@ -504,6 +517,16 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 		receipt.Error = "Choose another name to start the earlier request."
 	} else {
 		return receipt, true
+	}
+	// Cached reads add no owner query. Only a positively identified durable
+	// reconciliation gets fresh reservation admission and upload binding.
+	if receipt.State == "ready" {
+		if err := s.proveCreation(receipt); err != nil {
+			return s.creations[slug], true
+		}
+		if err := s.bindCreationUploads(ctx, receipt); err != nil {
+			return s.creations[slug], true
+		}
 	}
 	receipt.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := s.saveCreation(receipt); err != nil {
@@ -709,6 +732,16 @@ func rosterMatchesDirectTeam(roster teamruntime.Roster, preset teamruntime.Prese
 }
 
 func (s *Server) updateCreation(receipt creationReceipt) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	current := s.creations[receipt.Request.Slug]

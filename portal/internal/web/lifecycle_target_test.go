@@ -79,7 +79,7 @@ func browserLifecycleHelper(t *testing.T, server *Server) string {
 		t.Fatal(err)
 	}
 	t.Setenv("BROWSER_ARGUMENTS", arguments)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	return arguments
 }
 
@@ -487,7 +487,7 @@ func TestLifecycleTargetLegacyReviveOwningCommandResultFinishesOriginalReceipt(t
 	}
 	t.Setenv("BROWSER_PORTAL", filepath.Join(summary.Workspace, "work", "example", "portal.yml"))
 	t.Setenv("BROWSER_JOURNAL", journalPath)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	response := retryBrowserOperation(server, operation)
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("owned legacy retry = %d %s", response.Code, response.Body.String())
@@ -569,7 +569,7 @@ func TestLifecycleTargetAttemptRejectsLateResultWithTheSameReceipt(t *testing.T)
 	}
 	t.Setenv("BROWSER_STARTED", started)
 	t.Setenv("BROWSER_RELEASE", release)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	defer func() { _ = os.WriteFile(release, nil, 0o600); server.operationWG.Wait() }()
 	response := retryBrowserOperation(server, operation)
 	if response.Code != http.StatusAccepted {

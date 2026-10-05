@@ -212,9 +212,22 @@ module WorkspaceAutoArchive
     end
 
     def auto_archive_status(slug)
-      state = auto_archive_current_state(slug)
+      state = begin
+        auto_archive_current_state(slug)
+      rescue StandardError
+        { 'slug' => slug, 'lifecycle' => 'unknown', 'identity_kind' => 'unknown',
+          'activity_known' => false, 'eligible' => false, 'repair_needed' => true, 'hold' => false,
+          'diagnostics' => [Policy.diagnostic('legacy_record_invalid', 'legacy_format',
+            'Tracking or cached archival state is invalid; repair unresolved metadata offline.')] }
+      end
       policy = auto_archive_store.policy
       diagnostics = Array(state['diagnostics']).reject { |entry| %w[policy hold observation_stale].include?(entry['category']) }
+      begin
+        manifest = load_portal_manifest(File.join(auto_archive_tracking_directory(slug), 'portal.yml'), required: true, expected_slug: slug)
+        require_ordinary_manifest_ready!(slug, manifest)
+      rescue DevSession::Error, SystemCallError
+        diagnostics << Policy.diagnostic('manifest_unverified', 'legacy_format', 'Explicit ordinary tracking is required; repair unresolved metadata offline before using this session.')
+      end
       diagnostics << Policy.diagnostic('policy_disabled', 'policy', 'Automatic archival is disabled.') unless policy['enabled']
       diagnostics << Policy.diagnostic('keep_open', 'hold', 'Keep open is enabled.') if state['hold']
       if state['journal'] || state['operation']
@@ -229,7 +242,11 @@ module WorkspaceAutoArchive
       end
       state['activity_known'] = false unless state['activity_known'] == true
       state['eligible'] = !!(state['eligible'] && state['activity_known'] && policy['enabled'] && !state['hold'] && diagnostics.empty?)
-      state.merge('enabled' => policy['enabled'], 'diagnostics' => diagnostics,
+      state.delete('legacy_migration')
+      state.delete('migration_needed')
+      state.merge('schema' => 1, 'workspace' => workspace, 'slug' => slug,
+                  'repair_needed' => diagnostics.any? { |entry| entry['category'] == 'legacy_format' },
+                  'enabled' => policy['enabled'], 'diagnostics' => diagnostics,
                   'blockers' => diagnostics.map { |entry| entry['message'] })
     end
 
@@ -249,10 +266,10 @@ module WorkspaceAutoArchive
         auto_archive_status(slug)
       rescue StandardError
         { 'slug' => slug, 'lifecycle' => 'unknown', 'identity_kind' => 'unknown',
-          'activity_known' => false, 'eligible' => false, 'migration_needed' => true,
+          'activity_known' => false, 'eligible' => false, 'repair_needed' => true,
           'hold' => false, 'diagnostics' => [Policy.diagnostic('legacy_record_invalid', 'legacy_format',
-            'Tracking or cached archival state is invalid; review this record before normalization.')],
-          'blockers' => ['Tracking or cached archival state is invalid; review this record before normalization.'] }
+            'Tracking or cached archival state is invalid; repair unresolved metadata offline.')],
+          'blockers' => ['Tracking or cached archival state is invalid; repair unresolved metadata offline.'] }
       end
       counts = { 'total' => rows.length, 'eligible' => 0, 'held' => 0, 'unknown_activity' => 0, 'pending' => 0 }
       rows.each do |row|
@@ -332,8 +349,12 @@ module WorkspaceAutoArchive
       Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, root_thread_id]))
     end
 
+    def auto_archive_tracking_directory(slug)
+      File.directory?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug)
+    end
+
     def auto_archive_current_state(slug)
-      tracking = File.directory?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug)
+      tracking = auto_archive_tracking_directory(slug)
       manifest = load_portal_manifest(File.join(tracking, 'portal.yml'), required: true, expected_slug: slug)
       root = manifest.dig('codex', 'thread_id')
       identity = auto_archive_tracking_identity(slug, tracking, root)
@@ -359,7 +380,7 @@ module WorkspaceAutoArchive
       end
       state.merge('slug' => slug, 'identity' => identity, 'root_thread_id' => root,
                   'identity_kind' => root ? 'retained' : 'threadless', 'lifecycle' => lifecycle,
-                  'migration_needed' => false, 'journal' => journal)
+                  'repair_needed' => false, 'journal' => journal)
     end
 
     def auto_archive_scan_session(slug, dry_run:, transition:, observation:)
@@ -403,10 +424,12 @@ module WorkspaceAutoArchive
           auto_archive_store.lock do
             state = auto_archive_store.session(slug)
             diagnostic = if e.is_a?(ObservationFailure)
-                           state['continuity_lost'] = true
-                           state['idle_since'] = nil
-                           state['eligible_at'] = nil
-                           state['activity_known'] = false
+                           if e.category == 'activity_unknown'
+                             state['continuity_lost'] = true
+                             state['idle_since'] = nil
+                             state['eligible_at'] = nil
+                             state['activity_known'] = false
+                           end
                            Policy.diagnostic(e.code, e.category, e.message)
                          else
                            Policy.diagnostic('archive_proof_failed', 'tracking', 'Archival proof failed; retry after resolving the recorded failure.')
@@ -546,9 +569,7 @@ module WorkspaceAutoArchive
         raise ObservationFailure.new('manifest_unverified', 'A normalized manifest is required to verify conversation activity.')
       end
       root = manifest.dig('codex', 'thread_id')
-      if root && manifest.dig('creation', 'state') != 'ready'
-        raise ObservationFailure.new('creation_unfinished', 'Session creation is unfinished.')
-      end
+      require_ordinary_manifest_ready!(slug, manifest)
       identity = auto_archive_tracking_identity(slug, work_dir(slug), root)
       activity = auto_archive_session_observation(slug, identity)
       if activity['activityKnown'] && root && !activity['subjects'].any? { |subject| subject['address'] == 'lead' && subject['threadId'] == root }
@@ -625,10 +646,14 @@ module WorkspaceAutoArchive
         'blockers' => diagnostics.map { |entry| entry.fetch('message') } }
     end
 
-    def auto_archive_session_observation(slug, identity, operation_id: nil, archive_mode: nil)
+    def auto_archive_session_observation(slug, identity, operation_id: nil, archive_mode: nil, start_tmux_identity: nil, revive_operation_id: nil)
       unless (!operation_id && !archive_mode) ||
              (operation_id.is_a?(String) && operation_id.match?(/\A[0-9a-f]{64}\z/) && %w[complete abandoned].include?(archive_mode))
         raise ObservationFailure.new('operation_invalid', 'Archive observation needs its exact operation and mode together.')
+      end
+      unless [start_tmux_identity, revive_operation_id].all? { |value| value.nil? || value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/) } &&
+             (!operation_id || !start_tmux_identity && !revive_operation_id)
+        raise ObservationFailure.new('operation_invalid', 'Retained observation context is invalid or conflicts with archive.')
       end
       unless @portal_command && @codex_socket && @authority_dir && @env['DEV_WORKSPACE_CODEX_HOME']
         raise ObservationFailure.new('observer_unavailable', 'Conversation activity reader is unavailable.')
@@ -637,6 +662,8 @@ module WorkspaceAutoArchive
                  '--socket', @codex_socket, '--user-state-root', @workspace_state_root,
                  '--authority-dir', @authority_dir, '--codex-home', @env['DEV_WORKSPACE_CODEX_HOME']]
       command += ['--expected-operation-id', operation_id, '--expected-archive-mode', archive_mode] if operation_id
+      command += ['--expected-start-tmux-identity', start_tmux_identity] if start_tmux_identity
+      command += ['--expected-revive-operation-id', revive_operation_id] if revive_operation_id
       output, = @command_runner.capture(command)
       activity = JSON.parse(output)
       valid = activity.is_a?(Hash) && activity['schema'] == 1 && activity['workspace'] == workspace &&
@@ -647,10 +674,11 @@ module WorkspaceAutoArchive
                 activity['lastActivityAt'].positive? && activity['lastActivityAt'] <= Time.now.to_i)) &&
               activity['subjects'].is_a?(Array) && activity['subjects'].length <= 128 &&
               activity['subjects'].all? do |subject|
-                subject.is_a?(Hash) && (subject.keys - %w[address threadId projectId activityToken lastActivityAt idle]).empty? &&
+                subject.is_a?(Hash) && (subject.keys - %w[address threadId projectId activityToken lastActivityAt idle archiveState]).empty? &&
                   %w[address threadId].all? { |key| subject[key].is_a?(String) && subject[key].bytesize.between?(1, 256) && !subject[key].match?(/[[:cntrl:]]/) } &&
                   subject['activityToken'].is_a?(String) && subject['activityToken'].match?(/\A[0-9a-f]{64}\z/) &&
                   [true, false].include?(subject['idle']) &&
+                  (!subject.key?('archiveState') || %w[active fresh archived].include?(subject['archiveState'])) &&
                   (subject['lastActivityAt'].nil? || (subject['lastActivityAt'].is_a?(Integer) && subject['lastActivityAt'].positive? && subject['lastActivityAt'] <= Time.now.to_i))
               end &&
               activity['diagnostics'].is_a?(Array) && activity['diagnostics'].length <= 512 &&

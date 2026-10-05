@@ -632,7 +632,7 @@ func TestLifecycleOperationRetryUsesPersistedOptions(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("ARGUMENTS", arguments)
-			server.config.DevSession = helper
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			options := testCase.options
 			options.TargetID = deletionTargetForTest(t, server, "example")

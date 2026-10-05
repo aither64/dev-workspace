@@ -896,13 +896,14 @@ module DevSession
         goal_pending = false
         start_unmaterialized = false
         runtime_journal = nil
+        revive_runtime_journal = nil
 
         selected_session = with_slug_lock(slug) do
           guard_portal_preparation_reservation!(slug, receipt)
           preparation_started = creation_progress_begin('prepare')
           select_tmux_for_slug!(slug)
           if lifecycle_operation == 'revive'
-            prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
+            revive_runtime_journal = prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
           end
           prepare_portal_creation_receipt!(
             receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:, team_binding:, direct_team:
@@ -949,7 +950,7 @@ module DevSession
           elsif creation_journal
             validate_creation_tracking_files!(slug)
           end
-          manifest = ensure_portal_manifest(slug, creation_journal:)
+          manifest = ensure_portal_manifest(slug, creation_journal:, tracking_only: !run_codex && creation_journal.nil?)
           if creation_journal&.fetch('preserve_tracking', false) &&
              manifest.dig('codex', 'thread_id').to_s.empty? &&
              manifest.dig('creation', 'goal_sha256').nil?
@@ -1019,20 +1020,23 @@ module DevSession
             thread_id = nil
           end
           if run_codex && (thread_id.nil? || thread_id.empty?) &&
-             manifest.dig('creation', 'state') == 'ready' && selected &&
+             (!manifest.key?('creation') || manifest.dig('creation', 'state') == 'ready') && selected &&
              managed_by_workspace?(selected) && creation_journal.nil?
             raise Error,
                   "existing tmux session has no shared Codex thread; stop it before enabling portal interaction: #{slug}"
           end
           persisted_thread = manifest.dig('codex', 'thread_id')
+          if persisted_thread && !manifest.key?('creation')
+            require_creationless_retained_ready!(slug, manifest, start_journal: runtime_journal, revive_journal: revive_runtime_journal)
+          end
           recover_archived_thread = run_codex && persisted_thread &&
-                                    manifest.dig('creation', 'tracking_origin') == 'revived'
+                                    (lifecycle_operation == 'revive' || manifest.dig('creation', 'tracking_origin') == 'revived')
           lead_instructions = direct_team&.fetch('leadInstructions', nil)
           if lead_instructions.nil? && recover_archived_thread
             lead_instructions = frozen_direct_team_lead_instructions(slug, persisted_thread)
           end
           if run_codex && persisted_thread &&
-             manifest.dig('creation', 'state') == 'ready'
+             (!manifest.key?('creation') || manifest.dig('creation', 'state') == 'ready')
             require_current_codex_provenance!(slug, manifest, persisted_thread)
             if @portal_command && codex_provenance_configured?
               unless recover_archived_thread
@@ -1126,7 +1130,7 @@ module DevSession
                        selected = ensure_managed_session!(slug, session: selected)
                        if run_codex
                          goal_pending ? quiesce_native_client!(slug, selected) :
-                           reconcile_native_client!(slug, selected)
+                           reconcile_native_client!(slug, selected, start_journal: runtime_journal, revive_journal: revive_runtime_journal)
                        else
                          selected
                        end
@@ -1136,6 +1140,9 @@ module DevSession
                          slug,
                          preferred_identity: creation_journal&.fetch('tmux_identity', nil)
                        )
+                       if persisted_thread && !manifest.key?('creation')
+                         require_creationless_retained_ready!(slug, manifest, start_journal: runtime_journal, revive_journal: revive_runtime_journal)
+                       end
                        create_tmux_session(
                          slug,
                          run_codex:,
@@ -1163,12 +1170,12 @@ module DevSession
           if recover_archived_thread && !goal_pending
             write_session_authority(slug, selected, state: 'ready')
           end
-          manifest['creation']['state'] = goal_pending ? 'creating' : 'ready'
+          manifest['creation']['state'] = goal_pending ? 'creating' : 'ready' if manifest.key?('creation')
           unless goal_pending
             manifest['codex'] = codex_metadata(thread_id) if recover_archived_thread
-            clear_preserved_tracking_metadata!(manifest) if recover_archived_thread
+            clear_preserved_tracking_metadata!(manifest) if recover_archived_thread && manifest.key?('creation')
             manifest['schema'] = 1
-            manifest['creation'].delete('initial_goal_attempted')
+            manifest['creation'].delete('initial_goal_attempted') if manifest.key?('creation')
           end
           write_portal_manifest(slug, manifest)
           if goal_pending
@@ -1329,12 +1336,13 @@ module DevSession
                                     "source session has no Codex conversation: #{source_slug}"
                             end
                             creation = manifest.fetch('creation', {})
-                            if creation['state'] != 'ready' ||
-                               (creation['goal_sha256'] && !creation['initial_goal_sent'])
+                            if manifest.key?('creation') && (creation['state'] != 'ready' ||
+                               (creation['goal_sha256'] && !creation['initial_goal_sent']))
                               raise Error,
                                     "source session creation is incomplete: #{source_slug}"
                             end
                             require_current_codex_provenance!(source_slug, manifest, thread_id)
+                            require_creationless_retained_ready!(source_slug, manifest) unless manifest.key?('creation')
                             if @portal_command && codex_provenance_configured?
                               require_portal_thread_materialized(source_slug, thread_id)
                             end
@@ -1565,6 +1573,7 @@ module DevSession
     def sync(input, as_is:)
       slug = lookup_slug(input, as_is:)
       with_slug_lock(slug) do
+        require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
         select_tmux_for_slug!(slug)
         reject_conflicting_lifecycle_journal!(slug)
         session = sync_slug(slug, require_session: true)
@@ -1660,6 +1669,9 @@ module DevSession
 	end
 
 	def require_team_creation_ready!(slug)
+      manifest = load_portal_manifest(portal_file(slug), required: true, expected_slug: slug)
+      require_ordinary_manifest_ready!(slug, manifest)
+      require_creationless_retained_ready!(slug, manifest) if !manifest.key?('creation') && manifest.dig('codex', 'thread_id')
 	  workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
 	  path = File.join(@workspace_state_root, 'portal', workspace_id, 'creations', "#{slug}.json")
 	  return unless path_exists?(path)
@@ -1785,7 +1797,8 @@ module DevSession
           prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
           automatic&.call(journal || prepared)
           unless journal
-            source = validate_work_directory!(slug)
+            require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
+              source = validate_work_directory!(slug)
             destination = archive_dir(slug)
             raise Error, "archive already exists: #{destination}" if path_exists?(destination)
 
@@ -1949,6 +1962,7 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug, operation: 'revive')
           current = load_revive_journal(slug, operation_id:)
           unless current
+            require_ordinary_manifest_ready!(slug, load_portal_manifest(File.join(archive_dir(slug), PORTAL_MANIFEST), required: true, expected_slug: slug))
             lifecycle = lifecycle_state(
               read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
             )
@@ -1999,7 +2013,7 @@ module DevSession
             exclusive: false,
             allow_empty_thread: journal.fetch('legacy_without_portal'),
             lifecycle_operation: 'revive',
-            lifecycle_operation_id: operation_id
+            lifecycle_operation_id: journal.fetch('operation_id')
           )
         else
           with_creation_lock(slug) do
@@ -2294,6 +2308,9 @@ module DevSession
           raise Error, 'worktree name "workspace" is reserved for the workspace repository'
         end
 
+        if slug_state_exists?(slug)
+          require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
+        end
         ensure_tracking_files(slug)
 
         repo = repository_common_dir(project)
@@ -2305,7 +2322,7 @@ module DevSession
         path = File.join(worktrees_dir(slug), name)
         ensure_worktree_group!(slug, create: true)
 
-        manifest = ensure_portal_manifest(slug)
+        manifest = ensure_portal_manifest(slug, tracking_only: true)
         registered = manifest.fetch('repositories', []).find do |item|
           item.is_a?(Hash) && item['name'] == name
         end
@@ -2319,8 +2336,11 @@ module DevSession
             raise Error, "portal repository registration conflicts with worktree #{name}"
           end
           base_sha = registered['initial_base_sha']
-          unless base_sha&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
-            raise Error, "portal repository has no initial base commit: #{name}"
+          unless branch_exists?(repo, branch)
+            raise Error, "retained registered branch is missing: #{branch}; recover its exact ref before re-adding"
+          end
+          if requested_base && (!base_sha || resolve_commit(repo, requested_base) != base_sha)
+            raise Error, 'a retained historical base requires authoritative recorded evidence; --base cannot establish it'
           end
           default_branch = registered.fetch('default_branch', default_branch.delete_prefix('origin/'))
         else
@@ -2346,7 +2366,7 @@ module DevSession
 
           unless registered
             head_sha = git_capture(['git', '-C', path, 'rev-parse', 'HEAD']).strip
-            unless head_sha == base_sha
+            unless base_sha.nil? || head_sha == base_sha
               raise Error, "unregistered worktree has advanced from its recoverable base: #{path}"
             end
             update_portal_repository(
@@ -3088,49 +3108,49 @@ module DevSession
         return actual
       end
 
-      if goal_file && adoptable_tracking_for_conversation?(slug)
-        manifest = load_portal_manifest(portal_file(slug), required: false)
-        origin = manifest&.dig('creation', 'tracking_origin')
-        origin = 'retained' if origin.to_s.empty?
-        plan_sha256 = Digest::SHA256.hexdigest(read_bounded_file(plan_file(slug), 'plan.md'))
-        state_sha256 = Digest::SHA256.hexdigest(read_bounded_file(state_file(slug), 'state.md'))
-        if origin == 'revived'
-          validate_preserved_tracking_for_conversation!(slug, manifest, verify_content: true)
-          unless valid_uncommitted_revive?(slug) || committed_revived_tracking?(slug)
-            raise Error, "revived tracking provenance cannot be proven: #{slug}"
-          end
-        elsif origin == 'retained'
-          unless committed_retained_tracking?(slug)
-            raise Error,
-                  "retained plan, state, and portal absence must match the committed tree: #{slug}"
-          end
-        else
-          raise Error, "unsupported preserved tracking origin #{origin.inspect}: #{slug}"
+      if slug_state_exists?(slug)
+        manifest = load_portal_manifest(portal_file(slug), required: true)
+        require_ordinary_manifest_ready!(slug, manifest)
+        if manifest.dig('codex', 'thread_id') && !manifest.key?('creation')
+          raise Error, "a retained conversation cannot receive a new initial request: #{slug}" if goal_file
+          raise Error, "retained conversation requires Codex resume: #{slug}" unless run_codex
+          return nil
         end
-        unless run_codex
-          raise Error, "restarting retained tracking requires a Codex conversation: #{slug}"
+        if !manifest.key?('creation') && goal_file
+          unless run_codex && committed_ordinary_tracking?(slug)
+            raise Error, "explicit tracking must match its committed baseline before conversation creation: #{slug}"
+          end
+          identity = auto_archive_tracking_identity(slug, work_dir(slug), nil)
+          observation = auto_archive_session_observation(slug, identity)
+          unless observation['activityKnown'] && observation['idle'] && observation['subjects'].empty?
+            raise Error, "threadless conversation absence cannot be verified before creation: #{slug}"
+          end
+          journal = expected.merge(
+            'state' => 'creating', 'tmux_identity' => SecureRandom.hex(32),
+            'preserve_tracking' => true, 'tracking_origin' => 'retained',
+            'tracking_plan_sha256' => Digest::SHA256.hexdigest(read_bounded_file(plan_file(slug), 'plan.md')),
+            'tracking_state_sha256' => Digest::SHA256.hexdigest(read_bounded_file(state_file(slug), 'state.md'))
+          )
+          write_creation_journal(path, journal, create: true)
+          return journal
         end
-        journal = expected.merge(
-          'state' => 'creating',
-          'tmux_identity' => SecureRandom.hex(32),
-          'preserve_tracking' => true,
-          'tracking_origin' => origin,
-          'tracking_plan_sha256' => plan_sha256,
-          'tracking_state_sha256' => state_sha256
-        )
-        write_creation_journal(path, journal, create: true)
-        return journal
+      end
+
+      if goal_file && slug_state_exists?(slug) && !load_portal_manifest(portal_file(slug), required: true).dig('codex', 'thread_id')
+        raise Error, "present conversationless creation evidence cannot be adopted; repair tracking offline: #{slug}"
       end
 
       if slug_state_exists?(slug)
         raise Error, "dev session already exists: #{slug}" if exclusive
 
         manifest = load_portal_manifest(portal_file(slug), required: false)
-        if manifest && manifest.dig('creation', 'state') != 'ready'
+        if manifest && manifest.key?('creation') && manifest.dig('creation', 'state') != 'ready'
           raise Error, "dev session creation is incomplete: #{slug}"
         end
         return nil
       end
+
+      return nil if !run_codex && !goal_file
 
       journal = expected.merge(
         'state' => 'creating',
@@ -3428,7 +3448,7 @@ module DevSession
         journal['state'] == 'ready' && completed_creation_manifest?(manifest)
     end
 
-    def committed_revived_tracking?(slug)
+    def committed_ordinary_tracking?(slug)
       %w[plan.md state.md portal.yml].all? do |name|
         path = File.join('work', slug, name)
         next false unless committed_path?('HEAD', path)
@@ -3437,25 +3457,6 @@ module DevSession
           'git', '-C', workspace, 'show', "HEAD:#{path}"
         ]).b
       end
-    rescue Error, Errno::ENOENT
-      false
-    end
-
-    def committed_retained_tracking?(slug)
-      return false if archived_slug_known?(slug)
-
-      tracking_matches = %w[plan.md state.md].all? do |name|
-        path = File.join('work', slug, name)
-        next false unless committed_path?('HEAD', path)
-
-        File.binread(File.join(workspace, path)) == git_capture([
-          'git', '-C', workspace, 'show', "HEAD:#{path}"
-        ]).b
-      end
-      return false unless tracking_matches
-
-      relative_portal = File.join('work', slug, PORTAL_MANIFEST)
-      !path_exists?(portal_file(slug)) && !committed_path?('HEAD', relative_portal)
     rescue Error, Errno::ENOENT
       false
     end
@@ -3477,33 +3478,6 @@ module DevSession
       PRESERVED_MANIFEST_TRACKING_KEYS.all? do |key|
         creation[key] == journal[key]
       end
-    end
-
-    def adoptable_tracking_for_conversation?(slug)
-      return false unless path_exists?(work_dir(slug))
-      return false if path_exists?(archive_dir(slug)) || @tmux.session(slug)
-
-      manifest = load_portal_manifest(portal_file(slug), required: false)
-      lifecycle = validate_tracking_files!(slug)
-      unless lifecycle == 'active'
-        raise Error, "cannot create a conversation for a #{lifecycle} initiative: #{slug}"
-      end
-
-      unless manifest
-        if archived_slug_known?(slug)
-          raise Error, "archived slug must be restored with dev-session revive: #{slug}"
-        end
-        return true
-      end
-
-      eligible = manifest.dig('creation', 'state') == 'ready' &&
-                 manifest.dig('codex', 'thread_id').to_s.empty? &&
-                 manifest.dig('creation', 'goal_sha256').nil?
-      return false unless eligible
-      return true if manifest.dig('creation', 'tracking_origin') == 'revived'
-
-      raise Error,
-            "retained active tracking with a portal manifest cannot be adopted: #{slug}"
     end
 
     def validate_preserved_tracking_for_conversation!(slug, manifest, verify_content:)
@@ -3685,10 +3659,11 @@ module DevSession
       unless stat.directory? && receipt['source'] == slug &&
              manifest.dig('codex', 'thread_id') == receipt.fetch('source_thread') &&
              identity == receipt.fetch('source_identity') &&
-             manifest.dig('creation', 'state') == 'ready' &&
-             (!manifest.dig('creation', 'goal_sha256') || manifest.dig('creation', 'initial_goal_sent'))
+             (!manifest.key?('creation') || manifest.dig('creation', 'state') == 'ready' &&
+               (!manifest.dig('creation', 'goal_sha256') || manifest.dig('creation', 'initial_goal_sent')))
         raise Error, 'source session changed since creation was accepted'
       end
+      require_creationless_retained_ready!(slug, manifest) unless manifest.key?('creation')
     end
 
     def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:, team_binding: nil, direct_team: nil)
@@ -4103,10 +4078,118 @@ module DevSession
       "#{@portal_url}/#{slug}/"
     end
 
-    def ensure_portal_manifest(slug, creation_journal: nil)
+    # This is ordinary manifest readiness, not historical scope reconstruction.
+    # Present creation evidence never falls back to creation-less readiness.
+    def require_ordinary_manifest_ready!(slug, manifest)
+      unless manifest && manifest['schema'] == 1
+        raise Error, "explicit ordinary tracking is required; repair unresolved metadata offline: #{slug}"
+      end
+      if manifest.key?('creation')
+        creation = manifest.fetch('creation')
+        unless creation.is_a?(Hash) && creation['state'] == 'ready' &&
+               (!creation['goal_sha256'] || creation['initial_goal_sent'] == true)
+          raise Error, "session creation is incomplete: #{slug}"
+        end
+        return manifest
+      end
+      unless %w[repositories artifacts].all? { |key| manifest[key].is_a?(Array) } &&
+             !manifest.key?('forked_from')
+        raise Error, "explicit ordinary tracking scope is required: #{slug}"
+      end
+      root = manifest.dig('codex', 'thread_id')
+      if root
+        unless root.is_a?(String) && !root.empty? &&
+               valid_socket_path?(manifest.dig('codex', 'socket_path')) &&
+               manifest.dig('codex', 'client_version').is_a?(String) &&
+               !manifest.dig('codex', 'client_version').empty?
+          raise Error, "complete retained Codex provenance is required: #{slug}"
+        end
+      elsif manifest.key?('codex')
+        raise Error, "threadless tracking cannot contain a Codex placeholder: #{slug}"
+      end
+      manifest
+    end
+
+    # Exact start/revive coordinates come only from their loaded owners. This
+    # positive proof permits known busy attachment; archive has its own idle gate.
+    def require_creationless_retained_ready!(slug, manifest, start_journal: nil, revive_journal: nil)
+      require_ordinary_manifest_ready!(slug, manifest)
+      root = manifest.dig('codex', 'thread_id')
+      raise Error, "creation-less retained root is required: #{slug}" if manifest.key?('creation') || !root
+      require_current_codex_provenance!(slug, manifest, root)
+      identity = auto_archive_tracking_identity(slug, work_dir(slug), root)
+      authority = @selected_authority&.dup
+      check = lambda do
+        current = load_portal_manifest(portal_file(slug), required: true)
+        unless !current.key?('creation') && current['codex'] == manifest['codex'] &&
+               auto_archive_tracking_identity(slug, work_dir(slug), current.dig('codex', 'thread_id')) == identity
+          raise Error, "retained tracking identity changed: #{slug}"
+        end
+        require_ordinary_manifest_ready!(slug, current)
+        require_current_codex_provenance!(slug, current, root)
+        if start_journal && load_start_journal(slug) != start_journal
+          raise Error, "start journal changed during retained readiness: #{slug}"
+        end
+        if revive_journal
+          current_revive = load_revive_journal(slug, operation_id: revive_journal.fetch('operation_id'))
+          unless current_revive == revive_journal && current_revive['phase'] == 'runtime_starting' &&
+                 !current_revive['legacy_without_portal'] && current_revive['retained_thread_id'] == root
+            raise Error, "revive journal changed during retained readiness: #{slug}"
+          end
+          verify_committed_revive_tracking!(slug, current_revive)
+        end
+        if @authority_dir && (path_exists?(authority_file(slug)) || authority)
+          current_authority = load_session_authority(slug, required: false)
+          unless current_authority == authority && current_authority &&
+                 current_authority['codex_thread_id'] == root &&
+                 current_authority['codex_socket_path'] == manifest.dig('codex', 'socket_path') &&
+                 current_authority['codex_client_version'] == manifest.dig('codex', 'client_version')
+            raise Error, "retained runtime authority changed: #{slug}"
+          end
+        end
+        live = cleanup_session(slug)
+        if live
+          unless managed_by_workspace?(live) && live.codex_thread_id == root &&
+                 live.codex_socket_path == manifest.dig('codex', 'socket_path') &&
+                 live.codex_client_version == manifest.dig('codex', 'client_version') &&
+                 (!start_journal || live.identity_token == start_journal.fetch('tmux_identity'))
+            raise Error, "live tmux does not match retained conversation: #{slug}"
+          end
+          validate_authority_session!(slug, live) if authority
+        end
+      end
+      check.call
+      observation = auto_archive_session_observation(
+        slug, identity, start_tmux_identity: start_journal&.fetch('tmux_identity'),
+        revive_operation_id: revive_journal&.fetch('operation_id')
+      )
+      unless observation['activityKnown'] && observation['subjects'].any? { |subject| subject['address'] == 'lead' && subject['threadId'] == root }
+        raise Error, "retained conversation or submission readiness cannot be verified: #{slug}"
+      end
+      check.call
+      observation
+    end
+
+    def new_threadless_portal_manifest(slug)
+      { 'schema' => 1, 'slug' => slug, 'repositories' => [], 'artifacts' => [] }
+    end
+
+    def ensure_portal_manifest(slug, creation_journal: nil, tracking_only: false)
       path = portal_file(slug)
       manifest = load_portal_manifest(path, required: false)
       if manifest
+        if creation_journal&.fetch('preserve_tracking', false) && !manifest.key?('creation')
+          require_ordinary_manifest_ready!(slug, manifest)
+          unless !manifest.key?('codex') &&
+                 creation_journal['tracking_origin'] == 'retained' &&
+                 Digest::SHA256.hexdigest(read_bounded_file(plan_file(slug), 'plan.md')) == creation_journal['tracking_plan_sha256'] &&
+                 Digest::SHA256.hexdigest(read_bounded_file(state_file(slug), 'state.md')) == creation_journal['tracking_state_sha256']
+            raise Error, "explicit threadless tracking changed before conversation creation: #{slug}"
+          end
+          manifest['schema'] = 2
+          manifest['creation'] = new_portal_manifest(slug, creation_journal:).fetch('creation')
+          write_portal_manifest(slug, manifest)
+        end
         if creation_journal&.fetch('preserve_tracking', false) &&
            !completed_creation_manifest?(manifest) &&
            !preserved_manifest_matches_journal?(manifest, creation_journal)
@@ -4115,7 +4198,7 @@ module DevSession
         return manifest
       end
 
-      manifest = new_portal_manifest(slug, creation_journal:)
+      manifest = tracking_only ? new_threadless_portal_manifest(slug) : new_portal_manifest(slug, creation_journal:)
       write_portal_manifest(slug, manifest)
       manifest
     end
@@ -4381,11 +4464,9 @@ module DevSession
         Time.iso8601(finalized_at)
 
         manifest.fetch('repositories', []).each do |repository|
-          unless %w[initial_base_sha final_head_sha].all? do |key|
-                   repository[key]&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
-                 end
+          unless repository['final_head_sha']&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
             raise Error,
-                  "finalized portal repository has no immutable comparison in #{path}"
+                  "finalized portal repository has no immutable final head in #{path}"
           end
         end
       end
@@ -4824,9 +4905,8 @@ module DevSession
                 "portal repository has no worktree or recorded final head: #{repository['name']}"
         end
 
-        unless repository['initial_base_sha'] && repository['final_head_sha']
-          raise Error, "portal repository has incomplete comparison metadata: #{repository['name']}"
-        end
+        # An unknown historical start stays absent. Exact final heads remain
+        # mandatory; the comparison owner may use an existing saved exact pair.
       end
       manifest['finalized_at'] = finalized_at
       validate_portal_manifest!(manifest, slug, portal_file(slug))
@@ -5125,30 +5205,11 @@ module DevSession
 
     def existing_branch_base(repository, branch, requested_base, default_branch)
       if requested_base
-        base = resolve_commit(repository, requested_base)
-        _stdout, _stderr, status = @command_runner.capture(
-          ['git', "--git-dir=#{repository}", 'merge-base', '--is-ancestor', base, "refs/heads/#{branch}"],
-          allow_failure: true
-        )
-        raise Error, "base #{requested_base} is not an ancestor of retained branch #{branch}" unless status.success?
-
-        return base
+        raise Error, 'a retained historical base requires reviewed structured evidence; --base selects a new branch start'
       end
-
-      stdout, stderr, status = @command_runner.capture(
-        [
-          'git', "--git-dir=#{repository}", 'merge-base', '--all',
-          "refs/heads/#{branch}", default_branch
-        ],
-        allow_failure: true
-      )
-      candidates = stdout.lines.map(&:strip).reject(&:empty?).uniq
-      unless status.success? && candidates.length == 1
-        detail = stderr.strip
-        detail = "found #{candidates.length} merge bases" if detail.empty?
-        raise Error, "cannot reconstruct initial base for retained branch #{branch}: #{detail}"
-      end
-      candidates.fetch(0)
+      # Present ancestry cannot establish the branch's original start. Keep
+      # this historical coordinate unknown when reattaching an existing ref.
+      nil
     end
 
     def record_portal_repository_head(slug, name, worktree, common_dir)
@@ -6475,9 +6536,9 @@ module DevSession
     def apply_revived_portal_transition!(manifest, slug, path, plan_sha256:, state_sha256:)
       manifest.delete('finalized_at')
       manifest.fetch('repositories', []).each { |repository| repository.delete('final_head_sha') }
-      creation = manifest.fetch('creation')
-      clear_preserved_tracking_metadata!(manifest)
-      if creation['state'] == 'ready'
+      creation = manifest['creation']
+      clear_preserved_tracking_metadata!(manifest) if creation
+      if creation && creation['state'] == 'ready'
         creation['tracking_origin'] = 'revived'
         creation['tracking_plan_sha256'] = plan_sha256
         creation['tracking_state_sha256'] = state_sha256
@@ -7445,8 +7506,7 @@ module DevSession
     end
 
     def sync_portal_repositories(slug, entries, unexpected: unexpected_worktree_entries(slug, entries))
-      manifest = load_portal_manifest(portal_file(slug), required: false)
-      return entries unless manifest
+      manifest = load_portal_manifest(portal_file(slug), required: true)
 
       repositories = manifest.fetch('repositories', [])
       by_name = repositories.to_h { |repository| [repository.fetch('name'), repository] }
@@ -8148,10 +8208,19 @@ module DevSession
         end
         return
       end
+      require_ordinary_manifest_ready!(slug, manifest)
+      require_current_codex_provenance!(slug, manifest, manifest.dig('codex', 'thread_id'))
       unless @codex_socket && valid_socket_path?(@codex_socket)
         raise Error, "Codex App Server socket is required for archive preflight: #{slug}"
       end
 
+      unless manifest.key?('creation')
+        identity = auto_archive_tracking_identity(slug, File.dirname(tracking), manifest.dig('codex', 'thread_id'))
+        observation = auto_archive_session_observation(slug, identity, operation_id: expected_operation_id, archive_mode:)
+        unless observation['activityKnown'] && observation['idle']
+          raise Error, "retained conversation readiness cannot be verified: #{slug}"
+        end
+      end
       @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) do
         team(slug, action: 'require-archive-ready', lifecycle: true)
       end
@@ -8203,10 +8272,10 @@ module DevSession
       raise Error, "unable to restore terminal Codex client for #{slug}: #{e.message}"
     end
 
-    def reconcile_native_client!(slug, session, allow_creating: false)
+    def reconcile_native_client!(slug, session, allow_creating: false, start_journal: nil, revive_journal: nil)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
-      require_reconcilable_portal_thread!(slug, session, allow_creating:)
+      require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal:, revive_journal:)
       unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
              @tmux.pane_session_id(session.codex_pane_id) == session.id
         raise Error, "managed Codex pane identity is invalid for #{slug}"
@@ -8234,7 +8303,7 @@ module DevSession
       [command_name, ".#{command_name}-wrapped"]
     end
 
-    def require_reconcilable_portal_thread!(slug, session, allow_creating:)
+    def require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal: nil, revive_journal: nil)
       return unless @portal_command && !@portal_command.empty?
 
       manifest = load_portal_manifest(portal_file(slug), required: true)
@@ -8247,11 +8316,15 @@ module DevSession
               (!creation['goal_sha256'] || creation['initial_goal_sent'])
       creating = allow_creating && creation['state'] == 'creating' &&
                  creation['initial_goal_attempted']
-      unless ready || creating
+      unless ready || creating || !manifest.key?('creation')
         raise Error, "session creation is incomplete; wait before attaching: #{slug}"
       end
 
+      require_ordinary_manifest_ready!(slug, manifest) unless creating
       require_portal_thread_materialized(slug, session.codex_thread_id)
+      unless manifest.key?('creation')
+        require_creationless_retained_ready!(slug, manifest, start_journal:, revive_journal:)
+      end
     end
 
     def send_native_client_command(session)
@@ -8892,6 +8965,7 @@ module DevSession
       )
       runner.stop(slug, as_is: true)
     end
+
 
     def run_auto_archive
       action = @argv.shift

@@ -634,6 +634,8 @@ class DevSessionTest < Minitest::Test
         env: {},
         portal_command: nil
       )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
 
       shared_runner = DevSession::Runner.new(

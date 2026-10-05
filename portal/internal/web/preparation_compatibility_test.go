@@ -46,7 +46,7 @@ func compatibilityServer(t *testing.T, initialize bool) (*Server, string) {
 			t.Fatal(err)
 		}
 	}
-	server, err := New(Config{Workspace: workspace, BaseURL: "https://workspace.example.test", DevSession: "/does-not-run/dev-session",
+	server, err := New(Config{Workspace: workspace, BaseURL: "https://workspace.example.test", DevSession: fixtureDevSessionCommand(t, workspace, "/does-not-run/dev-session"),
 		HostProfile: profile, AuthorityDir: authority, CodexSocket: "/run/test/codex.sock", CodexVersion: "0.152.1",
 		UserStateRoot: filepath.Join(root, "state"), Logger: log.New(io.Discard, "", 0)})
 	if err != nil {

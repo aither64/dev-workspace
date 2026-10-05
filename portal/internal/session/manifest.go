@@ -86,14 +86,16 @@ func AvailableArtifacts(summary *Summary) []Artifact {
 }
 
 type Manifest struct {
-	Schema       int          `yaml:"schema" json:"schema"`
-	Slug         string       `yaml:"slug" json:"slug"`
-	ForkedFrom   string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
-	Codex        Codex        `yaml:"codex,omitempty" json:"codex"`
-	Creation     Creation     `yaml:"creation,omitempty" json:"creation"`
-	Repositories []Repository `yaml:"repositories,omitempty" json:"repositories"`
-	Artifacts    []Artifact   `yaml:"artifacts,omitempty" json:"artifacts"`
-	FinalizedAt  string       `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
+	creationPresent bool
+	scopeExplicit   bool
+	Schema          int          `yaml:"schema" json:"schema"`
+	Slug            string       `yaml:"slug" json:"slug"`
+	ForkedFrom      string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
+	Codex           Codex        `yaml:"codex,omitempty" json:"codex"`
+	Creation        Creation     `yaml:"creation,omitempty" json:"creation"`
+	Repositories    []Repository `yaml:"repositories,omitempty" json:"repositories"`
+	Artifacts       []Artifact   `yaml:"artifacts,omitempty" json:"artifacts"`
+	FinalizedAt     string       `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
 }
 
 type Summary struct {
@@ -222,8 +224,8 @@ func (m *Manifest) Validate(expectedSlug string) error {
 			return fmt.Errorf("invalid finalized_at: %w", err)
 		}
 		for _, repository := range m.Repositories {
-			if repository.InitialBaseSHA == "" || repository.FinalHeadSHA == "" {
-				return fmt.Errorf("finalized repository %q has no immutable comparison", repository.Name)
+			if repository.FinalHeadSHA == "" {
+				return fmt.Errorf("finalized repository %q has no immutable final head", repository.Name)
 			}
 		}
 	}
@@ -474,7 +476,18 @@ func decodeManifest(data []byte, manifest *Manifest) error {
 		}
 		return err
 	}
+	fields, _ := strictMapping(document.Content[0], []string{
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at",
+	}, []string{"schema", "slug"})
+	manifest.creationPresent = fields["creation"] != nil
+	manifest.scopeExplicit = fields["repositories"] != nil && fields["artifacts"] != nil
 	return nil
+}
+
+// HasCreation preserves YAML key presence, including an explicitly empty block.
+// Programmatically constructed manifests retain the same nonempty-state meaning.
+func (m *Manifest) HasCreation() bool {
+	return m.creationPresent || m.Creation != (Creation{})
 }
 
 func validateManifestNode(root *yaml.Node) error {

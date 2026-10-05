@@ -11,11 +11,17 @@ import (
 
 type semanticTestClient struct {
 	*testClient
-	tokens  map[string]string
-	failure string
+	tokens     map[string]string
+	failure    string
+	rootStates []workspacecodex.ArchiveState
 }
 
 func (client *semanticTestClient) ProveArchivedRootThread(ctx context.Context, id, cwd string) (workspacecodex.ArchiveState, error) {
+	if len(client.rootStates) > 0 {
+		value := client.rootStates[0]
+		client.rootStates = client.rootStates[1:]
+		return value, nil
+	}
 	return client.ProveArchivedThread(ctx, id, cwd, "")
 }
 func (client *semanticTestClient) ObserveThreadIdentity(_ context.Context, id, cwd, project string, _ workspacecodex.ArchiveState) (workspacecodex.ThreadObservation, error) {
@@ -33,6 +39,9 @@ func TestObserveRetainedAggregatesRootAndArchivedMemberWithoutSettingsActivity(t
 	if err != nil || !first.ActivityKnown || !first.Idle || len(first.Subjects) != 3 || first.LastActivityAt != nil {
 		t.Fatalf("observation=%#v, %v", first, err)
 	}
+	if first.Subjects[0].ArchiveState != "active" || first.Subjects[1].ArchiveState != "archived" || first.Subjects[2].ArchiveState != "active" {
+		t.Fatalf("archival evidence=%#v", first.Subjects)
+	}
 	_, err = service.Store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error { roster.Members[0].Model = "another-model"; return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +57,33 @@ func TestObserveRetainedAggregatesRootAndArchivedMemberWithoutSettingsActivity(t
 	}
 	if len(base.archives) != 0 || len(base.clearedThreads) != 0 || len(base.resumes) != 0 {
 		t.Fatal("observation mutated retained conversations")
+	}
+}
+
+func TestRetainedActivityTokenExcludesArchivalProofAndKeepsOldPayload(t *testing.T) {
+	identities := [][3]string{{"member", "thread", "project"}}
+	subjects := []ObservationSubject{{Address: "lead", ThreadID: "root", ActivityToken: "turn", Idle: true}}
+	old := workspacecodex.ObservationToken([]any{1, identities, subjects})
+	for _, state := range []string{"active", "fresh", "archived"} {
+		subjects[0].ArchiveState = state
+		if token := retainedActivityToken(identities, subjects); token != old {
+			t.Fatalf("%s changed activity", state)
+		}
+	}
+	subjects[0].ActivityToken = "new-turn"
+	if retainedActivityToken(identities, subjects) == old {
+		t.Fatal("actual turn was omitted")
+	}
+}
+
+func TestObserveRetainedRefusesUnknownOrDriftingArchivalState(t *testing.T) {
+	for _, states := range [][]workspacecodex.ArchiveState{{workspacecodex.ArchiveUnknown}, {workspacecodex.ArchiveActive, workspacecodex.ArchiveArchived}} {
+		service, base, members := archivePreflightFixture(t, false)
+		service.Client = &semanticTestClient{testClient: base, tokens: map[string]string{"root-one": "root", members[0].Thread: "one", members[1].Thread: "two"}, rootStates: states}
+		result, err := service.ObserveRetained(context.Background(), "one", "root-one", "bound")
+		if err != nil || result.ActivityKnown || result.Idle {
+			t.Fatalf("unsafe archival state=%#v %v", result, err)
+		}
 	}
 }
 

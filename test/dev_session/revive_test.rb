@@ -8,12 +8,22 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-revive'
-      archived_runner(workspace, slug)
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      manifest = base.send(:ensure_portal_manifest, slug, tracking_only: true)
+      manifest['codex'] = {
+        'thread_id' => 'retained-root', 'socket_path' => '/run/test/codex.sock',
+        'client_version' => '0.160.0'
+      }
+      base.send(:write_portal_manifest, slug, manifest)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      finalize_core(base, slug, as_is: true)
+      commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       starts = []
       runner_class = Class.new(DevSession::Runner) do
         define_method(:start) do |input, **options|
-          starts << [input, options]
+          starts << [input, options, git_capture(['git', '-C', workspace, 'log', '-1', '--format=%s']).strip]
         end
       end
       runner = runner_class.new(
@@ -30,8 +40,12 @@ class DevSessionTest < Minitest::Test
         File.read(File.join(workspace, 'work', slug, 'state.md'))
       )
       assert_equal(1, starts.length)
-      assert_equal(true, starts.fetch(0).fetch(1).fetch(:allow_empty_thread))
+      assert_equal(false, starts.fetch(0).fetch(1).fetch(:allow_empty_thread))
       assert_equal(false, starts.fetch(0).fetch(1).fetch(:exclusive))
+      assert_equal("workspace: revive #{slug}", starts.fetch(0).fetch(2))
+      revived = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('retained-root', revived.dig('codex', 'thread_id'))
+      refute(revived.key?('creation'))
       assert_equal(
         "workspace: revive #{slug}",
         git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip
@@ -43,7 +57,12 @@ class DevSessionTest < Minitest::Test
   def test_revive_retains_its_journal_until_the_automatic_archive_reset_succeeds
     with_workspace do |workspace|
       slug = '2026-06-06-revive-sidecar'
-      archived_runner(workspace, slug)
+      base = runner_for(workspace)
+      base.ensure_tracking_files(slug)
+      base.send(:ensure_portal_manifest, slug, tracking_only: true)
+      commit_tracking(workspace, slug, lifecycle: 'complete')
+      finalize_core(base, slug, as_is: true)
+      commit_archive_move(workspace, slug)
       configure_workspace_origin(workspace)
       runner = runner_for(workspace)
       runner.define_singleton_method(:start) { |*, **| nil }
@@ -269,6 +288,8 @@ class DevSessionTest < Minitest::Test
         today: TODAY,
         env: {}
       )
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
       manifest['codex'] = {
@@ -340,7 +361,8 @@ class DevSessionTest < Minitest::Test
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       refute(manifest.key?('finalized_at'))
       refute(manifest.dig('repositories', 0).key?('final_head_sha'))
-      assert_equal('revived', manifest.dig('creation', 'tracking_origin'))
+      refute(manifest.key?('creation'))
+      refute(manifest.key?('codex'))
       refute(File.exist?(File.join(workspace, 'archive', slug)))
 
       runner.worktree_add(
@@ -632,7 +654,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_revive_legacy_archive_reuses_retained_branch
+  def test_accepted_manifestless_revive_keeps_its_journal_and_retained_ref
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -679,7 +701,6 @@ class DevSessionTest < Minitest::Test
 
       journal = runner.send(:prepare_revive_journal!, slug, 'complete')
       runner.send(:finish_revive_tracking!, slug, journal)
-      File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
       revived = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('revived', revived.dig('creation', 'tracking_origin'))
       assert_equal(
@@ -690,112 +711,25 @@ class DevSessionTest < Minitest::Test
         Digest::SHA256.hexdigest(File.read(File.join(workspace, 'work', slug, 'state.md'))),
         revived.dig('creation', 'tracking_state_sha256')
       )
-      runner.worktree_add(
-        slug, 'sample', as_is: true, name: nil, branch: nil,
-        base: nil, fetch: false
-      )
-
-      path = File.join(workspace, 'worktrees', slug, 'sample')
-      assert_equal(slug, git_capture_success('git', '-C', path, 'branch', '--show-current').strip)
-      assert_equal(master, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
-      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
-      assert_equal(master, manifest.dig('repositories', 0, 'initial_base_sha'))
-
-      plan_before = File.read(File.join(workspace, 'work', slug, 'plan.md'))
-      state_before = File.read(File.join(workspace, 'work', slug, 'state.md'))
-      goal = File.join(workspace, 'goal.txt')
-      portal = File.join(workspace, 'portal.rb')
-      File.write(goal, "Continue the retained initiative.\n")
-      File.write(portal, <<~RUBY)
-        require 'json'
-        puts JSON.generate(threadId: 'thread-fresh') if ARGV[0, 2] == ['thread', 'create']
-      RUBY
-      session = DevSession::Tmux::Session.new(
-        id: '$fresh', name: slug, mark: '1', slug:, workspace:,
-        socket_path: '/run/current/tmux.sock', codex_thread_id: 'thread-fresh',
-        codex_socket_path: '/run/current/app-server.sock',
-        codex_client_version: '0.152.1', codex_pane_id: '%1'
-      )
-      runner_class = Class.new(DevSession::Runner) do
-        define_method(:create_tmux_session) { |*_args, **_options| session }
-        define_method(:sync_slug) { |*_args, **_options| session }
-        define_method(:revalidate_session!) { |_selected| session }
-        define_method(:reconcile_native_client!) { |_slug, selected, **_options| selected }
-        define_method(:verify_codex_client!) {}
+      # An already accepted predecessor journal still owns exact recovery.
+      # It is not permission to start a new manifestless revive or mutate its slug.
+      journal_path = runner.send(:lifecycle_journal_file, slug, 'revive')
+      journal_before = File.binread(journal_path)
+      plan_before = File.binread(File.join(workspace, 'work', slug, 'plan.md'))
+      state_before = File.binread(File.join(workspace, 'work', slug, 'state.md'))
+      portal_before = File.binread(File.join(workspace, 'work', slug, 'portal.yml'))
+      error = assert_raises(DevSession::Error) do
+        runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: nil, fetch: false)
       end
-      out = StringIO.new
-      starter = runner_class.new(
-        workspace:,
-        tmux: NullTmux.new,
-        codex_socket: '/run/current/app-server.sock',
-        codex_version: '0.152.1',
-        portal_command: [RbConfig.ruby, portal],
-        out:,
-        err: StringIO.new,
-        today: TODAY,
-        env: {}
-      )
-
-      starter.start(
-        slug,
-        as_is: true,
-        new: false,
-        attach: false,
-        run_codex: true,
-        goal_file: goal,
-        json: true,
-        exclusive: true
-      )
-
-      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
-      assert_equal(plan_before, File.read(File.join(workspace, 'work', slug, 'plan.md')))
-      assert_equal(state_before, File.read(File.join(workspace, 'work', slug, 'state.md')))
-      updated = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
-      assert_equal(master, updated.dig('repositories', 0, 'initial_base_sha'))
-      assert_equal('thread-fresh', updated.dig('codex', 'thread_id'))
-      assert_equal('ready', updated.dig('creation', 'state'))
-      refute(updated.dig('creation').key?('tracking_origin'))
-      refute(updated.dig('creation').key?('tracking_plan_sha256'))
-      refute(updated.dig('creation').key?('tracking_state_sha256'))
-
-      out.truncate(0)
-      out.rewind
-      starter.start(
-        slug,
-        as_is: true,
-        new: false,
-        attach: false,
-        run_codex: true,
-        goal_file: goal,
-        json: true,
-        exclusive: true
-      )
-      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
-
-      journal_path = starter.send(:creation_journal_file, slug)
-      interrupted = JSON.parse(File.read(journal_path)).merge('state' => 'creating')
-      interrupted['tmux_identity'] = 'a' * 64
-      File.write(journal_path, JSON.generate(interrupted))
-      File.write(
-        File.join(workspace, 'work', slug, 'plan.md'),
-        "#{plan_before}\nFollow-up recorded after the initial turn.\n"
-      )
-      out.truncate(0)
-      out.rewind
-      starter.start(
-        slug,
-        as_is: true,
-        new: false,
-        attach: false,
-        run_codex: true,
-        goal_file: nil,
-        json: true,
-        exclusive: false
-      )
-      assert_equal('thread-fresh', JSON.parse(out.string).fetch('threadId'))
-      completed_journal = JSON.parse(File.read(journal_path))
-      assert_equal('ready', completed_journal.fetch('state'))
-      refute(completed_journal.key?('tmux_identity'))
+      assert_includes(error.message, 'session revive is unfinished')
+      assert_equal(journal_before, File.binread(journal_path))
+      assert_equal(plan_before, File.binread(File.join(workspace, 'work', slug, 'plan.md')))
+      assert_equal(state_before, File.binread(File.join(workspace, 'work', slug, 'state.md')))
+      assert_equal(portal_before, File.binread(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(master, git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', slug).strip)
+      refute(File.exist?(File.join(workspace, 'worktrees', slug, 'sample')))
+      refute(revived.dig('codex', 'thread_id'))
+      assert_empty(revived.fetch('repositories'))
     end
   end
 

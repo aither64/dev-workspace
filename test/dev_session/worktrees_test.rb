@@ -22,6 +22,11 @@ class DevSessionTest < Minitest::Test
 
       path = File.join(workspace, 'worktrees', '2026-06-06-demo', 'sample')
       assert(File.exist?(File.join(path, '.git')))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', '2026-06-06-demo', 'portal.yml')))
+      refute(manifest.key?('codex'))
+      refute(manifest.key?('creation'))
+      assert_equal([], manifest.fetch('artifacts'))
+      assert_equal(1, manifest.fetch('repositories').length)
 
       runner.worktree_remove('demo', 'sample', as_is: false, force: false)
 
@@ -75,7 +80,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_worktree_add_uses_one_immutable_base_and_recovers_registration
+  def test_worktree_add_preserves_one_immutable_base_when_readding_registered_branch
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -85,11 +90,9 @@ class DevSessionTest < Minitest::Test
       path = File.join(workspace, 'worktrees', slug, 'sample')
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
+      commit_tracking(workspace, slug, lifecycle: 'active')
       base_sha = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
-      assert_git_success(
-        'git', "--git-dir=#{repository}", 'worktree', 'add', '-b', slug, path, base_sha
-      )
-
       runner.worktree_add(
         slug,
         'sample',
@@ -99,11 +102,53 @@ class DevSessionTest < Minitest::Test
         base: 'master',
         fetch: false
       )
+      runner.worktree_remove(slug, 'sample', as_is: true, force: false)
+      source = File.join(workspace, 'source-sample')
+      assert_git_success('git', '-C', source, 'commit', '--allow-empty', '-m', 'advance default')
+      assert_git_success('git', "--git-dir=#{repository}", 'fetch', 'origin',
+                         '+refs/heads/master:refs/heads/master', '+refs/heads/master:refs/remotes/origin/master')
+      refute_equal(base_sha, git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip)
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: slug, base: nil, fetch: false)
 
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       metadata = manifest.fetch('repositories').fetch(0)
       assert_equal(base_sha, metadata['initial_base_sha'])
       assert_equal(slug, metadata['branch'])
+      assert_equal(base_sha, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
+    end
+  end
+
+  def test_worktree_add_recovers_unregistered_checkout_without_inventing_a_base
+    skip 'git is not available' unless command_available?('git')
+
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      repository = File.join(workspace, 'repos', 'sample.git')
+      slug = '2026-06-06-demo'
+      path = File.join(workspace, 'worktrees', slug, 'sample')
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      commit_tracking(workspace, slug, lifecycle: 'active')
+      head = git_capture_success('git', "--git-dir=#{repository}", 'rev-parse', 'master').strip
+      assert_git_success('git', "--git-dir=#{repository}", 'worktree', 'add', '-b', slug, path, head)
+
+      error = assert_raises(DevSession::Error) do
+        runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: slug, base: 'master', fetch: false)
+      end
+      assert_includes(error.message, 'historical base requires reviewed structured evidence')
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: slug, base: nil, fetch: false)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      metadata = manifest.fetch('repositories').fetch(0)
+      refute(metadata.key?('initial_base_sha'))
+      assert_equal(slug, metadata.fetch('branch'))
+      assert_equal(head, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
+      runner.worktree_remove(slug, 'sample', as_is: true, force: false)
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: slug, base: nil, fetch: false)
+      restored = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(restored.fetch('repositories').first.key?('initial_base_sha'))
+      assert_equal(head, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip)
     end
   end
 

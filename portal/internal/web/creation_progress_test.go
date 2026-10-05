@@ -82,7 +82,7 @@ func TestCreationCommandStreamsBeforeExitWithoutReadyEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PROGRESS_TEST_RELEASE", release)
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	observed := make(chan struct{}, 1)
 	observer := server.creationProgressObserver(receipt)
 	result := make(chan error, 1)
@@ -140,7 +140,7 @@ func TestCreationCommandPreservesFailureAndCancellation(t *testing.T) {
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf 'real diagnostic\\n' >&2\nprintf '\\036DEV_WORKSPACE_CREATION_PROGRESS/1 bad\\n' >&2\nexit 7\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	server.config.DevSession = helper
+	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	_, stderr, err := server.runCreationCommand(context.Background(), time.Second, nil, func(creationprogress.Event) { t.Error("invalid frame reached callback") })
 	if err == nil || !strings.Contains(stderr, "real diagnostic") {
 		t.Fatalf("failure = %q, %v", stderr, err)

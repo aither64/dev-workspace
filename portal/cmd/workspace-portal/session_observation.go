@@ -28,8 +28,19 @@ func sessionCommand(args []string) error {
 	codexHome := flags.String("codex-home", "", "selected Codex home")
 	expectedID := flags.String("expected-operation-id", "", "validated executing archive operation")
 	expectedMode := flags.String("expected-archive-mode", "", "validated executing archive mode")
+	expectedStart := flags.String("expected-start-tmux-identity", "", "validated child start journal identity")
+	expectedRevive := flags.String("expected-revive-operation-id", "", "validated same-root revive operation")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
+	}
+	emptyRetainedCoordinate := false
+	flags.Visit(func(value *flag.Flag) {
+		if (value.Name == "expected-start-tmux-identity" || value.Name == "expected-revive-operation-id") && value.Value.String() == "" {
+			emptyRetainedCoordinate = true
+		}
+	})
+	if emptyRetainedCoordinate {
+		return errors.New("retained observation coordinates must be nonempty")
 	}
 	if flags.NArg() != 0 || !session.ValidSlug(*slug) || !canonicalAbsolutePath(*workspace) ||
 		!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*stateRoot) ||
@@ -37,7 +48,8 @@ func sessionCommand(args []string) error {
 		os.Getenv("DEV_WORKSPACE_CODEX_HOME") != *codexHome {
 		return errors.New("session observe requires complete host-selected runtime coordinates")
 	}
-	if err := portalweb.ValidateObservationArchiveContext(*expectedID, *expectedMode); err != nil {
+	retainedContext := portalweb.ObservationRetainedContext{StartTmuxIdentity: *expectedStart, ReviveOperationID: *expectedRevive}
+	if err := portalweb.ValidateObservationContext(*expectedID, *expectedMode, retainedContext); err != nil {
 		return err
 	}
 	canonical, err := filepath.EvalSymlinks(*workspace)
@@ -50,9 +62,6 @@ func sessionCommand(args []string) error {
 	}
 	if summary.Archived && *expectedID == "" {
 		return errors.New("semantic inactivity observation requires active tracking")
-	}
-	if summary.Archived && summary.Codex.ThreadID != "" {
-		return errors.New("retained inactivity observation requires active tracking")
 	}
 	directory := filepath.Join(*workspace, summary.Root, *slug)
 	identity, err := session.ObservationIdentity(*workspace, *slug, directory, summary.Codex.ThreadID)
@@ -88,7 +97,7 @@ func sessionCommand(args []string) error {
 			if err := session.RequireNoRuntime(ctx, *workspace, *slug, *authorityDir, os.Getenv("DEV_SESSION_TMUX_SOCKET")); err != nil {
 				return err
 			}
-			return portalweb.RequireObservationReceipts(current, *stateRoot, *expectedID, *expectedMode)
+			return portalweb.RequireObservationReceipts(current, *stateRoot, *expectedID, *expectedMode, retainedContext)
 		}
 		if err := check(); err != nil {
 			result.Unknown("absence_unverified", "Threadless tracking or operation absence cannot be verified.")
@@ -107,26 +116,47 @@ func sessionCommand(args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
-	if summary.Creation.State != "ready" || summary.Codex.SocketPath != *socket {
+	if err := session.RequireRetainedReady(summary, *socket); err != nil {
 		result.Unknown("creation_unverified", "Retained conversation creation or selected socket cannot be verified.")
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	if err := portalweb.RequireObservationReceipts(summary, *stateRoot, *expectedID, *expectedMode, retainedContext); err != nil {
+		result.Unknown("creation_unverified", "Retained operation or creation evidence cannot be verified.")
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
 	authority, err := session.LoadRuntimeAuthority(*authorityDir, *slug, *workspace)
 	if err != nil && !errors.Is(err, os.ErrNotExist) || err == nil &&
-		(authority.State != "ready" || authority.CodexThreadID != summary.Codex.ThreadID || authority.CodexSocketPath != *socket) {
+		(authority.State != "ready" || authority.CodexThreadID != summary.Codex.ThreadID || authority.CodexSocketPath != *socket ||
+			!summary.HasCreation() && authority.CodexClientVersion != summary.Codex.ClientVersion) {
 		result.Unknown("authority_unverified", "Retained runtime authority cannot be verified.")
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
+	authorityPresent := err == nil
 	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace}
 	result, err = service.ObserveRetained(ctx, *slug, summary.Codex.ThreadID, identity)
 	if err != nil {
 		return err
 	}
+	if !summary.HasCreation() {
+		for _, subject := range result.Subjects {
+			if subject.Address == "lead" && subject.ArchiveState == "fresh" {
+				result.Unknown("materialization_unverified", "Creation-less retained history is not materialized.")
+			}
+		}
+	}
 	again, err := session.Find(*workspace, *slug)
-	if err != nil || again.Codex.ThreadID != summary.Codex.ThreadID || again.Root != summary.Root {
+	if err != nil || again.Codex != summary.Codex || again.Root != summary.Root {
 		result.Unknown("identity_changed", "Retained tracking identity changed during observation.")
+	} else if session.RequireRetainedReady(again, *socket) != nil ||
+		portalweb.RequireObservationReceipts(again, *stateRoot, *expectedID, *expectedMode, retainedContext) != nil {
+		result.Unknown("creation_unverified", "Retained readiness changed during observation.")
 	} else if after, identityErr := session.ObservationIdentity(*workspace, *slug, directory, again.Codex.ThreadID); identityErr != nil || after != identity {
 		result.Unknown("identity_changed", "Tracking directory changed during observation.")
+	}
+	currentAuthority, authorityErr := session.LoadRuntimeAuthority(*authorityDir, *slug, *workspace)
+	if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) ||
+		authorityPresent != (authorityErr == nil) || authorityErr == nil && currentAuthority != authority {
+		result.Unknown("authority_unverified", "Retained runtime authority changed during observation.")
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
 }

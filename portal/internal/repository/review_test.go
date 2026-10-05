@@ -110,6 +110,25 @@ func TestReviewMergeBaseFollowsRebaseAndImmutablePair(t *testing.T) {
 		t.Fatalf("rebased total=%d, err=%v", count, err)
 	}
 }
+
+func TestArchivedUnknownBaseUsesOnlyExactSavedComparison(t *testing.T) {
+	f, reader, repo := reviewFixture(t)
+	head := commitInWorktree(t, f.worktree, "retained-feature")
+	repo.Head, repo.InitialBase, repo.Archived = head, "", true
+	runGit(t, "--git-dir="+f.commonDir, "update-ref", "refs/remotes/origin/master", head)
+	if _, err := reader.Pair(context.Background(), repo, nil); err == nil {
+		t.Fatal("current default supplied an unknown historical base")
+	}
+	saved := ReviewPair{Base: f.baseHead, Head: head}
+	pair, err := reader.Pair(context.Background(), repo, &saved)
+	if err != nil || pair.Base != f.baseHead {
+		t.Fatalf("saved comparison=%#v %v", pair, err)
+	}
+	saved.Head = f.baseHead
+	if _, err := reader.Pair(context.Background(), repo, &saved); err == nil {
+		t.Fatal("comparison from another head was adopted")
+	}
+}
 func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 	f, reader, repo := reviewFixture(t)
 	renamed := "renamed\twith\nnewlines"

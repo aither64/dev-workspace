@@ -601,3 +601,54 @@ func writeTrackingFiles(t *testing.T, directory, lifecycle string) {
 		t.Fatal(err)
 	}
 }
+
+func TestOrdinaryRetainedReadinessDistinguishesAbsentAndPresentCreation(t *testing.T) {
+	base := "schema: 1\nslug: " + fixtureSlug + "\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: root-exact\n  socket_path: /run/codex.sock\n  client_version: 0.160.0\n"
+	for _, test := range []struct {
+		name, creation string
+		present, ready bool
+	}{
+		{"absent", "", false, true},
+		{"empty", "creation: {}\n", true, false},
+		{"pending", "creation:\n  state: creating\n  initial_goal_sent: false\n", true, false},
+		{"ready", "creation:\n  state: ready\n  initial_goal_sent: true\n", true, true},
+		{"unsent goal", "creation:\n  state: ready\n  initial_goal_sent: false\n  goal_sha256: " + strings.Repeat("a", 64) + "\n", true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var manifest Manifest
+			if err := decodeManifest([]byte(base+test.creation), &manifest); err != nil {
+				t.Fatal(err)
+			}
+			if manifest.HasCreation() != test.present {
+				t.Fatalf("creation presence = %v", manifest.HasCreation())
+			}
+			summary := &Summary{Manifest: manifest}
+			if err := RequireRetainedReady(summary, "/run/codex.sock"); (err == nil) != test.ready {
+				t.Fatalf("ordinary readiness = %v", err)
+			}
+			if err := RequireRetainedReady(summary, "/run/foreign.sock"); err == nil {
+				t.Fatal("foreign selected socket accepted")
+			}
+		})
+	}
+	for _, bad := range []string{"creation: null\n", "creation: []\n", "creation: malformed\n"} {
+		var manifest Manifest
+		if err := decodeManifest([]byte(base+bad), &manifest); err == nil {
+			t.Fatalf("malformed present creation accepted: %q", bad)
+		}
+	}
+	for _, bad := range []string{
+		strings.Replace(base, "repositories: []\n", "", 1),
+		strings.Replace(base, "artifacts: []\n", "", 1),
+		strings.Replace(base, "  client_version: 0.160.0\n", "", 1),
+		base + "forked_from: source\n",
+	} {
+		var manifest Manifest
+		if err := decodeManifest([]byte(bad), &manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := RequireRetainedReady(&Summary{Manifest: manifest}, "/run/codex.sock"); err == nil {
+			t.Fatalf("incomplete creation-less scope or tuple accepted: %q", bad)
+		}
+	}
+}

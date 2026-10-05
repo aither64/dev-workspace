@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -150,6 +152,16 @@ func (s *Server) reconcileLifecycleOperationLocked(
 	slug string, now time.Time,
 ) (lifecycleOperation, bool, error) {
 	operation, exists := s.operations[slug]
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return operation, exists, err
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return operation, exists, err
+	}
 	progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
 	if progressErr != nil {
 		if !exists {
@@ -284,7 +296,9 @@ func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
 	for slug, progress := range pending {
 		if _, exists := s.operations[slug]; !exists {
 			operation := operationFromProgress(slug, progress)
-			if err := s.replaceLifecycleOperationLocked(slug, operation); err != nil {
+			if err := s.withCurrentGeneration(func() error {
+				return s.replaceLifecycleOperationLocked(slug, operation)
+			}); err != nil {
 				return nil, errors.Join(pendingErr, err)
 			}
 		}

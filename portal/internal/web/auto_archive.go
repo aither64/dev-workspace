@@ -72,14 +72,14 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	summary, err := session.Find(s.config.Workspace, slug)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
 	action := "status"
 	confirmedTargetID := ""
 	if r.Method == http.MethodPost {
+		summary, err := session.Find(s.config.Workspace, slug)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		var body struct {
 			Hold     *bool  `json:"hold"`
@@ -118,14 +118,15 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 		stdout, stderr, err = s.runDevSessionWithTransition(ctx, 10*time.Second, transition,
 			"auto-archive", action, slug, "--as-is", "--json")
 	} else {
-		stdout, stderr, err = s.runDevSession(ctx, 10*time.Second, "auto-archive", action, slug, "--as-is", "--json")
+		stdout, stderr, err = s.runDevSessionWithTransition(ctx, 10*time.Second, transition, "auto-archive", action, slug, "--as-is", "--json")
 	}
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": commandFailure("update automatic archival", stdout, stderr, err).Error()})
 		return
 	}
 	var result map[string]any
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil || result["slug"] != slug {
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil || result["schema"] != float64(1) ||
+		result["workspace"] != s.config.Workspace || result["slug"] != slug {
 		s.writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Automatic archival returned an invalid result."})
 		return
 	}

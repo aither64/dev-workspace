@@ -3,7 +3,7 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
-  def test_start_adopts_committed_active_tracking_and_registers_existing_worktrees
+  def test_start_recovers_accepted_manifestless_creation_and_registers_existing_worktrees
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
@@ -70,15 +70,7 @@ class DevSessionTest < Minitest::Test
         env: {}
       )
 
-      interrupted = runner.send(
-        :prepare_creation_journal,
-        slug,
-        goal,
-        exclusive: true,
-        run_codex: true,
-        model: nil,
-        effort: nil
-      )
+      interrupted = accepted_retained_creation_fixture(runner, slug, goal)
       assert_equal('retained', interrupted.fetch('tracking_origin'))
       refute(File.exist?(File.join(tracking, 'portal.yml')))
 
@@ -101,7 +93,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('sample', manifest.dig('repositories', 0, 'project'))
       assert_equal(slug, manifest.dig('repositories', 0, 'branch'))
       assert_equal('master', manifest.dig('repositories', 0, 'default_branch'))
-      assert_equal(master, manifest.dig('repositories', 0, 'initial_base_sha'))
+      refute(manifest.fetch('repositories').first.key?('initial_base_sha'))
       refute(manifest.fetch('creation').key?('tracking_origin'))
 
       journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
@@ -137,7 +129,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/retained plan, state, and portal absence must match/, error.message)
+      assert_match(/portal manifest not found/, error.message)
       refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
     end
   end
@@ -167,7 +159,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/retained plan, state, and portal absence must match/, error.message)
+      assert_match(/portal manifest not found/, error.message)
       refute(File.exist?(runner.send(:creation_journal_file, slug)))
       refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
     end
@@ -196,7 +188,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/restarting retained tracking requires a Codex conversation/, error.message)
+      assert_match(/portal manifest not found/, error.message)
       refute(File.exist?(runner.send(:creation_journal_file, slug)))
       refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
     end
@@ -326,7 +318,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/retained active tracking with a portal manifest cannot be adopted/, error.message)
+      assert_match(/present conversationless creation evidence cannot be adopted/, error.message)
       refute(File.exist?(runner.send(:creation_journal_file, slug)))
     end
   end
@@ -363,7 +355,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/archived slug must be restored with dev-session revive/, error.message)
+      assert_match(/portal manifest not found/, error.message)
       refute(File.exist?(runner.send(:creation_journal_file, slug)))
     end
   end
@@ -378,15 +370,7 @@ class DevSessionTest < Minitest::Test
       commit_tracking(workspace, slug, lifecycle: 'active')
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Continue this initiative.\n")
-      journal = runner.send(
-        :prepare_creation_journal,
-        slug,
-        goal,
-        exclusive: true,
-        run_codex: true,
-        model: nil,
-        effort: nil
-      )
+      journal = accepted_retained_creation_fixture(runner, slug, goal)
       manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: journal)
       manifest['creation']['tracking_state_sha256'] = '0' * 64
       runner.send(:write_portal_manifest, slug, manifest)
@@ -531,7 +515,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_fresh_conversation_rejects_terminal_revived_tracking
+  def test_accepted_conversation_retry_rejects_terminal_revived_tracking
     %w[complete abandoned].each do |lifecycle|
       with_workspace do |workspace|
         slug = "2026-06-06-#{lifecycle}"
@@ -552,6 +536,7 @@ class DevSessionTest < Minitest::Test
         File.write(File.join(tracking, 'portal.yml'), YAML.dump(manifest))
         goal = File.join(workspace, 'goal.txt')
         File.write(goal, "Resume retained work.\n")
+        accepted = accepted_retained_creation_fixture(runner, slug, goal, origin: 'revived', run_codex: false)
 
         error = assert_raises(DevSession::Error) do
           runner.start(
@@ -566,7 +551,7 @@ class DevSessionTest < Minitest::Test
           )
         end
         assert_match(/cannot create a conversation for a #{lifecycle} initiative/, error.message)
-        refute(File.exist?(runner.send(:creation_journal_file, slug)))
+        assert_equal(accepted, JSON.parse(File.read(runner.send(:creation_journal_file, slug))))
       end
     end
   end
@@ -583,15 +568,7 @@ class DevSessionTest < Minitest::Test
       File.unlink(runner.send(:lifecycle_journal_file, slug, 'revive'))
       goal = File.join(workspace, 'goal.txt')
       File.write(goal, "Resume retained work.\n")
-      journal = runner.send(
-        :prepare_creation_journal,
-        slug,
-        goal,
-        exclusive: true,
-        run_codex: true,
-        model: nil,
-        effort: nil
-      )
+      journal = accepted_retained_creation_fixture(runner, slug, goal, origin: 'revived')
       assert(journal.fetch('preserve_tracking'))
       File.write(File.join(workspace, 'work', slug, 'plan.md'), "x")
 
@@ -649,7 +626,7 @@ class DevSessionTest < Minitest::Test
           exclusive: true
         )
       end
-      assert_match(/revived tracking provenance cannot be proven/, error.message)
+      assert_match(/present conversationless creation evidence cannot be adopted/, error.message)
       refute(File.exist?(runner.send(:creation_journal_file, slug)))
     end
   end
@@ -661,6 +638,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-abandoned'
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
       commit_tracking(workspace, slug, lifecycle: 'abandoned')
       finalize_core(runner, slug, as_is: true)
       commit_archive_move(workspace, slug)
@@ -714,6 +692,22 @@ class DevSessionTest < Minitest::Test
 
       assert_equal("archive: clusters released\n", out.string)
     end
+  end
+
+  private
+
+  # Supported predecessor recovery input, not a new manifestless producer.
+  def accepted_retained_creation_fixture(runner, slug, goal, origin: 'retained', run_codex: true)
+    workspace = runner.workspace
+    journal = {
+      'schema' => 1, 'slug' => slug, 'goal_sha256' => Digest::SHA256.hexdigest(runner.send(:read_goal, goal)),
+      'run_codex' => run_codex, 'state' => 'creating', 'tmux_identity' => 'a' * 64,
+      'preserve_tracking' => true, 'tracking_origin' => origin,
+      'tracking_plan_sha256' => Digest::SHA256.file(File.join(workspace, 'work', slug, 'plan.md')).hexdigest,
+      'tracking_state_sha256' => Digest::SHA256.file(File.join(workspace, 'work', slug, 'state.md')).hexdigest
+    }
+    runner.send(:write_creation_journal, runner.send(:creation_journal_file, slug), journal, create: true)
+    journal
   end
 
 end

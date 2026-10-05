@@ -603,7 +603,7 @@ class DevSessionTest < Minitest::Test
   end
 
   class ReplacedDuringCreateTmux < NullTmux
-    attr_reader :mutations, :new_session_args, :name_lookups
+    attr_reader :mutations, :new_session_args, :name_lookups, :name_lookup_states
 
     def initialize(slug, workspace:)
       @slug = slug
@@ -611,10 +611,12 @@ class DevSessionTest < Minitest::Test
       @created = false
       @mutations = []
       @name_lookups = 0
+      @name_lookup_states = []
     end
 
     def session(slug)
       @name_lookups += 1
+      @name_lookup_states << @created
       return unless @created && slug == @slug
 
       DevSession::Tmux::Session.new(
@@ -645,7 +647,7 @@ class DevSessionTest < Minitest::Test
   end
 
   class ReplacedBeforeSyncTmux < NullTmux
-    attr_reader :mutations, :name_lookups
+    attr_reader :mutations, :name_lookups, :name_lookup_states
 
     def initialize(slug, workspace:)
       @slug = slug
@@ -654,12 +656,14 @@ class DevSessionTest < Minitest::Test
       @id_lookups = 0
       @mutations = []
       @name_lookups = 0
+      @name_lookup_states = []
       @pane = 0
       @identity_token = nil
     end
 
     def session(slug)
       @name_lookups += 1
+      @name_lookup_states << @created
       return unless @created && slug == @slug
 
       identity('$replacement', managed: true)

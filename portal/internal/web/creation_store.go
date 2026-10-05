@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
@@ -185,6 +187,16 @@ func (s *Server) retireIdleCreation(receipt creationReceipt) error {
 // Call with operationMu held. Removing the receipt last keeps an interrupted
 // retirement recoverable; a ready receipt no longer needs CLI binding evidence.
 func (s *Server) retireCreation(receipt creationReceipt) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
 	if err := s.compactPreparationsLocked(receipt); err != nil {
 		return err
 	}
