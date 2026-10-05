@@ -131,9 +131,47 @@ old `updatedAt` grace or infer conversation absence from a missing manifest.
 Read-only status never performs this conversion.
 
 Remove the adapter only after inventorying active and archived tracking, private
-observations and holds, unfinished lifecycle/creation/browser/migration receipts,
+observations and holds, unfinished lifecycle/creation/browser receipts,
 retained supported packages and restore/revival paths. Record dependent formats,
 counts and replacement paths. Removal requires zero dependent inputs and zero
 supported ways to reintroduce them; successful deployment or absence from
 `work/` alone is insufficient. Semantic fingerprint version 1 and its typed
 continuity/proof distinction remain the normal supported contract.
+
+## Ordinary retained tracking
+
+Ordinary schema-1 tracking may retain the exact root without creation or goal
+metadata. It needs explicit repository and artifact lists, complete Codex
+provenance, receipt checks and current proof of the root, team, runtime authority
+and submissions. Incomplete creation evidence keeps its original recovery path.
+Archive requires an idle conversation and repeats these proofs. Revival preserves
+the exact root, absent creation metadata and unknown historical bases.
+
+Repair unresolved older tracking offline before exposing it to ordinary writers
+or automatic archival. New manifestless start/adoption/revival and partial
+worktree registration refuse before journal, tracking or runtime mutation.
+Accepted predecessor journals retain their exact projections and recovery limits.
+A repair cannot certify a browser receipt whose expected journal and owning
+success result have both disappeared.
+
+## Compatibility removal inventory
+
+Generic lifecycle maintainers own these temporary readers and predecessor recovery
+paths. Inventory active **and archived** tracking, unfinished lifecycle/creation/
+revive/browser receipts, private observations/holds, retained supported
+package generations, and upgrade/restore/revival paths. Record each input format,
+its dependent count and supported replacement path. Removal requires zero
+current dependent inputs and zero supported reintroduction paths.
+
+| Temporary input/reader | Dependencies that must be absent before removal |
+| --- | --- |
+| Old no-sidecar archive recovery | No unfinished predecessor journal/intent and no retained supported executor or upgrade recovery able to create it |
+| Unversioned browser targets | No unfinished ctime-derived pre-journal receipt and no supported old portal/import path that can restore it |
+| Old automatic observations | No supported unversioned/root-ID-only observation or hold dependency and no old worker/restore path able to write it |
+
+Workspace maintainers own their offline repair tools. Keep such a tool while
+unresolved active or archived records, or a supported restoration path, need it.
+
+Do not use a deployment date, successful rollout, or zero active raw
+legacy records as the removal gate. Schema-2 archive journals and honest
+unknown-base schema-1 manifests remain ordinary permanent formats.

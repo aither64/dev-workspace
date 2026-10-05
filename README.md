@@ -21,6 +21,11 @@ deployment responsibilities. The package includes the automatically discoverable
 `dev-session-documentation` skill and the
 [`dev-session-monitor` skill](docs/dev-sessions.md#monitor-long-verification).
 
+Repair unresolved older tracking offline before enabling session writers or
+automatic archival.
+The [archive recovery guide](docs/session-archive-recovery.md) owns retry and
+compatibility removal procedures.
+
 ## Nix interfaces
 
 The flake exports these packages on `x86_64-linux`:

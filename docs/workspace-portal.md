@@ -341,14 +341,15 @@ replace only the exact failed pre-journal receipt ID; under lock, a changed
 receipt, an accepted journal or a missing expected journal refuses replacement.
 It cannot change the target of an operation that already started.
 
-Manifestless legacy revive can create a root inside its owning command. A
+An already accepted manifestless predecessor revive journal can create a root
+inside its owning command. A
 successful command result completes the original receipt. If the portal restarts
 after the command removes its journal but before that result is saved, the new
 root prevents same-target completion proof. The receipt remains failed with a
 missing expected journal; terminal active state alone cannot repair it, and
 fresh confirmation cannot replace it. Inspect the failed receipt and keep its
 ownership records and original root binding intact.
-Legacy normalization can establish the active session's metadata, but cannot
+Reviewed offline repair can establish the active session's metadata, but cannot
 certify the lost command result, rebind this receipt or bypass its ordinary
 pending-operation checks.
 
@@ -386,6 +387,40 @@ inspection stays read-only with the portal owner; full cleanup and tracking
 proof stays with the lifecycle executor. Ordinary scans have no such exclusion.
 After an accepted move, the owning retry samples the actual archived tracking
 identity but still discovers conversations at the original work CWD.
+
+## Ordinary retained readiness
+
+Schema-1 tracking distinguishes an absent `creation` key from an empty,
+malformed or unfinished block. A retained root without creation metadata needs
+explicit repository and artifact lists, its exact root ID, selected socket and
+client version. The creation and browser receipt owners check for conflicting
+evidence.
+
+The ordinary observer proves exact root and team identities, public submission state
+and complete saved-plus-loaded same-directory discovery. Browser mutation admission
+repeats that proof under existing generation and session gates, with the current
+runtime authority. Presentation alone cannot authorize a send. Busy conversations
+keep the existing operation-specific controls; unknown identity or submission
+proof refuses a write and cannot count as archive-idle.
+
+New manifestless start/adoption/revival and partial worktree registration refuse
+before mutation. Reviewed offline repair must establish complete ordinary metadata
+before those records are exposed to writers or automatic archival. Accepted
+lifecycle and creation journals keep their owning recovery, without a general
+pending-operation exemption. Cached status never reconstructs historical scope
+or reads a maintenance file.
+
+An accepted start retry carries only its exact existing tmux identity; a same-root
+revive retry carries its loaded operation ID at `runtime_starting`. The observer
+matches those existing owners before and after native reads. Only the matching
+start/revive state is allowed; creation receipts, another browser operation and
+other lifecycle or cleanup state still refuse. Interaction receives no such
+operation exemption.
+
+A positively proved observation subject may include `archiveState:
+active|fresh|archived`. This proof-only field remains excluded from the semantic
+activity token. Settings, routine manifest writes and archival bookkeeping do
+not become conversation activity.
 
 ## Extension catalog
 

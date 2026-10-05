@@ -36,27 +36,25 @@ dev-session start api-token-rotation --goal-file request.txt --no-attach
 The request file is required only while creating a shared conversation. An
 existing session resumes without asking for the request again.
 
-An unfinished initiative may predate the portal or lose its old process. Stop
-the old tmux session after checking that its writers are quiet, commit the
-active `plan.md` and `state.md`, and restart the exact slug with a fresh
-request:
+A valid ordinary manifest can retain an exact conversation without a `creation`
+block. `start` resumes that root through the selected socket after verifying its
+native identity, receipts, team roster and runtime authority. It preserves tracking
+and repository scope, leaves creation and goal metadata absent, and sends no new
+initial request. An empty, malformed or unfinished creation block stops the
+operation.
+Known busy activity permits ordinary attachment; unknown identity or submission
+state refuses it. Archive separately requires the complete idle proof.
 
-```sh
-dev-session start 2026-06-06-api-token-rotation --as-is \
-  --goal-file request.txt --no-attach
-```
+Existing tracking needs a manifest before a new restart or adoption. Repair its
+complete repository and retained conversation scope offline before enabling runtime
+writers or automatic archival. Committing plan and state, removing old processes,
+or finding no current checkout does not establish that scope. An already accepted
+creation or start journal keeps its existing recovery path.
 
-The helper preserves `plan.md` and `state.md` byte for byte. It creates a new
-shared conversation and registers existing canonical worktrees in the portal
-manifest. The plan and state must match the committed workspace tree.
-`portal.yml` must be absent from both the working tree and the committed tree;
-an existing manifest is never adopted as retained tracking. Restarting always
-creates a Codex conversation; `--no-codex` is refused. A directory that cannot
-be proven as a canonical, attached worktree is left untouched, reported as a
-warning, and omitted from the manifest until it is repaired. A conflicting
-registration still stops synchronization. The helper also refuses a
-conflicting managed session. This is a restart of the same active initiative,
-not a new initiative or a recovery of the old conversation.
+A session created only for tracking and worktrees has explicit repository and artifact lists
+and no Codex or creation placeholders. A later explicit start with an initial
+request creates a real conversation under normal creation recovery, after fresh
+conversation/receipt absence proof. It preserves the existing plan and state.
 
 If a unique existing slug already matches that name, `start` resumes it. If no
 existing slug matches, it creates today's slug. On June 6, 2026, a new
@@ -645,9 +643,12 @@ must still be an ancestor of `origin/<default_branch>`. The command reports
 every branch whose merge status cannot be proven. A squash merge or partial
 cherry-pick does not satisfy this rule, and a branch with feature commits still
 requires a matching remote ref. Coordination-only initiatives
-with no registered branches remain valid. Legacy records with live worktrees
-need normal manifest registrations before starting complete archival. Pending
-older journals retain their existing recovery checks. `--abandoned` skips only
+with no registered branches remain valid. Legacy records need positively
+resolved scope before a new archive, including exact-slug retained refs whose
+checkouts have gone. Repair those records offline before exposing them to writers
+or workers. A missing manifest or empty manifest left by revival cannot certify
+empty scope.
+Pending older journals retain their existing recovery checks. `--abandoned` skips only
 publication and merge proof. A retry fetches and
 reproves the exact heads stored in the archive journal before every remaining
 destructive phase; another merged commit on the feature branch cannot replace
@@ -746,13 +747,16 @@ and Codex identity.
 
 When the archive retains a Codex thread, revive restores and starts that exact
 conversation without forking it or resending the initial request. It does not
-recreate worktrees. Legacy archives without `portal.yml` get a fresh shared
-conversation through the same durable thread-creation recovery used by new
-sessions, so a lost App Server response cannot create a second thread. Adding
-retained feature branches through the normal worktree command reconstructs
-their registration. Supply `--base REF` if a retained branch's intended base
-cannot be inferred uniquely. Revive is journaled and retryable in the same way
-as archive.
+recreate worktrees. Creation-less ordinary archives preserve the same root and do
+not gain invented creation/goal evidence. Verified threadless archives revive
+without creating a conversation. Unknown historical bases remain omitted;
+`--base` cannot establish them from today's refs.
+
+A new manifestless archive revival refuses before publishing a journal, moving
+tracking or starting runtime. Repair its reviewed complete scope offline first.
+An already accepted older schema-3 revive journal retains its exact recovery,
+including its saved projection. Losing that journal and its owning success result
+cannot be repaired by inferring browser-operation success from restored tracking.
 
 ## Worktree helpers
 
@@ -771,7 +775,10 @@ This uses:
 - `git fetch origin` before creation.
 
 The helper also records the canonical project identity, GitHub repository,
-feature branch, default branch, and starting base commit in `portal.yml`.
+feature branch and default branch in `portal.yml`. A genuinely new branch also
+records its starting base. Reattaching an existing unknown-base branch preserves
+that omission; a missing registered branch refuses instead of creating one.
+Registration and sync never infer a historical base from present ancestry.
 Removing an individual worktree or using bulk cleanup records its last commit
 before cleanup. Archival verifies the project identity and records the last
 commit of every remaining worktree, so archived pages retain trustworthy
