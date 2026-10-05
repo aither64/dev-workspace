@@ -104,6 +104,8 @@ func run(args []string) error {
 		return serve(args[1:])
 	case "router":
 		return routeWorkspaces(args[1:])
+	case "session":
+		return sessionCommand(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
 	case "team":

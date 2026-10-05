@@ -79,6 +79,24 @@ func TestRequireArchiveReadyAllRefusesUnknownThreadsWithEitherRootState(t *testi
 	}
 }
 
+func TestRequireArchiveReadyAllAcceptsLoadedOnlyFreshRootAndRetainedMembers(t *testing.T) {
+	service, client, _ := archivePreflightFixture(t, false)
+	client.hideThreads = true
+	client.freshThreads = map[string]bool{"root-one": true}
+	before, err := service.Store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RequireArchiveReadyAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatalf("loaded-only retained discovery refused: %v", err)
+	}
+	after, err := service.Store.Load("one", "root-one")
+	if err != nil || !reflect.DeepEqual(before, after) || len(client.archives) != 0 ||
+		len(client.starts) != 2 || len(client.resumes) != 0 || len(client.deleted) != 0 || len(client.clearedThreads) != 0 {
+		t.Fatalf("loaded-only proof changed state: before=%#v after=%#v err=%v", before, after, err)
+	}
+}
+
 func TestRequireArchiveReadyAllRefusesBusyUnresolvedAndUnstableRetainedMembers(t *testing.T) {
 	for _, failure := range []string{"busy", "queued", "prompt", "unresolved active", "unresolved archived", "root attempts",
 		"unmaterialized", "wrong cwd", "wrong project", "project drift", "archive state drift", "creating", "replace", "remove", "missing discovery", "bad cursor"} {
@@ -140,6 +158,7 @@ func TestRequireArchiveReadyAllRefusesBusyUnresolvedAndUnstableRetainedMembers(t
 				}
 			case "missing discovery":
 				client.hideThreads = true
+				client.hideLoadedThreads = true
 			case "bad cursor":
 				client.archived["root-one"] = false
 				client.listPageSize, client.emptyNextCursor = 1, true

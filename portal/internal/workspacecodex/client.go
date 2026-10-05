@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"regexp"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -535,64 +532,6 @@ type ThreadActivity struct {
 	ID        string
 	Cwd       string
 	UpdatedAt time.Time
-}
-
-type ThreadObservation struct {
-	ThreadID  string   `json:"threadId"`
-	Cwd       string   `json:"cwd"`
-	UpdatedAt int64    `json:"updatedAt"`
-	Idle      bool     `json:"idle"`
-	Blockers  []string `json:"blockers"`
-}
-
-func (c *Client) ObserveThread(ctx context.Context, threadID, cwd string) (ThreadObservation, error) {
-	if threadID == "" || len(threadID) > 256 || !filepath.IsAbs(cwd) || filepath.Clean(cwd) != cwd {
-		return ThreadObservation{}, errors.New("thread observation requires a trusted identity and canonical directory")
-	}
-	activities, err := c.ListThreadActivity(ctx, []ThreadActivity{{ID: threadID, Cwd: cwd}})
-	if err != nil {
-		return ThreadObservation{}, err
-	}
-	if len(activities) != 1 || activities[0].ID != threadID || activities[0].Cwd != cwd ||
-		activities[0].UpdatedAt.Unix() <= 0 || activities[0].UpdatedAt.After(time.Now().Add(time.Minute)) {
-		return ThreadObservation{}, errors.New("thread observation returned invalid activity metadata")
-	}
-	blockers := make([]string, 0, 4)
-	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
-		prefix := fmt.Sprintf("Codex thread %s is not idle (latest turn ", threadID)
-		suffix := ` has status "inProgress")`
-		if !strings.HasPrefix(err.Error(), prefix) || !strings.HasSuffix(err.Error(), suffix) ||
-			len(err.Error()) <= len(prefix)+len(suffix) {
-			return ThreadObservation{}, err
-		}
-		blockers = append(blockers, "Codex has an active turn.")
-	}
-	prompts, err := c.PromptsWithItems(ctx, threadID)
-	if err != nil {
-		return ThreadObservation{}, fmt.Errorf("inspect pending Codex requests: %w", err)
-	}
-	if len(prompts) != 0 {
-		blockers = append(blockers, "Codex has pending requests.")
-	}
-	queue, err := c.ListQueue(ctx, threadID)
-	if err != nil {
-		return ThreadObservation{}, fmt.Errorf("inspect queued Codex messages: %w", err)
-	}
-	if len(queue) != 0 {
-		blockers = append(blockers, "Codex has queued messages.")
-	}
-	if err := c.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
-		known := regexp.MustCompile(`^Codex thread ` + regexp.QuoteMeta(threadID) +
-			` has [1-9][0-9]* unresolved (queue deletion\(s\); reopen its queue and retry deletion|message attempt\(s\)|queued message attempt\(s\))$`)
-		if !known.MatchString(err.Error()) {
-			return ThreadObservation{}, err
-		}
-		blockers = append(blockers, "Codex has unresolved submission attempts.")
-	}
-	return ThreadObservation{
-		ThreadID: threadID, Cwd: cwd, UpdatedAt: activities[0].UpdatedAt.Unix(),
-		Idle: len(blockers) == 0, Blockers: blockers,
-	}, nil
 }
 
 func (c *Client) ListThreadActivity(

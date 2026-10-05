@@ -754,6 +754,7 @@ type Client interface {
 	ReadProject(context.Context, string) (codex.ProjectMetadata, error)
 	StartThreadWithSettings(context.Context, string, map[string]string, codex.ThreadSettings) (string, error)
 	ListThreads(context.Context, codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error)
+	LoadedThreadIDs(context.Context) ([]string, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error)
 	RequireRootArchiveReady(context.Context, string, string) (workspacecodex.ArchiveState, error)
@@ -1655,43 +1656,7 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 				active[member.Thread] = member.ProjectID
 			}
 		}
-		// Explicitly request the complete selected source enum: omitted/empty
-		// filters hide noninteractive writers, even beside an archived root.
-		archived := false
-		seen, cursors := map[string]bool{}, map[string]bool{}
-		cursor := ""
-		for pages := 0; ; pages++ {
-			if pages > len(active) {
-				return errors.New("active archive discovery exceeded the retained set")
-			}
-			threads, next, err := service.Client.ListThreads(ctx, codex.ThreadListOptions{
-				Cwd: cwd, Archived: &archived, Limit: len(active) + 1, SortDirection: "asc", Cursor: cursor,
-				SourceKinds: workspacecodex.ArchiveDiscoverySourceKinds(),
-			})
-			if err != nil {
-				return fmt.Errorf("discover active archive conversations: %w", err)
-			}
-			for _, thread := range threads {
-				project, retained := active[thread.ID]
-				if !retained || seen[thread.ID] || thread.Cwd != cwd ||
-					(thread.ID == rootThreadID && thread.Source != "vscode") ||
-					(project != "" && (thread.ProjectID == nil || *thread.ProjectID != project)) {
-					return errors.New("unknown or changed Codex thread uses the session directory; refusing archive")
-				}
-				seen[thread.ID] = true
-			}
-			if next == nil {
-				break
-			}
-			if *next == "" || cursors[*next] {
-				return errors.New("active archive discovery returned an invalid cursor")
-			}
-			cursors[*next], cursor = true, *next
-		}
-		if len(seen) != len(active) {
-			return errors.New("a retained active conversation is absent from archive discovery")
-		}
-		return nil
+		return workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, rootThreadID, active)
 	})
 }
 

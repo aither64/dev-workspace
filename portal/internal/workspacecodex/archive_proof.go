@@ -230,7 +230,7 @@ func (c *Client) RequireArchiveThreadIdle(ctx context.Context, threadID, cwd str
 		return errors.New("archived conversation has pending requests")
 	}
 	if err := c.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
-		return err
+		return observationFailure("submission_unverified", err.Error())
 	}
 	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return fmt.Errorf("recheck archived conversation turns: %w", err)

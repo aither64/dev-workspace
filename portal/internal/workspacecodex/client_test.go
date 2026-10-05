@@ -181,68 +181,62 @@ func TestListThreadActivityAcceptsOnlyWorkspaceThreads(t *testing.T) {
 	}
 }
 
-func TestObserveThreadUsesOneMetadataReadAndFailsClosed(t *testing.T) {
+func TestObserveThreadSemanticActivityAndUnknownProof(t *testing.T) {
 	for _, testCase := range []struct {
-		name       string
-		status     string
-		cwd        string
-		queue      bool
-		pending    bool
-		badQueue   bool
-		unresolved bool
-		wantBlock  string
-		wantError  bool
+		name, status, cwd                           string
+		queue, pending, badQueue, unresolved, drift bool
+		wantBlock                                   string
+		wantError                                   bool
 	}{
 		{name: "idle", status: "completed"},
 		{name: "active", status: "inProgress", wantBlock: "Codex has an active turn."},
 		{name: "pending request", status: "completed", pending: true, wantBlock: "Codex has pending requests."},
 		{name: "queued", status: "completed", queue: true, wantBlock: "Codex has queued messages."},
-		{name: "unresolved attempt", status: "completed", unresolved: true, wantBlock: "Codex has unresolved submission attempts."},
 		{name: "unknown status", status: "unknown", wantError: true},
 		{name: "wrong directory", status: "completed", cwd: "/foreign", wantError: true},
 		{name: "malformed queue", status: "completed", badQueue: true, wantError: true},
+		{name: "unresolved attempt", status: "completed", unresolved: true, wantError: true},
+		{name: "turn drift", status: "completed", drift: true, wantError: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			cwd := "/workspace/work/one"
-			reads := 0
+			reads, turnReads := 0, 0
 			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 				if err := handshake(connection); err != nil {
 					return err
 				}
-				methods := []string{"thread/read"}
-				if testCase.cwd == "" {
-					methods = append(methods, "thread/turns/list")
-					if testCase.status != "unknown" {
-						methods = append(methods, "thread/queue/list")
-					}
-				}
-				for _, method := range methods {
+				for {
 					request, err := readObject(connection)
-					if err != nil || request["method"] != method {
-						return fmt.Errorf("observation method = %#v, %v; want %s", request, err, method)
+					if err != nil {
+						return nil
 					}
 					var result any
-					switch method {
+					switch request["method"] {
 					case "thread/read":
 						reads++
-						if testCase.pending {
-							if err := writeObject(connection, map[string]any{
-								"id": "input-1", "method": "item/tool/requestUserInput",
+						if testCase.pending && reads == 1 {
+							if err := writeObject(connection, map[string]any{"id": "input-1", "method": "item/tool/requestUserInput",
 								"params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
-									"questions": []any{map[string]any{"id": "choice", "header": "Choice", "question": "Continue?"}}},
-							}); err != nil {
+									"questions": []any{map[string]any{"id": "choice", "header": "Choice", "question": "Continue?"}}}}); err != nil {
 								return err
 							}
 						}
-						returnedCwd := cwd
+						returned := cwd
 						if testCase.cwd != "" {
-							returnedCwd = testCase.cwd
+							returned = testCase.cwd
 						}
-						result = map[string]any{"thread": map[string]any{
-							"id": "thread-1", "cwd": returnedCwd, "source": "vscode", "updatedAt": time.Now().Unix(),
-						}}
+						result = map[string]any{"thread": map[string]any{"id": "thread-1", "cwd": returned, "source": "vscode", "updatedAt": time.Now().Unix() + int64(reads)}}
 					case "thread/turns/list":
-						result = map[string]any{"data": []any{map[string]any{"id": "turn-1", "status": testCase.status}}}
+						turnReads++
+						params := request["params"].(map[string]any)
+						if params["limit"] != float64(1) || params["sortDirection"] != "desc" || params["itemsView"] != "notLoaded" {
+							return fmt.Errorf("latest-turn selector = %#v", params)
+						}
+						status := testCase.status
+						if testCase.drift && turnReads > 1 {
+							status = "inProgress"
+						}
+						result = map[string]any{"data": []any{map[string]any{"id": "turn-1", "status": status}}}
 					case "thread/queue/list":
 						var queue any = []any{}
 						if testCase.queue {
@@ -252,17 +246,17 @@ func TestObserveThreadUsesOneMetadataReadAndFailsClosed(t *testing.T) {
 							queue = nil
 						}
 						result = map[string]any{"data": queue}
+					default:
+						return fmt.Errorf("unexpected observation request %#v", request)
 					}
 					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
 						return err
 					}
 				}
-				return nil
 			})
-			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{
-				SubmissionLedgerPath: filepath.Join(t.TempDir(), "attempts.json"),
-			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "attempts.json")})
 			defer client.Close()
+			client.archiveProof = func(context.Context, string, string, string) (ArchiveState, error) { return ArchiveActive, nil }
 			if testCase.unresolved {
 				if err := client.PrepareSendWithOptions("thread-1", "message", "client-1", "", false, codex.TurnOptions{}); err != nil {
 					t.Fatal(err)
@@ -271,21 +265,35 @@ func TestObserveThreadUsesOneMetadataReadAndFailsClosed(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			observation, err := client.ObserveThread(ctx, "thread-1", cwd)
-			wantBlockers := 0
-			if testCase.wantBlock != "" {
-				wantBlockers = 1
-			}
 			if testCase.wantError {
 				if err == nil {
-					t.Fatalf("invalid observation succeeded: %#v", observation)
+					t.Fatalf("unknown observation succeeded: %#v", observation)
 				}
-			} else if err != nil || observation.ThreadID != "thread-1" || observation.Cwd != cwd ||
-				observation.Idle != (testCase.wantBlock == "") || len(observation.Blockers) != wantBlockers ||
-				(testCase.wantBlock != "" && observation.Blockers[0] != testCase.wantBlock) {
-				t.Fatalf("observation = %#v, %v", observation, err)
-			}
-			if reads != 1 {
-				t.Fatalf("metadata reads = %d, want one", reads)
+				if testCase.unresolved {
+					var failure *ObservationError
+					if !errors.As(err, &failure) || failure.Code != "submission_unverified" {
+						t.Fatalf("submission error=%v", err)
+					}
+				}
+			} else {
+				if err != nil || !observation.ActivityKnown || observation.ActivityToken == "" || observation.Idle != (testCase.wantBlock == "") {
+					t.Fatalf("observation=%#v, %v", observation, err)
+				}
+				if observation.LastActivityAt != nil {
+					t.Fatal("missing history boundaries invented a date")
+				}
+				if testCase.wantBlock != "" && (len(observation.Blockers) != 1 || observation.Blockers[0] != testCase.wantBlock) {
+					t.Fatalf("blockers=%#v", observation.Blockers)
+				}
+				if reads != 2 || turnReads != 2 {
+					t.Fatalf("rechecks=%d metadata/%d turns", reads, turnReads)
+				}
+				if testCase.name == "idle" {
+					again, err := client.ObserveThread(ctx, "thread-1", cwd)
+					if err != nil || again.ActivityToken != observation.ActivityToken {
+						t.Fatalf("administrative updatedAt changed activity: %#v, %v", again, err)
+					}
+				}
 			}
 		})
 	}

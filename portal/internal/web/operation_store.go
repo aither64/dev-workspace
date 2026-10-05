@@ -63,7 +63,16 @@ func newLifecycleOperationStore(workspace, configuredStateRoot string) (*lifecyc
 }
 
 func (store *lifecycleOperationStore) load() (map[string]lifecycleOperation, error) {
-	if err := store.inspectDirectory(); err != nil {
+	return store.loadWithDirectoryRepair(true)
+}
+
+// Observation never repairs modes or writes receipt state.
+func (store *lifecycleOperationStore) loadReadOnly() (map[string]lifecycleOperation, error) {
+	return store.loadWithDirectoryRepair(false)
+}
+
+func (store *lifecycleOperationStore) loadWithDirectoryRepair(repair bool) (map[string]lifecycleOperation, error) {
+	if err := store.inspectDirectoryMode(repair); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return make(map[string]lifecycleOperation), nil
 		}
@@ -83,6 +92,18 @@ func (store *lifecycleOperationStore) load() (map[string]lifecycleOperation, err
 	}
 	if len(data) > maxLifecycleOperationStoreBytes {
 		return nil, errors.New("lifecycle operation state exceeds 256 KiB")
+	}
+	if !repair {
+		if err := rejectDuplicateCreationJSONKeys(data); err != nil {
+			return nil, err
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		if raw := fields["operations"]; len(raw) == 0 || string(raw) == "null" {
+			return nil, errors.New("lifecycle operation state has no records array")
+		}
 	}
 	var payload lifecycleOperationStorePayload
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
@@ -263,6 +284,10 @@ func (store *lifecycleOperationStore) ensureDirectory() error {
 }
 
 func (store *lifecycleOperationStore) inspectDirectory() error {
+	return store.inspectDirectoryMode(true)
+}
+
+func (store *lifecycleOperationStore) inspectDirectoryMode(repair bool) error {
 	info, err := os.Lstat(store.directory)
 	if err != nil {
 		return fmt.Errorf("inspect lifecycle operation state directory: %w", err)
@@ -272,6 +297,9 @@ func (store *lifecycleOperationStore) inspectDirectory() error {
 		return errors.New("lifecycle operation state directory is unsafe")
 	}
 	if info.Mode().Perm() != 0o700 {
+		if !repair {
+			return errors.New("lifecycle operation state directory is not private")
+		}
 		if err := os.Chmod(store.directory, 0o700); err != nil {
 			return fmt.Errorf("make lifecycle operation state directory private: %w", err)
 		}

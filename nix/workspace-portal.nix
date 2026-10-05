@@ -277,7 +277,11 @@ buildGoModule {
     ln -s ../workspace-archive-cleanup.rb \
       "$out/libexec/workspace-portal/workspace-archive-cleanup.rb"
     install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
+      "$out/share/workspace-portal/codex_web_protocol_contract.py"
+    install -Dm644 ${src}/test/selected_protocol_contract.py \
       "$out/share/workspace-portal/codex_protocol_contract.py"
+    install -Dm644 ${src}/test/workspace_protocol_contract.py \
+      "$out/share/workspace-portal/workspace_protocol_contract.py"
     mkdir -p "$out/share/workspace-portal/codex"
     for source in ${codexWebSrc}/codex/*.go; do
       case "$source" in *_test.go) continue ;; esac

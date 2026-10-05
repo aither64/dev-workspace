@@ -54,6 +54,7 @@ type testClient struct {
 	deleteResponseLost bool
 	readError          error
 	archived           map[string]bool
+	freshThreads       map[string]bool
 	archiveAfter       func()
 	archiveResultError error
 	listPageSize       int
@@ -64,6 +65,7 @@ type testClient struct {
 	lostStart          bool
 	lostFork           bool
 	hideThreads        bool
+	hideLoadedThreads  bool
 	nameFailure        bool
 	idleError          error
 	idleErrors         map[string]error
@@ -189,6 +191,20 @@ func (client *testClient) ReadThreadMetadata(_ context.Context, threadID string,
 	}
 	return codex.ThreadMetadata{}, &codex.ThreadNotFoundError{ThreadID: threadID}
 }
+func (client *testClient) LoadedThreadIDs(_ context.Context) ([]string, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	ids := []string{}
+	if client.hideLoadedThreads {
+		return ids, nil
+	}
+	for _, thread := range client.threads {
+		if !client.archived[thread.ID] {
+			ids = append(ids, thread.ID)
+		}
+	}
+	return ids, nil
+}
 func (client *testClient) ProveArchivedThread(_ context.Context, threadID, cwd, projectID string) (workspacecodex.ArchiveState, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -204,6 +220,9 @@ func (client *testClient) ProveArchivedThread(_ context.Context, threadID, cwd, 
 		}
 		if client.archived[threadID] {
 			return workspacecodex.ArchiveArchived, nil
+		}
+		if client.freshThreads[threadID] {
+			return workspacecodex.ArchiveFresh, nil
 		}
 		return workspacecodex.ArchiveActive, nil
 	}
