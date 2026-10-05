@@ -3,6 +3,43 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_workspace_auto_archive_status_is_cached_sorted_and_isolates_legacy_and_moved_rows
+    with_workspace do |workspace|
+      slug = '2026-06-06-cached'
+      runner = automatic_fixture(workspace, slug)
+      automatic_scan(runner)
+      runner.auto_archive_hold(slug, true, as_is: true)
+      broken = File.join(workspace, 'work', '2026-06-06-broken')
+      FileUtils.mkdir_p(broken)
+      File.write(File.join(broken, 'state.md'), 'legacy prose only')
+      moved = '2026-06-06-moved'
+      runner.ensure_tracking_files(moved)
+      File.write(File.join(workspace, 'work', moved, 'portal.yml'), YAML.dump(
+        'schema' => 1, 'slug' => moved, 'repositories' => [], 'artifacts' => [],
+        'finalized_at' => Time.now.utc.iso8601
+      ))
+      set_lifecycle(workspace, moved, 'complete')
+      FileUtils.mkdir_p(File.join(workspace, 'archive'))
+      FileUtils.mv(File.join(workspace, 'work', moved), File.join(workspace, 'archive', moved))
+      runner.auto_archive_store.write("session-#{moved}", 'slug' => moved, 'hold' => false,
+        'operation' => { 'id' => 'a' * 64, 'mode' => 'complete', 'tier' => 'complete', 'identity' => 'pending' })
+      cached = Dir.glob(File.join(runner.auto_archive_store.root, '*.json')).to_h { |path| [path, File.binread(path)] }
+      refs = git_capture_success('git', '-C', workspace, 'for-each-ref', '--format=%(refname):%(objectname)')
+
+      result = runner.auto_archive_workspace_status
+
+      assert_equal(1, result.fetch('schema'))
+      assert_equal(workspace, result.fetch('workspace'))
+      assert_equal([File.basename(broken), slug, moved], result.fetch('sessions').map { |row| row.fetch('slug') })
+      assert(result.fetch('sessions').first.fetch('migration_needed'))
+      assert_equal('legacy_format', result.fetch('sessions').first.fetch('diagnostics').first.fetch('category'))
+      assert(result.fetch('sessions')[1].fetch('hold'))
+      assert(result.fetch('sessions').last.fetch('operation'))
+      refute(result.fetch('sessions').last.fetch('eligible'))
+      assert_equal(cached, cached.keys.to_h { |path| [path, File.binread(path)] })
+      assert_equal(refs, git_capture_success('git', '-C', workspace, 'for-each-ref', '--format=%(refname):%(objectname)'))
+    end
+  end
   def subprocess_can_lock?(path, mode)
     _output, _error, status = Open3.capture3(
       RbConfig.ruby, '-e',
@@ -137,24 +174,28 @@ class DevSessionTest < Minitest::Test
       automatic_scan(runner)
       portal = File.join(workspace, 'automatic-portal.rb')
       original = File.read(portal)
+      path = File.join(workspace, 'work', slug)
+      stat = File.lstat(path)
       valid = {
-        'threadId' => "thread-#{slug}", 'cwd' => File.join(workspace, 'work', slug),
-        'updatedAt' => Time.now.to_i, 'idle' => true, 'blockers' => []
+        'schema' => 1, 'workspace' => workspace, 'slug' => slug,
+        'identity' => Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, "thread-#{slug}"])),
+        'activityKnown' => true, 'activityToken' => 'a' * 64, 'lastActivityAt' => Time.now.to_i,
+        'idle' => true, 'subjects' => [], 'diagnostics' => []
       }
       [
         valid.except('idle'),
         valid.merge('idle' => false),
-        valid.merge('blockers' => ['Queued message.']),
-        valid.merge('blockers' => ['x' * 241]),
-        valid.merge('updatedAt' => Time.now.to_i + 120),
-        valid.merge('cwd' => '/foreign'),
+        valid.merge('diagnostics' => [{ 'code' => 'queued_input', 'category' => 'busy', 'message' => 'Queued message.' }]),
+        valid.merge('diagnostics' => [{ 'code' => 'queued_input', 'category' => 'busy', 'message' => 'x' * 241 }]),
+        valid.merge('lastActivityAt' => Time.now.to_i + 120),
+        valid.merge('workspace' => '/foreign'),
       ].each do |response|
         age_automatic_session(runner, slug, 86_401)
         File.write(portal, "puts #{JSON.generate(response).inspect}\n")
         result = automatic_scan(runner).fetch(0)
         assert_equal('deferred', result['result'])
         refute(result['eligible'])
-        assert(runner.auto_archive_store.session(slug)['reset_at'])
+        assert(runner.auto_archive_store.session(slug)['continuity_lost'])
       end
       File.write(portal, original)
       recovered = automatic_scan(runner).fetch(0)
@@ -187,7 +228,8 @@ class DevSessionTest < Minitest::Test
         assert_nil(current['result'])
         assert_nil(current['archive_mode'])
         observed = automatic_scan(runner).fetch(0)
-        assert_equal('replacement-thread', observed['identity'])
+        assert_equal('replacement-thread', observed['root_thread_id'])
+        refute_equal(first['identity'], observed['identity'])
         refute(observed['hold'])
         refute(observed['eligible'])
         runner.auto_archive_hold(slug, true, as_is: true)
@@ -311,6 +353,8 @@ class DevSessionTest < Minitest::Test
       automatic_scan(runner)
       age_automatic_session(runner, slug, 604_801)
       path = File.join(workspace, 'worktrees', slug, 'sample')
+      configure_git_identity(path)
+      previous_head = git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip
       original = runner.method(:archive)
       runner.define_singleton_method(:archive) do |input, **keywords|
         File.write(File.join(path, 'new-work.txt'), 'changed head')
@@ -319,6 +363,8 @@ class DevSessionTest < Minitest::Test
         original.call(input, **keywords)
       end
       result = automatic_scan(runner).fetch(0)
+      refute_equal(previous_head, git_capture_success('git', '-C', path, 'rev-parse', 'HEAD').strip,
+                   'archive race callback must commit a new feature HEAD')
       assert_equal('deferred', result['result'])
       assert(File.directory?(File.join(workspace, 'work', slug)))
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))

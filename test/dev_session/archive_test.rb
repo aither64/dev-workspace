@@ -3,13 +3,61 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_threadless_archive_threads_owned_context_through_preflights_and_never_adopts_a_root
+    [nil, 'b' * 64].each do |accepted_id|
+      with_workspace do |workspace|
+        slug = '2026-06-06-threadless-context'
+        runner = archive_runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        commit_archive_fixture(workspace, slug, lifecycle: 'active')
+        configure_workspace_origin(workspace)
+        runner.define_singleton_method(:retire_portal_thread!) { |*| raise 'threadless archive must not adopt a root' }
+        runner.archive(slug, as_is: true, abandoned: true, operation_id: accepted_id)
+        observations = File.readlines(File.join(workspace, 'archive-observations.jsonl')).map { |line| JSON.parse(line) }
+        first = observations.first.fetch('args')
+        if accepted_id
+          assert_equal(accepted_id, first.fetch(first.index('--expected-operation-id') + 1))
+        else
+          refute_includes(first, '--expected-operation-id')
+          refute_includes(first, '--expected-archive-mode')
+        end
+        later = observations.drop(1)
+        assert_operator(later.length, :>=, 5)
+        ids = later.map do |observation|
+          args = observation.fetch('args')
+          assert_equal('abandoned', args.fetch(args.index('--expected-archive-mode') + 1))
+          args.fetch(args.index('--expected-operation-id') + 1)
+        end
+        assert_equal(1, ids.uniq.length)
+        assert_equal(accepted_id, ids.first) if accepted_id
+        assert(observations.any? { |observation| observation['tracking'] == File.join(workspace, 'archive', slug) })
+        manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+        refute(manifest.key?('codex'))
+      end
+    end
+  end
+
+  def test_threadless_archive_refuses_unknown_conversation_before_publication
+    with_workspace do |workspace|
+      slug = '2026-06-06-threadless-residue'
+      runner = archive_runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      File.write(File.join(workspace, 'work', slug, 'conversation-residue'), 'unknown native conversation fixture')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
+      configure_workspace_origin(workspace)
+      assert_raises(WorkspaceAutoArchive::ObservationFailure) { runner.archive(slug, as_is: true) }
+      refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
   def test_archive_rejects_an_unmerged_registered_branch_before_mutating_state
     skip 'git is not available' unless command_available?('git')
 
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-demo'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -24,7 +72,7 @@ class DevSessionTest < Minitest::Test
         'git', "--git-dir=#{repository}", 'push', 'origin',
         "refs/heads/#{slug}:refs/heads/#{slug}"
       )
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       error = assert_raises(DevSession::Error) do
@@ -49,7 +97,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-unchanged-unpushed'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -58,7 +106,7 @@ class DevSessionTest < Minitest::Test
       base = git_capture_success(
         'git', "--git-dir=#{repository}", 'rev-parse', 'refs/heads/master'
       ).strip
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       runner.archive(slug, as_is: true)
@@ -83,12 +131,12 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-retry-unchanged-unpushed'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
       )
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
       File.write(hook, "#!/bin/sh\nexit 1\n")
@@ -112,7 +160,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-changed-unpushed'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -122,7 +170,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'feature.txt'), "unpushed\n")
       assert_git_success('git', '-C', path, 'add', 'feature.txt')
       assert_git_success('git', '-C', path, 'commit', '-m', 'unpushed feature')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       error = assert_raises(DevSession::Error) do
@@ -140,10 +188,10 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-coordination'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       File.write(File.join(workspace, 'staged.txt'), "staged\n")
       File.write(File.join(workspace, 'unstaged.txt'), "unstaged\n")
@@ -181,10 +229,10 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-archive-retry'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
       File.write(hook, "#!/bin/sh\nexit 1\n")
@@ -215,10 +263,10 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-archive-stale-runtime'
       state_home = File.join(workspace, '.xdg-state')
       authority_dir = File.join(workspace, 'authority')
-      base = runner_for(workspace)
+      base = archive_runner_for(workspace)
       base.ensure_tracking_files(slug)
       base.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       interrupted = false
       runner_class = Class.new(DevSession::Runner) do
@@ -233,7 +281,7 @@ class DevSessionTest < Minitest::Test
       first = runner_class.new(
         workspace:, tmux: NullTmux.new, authority_dir:,
         out: StringIO.new, err: StringIO.new, today: TODAY,
-        env: { 'XDG_STATE_HOME' => state_home }
+        env: archive_fixture_env(workspace, 'XDG_STATE_HOME' => state_home)
       )
 
       assert_raises(DevSession::Error) do
@@ -243,11 +291,11 @@ class DevSessionTest < Minitest::Test
       assert_equal('thread_retired', JSON.parse(File.read(journal_path)).fetch('phase'))
 
       replacement = ReplacedTmux.new(slug, workspace:)
-      second = runner_for(
+      second = archive_runner_for(
         workspace,
         tmux: replacement,
         authority_dir:,
-        env: { 'XDG_STATE_HOME' => state_home }
+        env: archive_fixture_env(workspace, 'XDG_STATE_HOME' => state_home)
       )
       stale = DevSession::Tmux::Session.new(
         id: '$11', name: slug, mark: '1', slug:, workspace:,
@@ -277,11 +325,12 @@ class DevSessionTest < Minitest::Test
         slug, workspace:, socket_path: '/run/test.sock', id: '$11',
         identity_token: nil
       )
-      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner = archive_runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
       runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      archive_retained_identity_fixture(workspace, slug)
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       error = assert_raises(DevSession::Error) do
@@ -304,7 +353,7 @@ class DevSessionTest < Minitest::Test
       tmux = RenamedManagedTmux.new(
         slug, workspace:, socket_path: '/run/test.sock', id: '$11'
       )
-      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner = archive_runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
       session = DevSession::Tmux::Session.new(
@@ -313,7 +362,8 @@ class DevSessionTest < Minitest::Test
         identity_token: 'a' * 64
       )
       runner.send(:write_session_authority, slug, session, state: 'ready')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      archive_retained_identity_fixture(workspace, slug)
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       error = assert_raises(DevSession::Error) do
@@ -336,11 +386,12 @@ class DevSessionTest < Minitest::Test
         slug, workspace:, socket_path: '/run/test.sock', id: '$11',
         identity_token: nil
       )
-      runner = runner_for(workspace, tmux:, authority_dir:)
+      runner = archive_runner_for(workspace, tmux:, authority_dir:)
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
       runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      archive_retained_identity_fixture(workspace, slug)
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       plan = runner.send(:prepare_cleanup, slug, force: false)
       runner.send(:prepare_archive_journal!, slug, 'complete', {}, plan)
@@ -360,10 +411,10 @@ class DevSessionTest < Minitest::Test
     %i[state thread].each do |mutation|
       with_workspace do |workspace|
         slug = "2026-06-06-archive-#{mutation}"
-        base = runner_for(workspace)
+        base = archive_runner_for(workspace)
         base.ensure_tracking_files(slug)
         base.send(:ensure_portal_manifest, slug)
-        commit_tracking(workspace, slug, lifecycle: 'active')
+        commit_archive_fixture(workspace, slug, lifecycle: 'active')
         configure_workspace_origin(workspace)
         fail_once = true
         runner_class = Class.new(DevSession::Runner) do
@@ -378,7 +429,7 @@ class DevSessionTest < Minitest::Test
         end
         runner = runner_class.new(
           workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
-          today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+          today: TODAY, env: archive_fixture_env(workspace)
         )
 
         assert_raises(DevSession::Error) do
@@ -394,7 +445,11 @@ class DevSessionTest < Minitest::Test
         else
           portal = File.join(workspace, 'archive', slug, 'portal.yml')
           manifest = YAML.safe_load(File.read(portal))
-          manifest['codex']['thread_id'] = 'replacement-thread'
+          manifest['codex'] = {
+            'thread_id' => 'replacement-thread',
+            'socket_path' => '/run/test/codex.sock',
+            'client_version' => '0.160.0'
+          }
           File.write(portal, YAML.dump(manifest))
         end
 
@@ -412,22 +467,24 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-archive-owned'
-      base = runner_for(workspace)
+      base = archive_runner_for(workspace)
       base.ensure_tracking_files(slug)
       base.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
-      fail_retirement = true
+      fail_thread_retired = true
       runner_class = Class.new(DevSession::Runner) do
-        define_method(:retire_portal_thread!) do |*arguments, **options|
-          raise DevSession::Error, 'injected retirement failure' if fail_retirement
+        define_method(:advance_archive!) do |current_slug, journal, phase|
+          if phase == 'thread_retired' && fail_thread_retired
+            raise DevSession::Error, 'injected pre-thread-retired failure'
+          end
 
-          super(*arguments, **options)
+          super(current_slug, journal, phase)
         end
       end
       runner = runner_class.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
-        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+        today: TODAY, env: archive_fixture_env(workspace)
       )
 
       assert_raises(DevSession::Error) do
@@ -456,7 +513,7 @@ class DevSessionTest < Minitest::Test
         assert_includes(error.message, 'session archive is unfinished')
       end
 
-      fail_retirement = false
+      fail_thread_retired = false
       runner.archive(slug, as_is: true)
 
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
@@ -470,19 +527,21 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-archive-dirty-commit'
-      base = runner_for(workspace)
+      base = archive_runner_for(workspace)
       base.ensure_tracking_files(slug)
       base.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       runner_class = Class.new(DevSession::Runner) do
-        define_method(:retire_portal_thread!) do |*_arguments, **_options|
-          raise DevSession::Error, 'injected retirement failure'
+        define_method(:advance_archive!) do |current_slug, journal, phase|
+          raise DevSession::Error, 'injected pre-thread-retired failure' if phase == 'thread_retired'
+
+          super(current_slug, journal, phase)
         end
       end
       runner = runner_class.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
-        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+        today: TODAY, env: archive_fixture_env(workspace)
       )
       assert_raises(DevSession::Error) do
         runner.archive(slug, as_is: true)
@@ -507,19 +566,21 @@ class DevSessionTest < Minitest::Test
 
     with_workspace do |workspace|
       slug = '2026-06-06-archive-verifier'
-      base = runner_for(workspace)
+      base = archive_runner_for(workspace)
       base.ensure_tracking_files(slug)
       base.send(:ensure_portal_manifest, slug)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       runner_class = Class.new(DevSession::Runner) do
-        define_method(:retire_portal_thread!) do |*_arguments, **_options|
-          raise DevSession::Error, 'injected retirement failure'
+        define_method(:advance_archive!) do |current_slug, journal, phase|
+          raise DevSession::Error, 'injected pre-thread-retired failure' if phase == 'thread_retired'
+
+          super(current_slug, journal, phase)
         end
       end
       runner = runner_class.new(
         workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
-        today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+        today: TODAY, env: archive_fixture_env(workspace)
       )
       assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
       journal_path = runner.send(:lifecycle_journal_file, slug, 'archive')
@@ -544,7 +605,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-reprove'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -554,7 +615,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'feature.txt'), "merged\n")
       assert_git_success('git', '-C', path, 'add', 'feature.txt')
       assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       merge_registered_branches(workspace, slug)
       configure_workspace_origin(workspace)
       hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
@@ -593,7 +654,7 @@ class DevSessionTest < Minitest::Test
       with_workspace do |workspace|
         create_bare_repo(workspace, 'sample')
         slug = "2026-06-06-reprove-#{phase.tr('_', '-')}"
-        runner = runner_for(workspace)
+        runner = archive_runner_for(workspace)
         runner.worktree_add(
           slug, 'sample', as_is: true, name: nil, branch: nil,
           base: 'master', fetch: false
@@ -603,7 +664,7 @@ class DevSessionTest < Minitest::Test
         File.write(File.join(path, 'feature.txt'), "first merged head\n")
         assert_git_success('git', '-C', path, 'add', 'feature.txt')
         assert_git_success('git', '-C', path, 'commit', '-m', 'first merged feature')
-        commit_tracking(workspace, slug, lifecycle: 'active')
+        commit_archive_fixture(workspace, slug, lifecycle: 'active')
         merge_registered_branches(workspace, slug)
         configure_workspace_origin(workspace)
 
@@ -639,7 +700,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-merged'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -649,7 +710,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'feature.txt'), "merged\n")
       assert_git_success('git', '-C', path, 'add', 'feature.txt')
       assert_git_success('git', '-C', path, 'commit', '-m', 'merged feature')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       merge_registered_branches(workspace, slug)
       configure_workspace_origin(workspace)
 
@@ -676,7 +737,7 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-discarded'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(
         slug, 'sample', as_is: true, name: nil, branch: nil,
         base: 'master', fetch: false
@@ -686,7 +747,7 @@ class DevSessionTest < Minitest::Test
       File.write(File.join(path, 'discarded.txt'), "discarded\n")
       assert_git_success('git', '-C', path, 'add', 'discarded.txt')
       assert_git_success('git', '-C', path, 'commit', '-m', 'discarded')
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
 
       runner.archive(slug, as_is: true, abandoned: true)

@@ -17,6 +17,71 @@ class DevSessionTest < Minitest::Test
 
   private
 
+  # Archive fixtures explicitly model normalized tracking-only provenance and
+  # a selected observation adapter. Go tests own native negative/receipt proof;
+  # Ruby fixtures own command context and journal/cleanup phase orchestration.
+  def archive_fixture_env(workspace, extra = {})
+    portal = File.join(workspace, 'archive-observer.rb')
+    unless File.exist?(portal)
+      File.write(portal, <<~'RUBY')
+        require 'digest'
+        require 'json'
+        require 'yaml'
+        exit 0 unless ARGV[0, 2] == ['session', 'observe']
+        workspace = ARGV.fetch(ARGV.index('--workspace') + 1)
+        slug = ARGV.fetch(ARGV.index('--session-slug') + 1)
+        cwd = File.join(workspace, 'work', slug)
+        cwd = File.join(workspace, 'archive', slug) unless File.directory?(cwd)
+        manifest = YAML.safe_load(File.read(File.join(cwd, 'portal.yml')))
+        abort 'fixture requires normalized threadless tracking' unless manifest['schema'] == 1 &&
+          manifest['repositories'].is_a?(Array) && manifest['artifacts'].is_a?(Array) &&
+          %w[codex creation forked_from].none? { |key| manifest.key?(key) }
+        File.open(File.join(workspace, 'archive-observations.jsonl'), 'a') do |file|
+          file.puts JSON.generate('args' => ARGV, 'tracking' => cwd,
+            'journal_present' => File.exist?(File.join(workspace, 'worktrees', '.locks', slug + '.archive.json')))
+        end
+        abort 'unknown conversation fixture' if File.exist?(File.join(cwd, 'conversation-residue'))
+        stat = File.lstat(cwd)
+        identity = Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, nil]))
+        puts JSON.generate('schema' => 1, 'workspace' => workspace, 'slug' => slug, 'identity' => identity,
+          'activityKnown' => true, 'activityToken' => Digest::SHA256.hexdigest('verified-threadless'),
+          'lastActivityAt' => nil, 'idle' => true, 'subjects' => [], 'diagnostics' => [])
+      RUBY
+    end
+    {
+      'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'),
+      DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin,
+      DevSession::ENV_CODEX_SOCKET => '/run/test/codex.sock',
+      DevSession::ENV_CODEX_VERSION => '0.160.0',
+      DevSession::ENV_AUTHORITY_DIR => File.join(workspace, '.archive-authority'),
+      'DEV_WORKSPACE_CODEX_HOME' => File.join(workspace, '.archive-codex')
+    }.merge(extra)
+  end
+
+  def archive_runner_for(workspace, env: {}, **options)
+    runner_for(workspace, **options, env: archive_fixture_env(workspace, env))
+  end
+
+  def commit_archive_fixture(workspace, slug, lifecycle:)
+    path = File.join(workspace, 'work', slug, 'portal.yml')
+    manifest = File.file?(path) ? YAML.safe_load(File.read(path)) : { 'schema' => 1, 'slug' => slug }
+    unless manifest.dig('codex', 'thread_id')
+      manifest.delete('codex') if manifest['codex'].nil? || manifest['codex'] == {}
+      manifest.delete('creation')
+      manifest['repositories'] ||= []
+      manifest['artifacts'] ||= []
+      File.write(path, YAML.dump(manifest))
+    end
+    commit_tracking(workspace, slug, lifecycle:)
+  end
+
+  def archive_retained_identity_fixture(workspace, slug)
+    path = File.join(workspace, 'work', slug, 'portal.yml')
+    manifest = YAML.safe_load(File.read(path))
+    manifest['codex'] = { 'thread_id' => "retained-#{slug}", 'socket_path' => '/run/test/codex.sock', 'client_version' => '0.160.0' }
+    File.write(path, YAML.dump(manifest))
+  end
+
   def automatic_fixture(workspace, slug, lifecycle: 'active', out: nil)
     portal = File.join(workspace, 'automatic-portal.rb')
     stamp = Time.now.to_i
@@ -26,13 +91,29 @@ class DevSessionTest < Minitest::Test
         cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
         abort 'Conversation has a queued message.' if File.exist?(File.join(cwd, 'busy'))
       end
+      if ARGV[0, 2] == ['session', 'observe']
+        require 'digest'
+        require 'yaml'
+        workspace = ARGV.fetch(ARGV.index('--workspace') + 1)
+        slug = ARGV.fetch(ARGV.index('--session-slug') + 1)
+        cwd = File.join(workspace, 'work', slug)
+        manifest = YAML.safe_load(File.read(File.join(cwd, 'portal.yml')))
+        thread = manifest.dig('codex', 'thread_id')
+        stat = File.lstat(cwd)
+        identity = Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, thread]))
+        busy = File.exist?(File.join(cwd, 'busy'))
+        token = Digest::SHA256.hexdigest(JSON.generate([thread, busy]))
+        diagnostics = busy ? [{ 'code' => 'queued_input', 'category' => 'busy', 'message' => 'Conversation has a queued message.' }] : []
+        subjects = [{ 'address' => 'lead', 'threadId' => thread, 'activityToken' => token, 'lastActivityAt' => #{stamp}, 'idle' => !busy }]
+        puts JSON.generate('schema' => 1, 'workspace' => workspace, 'slug' => slug, 'identity' => identity,
+          'activityKnown' => true, 'activityToken' => token, 'lastActivityAt' => #{stamp},
+          'idle' => !busy, 'subjects' => subjects, 'diagnostics' => diagnostics)
+        exit 0
+      end
       exit 0 unless ARGV.first == 'thread'
       cwd = ARGV.fetch(ARGV.index('--cwd') + 1)
       if ARGV[1] == 'observe'
-        blockers = File.exist?(File.join(cwd, 'busy')) ? ['Conversation has a queued message.'] : []
-        puts JSON.generate('threadId' => ARGV.fetch(ARGV.index('--thread-id') + 1),
-                           'cwd' => cwd, 'updatedAt' => #{stamp},
-                           'idle' => blockers.empty?, 'blockers' => blockers)
+        abort 'automatic fixture must use the exact session aggregate'
       elsif ARGV[1] == 'require-idle' && File.exist?(File.join(cwd, 'busy'))
         warn 'Conversation has a queued message.'
         exit 1
@@ -41,7 +122,9 @@ class DevSessionTest < Minitest::Test
     runner = runner_for(workspace, out:, env: {
       DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin,
       DevSession::ENV_CODEX_SOCKET => '/run/test/codex.sock',
-      DevSession::ENV_CODEX_VERSION => '0.152.1'
+      DevSession::ENV_CODEX_VERSION => '0.152.1',
+      DevSession::ENV_AUTHORITY_DIR => File.join(workspace, '.automatic-authority'),
+      'DEV_WORKSPACE_CODEX_HOME' => File.join(workspace, '.automatic-codex')
     })
     runner.ensure_tracking_files(slug)
     runner.send(:ensure_portal_manifest, slug)

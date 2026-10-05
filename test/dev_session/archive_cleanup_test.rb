@@ -148,6 +148,15 @@ class DevSessionTest < Minitest::Test
 
       runner.archive(slug, as_is: true, operation_id: intent.fetch('operation_id'))
 
+      observations = File.readlines(File.join(workspace, 'archive-observations.jsonl')).map { |line| JSON.parse(line) }
+      reconstructed = observations.find do |observation|
+        args = observation.fetch('args')
+        !observation.fetch('journal_present') && args.include?('--expected-operation-id')
+      end
+      refute_nil(reconstructed, 'prepared retry must observe before republishing its journal')
+      args = reconstructed.fetch('args')
+      assert_equal(intent.fetch('operation_id'), args.fetch(args.index('--expected-operation-id') + 1))
+      assert_equal(intent.fetch('mode'), args.fetch(args.index('--expected-archive-mode') + 1))
       refute(File.exist?(cleanup.path))
       assert(File.directory?(File.join(workspace, 'archive', slug)))
     end
@@ -464,9 +473,9 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-cleanup'
-      runner = runner_for(workspace)
+      runner = archive_runner_for(workspace)
       runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
-      commit_tracking(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       common = File.join(workspace, 'repos', 'sample.git')
       feature = File.join(workspace, 'worktrees', slug, 'sample')

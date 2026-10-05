@@ -1803,7 +1803,9 @@ module DevSession
             end
             plan = cleanup.plan(inventory)
             proven_heads = mode == 'complete' ? inventory.fetch('registered_heads') : {}
-            ensure_archive_conversations_ready!(slug)
+            preflight_id = prepared&.fetch('operation_id') || (automatic ? nil : operation_id)
+            ensure_archive_conversations_ready!(slug, expected_operation_id: preflight_id,
+                                                archive_mode: preflight_id ? mode : nil)
             ensure_retirement_identity!(slug, cleanup_session(slug))
             validate_development_cluster_helpers!
             validate_archive_move_command!
@@ -1843,7 +1845,9 @@ module DevSession
           else
             verify_archived_tracking_tree!(slug, journal)
           end
-          ensure_archive_conversations_ready!(slug) if archive_phase_before?(journal, 'thread_retired')
+          if archive_phase_before?(journal, 'thread_retired')
+            ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
+          end
           ensure_retirement_identity!(slug, cleanup_session(slug))
           unless sidecar
             # Temporary compatibility: old schema-2 journals cannot adopt the
@@ -1856,7 +1860,8 @@ module DevSession
             if mode == 'complete' && !sidecar
               reprove_exact_heads_merged!(slug, plan, journal.fetch('proven_heads'))
             end
-            quiesce_and_require_idle!(slug, plan.session, archive: true)
+            quiesce_and_require_idle!(slug, plan.session, archive: true,
+                                     expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
             advance_archive!(slug, journal, 'quiesced')
           end
           if archive_phase_before?(journal, 'clusters_released')
@@ -1894,11 +1899,17 @@ module DevSession
           verify_committed_archive_tracking!(slug, journal)
           if archive_phase_before?(journal, 'thread_retired')
             cleanup.revalidate!(sidecar, journal:) if sidecar
-            ensure_archive_conversations_ready!(slug)
-			sync_team_lifecycle!(slug, 'archive-retained')
-			sync_team_lifecycle!(slug, 'require-archived')
-            ensure_archive_conversations_ready!(slug)
-            retire_portal_thread!(slug, force: false)
+            ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
+            if journal.fetch('retained_thread_id')
+              sync_team_lifecycle!(slug, 'archive-retained')
+              sync_team_lifecycle!(slug, 'require-archived')
+              ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
+              retire_portal_thread!(slug, force: false)
+            else
+              # Negative proof owns this threadless operation. Do not use the
+              # generic retirement fallback to discover and adopt a late root.
+              ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
+            end
             advance_archive!(slug, journal, 'thread_retired')
           end
           if archive_phase_before?(journal, 'runtime_retired')
@@ -2137,7 +2148,9 @@ module DevSession
                        {}
                      end
       ensure_archive_root!
-      quiesced = quiesce_and_require_idle!(slug, plan.session, archive: !journal.nil?)
+      quiesced = quiesce_and_require_idle!(slug, plan.session, archive: !journal.nil?,
+                                        expected_operation_id: journal&.fetch('operation_id'),
+                                        archive_mode: journal&.fetch('mode'))
       verify_proven_heads_unchanged!(slug, plan, proven_heads) if lifecycle == 'complete' && !cleanup
       finalize_portal_manifest(
         slug,
@@ -8117,12 +8130,22 @@ module DevSession
       @command_runner.capture(command)
     end
 
-    def ensure_archive_conversations_ready!(slug)
+    def ensure_archive_conversations_ready!(slug, expected_operation_id: nil, archive_mode: nil)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
       unless manifest&.dig('codex', 'thread_id')
         raise Error, "archive team has no retained root: #{slug}" if direct_team_state_present?(slug)
-
+        unless manifest && manifest['schema'] == 1 && %w[repositories artifacts].all? { |key| manifest[key].is_a?(Array) } &&
+               %w[codex creation forked_from].none? { |key| manifest.key?(key) }
+          raise Error, "normalized threadless tracking is required before archive: #{slug}"
+        end
+        raise Error, "live runtime contradicts threadless archive: #{slug}" if @tmux.session(slug) || @selected_authority
+        directory = File.dirname(tracking)
+        identity = auto_archive_tracking_identity(slug, directory, nil)
+        observation = auto_archive_session_observation(slug, identity, operation_id: expected_operation_id, archive_mode:)
+        unless observation['activityKnown'] && observation['idle'] && observation['subjects'].empty?
+          raise Error, "threadless conversation absence cannot be verified: #{slug}"
+        end
         return
       end
       unless @codex_socket && valid_socket_path?(@codex_socket)
@@ -8134,10 +8157,10 @@ module DevSession
       end
     end
 
-    def quiesce_and_require_idle!(slug, session, archive: false)
+    def quiesce_and_require_idle!(slug, session, archive: false, expected_operation_id: nil, archive_mode: nil)
       quiesced = quiesce_native_client!(slug, session)
       if archive
-        ensure_archive_conversations_ready!(slug)
+        ensure_archive_conversations_ready!(slug, expected_operation_id:, archive_mode:)
       else
         ensure_portal_thread_idle!(slug, @selected_authority)
         sync_team_lifecycle!(slug, 'require-idle')
@@ -8901,10 +8924,17 @@ module DevSession
                    runner.auto_archive_hold(@argv.fetch(0), action == 'hold', as_is: opts[:as_is])
                  end
                when 'status'
-                 require_arity!(1, @argv, 'auto-archive status')
-                 validate_host_generation!
-                 slug = runner.resolve_slug(@argv.fetch(0), as_is: opts[:as_is])
-                 runner.auto_archive_status(slug)
+                 raise Error, 'auto-archive status accepts at most one session' if @argv.length > 1
+                 read = lambda do
+                   validate_host_generation!
+                   if @argv.empty?
+                     runner.auto_archive_workspace_status
+                   else
+                     slug = runner.resolve_slug(@argv.fetch(0), as_is: opts[:as_is])
+                     runner.auto_archive_status(slug)
+                   end
+                 end
+                 @transition_lock ? with_transition_lock(File::LOCK_SH, &read) : read.call
                else
                  raise Error, 'usage: auto-archive scan|enable|disable|hold|release|status [SLUG] [--dry-run] [--json] [--as-is]'
                end

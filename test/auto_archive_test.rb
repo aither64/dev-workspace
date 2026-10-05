@@ -12,7 +12,10 @@ class AutoArchiveTest < Minitest::Test
   end
 
   def snapshot(tier = 'complete', fingerprint = 'unchanged', blockers = [])
-    { 'identity' => 'thread-1', 'fingerprint' => fingerprint, 'tier' => tier, 'blockers' => blockers }
+    { 'identity' => 'thread-1', 'root_thread_id' => 'root-1', 'fingerprint_version' => 1,
+      'dimensions' => { 'activity' => fingerprint }, 'unknown_dimensions' => [],
+      'activity_known' => true, 'idle' => blockers.empty?, 'tier' => tier,
+      'diagnostics' => blockers.map { |message| WorkspaceAutoArchive::Policy.diagnostic('queued_input', 'busy', message) } }
   end
 
   def observe(previous = {}, value = snapshot, config = policy, now = NOW)
@@ -65,6 +68,55 @@ class AutoArchiveTest < Minitest::Test
     backwards = observe(first, snapshot, policy, NOW - 100)
     refute(backwards['eligible'])
     assert_equal((NOW - 100).iso8601, backwards['idle_since'])
+  end
+
+  def test_submission_unknown_loses_continuity_across_restart_with_identical_tokens
+    first = observe
+    unknown = snapshot.merge('activity_known' => false, 'idle' => false, 'dimensions' => {},
+      'diagnostics' => [WorkspaceAutoArchive::Policy.diagnostic('submission_unverified', 'activity_unknown', 'Submissions cannot be proved resolved.')])
+    failed = observe(first, unknown, policy, NOW + 86_400)
+    assert(failed['continuity_lost'])
+    assert_nil(failed['idle_since'])
+    refute(failed['eligible'])
+    restarted = JSON.parse(JSON.generate(failed))
+    recovered = observe(restarted, snapshot, policy, NOW + 172_800)
+    assert_equal((NOW + 172_800).iso8601, recovered['idle_since'])
+    refute(recovered['eligible'])
+  end
+
+  def test_proof_errors_preserve_known_grace_and_unknown_dimension_never_proves_eligibility
+    first = observe
+    proof = snapshot.merge('diagnostics' => [WorkspaceAutoArchive::Policy.diagnostic('merge_unverified', 'merge_proof', 'Merge proof is unavailable.')])
+    blocked = observe(first, proof, policy, NOW + 86_400)
+    assert_equal(first['idle_since'], blocked['idle_since'])
+    refute(blocked['eligible'])
+    changed_text = proof.merge('diagnostics' => [WorkspaceAutoArchive::Policy.diagnostic('merge_unverified', 'merge_proof', 'Network lookup failed again.')])
+    again = observe(blocked, changed_text, policy, NOW + 172_800)
+    assert_equal(first['idle_since'], again['idle_since'])
+    unknown = snapshot.merge('dimensions' => {}, 'unknown_dimensions' => ['activity'])
+    refute(observe(again, unknown, policy, NOW + 172_800)['eligible'])
+    assert(observe(again, snapshot, policy, NOW + 172_800)['eligible'])
+  end
+
+  def test_busy_to_idle_and_dirty_to_clean_restart_grace
+    first = observe({}, snapshot.merge('idle' => false,
+      'dimensions' => { 'activity' => 'queue-id', 'worktrees' => 'dirty' },
+      'diagnostics' => [WorkspaceAutoArchive::Policy.diagnostic('queued_input', 'busy', 'Queued input.')]))
+    clean = snapshot.merge('dimensions' => { 'activity' => 'unchanged', 'worktrees' => 'clean' })
+    recovered = observe(first, clean, policy, NOW + 172_800)
+    assert_equal((NOW + 172_800).iso8601, recovered['idle_since'])
+    refute(recovered['eligible'])
+  end
+
+  def test_legacy_root_hold_converts_only_on_positive_same_root_and_starts_one_baseline
+    old = { 'identity' => 'root-1', 'hold' => true, 'idle_since' => (NOW - 172_800).iso8601, 'fingerprint' => 'old' }
+    converted = observe(old, snapshot)
+    assert(converted['hold'])
+    assert_equal(NOW.iso8601, converted['idle_since'])
+    assert_equal(1, converted['fingerprint_version'])
+    again = observe(converted, snapshot, policy, NOW + 100)
+    assert_equal(converted['idle_since'], again['idle_since'])
+    refute(observe(old, snapshot.merge('root_thread_id' => 'replacement'))['hold'])
   end
 
   def test_stores_are_bound_to_the_workspace_and_survive_restarts
