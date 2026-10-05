@@ -77,8 +77,12 @@ Active same-directory discovery must match the retained set, even when the root
 is already archived. Discovery includes native subagents, exec/App Server and
 unknown-source threads as well as interactive conversations. The shared discovery
 owner combines saved lists with complete public loaded-ID enumeration and exact
-metadata-only reads. A newly loaded thread need not have a saved row, rollout or
-turn. Exact retained fresh identities can be loaded-only; unknown same-CWD
+metadata-only reads. The positive retained active-set query uses the App Server
+state database index to avoid a saved-rollout scan; loaded discovery remains
+independent, and threadless absence keeps its full saved-list proof.
+The final retirement lookup uses the index only after exact root proof.
+A newly loaded thread need not have a saved row, rollout or turn.
+Exact retained fresh identities can be loaded-only; unknown same-CWD
 identities block, and positively verified unrelated CWDs do not. Failed metadata
 reads, disappearance or contradictory saved/loaded identity make the sample
 unknown. The native loaded manager omits internal sessions; its absence is never

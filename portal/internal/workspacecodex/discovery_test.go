@@ -73,7 +73,7 @@ func TestThreadlessObservationRequiresCompleteDiscoveryAndPublicOperationAbsence
 				t.Fatalf("proof=%v", err)
 			}
 			for _, options := range client.options {
-				if options.Cwd != "/workspace/work/example" || !reflect.DeepEqual(options.SourceKinds, ArchiveDiscoverySourceKinds()) || options.Archived == nil {
+				if options.Cwd != "/workspace/work/example" || !reflect.DeepEqual(options.SourceKinds, ArchiveDiscoverySourceKinds()) || options.Archived == nil || options.UseStateDBOnly {
 					t.Fatalf("incomplete discovery: %#v", options)
 				}
 			}
@@ -125,7 +125,7 @@ func TestThreadlessObservationIncludesLoadedOnlyIdentities(t *testing.T) {
 
 func TestArchiveDiscoveryUnionsExactSavedAndLoadedRetainedIdentities(t *testing.T) {
 	const cwd = "/workspace/work/example"
-	for _, scenario := range []string{"loaded fresh root", "matching overlap", "unknown loaded", "other CWD", "changed overlap CWD", "changed overlap source", "changed member project", "absent retained"} {
+	for _, scenario := range []string{"loaded fresh root", "matching overlap", "unknown saved", "unknown loaded", "other CWD", "changed overlap CWD", "changed overlap source", "changed member project", "absent retained", "absent member"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := codex.ThreadMetadata{ID: "root", Cwd: cwd, Source: "vscode"}
 			project := "project"
@@ -135,6 +135,8 @@ func TestArchiveDiscoveryUnionsExactSavedAndLoadedRetainedIdentities(t *testing.
 			switch scenario {
 			case "matching overlap":
 				client.saved = []codex.ThreadMetadata{root}
+			case "unknown saved":
+				client.saved = []codex.ThreadMetadata{root, {ID: "unknown", Cwd: cwd, Source: "exec"}}
 			case "unknown loaded":
 				client.loadedIDs = []string{"unknown"}
 				client.metadata["unknown"] = codex.ThreadMetadata{ID: "unknown", Cwd: cwd, Source: "exec"}
@@ -159,11 +161,22 @@ func TestArchiveDiscoveryUnionsExactSavedAndLoadedRetainedIdentities(t *testing.
 				client.metadata["member"] = member
 			case "absent retained":
 				client.loadedIDs = nil
+			case "absent member":
+				client.saved = []codex.ThreadMetadata{root}
+				active["member"] = project
 			}
 			err := RequireExactActiveConversations(context.Background(), client, cwd, "root", active)
 			wantSuccess := scenario == "loaded fresh root" || scenario == "matching overlap" || scenario == "other CWD"
 			if (err == nil) != wantSuccess {
 				t.Fatalf("proof=%v", err)
+			}
+			if len(client.options) == 0 {
+				t.Fatal("retained discovery omitted the indexed active query")
+			}
+			for _, options := range client.options {
+				if !options.UseStateDBOnly || options.Archived == nil || *options.Archived || options.Cwd != cwd || !reflect.DeepEqual(options.SourceKinds, ArchiveDiscoverySourceKinds()) {
+					t.Fatalf("retained discovery changed its indexed active query: %#v", options)
+				}
 			}
 			if client.deprecatedExcludeTurns {
 				t.Fatal("loaded discovery supplied legacy excludeTurns instead of selected metadata-only defaults")

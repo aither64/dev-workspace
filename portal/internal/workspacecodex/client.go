@@ -399,7 +399,7 @@ func (c *Client) RecoverArchivedThread(
 	if threadID == "" || cwd == "" {
 		return "", errors.New("archived thread recovery requires a thread id and working directory")
 	}
-	active, activeFound, err := c.retirementCandidate(ctx, cwd, false)
+	active, activeFound, err := c.retirementCandidate(ctx, cwd, false, false)
 	if err != nil {
 		return "", err
 	}
@@ -445,7 +445,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 			return err
 		}
 		if threadID == "" {
-			candidate, found, err = c.retirementCandidate(ctx, cwd, false)
+			candidate, found, err = c.retirementCandidate(ctx, cwd, false, false)
 			if err != nil {
 				return err
 			}
@@ -464,7 +464,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		return err
 	}
 	stage = "find session conversation"
-	candidate, found, err = c.retirementCandidate(ctx, cwd, false)
+	candidate, found, err = c.retirementCandidate(ctx, cwd, false, true)
 	if err != nil {
 		return err
 	}
@@ -565,11 +565,11 @@ func (c *Client) RequireThreadMaterialized(ctx context.Context, threadID, cwd st
 }
 
 func (c *Client) retirementCandidate(
-	ctx context.Context, cwd string, archived bool,
+	ctx context.Context, cwd string, archived, indexed bool,
 ) (codex.ThreadMetadata, bool, error) {
 	threads, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
 		Cwd: cwd, SourceKinds: []string{threadSourceKind}, Archived: &archived,
-		Limit: 2, SortDirection: "asc",
+		Limit: 2, SortDirection: "asc", UseStateDBOnly: indexed,
 	})
 	if err != nil {
 		return codex.ThreadMetadata{}, false, err

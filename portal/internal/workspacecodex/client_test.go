@@ -512,6 +512,9 @@ func TestRecoverArchivedThreadUnarchivesAndResumesExactIdentity(t *testing.T) {
 				if params["cwd"] != cwd || params["archived"] != (index == 1) {
 					return fmt.Errorf("thread lookup %d = %#v", index, params)
 				}
+				if params["useStateDbOnly"] == true {
+					return fmt.Errorf("revival absence lookup must remain unindexed: %#v", params)
+				}
 				data := []any{}
 				if index == 1 {
 					data = append(data,
@@ -786,7 +789,7 @@ func TestRetireThreadTreatsMissingCwdCandidateAsAlreadyRetired(t *testing.T) {
 			return err
 		}
 		params := request["params"].(map[string]any)
-		if request["method"] != "thread/list" || params["archived"] != false {
+		if request["method"] != "thread/list" || params["archived"] != false || params["useStateDbOnly"] == true {
 			return fmt.Errorf("request = %#v", request)
 		}
 		return writeObject(connection, map[string]any{
@@ -811,6 +814,10 @@ func TestRetireThreadRecoversPersistedArchivedIdentityAfterActiveCheck(t *testin
 		request, err := readObject(connection)
 		if err != nil || request["method"] != "thread/list" {
 			return fmt.Errorf("active retirement check = %#v, %v", request, err)
+		}
+		params := request["params"].(map[string]any)
+		if params["useStateDbOnly"] != true || params["cwd"] != cwd || params["archived"] != false {
+			return fmt.Errorf("proved-root retirement must use indexed active discovery: %#v", params)
 		}
 		return writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"data": []any{}},

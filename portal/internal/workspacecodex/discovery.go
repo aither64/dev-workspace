@@ -59,7 +59,7 @@ func RequireExactActiveConversations(ctx context.Context, client ArchiveDiscover
 		}
 		threads, next, err := client.ListThreads(ctx, codex.ThreadListOptions{
 			Cwd: cwd, Archived: &archived, Limit: len(active) + 1, SortDirection: "asc", Cursor: cursor,
-			SourceKinds: ArchiveDiscoverySourceKinds(),
+			SourceKinds: ArchiveDiscoverySourceKinds(), UseStateDBOnly: true,
 		})
 		if err != nil {
 			return fmt.Errorf("discover active archive conversations: %w", err)
