@@ -535,14 +535,37 @@ New conversation activity, content changes to plan/state or declared artifacts,
 repository registrations and feature-head changes restart inactivity. Dirty
 worktrees block archival; returning to clean starts a fresh period. Portal
 visits, polling, file touches and routine runtime metadata updates do not count.
+Conversation activity comes from the latest actual turn's ID, status and recorded
+start/completion times, together with observed requests and queued message
+identities. Model, effort, name and `updatedAt` changes are administrative data.
+The session observation includes the exact root and every nonremoved retained
+member. A missing historical timestamp is reported as unknown rather than
+invented; a verified turn identity can still start observation-based grace.
 Unknown conversation activity, active turns, pending requests, queued messages
 and incomplete lifecycle operations prevent a new automatic archive.
 The passive scan holds shared transition and session locks, so portal access can
-continue during observation. It asks Codex for one combined activity and idle
-result, then releases those locks. A candidate archive acquires exclusive locks
+continue during observation. It asks Codex for one combined root/team activity
+and idle result, then releases those locks. A candidate archive acquires exclusive locks
 and checks current policy, conversation, team members, worktrees and branch
 proofs again before starting the archive journal. Missing or inconsistent Codex
-data defers archival and restarts the inactivity period.
+data defers archival and loses activity continuity. The next trustworthy sample
+starts fresh grace, even when its activity token matches the earlier sample.
+That loss survives restarts. An unchanged merge, network, inventory or tracking
+proof failure blocks archival while preserving known grace. An unreadable proof
+dimension cannot establish eligibility; once readable, a real change restarts
+grace. Error messages and fetched default-branch advancement do not count as
+session activity.
+
+A normalized tracking-only session has an explicit schema-1 manifest with
+repository and artifact lists and no fabricated conversation or creation record.
+Every observation freshly proves the absence of runtime authority, tmux, retained
+team, creation and conflicting operation state, directory submission binding,
+and saved active/archived or loaded conversations at its exact original work CWD.
+Loaded-only threads count even before their first turn or persisted history;
+unreadable discovery is unknown. Missing `portal.yml` alone proves no absence.
+Ordinary archive repeats this proof and never adopts a conversation during
+retirement. Archived members retain the bounded unloaded proof described in
+[archive recovery](session-archive-recovery.md#retained-conversations-and-selected-executor-recovery).
 
 The first scan after enabling starts a fresh period for existing sessions.
 Observations survive service restarts. Re-enabling, reviving a session or
@@ -557,9 +580,18 @@ while leaving manual archival available. The equivalent commands are:
 dev-session auto-archive hold api-token-rotation
 dev-session auto-archive release api-token-rotation
 dev-session auto-archive status api-token-rotation --json
+dev-session auto-archive status --json
 dev-session auto-archive scan --dry-run --json
 dev-session auto-archive disable
 ```
+
+Status reads cached observations without contacting Codex, fetching refs,
+advancing grace or scanning sessions. The workspace form returns policy/epoch,
+last scan, counts and sorted rows, including malformed legacy records and pending
+automatic operations whose tracking has moved. Rows distinguish unknown activity,
+proof blockers, holds, stale observations, journal progress and last worker
+attempt. One invalid record does not hide other sessions. The workspace page
+shows the same overview with links to each session's existing controls.
 
 A dry run reports current eligibility without updating observations or starting
 an archive. It may fetch Git refs to verify merge status. Disabling prevents new

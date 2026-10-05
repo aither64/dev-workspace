@@ -75,7 +75,14 @@ Ordinary archival verifies the exact retained root and every nonremoved member
 before publishing its operation, at cleanup, and at conversation retirement.
 Active same-directory discovery must match the retained set, even when the root
 is already archived. Discovery includes native subagents, exec/App Server and
-unknown-source threads as well as interactive conversations. Pending creation,
+unknown-source threads as well as interactive conversations. The shared discovery
+owner combines saved lists with complete public loaded-ID enumeration and exact
+metadata-only reads. A newly loaded thread need not have a saved row, rollout or
+turn. Exact retained fresh identities can be loaded-only; unknown same-CWD
+identities block, and positively verified unrelated CWDs do not. Failed metadata
+reads, disappearance or contradictory saved/loaded identity make the sample
+unknown. The native loaded manager omits internal sessions; its absence is never
+an archived-idle proof for another source. Pending creation,
 replacement or removal, unmaterialized members, active turns, requests, runnable
 queued input or unresolved submissions block progress.
 
@@ -113,3 +120,20 @@ the selected ordinary lifecycle executor with only its portal helper replaced.
 The schema-2 journal, exact tracking/head/root proof, profile token and normal
 transition/session locks remain authoritative. New sidecars require a capable
 ordinary executor and remain outside this temporary recovery adapter's inputs.
+
+## Old automatic observation conversion
+
+Generic lifecycle maintainers own the temporary conversion of schema-1 automatic
+observations without a semantic fingerprint version and with root-ID-only
+identity. Conversion retains a hold only after positively matching the same
+retained root, then starts one fresh semantic baseline. It does not reuse the
+old `updatedAt` grace or infer conversation absence from a missing manifest.
+Read-only status never performs this conversion.
+
+Remove the adapter only after inventorying active and archived tracking, private
+observations and holds, unfinished lifecycle/creation/browser/migration receipts,
+retained supported packages and restore/revival paths. Record dependent formats,
+counts and replacement paths. Removal requires zero dependent inputs and zero
+supported ways to reintroduce them; successful deployment or absence from
+`work/` alone is insufficient. Semantic fingerprint version 1 and its typed
+continuity/proof distinction remain the normal supported contract.

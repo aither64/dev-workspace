@@ -360,6 +360,33 @@ this lifecycle conversion. An already open predecessor JavaScript bundle is not
 hot upgraded; it may need a normal reload after a stale-target refusal. Pages
 loaded with the new bundle perform the refresh and confirmation flow in place.
 
+## Automatic archival overview
+
+The workspace page shows policy state, cached scan time, counts and sorted
+session rows. Each row gives its rule, earliest eligibility, Keep open state,
+known activity and useful blocker messages, with a link to the session. Invalid
+legacy tracking and pending automatic operations remain visible. The overview
+uses the existing visible-page polling and offers no mass archive or migration
+action.
+
+`GET /api/auto-archive` returns the schema-1 workspace status envelope through
+the normal authorization and package-generation gates. It invokes the read-only
+`dev-session auto-archive status --json` owner. Reads do not observe live turns,
+fetch refs, start grace or run a scan. A failed refresh retains prior rows;
+missing observations or observations older than two hours are shown as unavailable
+or stale.
+Per-session status and Keep open continue to use their existing routes.
+
+The internal `workspace-portal session observe` adapter returns schema-1 exact
+root/team or verified threadless activity. The [session guide](dev-sessions.md#automatic-archival)
+owns its inactivity semantics. Archive's validated executor may carry its exact
+operation ID and complete/abandoned mode together, so only that execution's
+accepted receipt/journal/cleanup intent is excluded from conflicts. Receipt
+inspection stays read-only with the portal owner; full cleanup and tracking
+proof stays with the lifecycle executor. Ordinary scans have no such exclusion.
+After an accepted move, the owning retry samples the actual archived tracking
+identity but still discovers conversations at the original work CWD.
+
 ## Extension catalog
 
 Downstream flakes call `dev-workspace.lib.mkPackage` with one `extensions`
