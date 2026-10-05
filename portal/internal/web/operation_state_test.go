@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLifecycleOperationStoreIsPrivateVersionedAndSurvivesRestart(t *testing.T) {
@@ -229,6 +232,8 @@ func TestLifecycleOperationReconcilesExternalSuccess(t *testing.T) {
 			if successErr != nil || !succeeded {
 				t.Fatalf("authoritative success = %t, %v", succeeded, successErr)
 			}
+			// Wait for the bounded background owner pass before reading its cache.
+			refreshTestIndexStatus(t, server, httptest.NewRecorder())
 			response := httptest.NewRecorder()
 			server.lifecycleStatus(response, "example")
 			var operation lifecycleOperation
@@ -468,6 +473,9 @@ func TestCompletedLifecycleOperationExpiresButFailuresPersist(t *testing.T) {
 		}
 	}
 	server.operationMu.Unlock()
+	if _, _, err := server.lifecycleOperationForSlug("old-success"); err != nil {
+		t.Fatal(err)
+	}
 	operations, err := server.lifecycleOperations()
 	if err != nil {
 		t.Fatal(err)
@@ -704,5 +712,228 @@ func TestLifecycleOperationStoreMissingFileIsEmpty(t *testing.T) {
 	}
 	if _, err := os.Stat(store.path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("operation store was created by a read: %v", err)
+	}
+}
+
+func TestLifecycleSnapshotGETDoesNotWaitForGenerationOrReceiptMutex(t *testing.T) {
+	server := newTestServer(t)
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = path
+	now := time.Now().UTC()
+	operation := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "tracking_committed", ReceiptID: strings.Repeat("a", 64)}
+	server.publishLifecycleSnapshot("example", operation, now)
+	server.operationMu.Lock()
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/example/operation", nil))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		server.operationMu.Unlock()
+		t.Fatal("snapshot GET waited for mutation or generation proof")
+	}
+	server.operationMu.Unlock()
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "tracking_committed") {
+		t.Fatalf("snapshot = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestIndexProgressOnlyReadsPublishedSnapshots(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC()
+	server.indexStatusCache = cachedIndexStatus{created: now, authoritative: true, statuses: []indexSessionStatus{{Slug: "example"}}}
+	server.publishLifecycleSnapshot("example", lifecycleOperation{Slug: "example", Kind: "archive", State: "running"}, now)
+	// These unavailable owner paths must be irrelevant to a cache-only read.
+	if err := os.RemoveAll(server.config.Workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(server.config.HostProfile); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status?progress=1", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"authoritative":true`) || !strings.Contains(response.Body.String(), `"state":"running"`) {
+		t.Fatalf("progress = %d %s", response.Code, response.Body.String())
+	}
+	server.displayRefreshMu.Lock()
+	pending := server.displayRefreshPending || server.displayFullPending
+	server.displayRefreshMu.Unlock()
+	if pending {
+		t.Fatal("progress-only GET scheduled a proof pass")
+	}
+}
+
+func TestDisplayGenerationContentionKeepsReceiptUnchanged(t *testing.T) {
+	server := newTestServer(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	operation := lifecycleOperation{Slug: "example", Kind: "archive", State: "paused", Phase: "prepared", StartedAt: now, UpdatedAt: now, Redirect: "/", Options: lifecycleOperationOptions{Mode: "complete"}}
+	server.operationMu.Lock()
+	err := server.replaceLifecycleOperationLocked("example", operation)
+	server.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(server.operationStore.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = path
+	started := time.Now()
+	err = server.refreshDisplaySnapshots(context.Background(), true)
+	if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+		t.Fatalf("display contention = %v", err)
+	}
+	after, err := os.ReadFile(server.operationStore.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _, _ := server.captureLifecycleOperation("example")
+	if string(before) != string(after) || current != operation {
+		t.Fatal("display contention changed the durable outcome")
+	}
+	if time.Since(started) > time.Second || server.indexStatusRetryAt.Before(started.Add(29*time.Second)) {
+		t.Fatal("display contention did not return promptly with error backoff")
+	}
+}
+
+func TestLifecycleReconciliationCannotOverwriteRetryOrResurrectDismissedReceipt(t *testing.T) {
+	for _, change := range []string{"retry", "dismiss", "replace-after-dismiss"} {
+		t.Run(change, func(t *testing.T) {
+			server := newTestServer(t)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			original := lifecycleOperation{Slug: "example", Kind: "archive", State: "failed", Phase: "starting", StartedAt: now, UpdatedAt: now, Redirect: "/", ReceiptID: strings.Repeat("a", 64), Attempt: 1, Options: lifecycleOperationOptions{Mode: "complete"}}
+			server.operationMu.Lock()
+			err := server.replaceLifecycleOperationLocked("example", original)
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			captured, existed, revision := server.captureLifecycleOperation("example")
+			// A slow pass has already proposed an outcome for its captured attempt.
+			proposed := captured
+			proposed.State = "complete"
+			server.operationMu.Lock()
+			switch change {
+			case "retry":
+				original.Attempt++
+				original.State = "running"
+				err = server.replaceLifecycleOperationLocked("example", original)
+			default:
+				err = server.removeLifecycleOperationLocked("example")
+			}
+			if err == nil && change == "replace-after-dismiss" {
+				original.ReceiptID = strings.Repeat("b", 64)
+				err = server.replaceLifecycleOperationLocked("example", original)
+			}
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := server.acceptLifecycleReconciliation("example", captured, existed, revision, proposed, true, proposed); err != nil {
+				t.Fatal(err)
+			}
+			current, exists, _ := server.captureLifecycleOperation("example")
+			if change == "dismiss" {
+				if exists {
+					t.Fatal("dismissed receipt was resurrected")
+				}
+			} else if current != original {
+				t.Fatalf("new receipt overwritten: %#v", current)
+			}
+		})
+	}
+}
+
+func TestLifecycleOperationTimeoutIncludesBothLockWaits(t *testing.T) {
+	for _, gate := range []string{"generation", "session"} {
+		t.Run(gate, func(t *testing.T) {
+			server := newTestServer(t)
+			path := filepath.Join(t.TempDir(), "transition.lock")
+			owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			server.config.TransitionLock = path
+			if gate == "generation" {
+				if err := unix.Flock(int(owner.Fd()), unix.LOCK_EX); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				lock := server.messageLock("example")
+				if err := lock.Lock(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				defer lock.Unlock()
+			}
+			started := time.Now()
+			err = server.executeLifecycleOperation(context.Background(), 25*time.Millisecond, "example", "archive", nil, lifecycleOperationOptions{})
+			if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+				t.Fatalf("%s wait = %v after %s", gate, err, time.Since(started))
+			}
+		})
+	}
+}
+
+func TestFastLifecycleRefreshSkipsFailedAndCompletedReceiptsAndTargetReads(t *testing.T) {
+	server := newTestServer(t)
+	checked := time.Now().UTC().Add(-time.Hour)
+	root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for slug, state := range map[string]string{"running": "running", "failed": "failed", "completed": "complete"} {
+		operation := lifecycleOperation{Slug: slug, Kind: "archive", State: state, Phase: "starting", StartedAt: checked.Format(time.RFC3339Nano), UpdatedAt: checked.Format(time.RFC3339Nano), Redirect: "/", Options: lifecycleOperationOptions{Mode: "complete"}}
+		server.operationMu.Lock()
+		err := server.replaceLifecycleOperationLocked(slug, operation)
+		server.operationMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Retain a positively sampled target. Fast progress must keep that view,
+		// rather than replace it with a new filesystem-derived sample every second.
+		operation.CurrentTarget = &lifecycleTargetSnapshot{Slug: slug, TargetID: strings.Repeat("a", 64), TargetIdentityVersion: 2}
+		server.publishLifecycleSnapshot(slug, operation, checked)
+		if state != "running" {
+			if err := os.WriteFile(filepath.Join(root, slug+".archive.json"), []byte("invalid journal"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := server.refreshDisplaySnapshots(context.Background(), false); err != nil {
+		t.Fatalf("fast pass inspected terminal receipt evidence: %v", err)
+	}
+	server.operationSnapshotMu.RLock()
+	running := server.operationSnapshots["running"]
+	failed, completed := server.operationSnapshots["failed"], server.operationSnapshots["completed"]
+	server.operationSnapshotMu.RUnlock()
+	if !running.checkedAt.After(checked) || running.operation.CurrentTarget == nil {
+		t.Fatal("running progress lost its published target")
+	}
+	if failed.checkedAt != checked || completed.checkedAt != checked {
+		t.Fatal("fast pass refreshed nonrunning rows")
+	}
+	if err := server.refreshDisplaySnapshots(context.Background(), true); err == nil {
+		t.Fatal("ordinary full discovery ignored malformed journal evidence")
 	}
 }

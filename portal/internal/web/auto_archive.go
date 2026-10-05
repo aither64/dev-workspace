@@ -58,11 +58,7 @@ func (s *Server) autoArchiveAPI(w http.ResponseWriter, r *http.Request, slug str
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	mode := unix.LOCK_SH
-	if r.Method == http.MethodPost {
-		mode = unix.LOCK_EX
-	}
-	transition, unlock, err := s.acquireTransitionContext(ctx, mode)
+	transition, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Workspace is busy. Try again shortly."})
 		return

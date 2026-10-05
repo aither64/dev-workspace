@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"golang.org/x/sys/unix"
@@ -113,6 +114,17 @@ func validateLifecycleTarget(summary *session.Summary, expectedTargetID, action 
 func (s *Server) writeLifecycleError(w http.ResponseWriter, err error) {
 	var changed *lifecycleTargetChangedError
 	if errors.As(err, &changed) {
+		if changed.Current != nil && changed.ReceiptID != "" {
+			s.operationSnapshotMu.Lock()
+			snapshot, exists := s.operationSnapshots[changed.Current.Slug]
+			if exists && snapshot.operation.ReceiptID == changed.ReceiptID && !snapshot.operation.Options.JournalExpected {
+				snapshot.operation.CurrentTarget = changed.Current
+				snapshot.operation.ErrorCode = "target_changed"
+				snapshot.checkedAt = time.Now().UTC()
+				s.operationSnapshots[changed.Current.Slug] = snapshot
+			}
+			s.operationSnapshotMu.Unlock()
+		}
 		s.writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "target_changed", "currentTarget": changed.Current, "receiptId": changed.ReceiptID})
 		return
 	}
@@ -128,9 +140,10 @@ func (s *Server) lifecycleSnapshot(slug string) *lifecycleTargetSnapshot {
 	return current
 }
 
-// Called under both the transition gate and operationMu. Journal ownership
+// Called under the transition gate on a captured receipt. The caller compares
+// that complete receipt under operationMu before saving. Journal ownership
 // always precedes page-target checks; a moved directory never retargets a retry.
-func (s *Server) prepareLifecycleRetryLocked(operation *lifecycleOperation, progress *session.LifecycleProgress) error {
+func (s *Server) prepareLifecycleRetry(operation *lifecycleOperation, progress *session.LifecycleProgress) error {
 	if progress != nil {
 		if progress.Operation != operation.Kind || progress.JournalID != operation.Options.JournalID ||
 			(operation.Options.JournalEvidence != "" && progress.Evidence != operation.Options.JournalEvidence) {

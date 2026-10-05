@@ -24,6 +24,17 @@ Cleanup uses non-force `git worktree remove` and `rmdir` for verified empty
 containers. Stop external writers first; helper locks do not serialize arbitrary
 Git commands, editors or native clients.
 
+Ordinary archive, delete, revive and hold commands retain a shared package
+transition lock and their existing session locks. Different sessions can proceed
+while package switches and recovery retain the exclusive transition lock. The
+operation deadline includes waiting for generation and session locks.
+Tracking commits cooperate through `dev-session-tracking.lock` in the shared
+Git common directory. Fetches occur before that short lock; each waiter then
+rechecks master, cached origin ancestry, current HEAD and owned staged paths.
+Normal hooks, owned-path failure cleanup and post-commit proof stay inside it,
+preserving unrelated index and working-tree changes. This does not serialize
+arbitrary operator Git commands.
+
 ## Retrying an interrupted operation
 
 Run the same installed `dev-session archive SLUG --as-is` command again. Include

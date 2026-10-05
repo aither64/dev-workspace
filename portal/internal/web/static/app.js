@@ -1168,6 +1168,10 @@
 
   let indexNavigationPending = false;
   let indexRefreshTimer = null;
+  let indexProgressTimer = null;
+  let indexRefreshRunning = false, indexProgressRunning = false, indexHasRunningOperations = false;
+  let indexFullNextAt = 0, indexProgressNextAt = 0;
+  const indexReads = createReadScope();
   const renderIndexOperations = (operations) => {
     const panel = document.getElementById("operations");
     const list = document.getElementById("operation-list");
@@ -1315,16 +1319,21 @@
   };
   const refreshIndexStatus = async () => {
     if (!body.hasAttribute("data-index")) return;
-    if (indexNavigationPending) return;
+    if (indexNavigationPending || document.hidden || indexReads.paused || indexRefreshRunning) return;
+    if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+    indexRefreshTimer = null;
+    indexRefreshRunning = true;
+    const read = indexReads.begin();
     const warning = document.getElementById("index-status-warning");
     let nextRefresh = 15_000;
     try {
-      const payload = await request("/api/index-status");
-      if (indexNavigationPending) return;
-      if (renderIndexOperations(payload.operations)) nextRefresh = 1000;
+      const payload = await request("/api/index-status", {signal: read.signal});
+      if (indexNavigationPending || !read.isCurrent()) return;
+      indexHasRunningOperations = renderIndexOperations(payload.operations);
+      scheduleIndexProgress();
+      if (warning) { warning.textContent = payload.warning || ""; warning.hidden = !warning.textContent; }
       const statuses = indexStatusOrder(payload.sessions);
       if (!indexStatusFreshForPage(body.dataset.indexGeneratedAt, payload.generatedAt)) {
-        nextRefresh = 1000;
         return;
       }
       const sidebar = document.querySelector(".index-sidebar");
@@ -1399,13 +1408,59 @@
       }
       if (sidebar) sidebar.scrollTop = previousSidebarTop;
     } catch (error) {
-      if (warning) {
+      nextRefresh = 30_000;
+      if (read.isCurrent() && warning) {
         warning.textContent = `Live session status is temporarily unavailable: ${error.message}`;
         warning.hidden = false;
       }
     } finally {
-      if (!indexNavigationPending) indexRefreshTimer = setTimeout(refreshIndexStatus, nextRefresh);
+      read.finish(); indexRefreshRunning = false;
+      indexFullNextAt = Date.now() + nextRefresh;
+      if (!indexNavigationPending && !document.hidden && !indexReads.paused) {
+        indexRefreshTimer = setTimeout(refreshIndexStatus, nextRefresh);
+      }
     }
+  };
+  const scheduleIndexProgress = () => {
+    if (indexProgressTimer !== null) clearTimeout(indexProgressTimer);
+    indexProgressTimer = null;
+    if (indexHasRunningOperations && !indexNavigationPending && !document.hidden && !indexReads.paused && !indexProgressRunning) {
+      indexProgressTimer = setTimeout(refreshIndexProgress, Math.max(1000, indexProgressNextAt - Date.now()));
+    }
+  };
+  const refreshIndexProgress = async () => {
+    indexProgressTimer = null;
+    if (indexNavigationPending || document.hidden || indexReads.paused || indexProgressRunning) return;
+    indexProgressRunning = true;
+    const read = indexReads.begin();
+    let delay = 1000;
+    try {
+      const payload = await request("/api/index-status?progress=1", {signal: read.signal});
+      if (read.isCurrent() && !indexNavigationPending) indexHasRunningOperations = renderIndexOperations(payload.operations);
+    } catch (error) {
+      delay = 15_000;
+      const warning = document.getElementById("index-status-warning");
+      if (read.isCurrent() && warning) {
+        warning.textContent = `Operation status is temporarily unavailable: ${error.message}`;
+        warning.hidden = false;
+      }
+    } finally {
+      read.finish(); indexProgressRunning = false;
+      indexProgressNextAt = Date.now() + delay;
+      scheduleIndexProgress();
+    }
+  };
+  const pauseIndexReads = () => {
+    indexReads.pause();
+    if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+    if (indexProgressTimer !== null) clearTimeout(indexProgressTimer);
+    indexRefreshTimer = indexProgressTimer = null;
+  };
+  const resumeIndexReads = () => {
+    if (document.hidden || indexNavigationPending) return;
+    indexReads.resume();
+    if (indexRefreshTimer === null && !indexRefreshRunning) indexRefreshTimer = setTimeout(refreshIndexStatus, Math.max(0, indexFullNextAt - Date.now()));
+    scheduleIndexProgress();
   };
   let creationDraft = null;
   let planSessionDraft = null;
@@ -1599,7 +1654,11 @@
         }
       });
     };
-    void refreshIndexStatus();
+    document.addEventListener("visibilitychange", () => document.hidden ? pauseIndexReads() : resumeIndexReads());
+    addEventListener("pagehide", pauseIndexReads);
+    addEventListener("pageshow", resumeIndexReads);
+    addEventListener("focus", resumeIndexReads);
+    if (document.hidden) pauseIndexReads(); else void refreshIndexStatus();
   }
   let models = [];
   let collaborationModes = [];
@@ -2310,7 +2369,7 @@
         if (operation.kind === kind && operation.state === "failed" && !operation.options?.journalExpected) receiptId = operation.receiptId;
         if (operation.options?.journalExpected) {
           showLifecycle(operation);
-          throw new Error("An accepted operation now owns this session. Use its Retry action.");
+          throw new Error("This session has an unfinished operation. Use its Retry action.");
         }
       }
     }
@@ -2733,7 +2792,7 @@
       );
       location.assign("/");
     } catch (error) {
-      if (operation?.options?.journalId) {
+      if (operation?.options?.journalExpected) {
         await adoptLifecycleAfterRequestFailure("archive", {
           journalId: operation.options.journalId,
           receiptId: operation.receiptId,
@@ -2823,7 +2882,7 @@
       );
       location.assign("/");
     } catch (error) {
-      if (operation?.options?.journalId) {
+      if (operation?.options?.journalExpected) {
         await adoptLifecycleAfterRequestFailure("revive", {
           journalId: operation.options.journalId,
           receiptId: operation.receiptId,

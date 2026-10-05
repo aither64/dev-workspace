@@ -3,6 +3,89 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_tracking_commits_serialize_on_fresh_head_and_preserve_unrelated_index_with_hooks
+    with_workspace do |workspace|
+      slugs = %w[first-tracking second-tracking]
+      runner = runner_for(workspace)
+      slugs.each { |slug| runner.ensure_tracking_files(slug) }
+      commit_tracking(workspace, slugs.first, lifecycle: 'active')
+      assert_git_success('git', '-C', workspace, 'add', File.join('work', slugs.last))
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'second tracking')
+      configure_workspace_origin(workspace)
+      initial = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip
+      File.write(File.join(workspace, 'unrelated.txt'), 'staged sentinel')
+      assert_git_success('git', '-C', workspace, 'add', 'unrelated.txt')
+      File.write(File.join(workspace, 'unrelated.txt'), 'working sentinel')
+      slugs.each do |slug|
+        set_lifecycle(workspace, slug, 'complete')
+        FileUtils.mkdir_p(File.join(workspace, 'archive'))
+        FileUtils.mv(File.join(workspace, 'work', slug), File.join(workspace, 'archive', slug))
+      end
+      first_entered, first_release, second_validated = Queue.new, Queue.new, Queue.new
+      first = runner_for(workspace)
+      first_owner = first.method(:validate_tracking_transition_commit!)
+      first.define_singleton_method(:validate_tracking_transition_commit!) do |*args, **options|
+        first_owner.call(*args, **options)
+        first_entered << true
+        raise "tracking fixture release timed out" unless first_release.pop(timeout: 5)
+      end
+      second = runner_for(workspace)
+      second_owner = second.method(:validate_tracking_transition_commit!)
+      second.define_singleton_method(:validate_tracking_transition_commit!) do |*args, **options|
+        second_validated << git_capture(['git', '-C', workspace, 'rev-parse', 'HEAD']).strip
+        second_owner.call(*args, **options)
+      end
+      # A real hook independently proves both commits execute inside the same
+      # short common-directory lock, while unrelated paths remain outside them.
+      marker = File.join(workspace, '.git', 'tracking-hooks')
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      lock_path = File.join(workspace, '.git', 'dev-session-tracking.lock')
+      File.write(hook, <<~SH)
+        #!/bin/sh
+        #{Shellwords.escape(RbConfig.ruby)} -e 'File.open(ARGV[0], File::RDWR) { |f| exit(f.flock(File::LOCK_EX | File::LOCK_NB) ? 1 : 0) }' #{Shellwords.escape(lock_path)} || exit 1
+        echo ran >> #{Shellwords.escape(marker)}
+      SH
+      File.chmod(0o755, hook)
+      first_thread = Thread.new { first.send(:commit_tracking_transition!, slugs.first, direction: 'archive', mode: 'complete') }
+      unless first_entered.pop(timeout: 5)
+        first_thread.value unless first_thread.alive?
+        flunk("first tracking commit did not enter validation: #{first_thread.backtrace}")
+      end
+      second_thread = Thread.new { second.send(:commit_tracking_transition!, slugs.last, direction: 'archive', mode: 'complete') }
+      sleep 0.02
+      assert_raises(ThreadError) { second_validated.pop(true) }
+      first_release << true
+      assert(first_thread.join(5), "first tracking commit did not finish: #{first_thread.backtrace}")
+      first_thread.value
+      second_head = second_validated.pop(timeout: 5)
+      unless second_head
+        second_thread.value unless second_thread.alive?
+        flunk("second tracking commit did not enter validation: #{second_thread.backtrace}")
+      end
+      refute_equal(initial, second_head)
+      assert(second_thread.join(5), "second tracking commit did not finish: #{second_thread.backtrace}")
+      second_thread.value
+      assert_equal('2', git_capture_success('git', '-C', workspace, 'rev-list', '--count', "#{initial}..HEAD").strip)
+      assert_equal(2, File.readlines(marker).length)
+      assert_equal('unrelated.txt', git_capture_success('git', '-C', workspace, 'diff', '--cached', '--name-only').strip)
+      assert_equal('staged sentinel', git_capture_success('git', '-C', workspace, 'show', ':unrelated.txt'))
+      assert_equal('working sentinel', File.read(File.join(workspace, 'unrelated.txt')))
+      slugs.each { |slug| first.send(:require_clean_committed_tracking_transition!, slug, direction: 'archive') }
+      assert_equal(0o600, File.stat(lock_path).mode & 0o777)
+      FileUtils.rm_rf(File.join(workspace, 'archive', slugs.first))
+      first.send(:commit_removed_tracking!, slugs.first, 'git_tracked' => true, 'tracking' => 'archive')
+      assert_equal(3, File.readlines(marker).length)
+      refute(first.send(:committed_path?, 'HEAD', File.join('archive', slugs.first)))
+      assert_equal('unrelated.txt', git_capture_success('git', '-C', workspace, 'diff', '--cached', '--name-only').strip)
+
+    ensure
+      first_release << true if first_thread&.alive?
+      [first_thread, second_thread].compact.each do |thread|
+        thread.kill.join unless thread.join(5)
+      end
+    end
+  end
+
   def test_ruby_manifest_validator_accepts_shared_fixture
     with_workspace do |workspace|
       slug = '2026-09-03-example'

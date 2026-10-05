@@ -5999,42 +5999,45 @@ module DevSession
     def commit_removed_tracking!(slug, removal)
       return unless removal.fetch('git_tracked', false)
 
-      relative = removal_tracking_path(slug, removal)
-      unless committed_path?('HEAD', relative)
-        require_removed_tracking_absent!(slug)
-        return
-      end
-      if path_exists?(File.join(workspace, relative))
-        raise Error, "deleted session tracking reappeared: #{relative}"
-      end
-
       require_linear_workspace_master_for_tracking!
-      _stdout, _stderr, status = @command_runner.capture(
-        ['git', '-C', workspace, 'diff', '--cached', '--quiet', '--', relative],
-        allow_failure: true
-      )
-      unless status.success?
-        raise Error, "session tracking gained staged changes during removal: #{relative}"
-      end
+      with_tracking_commit_lock do
+        relative = removal_tracking_path(slug, removal)
+        unless committed_path?('HEAD', relative)
+          require_removed_tracking_absent!(slug)
+          return
+        end
+        if path_exists?(File.join(workspace, relative))
+          raise Error, "deleted session tracking reappeared: #{relative}"
+        end
 
-      message = Tempfile.new(['dev-session-remove-', '.txt'])
-      begin
-        message.chmod(0o600)
-        message.write("workspace: delete #{slug}\n\n")
-        message.write("Discard this development session while retaining its Git branches and\n")
-        message.write("private recovery record.\n")
-        message.flush
-        message.fsync
-        @command_runner.run([
-          'git', '-C', workspace, 'commit', '--only', '-F', message.path, '--', relative
-        ])
-      ensure
-        message.close!
+        require_linear_workspace_master_for_tracking!(refresh: false)
+        _stdout, _stderr, status = @command_runner.capture(
+          ['git', '-C', workspace, 'diff', '--cached', '--quiet', '--', relative],
+          allow_failure: true
+        )
+        unless status.success?
+          raise Error, "session tracking gained staged changes during removal: #{relative}"
+        end
+
+        message = Tempfile.new(['dev-session-remove-', '.txt'])
+        begin
+          message.chmod(0o600)
+          message.write("workspace: delete #{slug}\n\n")
+          message.write("Discard this development session while retaining its Git branches and\n")
+          message.write("private recovery record.\n")
+          message.flush
+          message.fsync
+          @command_runner.run([
+            'git', '-C', workspace, 'commit', '--only', '-F', message.path, '--', relative
+          ])
+        ensure
+          message.close!
+        end
+        if committed_path?('HEAD', relative)
+          raise Error, "deleted session tracking remains committed: #{relative}"
+        end
+        require_removed_tracking_absent!(slug)
       end
-      if committed_path?('HEAD', relative)
-        raise Error, "deleted session tracking remains committed: #{relative}"
-      end
-      require_removed_tracking_absent!(slug)
     end
 
     def require_removed_tracking_absent!(slug)
@@ -6050,12 +6053,12 @@ module DevSession
       raise Error, "deleted session tracking differs from the working tree: #{slug}"
     end
 
-    def require_linear_workspace_master_for_tracking!
+    def require_linear_workspace_master_for_tracking!(refresh: true)
       branch = git_capture(['git', '-C', workspace, 'symbolic-ref', '--short', 'HEAD']).strip
       unless branch == 'master'
         raise Error, 'workspace checkout must be on master while changing session tracking'
       end
-      @command_runner.run(['git', '-C', workspace, 'fetch', 'origin', 'master'])
+      @command_runner.run(['git', '-C', workspace, 'fetch', 'origin', 'master']) if refresh
       _stdout, _stderr, status = @command_runner.capture(
         ['git', '-C', workspace, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'],
         allow_failure: true
@@ -7118,8 +7121,8 @@ module DevSession
       atomic_replace(path, replacement)
     end
 
-    def validate_tracking_transition_commit!(slug)
-      require_linear_workspace_master_for_tracking!
+    def validate_tracking_transition_commit!(slug, refresh: true)
+      require_linear_workspace_master_for_tracking!(refresh:)
       paths = [File.join('work', slug), File.join('archive', slug)]
       _stdout, _stderr, status = @command_runner.capture(
         ['git', '-C', workspace, 'diff', '--cached', '--quiet', '--', *paths],
@@ -7129,54 +7132,57 @@ module DevSession
     end
 
     def commit_tracking_transition!(slug, direction:, mode:)
-      validate_tracking_transition_commit!(slug)
-      source, destination = if direction == 'archive'
-                              [File.join('work', slug), File.join('archive', slug)]
-                            else
-                              [File.join('archive', slug), File.join('work', slug)]
-                            end
-      absolute_destination = File.join(workspace, destination)
-      raise Error, "tracking transition destination is missing: #{destination}" unless File.directory?(absolute_destination)
+      require_linear_workspace_master_for_tracking!
+      with_tracking_commit_lock do
+        validate_tracking_transition_commit!(slug, refresh: false)
+        source, destination = if direction == 'archive'
+                                [File.join('work', slug), File.join('archive', slug)]
+                              else
+                                [File.join('archive', slug), File.join('work', slug)]
+                              end
+        absolute_destination = File.join(workspace, destination)
+        raise Error, "tracking transition destination is missing: #{destination}" unless File.directory?(absolute_destination)
 
-      status = git_capture([
-        'git', '-C', workspace, 'status', '--porcelain=v1', '--', source, destination
-      ])
-      return if status.empty? && committed_path?('HEAD', destination) && !committed_path?('HEAD', source)
-      message = Tempfile.new(["dev-session-#{direction}-", '.txt'])
-      intent_added = false
-      begin
-        message.chmod(0o600)
-        if direction == 'archive'
-          message.write("workspace: archive #{slug}\n\n")
-          message.write(mode == 'abandoned' ?
-            "Record the explicitly abandoned session and retire its active tracking.\n" :
-            "Record the completed session after verifying its feature heads are merged.\n")
-        else
-          message.write("workspace: revive #{slug}\n\n")
-          message.write("Restore archived tracking so development can continue in the same session.\n")
-        end
-        message.flush
-        message.fsync
-        @command_runner.run([
-          'git', '-C', workspace, 'add', '--intent-to-add', '--', destination
+        status = git_capture([
+          'git', '-C', workspace, 'status', '--porcelain=v1', '--', source, destination
         ])
-        intent_added = true
-        @command_runner.run([
-          'git', '-C', workspace, 'commit', '--only', '-F', message.path,
-          '--', source, destination
-        ])
-      rescue StandardError
-        if intent_added
-          @command_runner.capture(
-            ['git', '-C', workspace, 'reset', '--quiet', 'HEAD', '--', source, destination],
-            allow_failure: true
-          )
+        return if status.empty? && committed_path?('HEAD', destination) && !committed_path?('HEAD', source)
+        message = Tempfile.new(["dev-session-#{direction}-", '.txt'])
+        intent_added = false
+        begin
+          message.chmod(0o600)
+          if direction == 'archive'
+            message.write("workspace: archive #{slug}\n\n")
+            message.write(mode == 'abandoned' ?
+              "Record the explicitly abandoned session and retire its active tracking.\n" :
+              "Record the completed session after verifying its feature heads are merged.\n")
+          else
+            message.write("workspace: revive #{slug}\n\n")
+            message.write("Restore archived tracking so development can continue in the same session.\n")
+          end
+          message.flush
+          message.fsync
+          @command_runner.run([
+            'git', '-C', workspace, 'add', '--intent-to-add', '--', destination
+          ])
+          intent_added = true
+          @command_runner.run([
+            'git', '-C', workspace, 'commit', '--only', '-F', message.path,
+            '--', source, destination
+          ])
+        rescue StandardError
+          if intent_added
+            @command_runner.capture(
+              ['git', '-C', workspace, 'reset', '--quiet', 'HEAD', '--', source, destination],
+              allow_failure: true
+            )
+          end
+          raise
+        ensure
+          message.close!
         end
-        raise
-      ensure
-        message.close!
+        require_clean_committed_tracking_transition!(slug, direction:)
       end
-      require_clean_committed_tracking_transition!(slug, direction:)
     end
 
     def require_clean_committed_tracking_transition!(slug, direction:)
@@ -7248,6 +7254,16 @@ module DevSession
         suffix = kind == 'session' ? '.lock' : ".#{kind}.lock"
         File.join(lock_root, "#{slug}#{suffix}")
       end
+    end
+
+    # All cooperating session tracking commits share the Git common directory.
+    # Fetch before this boundary; hooks, owned-path rollback and final proof stay
+    # inside it, so a waiter validates the HEAD it actually commits on.
+    def with_tracking_commit_lock(&block)
+      common = git_capture(['git', '-C', workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip
+      common = File.realpath(common)
+      with_host_lock(File.join(common, 'dev-session-tracking.lock'),
+                     'development session tracking commit lock', wait: true, &block)
     end
 
     def with_creation_lock(slug, &block)
@@ -8592,7 +8608,7 @@ module DevSession
         return yield
       end
 
-      with_transition_lock(File::LOCK_EX) do
+      with_transition_lock(File::LOCK_SH) do
         validate_host_generation!
         block.call
       end

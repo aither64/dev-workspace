@@ -363,7 +363,7 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 	defer probe.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		err = unix.Flock(int(probe.Fd()), unix.LOCK_SH|unix.LOCK_NB)
+		err = unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if errors.Is(err, unix.EWOULDBLOCK) {
 			break
 		}
@@ -374,11 +374,17 @@ func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *tes
 			t.Fatal(err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("lifecycle operation waited for the session lock before excluding portal mutations")
+			t.Fatal("lifecycle operation waited for the session lock before excluding package switches")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
+	if err := unix.Flock(int(probe.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		t.Fatalf("ordinary SH was blocked: %v", err)
+	}
+	if err := unix.Flock(int(probe.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
 	mutationLock.Unlock()
 	select {
 	case err := <-result:
@@ -677,7 +683,7 @@ func TestIndexDefersCodexActivityAndReturnsEnrichedStatus(t *testing.T) {
 	}
 
 	response = httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	refreshTestIndexStatus(t, server, response)
 	if response.Code != http.StatusOK {
 		t.Fatalf("index status = %d %q", response.Code, response.Body.String())
 	}
@@ -709,7 +715,7 @@ func TestIndexDefersCodexActivityAndReturnsEnrichedStatus(t *testing.T) {
 	server.indexStatusCache = cachedIndexStatus{}
 	server.indexStatusMu.Unlock()
 	response = httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	refreshTestIndexStatus(t, server, response)
 	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +747,7 @@ func TestIndexStatusMarksPartialSessionListNonAuthoritative(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	refreshTestIndexStatus(t, server, response)
 	var payload struct {
 		Sessions      []indexSessionStatus `json:"sessions"`
 		Authoritative bool                 `json:"authoritative"`
@@ -826,7 +832,7 @@ func TestIndexStatusReportsArchivePlacement(t *testing.T) {
 	writeWebTrackingFiles(t, directory, "complete")
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	refreshTestIndexStatus(t, server, response)
 	var payload struct {
 		Sessions []indexSessionStatus `json:"sessions"`
 	}
@@ -875,13 +881,21 @@ func TestIndexStatusUsesOneBoundedRefreshForConcurrentRequests(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	releasedAt := time.Now()
-	close(release)
+	// Both cold responses must return while native enrichment is still blocked.
 	for range 2 {
-		if response := <-responses; response.Code != http.StatusOK {
-			t.Fatalf("index status = %d %q", response.Code, response.Body.String())
+		select {
+		case response := <-responses:
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "loading") {
+				t.Fatalf("cold response = %d %s", response.Code, response.Body.String())
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cache read waited for native enrichment")
 		}
 	}
+	releasedAt := time.Now()
+	close(release)
+	waitTestIndexRefresh(t, server, releasedAt)
+
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
 	controller.mu.Lock()
@@ -910,15 +924,18 @@ func TestIndexStatusIncludesOperationsBeforeTheirJournalExists(t *testing.T) {
 	writeWebTrackingFiles(t, directory, "active")
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	server.operationMu.Lock()
-	server.operations["example"] = lifecycleOperation{
+	operation := lifecycleOperation{
 		Slug: "example", Kind: "archive", State: "running", Phase: "starting",
 		StartedAt: now, UpdatedAt: now, Redirect: "/",
 		Options: lifecycleOperationOptions{Mode: "complete"},
 	}
+	if err := server.replaceLifecycleOperationLocked("example", operation); err != nil {
+		t.Fatal(err)
+	}
 	server.operationMu.Unlock()
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status", nil))
+	refreshTestIndexStatus(t, server, response)
 	var payload struct {
 		Sessions []indexSessionStatus `json:"sessions"`
 	}
@@ -1788,7 +1805,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"const signature = JSON.stringify([entries,", "client.operation().then((operation)",
 		"dialog.showModal()", `lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")`,
 		`openLifecycleConfirmation("delete")`, "confirmationForLifecycle",
-		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "nextRefresh = 1000",
+		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "setTimeout(refreshIndexProgress, Math.max(1000,",
 		"renderIndexOperations(payload.operations)", "indexNavigationPending = true",
 		`timedProgress(progress, "Preparing session")`, `operation")}/retry`, "fork-progress",
 	} {
@@ -2140,6 +2157,9 @@ func TestLifecycleStatusReportsDurablePhaseAndRetainsFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "example.archive.json"), []byte(payload), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := server.lifecycleOperationForSlug("example"); err != nil {
+		t.Fatal(err)
+	}
 	response := httptest.NewRecorder()
 	server.lifecycleStatus(response, "example")
 	var operation lifecycleOperation
@@ -2152,13 +2172,16 @@ func TestLifecycleStatusReportsDurablePhaseAndRetainsFailure(t *testing.T) {
 	}
 
 	server.operationMu.Lock()
-	server.operations["example"] = lifecycleOperation{
+	failed := lifecycleOperation{
 		Slug: "example", Kind: "archive", State: "failed", Phase: operation.Phase,
 		StartedAt: operation.StartedAt, UpdatedAt: operation.UpdatedAt,
 		Error: "helper failed", Redirect: "/", ReceiptID: operation.ReceiptID,
 		Options: lifecycleOperationOptions{
 			Mode: "complete", JournalID: strings.Repeat("a", 64), JournalExpected: true,
 		},
+	}
+	if err := server.replaceLifecycleOperationLocked("example", failed); err != nil {
+		t.Fatal(err)
 	}
 	server.operationMu.Unlock()
 	response = httptest.NewRecorder()
@@ -3520,16 +3543,16 @@ func TestDeleteJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *
 	}
 	t.Setenv("INVOKED", invoked)
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	lockPath := filepath.Join(t.TempDir(), "transition.lock")
-	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	mutationLock := server.messageLock("example")
+	if err := mutationLock.Lock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Close()
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
-		t.Fatal(err)
-	}
-	server.config.TransitionLock = lockPath
+	locked := true
+	defer func() {
+		if locked {
+			mutationLock.Unlock()
+		}
+	}()
 	initialOperation, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists {
 		t.Fatalf("discover initial journal receipt = %t, %v", exists, err)
@@ -3560,9 +3583,8 @@ func TestDeleteJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *
 		replacementOperation.ReceiptID == attemptA.ReceiptID {
 		t.Fatalf("replacement receipt = %#v, %t, %v", replacementOperation, exists, err)
 	}
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
+	mutationLock.Unlock()
+	locked = false
 	server.operationWG.Wait()
 	operation, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists || operation.State != "paused" ||
@@ -3606,16 +3628,16 @@ func TestArchiveJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t 
 	}
 	t.Setenv("INVOKED", invoked)
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	lockPath := filepath.Join(t.TempDir(), "transition.lock")
-	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	mutationLock := server.messageLock("example")
+	if err := mutationLock.Lock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Close()
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
-		t.Fatal(err)
-	}
-	server.config.TransitionLock = lockPath
+	locked := true
+	defer func() {
+		if locked {
+			mutationLock.Unlock()
+		}
+	}()
 	initial, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists {
 		t.Fatalf("discover archive receipt = %t, %v", exists, err)
@@ -3640,9 +3662,8 @@ func TestArchiveJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t 
 		replacement.ReceiptID == attemptA.ReceiptID {
 		t.Fatalf("replacement archive receipt = %#v, %t, %v", replacement, exists, err)
 	}
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
+	mutationLock.Unlock()
+	locked = false
 	server.operationWG.Wait()
 	current, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists || current.ReceiptID != replacement.ReceiptID ||
@@ -3899,16 +3920,16 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	lockPath := filepath.Join(t.TempDir(), "transition.lock")
-	owner, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	mutationLock := server.messageLock("example")
+	if err := mutationLock.Lock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Close()
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_SH); err != nil {
-		t.Fatal(err)
-	}
-	server.config.TransitionLock = lockPath
+	locked := true
+	defer func() {
+		if locked {
+			mutationLock.Unlock()
+		}
+	}()
 
 	request := httptest.NewRequest(
 		http.MethodPost, "/api/sessions/example/delete",
@@ -3928,14 +3949,13 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 	operation := server.operations["example"]
 	server.operationMu.Unlock()
 	if operation.State != "running" {
-		t.Fatalf("deletion did not wait for the exclusive transition: %#v", operation)
+		t.Fatalf("deletion did not wait for the session mutation lock: %#v", operation)
 	}
-	if err := unix.Flock(int(owner.Fd()), unix.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
+	mutationLock.Unlock()
+	locked = false
 	operation = waitLifecycleOperation(t, server, "example")
 	if operation.State != "complete" {
-		t.Fatalf("deletion did not continue after the transition was released: %#v", operation)
+		t.Fatalf("deletion did not continue after the session mutation lock was released: %#v", operation)
 	}
 }
 
@@ -4347,6 +4367,7 @@ func newTestServerWithTrustedOrigins(t *testing.T, trustedOrigins []string) *Ser
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(server.Close)
 	return server
 }
 
@@ -4700,4 +4721,32 @@ func TestCreationlessConversationMutationRequiresCurrentRetainedProof(t *testing
 			}
 		})
 	}
+}
+
+// Test enrichment waits for the owner pass; HTTP cache reads themselves never wait.
+func waitTestIndexRefresh(t *testing.T, server *Server, after time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.indexStatusMu.Lock()
+		ready := server.indexStatusCache.created.After(after) && server.indexStatusWait == nil
+		server.indexStatusMu.Unlock()
+		if ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background index refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func refreshTestIndexStatus(t *testing.T, server *Server, response *httptest.ResponseRecorder) {
+	t.Helper()
+	server.indexStatusMu.Lock()
+	before := server.indexStatusCache.created
+	server.indexStatusRetryAt = time.Time{}
+	server.indexStatusMu.Unlock()
+	server.requestDisplayRefresh(true)
+	waitTestIndexRefresh(t, server, before)
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status?progress=1", nil))
 }

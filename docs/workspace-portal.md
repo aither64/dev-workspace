@@ -299,6 +299,19 @@ describes prepared intents, retry proof and the old no-sidecar compatibility pat
 
 ## Browser lifecycle confirmation and recovery
 
+Lifecycle status reads return published snapshots without waiting for package
+locks or native inspection. One background task reconciles them with the owning
+receipts and journals; unavailable proof keeps the last known state marked stale.
+Retry, dismissal and new confirmations still perform fresh ownership checks.
+
+The index polls cached operation progress once per second while a command runs.
+Repository, activity and cluster enrichment refresh separately, at most once
+every 15 seconds, with a 30-second backoff after a failed refresh. Hidden pages
+pause both polls. A cold cache reports loading; it does not certify an empty
+session inventory. `GET /api/index-status?progress=1` reads only these snapshots.
+Ordinary index-status requests ask the single background task to refresh when
+due, with a six-second pass deadline. Session operation GETs also stay cache-only.
+
 Archive, revive, delete and Keep open use target identity version 2. The target
 contains the canonical workspace, slug, tracking location (`work` or `archive`),
 tracking directory device/inode and retained root conversation, including an
@@ -333,6 +346,9 @@ Completion reconciliation requires the receipt's exact directory/root binding
 as well as terminal lifecycle. A replacement with the same slug and terminal
 state cannot complete an older receipt. Deletion retains its exact operation-ID
 and completion-marker proof.
+An allocated journal ID alone does not establish journal acceptance. A failed
+pre-journal retry with `target_changed` opens fresh confirmation inline; an
+expected missing journal continues to refuse recovery.
 
 A predecessor receipt without a version and without a journal converts only
 when recomputing its original hash gives an exact positive match. A mismatch is

@@ -35,7 +35,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         await route.continue();
       });
       let threadStatus = "idle", activityState = "idle", pending = [];
-      let workspaceArchiveReads = 0, indexReads = 0, failWorkspaceArchive = false;
+      let workspaceArchiveReads = 0, indexReads = 0, indexProgressReads = 0, failWorkspaceArchive = false;
       await page.route("**/api/auto-archive", route => {
         workspaceArchiveReads++;
         return route.fulfill(failWorkspaceArchive ? {status: 503, json: {error: "Fixture overview failure"}} : {json: {
@@ -336,6 +336,34 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       }
       await expect(technical.locator("pre")).toHaveText("unknown <script>diagnostic</script>");
       await expect(page.locator("#auto-archive-values")).toContainText("An archival check could not be completed.");
+      // An allocated journal ID is still pre-journal. A changed target must
+      // reopen fresh confirmation in this document, without an automatic replay.
+      const oldTarget = await page.locator("body").getAttribute("data-lifecycle-target-id");
+      const receiptId = "a".repeat(64), allocatedJournalId = "b".repeat(64);
+      const currentTarget = {targetIdentityVersion: 2, targetId: "c".repeat(64), slug: "example", threadId: "replacement-root", lifecycle: "active", archived: false};
+      const confirmations = [];
+      await page.route("**/api/sessions/example/operation", route => route.fulfill({json: confirmations.length ? {
+        slug: "example", kind: "archive", state: "failed", receiptId, phase: "starting",
+        code: confirmations.length === 1 ? "target_changed" : undefined,
+        error: "Fixture refusal", currentTarget,
+        options: {mode: "complete", journalId: allocatedJournalId, journalExpected: false, targetId: currentTarget.targetId},
+      } : {state: "idle"}}));
+      await page.route("**/api/sessions/example/archive", route => {
+        confirmations.push(route.request().postDataJSON());
+        return route.fulfill(confirmations.length === 1 ? {status: 409, json: {error: "Review the current session", code: "target_changed", currentTarget, receiptId}} :
+          {status: 503, json: {error: "Fixture refusal after explicit confirmation"}});
+      });
+      await page.locator("#archive-session-open").click();
+      await page.locator('#archive-session-form button[value="complete"]').click();
+      await expect(page.locator("#archive-session-dialog")).toBeVisible();
+      await expect(page.locator("[data-lifecycle-target-summary]")).toContainText("replacement-root");
+      assert.equal(confirmations.length, 1, "changed pre-journal request replayed without confirmation");
+      assert.equal(confirmations[0].targetId, oldTarget);
+      await page.locator('#archive-session-form button[value="complete"]').click();
+      await expect.poll(() => confirmations.length).toBe(2);
+      assert.equal(confirmations[1].targetId, currentTarget.targetId);
+      assert.equal(confirmations[1].receiptId, receiptId);
+      await expect(page.locator("#archive-session-dialog")).not.toBeVisible();
       await page.goto(baseURL + "/");
       await width(310);
       await page.setViewportSize({width: 600, height: 720}); await width(180);
@@ -347,16 +375,27 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(limits).toHaveAttribute("aria-expanded", "false");
       await page.setViewportSize({width: 1440, height: 720}); await width(310);
       await expect(page.locator("#codex-limits-panel")).toBeVisible();
-      // The index never fetches the separate archival overview.
+      // Even fast operation polling on the index never reads the overview.
       await page.route(/\/api\/index-status(?:\?.*)?$/, route => {
-        indexReads++;
+        if (new URL(route.request().url()).searchParams.get("progress") === "1") indexProgressReads++; else indexReads++;
+        // A cached timestamp older than the page must not trigger fast full scans.
         return route.fulfill({json: {sessions: [], authoritative: true, generatedAt: "2000-01-01T00:00:00Z",
           operations: [{slug: "example", kind: "archive", state: "running", phase: "prepared"}]}});
       });
       await page.clock.install();
       await page.goto(baseURL + "/");
       await expect.poll(() => indexReads).toBeGreaterThan(0);
+      const firstIndexReads = indexReads;
       await page.clock.runFor(1500);
+      await expect.poll(() => indexProgressReads).toBeGreaterThan(0);
+      assert.equal(indexReads, firstIndexReads, "fast progress started a full status request");
+      await page.clock.runFor(14_000);
+      await expect.poll(() => indexReads).toBeGreaterThan(firstIndexReads);
+      const visibleIndexReads = [indexReads, indexProgressReads];
+      await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable: true, value: true}); document.dispatchEvent(new Event("visibilitychange")); });
+      await page.clock.runFor(20_000);
+      assert.deepEqual([indexReads, indexProgressReads], visibleIndexReads, "hidden index kept polling");
+      await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable: true, value: false}); document.dispatchEvent(new Event("visibilitychange")); });
       assert.equal(workspaceArchiveReads, 0);
       await expect(page.locator("#workspace-auto-archive")).toHaveCount(0);
       await page.getByRole("link", {name: "Automatic archival", exact: true}).click();

@@ -171,6 +171,7 @@ type Server struct {
 	indexStatusMu          sync.Mutex
 	indexStatusCache       cachedIndexStatus
 	indexStatusWait        chan struct{}
+	indexStatusRetryAt     time.Time
 	codexLimitsMu          sync.Mutex
 	codexLimitsCache       codexLimitsSnapshot
 	codexLimitsWait        *codexLimitsCall
@@ -178,6 +179,14 @@ type Server struct {
 	messageLocks           map[string]conversation.MutationLocker
 	clusters               cluster.Runner
 	operationMu            sync.Mutex
+	operationRevisions     map[string]uint64
+	operationSnapshotMu    sync.RWMutex
+	operationSnapshots     map[string]cachedLifecycleSnapshot
+	operationStatusWarning string
+	displayRefreshMu       sync.Mutex
+	displayRefreshWake     chan struct{}
+	displayRefreshPending  bool
+	displayFullPending     bool
 	creations              map[string]creationReceipt
 	preparations           map[string]sessionPreparation
 	preparationUnconfirmed map[string]string
@@ -189,6 +198,7 @@ type Server struct {
 	operationContext       context.Context
 	cancelOperations       context.CancelFunc
 	operationWG            sync.WaitGroup
+	displayRefreshWG       sync.WaitGroup
 	closing                bool
 	stopOnce               sync.Once
 	stopping               chan struct{}
@@ -428,18 +438,21 @@ func New(config Config) (*Server, error) {
 		uploadCreationMu: conversation.NewMutationLock(),
 		config:           config, hostProfile: hostProfile, templates: templates,
 		markdown: goldmark.New(goldmark.WithExtensions(extension.Table)), sanitizer: policy,
-		repository:       repository.Runner{Workspace: workspace, GH: config.GH},
-		clusters:         cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders, Cache: &cluster.StatusCache{}},
-		repositoryCache:  make(map[string]cachedRepositories),
-		messageLocks:     make(map[string]conversation.MutationLocker),
-		operations:       operations,
-		operationStore:   operationStore,
-		operationContext: operationContext,
-		cancelOperations: cancelOperations,
-		stopping:         make(chan struct{}),
-		trustedOrigins:   trustedOrigins,
-		installedTeams:   installedTeams,
-		namingSlots:      make(chan struct{}, 2),
+		repository:         repository.Runner{Workspace: workspace, GH: config.GH},
+		clusters:           cluster.Runner{Workspace: workspace, Providers: config.ClusterProviders, Cache: &cluster.StatusCache{}},
+		repositoryCache:    make(map[string]cachedRepositories),
+		messageLocks:       make(map[string]conversation.MutationLocker),
+		operations:         operations,
+		operationRevisions: make(map[string]uint64),
+		operationSnapshots: make(map[string]cachedLifecycleSnapshot),
+		displayRefreshWake: make(chan struct{}, 1),
+		operationStore:     operationStore,
+		operationContext:   operationContext,
+		cancelOperations:   cancelOperations,
+		stopping:           make(chan struct{}),
+		trustedOrigins:     trustedOrigins,
+		installedTeams:     installedTeams,
+		namingSlots:        make(chan struct{}, 2),
 	}
 	if err := server.loadPreparations(); err != nil {
 		cancelOperations()
@@ -467,6 +480,11 @@ func New(config Config) (*Server, error) {
 		cancelOperations()
 		return nil, err
 	}
+	for slug, operation := range operations {
+		server.publishLifecycleSnapshot(slug, operation, time.Time{})
+	}
+	server.displayRefreshWG.Add(1)
+	go server.runDisplayRefreshes()
 	server.startUploadCollector()
 	server.startActivityMonitor()
 	if config.Codex != nil {
@@ -613,6 +631,7 @@ func (s *Server) Close() {
 		s.cancelOperations()
 		s.operationMu.Unlock()
 		s.operationWG.Wait()
+		s.displayRefreshWG.Wait()
 		s.pausePreparationsOnClose()
 	})
 }
@@ -744,6 +763,9 @@ func (s *Server) acquireTransition(mode int) (*os.File, func(), error) {
 func (s *Server) acquireTransitionContext(
 	ctx context.Context, mode int,
 ) (*os.File, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if s.config.TransitionLock == "" {
 		return nil, func() {}, nil
 	}
@@ -756,7 +778,7 @@ func (s *Server) acquireTransitionContext(
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+		if mode&unix.LOCK_NB != 0 || (!errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN)) {
 			file.Close()
 			return nil, nil, err
 		}
@@ -831,12 +853,27 @@ func (s *Server) validMutation(r *http.Request) bool {
 }
 
 func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
-	summaries, err := s.listSessions()
+	s.indexStatusMu.Lock()
+	cached := cloneIndexStatus(s.indexStatusCache)
+	s.indexStatusMu.Unlock()
+	var summaries []session.Summary
+	var err error
+	if cached.created.IsZero() {
+		summaries, err = s.listSessions()
+	} else {
+		for _, status := range cached.statuses {
+			summaries = append(summaries, session.Summary{Manifest: session.Manifest{Slug: status.Slug,
+				Repositories: make([]session.Repository, status.RepositoryCount)}, Archived: status.Archived, UpdatedAt: status.UpdatedAt})
+		}
+	}
 	now := time.Now().UTC()
 	data := pageData{
 		BaseURL: s.config.BaseURL, CreationDate: now.Format(time.DateOnly),
 		IndexGeneratedAt: now.Format(time.RFC3339Nano), MaxMessageBytes: session.MaxMessageBytes,
 		AgentTeams: s.agentTeamsPage(),
+	}
+	if !cached.created.IsZero() {
+		data.IndexGeneratedAt = cached.created.Format(time.RFC3339Nano)
 	}
 	if err != nil {
 		data.Error = err.Error()
@@ -852,17 +889,15 @@ func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
-	result, err := s.loadIndexStatus(r.Context())
-	if err != nil {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
+	if r.URL.Query().Get("progress") != "1" {
+		s.requestDisplayRefresh(true)
 	}
-	operations, operationErr := s.lifecycleOperations()
-	if operationErr != nil {
-		s.config.Logger.Printf("load lifecycle operations for index status: %v", operationErr)
-		if result.warning == "" {
-			result.warning = "Some lifecycle operation status is unavailable."
-		}
+	s.indexStatusMu.Lock()
+	result := cloneIndexStatus(s.indexStatusCache)
+	s.indexStatusMu.Unlock()
+	operations, _ := s.lifecycleOperations()
+	if result.created.IsZero() && result.warning == "" {
+		result.warning = "Session status is loading."
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
@@ -872,49 +907,24 @@ func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) loadIndexStatus(requestContext context.Context) (cachedIndexStatus, error) {
-	s.indexStatusMu.Lock()
-	if !s.indexStatusCache.created.IsZero() && time.Since(s.indexStatusCache.created) < 5*time.Second {
-		result := cloneIndexStatus(s.indexStatusCache)
-		s.indexStatusMu.Unlock()
-		return result, nil
-	}
-	if wait := s.indexStatusWait; wait != nil {
-		s.indexStatusMu.Unlock()
-		select {
-		case <-wait:
-			s.indexStatusMu.Lock()
-			result := cloneIndexStatus(s.indexStatusCache)
-			s.indexStatusMu.Unlock()
-			return result, nil
-		case <-requestContext.Done():
-			return cachedIndexStatus{}, requestContext.Err()
-		}
-	}
-	wait := make(chan struct{})
-	s.indexStatusWait = wait
-	s.indexStatusMu.Unlock()
-
-	ctx, cancel := context.WithTimeout(s.operationContext, 6*time.Second)
-	result := s.computeIndexStatus(ctx)
-	cancel()
-	result.created = time.Now().UTC()
-	s.indexStatusMu.Lock()
-	s.indexStatusCache = result
-	s.indexStatusWait = nil
-	close(wait)
-	s.indexStatusMu.Unlock()
-	return cloneIndexStatus(result), nil
-}
-
 func cloneIndexStatus(source cachedIndexStatus) cachedIndexStatus {
 	source.statuses = append([]indexSessionStatus(nil), source.statuses...)
 	return source
 }
 
 func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
+	pending, err := session.PendingLifecycles(s.config.Workspace)
+	return s.computeIndexStatusWithPending(ctx, pending, err)
+}
+
+func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[string]session.LifecycleProgress, pendingErr error) cachedIndexStatus {
 	result := cachedIndexStatus{}
-	summaries, err := s.listSessions()
+	summaries, err := s.listSessionsWithPending(pending, pendingErr)
+	operations, _ := s.lifecycleOperations()
+	operationsBySlug := make(map[string]lifecycleOperation, len(operations))
+	for _, operation := range operations {
+		operationsBySlug[operation.Slug] = operation
+	}
 	result.authoritative = err == nil
 	if err != nil {
 		s.config.Logger.Printf("list sessions for index status: %v", err)
@@ -1014,33 +1024,28 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 				updated = activity
 			}
 		}
-		pending, pendingErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
-		if pendingErr != nil {
-			s.config.Logger.Printf("inspect lifecycle status for %s: %v", summary.Slug, pendingErr)
-			result.warning = "Some lifecycle status is unavailable."
-		}
-		if pending == "" {
-			operation, ok, operationErr := s.lifecycleOperationForSlug(summary.Slug)
-			if operationErr != nil {
-				s.config.Logger.Printf("reconcile lifecycle operation for %s: %v", summary.Slug, operationErr)
-				result.warning = "Some lifecycle operation status is unavailable."
-			}
-			if ok && (operation.State == "running" || operation.State == "failed") {
-				pending = operation.Kind
+		pendingKind := pending[summary.Slug].Operation
+		if pendingKind == "" {
+			if operation, ok := operationsBySlug[summary.Slug]; ok && operation.State != "complete" {
+				pendingKind = operation.Kind
 			}
 		}
 		result.statuses = append(result.statuses, indexSessionStatus{
 			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived,
 			RepositoryCount: len(summary.Repositories),
-			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pending,
+			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pendingKind,
 		})
 	}
 	return result
 }
 
 func (s *Server) listSessions() ([]session.Summary, error) {
-	summaries, listErr := session.List(s.config.Workspace)
 	pending, pendingErr := session.PendingLifecycles(s.config.Workspace)
+	return s.listSessionsWithPending(pending, pendingErr)
+}
+
+func (s *Server) listSessionsWithPending(pending map[string]session.LifecycleProgress, pendingErr error) ([]session.Summary, error) {
+	summaries, listErr := session.List(s.config.Workspace)
 	seen := make(map[string]struct{}, len(summaries))
 	for _, summary := range summaries {
 		seen[summary.Slug] = struct{}{}
@@ -1665,12 +1670,12 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodDelete && parts[1] == "operation" {
-		s.dismissLifecycleOperation(w, r, parts[0])
+		s.withPortalMutation(w, r, parts[0], func() { s.dismissLifecycleOperation(w, r, parts[0]) })
 		return
 	}
 	if len(parts) == 3 && r.Method == http.MethodPost &&
 		parts[1] == "operation" && parts[2] == "retry" {
-		s.retryLifecycleOperation(w, r, parts[0])
+		s.withPortalMutation(w, r, parts[0], func() { s.retryLifecycleOperation(w, r, parts[0]) })
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "delete" {
@@ -2602,7 +2607,9 @@ func (s *Server) startLifecycleOperation(
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
 		return
 	}
-	_, unlock, gateErr := s.acquireTransition(unix.LOCK_SH)
+	admission, cancel := context.WithTimeout(s.operationContext, 15*time.Second)
+	defer cancel()
+	_, unlock, gateErr := s.acquireTransitionContext(admission, unix.LOCK_SH)
 	if gateErr != nil {
 		s.writeLifecycleError(w, gateErr)
 		return
@@ -2658,10 +2665,12 @@ func (s *Server) startLifecycleOperation(
 		s.writeJSON(w, http.StatusAccepted, operation)
 		return
 	}
+	originalOperation, originalExists, originalRevision := operation, exists, s.operationRevisions[slug]
+	s.operationMu.Unlock()
 	progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
 	if proofErr == nil {
 		if expectedReceiptID != "" {
-			proofErr = s.prepareLifecycleRetryLocked(&operation, progress)
+			proofErr = s.prepareLifecycleRetry(&operation, progress)
 			if proofErr == nil {
 				// Preserve explicit force escalation after proving the stored receipt.
 				force := options.Force
@@ -2708,7 +2717,6 @@ func (s *Server) startLifecycleOperation(
 		if errors.As(proofErr, &changed) && exists && operation.State == "failed" && !operation.Options.JournalExpected {
 			changed.ReceiptID = operation.ReceiptID
 		}
-		s.operationMu.Unlock()
 		s.writeLifecycleError(w, proofErr)
 		return
 	}
@@ -2723,7 +2731,6 @@ func (s *Server) startLifecycleOperation(
 		receiptID, receiptErr = newLifecycleOperationID()
 	}
 	if receiptErr != nil {
-		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "unable to create the lifecycle operation",
 		})
@@ -2742,6 +2749,19 @@ func (s *Server) startLifecycleOperation(
 		StartedAt: startedAt, UpdatedAt: now, ReceiptID: receiptID, Options: options,
 		TargetIdentityVersion: version, Attempt: attempt,
 	}
+	s.operationMu.Lock()
+	current, present := s.operations[slug]
+	if s.closing {
+		s.operationMu.Unlock()
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
+		return
+	}
+	if present != originalExists || (present && current != originalOperation) ||
+		(!present && s.operationRevisions[slug] != originalRevision) {
+		s.operationMu.Unlock()
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "The lifecycle operation changed. Review its current status before retrying."})
+		return
+	}
 	if err := s.operationStore.canPersistTerminalOutcomes(s.operations, slug, operation); err != nil {
 		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusInsufficientStorage, map[string]string{
@@ -2758,6 +2778,7 @@ func (s *Server) startLifecycleOperation(
 	}
 	s.operationWG.Add(1)
 	s.operationMu.Unlock()
+	s.requestDisplayRefresh(true)
 	go func(started lifecycleOperation) {
 		defer s.operationWG.Done()
 		err := s.runLifecycleOperation(s.operationContext, slug, kind, args, started.Options)
@@ -2774,36 +2795,47 @@ func (s *Server) startLifecycleOperation(
 			if errors.As(err, &changed) {
 				completed.ErrorCode = "target_changed"
 			}
-			if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
-				completed.Phase = progress.Phase
-				if completed.Options.JournalID != "" &&
-					completed.Options.JournalID == progress.JournalID {
-					if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
-						completed.applyProgressOptions(*progress)
-						s.bindLifecycleJournalTarget(&completed, *progress)
+		}
+		persistErr := s.withCurrentGeneration(func() error {
+			if err != nil {
+				if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
+					completed.Phase = progress.Phase
+					if completed.Options.JournalID != "" &&
+						completed.Options.JournalID == progress.JournalID {
+						if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
+							completed.applyProgressOptions(*progress)
+							s.bindLifecycleJournalTarget(&completed, *progress)
+						}
 					}
 				}
 			}
-		}
-		s.operationMu.Lock()
-		current, ownsReceipt := s.operations[slug]
-		if !ownsReceipt || current.ReceiptID == "" ||
-			current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
-			s.config.Logger.Printf(
-				"discard stale %s operation result for %s", kind, slug,
-			)
-			s.operationMu.Unlock()
-			return
-		}
-		if persistErr := s.withCurrentGeneration(func() error {
-			return s.replaceLifecycleOperationLocked(slug, completed)
-		}); persistErr != nil {
+			view := s.lifecycleOperationView(slug, completed)
+			s.operationMu.Lock()
+			defer s.operationMu.Unlock()
+			current, exists := s.operations[slug]
+			if !exists || current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
+				return nil
+			}
+			if err := s.replaceLifecycleOperationLocked(slug, completed); err != nil {
+				return err
+			}
+			s.publishLifecycleSnapshot(slug, view, time.Now().UTC())
+			return nil
+		})
+		if persistErr != nil {
 			s.config.Logger.Printf("persist completed %s operation for %s: %v", kind, slug, persistErr)
-			completed.State = "failed"
-			completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
-			s.operations[slug] = completed
+			s.operationMu.Lock()
+			current, exists := s.operations[slug]
+			if exists && current.ReceiptID == completed.ReceiptID && current.Attempt == completed.Attempt {
+				completed.State = "failed"
+				completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
+				s.operations[slug] = completed
+				s.operationRevisions[slug]++
+				s.publishLifecycleSnapshot(slug, completed, time.Time{})
+			}
+			s.operationMu.Unlock()
 		}
-		s.operationMu.Unlock()
+
 	}(operation)
 	s.writeJSON(w, http.StatusAccepted, operation)
 }
@@ -2818,7 +2850,9 @@ func (s *Server) executeLifecycleOperation(
 	parent context.Context, timeout time.Duration, slug, kind string, args []string,
 	options lifecycleOperationOptions,
 ) error {
-	transition, unlockTransition, err := s.acquireTransition(unix.LOCK_EX)
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	transition, unlockTransition, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
 		return fmt.Errorf("lock workspace runtime for %s: %w", kind, err)
 	}
@@ -2827,7 +2861,7 @@ func (s *Server) executeLifecycleOperation(
 		return err
 	}
 	mutationLock := s.messageLock(slug)
-	if err := mutationLock.Lock(parent); err != nil {
+	if err := mutationLock.Lock(ctx); err != nil {
 		return fmt.Errorf("lock conversation mutations for %s: %w", kind, err)
 	}
 	defer mutationLock.Unlock()
@@ -2855,7 +2889,7 @@ func (s *Server) executeLifecycleOperation(
 			return targetErr
 		}
 	}
-	stdout, stderr, err := s.runDevSessionWithTransition(parent, timeout, transition, args...)
+	stdout, stderr, err := s.runDevSessionWithTransition(ctx, timeout, transition, args...)
 	if err != nil {
 		return commandFailure(kind+" session", stdout, stderr, err)
 	}
@@ -2866,31 +2900,22 @@ func (s *Server) executeLifecycleOperation(
 }
 
 func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
-	operation, ok, err := s.lifecycleOperationForSlug(slug)
-	if err != nil {
-		if !ok {
-			operation = lifecycleOperation{
-				Slug: slug,
-			}
-		}
-		operation.State = "failed"
-		operation.Error = boundedLifecycleError("Session lifecycle state is unsafe: " + err.Error())
-		operation.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	} else if !ok {
-		operation = lifecycleOperation{State: "idle"}
+	// GET demand coalesces ordinary discovery/target refreshes. The worker's
+	// independent running-only cadence supplies fast progress between them.
+	s.requestDisplayRefresh(true)
+	s.operationSnapshotMu.RLock()
+	snapshot, exists := s.operationSnapshots[slug]
+	warning := s.operationStatusWarning
+	s.operationSnapshotMu.RUnlock()
+	if !exists {
+		snapshot.operation = lifecycleOperation{State: "idle"}
 	}
-	operation.CurrentTarget = s.lifecycleSnapshot(slug)
-	if operation.State == "failed" && !operation.Options.JournalExpected && operation.CurrentTarget != nil {
-		if summary, findErr := session.Find(s.config.Workspace, slug); findErr == nil {
-			if _, err := validateLifecycleReceiptTarget(summary, operation); err != nil {
-				var changed *lifecycleTargetChangedError
-				if errors.As(err, &changed) {
-					operation.ErrorCode = "target_changed"
-				}
-			}
-		}
-	}
-	s.writeJSON(w, http.StatusOK, operation)
+	s.writeJSON(w, http.StatusOK, struct {
+		lifecycleOperation
+		StatusCheckedAt time.Time `json:"statusCheckedAt"`
+		StatusStale     bool      `json:"statusStale"`
+		StatusWarning   string    `json:"statusWarning,omitempty"`
+	}{snapshot.operation, snapshot.checkedAt, snapshot.checkedAt.IsZero() || time.Since(snapshot.checkedAt) > 15*time.Second || warning != "", warning})
 }
 
 func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request, slug string) {

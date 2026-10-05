@@ -20,6 +20,192 @@ const (
 	maxLifecycleOperationErrorBytes    = 4096
 )
 
+type cachedLifecycleSnapshot struct {
+	operation lifecycleOperation
+	checkedAt time.Time
+}
+
+func (s *Server) publishLifecycleSnapshot(slug string, operation lifecycleOperation, checkedAt time.Time) {
+	s.operationSnapshotMu.Lock()
+	defer s.operationSnapshotMu.Unlock()
+	if s.operationSnapshots == nil {
+		s.operationSnapshots = make(map[string]cachedLifecycleSnapshot)
+	}
+	// Receipt persistence may replace progress, but cannot manufacture a fresh
+	// target observation. Keep the last observed target only for the same receipt.
+	if previous, ok := s.operationSnapshots[slug]; ok && previous.operation.ReceiptID == operation.ReceiptID && operation.CurrentTarget == nil {
+		operation.CurrentTarget = previous.operation.CurrentTarget
+	}
+	s.operationSnapshots[slug] = cachedLifecycleSnapshot{operation, checkedAt}
+}
+
+func (s *Server) requestDisplayRefresh(full bool) {
+	s.displayRefreshMu.Lock()
+	s.displayRefreshPending = true
+	s.displayFullPending = s.displayFullPending || full
+	s.displayRefreshMu.Unlock()
+	select {
+	case s.displayRefreshWake <- struct{}{}:
+	default:
+	}
+}
+
+// One cancellation-bound worker coalesces all display demand. Slow proof never
+// holds operationMu or the separately protected published snapshot map.
+func (s *Server) runDisplayRefreshes() {
+	defer s.displayRefreshWG.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var lastReconcile time.Time
+	backedOff := false
+	for {
+		select {
+		case <-s.operationContext.Done():
+			return
+		case <-s.displayRefreshWake:
+		case <-ticker.C:
+		}
+		now := time.Now()
+		s.displayRefreshMu.Lock()
+		requested, fullRequested := s.displayRefreshPending, s.displayFullPending
+		s.displayRefreshMu.Unlock()
+		s.indexStatusMu.Lock()
+		full := fullRequested && !now.Before(s.indexStatusRetryAt)
+		s.indexStatusMu.Unlock()
+		operations, _ := s.lifecycleOperations()
+		running := false
+		for _, operation := range operations {
+			running = running || operation.State == "running"
+		}
+		interval := 15 * time.Second
+		if running && !backedOff {
+			interval = time.Second
+		}
+		if !full && (now.Before(lastReconcile.Add(interval)) || (!requested && !running)) {
+			continue
+		}
+		s.displayRefreshMu.Lock()
+		s.displayRefreshPending = false
+		if full {
+			s.displayFullPending = false
+		}
+		s.displayRefreshMu.Unlock()
+		ctx, cancel := context.WithTimeout(s.operationContext, 6*time.Second)
+		err := s.refreshDisplaySnapshots(ctx, full)
+		cancel()
+		lastReconcile = now
+		backedOff = err != nil
+		s.operationSnapshotMu.Lock()
+		s.operationStatusWarning = ""
+		if err != nil {
+			s.operationStatusWarning = "Lifecycle status is temporarily unavailable; showing the last known state."
+		}
+		s.operationSnapshotMu.Unlock()
+		if err != nil {
+			s.config.Logger.Printf("refresh portal status: %v", err)
+		}
+	}
+}
+
+func (s *Server) refreshDisplaySnapshots(ctx context.Context, full bool) (resultErr error) {
+	attemptedAt := time.Now()
+	// Include missing-record revisions so delayed journal discovery cannot revive
+	// a receipt accepted and dismissed while this pass was reading its evidence.
+	s.operationMu.Lock()
+	originals := make(map[string]lifecycleOperation, len(s.operations))
+	revisions := make(map[string]uint64, len(s.operationRevisions))
+	for slug, operation := range s.operations {
+		if full || operation.State == "running" {
+			originals[slug] = operation
+			revisions[slug] = s.operationRevisions[slug]
+		}
+	}
+	if full {
+		for slug, revision := range s.operationRevisions {
+			revisions[slug] = revision
+		}
+	}
+	s.operationMu.Unlock()
+	if full {
+		s.indexStatusMu.Lock()
+		s.indexStatusRetryAt = attemptedAt.Add(15 * time.Second)
+		s.indexStatusWait = make(chan struct{})
+		s.indexStatusMu.Unlock()
+		defer func() {
+			s.indexStatusMu.Lock()
+			if resultErr != nil {
+				s.indexStatusRetryAt = attemptedAt.Add(30 * time.Second)
+				s.indexStatusCache.warning = "Session status is temporarily unavailable; showing the last known state."
+			}
+			close(s.indexStatusWait)
+			s.indexStatusWait = nil
+			s.indexStatusMu.Unlock()
+		}()
+	}
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH|unix.LOCK_NB)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
+	var pending map[string]session.LifecycleProgress
+	if full {
+		pending, err = session.PendingLifecycles(s.config.Workspace)
+		if err != nil {
+			return err
+		}
+	}
+	slugs := make(map[string]bool, len(originals)+len(pending))
+	for slug := range originals {
+		slugs[slug] = true
+	}
+	for slug := range pending {
+		slugs[slug] = true
+	}
+	for slug := range slugs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		original, existed := originals[slug]
+		var progress *session.LifecycleProgress
+		var proofErr error
+		if full {
+			if found, ok := pending[slug]; ok {
+				progress = &found
+			}
+		} else {
+			progress, proofErr = session.PendingLifecycleProgress(s.config.Workspace, slug)
+		}
+		operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		view := operation
+		if full {
+			view = s.lifecycleOperationView(slug, operation)
+		}
+		if err := s.acceptLifecycleReconciliation(slug, original, existed, revisions[slug], operation, exists, view); err != nil {
+			return err
+		}
+	}
+	if full {
+		result := s.computeIndexStatusWithPending(ctx, pending, nil)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result.created = time.Now().UTC()
+		s.indexStatusMu.Lock()
+		s.indexStatusCache = result
+		if result.warning != "" {
+			s.indexStatusRetryAt = attemptedAt.Add(30 * time.Second)
+		}
+		s.indexStatusMu.Unlock()
+	}
+	return nil
+}
+
 func validateLifecycleOperation(operation lifecycleOperation) error {
 	if !session.ValidSlug(operation.Slug) {
 		return errors.New("invalid session slug")
@@ -142,27 +328,39 @@ func (operation *lifecycleOperation) applyProgressOptions(progress session.Lifec
 	}
 }
 
+// Mutation callers use fresh owner proof, never the display snapshot.
 func (s *Server) lifecycleOperationForSlug(slug string) (lifecycleOperation, bool, error) {
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	return s.reconcileLifecycleOperationLocked(slug, time.Now().UTC())
-}
-
-func (s *Server) reconcileLifecycleOperationLocked(
-	slug string, now time.Time,
-) (lifecycleOperation, bool, error) {
-	operation, exists := s.operations[slug]
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	original, existed, revision := s.captureLifecycleOperation(slug)
+	ctx, cancel := context.WithTimeout(s.operationContext, 15*time.Second)
 	defer cancel()
 	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
-		return operation, exists, err
+		return original, existed, err
 	}
 	defer unlock()
 	if err := s.requireCurrentHostProfile(); err != nil {
-		return operation, exists, err
+		return original, existed, err
 	}
-	progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+	progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+	operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
+	view := s.lifecycleOperationView(slug, operation)
+	if saveErr := s.acceptLifecycleReconciliation(slug, original, existed, revision, operation, exists, view); saveErr != nil {
+		return original, existed, errors.Join(err, saveErr)
+	}
+	current, present, _ := s.captureLifecycleOperation(slug)
+	return current, present, err
+}
+
+func (s *Server) captureLifecycleOperation(slug string) (lifecycleOperation, bool, uint64) {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	operation, exists := s.operations[slug]
+	return operation, exists, s.operationRevisions[slug]
+}
+
+func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOperation, exists bool,
+	progress *session.LifecycleProgress, progressErr error, now time.Time,
+) (lifecycleOperation, bool, error) {
 	if progressErr != nil {
 		if !exists {
 			return lifecycleOperation{}, false, progressErr
@@ -170,9 +368,6 @@ func (s *Server) reconcileLifecycleOperationLocked(
 		operation.State = "failed"
 		operation.Error = boundedLifecycleError("Session lifecycle state is unsafe: " + progressErr.Error())
 		operation.UpdatedAt = now.Format(time.RFC3339Nano)
-		if err := s.replaceLifecycleOperationLocked(slug, operation); err != nil {
-			return operation, true, errors.Join(progressErr, err)
-		}
 		return operation, true, progressErr
 	}
 	if progress != nil {
@@ -198,11 +393,6 @@ func (s *Server) reconcileLifecycleOperationLocked(
 				operation.Error = ""
 			}
 		}
-		if !exists || operation != s.operations[slug] {
-			if err := s.replaceLifecycleOperationLocked(slug, operation); err != nil {
-				return operation, true, err
-			}
-		}
 		return operation, true, nil
 	}
 	if !exists {
@@ -221,22 +411,51 @@ func (s *Server) reconcileLifecycleOperationLocked(
 			operation.Error = "The portal restarted before this operation completed. Retry it."
 			operation.UpdatedAt = now.Format(time.RFC3339Nano)
 		}
-		if operation != s.operations[slug] {
-			if err := s.replaceLifecycleOperationLocked(slug, operation); err != nil {
-				return operation, true, err
-			}
-		}
 	}
 	if operation.State == "complete" {
 		updatedAt, err := time.Parse(time.RFC3339Nano, operation.UpdatedAt)
 		if err == nil && now.Sub(updatedAt) >= lifecycleOperationSuccessRetention {
-			if err := s.removeLifecycleOperationLocked(slug); err != nil {
-				return operation, true, err
-			}
 			return lifecycleOperation{}, false, nil
 		}
 	}
 	return operation, true, nil
+}
+
+// Copy target data only after native/tracking proof, outside both display and
+// receipt mutexes. This response-only view never changes receipt authority.
+func (s *Server) lifecycleOperationView(slug string, operation lifecycleOperation) lifecycleOperation {
+	operation.CurrentTarget = s.lifecycleSnapshot(slug)
+	if operation.State == "failed" && !operation.Options.JournalExpected {
+		if summary, err := session.Find(s.config.Workspace, slug); err == nil {
+			var changed *lifecycleTargetChangedError
+			if _, err := validateLifecycleReceiptTarget(summary, operation); errors.As(err, &changed) {
+				operation.ErrorCode = "target_changed"
+			}
+		}
+	}
+	return operation
+}
+
+func (s *Server) acceptLifecycleReconciliation(slug string, original lifecycleOperation, existed bool,
+	revision uint64, proposed lifecycleOperation, exists bool, view lifecycleOperation,
+) error {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	current, present := s.operations[slug]
+	if present != existed || (present && current != original) || (!present && s.operationRevisions[slug] != revision) {
+		return nil // Retry, dismissal or a newer executor result owns the receipt.
+	}
+	if exists {
+		if !existed || current != proposed {
+			if err := s.replaceLifecycleOperationLocked(slug, proposed); err != nil {
+				return err
+			}
+		}
+		s.publishLifecycleSnapshot(slug, view, time.Now().UTC())
+	} else if existed {
+		return s.removeLifecycleOperationLocked(slug)
+	}
+	return nil
 }
 
 func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOperation) (bool, error) {
@@ -289,36 +508,13 @@ func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOpe
 	}
 }
 
+// Display callers copy published immutable views; no receipt or journal I/O.
 func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
-	pending, pendingErr := session.PendingLifecycles(s.config.Workspace)
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	for slug, progress := range pending {
-		if _, exists := s.operations[slug]; !exists {
-			operation := operationFromProgress(slug, progress)
-			if err := s.withCurrentGeneration(func() error {
-				return s.replaceLifecycleOperationLocked(slug, operation)
-			}); err != nil {
-				return nil, errors.Join(pendingErr, err)
-			}
-		}
-	}
-	now := time.Now().UTC()
-	slugs := make([]string, 0, len(s.operations))
-	for slug := range s.operations {
-		slugs = append(slugs, slug)
-	}
-	var problems []error
-	operations := make([]lifecycleOperation, 0, len(slugs))
-	for _, slug := range slugs {
-		operation, exists, err := s.reconcileLifecycleOperationLocked(slug, now)
-		if err != nil {
-			problems = append(problems, err)
-		}
-		if exists {
-			operation.CurrentTarget = s.lifecycleSnapshot(slug)
-			operations = append(operations, operation)
-		}
+	s.operationSnapshotMu.RLock()
+	defer s.operationSnapshotMu.RUnlock()
+	operations := make([]lifecycleOperation, 0, len(s.operationSnapshots))
+	for _, snapshot := range s.operationSnapshots {
+		operations = append(operations, snapshot.operation)
 	}
 	sort.Slice(operations, func(i, j int) bool {
 		if operations[i].UpdatedAt != operations[j].UpdatedAt {
@@ -326,7 +522,7 @@ func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
 		}
 		return operations[i].Slug < operations[j].Slug
 	})
-	return operations, errors.Join(append(problems, pendingErr)...)
+	return operations, nil
 }
 
 func (s *Server) replaceLifecycleOperationLocked(slug string, operation lifecycleOperation) error {
@@ -340,6 +536,8 @@ func (s *Server) replaceLifecycleOperationLocked(slug string, operation lifecycl
 		}
 		return err
 	}
+	s.operationRevisions[slug]++
+	s.publishLifecycleSnapshot(slug, operation, time.Time{})
 	return nil
 }
 
@@ -353,6 +551,10 @@ func (s *Server) removeLifecycleOperationLocked(slug string) error {
 		s.operations[slug] = previous
 		return err
 	}
+	s.operationRevisions[slug]++
+	s.operationSnapshotMu.Lock()
+	delete(s.operationSnapshots, slug)
+	s.operationSnapshotMu.Unlock()
 	return nil
 }
 

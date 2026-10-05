@@ -130,6 +130,43 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_cli_lifecycle_allows_other_shared_generation_readers_while_excluding_switches
+    Dir.mktmpdir('dev-session-lifecycle-shared-lock-test') do |directory|
+      path = File.join(directory, 'transition.lock')
+      entered, release = Queue.new, Queue.new
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(:resolve_slug) { |input, as_is:| input if as_is }
+      fake_runner.define_singleton_method(:delete) do |*_arguments, **_options|
+        entered << true
+        raise "lifecycle fixture release timed out" unless release.pop(timeout: 5)
+      end
+      errors = StringIO.new
+      cli = DevSession::CLI.new(
+        ['--transition-lock', path, '--', 'delete', 'example', '--as-is'],
+        input: TTYInput.new("yes\n"), out: StringIO.new, err: errors
+      )
+      cli.define_singleton_method(:runner) { fake_runner }
+      thread = Thread.new { cli.run }
+      unless entered.pop(timeout: 5)
+        assert_equal(0, thread.value, errors.string) unless thread.alive?
+        flunk("lifecycle CLI did not enter its mutation: #{errors.string}; #{thread.backtrace}")
+      end
+      File.open(path, File::RDWR) do |probe|
+        assert(probe.flock(File::LOCK_SH | File::LOCK_NB))
+        probe.flock(File::LOCK_UN)
+        refute(probe.flock(File::LOCK_EX | File::LOCK_NB))
+      end
+      release << true
+      assert(thread.join(5), "lifecycle fixture thread did not finish: #{thread.backtrace}")
+      assert_equal(0, thread.value, errors.string)
+    ensure
+      release << true if thread&.alive?
+      if thread && !thread.join(5)
+        thread.kill.join
+      end
+    end
+  end
+
   def test_cli_confirms_lifecycle_action_before_waiting_for_the_transition_lock
     Dir.mktmpdir('dev-session-lifecycle-lock-test') do |directory|
       path = File.join(directory, 'transition.lock')

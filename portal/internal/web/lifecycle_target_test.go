@@ -165,6 +165,9 @@ func TestLifecycleTargetV2RetryKeepsReceiptAcrossRestartAndStatusRefresh(t *test
 		t.Fatal(err)
 	}
 	status := httptest.NewRecorder()
+	if _, _, err := server.lifecycleOperationForSlug("example"); err != nil {
+		t.Fatal(err)
+	}
 	server.lifecycleStatus(status, "example")
 	var snapshot lifecycleOperation
 	if err := json.Unmarshal(status.Body.Bytes(), &snapshot); err != nil {
@@ -369,6 +372,9 @@ func TestLifecycleTargetJournalOwnsMovedRetryAndRejectsChangedEvidence(t *testin
 	browserTargetFixture(t, server, "archive", "abandoned", "root-a")
 	writeBrowserArchiveJournal(t, server, operation, "tracking_committed", strings.Repeat("c", 64))
 	status := httptest.NewRecorder()
+	if _, _, err := server.lifecycleOperationForSlug("example"); err != nil {
+		t.Fatal(err)
+	}
 	server.lifecycleStatus(status, "example")
 	var snapshot lifecycleOperation
 	if err := json.Unmarshal(status.Body.Bytes(), &snapshot); err != nil {

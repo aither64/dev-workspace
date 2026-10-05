@@ -446,6 +446,69 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_portal_lifecycle_keeps_inherited_shared_lock_and_supplies_ordinary_dispatch_lock
+    Dir.mktmpdir('workspace-host-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'config', 'registry.json')
+      state = File.join(directory, 'state')
+      codex = File.join(directory, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 1.2.3'\n")
+      File.chmod(0o755, codex)
+      selected_home = File.join(directory, 'selected-codex-home')
+      configured_home = File.join(directory, 'codex-home')
+      FileUtils.mkdir_p(selected_home)
+      File.symlink(selected_home, configured_home)
+      DevWorkspaceHost::Registry.new(config).register(
+        name: 'example-workspace', root:, hostname: 'example-workspace.workspace.example.test',
+        aliases: [], replace: false
+      )
+      FileUtils.mkdir_p(state)
+      lock_path = File.join(state, 'transition.lock')
+      owner = File.open(lock_path, File::RDWR | File::CREAT, 0o600)
+      owner.flock(File::LOCK_SH)
+      error_output = StringIO.new
+      host = CapturingHost.new(
+        env: {
+          'HOME' => directory,
+          'PATH' => ENV.fetch('PATH'),
+          'DEV_WORKSPACES_CONFIG' => config,
+          'DEV_WORKSPACES_STATE' => state,
+          'DEV_WORKSPACES_RUNTIME_DIR' => File.join(directory, 'runtime'),
+          'DEV_WORKSPACES_SYSTEM_CODEX' => codex,
+          'CODEX_HOME' => configured_home,
+          'DEV_WORKSPACE_CODEX_HOME' => File.join(directory, 'stale-codex-home'),
+          'DISPATCH_MARKER' => 'inherited-value',
+          'DEV_WORKSPACE_TRANSITION_LOCK_FD' => owner.fileno.to_s
+        },
+        out: StringIO.new,
+        err: error_output
+      )
+
+      assert_equal(0, host.run(
+        'dev-session',
+        ['--workspace', 'example-workspace', 'delete', '2026-09-06-test', '--as-is']
+      ), error_output.string)
+      environment, command, arguments = host.captured
+      assert_equal(owner.fileno.to_s, environment.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD'))
+      assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
+      assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(configured_home, environment.fetch('CODEX_HOME'))
+      assert_equal('inherited-value', environment.fetch('DISPATCH_MARKER'))
+      assert_equal('dev-session', File.basename(command))
+      assert_equal(root, arguments.fetch(arguments.index('--workspace') + 1))
+      assert_includes(arguments, '--transition-lock')
+      assert_equal(lock_path, arguments.fetch(arguments.index('--transition-lock') + 1))
+      File.open(lock_path, File::RDWR) do |probe|
+        assert(probe.flock(File::LOCK_SH | File::LOCK_NB))
+        probe.flock(File::LOCK_UN)
+        refute(probe.flock(File::LOCK_EX | File::LOCK_NB))
+      end
+    ensure
+      owner&.flock(File::LOCK_UN)
+      owner&.close
+    end
+  end
+
   def test_inherited_transition_lock_rejects_an_unlocked_descriptor_for_the_same_inode
     Dir.mktmpdir('workspace-host-test') do |directory|
       state = File.join(directory, 'state')
