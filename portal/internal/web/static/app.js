@@ -945,10 +945,22 @@
   const workspaceArchivePresentation = (payload) => ({
     summary: `Automatic archival is ${payload.policy?.enabled ? "enabled" : "disabled"}. ${payload.counts?.total || 0} sessions; ${payload.counts?.held || 0} kept open.`,
     rows: [...(Array.isArray(payload.sessions) ? payload.sessions : [])].sort((a, b) => String(a.slug).localeCompare(String(b.slug))).map(row => {
-      const rule = {complete: "1 day", merged: "7 days", empty: "14 days"}[row.tier] || "No eligible rule";
-      const diagnosis = Array.isArray(row.diagnostics) ? row.diagnostics.map(entry => entry.message).filter(Boolean).join(" ") : "";
+      const diagnostics = Array.isArray(row.diagnostics) ? row.diagnostics : [];
+      const diagnosis = diagnostics.map(entry => entry.message).filter(Boolean).join(" ");
+      let rule;
+      if (row.repair_needed || diagnostics.some(entry => entry.category === "legacy_format")) {
+        rule = "Needs metadata repair";
+      } else if (row.lifecycle === "abandoned" || diagnostics.some(entry => entry.code === "manual_abandoned")) {
+        rule = "Manual archive required";
+      } else if (row.activity_known !== true || diagnostics.some(entry => ["activity_unknown", "observation_stale"].includes(entry.category))) {
+        rule = "Activity not verified";
+      } else {
+        rule = {complete: "1 day", merged: "7 days", empty: "14 days"}[row.tier] ||
+          diagnostics.find(entry => entry.message)?.message || "Archive rule has not been verified";
+      }
+      const detail = diagnosis === rule ? "" : diagnosis || (row.activity_known ? "Cached activity is known." : "Activity has not been verified.");
       return {slug: row.slug, href: `/${encodeURIComponent(row.slug)}/#settings`,
-        message: `${rule}${row.hold ? " · Keep open" : ""}${row.eligible_at ? ` · Earliest eligibility: ${new Date(row.eligible_at).toLocaleString()}` : ""}. ${diagnosis || (row.activity_known ? "Cached activity is known." : "Activity has not been verified.")}${row.journal ? ` ${row.journal.operation} recovery: ${row.journal.phase}.` : ""}`};
+        message: `${rule}${row.hold ? " · Keep open" : ""}${row.eligible_at ? ` · Earliest eligibility: ${new Date(row.eligible_at).toLocaleString()}` : ""}${rule.endsWith(".") ? "" : "."}${detail ? ` ${detail}` : ""}${row.journal ? ` ${row.journal.operation} recovery: ${row.journal.phase}.` : ""}`};
     }),
   });
 
@@ -1018,6 +1030,47 @@
   };
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
+  if (body.hasAttribute("data-automatic-archival")) {
+    const status = document.getElementById("workspace-auto-archive-status");
+    const list = document.getElementById("workspace-auto-archive-rows");
+    const reads = createReadScope();
+    let timer = null, running = false, checkedAt = 0, leaving = false;
+    const refresh = async () => {
+      clearTimeout(timer);
+      if (document.hidden || leaving || reads.paused || running) return;
+      const remaining = 30_000 - (Date.now() - checkedAt);
+      if (remaining > 0) { timer = setTimeout(refresh, remaining); return; }
+      running = true;
+      const read = reads.begin(60_000);
+      try {
+        const payload = await request("/api/auto-archive", {signal: read.signal});
+        if (!read.isCurrent()) return;
+        const presentation = workspaceArchivePresentation(payload);
+        status.textContent = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
+        list.replaceChildren();
+        for (const row of presentation.rows) {
+          const item = document.createElement("div"); item.className = "auto-archive-overview-row";
+          const link = document.createElement("a"); link.href = row.href; link.textContent = row.slug;
+          const details = document.createElement("p"); details.className = "muted"; details.textContent = row.message;
+          item.append(link, details); list.append(item);
+        }
+      } catch (error) {
+        if (read.isCurrent()) status.textContent = "Cached archival status is unavailable. Previously displayed rows are retained.";
+      } finally {
+        if (read.isCurrent()) checkedAt = Date.now();
+        read.finish(); running = false;
+        if (!reads.paused && !leaving) timer = setTimeout(refresh, Math.max(0, 30_000 - (Date.now() - checkedAt)));
+      }
+    };
+    const pause = () => { reads.pause(); clearTimeout(timer); timer = null; };
+    const resume = () => { if (!document.hidden && !leaving) { reads.resume(); void refresh(); } };
+    addEventListener("pagehide", () => { leaving = true; pause(); });
+    addEventListener("pageshow", () => { leaving = false; resume(); });
+    addEventListener("focus", resume);
+    document.addEventListener("visibilitychange", () => { if (document.hidden) pause(); else resume(); });
+    if (document.hidden) pause(); else void refresh();
+    return;
+  }
   const conversationAssets = await import("/codex/assets/conversation.js?v=12");
   let composerUploads = null;
   let composerUploadReady = true;
@@ -1260,31 +1313,11 @@
     }
     return records.some((operation) => operation.state === "running");
   };
-  let workspaceArchiveRead = null, workspaceArchiveCheckedAt = 0;
-  const refreshWorkspaceArchive = () => {
-    const status = document.getElementById("workspace-auto-archive-status");
-    const list = document.getElementById("workspace-auto-archive-rows");
-    if (!status || !list || document.hidden || workspaceArchiveRead || Date.now() - workspaceArchiveCheckedAt < 30_000) return;
-    workspaceArchiveRead = request("/api/auto-archive").then(payload => {
-      const presentation = workspaceArchivePresentation(payload);
-      status.textContent = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
-      list.replaceChildren();
-      for (const row of presentation.rows) {
-        const item = document.createElement("div"); item.className = "auto-archive-overview-row";
-        const link = document.createElement("a"); link.href = row.href; link.textContent = row.slug;
-        const details = document.createElement("p"); details.className = "muted"; details.textContent = row.message;
-        item.append(link, details); list.append(item);
-      }
-      workspaceArchiveCheckedAt = Date.now();
-    }).catch(() => { status.textContent = "Cached archival status is unavailable. Previously displayed rows are retained."; })
-      .finally(() => { workspaceArchiveRead = null; });
-  };
   const refreshIndexStatus = async () => {
     if (!body.hasAttribute("data-index")) return;
     if (indexNavigationPending) return;
     const warning = document.getElementById("index-status-warning");
     let nextRefresh = 15_000;
-    refreshWorkspaceArchive();
     try {
       const payload = await request("/api/index-status");
       if (indexNavigationPending) return;

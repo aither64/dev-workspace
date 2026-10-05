@@ -63,6 +63,26 @@ assert(workspaceArchival.rows[0].message.includes("Keep open"));
 assert(workspaceArchival.rows[1].message.includes("tracking_committed"));
 assert.equal(workspaceArchival.rows[2].href,"/z-broken/#settings");
 assert(workspaceArchival.rows[2].message.includes("Review legacy tracking."));
+assert(workspaceArchival.rows[1].message.startsWith("Activity not verified"));
+assert(workspaceArchival.rows[2].message.startsWith("Needs metadata repair"));
+const workspaceReasons = workspaceArchivePresentation({sessions: [
+  {slug: "repair", lifecycle: "abandoned", repair_needed: true},
+  {slug: "manifest", activity_known: true, diagnostics: [{code: "manifest_unverified", category: "legacy_format"}]},
+  {slug: "abandoned", lifecycle: "abandoned", activity_known: false},
+  {slug: "stale", tier: "merged", activity_known: true, diagnostics: [{code: "observation_stale", category: "observation_stale"}]},
+  {slug: "missing", tier: "complete"},
+  {slug: "blocked", activity_known: true, diagnostics: [{code: "no_archive_rule", category: "policy", message: "Session has no automatic archive rule."}]},
+  {slug: "ready", activity_known: true, tier: "empty"},
+]}).rows;
+const workspaceReason = slug => workspaceReasons.find(row => row.slug === slug).message;
+assert(workspaceReason("repair").startsWith("Needs metadata repair"));
+assert(workspaceReason("manifest").startsWith("Needs metadata repair"));
+assert(workspaceReason("abandoned").startsWith("Manual archive required"));
+assert(workspaceReason("stale").startsWith("Activity not verified"));
+assert(workspaceReason("missing").startsWith("Activity not verified"));
+assert(workspaceReason("blocked").startsWith("Session has no automatic archive rule."));
+assert(workspaceReason("ready").startsWith("14 days"));
+assert(!workspaceReasons.some(row => row.message.includes("No eligible rule")));
 assert.deepEqual(autoArchivePresentation({activity_known:false,diagnostics:[{code:"submission_unverified",category:"activity_unknown",message:"Submission proof is unknown."}]}).blockers,["Submission proof is unknown."]);
 
 const archiveOperation = {kind: "archive", state: "paused", options: {journalId: "journal-1"}};

@@ -363,12 +363,14 @@ loaded with the new bundle perform the refresh and confirmation flow in place.
 
 ## Automatic archival overview
 
-The workspace page shows policy state, cached scan time, counts and sorted
+The workspace's **Automatic archival** link opens `/automatic-archival`, which
+shows policy state, cached scan time, counts and sorted
 session rows. Each row gives its rule, earliest eligibility, Keep open state,
 known activity and useful blocker messages, with a link to the session. Invalid
 legacy tracking and pending automatic operations remain visible. The overview
-uses the existing visible-page polling and offers no mass archive or migration
-action.
+refreshes every 30 seconds while visible and offers no mass archive or migration
+action. The workspace index only links to this page; its operation-status polling
+does not fetch the archival overview.
 
 `GET /api/auto-archive` returns the schema-1 workspace status envelope through
 the normal authorization and package-generation gates. It invokes the read-only

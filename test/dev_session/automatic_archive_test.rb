@@ -40,6 +40,27 @@ class DevSessionTest < Minitest::Test
       assert_equal(refs, git_capture_success('git', '-C', workspace, 'for-each-ref', '--format=%(refname):%(objectname)'))
     end
   end
+  def test_automatic_archive_inventory_preserves_undated_tracking_and_ignores_unrelated_folders
+    with_workspace do |workspace|
+      runner = automatic_fixture(workspace, 'undated-session')
+      FileUtils.mkdir_p(File.join(workspace, 'work', 'logs'))
+      File.write(File.join(workspace, 'work', 'logs', 'output.log'), 'not session tracking')
+      FileUtils.mkdir_p(File.join(workspace, 'work', 'vpsadmin'))
+      File.write(File.join(workspace, 'work', 'vpsadmin', 'state.md'), 'unresolved legacy state')
+      FileUtils.mkdir_p(File.join(workspace, 'work', 'pending-creation'))
+      lock_root = File.join(workspace, 'worktrees', '.locks')
+      FileUtils.mkdir_p(lock_root)
+      File.write(File.join(lock_root, 'pending-creation.creation.json'), 'malformed pending evidence')
+      assert_equal(%w[pending-creation undated-session vpsadmin], runner.auto_archive_session_slugs.sort)
+      rows = runner.auto_archive_workspace_status.fetch('sessions')
+      assert_equal(%w[pending-creation undated-session vpsadmin], rows.map { |row| row.fetch('slug') })
+      refute(rows.any? { |row| row.fetch('slug') == 'logs' })
+      assert(rows.find { |row| row.fetch('slug') == 'vpsadmin' }.fetch('repair_needed'))
+      scanned = runner.auto_archive_scan(dry_run: true, transition: ->(&block) { block.call })
+      assert_equal(%w[pending-creation undated-session vpsadmin], scanned.map { |row| row.fetch('slug') })
+    end
+  end
+
   def subprocess_can_lock?(path, mode)
     _output, _error, status = Open3.capture3(
       RbConfig.ruby, '-e',

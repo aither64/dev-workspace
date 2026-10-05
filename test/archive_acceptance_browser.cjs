@@ -43,7 +43,7 @@ const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, millise
     const page = await context.newPage();
     page.on("pageerror", error => errors.push(error.message));
     await page.goto(origin + "/" + spec.slug + "/");
-    assert.equal(await page.locator('script[src="/static/app.js?v=23"]').count(), 1);
+    assert.equal(await page.locator('script[src="/static/app.js?v=24"]').count(), 1);
     const pageIdentity = randomUUID();
     await page.evaluate(id => { window.acceptanceDocumentIdentity = id; }, pageIdentity);
     const operation = async () => {

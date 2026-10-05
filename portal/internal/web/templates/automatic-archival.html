@@ -1,0 +1,24 @@
+{{define "automatic-archival"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Automatic archival · {{.DisplayLabel}}</title>
+  <link rel="stylesheet" href="/static/style.css?v=4">
+</head>
+<body data-automatic-archival>
+  <header class="topbar">
+    <div><p class="eyebrow">{{.DisplayLabel}}</p><h1>Automatic archival</h1></div>
+    <a href="/">Back to workspace</a>
+  </header>
+  <main class="page">
+    <section id="workspace-auto-archive" class="panel" aria-label="Automatic archival status">
+      <p id="workspace-auto-archive-status" role="status">Loading cached archival status…</p>
+      <div id="workspace-auto-archive-rows"></div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=24" defer></script>
+</body>
+</html>
+{{end}}

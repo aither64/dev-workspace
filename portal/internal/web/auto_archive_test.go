@@ -12,6 +12,33 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
+func TestAutomaticArchivalPageIsSeparateFromIndex(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	// Rendering either page needs no cached-status command or live observation.
+	server.config.DevSession = filepath.Join(t.TempDir(), "unavailable-dev-session")
+	index := httptest.NewRecorder()
+	server.Handler().ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), `href="/automatic-archival"`) {
+		t.Fatalf("index navigation = %d: %s", index.Code, index.Body.String())
+	}
+	for _, removed := range []string{"workspace-auto-archive-status", "workspace-auto-archive-rows", "data-automatic-archival"} {
+		if strings.Contains(index.Body.String(), removed) {
+			t.Fatalf("index still renders overview %q", removed)
+		}
+	}
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/automatic-archival", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("dedicated route reached slug lookup: %d: %s", page.Code, page.Body.String())
+	}
+	for _, required := range []string{"data-automatic-archival", "workspace-auto-archive-status", "workspace-auto-archive-rows", `href="/"`, `/static/app.js?v=24`} {
+		if !strings.Contains(page.Body.String(), required) {
+			t.Fatalf("overview lacks %q: %s", required, page.Body.String())
+		}
+	}
+}
+
 func TestWorkspaceAutoArchiveReadsCachedEnvelopeWithoutScan(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

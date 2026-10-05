@@ -35,6 +35,18 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         await route.continue();
       });
       let threadStatus = "idle", activityState = "idle", pending = [];
+      let workspaceArchiveReads = 0, indexReads = 0, failWorkspaceArchive = false;
+      await page.route("**/api/auto-archive", route => {
+        workspaceArchiveReads++;
+        return route.fulfill(failWorkspaceArchive ? {status: 503, json: {error: "Fixture overview failure"}} : {json: {
+          policy: {enabled: false}, counts: {total: 3, held: 1}, last_scan: {checked_at: new Date().toISOString()},
+          sessions: [
+            {slug: "broken", repair_needed: true, diagnostics: [{category: "legacy_format", message: "Manifest is invalid."}]},
+            {slug: "abandoned", lifecycle: "abandoned", hold: true},
+            {slug: "unknown", activity_known: false},
+          ],
+        }});
+      });
       const blockingPrompt = {
         id: "request-1", token: "token-1", method: "item/tool/requestUserInput", kind: "userInput",
         threadId: "thread-1", turnId: "turn-1", itemId: "item-1", authorityAvailable: true,
@@ -335,6 +347,54 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(limits).toHaveAttribute("aria-expanded", "false");
       await page.setViewportSize({width: 1440, height: 720}); await width(310);
       await expect(page.locator("#codex-limits-panel")).toBeVisible();
+      // The index never fetches the separate archival overview.
+      await page.route(/\/api\/index-status(?:\?.*)?$/, route => {
+        indexReads++;
+        return route.fulfill({json: {sessions: [], authoritative: true, generatedAt: "2000-01-01T00:00:00Z",
+          operations: [{slug: "example", kind: "archive", state: "running", phase: "prepared"}]}});
+      });
+      await page.clock.install();
+      await page.goto(baseURL + "/");
+      await expect.poll(() => indexReads).toBeGreaterThan(0);
+      await page.clock.runFor(1500);
+      assert.equal(workspaceArchiveReads, 0);
+      await expect(page.locator("#workspace-auto-archive")).toHaveCount(0);
+      await page.getByRole("link", {name: "Automatic archival", exact: true}).click();
+      await page.waitForURL("**/automatic-archival");
+      await expect(page.locator("#workspace-auto-archive-status")).toContainText("disabled");
+      await expect(page.locator("#workspace-auto-archive-status")).toContainText("Last scan:");
+      await expect(page.locator("#workspace-auto-archive-rows a")).toHaveText(["abandoned", "broken", "unknown"]);
+      await expect(page.locator("#workspace-auto-archive-rows p")).toContainText([
+        "Manual archive required", "Needs metadata repair", "Activity not verified",
+      ]);
+      await expect(page.getByRole("link", {name: "broken", exact: true})).toHaveAttribute("href", "/broken/#settings");
+      assert.equal(workspaceArchiveReads, 1);
+      const overviewIndexReads = indexReads;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      assert.equal(workspaceArchiveReads, 1);
+      failWorkspaceArchive = true;
+      await page.clock.runFor(30_000);
+      await expect(page.locator("#workspace-auto-archive-status")).toContainText("unavailable");
+      await expect(page.locator("#workspace-auto-archive-rows a")).toHaveCount(3);
+      assert.equal(indexReads, overviewIndexReads);
+      const visibleReads = workspaceArchiveReads;
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", {configurable: true, value: true});
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await page.clock.runFor(30_000);
+      assert.equal(workspaceArchiveReads, visibleReads);
+      failWorkspaceArchive = false;
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", {configurable: true, value: false});
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await expect(page.locator("#workspace-auto-archive-status")).toContainText("disabled");
+      await page.getByRole("link", {name: "Back to workspace", exact: true}).click();
+      await page.waitForURL(baseURL + "/");
+      const afterOverviewReads = workspaceArchiveReads;
+      await page.clock.runFor(1500);
+      assert.equal(workspaceArchiveReads, afterOverviewReads);
       assert.deepEqual(errors, []);
       console.log(engine.name() + ": comparison-only compact sidebar, limits, keyboard navigation and archival presentation passed");
     } finally { releaseReviewStyle(); await browser.close(); }

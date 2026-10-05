@@ -252,8 +252,7 @@ module WorkspaceAutoArchive
 
     def auto_archive_workspace_status
       policy = auto_archive_store.policy
-      active_root = File.join(workspace, 'work')
-      slugs = File.directory?(active_root) ? Dir.children(active_root).select { |slug| slug.match?(DevSession::SAFE_PART) } : []
+      slugs = auto_archive_session_slugs
       if File.directory?(auto_archive_store.root)
         Dir.glob(File.join(auto_archive_store.root, 'session-*.json')).each do |path|
           slug = File.basename(path).delete_prefix('session-').delete_suffix('.json')
@@ -282,6 +281,22 @@ module WorkspaceAutoArchive
         'last_scan' => auto_archive_store.read('scan'), 'counts' => counts, 'sessions' => rows }
     end
 
+    # Undated --as-is sessions remain valid. Unrelated work folders have no
+    # tracking or operation evidence and do not belong in session diagnostics.
+    def auto_archive_session_slugs
+      root = File.join(workspace, 'work')
+      return [] unless File.directory?(root)
+
+      Dir.children(root).select do |slug|
+        next false unless slug.match?(DevSession::SAFE_PART)
+
+        tracking = %w[portal.yml plan.md state.md].any? { |name| path_exists?(File.join(root, slug, name)) }
+        private_names = %w[creation fork start] + DevSession::LIFECYCLE_JOURNAL_NAMES.values
+        evidence = private_names.any? { |name| path_exists?(File.join(workspace, 'worktrees', '.locks', "#{slug}.#{name}.json")) }
+        tracking || evidence || path_exists?(DevSession::ArchiveCleanup.new(self, slug).path)
+      end
+    end
+
     def auto_archive_reset(slug)
       return unless File.directory?(auto_archive_store.root)
       auto_archive_store.lock do
@@ -299,7 +314,7 @@ module WorkspaceAutoArchive
       @out = @err
       scan = lambda do
         slugs = if dry_run || auto_archive_store.policy['enabled']
-                  Dir.children(File.join(workspace, 'work')).select { |slug| slug.match?(DevSession::SAFE_PART) }
+                  auto_archive_session_slugs
                 else
                   []
                 end
