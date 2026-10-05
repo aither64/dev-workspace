@@ -90,7 +90,7 @@ unknown-source threads as well as interactive conversations. The shared discover
 owner combines saved lists with complete public loaded-ID enumeration and exact
 metadata-only reads. The positive retained active-set query uses the App Server
 state database index to avoid a saved-rollout scan; loaded discovery remains
-independent, and threadless absence keeps its full saved-list proof.
+independent. Threadless absence uses the separate negative proof below.
 The final retirement lookup uses the index only after exact root proof.
 A newly loaded thread need not have a saved row, rollout or turn.
 Exact retained fresh identities can be loaded-only; unknown same-CWD
@@ -135,6 +135,31 @@ the selected ordinary lifecycle executor with only its portal helper replaced.
 The schema-2 journal, exact tracking/head/root proof, profile token and normal
 transition/session locks remain authoritative. New sidecars require a capable
 ordinary executor and remain outside this temporary recovery adapter's inputs.
+
+## Threadless conversation absence
+
+Threadless readiness combines fail-closed public indexed queries for unassigned
+threads and every native project, fresh saved-rollout scope, complete loaded-ID
+metadata and public directory-submission checks before and after discovery.
+Project enumeration is repeated to detect membership drift. Explicit project
+selectors propagate an unavailable native database instead of accepting an empty
+index response. Every query includes active or archived state and all supported
+source kinds and providers.
+
+Saved rollouts may be imported without an index entry. The reader checks their
+first `session_meta` record within 1 MiB, with strict identity and duplicate-key
+validation, then rechecks file identities, prefixes and directory entries.
+It does not read turn bodies; append-only body updates do not change the scope.
+A same-directory import blocks readiness. A positively identified different
+CWD is harmless. Compressed-only files or unusable headers need exact public
+metadata bound to that saved path; unavailable or contradictory scope refuses.
+The native plain sibling takes precedence when both representations exist.
+
+This is fresh sampled proof, not a writer exclusion or a saved inventory cache.
+Restore or replace a Codex home only through the existing stopped-writer and
+selected-home procedure, then obtain new proof. The reader never imports,
+resumes, repairs or adopts a conversation. Normal session/package locks and
+external writer exclusions retain their existing responsibilities.
 
 ## Old automatic observation conversion
 

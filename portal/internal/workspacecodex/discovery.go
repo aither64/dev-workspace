@@ -21,6 +21,7 @@ type ArchiveDiscoveryClient interface {
 type ThreadlessObservationClient interface {
 	ArchiveDiscoveryClient
 	ThreadOperationAttempt(string) (string, error)
+	RequireSavedConversationAbsence(context.Context, string) error
 }
 
 // RequireThreadlessConversations proves only the public directory operation
@@ -40,7 +41,10 @@ func RequireThreadlessConversations(ctx context.Context, client ThreadlessObserv
 	if err := checkOperation(); err != nil {
 		return err
 	}
-	if err := RequireNoConversations(ctx, client, cwd); err != nil {
+	if err := client.RequireSavedConversationAbsence(ctx, cwd); err != nil {
+		return err
+	}
+	if err := requireLoadedConversationScope(ctx, client, cwd, "", map[string]string{}, map[string]codex.ThreadMetadata{}); err != nil {
 		return err
 	}
 	return checkOperation()

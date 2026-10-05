@@ -17,6 +17,8 @@ type threadlessTestClient struct {
 	archivedResidue        bool
 	cursor                 bool
 	lookups                []string
+	savedChecks            int
+	afterSaved             func()
 	loadedIDs              []string
 	loadedError            error
 	metadata               map[string]codex.ThreadMetadata
@@ -29,6 +31,19 @@ type threadlessTestClient struct {
 func (client *threadlessTestClient) ThreadOperationAttempt(cwd string) (string, error) {
 	client.lookups = append(client.lookups, cwd)
 	return client.binding, client.lookupError
+}
+func (client *threadlessTestClient) RequireSavedConversationAbsence(context.Context, string) error {
+	client.savedChecks++
+	if client.afterSaved != nil {
+		client.afterSaved()
+	}
+	if client.discoveryError != nil {
+		return client.discoveryError
+	}
+	if client.archivedResidue || client.cursor {
+		return errors.New("saved scope not proved")
+	}
+	return nil
 }
 func (client *threadlessTestClient) ListThreads(_ context.Context, options codex.ThreadListOptions) ([]codex.ThreadMetadata, *string, error) {
 	client.options = append(client.options, options)
@@ -72,12 +87,10 @@ func TestThreadlessObservationRequiresCompleteDiscoveryAndPublicOperationAbsence
 			if (err == nil) != (scenario == "empty") {
 				t.Fatalf("proof=%v", err)
 			}
-			for _, options := range client.options {
-				if options.Cwd != "/workspace/work/example" || !reflect.DeepEqual(options.SourceKinds, ArchiveDiscoverySourceKinds()) || options.Archived == nil || options.UseStateDBOnly {
-					t.Fatalf("incomplete discovery: %#v", options)
-				}
+			if len(client.options) != 0 {
+				t.Fatal("threadless proof used unpartitioned saved discovery")
 			}
-			if scenario == "empty" && (len(client.options) != 2 || *client.options[0].Archived || !*client.options[1].Archived || len(client.lookups) != 2) {
+			if scenario == "empty" && (client.savedChecks != 1 || len(client.lookups) != 2) {
 				t.Fatalf("proof not bracketed: %#v", client)
 			}
 		})
@@ -113,7 +126,7 @@ func TestThreadlessObservationIncludesLoadedOnlyIdentities(t *testing.T) {
 			if (err == nil) != (scenario == "other CWD") {
 				t.Fatalf("proof=%v", err)
 			}
-			if len(client.options) != 2 || client.deprecatedExcludeTurns {
+			if client.savedChecks != 1 || client.deprecatedExcludeTurns {
 				t.Fatalf("discovery changed its bounded read contract: %#v", client)
 			}
 			if scenario == "other CWD" && (len(client.metadataReads) != 1 || len(client.lookups) != 2) {
@@ -182,5 +195,13 @@ func TestArchiveDiscoveryUnionsExactSavedAndLoadedRetainedIdentities(t *testing.
 				t.Fatal("loaded discovery supplied legacy excludeTurns instead of selected metadata-only defaults")
 			}
 		})
+	}
+}
+
+func TestThreadlessObservationRechecksPublicOperationAfterDiscovery(t *testing.T) {
+	client := &threadlessTestClient{}
+	client.afterSaved = func() { client.binding = "new-directory-operation" }
+	if err := RequireThreadlessConversations(context.Background(), client, "/workspace/work/example"); err == nil || len(client.lookups) != 2 {
+		t.Fatalf("submission drift was accepted: %v, %#v", err, client.lookups)
 	}
 }

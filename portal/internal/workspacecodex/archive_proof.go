@@ -324,38 +324,43 @@ func archivePathWithin(root, path string) bool {
 	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
-func readArchiveHeader(file *os.File) (struct {
+type archiveHeader struct {
 	ID  string  `json:"id"`
 	Cwd *string `json:"cwd"`
-}, error) {
-	var payload struct {
-		ID  string  `json:"id"`
-		Cwd *string `json:"cwd"`
-	}
-	line, err := bufio.NewReader(io.LimitReader(file, archiveHeaderLimit+1)).ReadBytes('\n')
+}
+
+func readArchiveHeader(file *os.File) (archiveHeader, error) {
+	payload, _, err := readArchiveHeaderRecord(file)
+	return payload, err
+}
+
+// Preserve the exact bounded prefix for scope rechecks without reading turns.
+func readArchiveHeaderRecord(reader io.Reader) (archiveHeader, []byte, error) {
+	var payload archiveHeader
+	line, err := bufio.NewReader(io.LimitReader(reader, archiveHeaderLimit+1)).ReadBytes('\n')
 	if err != nil {
-		return payload, errors.New("archived rollout has no complete first metadata record")
+		return payload, line, errors.New("archived rollout has no complete first metadata record")
 	}
 	if len(line) > archiveHeaderLimit || len(line) == 0 || line[len(line)-1] != '\n' {
-		return payload, errors.New("archived rollout metadata record exceeds 1 MiB")
+		return payload, line, errors.New("archived rollout metadata record exceeds 1 MiB")
 	}
 	record, err := uniqueArchiveObject(bytes.TrimSuffix(line, []byte{'\n'}))
 	var recordType string
 	if err != nil || json.Unmarshal(record["type"], &recordType) != nil || recordType != "session_meta" {
-		return payload, errors.New("archived rollout has an invalid session_meta record")
+		return payload, line, errors.New("archived rollout has an invalid session_meta record")
 	}
 	fields, err := uniqueArchiveObject(record["payload"])
 	if err != nil || json.Unmarshal(fields["id"], &payload.ID) != nil || payload.ID == "" {
-		return payload, errors.New("archived rollout has an invalid session_meta identity")
+		return payload, line, errors.New("archived rollout has an invalid session_meta identity")
 	}
 	if cwd, present := fields["cwd"]; present {
 		var value string
 		if json.Unmarshal(cwd, &value) != nil {
-			return payload, errors.New("archived rollout has an invalid session_meta directory")
+			return payload, line, errors.New("archived rollout has an invalid session_meta directory")
 		}
 		payload.Cwd = &value
 	}
-	return payload, nil
+	return payload, line, nil
 }
 
 func uniqueArchiveObject(data []byte) (map[string]json.RawMessage, error) {
