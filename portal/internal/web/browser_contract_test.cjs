@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
   currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest,
-  automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
+  workspaceArchivePresentation, automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
   legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView,
   cleanupCompletedDeleteStorage,
@@ -52,12 +52,31 @@ assert.deepEqual(autoArchivePresentation({blockers: ["Automatic archival is disa
 assert.deepEqual(autoArchivePresentation({blockers: ["Codex thread thread-1 has 2 pending request(s)", "Codex thread thread-1 has 1 queued message(s)"]}).blockers,
   ["Codex has pending requests.", "Codex has queued messages."]);
 
+const workspaceArchival = workspaceArchivePresentation({policy:{enabled:false},counts:{total:3,held:1},sessions:[
+  {slug:"z-broken",diagnostics:[{code:"legacy_record_invalid",category:"legacy_format",message:"Review legacy tracking."}]},
+  {slug:"a-held",tier:"merged",hold:true,activity_known:true},
+  {slug:"m-moved",tier:"complete",journal:{operation:"archive",phase:"tracking_committed"},diagnostics:[{code:"submission_unverified",category:"activity_unknown",message:"Submission proof is unknown."}]},
+]});
+assert(workspaceArchival.summary.includes("disabled"));
+assert.deepEqual(workspaceArchival.rows.map(row=>row.slug),["a-held","m-moved","z-broken"]);
+assert(workspaceArchival.rows[0].message.includes("Keep open"));
+assert(workspaceArchival.rows[1].message.includes("tracking_committed"));
+assert.equal(workspaceArchival.rows[2].href,"/z-broken/#settings");
+assert(workspaceArchival.rows[2].message.includes("Review legacy tracking."));
+assert.deepEqual(autoArchivePresentation({activity_known:false,diagnostics:[{code:"submission_unverified",category:"activity_unknown",message:"Submission proof is unknown."}]}).blockers,["Submission proof is unknown."]);
+
 const archiveOperation = {kind: "archive", state: "paused", options: {journalId: "journal-1"}};
 const failedArchive = {identity: "thread-1", operation: {id: "journal-1", identity: "thread-1"},
   result: "deferred", checked_at: "2026-09-16T20:02:12Z",
   blockers: ["command failed with exit 124: /nix/store/example/bin/workspace-portal thread retire"]};
 const lastArchiveFailure = {message: "Closing the conversation timed out.", attemptedAt: failedArchive.checked_at};
 assert.deepEqual(archiveFailurePresentation(archiveOperation, failedArchive, "thread-1"), lastArchiveFailure);
+const semanticArchiveFailure = {...failedArchive,identity:"bound-directory-target",root_thread_id:"thread-1",
+  operation:{id:"journal-1",identity:"bound-directory-target",identity_version:1,root_thread_id:"thread-1"},
+  diagnostics:[{code:"archive_proof_failed",category:"tracking",message:"Exact tracking proof is unavailable."}]};
+assert.equal(archiveFailurePresentation(archiveOperation,semanticArchiveFailure,"thread-1").message,"Exact tracking proof is unavailable.");
+assert.equal(archiveFailurePresentation(archiveOperation,{...semanticArchiveFailure,identity:"replacement-directory"},"thread-1"),null);
+
 assert.deepEqual(archiveFailurePresentation({...archiveOperation, state: "running"}, failedArchive, "thread-1"), lastArchiveFailure);
 assert.deepEqual(archiveFailurePresentation(archiveOperation, {...failedArchive,
   blockers: ["command failed with exit 1: workspace-portal thread retire\nfind session conversation: context deadline exceeded"]}, "thread-1"), lastArchiveFailure);

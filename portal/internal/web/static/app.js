@@ -820,6 +820,14 @@
     if (state.enabled && !state.hold && date(state.eligible_at)) fields.push(["Not before", date(state.eligible_at)]);
     if (state.result) fields.push(["Last result", ({archived: "Archived", deferred: "Deferred", error: "Check failed"})[state.result] || "Unknown result"]);
     const blockers = [], diagnostics = [];
+    if (Array.isArray(state.diagnostics)) {
+      for (const entry of state.diagnostics) {
+        if (!["policy", "hold"].includes(entry.category) && entry.message) blockers.push(entry.message);
+      }
+      if (state.activity_known !== undefined) fields.push(["Conversation activity", state.activity_known ? "Verified at the last observation" : "Unknown"]);
+      if (Number.isInteger(state.last_activity_at)) fields.push(["Last actual activity", new Date(state.last_activity_at * 1000).toLocaleString()]);
+      return {fields, blockers: [...new Set(blockers)], diagnostics: state.last_attempt_error ? [state.last_attempt_error] : []};
+    }
     const plain = {
       "Session has uncommitted worktree changes.": "The session has uncommitted worktree changes.",
       "Abandoned sessions require manual archival.": "Abandoned sessions must be archived manually.",
@@ -842,11 +850,12 @@
   const archiveFailurePresentation = (operation, state, threadId) => {
     if (operation?.kind !== "archive" || !["paused", "failed", "running"].includes(operation.state) ||
         !operation.options?.journalId || operation.options.journalId !== state?.operation?.id ||
-        !threadId || state.identity !== threadId || state.operation.identity !== threadId ||
-        !["deferred", "error"].includes(state.result) || !Number.isFinite(Date.parse(state.checked_at))) return null;
+        !threadId || (state.root_thread_id || state.identity) !== threadId ||
+        (state.operation.identity_version === 1 ? state.operation.identity !== state.identity : state.operation.identity !== threadId) ||
+        !["deferred", "error"].includes(state.result) || !Number.isFinite(Date.parse(state.last_attempt_at || state.checked_at))) return null;
     const presentation = autoArchivePresentation(state);
     if (!presentation.blockers.length) return null;
-    return {message: presentation.blockers.join(" "), attemptedAt: state.checked_at};
+    return {message: presentation.blockers.join(" "), attemptedAt: state.last_attempt_at || state.checked_at};
   };
 
   const createCodexLimitsReader = (request, render) => {
@@ -933,9 +942,19 @@
     return args.join(" ");
   };
 
+  const workspaceArchivePresentation = (payload) => ({
+    summary: `Automatic archival is ${payload.policy?.enabled ? "enabled" : "disabled"}. ${payload.counts?.total || 0} sessions; ${payload.counts?.held || 0} kept open.`,
+    rows: [...(Array.isArray(payload.sessions) ? payload.sessions : [])].sort((a, b) => String(a.slug).localeCompare(String(b.slug))).map(row => {
+      const rule = {complete: "1 day", merged: "7 days", empty: "14 days"}[row.tier] || "No eligible rule";
+      const diagnosis = Array.isArray(row.diagnostics) ? row.diagnostics.map(entry => entry.message).filter(Boolean).join(" ") : "";
+      return {slug: row.slug, href: `/${encodeURIComponent(row.slug)}/#settings`,
+        message: `${rule}${row.hold ? " · Keep open" : ""}${row.eligible_at ? ` · Earliest eligibility: ${new Date(row.eligible_at).toLocaleString()}` : ""}. ${diagnosis || (row.activity_known ? "Cached activity is known." : "Activity has not been verified.")}${row.journal ? ` ${row.journal.operation} recovery: ${row.journal.phase}.` : ""}`};
+    }),
+  });
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
+      workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
       currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
@@ -1241,11 +1260,31 @@
     }
     return records.some((operation) => operation.state === "running");
   };
+  let workspaceArchiveRead = null, workspaceArchiveCheckedAt = 0;
+  const refreshWorkspaceArchive = () => {
+    const status = document.getElementById("workspace-auto-archive-status");
+    const list = document.getElementById("workspace-auto-archive-rows");
+    if (!status || !list || document.hidden || workspaceArchiveRead || Date.now() - workspaceArchiveCheckedAt < 30_000) return;
+    workspaceArchiveRead = request("/api/auto-archive").then(payload => {
+      const presentation = workspaceArchivePresentation(payload);
+      status.textContent = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
+      list.replaceChildren();
+      for (const row of presentation.rows) {
+        const item = document.createElement("div"); item.className = "auto-archive-overview-row";
+        const link = document.createElement("a"); link.href = row.href; link.textContent = row.slug;
+        const details = document.createElement("p"); details.className = "muted"; details.textContent = row.message;
+        item.append(link, details); list.append(item);
+      }
+      workspaceArchiveCheckedAt = Date.now();
+    }).catch(() => { status.textContent = "Cached archival status is unavailable. Previously displayed rows are retained."; })
+      .finally(() => { workspaceArchiveRead = null; });
+  };
   const refreshIndexStatus = async () => {
     if (!body.hasAttribute("data-index")) return;
     if (indexNavigationPending) return;
     const warning = document.getElementById("index-status-warning");
     let nextRefresh = 15_000;
+    refreshWorkspaceArchive();
     try {
       const payload = await request("/api/index-status");
       if (indexNavigationPending) return;

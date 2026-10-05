@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,36 @@ import (
 
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+func TestWorkspaceAutoArchiveReadsCachedEnvelopeWithoutScan(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	command := filepath.Join(t.TempDir(), "dev-session")
+	payload, err := json.Marshal(map[string]any{"schema": 1, "workspace": server.config.Workspace,
+		"policy":   map[string]any{"enabled": false, "epoch": nil},
+		"sessions": []any{map[string]any{"slug": "malformed", "migration_needed": true}, map[string]any{"slug": "one", "activity_known": true}},
+		"counts":   map[string]any{"total": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n[ \"$*\" = 'auto-archive status --json' ] || exit 7\nprintf '%s\\n' '" + strings.ReplaceAll(string(payload), "'", "'\"'\"'") + "'\n"
+	if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.config.DevSession = command
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/auto-archive", nil))
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"migration_needed":true`) || !strings.Contains(response.Body.String(), `"slug":"one"`) {
+		t.Fatalf("workspace status=%d: %s", response.Code, response.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auto-archive", strings.NewReader(`{}`))
+	request.Header.Set("Origin", server.config.BaseURL)
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != 405 {
+		t.Fatalf("workspace mutation=%d", response.Code)
+	}
+}
 
 func TestAutoArchiveStatusAndHoldValidateSessionAndOrigin(t *testing.T) {
 	server := newTestServer(t)

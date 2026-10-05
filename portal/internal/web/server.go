@@ -671,6 +671,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.codexLimits(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
 		s.collaborationModes(w, r)
+	case r.URL.Path == "/api/auto-archive":
+		s.autoArchiveWorkspaceAPI(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/index-status":
 		s.indexStatus(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifacts/"):
