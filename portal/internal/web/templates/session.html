@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=5">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -15,7 +15,8 @@
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
   <header class="sidebar-heading">
-    <div><a href="/" class="sidebar-home" title="Workspace" aria-label="Workspace"><span aria-hidden="true" class="rail-icon">⌂</span><span class="rail-label">Workspace</span></a><h1>{{.Session.Slug}}</h1></div>
+    <div class="sidebar-toolbar"><a href="/" class="sidebar-home" title="Workspace" aria-label="Workspace"><span aria-hidden="true" class="rail-icon">⌂</span><span class="rail-label">Workspace</span></a>{{template "sidebar-menu"}}</div>
+    <h1>{{.Session.Slug}}</h1>
   </header>
     {{if not .LifecycleOnly}}
       <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
@@ -204,7 +205,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=24" defer></script>
+  <script src="/static/app.js?v=25" defer></script>
 </body>
 </html>
 {{end}}

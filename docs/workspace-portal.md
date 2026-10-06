@@ -379,7 +379,8 @@ loaded with the new bundle perform the refresh and confirmation flow in place.
 
 ## Automatic archival overview
 
-The workspace's **Automatic archival** link opens `/automatic-archival`, which
+The ⋮ menu at the top of the workspace and session sidebars contains
+**Automatic archival**. Its link opens `/automatic-archival`, which
 shows policy state, cached scan time, counts and sorted
 session rows. Each row gives its rule, earliest eligibility, Keep open state,
 known activity and useful blocker messages, with a link to the session. Invalid

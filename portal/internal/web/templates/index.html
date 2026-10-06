@@ -5,13 +5,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=5">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
   <div class="workspace-shell index-shell">
   <aside class="workspace-sidebar index-sidebar">
-    <header class="sidebar-heading"><p class="eyebrow">{{.DisplayLabel}}</p><h1>Workspace</h1></header>
+    <header class="sidebar-heading sidebar-toolbar"><p class="eyebrow">{{.DisplayLabel}}</p>{{template "sidebar-menu"}}</header>
     <div class="sidebar-content">
     <section>
       <div class="section-heading"><h2>Work</h2><span id="active-count">{{len .Active}}</span></div>
@@ -81,8 +81,6 @@
       </form>
     </section>
 
-    <nav aria-label="Workspace settings"><a href="/automatic-archival">Automatic archival</a></nav>
-
     <section id="operations" class="panel operations-panel" hidden>
       <div class="section-heading"><h2>Operations</h2><span id="operation-count">0</span></div>
       <div id="operation-list" class="operation-list" aria-live="polite"></div>
@@ -93,9 +91,16 @@
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/app.js?v=24" defer></script>
+  <script src="/static/app.js?v=25" defer></script>
 </body>
 </html>
+{{end}}
+
+{{define "sidebar-menu"}}
+<button class="sidebar-menu-toggle quiet" type="button" popovertarget="sidebar-menu" title="Workspace menu" aria-label="Workspace menu"><span aria-hidden="true">⋮</span></button>
+<nav id="sidebar-menu" class="sidebar-menu" popover="auto" aria-label="Workspace navigation">
+  <a href="/automatic-archival" autofocus>Automatic archival</a>
+</nav>
 {{end}}
 
 {{define "codex-limits"}}

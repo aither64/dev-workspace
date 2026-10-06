@@ -22,17 +22,25 @@ func TestAutomaticArchivalPageIsSeparateFromIndex(t *testing.T) {
 	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), `href="/automatic-archival"`) {
 		t.Fatalf("index navigation = %d: %s", index.Code, index.Body.String())
 	}
-	for _, removed := range []string{"workspace-auto-archive-status", "workspace-auto-archive-rows", "data-automatic-archival"} {
+	for _, removed := range []string{"workspace-auto-archive-status", "workspace-auto-archive-rows", "data-automatic-archival", `<h1>Workspace</h1>`, `aria-label="Workspace settings"`} {
 		if strings.Contains(index.Body.String(), removed) {
 			t.Fatalf("index still renders overview %q", removed)
 		}
+	}
+	for _, required := range []string{`class="sidebar-heading sidebar-toolbar"`, `aria-label="Workspace menu"`, `popovertarget="sidebar-menu"`, `popover="auto"`, `href="/automatic-archival" autofocus`} {
+		if !strings.Contains(index.Body.String(), required) {
+			t.Fatalf("index sidebar menu lacks %q", required)
+		}
+	}
+	if strings.Count(index.Body.String(), `href="/automatic-archival"`) != 1 {
+		t.Fatal("index automatic archival navigation is duplicated")
 	}
 	page := httptest.NewRecorder()
 	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/automatic-archival", nil))
 	if page.Code != http.StatusOK {
 		t.Fatalf("dedicated route reached slug lookup: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{"data-automatic-archival", "workspace-auto-archive-status", "workspace-auto-archive-rows", `href="/"`, `/static/app.js?v=24`} {
+	for _, required := range []string{"data-automatic-archival", "workspace-auto-archive-status", "workspace-auto-archive-rows", `href="/"`, `/static/app.js?v=25`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("overview lacks %q: %s", required, page.Body.String())
 		}

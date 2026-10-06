@@ -997,11 +997,23 @@
   }
 
   const body = document.body;
+  const sidebarMenu = document.getElementById("sidebar-menu");
+  const sidebarMenuToggle = document.querySelector(".sidebar-menu-toggle");
+  const positionSidebarMenu = () => {
+    if (!sidebarMenu?.matches(":popover-open")) return;
+    const button = sidebarMenuToggle.getBoundingClientRect();
+    sidebarMenu.style.left = `${Math.max(8, Math.min(button.left, innerWidth - sidebarMenu.offsetWidth - 8))}px`;
+    sidebarMenu.style.top = `${Math.max(8, Math.min(button.bottom + 6, innerHeight - sidebarMenu.offsetHeight - 8))}px`;
+  };
+  sidebarMenu?.addEventListener("toggle", positionSidebarMenu);
+  window.addEventListener("resize", positionSidebarMenu);
+  document.querySelector(".sidebar-content")?.addEventListener("scroll", positionSidebarMenu, {passive: true});
   const narrowSidebar = globalThis.matchMedia("(max-width: 760px)");
   let comparisonOpen = false, updateLimitsPopover = () => {};
   const updateSidebar = () => {
     const reviewing = comparisonOpen && document.getElementById("repositories")?.classList.contains("active");
     body.classList.toggle("compact-sidebar", narrowSidebar.matches || Boolean(reviewing));
+    positionSidebarMenu();
     updateLimitsPopover();
   };
   narrowSidebar.addEventListener("change", updateSidebar);
