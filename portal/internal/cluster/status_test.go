@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -133,6 +135,118 @@ func TestInspectNormalizesLegacyHelperStatus(t *testing.T) {
 	}
 	if statuses[0].Links != nil || statuses[0].Credentials != nil {
 		t.Fatalf("legacy fields were not cleared: %#v", statuses[0])
+	}
+}
+
+const webUISourceMetadata = `"webuiSource":{"revision":"aa2f60b89df65d2f987be48784ed42bab7010833","dirty":false,"kind":"worktree"}`
+const releasedMaintenanceMetadata = `"maintenance":{"version":2,"mode":"maintenance","phase":"released","pending":false,"copied":true,"active":true}`
+
+func TestInspectAcceptsProviderMetadataWithoutChangingStatus(t *testing.T) {
+	for _, testCase := range []struct{ name, metadata string }{
+		{"worktree", webUISourceMetadata},
+		{"pinned-dirty", strings.ReplaceAll(strings.ReplaceAll(webUISourceMetadata, "worktree", "pinned"), "false", "true")},
+		{"maintenance-v1", strings.ReplaceAll(releasedMaintenanceMetadata, `"version":2`, `"version":1`)},
+		{"maintenance-v2", releasedMaintenanceMetadata},
+		{"combined", webUISourceMetadata + "," + releasedMaintenanceMetadata},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			payload := `{"schema":2,"found":true,"kind":"vpsadmin","state":"running","ready":true,"topology":"storage","network":"bridge","services":[{"label":"React Web UI","url":"https://webui.example.test/"}],` + testCase.metadata + `}`
+			statuses, err := (Runner{Workspace: t.TempDir(), Providers: testProviders(
+				"vpsadmin", statusHelper(t, payload), "vpsAdmin",
+			)}).Inspect("example")
+			if err != nil || len(statuses) != 1 {
+				t.Fatalf("inspection = %v, %v", statuses, err)
+			}
+			status := statuses[0]
+			if status.State != "running" || !status.Ready || len(status.Services) != 1 || status.Notice != "" {
+				t.Fatalf("status = %#v", status)
+			}
+			encoded, err := json.Marshal(status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "webuiSource") || strings.Contains(string(encoded), "maintenance") {
+				t.Fatalf("provider metadata escaped into public status: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestInspectRejectsInvalidProviderMetadata(t *testing.T) {
+	for _, testCase := range []struct{ name, metadata string }{
+		{"source-revision", strings.ReplaceAll(webUISourceMetadata, "aa2f60b89df65d2f987be48784ed42bab7010833", "invalid")},
+		{"source-uppercase", strings.ReplaceAll(webUISourceMetadata, "aa2f", "AA2F")},
+		{"source-kind", strings.ReplaceAll(webUISourceMetadata, "worktree", "foreign")},
+		{"source-missing-dirty", strings.ReplaceAll(webUISourceMetadata, `"dirty":false,`, "")},
+		{"source-null-dirty", strings.ReplaceAll(webUISourceMetadata, `"dirty":false`, `"dirty":null`)},
+		{"source-wrong-dirty-type", strings.ReplaceAll(webUISourceMetadata, `"dirty":false`, `"dirty":"false"`)},
+		{"source-unknown-field", strings.ReplaceAll(webUISourceMetadata, `"dirty":false`, `"dirty":false,"extra":true`)},
+		{"maintenance-version", strings.ReplaceAll(releasedMaintenanceMetadata, `"version":2`, `"version":3`)},
+		{"maintenance-mode", strings.ReplaceAll(releasedMaintenanceMetadata, `"mode":"maintenance"`, `"mode":"other"`)},
+		{"maintenance-phase", strings.ReplaceAll(releasedMaintenanceMetadata, "released", "unknown")},
+		{"maintenance-missing-pending", strings.ReplaceAll(releasedMaintenanceMetadata, `"pending":false,`, "")},
+		{"maintenance-missing-copied", strings.ReplaceAll(releasedMaintenanceMetadata, `"copied":true,`, "")},
+		{"maintenance-missing-active", strings.ReplaceAll(releasedMaintenanceMetadata, `,"active":true`, "")},
+		{"maintenance-pending-disagrees", strings.ReplaceAll(releasedMaintenanceMetadata, `"pending":false`, `"pending":true`)},
+		{"maintenance-active-disagrees", strings.ReplaceAll(releasedMaintenanceMetadata, `"active":true`, `"active":false`)},
+		{"maintenance-unknown-field", strings.ReplaceAll(releasedMaintenanceMetadata, `"version":2`, `"version":2,"extra":true`)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			payload := `{"schema":2,"found":true,"kind":"vpsadmin","state":"running","ready":false,"services":[],` + testCase.metadata + `}`
+			_, err := (Runner{Workspace: t.TempDir(), Providers: testProviders(
+				"vpsadmin", statusHelper(t, payload), "vpsAdmin",
+			)}).Inspect("example")
+			if err == nil {
+				t.Fatal("invalid metadata was accepted")
+			}
+		})
+	}
+	for _, payload := range []string{
+		`{"schema":1,"found":true,"kind":"vpsadmin","state":"stopped",` + webUISourceMetadata + `}`,
+		`{"schema":2,"found":false,"kind":"vpsadmin",` + releasedMaintenanceMetadata + `}`,
+		`{"schema":2,"found":true,"kind":"vpsadmin","state":"running","services":[],` + webUISourceMetadata + `} {}`,
+	} {
+		_, err := (Runner{Workspace: t.TempDir(), Providers: testProviders(
+			"vpsadmin", statusHelper(t, payload), "vpsAdmin",
+		)}).Inspect("example")
+		if err == nil {
+			t.Fatalf("invalid envelope was accepted: %s", payload)
+		}
+	}
+}
+
+func TestPendingMaintenanceReplacesCachedReadinessAndServices(t *testing.T) {
+	for _, phase := range []string{"held", "maintenance_ready", "copying", "copied", "starting_copied"} {
+		t.Run(phase, func(t *testing.T) {
+			cache := &StatusCache{}
+			cache.observe("example\x00vpsadmin", Status{State: "running", Ready: true, Services: []Service{
+				{Label: "Web UI", Accounts: []Account{{Label: "Admin", Fields: []Field{
+					{Label: "Password", Value: "old-password", Secret: true},
+				}}}},
+			}}, true, "")
+			metadata := fmt.Sprintf(`"maintenance":{"version":2,"mode":"maintenance","phase":%q,"pending":true,"copied":false,"active":false}`, phase)
+			payload := `{"schema":2,"found":true,"kind":"vpsadmin","state":"running","ready":false,"services":[],` + metadata + `}`
+			runner := Runner{Workspace: t.TempDir(), Providers: testProviders(
+				"vpsadmin", statusHelper(t, payload), "vpsAdmin",
+			), Cache: cache}
+			statuses, err := runner.Inspect("example")
+			if err != nil || len(statuses) != 1 || statuses[0].Ready || len(statuses[0].Services) != 0 || statuses[0].Notice != "" {
+				t.Fatalf("pending maintenance = %v, %v", statuses, err)
+			}
+			cached := cache.observe("example\x00vpsadmin", Status{}, true, "busy")
+			if cached.Ready || len(cached.Services) != 0 {
+				t.Fatalf("maintenance did not replace cache: %#v", cached)
+			}
+			for _, invalid := range []string{
+				strings.ReplaceAll(payload, `"ready":false`, `"ready":true`),
+				strings.ReplaceAll(payload, `"services":[]`, `"services":[{"label":"Web UI","url":"https://example.test/"}]`),
+			} {
+				runner.Providers[0].Helper = statusHelper(t, invalid)
+				if _, err := runner.Inspect("example"); err == nil {
+					t.Fatal("pending maintenance exposed readiness or services")
+				}
+			}
+		})
 	}
 }
 

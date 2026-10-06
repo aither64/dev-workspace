@@ -864,6 +864,24 @@ last valid state and displays a local update notice. Other failures indicate
 unavailable status. Readiness and credentials are replaced by the next complete
 status response, including an empty response after reset.
 
+Schema-2 responses may include optional `webuiSource` and `maintenance`
+metadata. The portal validates these objects without adding them to the rendered
+cluster card. `webuiSource` contains a 40-character lowercase hexadecimal
+`revision`, a boolean `dirty`, and a `kind` of `pinned` or `worktree`.
+`maintenance` contains `version` (1 or 2), `mode` (`maintenance`), `phase`,
+and boolean `pending`, `copied`, and `active` fields. Supported phases are
+`held`, `maintenance_ready`, `copying`, `copied`, `starting_copied`, and
+`released`. Only `released` has `pending: false` and `active: true`.
+Pending maintenance requires `ready: false` and an empty `services` array.
+Metadata requires a found schema-2 cluster. Unknown fields, incomplete metadata,
+and trailing output are rejected.
+
+Helpers that omit these metadata objects remain compatible. Portal generations
+without metadata support reject responses containing either object. Deploy a
+reader that accepts them together with helpers that emit them; removing one
+object does not make the other compatible. This wire contract does not change
+persisted cluster state or the package transition policy.
+
 The portal gives a release/reset operation
 `clusterProvider.releaseTimeoutSeconds` (180 seconds). Providers must budget
 guest shutdown, forced reaping, runner cleanup, and command completion within

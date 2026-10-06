@@ -86,6 +86,31 @@ type Status struct {
 	Services    []Service    `json:"services,omitempty"`
 }
 
+// Provider metadata is validated at the wire boundary without changing the
+// portal's rendered Status interface.
+type helperResponse struct {
+	Schema      int                `json:"schema"`
+	Found       bool               `json:"found"`
+	WebUISource *helperWebUISource `json:"webuiSource"`
+	Maintenance *helperMaintenance `json:"maintenance"`
+	Status
+}
+
+type helperWebUISource struct {
+	Revision string `json:"revision"`
+	Dirty    *bool  `json:"dirty"`
+	Kind     string `json:"kind"`
+}
+
+type helperMaintenance struct {
+	Version int    `json:"version"`
+	Mode    string `json:"mode"`
+	Phase   string `json:"phase"`
+	Pending *bool  `json:"pending"`
+	Copied  *bool  `json:"copied"`
+	Active  *bool  `json:"active"`
+}
+
 type Runner struct {
 	Workspace string
 	Providers []Provider
@@ -268,11 +293,7 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 		}
 		return Status{}, false, errors.New(message)
 	}
-	var response struct {
-		Schema int  `json:"schema"`
-		Found  bool `json:"found"`
-		Status
-	}
+	var response helperResponse
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&response); err != nil {
@@ -286,6 +307,9 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 	}
 	if response.Label != "" || response.Notice != "" {
 		return Status{}, false, errors.New("development cluster helper returned an invalid status")
+	}
+	if err := response.validateMetadata(); err != nil {
+		return Status{}, false, fmt.Errorf("development cluster helper returned an invalid status: %w", err)
 	}
 	if !response.Found {
 		return Status{}, false, nil
@@ -303,6 +327,40 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 	}
 	response.Label = provider.Label
 	return response.Status, true, nil
+}
+
+func (response helperResponse) validateMetadata() error {
+	if response.WebUISource == nil && response.Maintenance == nil {
+		return nil
+	}
+	if response.Schema != 2 || !response.Found {
+		return errors.New("metadata requires a found schema 2 cluster")
+	}
+	if source := response.WebUISource; source != nil {
+		if len(source.Revision) != 40 || strings.Trim(source.Revision, "0123456789abcdef") != "" ||
+			source.Dirty == nil || (source.Kind != "pinned" && source.Kind != "worktree") {
+			return errors.New("WebUI source metadata is invalid")
+		}
+	}
+	if maintenance := response.Maintenance; maintenance != nil {
+		if (maintenance.Version != 1 && maintenance.Version != 2) || maintenance.Mode != "maintenance" ||
+			maintenance.Pending == nil || maintenance.Copied == nil || maintenance.Active == nil {
+			return errors.New("maintenance metadata is invalid")
+		}
+		switch maintenance.Phase {
+		case "held", "maintenance_ready", "copying", "copied", "starting_copied", "released":
+		default:
+			return errors.New("maintenance phase is invalid")
+		}
+		released := maintenance.Phase == "released"
+		if *maintenance.Pending != !released || *maintenance.Active != released {
+			return errors.New("maintenance flags disagree with phase")
+		}
+		if *maintenance.Pending && (response.Ready || len(response.Services) != 0) {
+			return errors.New("pending maintenance contains readiness or services")
+		}
+	}
+	return nil
 }
 
 func validateStructuredStatus(schema int, status Status) error {
