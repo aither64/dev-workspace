@@ -679,7 +679,8 @@ module WorkspaceAutoArchive
       command += ['--expected-operation-id', operation_id, '--expected-archive-mode', archive_mode] if operation_id
       command += ['--expected-start-tmux-identity', start_tmux_identity] if start_tmux_identity
       command += ['--expected-revive-operation-id', revive_operation_id] if revive_operation_id
-      output, = @command_runner.capture(command)
+      # Host dispatch can select the tmux socket on argv without exporting it.
+      output, = @command_runner.capture(command, env: session_environment(slug))
       activity = JSON.parse(output)
       valid = activity.is_a?(Hash) && activity['schema'] == 1 && activity['workspace'] == workspace &&
               activity['slug'] == slug && activity['identity'] == identity &&

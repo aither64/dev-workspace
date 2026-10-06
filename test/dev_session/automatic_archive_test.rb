@@ -3,6 +3,53 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_automatic_observation_forwards_selected_tmux_socket_to_child
+    with_workspace do |workspace|
+      slug = '2026-06-06-selected-tmux'
+      socket = File.join(workspace, 'selected-tmux.sock')
+      portal = File.join(workspace, 'socket-observer.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        abort 'selected tmux socket is missing or wrong' unless ENV['DEV_SESSION_TMUX_SOCKET'] == #{socket.inspect}
+        puts JSON.generate('schema' => 1, 'workspace' => #{workspace.inspect}, 'slug' => #{slug.inspect},
+          'identity' => 'fixture-identity', 'activityKnown' => true, 'activityToken' => 'a' * 64,
+          'lastActivityAt' => nil, 'idle' => true, 'subjects' => [], 'diagnostics' => [])
+      RUBY
+      invocation = <<~'RUBY'
+        require 'json'
+        load ARGV.shift
+        workspace, socket, slug = ARGV
+        runner = DevSession::Runner.new(workspace: workspace, tmux_socket: socket.empty? ? nil : socket)
+        activity = runner.send(:auto_archive_session_observation, slug, 'fixture-identity')
+        puts JSON.generate('activity' => activity, 'ambient_socket' => ENV['DEV_SESSION_TMUX_SOCKET'])
+      RUBY
+      environment = {
+        'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'),
+        'DEV_WORKSPACES_STATE' => File.join(workspace, '.xdg-state', 'dev-workspaces'),
+        DevSession::ENV_REQUIRE_RUNTIME => '0',
+        DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin,
+        DevSession::ENV_CODEX_SOCKET => '/run/test/codex.sock',
+        DevSession::ENV_AUTHORITY_DIR => File.join(workspace, '.authority'),
+        'DEV_WORKSPACE_CODEX_HOME' => File.join(workspace, '.codex')
+      }
+      [nil, File.join(workspace, 'ambient-tmux.sock')].each do |ambient|
+        environment[DevSession::ENV_TMUX_SOCKET] = ambient
+        output, error, status = Open3.capture3(environment, RbConfig.ruby, '-e', invocation,
+          File.expand_path('../../libexec/dev-session', __dir__), workspace, socket, slug)
+        assert(status.success?, error)
+        result = JSON.parse(output)
+        assert(result.fetch('activity').fetch('activityKnown'))
+        assert(result.fetch('activity').fetch('idle'))
+        ambient ? assert_equal(ambient, result.fetch('ambient_socket')) : assert_nil(result.fetch('ambient_socket'))
+      end
+      environment[DevSession::ENV_TMUX_SOCKET] = nil
+      _output, error, status = Open3.capture3(environment, RbConfig.ruby, '-e', invocation,
+        File.expand_path('../../libexec/dev-session', __dir__), workspace, '', slug)
+      refute(status.success?)
+      assert_includes(error, 'Conversation activity cannot be verified.')
+    end
+  end
+
   def test_workspace_auto_archive_status_is_cached_sorted_and_isolates_legacy_and_moved_rows
     with_workspace do |workspace|
       slug = '2026-06-06-cached'
