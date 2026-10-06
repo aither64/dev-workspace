@@ -5055,6 +5055,8 @@ module DevSession
           if recorded_github && actual_github != recorded_github
             raise Error, "origin identity is #{actual_github || raw_remote.inspect}"
           end
+          next if archive_cleanup_shared_master_retained?(repository, common_dir, expected, mode: journal.fetch('mode'))
+
           proof = archive_branch_proof(
             repository, common_dir, branch, default_branch, allow_unpushed: true
           )

@@ -3,6 +3,105 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_archive_shared_master_preserves_the_sealed_head_after_its_tracking_commit
+    with_shared_master_archive_fixture do |runner, workspace, slug, sealed|
+      runner.archive(slug, as_is: true)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(sealed, manifest.fetch('repositories').fetch(0).fetch('final_head_sha'))
+      refute_equal(sealed, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip)
+      assert_equal(sealed, git_capture_success('git', '-C', workspace, 'rev-parse', 'refs/remotes/origin/master').strip)
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+    end
+  end
+
+  def test_archive_shared_master_retry_accepts_another_tracking_commit_without_retargeting
+    with_shared_master_archive_fixture do |runner, workspace, slug, sealed|
+      runner.define_singleton_method(:commit_tracking_transition!) do |*_args, **_options|
+        raise DevSession::Error, 'pause before archive tracking commit'
+      end
+      error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+      assert_includes(error.message, 'pause before archive tracking commit')
+      journal_path = runner.send(:lifecycle_journal_file, slug, 'archive')
+      journal = JSON.parse(File.read(journal_path))
+      assert_equal('tracking_archived', journal.fetch('phase'))
+      assert_equal({ 'workspace' => sealed }, journal.fetch('proven_heads'))
+      original_sidecar = DevSession::ArchiveCleanup.new(runner, slug).load
+      runner.singleton_class.remove_method(:commit_tracking_transition!)
+
+      other = File.join(workspace, 'work', '2026-06-07-other', 'state.md')
+      FileUtils.mkdir_p(File.dirname(other))
+      File.write(other, "---\nlifecycle: active\n---\n\nOther tracking checkpoint.\n")
+      assert_git_success('git', '-C', workspace, 'add', other)
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'record other tracking checkpoint')
+      assert_git_success('git', '-C', workspace, 'push', 'origin', 'master')
+      assert_equal(original_sidecar, DevSession::ArchiveCleanup.new(runner, slug).load)
+      assert_equal(journal, JSON.parse(File.read(journal_path)))
+
+      runner.archive(slug, as_is: true)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(sealed, manifest.fetch('repositories').fetch(0).fetch('final_head_sha'))
+      assert_equal('2', git_capture_success('git', '-C', workspace, 'rev-list', '--count', "#{sealed}..HEAD").strip)
+      assert_equal(File.binread(other), git_capture_success('git', '-C', workspace, 'show', 'HEAD:work/2026-06-07-other/state.md'))
+      refute(File.exist?(journal_path))
+      refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+    end
+  end
+
+  def test_archive_abandoned_shared_master_keeps_unpublished_sealed_head_after_tracking_commit
+    with_shared_master_archive_fixture do |runner, workspace, slug, published|
+      other = File.join(workspace, 'work', '2026-06-07-other', 'state.md')
+      FileUtils.mkdir_p(File.dirname(other))
+      File.write(other, "---\nlifecycle: active\n---\n\nUnpublished tracking checkpoint.\n")
+      assert_git_success('git', '-C', workspace, 'add', other)
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'record unpublished tracking checkpoint')
+      sealed = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip
+      refute_equal(published, sealed)
+
+      runner.archive(slug, as_is: true, abandoned: true)
+
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(sealed, manifest.fetch('repositories').fetch(0).fetch('final_head_sha'))
+      refute_equal(sealed, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip)
+      assert_equal(published, git_capture_success('git', '-C', workspace, 'rev-parse', 'refs/remotes/origin/master').strip)
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+    end
+  end
+
+  def test_archive_shared_master_retry_refuses_rewound_or_missing_local_and_origin_heads
+    %i[local_rewound origin_rewound origin_missing].each do |change|
+      with_shared_master_archive_fixture do |runner, workspace, slug, sealed|
+        runner.define_singleton_method(:commit_tracking_transition!) do |*_args, **_options|
+          raise DevSession::Error, 'pause before archive tracking commit'
+        end
+        error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+        assert_includes(error.message, 'pause before archive tracking commit')
+        runner.singleton_class.remove_method(:commit_tracking_transition!)
+        journal_path = runner.send(:lifecycle_journal_file, slug, 'archive')
+        saved_journal = File.binread(journal_path)
+        manifest_path = File.join(workspace, 'archive', slug, 'portal.yml')
+        saved_manifest = File.binread(manifest_path)
+        parent = git_capture_success('git', '-C', workspace, 'rev-parse', "#{sealed}^").strip
+        common = change == :local_rewound ? File.join(workspace, '.git') : File.join(workspace, '.git', 'test-origin.git')
+        if change == :origin_missing
+          assert_git_success('git', "--git-dir=#{common}", 'update-ref', '-d', 'refs/heads/master')
+        else
+          assert_git_success('git', "--git-dir=#{common}", 'update-ref', 'refs/heads/master', parent)
+        end
+
+        error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+
+        assert_includes(error.message, 'no longer retains sealed HEAD') unless change == :origin_missing
+        assert_equal(saved_journal, File.binread(journal_path))
+        assert_equal(saved_manifest, File.binread(manifest_path))
+        assert(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+      end
+    end
+  end
+
   def test_archive_cleanup_removes_nested_default_and_detached_checkouts_and_empty_containers
     with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
       group = File.dirname(feature)
@@ -480,6 +579,24 @@ class DevSessionTest < Minitest::Test
       common = File.join(workspace, 'repos', 'sample.git')
       feature = File.join(workspace, 'worktrees', slug, 'sample')
       yield runner, workspace, slug, common, feature
+    end
+  end
+
+  def with_shared_master_archive_fixture
+    with_workspace do |workspace|
+      slug = '2026-06-06-shared-master'
+      runner = archive_runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
+      path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(path))
+      manifest['repositories'] = [{ 'name' => 'workspace', 'project' => 'workspace', 'branch' => 'master', 'default_branch' => 'master' }]
+      File.write(path, YAML.dump(manifest))
+      assert_git_success('git', '-C', workspace, 'add', path)
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'register shared master obligation')
+      configure_workspace_origin(workspace)
+      sealed = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip
+      yield runner, workspace, slug, sealed
     end
   end
 end

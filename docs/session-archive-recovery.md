@@ -16,6 +16,14 @@ that fetched default. Abandoned archival skips publication and merge proof, but
 still requires an existing shared branch, tag or origin tracking ref to retain
 each detached commit. Archival creates no rescue ref and never removes branches.
 
+The registered coordination workspace's shared `master` branch can advance
+through tracking commits, including the archive's own commit. Its sealed final
+head stays unchanged and must remain an ancestor of local `master`. Complete
+archival also requires it merged into current origin `master`; abandoned archival
+keeps its publication exemption. This exception requires the exact workspace Git
+common directory; other repositories, feature branches and auxiliary checkouts
+keep their existing head checks.
+
 Before cleanup, the operation records checkout, Git administration, common
 repository and container identities, exact heads and selected retention refs in
 a sealed inventory. It checks that inventory, cleanliness, tracking projection

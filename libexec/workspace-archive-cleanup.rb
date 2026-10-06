@@ -33,6 +33,29 @@ module DevSession
         archive_branch_proof(repository, common, branch, default, allow_unpushed:)
       end
 
+      def archive_cleanup_shared_master_retained?(repository, common, head, mode:)
+        return false unless repository['project'] == 'workspace' &&
+                            repository['branch'] == 'master' && repository['default_branch'] == 'master' &&
+                            common == File.realpath(File.join(workspace, '.git'))
+
+        # Archival itself and other sessions append tracking commits to master.
+        refs = ['refs/heads/master']
+        if mode == 'complete'
+          fetch_archive_refs!(common, ['master'])
+          refs << 'refs/remotes/origin/master'
+        end
+        refs.each do |ref|
+          tip = resolve_commit(common, ref)
+          _stdout, _stderr, status = @command_runner.capture(
+            ['git', "--git-dir=#{common}", 'merge-base', '--is-ancestor', head, tip], allow_failure: true
+          )
+          unless status.success?
+            raise Error, "shared workspace #{ref} no longer retains sealed HEAD #{head}"
+          end
+        end
+        true
+      end
+
       def archive_cleanup_manifest(slug)
         tracking = path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug)
         load_portal_manifest(File.join(tracking, PORTAL_MANIFEST), required: false)
@@ -611,7 +634,9 @@ module DevSession
              git(['git', "--git-dir=#{common}", 'config', '--get', 'remote.origin.url']).strip == proof.fetch('origin')
         raise Error, "archive retained repository identity changed: #{proof.fetch('name')}"
       end
-      if proof.fetch('branch') && resolve_commit(common, "refs/heads/#{proof.fetch('branch')}") != proof.fetch('head')
+      shared_master = proof.fetch('kind') == 'registered' &&
+                      @runner.archive_cleanup_shared_master_retained?(proof, common, proof.fetch('head'), mode:)
+      if !shared_master && proof.fetch('branch') && resolve_commit(common, "refs/heads/#{proof.fetch('branch')}") != proof.fetch('head')
         detail = mode == 'complete' ? 'feature branch changed after merge proof' : 'feature branch changed during archival'
         raise Error, "#{detail}: #{proof.fetch('name')}"
       end
@@ -620,7 +645,7 @@ module DevSession
         unless current_default == proof.fetch('default_branch')
           raise Error, "archive origin default changed: #{proof.fetch('name')}"
         end
-        if %w[registered additional].include?(proof.fetch('kind'))
+        if !shared_master && %w[registered additional].include?(proof.fetch('kind'))
           repository = proof.slice('branch', 'default_branch', 'initial_base_sha')
           actual = @runner.archive_cleanup_branch_proof(repository, common, proof.fetch('branch'), current_default,
                         allow_unpushed: proof.fetch('allow_unpushed'))
@@ -628,7 +653,7 @@ module DevSession
                  (!actual.fetch(:feature_remote) || actual.fetch(:remote_head) == proof.fetch('head'))
             raise Error, "feature head changed during archive cleanup: #{proof.fetch('name')}"
           end
-        else
+        elsif !shared_master
           fetch_refs!(common, [current_default])
         end
       end
