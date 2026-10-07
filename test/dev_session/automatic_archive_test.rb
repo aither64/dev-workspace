@@ -474,6 +474,10 @@ class DevSessionTest < Minitest::Test
       result = automatic_scan(runner).fetch(0)
       refute(result['eligible'])
       assert_includes(result['blockers'].join, 'cannot be completed')
+      status = runner.auto_archive_status(slug)
+      assert_equal('deferred', status.fetch('result'))
+      assert_includes(status.fetch('last_attempt_error'), 'sample/sample: feature branch is not present on origin')
+      assert(status.fetch('last_attempt_at'))
       assert(File.directory?(File.join(workspace, 'work', slug)))
     end
   end
@@ -530,6 +534,8 @@ class DevSessionTest < Minitest::Test
       assert_equal('tracking_committed', JSON.parse(File.read(journal))['phase'])
       head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD')
       pending = runner.auto_archive_status(slug)
+      assert_includes(pending.fetch('last_attempt_error'), 'find session conversation: context deadline exceeded')
+      assert_includes(pending.fetch('last_attempt_error'), 'command failed with exit 1')
       refute(pending['repair_needed'])
       assert_equal('tracking_committed', pending.fetch('journal').fetch('phase'))
       assert(pending.fetch('diagnostics').any? { |entry| entry['code'] == 'archive_operation_pending' })
@@ -540,6 +546,22 @@ class DevSessionTest < Minitest::Test
       assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD'))
       refute(File.exist?(journal))
       assert_empty(runner.auto_archive_status(slug)['blockers'])
+    end
+  end
+
+  def test_automatic_archive_records_bounded_utf8_failures
+    with_workspace do |workspace|
+      slug = '2026-06-06-bounded-error'
+      runner = automatic_fixture(workspace, slug, lifecycle: 'complete')
+      automatic_scan(runner)
+      runner.define_singleton_method(:auto_archive_observe) do |*, **|
+        raise DevSession::Error, 'specific failure: ' + ('ž' * 20_000)
+      end
+      assert_equal('deferred', automatic_scan(runner).fetch(0)['result'])
+      message = runner.auto_archive_status(slug).fetch('last_attempt_error')
+      assert(message.start_with?('specific failure: '))
+      assert_operator(message.bytesize, :<=, 16_384)
+      assert(message.valid_encoding?)
     end
   end
 

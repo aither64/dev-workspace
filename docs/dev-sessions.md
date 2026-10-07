@@ -572,8 +572,9 @@ Observations survive service restarts. Re-enabling, reviving a session or
 releasing a hold also starts a fresh period. Changes made and reverted entirely
 between scans cannot be observed.
 
-Use **Automatic archival** on the session page to inspect its rule, earliest
-eligibility, blockers and last result. **Keep open** prevents automatic archival
+The session's **Settings** tab shows its archival status and any concrete failure.
+Policy, eligibility, activity and the full saved error are under **Technical
+details**. **Keep open** prevents automatic archival
 while leaving manual archival available. The equivalent commands are:
 
 ```sh
@@ -681,9 +682,11 @@ deployment interruption stops the operation, run the same `archive` command
 again with the same mode. It resumes completed phases without repeating them.
 The CLI prints phases as they are persisted. The browser exposes the same phase
 and offers Retry when an archive, delete, or revive operation fails or pauses.
-For an automatic archive, the session banner also shows the last failed worker
-attempt and its timestamp. This is separate from the last completed journal
-step. Technical details remain in Settings. A pending archive keeps the
+For an automatic archive, the session banner shows the saved failure and its
+timestamp. Settings shows the same reason while the banner is hidden there.
+The worker retains its actual bounded exception alongside the public diagnostic;
+pending-operation and stale-observation metadata do not replace the failure.
+Technical details remain collapsed in Settings. A pending archive keeps the
 conversation read-only; completion retains the conversation in archived history.
 
 Ordinary commands in the automatic worker have a 60-second timeout. Conversation

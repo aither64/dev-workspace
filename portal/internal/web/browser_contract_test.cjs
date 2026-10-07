@@ -95,6 +95,29 @@ const semanticArchiveFailure = {...failedArchive,identity:"bound-directory-targe
   operation:{id:"journal-1",identity:"bound-directory-target",identity_version:1,root_thread_id:"thread-1"},
   diagnostics:[{code:"archive_proof_failed",category:"tracking",message:"Exact tracking proof is unavailable."}]};
 assert.equal(archiveFailurePresentation(archiveOperation,semanticArchiveFailure,"thread-1").message,"Exact tracking proof is unavailable.");
+const actualArchiveFailure = {...semanticArchiveFailure,
+  journal: {operation: "archive", phase: "clusters_released"},
+  last_attempt_at: "2026-10-07T12:06:43Z",
+  last_attempt_error: "archived tracking changed during recovery: example",
+  diagnostics: [
+    {code: "archive_proof_failed", category: "tracking", message: "Archival proof failed; retry after resolving the recorded failure."},
+    {code: "archive_operation_pending", category: "lifecycle_pending", message: "An accepted lifecycle operation needs its recorded retry."},
+    {code: "observation_stale", category: "observation_stale", message: "The cached observation is older than two hours."},
+  ]};
+assert.deepEqual(autoArchivePresentation(actualArchiveFailure).blockers,
+  ["Archiving session records: archived tracking changed during recovery: example"]);
+assert.deepEqual(autoArchivePresentation(actualArchiveFailure).diagnostics, [actualArchiveFailure.last_attempt_error]);
+assert.deepEqual(autoArchivePresentation({...actualArchiveFailure, journal: null,
+  last_attempt_error: "sample/sample: feature branch is not present on origin",
+  diagnostics: [{code: "cleanup_proof_failed", category: "merge_proof", message: "Cleanup or exact merge proof is not satisfied."}]}).blockers,
+  ["sample/sample: feature branch is not present on origin"]);
+assert.deepEqual(archiveFailurePresentation(archiveOperation, actualArchiveFailure, "thread-1"), {
+  message: "Archiving session records: archived tracking changed during recovery: example",
+  attemptedAt: actualArchiveFailure.last_attempt_at,
+});
+assert.deepEqual(autoArchivePresentation({...actualArchiveFailure,
+  last_attempt_error: "command failed with exit 1: fixture\nworkspace-portal: retained thread has queued messages"}).blockers,
+  ["Archiving session records: workspace-portal: retained thread has queued messages"]);
 assert.equal(archiveFailurePresentation(archiveOperation,{...semanticArchiveFailure,identity:"replacement-directory"},"thread-1"),null);
 
 assert.deepEqual(archiveFailurePresentation({...archiveOperation, state: "running"}, failedArchive, "thread-1"), lastArchiveFailure);

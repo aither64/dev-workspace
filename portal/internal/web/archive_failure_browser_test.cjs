@@ -51,6 +51,9 @@ const {chromium, firefox, expect} = require("@playwright/test");
       // A settings visit shares the pending-page read, and focus does not evade throttling.
       await banner.getByRole("link", {name: "Technical details"}).click();
       await expect(page.locator("#settings")).toBeVisible();
+      await expect(banner).toBeHidden();
+      await expect(page.locator("#auto-archive-values")).toContainText("Closing the conversation timed out.");
+      await expect(page.locator("#auto-archive-details")).not.toHaveAttribute("open");
       assert.equal(reads, 1);
       offline = true;
       const offlineOperationResponse = responseFor("operation");
@@ -71,6 +74,7 @@ const {chromium, firefox, expect} = require("@playwright/test");
       assert.equal(reads, 3);
       held = false; release();
       await expect(page.locator("#auto-archive-status")).toBeHidden();
+      await page.locator("#session-tab-codex").click();
       failure.operation.id = "b".repeat(64);
       const priorClearedDetail = await operationDetail.textContent();
       operation = {...operation, updatedAt: "2026-09-16T13:07:17Z"};
@@ -105,9 +109,39 @@ const {chromium, firefox, expect} = require("@playwright/test");
       assert.equal((await (await runningOperationResponse).json()).state, "running");
       await expect(operationDetail).toContainText("Running");
       await expect(banner).toContainText("Last automatic attempt failed");
+      failure.last_attempt_error = "archived tracking changed during recovery: <script>example</script>";
+      failure.last_attempt_at = "2026-10-07T12:06:43Z";
+      failure.journal = {operation: "archive", phase: "clusters_released"};
+      failure.diagnostics = [
+        {code: "archive_proof_failed", category: "tracking", message: "Archival proof failed; retry after resolving the recorded failure."},
+        {code: "archive_operation_pending", category: "lifecycle_pending", message: "An accepted lifecycle operation needs its recorded retry."},
+        {code: "observation_stale", category: "observation_stale", message: "The cached observation is older than two hours."},
+      ];
+      operation = {...operation, state: "paused"};
+      await page.locator("#session-tab-settings").click();
+      await wake();
+      const values = page.locator("#auto-archive-values");
+      await expect(values).toContainText("Archiving session records: archived tracking changed during recovery:");
+      await expect(values).not.toContainText("An accepted lifecycle operation");
+      await expect(banner).toBeHidden();
+      assert.equal(await values.locator("script").count(), 0);
+      await page.reload();
+      await expect(values).toContainText("Archiving session records: archived tracking changed during recovery:");
+      await expect(page.locator("#auto-archive-details")).not.toHaveAttribute("open");
+      await page.locator("#auto-archive-details summary").click();
+      await expect(page.locator("#auto-archive-details pre")).toContainText(failure.last_attempt_error);
+      failure.result = "archived";
+      failure.last_attempt_error = null;
+      failure.diagnostics = [{code: "observation_stale", category: "observation_stale", message: "The cached observation is older than two hours."}];
+      await page.reload();
+      await expect(values).toHaveText("Session archived.");
+      await expect(page.locator("#auto-archive-details")).not.toHaveAttribute("open");
+      await page.locator("#auto-archive-details summary").click();
+      await expect(page.locator("#auto-archive-details pre")).toContainText("The cached observation is older than two hours.");
       // Completion must clear the historical warning and reload the final page.
       operation = {...operation, state: "complete"};
       const nextNavigation = page.waitForEvent("framenavigated", {predicate: frame => frame === page.mainFrame()});
+      await wake();
       await nextNavigation;
       await expect(banner).toBeHidden();
       assert.deepEqual(errors, []);

@@ -356,6 +356,11 @@ module WorkspaceAutoArchive
 
     private
 
+    def auto_archive_error_message(error)
+      error.message.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+           .byteslice(0, 16_384).scrub('')
+    end
+
     def auto_archive_tracking_identity(slug, tracking, root_thread_id)
       stat = File.lstat(tracking)
       unless stat.directory? && File.realpath(tracking) == tracking
@@ -451,7 +456,8 @@ module WorkspaceAutoArchive
                          end
             state.merge!('eligible' => false, 'result' => 'deferred', 'blockers' => [diagnostic['message']],
                          'diagnostics' => [diagnostic], 'last_attempt_at' => Time.now.utc.iso8601,
-                         'last_attempt_result' => 'deferred', 'last_attempt_error' => diagnostic['message'])
+                         'last_attempt_result' => 'deferred',
+                         'last_attempt_error' => auto_archive_error_message(e))
             auto_archive_store.write("session-#{slug}", state)
           end
         end
@@ -564,7 +570,8 @@ module WorkspaceAutoArchive
           state['eligible'] = false
           state['blockers'] << proof_error.message
           state['diagnostics'] << Policy.diagnostic('cleanup_proof_failed', proof_category, 'Cleanup or exact merge proof is not satisfied.')
-          state['last_attempt_error'] = state['diagnostics'].last.fetch('message')
+          state['result'] = 'deferred'
+          state['last_attempt_error'] = auto_archive_error_message(proof_error)
           state['last_attempt_at'] = Time.now.utc.iso8601
           state['last_attempt_result'] = 'deferred'
         end

@@ -821,7 +821,18 @@
     if (state.result) fields.push(["Last result", ({archived: "Archived", deferred: "Deferred", error: "Check failed"})[state.result] || "Unknown result"]);
     const blockers = [], diagnostics = [];
     if (Array.isArray(state.diagnostics)) {
+      const failedAttempt = state.last_attempt_error && ["deferred", "error"].includes(state.result);
+      if (failedAttempt) {
+        const reason = state.last_attempt_error.split(/\r?\n/).map(line => line.trim())
+          .find(line => line && !line.startsWith("command failed with exit")) || state.last_attempt_error;
+        const step = {prepared: "Stopping session activity", quiesced: "Releasing development clusters",
+          clusters_released: "Archiving session records", tracking_archived: "Committing archive records",
+          tracking_committed: "Closing conversations", thread_retired: "Stopping session runtime",
+          runtime_retired: "Finishing archive", archived: "Finishing archive"}[state.journal?.phase];
+        blockers.push(step ? `${step}: ${reason.slice(0, 400)}` : reason.slice(0, 400));
+      }
       for (const entry of state.diagnostics) {
+        if (failedAttempt && ["archive_proof_failed", "cleanup_proof_failed", "archive_operation_pending", "observation_stale"].includes(entry.code)) continue;
         if (!["policy", "hold"].includes(entry.category) && entry.message) blockers.push(entry.message);
       }
       if (state.activity_known !== undefined) fields.push(["Conversation activity", state.activity_known ? "Verified at the last observation" : "Unknown"]);
@@ -2223,7 +2234,7 @@
   let lastAutoArchive = null, autoArchiveRead = 0, autoArchiveSaving = false;
   let autoArchiveLoading = null, autoArchiveReadAt = -Infinity;
   const showAutoArchiveDetails = (diagnostics) => {
-    autoArchiveDetails.hidden = !diagnostics.length;
+    autoArchiveDetails.hidden = !diagnostics.length && !autoArchiveDetails.querySelector("dl");
     autoArchiveDetails.querySelector("pre").textContent = diagnostics.join("\n\n");
   };
   const renderAutoArchive = (state) => {
@@ -2237,16 +2248,17 @@
       const description = document.createElement("dd"); description.textContent = value;
       fields.append(term, description);
     }
-    autoArchiveValues.replaceChildren(fields); autoArchiveValues.hidden = false;
-    if (presentation.blockers.length) {
-      const heading = document.createElement("h4"); heading.textContent = "Blockers at last check";
-      const list = document.createElement("ul");
-      for (const text of presentation.blockers) {
-        const item = document.createElement("li"); item.textContent = text; list.append(item);
-      }
-      autoArchiveValues.append(heading, list);
-    }
-    showAutoArchiveDetails(presentation.diagnostics);
+    autoArchiveDetails.querySelector("dl")?.remove();
+    autoArchiveDetails.querySelector("summary").after(fields);
+    const attemptedAt = state.last_attempt_at || state.checked_at;
+    const attempted = ["deferred", "error"].includes(state.result) && Number.isFinite(Date.parse(attemptedAt)) ?
+      ` Last attempt: ${new Date(attemptedAt).toLocaleString()}.` : "";
+    autoArchiveValues.textContent = state.result === "archived" ? "Session archived." :
+      presentation.blockers.length ? `${presentation.blockers.join(" ")}${attempted}` :
+      state.hold ? "Keep open is enabled." :
+        state.enabled ? "Automatic archival is enabled." : "Automatic archival is disabled.";
+    autoArchiveValues.hidden = false;
+    showAutoArchiveDetails(state.result === "archived" ? [...presentation.blockers, ...presentation.diagnostics] : presentation.diagnostics);
     autoArchiveStatus.textContent = ""; autoArchiveStatus.hidden = true;
     if (autoArchiveHold) { autoArchiveHold.checked = state.hold; autoArchiveHold.disabled = autoArchiveSaving; }
   };
@@ -2351,10 +2363,11 @@
   function renderArchiveFailure() {
     if (!archiveFailure) return;
     const failure = archiveFailurePresentation(lastLifecycleOperation, lastAutoArchive, body.dataset.rootThreadId);
-    archiveFailure.hidden = !failure;
+    archiveFailure.hidden = !failure || document.getElementById("settings")?.classList.contains("active");
     archiveFailure.querySelector("span").textContent = failure ?
       `Last automatic attempt failed (${new Date(failure.attemptedAt).toLocaleString()}): ${failure.message}` : "";
   }
+  document.addEventListener("session-section-change", renderArchiveFailure);
   const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
     if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
     if (operation.options?.journalExpected) { pendingLifecycle = operation.kind; body.dataset.pendingLifecycle = pendingLifecycle; }
