@@ -514,6 +514,26 @@ Cluster helpers receive
 the selected workspace through `DEVCLUSTER_WORKSPACE` and keep ownership of
 their `status`, `reset`, `cleanup-paths` and `transition-adopt` protocols.
 
+Provider commands whose first argument is `capture-lease` use a full-duplex
+relay. Readiness and diagnostics reach the caller immediately, on separate
+stdout and stderr channels. The dispatcher retains the package-generation
+guard until the provider has exited and been reaped. Other commands keep their
+buffered dispatch behavior.
+
+The provider receives new pipes with inherited authority descriptors closed.
+Caller EOF, broken channels and interruption close provider input and perform
+bounded cleanup of that spawned child. Provider exit cancels a blocked caller
+input relay. Abrupt dispatcher loss closes the mediated channels too. Providers
+must treat input EOF as lease loss, and capture peers must stop fixture work on
+controller loss. A request accepted before loss may already have taken effect.
+This transport does not change provider catalogs, state schemas, package
+transition policy or command exit mapping.
+
+Protocol stdout EOF ends a lease even if the provider is still running. The
+dispatcher closes the caller's protocol output promptly and keeps the generation
+guard while it closes provider input and reaps the child. Closing diagnostic
+stderr alone does not end the lease.
+
 The package constructor also accepts `userNamespace` and `routerSocket` for a
 deployment-specific compatibility generation. `userNamespace` selects the
 default user config, state, runtime and profile paths, including portal

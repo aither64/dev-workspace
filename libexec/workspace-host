@@ -363,8 +363,9 @@ module DevWorkspaceHost
   end
 
   class Host
-    def initialize(env: ENV, out: $stdout, err: $stderr)
+    def initialize(env: ENV, input: $stdin, out: $stdout, err: $stderr)
       @env = env
+      @input = input
       @out = out
       @err = err
       @home = File.expand_path(env.fetch('HOME'))
@@ -1179,7 +1180,11 @@ module DevWorkspaceHost
         provider = extension_catalog.provider_programs.fetch(program) do
           raise Error, "unknown development cluster command: #{program}"
         end
-        system_env!(environment, provider.fetch('command'), *argv)
+        if argv.first == 'capture-lease'
+          system_env_streaming!(environment, provider.fetch('command'), *argv)
+        else
+          system_env!(environment, provider.fetch('command'), *argv)
+        end
       end
     end
 
@@ -2977,6 +2982,127 @@ module DevWorkspaceHost
       @err.write(stderr)
       return if status.success?
       raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
+    end
+
+    # Mediate the peer channels while the caller holds the generation guard.
+    # The provider gets new pipes, never the original peer or authority FDs.
+    def system_env_streaming!(environment, *argv)
+      raise Error, 'development cluster protocol output must support close' unless @out.respond_to?(:close) && @out.respond_to?(:closed?)
+
+      child_input, input = IO.pipe
+      output, child_output = IO.pipe
+      errors, child_errors = IO.pipe
+      child = { pid: Process.spawn(environment, *argv, in: child_input,
+                out: child_output, err: child_errors, close_others: true,
+                unsetenv_others: true), status: nil }
+      [child_input, child_output, child_errors].each(&:close)
+      events = Queue.new
+      pumps = [[output, @out, true], [errors, @err, false]].map do |source, destination, protocol|
+        Thread.new do
+          loop do
+            destination.write(source.readpartial(16 * 1024))
+            destination.flush if destination.respond_to?(:flush)
+          end
+        rescue EOFError
+          events << [:protocol_eof, nil] if protocol
+        rescue StandardError => error
+          events << [:error, error]
+        ensure
+          if protocol
+            begin
+              # Ruby protects standard descriptors even on explicit close.
+              # Detach the actual protocol pipe before closing its Ruby sink.
+              if destination.is_a?(IO) && !destination.closed? && destination.fileno <= 2
+                destination.reopen(File::NULL, 'w')
+              end
+              destination.close unless destination.closed?
+            rescue StandardError => error
+              events << [:error, error]
+            end
+          end
+        end
+      end
+      peer = Thread.new do
+        loop do
+          input.write(@input.readpartial(16 * 1024))
+          input.flush
+        end
+      rescue EOFError
+        events << [:eof, nil]
+      rescue StandardError => error
+        events << [:error, error]
+      end
+      event = detail = nil
+      loop do
+        if wait_streaming_child(child, 0)
+          event = :exit
+          break
+        end
+        begin
+          event, detail = events.pop(true)
+          break
+        rescue ThreadError
+          sleep 0.01
+        end
+      end
+      peer.kill.join
+      input.close unless input.closed?
+      cancel_streaming_child(child) unless event == :exit
+      status = child.fetch(:status)
+      pumps.each do |pump|
+        next if pump.join(1)
+
+        raise Error, 'development cluster provider did not close its output channels'
+      end
+      until events.empty?
+        pending_event, pending_detail = events.pop
+        event, detail = pending_event, pending_detail if pending_event == :error
+      end
+      raise Error, "development cluster relay failed: #{detail.class}" if event == :error
+      return if status.success?
+
+      raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
+    ensure
+      peer&.kill&.join
+      input&.close unless input&.closed?
+      cancel_streaming_child(child) if child && child[:pid]
+      [output, errors, child_input, child_output, child_errors].compact.each do |pipe|
+        pipe.close unless pipe.closed?
+      end
+      pumps&.each { |pump| pump.kill.join }
+    end
+
+    def cancel_streaming_child(child)
+      return if wait_streaming_child(child, 2)
+
+      %w[TERM KILL].each do |signal|
+        begin
+          # This dispatcher alone reaps the child. An exited, unreaped child
+          # still owns its PID; there is no detached wait thread racing signals.
+          Process.kill(signal, child.fetch(:pid))
+        rescue Errno::ESRCH
+          # Reap the exact child below even if it has already exited.
+        end
+        return if wait_streaming_child(child, 2)
+      end
+      raise Error, 'development cluster provider could not be reaped'
+    end
+
+    def wait_streaming_child(child, seconds)
+      return true unless child[:pid]
+
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+      loop do
+        result = Process.waitpid2(child.fetch(:pid), Process::WNOHANG)
+        if result
+          child[:pid] = nil
+          child[:status] = result.last
+          return true
+        end
+        return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        sleep 0.01
+      end
     end
 
     def system_env_interactive!(environment, *argv)
