@@ -16,6 +16,15 @@ that fetched default. Abandoned archival skips publication and merge proof, but
 still requires an existing shared branch, tag or origin tracking ref to retain
 each detached commit. Archival creates no rescue ref and never removes branches.
 
+Record checksums cover paths, entry types, file contents and symlink targets.
+Permission changes alone do not change the recorded content. Archival and revival
+retain the files through ordinary moves and Git tracking. They accept checksums
+from existing mode-sensitive journals as exact legacy proofs without rewriting
+their evidence. Those journals still require their recorded modes; resolve an
+existing mismatch before retrying. Newly created operations use content-only
+checksums and require an executor with this support. Finish pending operations
+before changing the selected workspace package.
+
 The registered coordination workspace's shared `master` branch can advance
 through tracking commits, including the archive's own commit. Its sealed final
 head stays unchanged and must remain an ancestor of local `master`. Complete

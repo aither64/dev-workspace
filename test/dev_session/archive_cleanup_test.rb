@@ -3,6 +3,96 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_archive_private_records_under_restrictive_umask
+    %w[active complete].each do |lifecycle|
+      with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
+        if lifecycle == 'complete'
+          set_lifecycle(workspace, slug, lifecycle)
+          assert_git_success('git', '-C', workspace, 'add', File.join('work', slug, 'state.md'))
+          assert_git_success('git', '-C', workspace, 'commit', '-m', 'complete fixture')
+        end
+        tracking = File.join(workspace, 'work', slug)
+        Dir[File.join(tracking, '*')].each { |path| File.chmod(0o600, path) if File.file?(path) }
+        previous_umask = File.umask(0o077)
+        begin
+          runner.archive(slug, as_is: true)
+        ensure
+          File.umask(previous_umask)
+        end
+        assert(File.directory?(File.join(workspace, 'archive', slug)))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+      end
+    end
+  end
+
+  def test_archive_retry_accepts_permission_changes_but_rejects_changed_records
+    with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
+      runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause before commit' }
+      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+      runner.singleton_class.remove_method(:commit_tracking_transition!)
+      tracking = File.join(workspace, 'archive', slug)
+      path = File.join(tracking, 'plan.md')
+      content = File.binread(path)
+      journal = runner.send(:lifecycle_journal_file, slug, 'archive')
+      original_journal = File.binread(journal)
+      %i[contents path type].each do |change|
+        case change
+        when :contents then File.write(path, content + 'changed')
+        when :path then File.rename(path, path + '.renamed')
+        when :type
+          File.unlink(path)
+          File.symlink('state.md', path)
+        end
+        error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+        assert_includes(error.message, 'archived tracking changed')
+        assert_equal(original_journal, File.binread(journal))
+        File.rename(path + '.renamed', path) if change == :path
+        File.unlink(path) if change == :type
+        File.binwrite(path, content)
+      end
+      Dir[File.join(tracking, '*')].each { |file| File.chmod(0o600, file) if File.file?(file) }
+      File.chmod(0o700, tracking)
+      runner.archive(slug, as_is: true)
+      refute(File.exist?(journal))
+    end
+  end
+
+  def test_tracking_content_digest_preserves_symlink_targets
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      root = File.join(workspace, 'records')
+      FileUtils.mkdir_p(root)
+      File.symlink('first', File.join(root, 'link'))
+      digest = runner.send(:tracking_tree_sha256, root)
+      File.unlink(File.join(root, 'link'))
+      File.symlink('second', File.join(root, 'link'))
+      refute(runner.send(:tracking_tree_matches?, root, digest))
+    end
+  end
+
+  def test_archive_retries_legacy_prepared_intent_and_moved_tracking
+    %i[prepared moved].each do |phase|
+      with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
+        runner.define_singleton_method(:tracking_tree_sha256) do |root, **keywords|
+          super(root, **keywords, legacy_permissions: true)
+        end
+        if phase == :prepared
+          runner.define_singleton_method(:write_lifecycle_journal) { |*, **| raise DevSession::Error, 'pause after sidecar' }
+        else
+          runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause after move' }
+        end
+        assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+        runner.singleton_class.remove_method(:tracking_tree_sha256)
+        runner.singleton_class.remove_method(phase == :prepared ? :write_lifecycle_journal : :commit_tracking_transition!)
+        runner.archive(slug, as_is: true)
+        assert(File.directory?(File.join(workspace, 'archive', slug)))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+      end
+    end
+  end
+
   def test_archive_shared_master_preserves_the_sealed_head_after_its_tracking_commit
     with_shared_master_archive_fixture do |runner, workspace, slug, sealed|
       runner.archive(slug, as_is: true)

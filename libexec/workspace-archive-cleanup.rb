@@ -70,6 +70,10 @@ module DevSession
         tracking_tree_sha256(work_dir(slug))
       end
 
+      def archive_cleanup_source_matches?(slug, digest)
+        tracking_tree_matches?(work_dir(slug), digest)
+      end
+
       def archive_cleanup_read_sidecar(path)
         read_private_json_object(path, 'archive cleanup sidecar', max_size: ArchiveCleanup::MAX_BYTES, mode: 0o600)
       end
@@ -262,7 +266,7 @@ module DevSession
       inventory = sidecar.fetch('inventory')
       source = source_path
       unless !exists?(archive_path) && directory_identity(source) == inventory.fetch('tracking_identity') &&
-             @runner.archive_cleanup_source_digest(@slug) == inventory.fetch('source_sha256') &&
+             @runner.archive_cleanup_source_matches?(@slug, inventory.fetch('source_sha256')) &&
              inventory.fetch('worktrees').none? { |record| record.fetch('removed') } &&
              inventory.fetch('containers').none? { |record| record.fetch('removed') }
         raise Error, "prepared archive cleanup source changed: #{@slug}"

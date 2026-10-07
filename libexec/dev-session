@@ -6583,7 +6583,7 @@ module DevSession
       journal_root
     end
 
-    def archived_tracking_identity(slug, plan, mode, proven_heads, finalized_at)
+    def archived_tracking_identity(slug, plan, mode, proven_heads, finalized_at, legacy_permissions: false)
       state = read_bounded_file(state_file(slug), 'state.md')
       target_state = tracking_lifecycle_content(state, mode)
       manifest = finalized_portal_manifest(
@@ -6592,29 +6592,32 @@ module DevSession
       overrides = { 'state.md' => target_state }
       overrides[PORTAL_MANIFEST] = YAML.dump(manifest) if manifest
       [
-        tracking_tree_sha256(work_dir(slug), overrides:),
+        tracking_tree_sha256(work_dir(slug), overrides:, legacy_permissions:),
         manifest&.dig('codex', 'thread_id')
       ]
     end
 
     def verify_pending_archive_tracking!(slug, journal, plan, final_heads: nil)
       final_heads ||= ArchiveCleanup.new(self, slug).load(journal:)&.fetch('inventory')&.fetch('registered_heads')
-      actual_digest, thread_id = archived_tracking_identity(
+      projection = [
         slug,
         plan,
         journal.fetch('mode'),
         final_heads || journal.fetch('proven_heads'),
         journal.fetch('finalized_at')
-      )
-      unless actual_digest == journal.fetch('target_tracking_sha256') &&
+      ]
+      actual_digest, thread_id = archived_tracking_identity(*projection)
+      expected = journal.fetch('target_tracking_sha256')
+      matches = actual_digest == expected ||
+                archived_tracking_identity(*projection, legacy_permissions: true).first == expected
+      unless matches &&
              thread_id == journal['retained_thread_id']
         raise Error, "tracking changed during archival: #{slug}"
       end
     end
 
     def verify_archived_tracking_tree!(slug, journal)
-      actual = tracking_tree_sha256(archive_dir(slug))
-      unless actual == journal.fetch('target_tracking_sha256')
+      unless tracking_tree_matches?(archive_dir(slug), journal.fetch('target_tracking_sha256'))
         raise Error, "archived tracking changed during recovery: #{slug}"
       end
 
@@ -6970,13 +6973,17 @@ module DevSession
     end
 
     def verify_revived_tracking_tree!(slug, journal)
-      actual = tracking_tree_sha256(work_dir(slug))
-      return if actual == journal.fetch('target_tracking_sha256')
+      return if tracking_tree_matches?(work_dir(slug), journal.fetch('target_tracking_sha256'))
 
       raise Error, "revived tracking changed during recovery: #{slug}"
     end
 
-    def tracking_tree_sha256(root, overrides: {})
+    def tracking_tree_matches?(root, expected, overrides: {})
+      tracking_tree_sha256(root, overrides:) == expected ||
+        tracking_tree_sha256(root, overrides:, legacy_permissions: true) == expected
+    end
+
+    def tracking_tree_sha256(root, overrides: {}, legacy_permissions: false)
       digest = Digest::SHA256.new
       seen_overrides = {}
       visit = lambda do |directory, relative_root|
@@ -6991,7 +6998,7 @@ module DevSession
           unless path_exists?(path)
             tracking_digest_field(digest, 'file')
             tracking_digest_field(digest, relative)
-            tracking_digest_field(digest, format('%o', 0o644))
+            tracking_digest_field(digest, format('%o', 0o644)) if legacy_permissions
             tracking_digest_field(digest, overrides.fetch(relative))
             seen_overrides[relative] = true
             next
@@ -7009,7 +7016,7 @@ module DevSession
           tracking_digest_field(digest, kind)
           tracking_digest_field(digest, relative)
           mode = kind == 'file' && overrides.key?(relative) ? 0o644 : stat.mode & 0o777
-          tracking_digest_field(digest, format('%o', mode))
+          tracking_digest_field(digest, format('%o', mode)) if legacy_permissions
           case kind
           when 'directory'
             visit.call(path, relative)

@@ -3,6 +3,32 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_revive_retries_content_and_legacy_record_digests
+    [false, true].each do |legacy|
+      with_workspace do |workspace|
+        slug = '2026-06-06-revive-digest'
+        archived_runner(workspace, slug)
+        configure_workspace_origin(workspace)
+        runner = runner_for(workspace)
+        runner.define_singleton_method(:start) { |*, **| nil }
+        if legacy
+          runner.define_singleton_method(:tracking_tree_sha256) do |root, **keywords|
+            super(root, **keywords, legacy_permissions: true)
+          end
+        end
+        runner.send(:prepare_revive_journal!, slug, 'complete')
+        runner.singleton_class.remove_method(:tracking_tree_sha256) if legacy
+        File.rename(File.join(workspace, 'archive', slug), File.join(workspace, 'work', slug))
+        unless legacy
+          Dir[File.join(workspace, 'work', slug, '*')].each { |path| File.chmod(0o600, path) if File.file?(path) }
+        end
+        runner.revive(slug, as_is: true)
+        assert_match(/\A---\nlifecycle: active\n---/, File.read(File.join(workspace, 'work', slug, 'state.md')))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive')))
+      end
+    end
+  end
+
   def test_revive_commits_tracking_before_starting_the_runtime
     skip 'git is not available' unless command_available?('git')
 
