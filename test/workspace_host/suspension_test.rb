@@ -377,7 +377,8 @@ class WorkspaceHostTest < Minitest::Test
   class TransitionHost < DevWorkspaceHost::Host
     attr_accessor :busy, :candidate, :executing_package, :delegate_quiesce,
                   :quiesce_output, :fail_activation, :fail_links, :fail_restart,
-                  :fail_restore, :fail_set_before_profile, :fail_set_after_profile
+                  :fail_restore, :fail_set_before_profile, :fail_set_after_profile,
+                  :registration_digest, :registration_argv, :registration_capacity
     attr_reader :events
 
     def initialize(candidate:, busy:, **options)
@@ -468,6 +469,7 @@ class WorkspaceHostTest < Minitest::Test
     end
 
     def activate_installed(_command)
+      @system_codex = codex_for_package(candidate)
       configure_user_services
       if fail_activation
         self.fail_activation = false
@@ -510,9 +512,9 @@ class WorkspaceHostTest < Minitest::Test
     def registration_plan_for(_entry, package: package_root)
       DevWorkspaceHost::RegistrationPlan.new(
         package_root: File.realpath(package),
-        argv: ['-c', 'agents.dw_transition.config_file=/nix/store/transition-role.toml'],
-        digest: 'a' * 64, policy: 1,
-        required_native_child_threads: 1, states: []
+        argv: registration_argv || ['-c', 'agents.dw_transition.config_file=/nix/store/transition-role.toml'],
+        digest: registration_digest || 'a' * 64, policy: 1,
+        required_native_child_threads: registration_capacity || 1, states: []
       )
     end
 

@@ -1944,7 +1944,7 @@ func (s *Server) teamService() (teamruntime.Service, error) {
 	if err != nil {
 		return teamruntime.Service{}, err
 	}
-	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace, ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
+	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace, HostProfile: s.config.HostProfile, ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
 		return s.validateModelSettings(ctx, settings, false)
 	}}
 	if s.installedTeams != nil && s.installedTeams.Managed {

@@ -336,7 +336,7 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_reconciliation_uses_semantic_digest_for_restart_and_keeps_strict_pending_evidence
+  def test_reconciliation_uses_launch_arguments_for_restart_and_keeps_strict_pending_evidence
     Dir.mktmpdir('workspace-agent-team-reconcile-test') do |directory|
       package, entry, host = registration_host(directory)
       codex = File.realpath(host.send(:active_codex))
@@ -347,6 +347,11 @@ class WorkspaceHostTest < Minitest::Test
       refute_includes(host.events, [:restarted])
 
       host.responses = { entry.fetch('name') => registration_response(digest: 'b' * 64) }
+      assert(host.send(:reconcile_codex_update, defer_busy: false))
+      refute_includes(host.events, [:restarted])
+      assert_equal('a' * 64, host.send(:load_registration_marker, entry).dig('launch', 'digest'))
+
+      host.responses = { entry.fetch('name') => registration_response(digest: 'b' * 64, argv: []) }
       assert(host.send(:reconcile_codex_update, defer_busy: false))
       assert_includes(host.events, [:checked, codex])
       assert(host.events.any? { |event| event.first == :probed && event[2] == 'b' * 64 })
@@ -375,7 +380,7 @@ class WorkspaceHostTest < Minitest::Test
       original = host.send(:registration_plan_for, entry, package:)
       host.send(:write_registration_marker, entry, codex, original)
       host.send(:write_pending_codex_update, package, codex, [[entry, original]])
-      host.responses = { entry.fetch('name') => registration_response(digest: 'b' * 64) }
+      host.responses = { entry.fetch('name') => registration_response(digest: 'b' * 64, argv: []) }
       host.fail_marker_verification = true
 
       assert_raises(DevWorkspaceHost::Error) do
@@ -667,8 +672,7 @@ class WorkspaceHostTest < Minitest::Test
 
   def registration_host(directory, argv: ['-c', 'agents.dw_example.config_file=/nix/store/example-role.toml'])
     _root, entry, environment = registration_workspace(directory)
-    package = File.join(directory, 'package')
-    FileUtils.mkdir_p(package)
+    package = make_package(directory, 'package')
     host = RegistrationHost.new(
       package:, responses: { entry.fetch('name') => registration_response(argv:) }, env: environment,
       out: StringIO.new, err: StringIO.new

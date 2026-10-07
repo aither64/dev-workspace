@@ -32,6 +32,10 @@ func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string
 	if err := os.WriteFile(devSession, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	hostProfile := filepath.Join(root, "custom-profile")
+	if err := os.Symlink(filepath.Dir(packageBin), hostProfile); err != nil {
+		t.Fatal(err)
+	}
 	store, err := teamruntime.NewStore(stateRoot, workspace)
 	if err != nil {
 		t.Fatal(err)
@@ -47,11 +51,12 @@ func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string
 	}
 	binding := teamMCPBinding{stateRoot: stateRoot, workspace: workspace, slug: slug,
 		rootThreadID: "lead-thread", address: "reviewer0", memberThreadID: "member-thread",
-		devSession: devSession, workDir: workDir, store: store}
+		devSession: filepath.Join(hostProfile, "bin", "dev-session"), hostProfile: hostProfile, workDir: workDir, store: store}
 	args := []string{"--user-state-root", stateRoot, "--workspace", workspace,
+		"--host-profile", hostProfile,
 		"--session-slug", slug, "--root-thread-id", "lead-thread",
 		"--member-address", "reviewer0", "--member-thread-id", "member-thread"}
-	deps := teamMCPDependencies{executable: func() (string, error) { return filepath.Join(packageBin, "workspace-portal"), nil }}
+	deps := teamMCPDependencies{}
 	return binding, deps, args
 }
 
@@ -94,6 +99,7 @@ func TestTeamMCPProtocolAndBoundHostInvocation(t *testing.T) {
 	t.Setenv("DEV_SESSION_SLUG", "foreign-session")
 	t.Setenv("DEV_SESSION_MEMBER_ADDRESS", "implementer0")
 	t.Setenv("DEV_WORKSPACES_STATE", "/foreign/state")
+	t.Setenv("DEV_WORKSPACES_PROFILE", "/foreign/profile")
 	var invocations []teamMCPInvocation
 	deps.run = func(_ context.Context, invocation teamMCPInvocation) error {
 		invocations = append(invocations, invocation)
@@ -145,6 +151,7 @@ func TestTeamMCPProtocolAndBoundHostInvocation(t *testing.T) {
 	}
 	for key, want := range map[string]string{
 		"DEV_WORKSPACES_STATE":                binding.stateRoot,
+		"DEV_WORKSPACES_PROFILE":              binding.hostProfile,
 		"DEV_SESSION_SLUG":                    binding.slug,
 		"DEV_SESSION_WORKSPACE":               binding.workspace,
 		"DEV_SESSION_WORK_DIR":                binding.workDir,
@@ -256,5 +263,56 @@ func TestTeamMCPChildOutputNeverEntersProtocol(t *testing.T) {
 	if len(responses) != 1 || teamMCPResult(t, responses[0])["isError"] != false ||
 		strings.Contains(output.String(), "host stdout") || strings.Contains(diagnostics.String(), "host stderr") {
 		t.Fatalf("host output escaped into MCP streams: %q, %q", output.String(), diagnostics.String())
+	}
+}
+
+func TestRetainedTeamMCPDispatchesThroughCustomProfileAfterSwitch(t *testing.T) {
+	binding, deps, args := teamMCPFixture(t)
+	trace := filepath.Join(t.TempDir(), "deliveries")
+	t.Setenv("TEAM_MCP_TRACE", trace)
+	writeDispatcher := func(path, generation string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		body := "#!/bin/sh\nprintf '%s:%s\\n' '" + generation + "' \"${11}\" >> \"$TEAM_MCP_TRACE\"\ncat >/dev/null\n"
+		if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeDispatcher(binding.devSession, "first")
+	second := filepath.Join(t.TempDir(), "second")
+	writeDispatcher(filepath.Join(second, "bin", "dev-session"), "second")
+	run := deps.withDefaults().run
+	count := 0
+	deps.run = func(ctx context.Context, invocation teamMCPInvocation) error {
+		if err := run(ctx, invocation); err != nil {
+			return err
+		}
+		count++
+		if count == 1 {
+			link := binding.hostProfile + ".next"
+			if err := os.Symlink(second, link); err != nil {
+				return err
+			}
+			return os.Rename(link, binding.hostProfile)
+		}
+		return nil
+	}
+	const id = "12345678-1234-1234-1234-123456789abc"
+	call := teamMCPRequestLine(t, 1, "tools/call", map[string]any{"name": "report_to_lead", "arguments": map[string]any{
+		"message": "same report retry", "message_id": id}})
+	var output, diagnostics bytes.Buffer
+	if err := teamMCPCommand(args, strings.NewReader(call+call), &output, &diagnostics, deps); err != nil {
+		t.Fatal(err)
+	}
+	for _, response := range teamMCPResponses(t, output.String()) {
+		if teamMCPResult(t, response)["isError"] != false {
+			t.Fatalf("report failed: %#v", response)
+		}
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil || string(data) != "first:"+id+"\nsecond:"+id+"\n" {
+		t.Fatalf("selected dispatchers and retry identity = %q, %v", data, err)
 	}
 }

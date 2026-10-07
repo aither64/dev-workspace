@@ -381,11 +381,7 @@ module DevWorkspaceHost
       )
       @profile = env.fetch('DEV_WORKSPACES_PROFILE', File.join(@state, 'profile'))
       @skills = env.fetch('DEV_WORKSPACES_SKILLS_DIR', File.join(@home, '.codex/skills'))
-      @system_codex = if env.key?('DEV_WORKSPACES_SYSTEM_CODEX')
-                        env.fetch('DEV_WORKSPACES_SYSTEM_CODEX')
-                      else
-                        File.join(package_root, 'libexec/codex/bin/codex')
-                      end
+      @system_codex = codex_for_package(package_root)
       @router_socket = env.fetch(
         'DEV_WORKSPACES_ROUTER_SOCKET',
         '/run/dev-workspaces/router.sock'
@@ -608,25 +604,29 @@ module DevWorkspaceHost
       end
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
+      candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
       system! candidate_host, 'check-codex', '--codex', current_codex
-      if File.realpath(@system_codex) != current_codex
-        system! candidate_host, 'check-codex', '--codex', @system_codex
+      if candidate_codex != current_codex
+        system! candidate_host, 'check-codex', '--codex', candidate_codex
       end
 
       candidate_plans = registration_plans(package: candidate)
-      probe_registration_plans!(File.realpath(@system_codex), candidate_plans)
+      probe_registration_plans!(candidate_codex, candidate_plans)
       predecessor_package = preselection_session_package
+      restart_required = codex_restart_required?(
+        candidate_plans, candidate_codex, package: candidate, predecessor: predecessor_package
+      )
       quiesced = []
       begin
-        quiesced = quiesce_sessions
+        quiesced = quiesce_sessions if restart_required
       rescue Error
-        write_pending_codex_update(candidate, File.realpath(@system_codex), candidate_plans)
+        write_pending_codex_update(candidate, candidate_codex, candidate_plans)
         raise
       end
       begin
         stop_auto_archive_services
-        write_pending_codex_update(candidate, File.realpath(@system_codex), candidate_plans)
+        write_pending_codex_update(candidate, candidate_codex, candidate_plans)
         FileUtils.mkdir_p(File.dirname(@profile), mode: 0o700)
         unless File.symlink?(@profile) && File.realpath(@profile) == candidate
           system! 'nix-env', '--profile', @profile, '--set', candidate
@@ -652,10 +652,10 @@ module DevWorkspaceHost
         reraise_after_terminal_restoration(transition_error, quiesced, package: predecessor_package)
       end
       wait_for_codex_sockets
-      verify_registration_semantics!(candidate_plans, File.realpath(@system_codex))
+      verify_registration_semantics!(candidate_plans, candidate_codex)
       clear_pending_codex_update
       begin
-        restore_quiesced_sessions(quiesced, package: candidate)
+        restore_quiesced_sessions(quiesced, package: candidate) if restart_required
       rescue StandardError => restore_error
         raise Error,
               "workspace package transition completed, but terminal clients need dev-session sync: " \
@@ -1587,11 +1587,13 @@ module DevWorkspaceHost
 
     def marker_has_semantics?(marker, codex, plan)
       marker.is_a?(Hash) && marker.dig('launch', 'codex_path') == codex &&
-        marker.dig('launch', 'digest') == plan.digest
+        marker.dig('launch', 'policy') == plan.policy && marker.dig('launch', 'argv') == plan.argv &&
+        marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads
     end
 
     def marker_matches_plan?(entry, marker, codex, plan)
       marker_has_semantics?(marker, codex, plan) &&
+        marker.dig('launch', 'digest') == plan.digest &&
         marker.dig('launch', 'package_root') == plan.package_root &&
         marker.dig('launch', 'policy') == plan.policy && marker.dig('launch', 'argv') == plan.argv &&
         marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads &&
@@ -1769,7 +1771,7 @@ module DevWorkspaceHost
               'complete the selected forward package transition first'
       end
       plans = registration_plans(package:)
-      restart_required = active != adopted || registration_restart_required?(plans, adopted)
+      restart_required = codex_restart_required?(plans, adopted, package:, active:)
       unless restart_required
         plans.each do |entry, plan|
           refresh_registration_inventory(entry, plan)
@@ -1819,10 +1821,37 @@ module DevWorkspaceHost
       true
     end
 
+    def codex_restart_required?(plans, codex, package:, predecessor: package, active: File.realpath(active_codex))
+      !live_package_switch_contract?(predecessor) || !live_package_switch_contract?(package) ||
+        active != codex || registration_restart_required?(plans, codex)
+    end
+
     def registration_restart_required?(plans, codex)
       plans.any? do |entry, plan|
-        !marker_has_semantics?(load_registration_marker(entry), codex, plan)
+        marker = load_registration_marker(entry)
+        !marker_has_semantics?(marker, codex, plan) ||
+          !live_package_switch_contract?(marker.dig('launch', 'package_root'))
       end
+    end
+
+    def codex_for_package(package)
+      @env.fetch('DEV_WORKSPACES_SYSTEM_CODEX') { File.join(package, 'libexec/codex/bin/codex') }
+    end
+
+    # The launch package proves that every retained member report helper can
+    # dispatch through the selected profile. A predecessor without this policy
+    # needs one idle restart even when its native Codex invocation is unchanged.
+    def live_package_switch_contract?(package)
+      return false unless package.is_a?(String)
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      payload = File.binread(path, 64 * 1024 + 1)
+      return false if payload.bytesize > 64 * 1024
+
+      contract = parse_strict_json_object(payload, 'live package switch contract', 64 * 1024)
+      contract['livePackageSwitchPolicy'] == RUNTIME_CONTRACT.fetch('livePackageSwitchPolicy')
+    rescue Error, SystemCallError
+      false
     end
 
     def verify_registration_markers!(plans, codex)

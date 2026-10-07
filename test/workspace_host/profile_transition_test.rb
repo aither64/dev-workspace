@@ -27,6 +27,7 @@ class WorkspaceHostTest < Minitest::Test
       previous = File.realpath(host.instance_variable_get(:@profile))
       host.candidate = make_package(paths.fetch(:root), 'package-two')
       host.executing_package = host.candidate
+      host.registration_argv = [] # This case exercises the idle predecessor dispatcher.
 
       workspace = host.send(:registry).entries.fetch(0).fetch('root')
       locks = File.join(workspace, 'worktrees', '.locks')

@@ -708,6 +708,7 @@ module DevSession
       process_exec: nil,
       portal_command: nil,
       portal_url: nil,
+      host_profile: nil,
       cluster_providers: { },
       require_runtime: nil,
       env: ENV,
@@ -731,6 +732,7 @@ module DevSession
       @workspace_state_root = File.expand_path(
         env.fetch('DEV_WORKSPACES_STATE', File.join(@state_home, namespace))
       )
+      @host_profile = host_profile || env.fetch('DEV_WORKSPACES_PROFILE', File.join(@workspace_state_root, 'profile'))
       @out = out
       @err = err
       @today = today
@@ -1697,6 +1699,7 @@ module DevSession
       end
 	  command = [*@portal_command, 'team', action == 'archive-retained' ? 'archive' : action,
                  '--user-state-root', @workspace_state_root,
+                 '--host-profile', @host_profile,
                  '--workspace', workspace,
                  '--session-slug', slug,
                  '--root-thread-id', root_thread,
@@ -8758,6 +8761,7 @@ module DevSession
         codex_command: @codex_command,
         portal_command: @portal_command,
         portal_url: @portal_url,
+        host_profile: @host_profile,
         cluster_providers: @cluster_providers,
         require_runtime: @require_runtime,
         env: @env,

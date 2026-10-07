@@ -788,6 +788,7 @@ type Service struct {
 	Store            *Store
 	Client           Client
 	Workspace        string
+	HostProfile      string
 	Catalog          *agentteams.Catalog
 	ValidateSettings func(context.Context, codex.ThreadSettings) error
 }
@@ -821,11 +822,19 @@ func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member
 		return codex.ThreadPolicy{}, errors.New("member report helper path is not canonical and absolute")
 	}
 	identity := strings.Join([]string{service.Store.workspace, slug, rootThreadID, member.Address, member.Thread}, "\x00")
+	hostProfile := service.HostProfile
+	if hostProfile == "" {
+		hostProfile = filepath.Join(service.Store.stateRoot, "profile")
+	}
+	if !filepath.IsAbs(hostProfile) || filepath.Clean(hostProfile) != hostProfile {
+		return codex.ThreadPolicy{}, errors.New("member report host profile must be an absolute clean path")
+	}
 	digest := sha256.Sum256([]byte(identity))
 	policy.MCPServer = &codex.ThreadMCPServer{
 		Name: "team_" + hex.EncodeToString(digest[:16]), Tool: "report_to_lead", Command: command,
 		Args: []string{
 			"team-mcp", "--user-state-root", service.Store.stateRoot,
+			"--host-profile", hostProfile,
 			"--workspace", service.Store.workspace, "--session-slug", slug,
 			"--root-thread-id", rootThreadID, "--member-address", member.Address,
 			"--member-thread-id", member.Thread,

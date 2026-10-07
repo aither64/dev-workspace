@@ -10,7 +10,9 @@ const RegistrationPolicyVersion = 1
 // RegistrationPlan is the host launch contract. Direct team members use
 // independent App Server threads, so they need no native agent configuration.
 // The installed catalog identity still participates in the marker digest: a
-// creation request can only use a catalog registered with this host generation.
+// creation request uses the selected package's validated catalog. The digest
+// records launch provenance; catalog changes alone do not alter the native
+// executable, policy, argv or capacity and therefore do not require a restart.
 type RegistrationPlan struct {
 	Schema                     int      `json:"schema"`
 	Policy                     int      `json:"policy"`

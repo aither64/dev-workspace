@@ -407,6 +407,7 @@ func teamCommand(args []string) error {
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
 	stateRoot := flags.String("user-state-root", "", "private user state root")
+	hostProfile := flags.String("host-profile", "", "selected workspace user profile")
 	packageRoot := flags.String("package-root", "", "installed workspace package root")
 	workspace := flags.String("workspace", "", "development workspace root")
 	slug := flags.String("session-slug", "", "development session slug")
@@ -503,7 +504,7 @@ func teamCommand(args []string) error {
 		"DEV_SESSION_SLUG": *slug, "DEV_SESSION_WORKSPACE": *workspace, "DEV_SESSION_WORK_DIR": *cwd,
 		"DEV_SESSION_REQUIRE_RUNTIME": "1", "DEV_SESSION_CODEX_SOCKET": *socket,
 	}
-	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, Client: client, Workspace: *workspace, Catalog: teamCatalog,
+	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, Client: client, Workspace: *workspace, HostProfile: *hostProfile, Catalog: teamCatalog,
 		ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
 			models, err := client.ListModels(ctx)
 			if err != nil {

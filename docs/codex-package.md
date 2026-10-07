@@ -111,6 +111,13 @@ for the supported entry points. System recovery uses its retained system
 generation; whether an older Codex can read newer state must be established
 separately on disposable state before using that recovery path.
 
+Workspace package switches compare the candidate's resolved native executable
+and launch contract, rather than its CLI version string or package path. With
+the live-switch contract, an unchanged native invocation preserves the running
+App Server and terminal clients. The initial cutover from an older package and
+any changed invocation require idle sessions; see
+[switching while threads are active](workspace-portal.md#switching-while-codex-threads-are-active).
+
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with

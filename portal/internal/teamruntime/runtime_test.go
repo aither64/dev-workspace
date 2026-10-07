@@ -651,7 +651,7 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 		t.Fatalf("member report policy = starts %#v, assignment %#v", client.starts, client.options)
 	}
 	if got, want := bound.MCPServer.Args, []string{
-		"team-mcp", "--user-state-root", store.stateRoot, "--workspace", workspace,
+		"team-mcp", "--user-state-root", store.stateRoot, "--host-profile", filepath.Join(store.stateRoot, "profile"), "--workspace", workspace,
 		"--session-slug", "one", "--root-thread-id", "root-one", "--member-address", "implementer0", "--member-thread-id", "thread-1",
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("member report helper args = %#v, want %#v", got, want)

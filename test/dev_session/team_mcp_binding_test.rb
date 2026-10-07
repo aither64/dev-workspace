@@ -67,6 +67,8 @@ class TeamMcpBindingTest < DevSessionTest
       argv, input = capture.calls.fetch(0)
       assert_equal('Private report text', input)
       assert_equal('/dev/stdin', argv.fetch(argv.index('--input-file') + 1))
+      assert_equal(File.join(workspace, '.xdg-state', 'dev-workspaces', 'profile'),
+                   argv.fetch(argv.index('--host-profile') + 1))
       refute_includes(argv.join(' '), 'Private report text')
       refute_includes(argv, '--message')
     end

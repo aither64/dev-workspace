@@ -35,7 +35,7 @@ var teamMCPMessageIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[
 // cannot choose another session or sender.
 type teamMCPBinding struct {
 	stateRoot, workspace, slug, rootThreadID, address, memberThreadID string
-	devSession, workDir                                               string
+	devSession, hostProfile, workDir                                  string
 	store                                                             *teamruntime.Store
 }
 
@@ -46,14 +46,10 @@ type teamMCPInvocation struct {
 }
 
 type teamMCPDependencies struct {
-	executable func() (string, error)
-	run        func(context.Context, teamMCPInvocation) error
+	run func(context.Context, teamMCPInvocation) error
 }
 
 func (dependencies teamMCPDependencies) withDefaults() teamMCPDependencies {
-	if dependencies.executable == nil {
-		dependencies.executable = os.Executable
-	}
 	if dependencies.run == nil {
 		dependencies.run = func(ctx context.Context, invocation teamMCPInvocation) error {
 			command := exec.CommandContext(ctx, invocation.command, invocation.args...)
@@ -74,6 +70,7 @@ func teamMCPCommand(args []string, input io.Reader, output, diagnostics io.Write
 	flags := flag.NewFlagSet("team-mcp", flag.ContinueOnError)
 	flags.SetOutput(diagnostics)
 	stateRoot := flags.String("user-state-root", "", "private user state root")
+	hostProfile := flags.String("host-profile", "", "selected workspace user profile")
 	workspace := flags.String("workspace", "", "canonical workspace root")
 	slug := flags.String("session-slug", "", "bound session slug")
 	rootThreadID := flags.String("root-thread-id", "", "bound lead thread ID")
@@ -83,9 +80,10 @@ func teamMCPCommand(args []string, input io.Reader, output, diagnostics io.Write
 		return err
 	}
 	if flags.NArg() != 0 || !canonicalAbsolutePath(*stateRoot) || !canonicalAbsolutePath(*workspace) ||
+		!canonicalAbsolutePath(*hostProfile) ||
 		!session.ValidSlug(*slug) || !teamMCPThreadIDPattern.MatchString(*rootThreadID) ||
 		!teamMCPThreadIDPattern.MatchString(*memberThreadID) || !teamMCPAddressPattern.MatchString(*address) {
-		return errors.New("team-mcp requires a canonical state root, workspace, session, lead thread, member address, and member thread")
+		return errors.New("team-mcp requires a canonical state root, host profile, workspace, session, lead thread, member address, and member thread")
 	}
 	resolvedWorkspace, err := filepath.EvalSymlinks(*workspace)
 	if err != nil || resolvedWorkspace != *workspace {
@@ -99,17 +97,15 @@ func teamMCPCommand(args []string, input io.Reader, output, diagnostics io.Write
 	if err != nil {
 		return err
 	}
-	executable, err := dependencies.executable()
-	if err != nil || !canonicalAbsolutePath(executable) {
-		return errors.New("team-mcp cannot resolve its package executable")
-	}
-	devSession := filepath.Join(filepath.Dir(executable), "dev-session")
+	// Keep the profile symlink in this path. Each report must dispatch through
+	// the currently selected generation, including from a retained MCP process.
+	devSession := filepath.Join(*hostProfile, "bin", "dev-session")
 	if info, err := os.Stat(devSession); err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
-		return errors.New("team-mcp cannot find the package dev-session command")
+		return errors.New("team-mcp cannot find the selected profile dev-session command")
 	}
 	binding := teamMCPBinding{stateRoot: *stateRoot, workspace: *workspace, slug: *slug,
 		rootThreadID: *rootThreadID, address: *address, memberThreadID: *memberThreadID,
-		devSession: devSession, workDir: filepath.Join(*workspace, "work", *slug), store: store}
+		devSession: devSession, hostProfile: *hostProfile, workDir: filepath.Join(*workspace, "work", *slug), store: store}
 	return binding.serve(context.Background(), input, output, diagnostics, dependencies.run)
 }
 
@@ -138,13 +134,14 @@ func (binding teamMCPBinding) invocation(message, messageID string) teamMCPInvoc
 	environment := make([]string, 0, len(os.Environ())+7)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "DEV_SESSION_") || key == "DEV_WORKSPACES_STATE" || key == "DEV_WORKSPACE_NAME" {
+		if strings.HasPrefix(key, "DEV_SESSION_") || key == "DEV_WORKSPACES_STATE" || key == "DEV_WORKSPACES_PROFILE" || key == "DEV_WORKSPACE_NAME" {
 			continue
 		}
 		environment = append(environment, entry)
 	}
 	environment = append(environment,
 		"DEV_WORKSPACES_STATE="+binding.stateRoot,
+		"DEV_WORKSPACES_PROFILE="+binding.hostProfile,
 		"DEV_SESSION_SLUG="+binding.slug,
 		"DEV_SESSION_WORKSPACE="+binding.workspace,
 		"DEV_SESSION_WORK_DIR="+binding.workDir,

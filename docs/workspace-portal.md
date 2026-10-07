@@ -231,6 +231,35 @@ an older package; recover by repeating the same switch or selecting a newer
 package. Commands waiting on a transition lock reject a generation change and
 must be run again.
 
+### Switching while Codex threads are active
+
+Packages publishing `livePackageSwitchPolicy = 1` can switch while threads are
+active when the candidate resolves to the same native Codex executable, launch
+policy, complete arguments and native child-thread capacity as every running
+workspace's launch marker. Catalog defaults, portal code, session tools and
+package paths do not themselves require a Codex restart. The host refreshes
+registration inventory and restarts the portal and router; Codex, tmux and
+managed terminal clients keep running. Browser clients reconnect to the portal.
+
+The immutable launch marker continues to describe the package and catalog that
+actually started Codex. Inventory describes the selected package. Neither a
+catalog update nor a live switch rewrites launch provenance. Existing rosters
+keep their saved settings; newly selected presets and members use the selected
+catalog.
+
+A predecessor without this policy requires one idle cutover and Codex restart,
+even if the native invocation is unchanged. This retires member report helpers
+that dispatch to their original package. New helpers bind the configured user
+profile and resolve its `bin/dev-session` on every report. Missing or malformed
+launch markers, changed launch arguments or a different native executable also
+take the idle restart path. The candidate's bundled executable is checked, unless
+the operator explicitly supplies `DEV_WORKSPACES_SYSTEM_CODEX`.
+
+Lifecycle journals, unfinished creations, cluster and authority checks, and the
+exclusive transition lock still apply to live switches. A failure after profile
+selection retains the forward target and pending reconciliation evidence. Retry
+the same switch from the stable command; do not select an older generation.
+
 ### Cluster transition policy
 
 The runtime contract uses development-cluster state schema 1 and transition
@@ -621,8 +650,9 @@ an implementation-purpose member, or a lead that owns design and satisfies
 the implementation policy when no implementer is present. An existing
 implementer must satisfy its policy; the lead cannot substitute for an invalid
 implementer. Role names can differ from the built-in names. The package records
-its catalog digest, and the host launch marker binds it through the
-registration-plan digest. No native child-agent capacity or per-role startup
+its catalog digest, and the host launch marker records the launch catalog through
+the registration-plan digest. Catalog identity alone does not require a restart.
+No native child-agent capacity or per-role startup
 arguments are required for direct threads.
 
 At creation, the selected preset is copied into the private schema-3 receipt
@@ -699,10 +729,12 @@ that binding, including for members created by an earlier package. No roster
 format change is needed. The helper checks the current roster identity before
 sending. A missing or mismatched binding fails without sending to `lead`.
 The helper exposes only `report_to_lead`. It passes the report through stdin to
-the installed session command, which checks that the lead thread still belongs
+the configured user profile's session command, which checks that the lead thread still belongs
 to this session under the session lock. Neither command puts the report text in
 its process arguments. Use a fresh message ID for each report, and reuse that
-ID only when retrying delivery of the same report.
+ID only when retrying delivery of the same report. The helper retains the stable
+profile path across package switches, including custom profiles, and checks the
+roster again for each call.
 
 A fork requires all source members to have finished creation, preserves the
 source member snapshot, and refuses an interrupted retry if that roster
