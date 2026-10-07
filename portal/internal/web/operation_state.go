@@ -186,7 +186,7 @@ func (s *Server) refreshDisplaySnapshots(ctx context.Context, full bool) (result
 		if full {
 			view = s.lifecycleOperationView(slug, operation)
 		}
-		if err := s.acceptLifecycleReconciliation(slug, original, existed, revisions[slug], operation, exists, view); err != nil {
+		if _, err := s.acceptLifecycleReconciliation(slug, original, existed, revisions[slug], operation, exists, view); err != nil {
 			return err
 		}
 	}
@@ -341,14 +341,25 @@ func (s *Server) lifecycleOperationForSlug(slug string) (lifecycleOperation, boo
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return original, existed, err
 	}
-	progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
-	operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
-	view := s.lifecycleOperationView(slug, operation)
-	if saveErr := s.acceptLifecycleReconciliation(slug, original, existed, revision, operation, exists, view); saveErr != nil {
-		return original, existed, errors.Join(err, saveErr)
+	for {
+		if err := ctx.Err(); err != nil {
+			return original, existed, err
+		}
+		progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
+		operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
+		view := s.lifecycleOperationView(slug, operation)
+		accepted, saveErr := s.acceptLifecycleReconciliation(slug, original, existed, revision, operation, exists, view)
+		if saveErr != nil {
+			return original, existed, errors.Join(err, saveErr)
+		}
+		if accepted {
+			return operation, exists, err
+		}
+		// A display refresh, retry or executor changed the receipt during proof.
+		// Re-read its journal too; the winning receipt may still describe an old
+		// journal, so returning it without reconciliation is not fresh proof.
+		original, existed, revision = s.captureLifecycleOperation(slug)
 	}
-	current, present, _ := s.captureLifecycleOperation(slug)
-	return current, present, err
 }
 
 func (s *Server) captureLifecycleOperation(slug string) (lifecycleOperation, bool, uint64) {
@@ -438,24 +449,26 @@ func (s *Server) lifecycleOperationView(slug string, operation lifecycleOperatio
 
 func (s *Server) acceptLifecycleReconciliation(slug string, original lifecycleOperation, existed bool,
 	revision uint64, proposed lifecycleOperation, exists bool, view lifecycleOperation,
-) error {
+) (bool, error) {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	current, present := s.operations[slug]
 	if present != existed || (present && current != original) || (!present && s.operationRevisions[slug] != revision) {
-		return nil // Retry, dismissal or a newer executor result owns the receipt.
+		return false, nil // Retry, dismissal or a newer executor result owns the receipt.
 	}
 	if exists {
 		if !existed || current != proposed {
 			if err := s.replaceLifecycleOperationLocked(slug, proposed); err != nil {
-				return err
+				return false, err
 			}
 		}
 		s.publishLifecycleSnapshot(slug, view, time.Now().UTC())
 	} else if existed {
-		return s.removeLifecycleOperationLocked(slug)
+		if err := s.removeLifecycleOperationLocked(slug); err != nil {
+			return false, err
+		}
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOperation) (bool, error) {

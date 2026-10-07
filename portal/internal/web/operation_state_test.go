@@ -849,8 +849,8 @@ func TestLifecycleReconciliationCannotOverwriteRetryOrResurrectDismissedReceipt(
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := server.acceptLifecycleReconciliation("example", captured, existed, revision, proposed, true, proposed); err != nil {
-				t.Fatal(err)
+			if accepted, err := server.acceptLifecycleReconciliation("example", captured, existed, revision, proposed, true, proposed); err != nil || accepted {
+				t.Fatalf("stale reconciliation accepted = %t, error = %v", accepted, err)
 			}
 			current, exists, _ := server.captureLifecycleOperation("example")
 			if change == "dismiss" {

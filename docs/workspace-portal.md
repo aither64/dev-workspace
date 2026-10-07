@@ -316,6 +316,10 @@ Lifecycle status reads return published snapshots without waiting for package
 locks or native inspection. One background task reconciles them with the owning
 receipts and journals; unavailable proof keeps the last known state marked stale.
 Retry, dismissal and new confirmations still perform fresh ownership checks.
+If another receipt writer wins during that check, the mutation reader checks
+the current receipt and journal again within its existing deadline. Display
+refreshes can discard a stale proposal; mutation checks cannot treat that
+discard as successful proof of the winning receipt.
 
 The index polls cached operation progress once per second while a command runs.
 Repository, activity and cluster enrichment refresh separately, at most once
