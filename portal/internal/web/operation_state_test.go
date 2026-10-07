@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"golang.org/x/sys/unix"
 )
 
@@ -861,6 +862,153 @@ func TestLifecycleReconciliationCannotOverwriteRetryOrResurrectDismissedReceipt(
 				t.Fatalf("new receipt overwritten: %#v", current)
 			}
 		})
+	}
+}
+
+// These store fixtures exercise fresh reconciliation without a background owner.
+func freshLifecycleStoreServer(t *testing.T) *Server {
+	t.Helper()
+	workspace := t.TempDir()
+	store, err := newLifecycleOperationStore(workspace, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Server{
+		config: Config{Workspace: workspace}, operationStore: store,
+		operations: make(map[string]lifecycleOperation), operationRevisions: make(map[string]uint64),
+	}
+}
+
+func TestLifecycleFreshOwnerReconciliationRetriesProgressConflict(t *testing.T) {
+	server := freshLifecycleStoreServer(t)
+	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(journalRoot, "example.archive.json")
+	writeJournal := func(mode, journalID string) {
+		t.Helper()
+		payload := fmt.Sprintf(
+			`{"schema":2,"slug":"example","workspace":%q,"phase":"prepared","mode":%q,"operation_id":%q}`,
+			server.config.Workspace, mode, journalID,
+		)
+		if err := os.WriteFile(journalPath+".tmp", []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(journalPath+".tmp", journalPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	journalA, journalB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	writeJournal("complete", journalA)
+	progressA, err := session.PendingLifecycleProgress(server.config.Workspace, "example")
+	if err != nil || progressA == nil {
+		t.Fatalf("journal A progress = %#v, %v", progressA, err)
+	}
+	original := operationFromProgress("example", *progressA)
+	original.State, original.Phase = "running", "starting"
+	server.operationMu.Lock()
+	err = server.replaceLifecycleOperationLocked("example", original)
+	server.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	captured, existed, revision := server.captureLifecycleOperation("example")
+	preparedA, exists, err := server.proposeLifecycleOperation("example", captured, existed, progressA, nil, time.Now().UTC())
+	if err != nil || !exists || preparedA.Phase != "prepared" {
+		t.Fatalf("A proposal = %#v, %t, %v", preparedA, exists, err)
+	}
+	// A worker accepts its already-computed A progress after B replaces the journal.
+	writeJournal("abandoned", journalB)
+	if applied, err := server.acceptLifecycleReconciliation("example", captured, existed, revision, preparedA, true, preparedA); err != nil || !applied {
+		t.Fatalf("A progress acceptance = %t, %v", applied, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	operation, exists, err := server.reconcileLifecycleOperation(ctx, "example", captured, existed, revision)
+	if err != nil || !exists || operation.State != "paused" || operation.Phase != "prepared" ||
+		operation.Options.JournalID != journalB || operation.Options.Mode != "abandoned" ||
+		operation.ReceiptID == original.ReceiptID {
+		t.Fatalf("fresh replacement = %#v, %t, %v", operation, exists, err)
+	}
+	stored, present, _ := server.captureLifecycleOperation("example")
+	if !present || stored != operation {
+		t.Fatalf("accepted replacement = %#v, want %#v", stored, operation)
+	}
+	reloaded, err := server.operationStore.loadReadOnly()
+	if err != nil || reloaded["example"] != operation {
+		t.Fatalf("durable replacement = %#v, %v", reloaded, err)
+	}
+}
+
+func TestLifecycleFreshOwnerReconciliationHonorsDeadline(t *testing.T) {
+	for _, name := range []string{"canceled", "expired"} {
+		t.Run(name, func(t *testing.T) {
+			server := freshLifecycleStoreServer(t)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			original := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "starting", StartedAt: now, UpdatedAt: now, Redirect: "/", ReceiptID: strings.Repeat("a", 64), Options: lifecycleOperationOptions{Mode: "complete"}}
+			server.operationMu.Lock()
+			err := server.replaceLifecycleOperationLocked("example", original)
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(server.operationStore.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			captured, existed, revision := server.captureLifecycleOperation("example")
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			wantErr := context.Canceled
+			if name == "expired" {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+				wantErr = context.DeadlineExceeded
+			}
+			operation, exists, err := server.reconcileLifecycleOperation(ctx, "example", captured, existed, revision)
+			if !errors.Is(err, wantErr) || !exists || operation != original {
+				t.Fatalf("bounded result = %#v, %t, %v", operation, exists, err)
+			}
+			after, err := os.ReadFile(server.operationStore.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, present, currentRevision := server.captureLifecycleOperation("example")
+			if string(before) != string(after) || !present || stored != original || currentRevision != revision {
+				t.Fatal("expired owner changed durable receipt authority")
+			}
+		})
+	}
+}
+
+func TestLifecycleFreshOwnerReconciliationAcceptsNoopAndAbsence(t *testing.T) {
+	server := freshLifecycleStoreServer(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	original := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "starting", StartedAt: now, UpdatedAt: now, Redirect: "/", ReceiptID: strings.Repeat("a", 64), Options: lifecycleOperationOptions{Mode: "complete"}}
+	server.operationMu.Lock()
+	err := server.replaceLifecycleOperationLocked("example", original)
+	server.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	captured, existed, revision := server.captureLifecycleOperation("example")
+	if applied, err := server.acceptLifecycleReconciliation("example", captured, existed, revision, captured, true, captured); err != nil || !applied {
+		t.Fatalf("matched no-op acceptance = %t, %v", applied, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	operation, exists, err := server.reconcileLifecycleOperation(ctx, "example", captured, existed, revision)
+	if err != nil || !exists || operation != original {
+		t.Fatalf("unchanged reconciliation = %#v, %t, %v", operation, exists, err)
+	}
+	missing, present, missingRevision := server.captureLifecycleOperation("missing")
+	if applied, err := server.acceptLifecycleReconciliation("missing", missing, present, missingRevision, missing, false, missing); err != nil || !applied {
+		t.Fatalf("matched absence acceptance = %t, %v", applied, err)
+	}
+	operation, exists, err = server.reconcileLifecycleOperation(ctx, "missing", missing, present, missingRevision)
+	if err != nil || exists || operation != missing {
+		t.Fatalf("absent reconciliation = %#v, %t, %v", operation, exists, err)
 	}
 }
 
