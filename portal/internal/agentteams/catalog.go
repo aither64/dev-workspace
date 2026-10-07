@@ -493,14 +493,20 @@ func validTeam(name string, team Team, capacity Capacity, policies WorkPolicies)
 		return len(team.Roles) == 1 && team.DesignOwner == "team_lead" && team.MaxOpenAgents == 0 &&
 			team.Routing == (Routing{}) && supportsPolicy(lead, policies.Design) && supportsPolicy(lead, policies.Implementation)
 	}
-	hasImplementation, hasReviewer := false, false
+	hasImplementationRole, hasImplementation, hasReviewer := false, false, false
 	for _, role := range team.Roles {
-		if role.Purpose == "implementation" && matchesPolicy(role, policies.Implementation) {
-			hasImplementation = true
+		if role.Purpose == "implementation" {
+			hasImplementationRole = true
+			hasImplementation = hasImplementation || matchesPolicy(role, policies.Implementation)
 		}
 		if role.Purpose == "review" && role.FreshContext {
 			hasReviewer = true
 		}
+	}
+	// Without an implementer, a lead-owned team must satisfy implementation
+	// policy itself. An invalid existing implementer must not use this fallback.
+	if !hasImplementationRole && team.DesignOwner == "team_lead" {
+		hasImplementation = lead.Access == "workspace_write" && matchesPolicy(lead, policies.Implementation)
 	}
 	if !matchesPolicy(owner, policies.Design) || !hasImplementation || !hasReviewer || team.MaxOpenAgents < 1 ||
 		team.MaxOpenAgents > capacity.RequiredNativeChildThreads || team.Routing.DesignSimpleEffort == nil ||

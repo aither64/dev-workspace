@@ -125,9 +125,9 @@ let
   };
   evaluate =
     teamConfig:
-    builtins.tryEval (builtins.deepSeq (mkPackage {
+    builtins.tryEval (builtins.seq (mkPackage {
       inherit pkgs teamConfig;
-    }) true);
+    }).drvPath true);
   invalidExtraField = validTeamConfig // { unexpected = true; };
   invalidCapacity = validTeamConfig // {
     capacity.required_native_child_threads = 0;
@@ -182,8 +182,58 @@ let
     inherit pkgs;
     teamConfig = renamedTeamConfig;
   };
+  leadReviewedConfig = validTeamConfig // {
+    work_policy = validTeamConfig.work_policy // {
+      design = implementationPolicy;
+    };
+    teams = validTeamConfig.teams // {
+      development = validTeamConfig.teams.development // {
+        design_owner = "team_lead";
+        max_open_agents = 1;
+        roles = {
+          team_lead = validTeamConfig.teams.development.roles.team_lead // {
+            effort = "xhigh";
+          };
+          reviewer = validTeamConfig.teams.development.roles.reviewer;
+        };
+      };
+    };
+  };
+  invalidLeadReviewedReviewer = libUpdateTeamRoles leadReviewedConfig {
+    reviewer = leadReviewedConfig.teams.development.roles.reviewer // {
+      fresh_context = false;
+    };
+  };
+  invalidLeadReviewedImplementer = libUpdateTeamRoles leadReviewedConfig {
+    implementer = validTeamConfig.teams.development.roles.implementer // {
+      effort = "high";
+    };
+  };
+  invalidLeadReviewedLead = libUpdateTeamRoles leadReviewedConfig {
+    team_lead = leadReviewedConfig.teams.development.roles.team_lead // {
+      effort = "high";
+    };
+  };
+  libUpdateTeamRoles =
+    config: roles:
+    config
+    // {
+      teams = config.teams // {
+        development = config.teams.development // {
+          roles = config.teams.development.roles // roles;
+        };
+      };
+    };
+  leadReviewedPackage = mkPackage {
+    inherit pkgs;
+    teamConfig = leadReviewedConfig;
+  };
   unmanagedPackage = mkPackage { inherit pkgs; };
 in
+assert (evaluate leadReviewedConfig).success;
+assert !((evaluate invalidLeadReviewedReviewer).success);
+assert !((evaluate invalidLeadReviewedImplementer).success);
+assert !((evaluate invalidLeadReviewedLead).success);
 assert !((evaluate invalidExtraField).success);
 assert !((evaluate invalidCapacity).success);
 assert !((evaluate invalidFreshContext).success);
@@ -198,6 +248,8 @@ pkgs.runCommand "dev-workspace-agent-team-catalog" {
   catalog=${configuredPackage}/share/dev-workspace/agent-teams.json
   metadata=${configuredPackage}/share/dev-workspace/package.json
   renamed_catalog=${renamedPackage}/share/dev-workspace/agent-teams.json
+  jq -e '.teams.development.roles | keys == ["reviewer", "team_lead"]' \
+    ${leadReviewedPackage}/share/dev-workspace/agent-teams.json >/dev/null
 
   test -f "$catalog"
   test ! -e ${unmanagedPackage}/share/dev-workspace/agent-teams.json

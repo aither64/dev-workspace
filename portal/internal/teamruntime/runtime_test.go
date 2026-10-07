@@ -2282,6 +2282,42 @@ func TestCatalogPresetProjectsLeadOwnedDevelopmentWithoutDesigner(t *testing.T) 
 	}
 }
 
+func TestCatalogPresetCreatesLeadAndReviewerOnly(t *testing.T) {
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"lead_reviewed": {Description: "Lead implements; reviewer reviews.", DesignOwner: "team_lead", MaxOpenAgents: 1, Mode: "development", TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+			"team_lead": {Model: "gpt-6.1-sol", Effort: "xhigh", Purpose: "lead", Instructions: "Own design and implementation."},
+			"reviewer":  {Model: "gpt-6-astra", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Instructions: "Review independently.", Access: "read_only", FreshContext: true},
+		}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "lead_reviewed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.Name != "Lead and reviewer" || preset.MemberCount() != 2 ||
+		preset.RoleSummary() != "1 lead, 1 reviewer" || !reflect.DeepEqual(preset.Roles, []string{"lead", "reviewer0"}) ||
+		preset.LeadModel != "gpt-6.1-sol" || preset.LeadEffort != "xhigh" {
+		t.Fatalf("lead and reviewer projection = %#v", preset)
+	}
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	ready, err := service.ApplyPresetSpec(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ready.Members) != 1 || ready.Members[0].Address != "reviewer0" || ready.Members[0].State != "ready" ||
+		ready.LeadInstructions != preset.LeadInstructions || len(client.starts) != 1 ||
+		client.starts[0].Model != "gpt-6-astra" || client.starts[0].ReasoningEffort != "xhigh" ||
+		client.starts[0].Policy.Sandbox != "read-only" ||
+		!strings.HasSuffix(client.starts[0].Policy.DeveloperInstructions, "Review independently.") {
+		t.Fatalf("created team = %#v, starts = %#v", ready, client.starts)
+	}
+}
+
 func TestCatalogPresetProjectsCustomRole(t *testing.T) {
 	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
 		"custom": {TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{

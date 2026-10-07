@@ -249,9 +249,15 @@ let
         && roleSupportsWorkPolicy team.roles.team_lead workPolicy.implementation
       else
         roleMatchesWorkPolicy (builtins.getAttr team.design_owner team.roles) workPolicy.design
-        && builtins.any (
-          role: role.purpose == "implementation" && roleMatchesWorkPolicy role workPolicy.implementation
-        ) (builtins.attrValues team.roles)
+        && (
+          if builtins.any (role: role.purpose == "implementation") (builtins.attrValues team.roles) then
+            builtins.any (
+              role: role.purpose == "implementation" && roleMatchesWorkPolicy role workPolicy.implementation
+            ) (builtins.attrValues team.roles)
+          else
+            team.design_owner == "team_lead"
+            && roleMatchesWorkPolicy team.roles.team_lead workPolicy.implementation
+        )
         && builtins.any (role: role.purpose == "review" && role.fresh_context) (
           builtins.attrValues team.roles
         )

@@ -519,8 +519,9 @@ The portal's Team assignment API sends as `lead` only. A member can report to
 `lead` through its bound host tool, which checks that member's roster and
 thread identity; browser input cannot claim to be a member.
 
-The installed workspace policy supplies three starting teams: Solo (`solo`),
-Full team (`delegated`), and Lead-designed team (`lead_designed`). Their role
+The installed workspace policy supplies starting teams such as Solo (`solo`),
+Full team (`delegated`), Lead-designed team (`lead_designed`), and Lead and
+reviewer (`lead_reviewed`). Their role
 lists and exact lead model and reasoning effort appear on the new-session
 screen. Solo has only the lead, which investigates, designs and edits
 application code without automatic specialists. Full team has `lead`,
@@ -528,6 +529,9 @@ application code without automatic specialists. Full team has `lead`,
 delegated application implementation. Lead-designed has `lead`, `implementer0`
 and `reviewer0`; the lead writes the substantive design brief and delegates
 application implementation. Catalog prompts own these mode-specific policies.
+Lead and reviewer has `lead` and `reviewer0`; the lead owns investigation,
+design and application implementation, while the retained reviewer performs
+independent final review.
 The selected team and its member settings are saved with the creation receipt.
 Member threads are created before the lead receives the initial request. A
 failed creation can be retried with that saved selection.
@@ -612,8 +616,11 @@ the lead. Member role names use lowercase letters and digits and are at most
 `implementation`, `review`, or `general`. The lead uses purpose `lead`.
 The generic package requires instructions for every role. A site can provide
 defaults for known roles and supply instructions for its own roles. A
-development team still needs a design owner, an implementer, and a reviewer,
-but their role names can differ from the built-in names. The package records
+development team needs a design owner and an independent reviewer. It can use
+an implementation-purpose member, or a lead that owns design and satisfies
+the implementation policy when no implementer is present. An existing
+implementer must satisfy its policy; the lead cannot substitute for an invalid
+implementer. Role names can differ from the built-in names. The package records
 its catalog digest, and the host launch marker binds it through the
 registration-plan digest. No native child-agent capacity or per-role startup
 arguments are required for direct threads.
@@ -723,6 +730,11 @@ New session needs an initial request or attachments and a starting team. Options
 contains a custom short name and advanced lead settings. An empty custom name
 generates a dated name; the CLI preview asks for an explicit name. Installed
 team defaults remain available when model discovery fails.
+
+This lead-owned composition uses the existing catalog and receipt schemas. Its
+catalog must be paired with a runtime that accepts the composition; older
+validators still require a separate implementer. Existing saved rosters remain
+unchanged, and package updates follow the existing forward-only transition policy.
 
 Automatic naming uses a private Codex child owned by the portal service, with a
 fixed original catalog and `gpt-5.5`/`low`. Ordinary conversations keep their

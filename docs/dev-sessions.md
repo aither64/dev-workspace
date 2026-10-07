@@ -341,7 +341,9 @@ session.
 The root conversation is the lead in both the portal and tmux. The selected
 catalog prompt and retained instructions determine design and application
 ownership. A Solo lead can investigate, design and edit application code without
-automatic specialists. A Lead-designed lead owns the design brief and assigns
+automatic specialists. A Lead and reviewer lead also owns design and application
+edits and uses its retained reviewer for independent final review.
+A Lead-designed lead owns the design brief and assigns
 application work to an implementer; a Full-team lead assigns nontrivial design
 to its design-purpose member and application work to its implementation-purpose
 member. The design owner writes the design and verification brief before

@@ -387,7 +387,7 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 		if err := validateCatalogInstructions(&catalog, id, "team_lead", lead); err != nil {
 			return nil, err
 		}
-		name := map[string]string{"solo": "Solo", "delegated": "Full team", "lead_designed": "Lead-designed team"}[id]
+		name := map[string]string{"solo": "Solo", "delegated": "Full team", "lead_designed": "Lead-designed team", "lead_reviewed": "Lead and reviewer"}[id]
 		if name == "" {
 			name = strings.ReplaceAll(id, "_", " ")
 			name = strings.ToUpper(name[:1]) + name[1:]

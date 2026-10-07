@@ -12,6 +12,72 @@ import (
 
 func ptrString(value string) *string { return &value }
 
+func TestDevelopmentTeamCanImplementWithLead(t *testing.T) {
+	fixture := catalogFixture(t)
+	base := fixture.Teams["solo"]
+	base.Mode, base.MaxOpenAgents = "development", 1
+	base.Routing = Routing{DesignSimpleEffort: ptrString("high"), ImplementerSimpleEffort: ptrString("high")}
+	base.Roles["reviewer"] = Role{Model: "model-review", Effort: "high", Behavior: "reviewer", Purpose: "review",
+		Instructions: "Review the work.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}
+	for _, test := range []struct {
+		name   string
+		change func(*Team)
+		valid  bool
+	}{
+		{"lead and reviewer", func(*Team) {}, true},
+		{"lead cannot write", func(team *Team) {
+			role := team.Roles["team_lead"]
+			role.Access = "read_only"
+			team.Roles["team_lead"] = role
+		}, false},
+		{"missing reviewer", func(team *Team) { delete(team.Roles, "reviewer") }, false},
+		{"reviewer can write", func(team *Team) {
+			role := team.Roles["reviewer"]
+			role.Access = "workspace_write"
+			team.Roles["reviewer"] = role
+		}, false},
+		{"reviewer lacks fresh context", func(team *Team) {
+			role := team.Roles["reviewer"]
+			role.FreshContext = false
+			team.Roles["reviewer"] = role
+		}, false},
+		{"lead lacks implementation policy", func(team *Team) {
+			role := team.Roles["team_lead"]
+			role.AllowedEfforts = []string{"high", "xhigh"}
+			team.Roles["team_lead"] = role
+		}, false},
+		{"separate design owner needs implementer", func(team *Team) {
+			role := team.Roles["team_lead"]
+			role.Behavior, role.Purpose = "designer", "design"
+			team.Roles["designer"] = role
+			team.DesignOwner = "designer"
+		}, false},
+		{"valid separate implementer", func(team *Team) {
+			role := team.Roles["team_lead"]
+			role.Behavior, role.Purpose = "implementer", "implementation"
+			team.Roles["implementer"] = role
+		}, true},
+		{"invalid implementer cannot fall back to lead", func(team *Team) {
+			role := team.Roles["team_lead"]
+			role.Behavior, role.Purpose = "implementer", "implementation"
+			role.Effort = "xhigh"
+			role.AllowedEfforts = []string{"high", "xhigh"}
+			team.Roles["implementer"] = role
+		}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var team Team
+			if err := json.Unmarshal(marshalFixture(t, base), &team); err != nil {
+				t.Fatal(err)
+			}
+			test.change(&team)
+			if got := validTeam("development", team, fixture.Capacity, fixture.WorkPolicy); got != test.valid {
+				t.Fatalf("team valid = %t, want %t", got, test.valid)
+			}
+		})
+	}
+}
+
 func catalogFixture(t *testing.T) Catalog {
 	t.Helper()
 	identity := NativeIdentity{
