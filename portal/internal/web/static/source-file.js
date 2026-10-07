@@ -16,6 +16,7 @@ export function sourceFileVersion(file) {
     case "archive": return `Archived final commit · ${file.revision}`;
     case "archived-artifact": return "Archived session artifact";
     case "artifact": return "Current session artifact";
+    case "workspace": return "Current workspace · includes uncommitted edits";
     default: throw new Error("The file source is unknown. Reload the page to try again.");
   }
 }
@@ -36,7 +37,8 @@ export async function mountSourceFile(root) {
     }
   });
   try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(root.dataset.slug)}/file${location.search}`, {credentials: "same-origin"});
+    const api = root.dataset.fileApi || `/api/sessions/${encodeURIComponent(root.dataset.slug)}/file`;
+    const response = await fetch(`${api}${location.search}`, {credentials: "same-origin"});
     const file = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(file.error || "This file is unavailable. Check that the session and file still exist.");
     title.textContent = file.repository ? `${file.repository}/${file.path}` : file.path;

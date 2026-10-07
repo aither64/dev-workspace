@@ -15,7 +15,7 @@
   <main class="source-file-page">
     <nav><a href="/">{{.DisplayLabel}}</a>{{if .Session}} · <a href="/{{.Session.Slug}}/">Back to session</a>{{end}}</nav>
     {{if .Error}}<p class="notice warning" role="alert">{{.Error}}</p>{{else}}
-    <section id="source-file" data-slug="{{.Session.Slug}}" aria-labelledby="source-file-title">
+    <section id="source-file"{{if .Session}} data-slug="{{.Session.Slug}}"{{end}}{{if .SourceFileAPI}} data-file-api="{{.SourceFileAPI}}"{{end}} aria-labelledby="source-file-title">
       <header class="source-file-heading">
         <div><h1 id="source-file-title">File</h1><p id="source-file-version" class="muted"></p></div>
         <button id="source-file-copy" type="button" class="quiet">Copy link</button>

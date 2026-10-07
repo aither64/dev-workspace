@@ -24,8 +24,8 @@ func sourceLine(value string) bool {
 }
 
 // sourceLink maps workspace path structure without filesystem reads. Rendering
-// a transcript never grants access: the file API checks the current session,
-// registration, index membership and confinement when the link is opened.
+// a transcript never grants access: the file API checks index membership and
+// confinement, plus session registration/publication for session files.
 func (s *Server) sourceLink(input *url.URL) (string, bool) {
 	if input.Scheme != "" || input.Host != "" || input.User != nil || input.RawQuery != "" || input.ForceQuery {
 		return "", false
@@ -55,27 +55,34 @@ func (s *Server) sourceLink(input *url.URL) (string, bool) {
 		return "", false
 	}
 	parts := strings.SplitN(relative, "/", 4)
-	if len(parts) < 3 || !session.ValidSlug(parts[1]) {
-		return "", false
-	}
 	query := url.Values{}
-	switch parts[0] {
-	case "worktrees":
-		if len(parts) != 4 || !session.ValidSlug(parts[2]) || !repository.ValidSourcePath(parts[3]) {
+	target := url.URL{}
+	if repository.ValidWorkspaceSourcePath(relative) {
+		target.Path = "/workspace-files"
+		query.Set("path", relative)
+	} else {
+		if len(parts) < 3 || !session.ValidSlug(parts[1]) {
 			return "", false
 		}
-		query.Set("repository", repository.ReviewID(parts[2]))
-		query.Set("path", parts[3])
-	case "work", "archive":
-		artifact, ok := session.NormalizeArtifactPath(strings.Join(parts[2:], "/"))
-		if !ok {
+		switch parts[0] {
+		case "worktrees":
+			if len(parts) != 4 || !session.ValidSlug(parts[2]) || !repository.ValidSourcePath(parts[3]) {
+				return "", false
+			}
+			query.Set("repository", repository.ReviewID(parts[2]))
+			query.Set("path", parts[3])
+		case "work", "archive":
+			artifact, ok := session.NormalizeArtifactPath(strings.Join(parts[2:], "/"))
+			if !ok {
+				return "", false
+			}
+			query.Set("artifact", artifact)
+		default:
 			return "", false
 		}
-		query.Set("artifact", artifact)
-	default:
-		return "", false
+		target.Path = "/files/" + parts[1]
 	}
-	target := url.URL{Path: "/files/" + parts[1], RawQuery: query.Encode()}
+	target.RawQuery = query.Encode()
 	if line != "" {
 		number, _ := strconv.ParseUint(line, 10, 64)
 		target.Fragment = "L" + strconv.FormatUint(number, 10)
@@ -138,6 +145,40 @@ func (s *Server) sourcePage(w http.ResponseWriter, r *http.Request) {
 	}
 	data.Session = summary
 	s.render(w, "source-file", data)
+}
+
+func workspaceSourceTarget(rawQuery string) (string, bool) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil || len(query) != 1 || len(query["path"]) != 1 {
+		return "", false
+	}
+	path := query.Get("path")
+	return path, repository.ValidWorkspaceSourcePath(path)
+}
+
+func (s *Server) workspaceSourcePage(w http.ResponseWriter, r *http.Request) {
+	data := pageData{SourceFileAPI: "/api/workspace/file"}
+	if _, ok := workspaceSourceTarget(r.URL.RawQuery); !ok {
+		data.Error = "This workspace file link is invalid."
+		s.renderStatus(w, http.StatusNotFound, "source-file", data)
+		return
+	}
+	s.render(w, "source-file", data)
+}
+
+func (s *Server) workspaceSourceFile(w http.ResponseWriter, r *http.Request) {
+	path, ok := workspaceSourceTarget(r.URL.RawQuery)
+	if !ok {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This workspace file link is invalid."})
+		return
+	}
+	result, err := s.reviews().reader.WorkspaceSource(r.Context(), path)
+	if err != nil {
+		s.config.Logger.Printf("workspace source file %s: %v", path, err)
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. It must be a tracked regular file in the workspace repository."})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *session.Summary) {

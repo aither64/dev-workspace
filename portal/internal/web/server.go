@@ -248,6 +248,7 @@ type pageData struct {
 	SelectedThreadID  string
 	ConversationID    string
 	MemberNotice      string
+	SourceFileAPI     string
 }
 
 type teamRoleOption struct {
@@ -702,6 +703,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.artifactImage(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/files/"):
 		s.sourcePage(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/workspace-files":
+		s.workspaceSourcePage(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/workspace/file":
+		s.workspaceSourceFile(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, s.config.Workspace+"/"):
 		s.sourceRedirect(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/sessions/"):

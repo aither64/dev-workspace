@@ -12,7 +12,7 @@ import (
 )
 
 // SourceKind identifies whether the displayed bytes came from a live worktree,
-// an archived final commit, or an explicitly published tracking artifact.
+// an archived final commit, a shared workspace, or a published tracking artifact.
 type SourceKind string
 
 const (
@@ -20,6 +20,7 @@ const (
 	SourceArchive          SourceKind = "archive"
 	SourceArtifact         SourceKind = "artifact"
 	SourceArchivedArtifact SourceKind = "archived-artifact"
+	SourceWorkspace        SourceKind = "workspace"
 )
 
 type SourceFile struct {
@@ -41,6 +42,36 @@ func ValidSourcePath(path string) bool {
 		}
 	}
 	return true
+}
+
+// Session files retain their registration and artifact publication checks even
+// when they are tracked by the workspace repository.
+func ValidWorkspaceSourcePath(path string) bool {
+	if !ValidSourcePath(path) {
+		return false
+	}
+	first, _, _ := strings.Cut(path, "/")
+	switch first {
+	case "work", "archive", "worktrees", "repos":
+		return false
+	}
+	return true
+}
+
+func (r ReviewReader) WorkspaceSource(ctx context.Context, path string) (SourceFile, error) {
+	result := SourceFile{Path: path, Source: SourceWorkspace}
+	if !ValidWorkspaceSourcePath(path) {
+		return result, errors.New("invalid shared workspace path")
+	}
+	root, err := r.git(ctx, r.Workspace, 8192, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return result, err
+	}
+	if strings.TrimSuffix(string(root), "\n") != r.Workspace {
+		return result, errors.New("configured workspace is not the repository root")
+	}
+	result.Content, err = r.trackedSource(ctx, "", path)
+	return result, err
 }
 
 // Source revalidates repository ownership on each request. Browser input selects
@@ -71,28 +102,31 @@ func (r ReviewReader) Source(ctx context.Context, slug string, item session.Repo
 		return result, err
 	}
 
-	worktree := filepath.Join(r.Workspace, "worktrees", slug, item.Name)
-	out, err := r.git(ctx, worktree, 64*1024, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path)
+	result.Content, err = r.trackedSource(ctx, filepath.Join("worktrees", slug, item.Name), path)
+	return result, err
+}
+
+func (r ReviewReader) trackedSource(ctx context.Context, directory, path string) (ReviewBlob, error) {
+	out, err := r.git(ctx, filepath.Join(r.Workspace, directory), 64*1024, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path)
 	if err != nil {
-		return result, err
+		return ReviewBlob{}, err
 	}
 	if len(out) == 0 {
-		return result, errors.New("file is not tracked")
+		return ReviewBlob{}, errors.New("file is not tracked")
 	}
 	for _, entry := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
 		metadata, name, ok := strings.Cut(entry, "\t")
 		fields := strings.Fields(metadata)
 		if !ok || name != path || len(fields) != 3 || !regularGitMode(fields[0]) {
-			return result, errors.New("file is not a tracked regular file")
+			return ReviewBlob{}, errors.New("file is not a tracked regular file")
 		}
 	}
-	file, info, err := session.OpenRegularFile(r.Workspace, filepath.Join("worktrees", slug, item.Name, path))
+	file, info, err := session.OpenRegularFile(r.Workspace, filepath.Join(directory, path))
 	if err != nil {
-		return result, err
+		return ReviewBlob{}, err
 	}
 	defer file.Close()
-	result.Content, err = ReadSourcePreview(file, info.Size())
-	return result, err
+	return ReadSourcePreview(file, info.Size())
 }
 
 func regularGitMode(mode string) bool { return mode == "100644" || mode == "100755" }

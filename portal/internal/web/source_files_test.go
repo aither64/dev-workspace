@@ -95,7 +95,7 @@ func TestSourceLinksEscapingAndRejectedDestinations(t *testing.T) {
 		root + "/worktrees/example/project/.git/config", root + "/worktrees/example/project/file:0",
 		root + "/worktrees/example/project/file:9007199254740992", root + "/worktrees/example/project/file:10:0",
 		root + "/worktrees/example/project/file#L0", root + "/worktrees/example/project/file:10#L11",
-		root + "/notes/private", root + "/worktrees/example/project/file?download=1",
+		root + "/repos/private", root + "/worktrees/example/project/file?download=1",
 	} {
 		input, err := url.Parse(raw)
 		if err != nil {

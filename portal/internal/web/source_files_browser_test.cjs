@@ -18,6 +18,7 @@ const fs = require("node:fs");
   assert.match(sourceFileVersion({source: "worktree"}), /uncommitted/);
   assert.match(sourceFileVersion({source: "archived-artifact"}), /Archived/);
   assert.equal(sourceFileVersion({source: "artifact"}), "Current session artifact");
+  assert.match(sourceFileVersion({source: "workspace"}), /Current workspace.*uncommitted/);
   assert.throws(() => sourceFileVersion({source: "unknown"}), /source is unknown/);
 
   // Keep the mounted UI and event handlers intact; replace only the browser's
@@ -32,13 +33,18 @@ const fs = require("node:fs");
   globalThis.document = {getElementById: id => elements[id], querySelector: () => ({content: "nonce"})};
   globalThis.location = new URL(original + "#L10");
   globalThis.addEventListener = (name, callback) => { events[name] = callback; };
-  globalThis.fetch = async () => ({ok: true, json: async () => ({path: "example.nix", source: "worktree", content: {text: "line\n"}})});
+  let fetchedURL;
+  globalThis.fetch = async url => {
+    fetchedURL = url;
+    return {ok: true, json: async () => ({path: "example.nix", source: "worktree", content: {text: "line\n"}})};
+  };
   let finishOldReveal;
   globalThis.sourceTestEditor = {clearLine() {}, revealLine: (_side, line) => line === 10
     ? new Promise(resolve => { finishOldReveal = resolve; }) : Promise.resolve(false)};
   const mounting = mountSourceFile({dataset: {slug: "example"}});
   for (let tries = 0; !finishOldReveal && tries < 50; tries++) await new Promise(setImmediate);
   assert.equal(typeof finishOldReveal, "function");
+  assert.equal(fetchedURL, `/api/sessions/example/file${location.search}`);
   globalThis.location = new URL(original + "#L999");
   await events.hashchange();
   assert.match(elements["source-file-notice"].textContent, /Line 999 is not present/);
@@ -52,5 +58,17 @@ const fs = require("node:fs");
   globalThis.location = new URL(original + "#L1");
   await mountSourceFile({dataset: {slug: "example"}});
   assert.equal(elements["source-file-notice"].textContent, "");
+  globalThis.location = new URL("https://workspace.example.test/workspace-files?path=docs%2Fguide.md#L93");
+  let revealedLine;
+  globalThis.sourceTestEditor = {clearLine() {}, revealLine: async (_side, line) => { revealedLine = line; return true; }};
+  globalThis.fetch = async url => {
+    fetchedURL = url;
+    return {ok: true, json: async () => ({path: "docs/guide.md", source: "workspace", content: {text: "line\n"}})};
+  };
+  await mountSourceFile({dataset: {fileApi: "/api/workspace/file"}});
+  assert.equal(fetchedURL, "/api/workspace/file?path=docs%2Fguide.md");
+  assert.equal(revealedLine, 93);
+  assert.equal(elements["source-file-title"].textContent, "docs/guide.md");
+  assert.match(elements["source-file-version"].textContent, /Current workspace/);
   console.log("Source file URL and source identity contracts passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

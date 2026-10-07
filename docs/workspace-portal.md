@@ -51,6 +51,13 @@ and displays its revision. A link is a live reference, so later edits can move
 the referenced line. The viewer reports a missing line instead of selecting a
 different one.
 
+Shared workspace links show current contents of Git-tracked files, including
+uncommitted edits and newly staged files. They can open documentation, the root
+`AGENTS.md`, scripts and notes without a session registration. The configured
+workspace must be the Git repository root. Files under `work/`, `archive/`,
+`worktrees/` and `repos/` are excluded from this shared reader so session files
+keep their repository registration and artifact publication checks.
+
 Tracking files are limited to `plan.md`, `state.md` and artifacts declared in
 `portal.yml`. Their links continue to work when tracking moves into `archive/`.
 Untracked repository files, Git metadata, symlinks and other host files are not
@@ -64,6 +71,12 @@ repository ID is the same opaque ID used by repository review. The read-only
 returns `path`, `repository` when applicable, `source`, the archived `revision`
 when applicable, and a `content` object with the existing review preview fields.
 Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
+Shared files use `/workspace-files?path=<relative-path>#L10` and
+`GET /api/workspace/file?path=<relative-path>`. This endpoint returns the same
+preview fields with `source: "workspace"` and no repository or revision. It
+accepts exactly one `path` value and no other query parameters. The viewer labels
+these files as current workspace contents; archived conversations still open
+their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
