@@ -341,6 +341,14 @@ func (s *Server) lifecycleOperationForSlug(slug string) (lifecycleOperation, boo
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return original, existed, err
 	}
+	return s.reconcileLifecycleOperation(ctx, slug, original, existed, revision)
+}
+
+// The caller retains its transition guard and original deadline. A lost CAS
+// requires new receipt and journal proof, never a recapture reported as success.
+func (s *Server) reconcileLifecycleOperation(ctx context.Context, slug string,
+	original lifecycleOperation, existed bool, revision uint64,
+) (lifecycleOperation, bool, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return original, existed, err
@@ -348,6 +356,9 @@ func (s *Server) lifecycleOperationForSlug(slug string) (lifecycleOperation, boo
 		progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
 		operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
 		view := s.lifecycleOperationView(slug, operation)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return original, existed, errors.Join(err, contextErr)
+		}
 		accepted, saveErr := s.acceptLifecycleReconciliation(slug, original, existed, revision, operation, exists, view)
 		if saveErr != nil {
 			return original, existed, errors.Join(err, saveErr)
