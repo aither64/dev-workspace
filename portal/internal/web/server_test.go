@@ -1771,16 +1771,13 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`,
 		`Solo (1): 1 lead</option>`, `Lead-designed team (3): 1 lead, 1 implementer, 1 reviewer</option>`,
 		`data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
-		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select><option value="">Selected team default</option>`,
-		`Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
+		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required><option value="gpt-6-sol" selected>gpt-6-sol</option>`,
+		`Lead reasoning effort<select name="effort" data-effort-select required><option value="high" selected>high</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("new session omitted %q", marker)
 		}
 	}
-	if strings.Contains(body, `name="model" data-model-select required`) || strings.Contains(body, `name="effort" data-effort-select required`) {
-		t.Fatal("managed New session requires overrides instead of accepting installed team defaults")
-	}
-	if strings.Contains(body, `Advanced lead override`) || strings.Contains(body, `Configured default`) {
+	if strings.Contains(body, `Selected team default`) || strings.Contains(body, `Configured default`) {
 		t.Fatal("new session still exposes an ambiguous lead override")
 	}
 	data.Session = &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true}
@@ -1855,7 +1852,7 @@ func TestCreationAndMemberReasoningSelectorsRequireExplicitValues(t *testing.T) 
 	}
 	if !strings.Contains(string(javascript),
 		`const existingSettings = modelSelect.dataset.existingSettings === "true"`) ||
-		!strings.Contains(string(javascript), `if (!existingSettings && !effortSelect.required)`) {
+		!strings.Contains(string(javascript), `if (!newSession && !existingSettings && !effortSelect.required)`) {
 		t.Fatal("existing-thread settings still offer unsupported automatic reasoning")
 	}
 }

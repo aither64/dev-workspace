@@ -1705,9 +1705,10 @@
     if (!selected || !modelSelect || !effortSelect) return;
     if (form.id === "new-session-form") {
       if (form.dataset.requestLocked === "true") return;
-      modelSelect.value = "";
-      populateEfforts(modelSelect, effortSelect);
-      effortSelect.value = "";
+      selectCreationSetting(modelSelect, selected.dataset.leadModel || "");
+      populateEfforts(modelSelect, effortSelect, selected.dataset.leadEffort || "");
+      modelSelect.dataset.userEdited = "false";
+      effortSelect.dataset.userEdited = "false";
       return;
     }
     if (!models.length) return;
@@ -1719,9 +1720,23 @@
     effortSelect.dataset.userEdited = "false";
   };
 
+  // Catalog defaults stay explicit while live model discovery is pending or
+  // unavailable. Backend validation still decides whether a pair is supported.
+  const selectCreationSetting = (select, value) => {
+    if (!value) return;
+    if (!Array.from(select.options).some((option) => option.value === value)) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      select.append(option);
+    }
+    select.value = value;
+  };
+
   const restoreDraftSelect = (select, value, unavailableLabel) => {
     if (!select || typeof value !== "string") return;
-    if (!Array.from(select.options).some((option) => option.value === value) && value !== "") {
+    if (!Array.from(select.options).some((option) => option.value === value) &&
+        (value !== "" || select.closest("form")?.dataset.requestLocked === "true")) {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = unavailableLabel;
@@ -1815,6 +1830,10 @@
       if (form.elements.catalogDigest) form.elements.catalogDigest.value = draft.catalogDigest;
       restoreDraftSelect(form.elements.team, draft.team, "Saved team");
       if (form.elements.team) updateTeamDescription(form.elements.team);
+      if (form.dataset.requestLocked !== "true" && form.elements.team && !draft.model && !draft.effort) {
+        applyTeamLeadSettings(form.elements.team);
+        return;
+      }
       restoreDraftSelect(form.elements.model, draft.model, "Saved model");
       if (form.dataset.requestLocked !== "true") populateEfforts(form.elements.model, form.elements.effort, draft.effort);
       restoreDraftSelect(form.elements.effort, draft.effort, "Saved reasoning effort");
@@ -1853,7 +1872,7 @@
     const model = models.find((candidate) => candidate.model === modelSelect.value);
     const existingSettings = modelSelect.dataset.existingSettings === "true";
     effortSelect.replaceChildren();
-    if (!existingSettings && !effortSelect.required) {
+    if (!newSession && !existingSettings && !effortSelect.required) {
       const fallback = document.createElement("option");
       fallback.value = "";
       fallback.textContent = automaticReasoningLabel(model);
@@ -1867,6 +1886,7 @@
       effortSelect.append(element);
     }
     const desired = selected || effortSelect.dataset.currentValue || model?.defaultReasoningEffort || "";
+    if (newSession) selectCreationSetting(effortSelect, desired);
     if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
       effortSelect.value = desired;
     }
@@ -1926,6 +1946,8 @@
       if (!models.length) models = await request("/api/models");
       for (const modelSelect of modelSelects) {
         if (modelSelect.closest("form")?.dataset.requestLocked === "true") continue;
+        const newSession = modelSelect.closest("form")?.id === "new-session-form";
+        const savedModel = modelSelect.value;
         const allowDefault = !modelSelect.required;
         modelSelect.replaceChildren();
         if (allowDefault) {
@@ -1937,11 +1959,13 @@
         for (const model of models) {
           const option = document.createElement("option");
           option.value = model.model;
-          option.textContent = model.displayName;
+          option.textContent = newSession ? model.model : model.displayName;
           option.title = model.description || "";
           modelSelect.append(option);
         }
-        if (!currentModel && modelSelect.required) {
+        if (newSession && savedModel) {
+          selectCreationSetting(modelSelect, savedModel);
+        } else if (!currentModel && modelSelect.required) {
           const defaultModel = models.find((model) => model.isDefault);
           if (defaultModel) modelSelect.value = defaultModel.model;
         }

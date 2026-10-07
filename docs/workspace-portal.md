@@ -729,7 +729,12 @@ ownership and recovery for New session API callers.
 New session needs an initial request or attachments and a starting team. Options
 contains a custom short name and advanced lead settings. An empty custom name
 generates a dated name; the CLI preview asks for an explicit name. Installed
-team defaults remain available when model discovery fails.
+team defaults appear as exact selected model and reasoning values, including
+when model discovery fails. Changing the starting team selects that team's
+lead defaults. A manual model selection uses the model's advertised default
+reasoning effort; both settings can then be changed. Reloading preserves explicit
+unsent choices. Older unsent drafts with empty settings select the team's concrete
+defaults, while submitted requests retain their original body for recovery.
 
 This lead-owned composition uses the existing catalog and receipt schemas. Its
 catalog must be paired with a runtime that accepts the composition; older

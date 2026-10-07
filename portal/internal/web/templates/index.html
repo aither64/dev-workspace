@@ -53,7 +53,7 @@
         <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
         <p class="muted">Leave the name blank to generate a dated session name from your request.</p>
         {{if .AgentTeams.Managed}}
-        <div class="field-grid"><label>Lead model<select name="model" data-model-select><option value="">Selected team default</option></select></label><label>Lead reasoning effort<select name="effort" data-effort-select><option value="">Selected team default</option></select></label></div>
+        <div class="field-grid"><label>Lead model<select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label>Lead reasoning effort<select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
         {{else}}
         <div class="field-grid">
           <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
@@ -91,7 +91,7 @@
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/app.js?v=25" defer></script>
+  <script src="/static/app.js?v=26" defer></script>
 </body>
 </html>
 {{end}}
