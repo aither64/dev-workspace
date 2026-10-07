@@ -51,6 +51,8 @@ func TestObserveArchivedSemanticActivityPreservesColdQueueBoundary(t *testing.T)
 	identity, _, path := archiveProofFixture(t)
 	t.Setenv("DEV_WORKSPACE_CODEX_HOME", identity.CodexHome)
 	loadedReads, turnReads := 0, 0
+	// Repeated reads describe the same unchanged archived thread.
+	updatedAt := time.Now().Unix()
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
@@ -63,7 +65,7 @@ func TestObserveArchivedSemanticActivityPreservesColdQueueBoundary(t *testing.T)
 			var result any
 			switch request["method"] {
 			case "thread/read":
-				result = map[string]any{"thread": map[string]any{"id": identity.ThreadID, "cwd": identity.Cwd, "projectId": identity.ProjectID, "source": "vscode", "path": path, "status": map[string]any{"type": "notLoaded"}, "updatedAt": time.Now().Unix()}}
+				result = map[string]any{"thread": map[string]any{"id": identity.ThreadID, "cwd": identity.Cwd, "projectId": identity.ProjectID, "source": "vscode", "path": path, "status": map[string]any{"type": "notLoaded"}, "updatedAt": updatedAt}}
 			case "thread/turns/list":
 				turnReads++
 				result = map[string]any{"data": []any{map[string]any{"id": "terminal-turn", "status": "completed", "startedAt": 900, "completedAt": 950}}, "nextCursor": nil, "backwardsCursor": nil}
