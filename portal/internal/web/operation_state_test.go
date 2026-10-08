@@ -335,8 +335,9 @@ func TestMatchingDeleteJournalPreservesTheAcceptedBrowserIdentity(t *testing.T) 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	server.operationMu.Lock()
 	if err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
-		Slug: "example", Kind: "delete", State: "running", Phase: "starting",
+		Slug: "example", Kind: "delete", State: "complete", Phase: "complete",
 		StartedAt: now, UpdatedAt: now, Redirect: "/",
+		ReceiptID: strings.Repeat("b", 64), Attempt: 1,
 		Options: lifecycleOperationOptions{
 			TargetID: targetID, DeletedThreadID: "deleted-thread",
 			JournalID: journalID,
@@ -345,6 +346,7 @@ func TestMatchingDeleteJournalPreservesTheAcceptedBrowserIdentity(t *testing.T) 
 		server.operationMu.Unlock()
 		t.Fatal(err)
 	}
+	accepted := server.operations["example"]
 	server.operationMu.Unlock()
 
 	// Rewriting the manifest changes the tracking directory ctime. The accepted
@@ -367,6 +369,11 @@ func TestMatchingDeleteJournalPreservesTheAcceptedBrowserIdentity(t *testing.T) 
 	operation, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists {
 		t.Fatalf("matching journal reconciliation = %#v, %t, %v", operation, exists, err)
+	}
+	if operation.State != "paused" || operation.Phase != "validated" ||
+		operation.ReceiptID != accepted.ReceiptID || operation.Attempt != accepted.Attempt ||
+		operation.Options.Force != accepted.Options.Force || operation.StartedAt != accepted.StartedAt {
+		t.Fatalf("complete receipt with a retained matching journal = %#v", operation)
 	}
 	if operation.Options.TargetID != targetID ||
 		operation.Options.DeletedThreadID != "deleted-thread" ||
