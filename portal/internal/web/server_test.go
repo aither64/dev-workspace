@@ -3968,17 +3968,19 @@ func TestDeleteOperationRetryUsesTheJournaledForceSetting(t *testing.T) {
 		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true,"operation_id":%q}`,
 		server.config.Workspace, strings.Repeat("a", 64),
 	)
-	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(journal), 0o600); err != nil {
+	journalPath := filepath.Join(root, "example.removal.json")
+	if err := os.WriteFile(journalPath, []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	arguments := filepath.Join(t.TempDir(), "arguments")
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	if err := os.WriteFile(
-		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"), 0o755,
+		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\" || exit 1\nrm -- \"$DELETE_JOURNAL\" || exit 1\nexit 0\n"), 0o755,
 	); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
+	t.Setenv("DELETE_JOURNAL", journalPath)
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	freshDelete := httptest.NewRecorder()
 	server.deleteSession(freshDelete, httptest.NewRequest(
@@ -4002,8 +4004,22 @@ func TestDeleteOperationRetryUsesTheJournaledForceSetting(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("delete retry = %d %q", response.Code, response.Body.String())
 	}
-	if operation := waitLifecycleOperation(t, server, "example"); operation.State != "complete" {
-		t.Fatalf("delete retry operation = %#v", operation)
+	completed := waitLifecycleOperation(t, server, "example")
+	if completed.State != "complete" || completed.ReceiptID != pendingOperation.ReceiptID ||
+		completed.Attempt != pendingOperation.Attempt+1 || !completed.Options.Force ||
+		completed.StartedAt != pendingOperation.StartedAt {
+		t.Fatalf("delete retry operation = %#v", completed)
+	}
+	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("delete retry journal remains: %v", err)
+	}
+	reconciled, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || reconciled.State != "complete" ||
+		reconciled.ReceiptID != completed.ReceiptID || reconciled.Attempt != completed.Attempt ||
+		reconciled.Options.Force != completed.Options.Force ||
+		reconciled.Options.JournalID != completed.Options.JournalID ||
+		reconciled.StartedAt != completed.StartedAt {
+		t.Fatalf("completed delete retry reconciliation = %#v, %t, %v", reconciled, exists, err)
 	}
 	data, err := os.ReadFile(arguments)
 	if err != nil {
@@ -4026,17 +4042,19 @@ func TestDeleteOperationRetryCanUpgradeTheJournaledForceSetting(t *testing.T) {
 		`{"schema":1,"slug":"example","workspace":%q,"phase":"prepared","force":false,"operation_id":%q}`,
 		server.config.Workspace, journalID,
 	)
-	if err := os.WriteFile(filepath.Join(root, "example.removal.json"), []byte(journal), 0o600); err != nil {
+	journalPath := filepath.Join(root, "example.removal.json")
+	if err := os.WriteFile(journalPath, []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	arguments := filepath.Join(t.TempDir(), "arguments")
 	helper := filepath.Join(t.TempDir(), "dev-session")
 	if err := os.WriteFile(
-		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"), 0o755,
+		helper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\" || exit 1\nrm -- \"$DELETE_JOURNAL\" || exit 1\nexit 0\n"), 0o755,
 	); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("ARGUMENTS", arguments)
+	t.Setenv("DELETE_JOURNAL", journalPath)
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	operation, exists, err := server.lifecycleOperationForSlug("example")
 	if err != nil || !exists {
@@ -4053,9 +4071,22 @@ func TestDeleteOperationRetryCanUpgradeTheJournaledForceSetting(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("force-upgrade retry = %d %q", response.Code, response.Body.String())
 	}
-	if operation := waitLifecycleOperation(t, server, "example"); operation.State != "complete" ||
-		!operation.Options.Force || operation.StartedAt != originalStartedAt {
-		t.Fatalf("force-upgrade operation = %#v", operation)
+	completed := waitLifecycleOperation(t, server, "example")
+	if completed.State != "complete" || !completed.Options.Force ||
+		completed.StartedAt != originalStartedAt || completed.ReceiptID != operation.ReceiptID ||
+		completed.Attempt != operation.Attempt+1 {
+		t.Fatalf("force-upgrade operation = %#v", completed)
+	}
+	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("force-upgrade journal remains: %v", err)
+	}
+	reconciled, exists, err := server.lifecycleOperationForSlug("example")
+	if err != nil || !exists || reconciled.State != "complete" ||
+		reconciled.ReceiptID != completed.ReceiptID || reconciled.Attempt != completed.Attempt ||
+		reconciled.Options.Force != completed.Options.Force ||
+		reconciled.Options.JournalID != completed.Options.JournalID ||
+		reconciled.StartedAt != completed.StartedAt {
+		t.Fatalf("completed force-upgrade reconciliation = %#v, %t, %v", reconciled, exists, err)
 	}
 	data, err := os.ReadFile(arguments)
 	if err != nil {
