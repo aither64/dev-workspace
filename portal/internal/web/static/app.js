@@ -870,25 +870,45 @@
     return {message: presentation.blockers.join(" "), attemptedAt: state.last_attempt_at || state.checked_at};
   };
 
-  const createCodexLimitsReader = (request, render) => {
-    let snapshot = null;
-    let pending = null;
-    return {
-      refresh() {
-        if (pending) return pending;
-        pending = (async () => {
+  const createCodexLimitsReader = (request, render, options = {}) => {
+    let snapshot = null, pending = null, generation = 0, rerun = false;
+    let lastSuccessAt = -Infinity, retryTimer = null;
+    const now = options.now || Date.now;
+    let retryDelay = options.retryInitialMs || 2000;
+    const reader = {
+      refresh(force = false) {
+        if (options.isVisible?.() === false) return Promise.resolve();
+        if (pending) { if (force) rerun = true; return pending.promise; }
+        if (!force && now() - lastSuccessAt < (options.freshnessMs || 0)) return Promise.resolve();
+        clearTimeout(retryTimer); retryTimer = null;
+        const read = {generation, abort: new AbortController(), promise: null};
+        const timeout = setTimeout(() => read.abort.abort(), options.deadlineMs || 10_000);
+        pending = read; options.onStart?.();
+        read.promise = (async () => {
           try {
-            snapshot = await request("/api/codex-limits");
+            const value = await request("/api/codex-limits", {signal: read.abort.signal});
+            if (read.generation !== generation || read.abort.signal.aborted) return;
+            snapshot = value; lastSuccessAt = now(); retryDelay = options.retryInitialMs || 2000;
             render(snapshot, false);
-          } catch (_error) {
-            render(snapshot, true);
+          } catch (error) {
+            if (read.generation !== generation) return;
+            render(snapshot, true, error);
+            if (options.retryInitialMs && options.isVisible?.() !== false && error.status !== 401 && error.status !== 403) {
+              retryTimer = setTimeout(() => { retryTimer = null; void reader.refresh(true); }, retryDelay);
+              retryDelay = Math.min(options.retryMaxMs || 30_000, retryDelay * 2);
+            }
           } finally {
-            pending = null;
+            clearTimeout(timeout);
+            if (pending === read) pending = null;
+            if (rerun) { rerun = false; void reader.refresh(true); }
           }
         })();
-        return pending;
+        return read.promise;
       },
+      invalidate() { ++generation; lastSuccessAt = -Infinity; },
+      pause() { ++generation; pending?.abort.abort(); clearTimeout(retryTimer); retryTimer = null; },
     };
+    return reader;
   };
 
   // Creation drafts are deliberately small browser-local retry records. The
@@ -1108,16 +1128,84 @@
   const limitsPanel = document.getElementById("codex-limits-panel");
   if (limitsPanel) {
     const toggle = document.querySelector(".codex-limits-toggle");
+    const dialog = document.getElementById("codex-limits-dialog");
+    const details = dialog.querySelector("[data-account-limits]");
+    const resetStatus = dialog.querySelector("[data-reset-status]");
+    let limitsSnapshot = null, resetAction = null, limits = null, limitsLeaving = false;
+    const openDetails = () => { renderAccountDetails(); dialog.showModal(); void limits?.refresh(); };
+    limitsPanel.querySelector("[data-limits-details]").addEventListener("click", openDetails);
+    dialog.querySelector("[data-limits-close]").addEventListener("click", () => dialog.close());
+    toggle.removeAttribute("popovertarget");
+    toggle.setAttribute("aria-controls", dialog.id); toggle.setAttribute("aria-haspopup", "dialog");
+    toggle.addEventListener("click", openDetails);
+    dialog.addEventListener("close", () => toggle.setAttribute("aria-expanded", "false"));
+    dialog.addEventListener("toggle", event => toggle.setAttribute("aria-expanded", String(event.newState === "open")));
+    const resetFeedback = outcome => {
+      if (!outcome) return;
+      resetStatus.textContent = ({reset: "Reset used.",
+        alreadyRedeemed: "This reset attempt already completed.",
+        nothingToReset: "No limit is eligible for a reset.", noCredit: "No banked resets are available."})[outcome];
+    };
+    const redeem = async credit => {
+      resetStatus.textContent = "";
+      try {
+        const expires = credit?.expiresAt != null ? ` (expires ${new Date(credit.expiresAt * 1000).toLocaleString()})` : "";
+        resetFeedback(await resetAction.use({creditId: credit?.id || "", accountScope: limitsSnapshot?.accountScope,
+          description: credit ? `${credit.title || "this reset"}${expires}` : "the next available reset"}));
+      } catch (error) { resetStatus.textContent = error.message; }
+    };
+    const renderAccountDetails = () => {
+      details.replaceChildren();
+      const snapshot = limitsSnapshot;
+      const line = text => { const p = document.createElement("p"); p.textContent = text; details.append(p); };
+      if (!snapshot) { line("Account details are unavailable."); return; }
+      renderLimitWindows(details, snapshot.windows || []);
+      const credits = snapshot.credits;
+      if (credits) line(credits.unlimited ? "Unlimited credits" : `Credits: ${credits.balance ?? (credits.hasCredits ? "Available" : "0")}`);
+      else line("Credits were not reported.");
+      const resets = snapshot.rateLimitResetCredits;
+      line(resets ? `Banked resets: ${resets.availableCount}` : "Banked resets were not reported.");
+      const state = resetAction?.state();
+      const blocked = !snapshot.canReset || !snapshot.accountScope || !state || state.busy || state.unavailable || Boolean(state.pending);
+      if (state?.pending) {
+        line("A saved reset attempt has an unconfirmed outcome. Resolve it before using another reset.");
+        const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "Retry saved attempt";
+        retry.disabled = state.busy || state.unavailable || state.pending.accountScope !== snapshot.accountScope;
+        retry.addEventListener("click", async () => { try { resetFeedback(await resetAction.retry()); } catch (error) { resetStatus.textContent = error.message; } });
+        details.append(retry);
+        if (state.pending.accountScope !== snapshot.accountScope) line("The saved attempt belongs to a different Codex account.");
+      }
+      if (state?.unavailable) line("Reset actions are unavailable because this browser cannot safely save and coordinate attempts.");
+      if (resets?.availableCount > 0) {
+        if (resets.credits == null) line("Individual reset details are unavailable.");
+        else if (resets.credits.length < resets.availableCount) line("Codex reported details for only some available resets.");
+        const rows = [...(resets.credits || [])].sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
+        for (const credit of rows) {
+          const row = document.createElement("div"); row.className = "reset-credit";
+          const text = document.createElement("span");
+          text.textContent = `${credit.title || "Rate-limit reset"} · ${credit.expiresAt == null ? "No expiration" : `Expires ${new Date(credit.expiresAt * 1000).toLocaleString()}`}`;
+          const button = document.createElement("button"); button.type = "button"; button.textContent = "Use reset…";
+          button.disabled = blocked || credit.status !== "available" || credit.resetType !== "codexRateLimits" ||
+            credit.expiresAt != null && credit.expiresAt * 1000 <= Date.now();
+          button.addEventListener("click", () => { void redeem(credit); });
+          row.append(text, button); details.append(row);
+        }
+        if (resets.credits == null || resets.credits.length < resets.availableCount) {
+          const next = document.createElement("button"); next.type = "button"; next.textContent = "Use next available reset…";
+          next.disabled = blocked; next.addEventListener("click", () => { void redeem(); }); details.append(next);
+        }
+        if (!snapshot.canReset) line("Reset redemption is unavailable until the current account can be verified.");
+      }
+      line(`Updated ${new Date(snapshot.updatedAt).toLocaleString()}`);
+    };
     const content = limitsPanel.querySelector("[data-limits-content]");
     const compactLabel = toggle.querySelector("[data-limits-compact-label]");
     const compactValue = toggle.querySelector("[data-limits-compact-value]");
     const formatLimitDate = (date) => date.toLocaleString(undefined, {
       month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
     });
-    const renderLimits = (snapshot, failed) => {
-      content.replaceChildren();
+    const renderLimitWindows = (target, windows) => {
       const summaries = [];
-      const windows = snapshot?.windows || [];
       for (const window of windows) {
         const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
         const label = window.windowDurationMins === 10080 ? "Weekly" : "5h";
@@ -1149,19 +1237,39 @@
           resetLine.append("Resets ", time);
           item.append(resetLine);
         }
-        content.append(item);
+        target.append(item);
       }
+      return summaries;
+    };
+    const renderLimits = (snapshot, failed) => {
+      content.replaceChildren();
+      const windows = snapshot?.windows || [];
+      const summaries = renderLimitWindows(content, windows);
       if (!windows.length) {
         const status = document.createElement("p");
         status.className = "limits-status";
-        status.textContent = snapshot ? "No limits reported." : "Limits unavailable.";
-        content.append(status);
+        status.textContent = snapshot ? "No limits reported." : failed ? "Limits unavailable." : "";
+        if (status.textContent) content.append(status);
       }
       if (failed && snapshot) {
         const stale = document.createElement("p");
         stale.className = "limits-status stale";
         stale.textContent = `Update failed. Last updated ${formatLimitDate(new Date(snapshot.updatedAt))}.`;
         content.append(stale);
+      }
+      const credits = snapshot?.credits;
+      const resets = snapshot?.rateLimitResetCredits;
+      const extra = [];
+      if (credits?.unlimited) extra.push("Unlimited credits");
+      else if (credits?.hasCredits) extra.push(credits.balance != null ? `${credits.balance} credits` : "Credits available");
+      if (resets?.availableCount > 0) extra.push(`${resets.availableCount} banked resets`);
+      if (extra.length) {
+        const summary = document.createElement("button"); summary.type = "button"; summary.className = "quiet limits-account-summary";
+        summary.textContent = extra.join(" · "); summary.addEventListener("click", openDetails); content.append(summary);
+      }
+      if (failed) {
+        const retry = document.createElement("button"); retry.type = "button"; retry.className = "quiet"; retry.textContent = "Retry";
+        retry.addEventListener("click", () => { void limits?.refresh(true); }); content.append(retry);
       }
       const compactWindow = windows.find((window) => window.windowDurationMins === 10080) || windows[0];
       compactLabel.textContent = compactWindow ? (compactWindow.windowDurationMins === 10080 ? "Weekly" : "5h") : "Limits";
@@ -1171,27 +1279,46 @@
       toggle.title = `Codex limits. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
       toggle.setAttribute("aria-label", toggle.title);
     };
-    updateLimitsPopover = () => {
-      const compact = body.classList.contains("compact-sidebar");
-      if (compact === limitsPanel.hasAttribute("popover")) return;
-      if (compact) limitsPanel.setAttribute("popover", "auto");
-      else {
-        if (limitsPanel.matches(":popover-open")) limitsPanel.hidePopover();
-        limitsPanel.removeAttribute("popover");
+    const notice = conversationAssets.createRefreshNotice({render: state => {
+      renderLimits(limitsSnapshot, state.warning);
+      if (state.loading && !limitsSnapshot) {
+        const loading = document.createElement("p"); loading.className = "limits-status";
+        loading.textContent = "Loading limits…"; content.append(loading);
       }
-      toggle.setAttribute("aria-expanded", "false");
-    };
-    limitsPanel.addEventListener("toggle", (event) => {
-      toggle.setAttribute("aria-expanded", String(event.newState === "open"));
+      renderAccountDetails();
+    }});
+    limits = createCodexLimitsReader(request, (snapshot, failed, error) => {
+      if (failed) notice.failure(error);
+      else { limitsSnapshot = snapshot; notice.success(); }
+    }, {freshnessMs: refreshPolicy.limitsMs, deadlineMs: refreshPolicy.limitsDeadlineMs,
+      retryInitialMs: refreshPolicy.retryInitialMs, retryMaxMs: refreshPolicy.retryMaxMs,
+      isVisible: () => !document.hidden, onStart: () => notice.begin()});
+    const {createResetCreditAction} = await import("/static/reset-credits.js?v=1");
+    let resetStorage = null;
+    try { resetStorage = localStorage; } catch (_) {}
+    const resetStorageKey = `workspace-portal.reset-attempt.${location.origin}`;
+    const store = conversationAssets.createDurableAttemptStore({storage: resetStorage,
+      key: resetStorageKey,
+      decode: (id, value) => typeof value.creditId === "string" && value.creditId.length <= 512 &&
+        /^[0-9a-f]{64}$/.test(value.accountScope) ? {...value, id} : null});
+    const withLock = navigator.locks?.request ? operation => navigator.locks.request(resetStorageKey,
+      {ifAvailable: true}, lock => {
+        if (!lock) throw new Error("A reset attempt is already running in another tab.");
+        return operation();
+      }) : null;
+    resetAction = createResetCreditAction({request, store, withLock,
+      confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
+      refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
+    globalThis.addEventListener("storage", event => {
+      if (event.key === resetStorageKey || event.key === null) resetAction.reload();
     });
-    updateLimitsPopover();
-    const limits = createCodexLimitsReader(request, renderLimits);
-    const refreshVisibleLimits = () => {
-      if (!document.hidden) void limits.refresh();
-    };
+    globalThis.addEventListener("focus", () => resetAction.reload());
+    const refreshVisibleLimits = () => { if (!document.hidden && !limitsLeaving) void limits.refresh(); else { limits.pause(); notice.cancel(); } };
+    globalThis.addEventListener("pagehide", () => { limitsLeaving = true; refreshVisibleLimits(); });
+    globalThis.addEventListener("pageshow", () => { limitsLeaving = false; refreshVisibleLimits(); });
     document.addEventListener("visibilitychange", refreshVisibleLimits);
     globalThis.addEventListener("focus", refreshVisibleLimits);
-    globalThis.setInterval(refreshVisibleLimits, 60_000);
+    globalThis.setInterval(refreshVisibleLimits, refreshPolicy.limitsMs);
     refreshVisibleLimits();
   }
 

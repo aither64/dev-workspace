@@ -369,8 +369,8 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.setViewportSize({width: 600, height: 720}); await width(180);
       await limits.focus(); await page.keyboard.press("Enter");
       await expect(limits).toHaveAttribute("aria-expanded", "true");
-      const limitsBox = await page.locator("#codex-limits-panel").boundingBox();
-      assert(limitsBox.x >= 180 && limitsBox.x + limitsBox.width <= 600, "index limits popover escaped the viewport");
+      const limitsBox = await page.locator("#codex-limits-dialog").boundingBox();
+      assert(limitsBox.x >= 0 && limitsBox.x + limitsBox.width <= 600, "account limits dialog escaped the viewport");
       await page.keyboard.press("Escape");
       await expect(limits).toHaveAttribute("aria-expanded", "false");
       await page.setViewportSize({width: 1440, height: 720}); await width(310);

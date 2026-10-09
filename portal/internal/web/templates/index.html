@@ -110,9 +110,11 @@
   </button>
   <div id="codex-limits-panel" class="codex-limits-panel">
     <h2>Codex limits</h2>
-    <div data-limits-content><p class="limits-status">Loading limits…</p></div>
+    <div data-limits-content></div>
+    <button type="button" class="quiet" data-limits-details>Account details</button>
   </div>
 </section>
+<dialog id="codex-limits-dialog" aria-labelledby="codex-limits-title"><div class="section-heading"><h2 id="codex-limits-title">Codex limits</h2><button type="button" class="quiet" data-limits-close>Close</button></div><div data-account-limits></div><p data-reset-status role="status"></p></dialog>
 {{end}}
 
 {{define "session-card"}}

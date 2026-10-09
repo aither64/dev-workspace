@@ -175,6 +175,8 @@ type Server struct {
 	codexLimitsMu          sync.Mutex
 	codexLimitsCache       codexLimitsSnapshot
 	codexLimitsWait        *codexLimitsCall
+	codexLimitsGeneration  uint64
+	codexResetMu           sync.Mutex
 	messageMu              sync.Mutex
 	messageLocks           map[string]conversation.MutationLocker
 	clusters               cluster.Runner
@@ -691,6 +693,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.models(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/codex-limits":
 		s.codexLimits(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-limits/reset":
+		s.consumeCodexReset(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
 		s.collaborationModes(w, r)
 	case r.URL.Path == "/api/auto-archive":

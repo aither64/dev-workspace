@@ -113,14 +113,36 @@ the configured hostname and aliases; the registry stores the resolved values.
 The portal sidebar shows the main Codex allowance, with percentage remaining
 and reset times in the browser's local timezone. The weekly and 5-hour windows
 appear only when Codex reports them. Model-specific allowances are excluded.
-On narrow screens, select the compact limit indicator to open the details.
+Reported credits and banked reset counts appear alongside the allowance.
+Select **Account details**, the account summary or the compact limit indicator
+to see reset details and expiration times. Expired or unsupported reset rows
+cannot be used. If Codex reports only a count or partial details, **Use next
+available reset** lets Codex choose. Every use asks for confirmation.
 
 The session-independent `GET /api/codex-limits` endpoint reads the configured
 App Server account and returns `windows` plus an `updatedAt` snapshot time.
 Each window contains `usedPercent`, `windowDurationMins` and nullable `resetsAt`
 (Unix seconds). Reads share a 30-second server cache. Open pages refresh every
-minute while visible and when focused. A failed refresh keeps prior values
-marked with their last update time.
+minute while visible; focus skips reads while the snapshot is still fresh.
+Background reads retain prior values. Failures show a warning after 30 continuous
+visible seconds, with the last update time. Browser timing defaults live in
+codex-web's `conversation/assets/refresh.js`.
+
+`POST /api/codex-limits/reset` requires the portal's exact origin, a UUID
+`idempotencyKey`, optional `creditId` and the snapshot's opaque `accountScope`.
+The server checks the current account before every attempt, serializes reset
+operations and invalidates its cache even when the RPC response is lost. Reads
+started before that mutation cannot repopulate the cache. Raw account IDs are
+not exposed. Reset actions are unavailable when Codex cannot report account
+identity or the browser cannot verify storage writes and coordinate tabs.
+
+An origin-scoped Web Lock protects saving, sending and clearing each attempt
+across tabs. The browser reloads the saved attempt inside the lock and saves
+one attempt before sending it. Browsers without Web Locks cannot redeem resets. A lost acknowledgement keeps
+that attempt across reloads and blocks another reset until **Retry saved
+attempt** resolves it with the same key. A different account cannot retry it.
+Confirmed outcomes trigger a fresh account read; the browser never estimates
+remaining counts. Opening details and refreshing limits never consume a reset.
 
 ## Session creation
 
