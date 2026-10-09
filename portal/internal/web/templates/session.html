@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=6">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -41,6 +41,13 @@
     </div>
   </aside>
   <main class="page session-page">
+    {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
+    <section id="session-recovery" class="notice full" role="status" aria-live="polite">
+      <span id="session-recovery-message">Checking session recovery…</span>
+      <button id="session-resume" type="button" class="quiet" hidden>Resume session</button>
+      <button id="session-continue" type="button" hidden>Continue task</button>
+    </section>
+    {{end}}
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
     {{if .MemberNotice}}<p class="notice warning full">{{.MemberNotice}}</p>{{end}}
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
@@ -80,9 +87,9 @@
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>
           <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         </div>
-        {{if .Session.Interactive}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
+        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
         <div class="composer-context">
-        {{if .Session.Interactive}}
+        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
         <div id="message-receipts" class="message-receipts" hidden></div>
         <section id="queue-panel" class="queue-panel" hidden>
           <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
@@ -99,11 +106,11 @@
         </section>
         {{end}}
         </div>
-        {{if .Session.Interactive}}
+        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
         <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
           <div id="message-uploads"></div>
-          <div class="chat-actions"><div class="composer-actions"><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span></div><div class="composer-controls"><div class="composer-settings"><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet icon-button" title="Edit Codex settings" aria-label="Edit Codex settings" aria-haspopup="dialog" aria-controls="codex-settings-dialog" disabled><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
+          <div class="chat-actions"><div class="composer-actions"><span id="message-upload-controls"></span><button id="message-send" type="submit"{{if not .Session.Interactive}} disabled{{end}}>Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span></div><div class="composer-controls"><div class="composer-settings"><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet icon-button" title="Edit Codex settings" aria-label="Edit Codex settings" aria-haspopup="dialog" aria-controls="codex-settings-dialog" disabled><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div><button id="interrupt" type="button" class="danger"{{if or (not .Session.Interactive) .Session.ExecutionHeld}} disabled{{end}}>Interrupt</button></div></div>
         </form>
         <dialog id="codex-settings-dialog" aria-labelledby="codex-settings-title">
           <div class="section-heading"><h2 id="codex-settings-title">Codex settings</h2><button id="codex-settings-close" type="button" class="quiet" aria-label="Close settings">Close</button></div>

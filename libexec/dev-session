@@ -197,6 +197,7 @@ module DevSession
       dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
         [--model MODEL] [--effort EFFORT]
       dev-session attach <name-or-slug> [--as-is]
+      dev-session resume <name-or-slug> [--as-is]
       dev-session sync <name-or-slug> [--as-is]
       dev-session quiesce <name-or-slug> [--as-is]
       dev-session stop <name-or-slug> [--as-is]
@@ -230,6 +231,7 @@ module DevSession
 
   class Error < StandardError; end
   class SupersededGenerationError < Error; end
+  class TemporaryRecoveryError < Error; end
 
   class CommandError < Error
     attr_reader :argv, :status, :stdout, :stderr
@@ -1228,6 +1230,7 @@ module DevSession
             write_portal_creation_evidence!(receipt, slug, selected_session)
           end
         end
+        recovery_state!(slug, trusted_thread_id, 'running') if run_codex && trusted_thread_id
         selected_session
       end
 
@@ -1266,9 +1269,76 @@ module DevSession
         select_tmux_for_slug!(slug)
         reject_conflicting_lifecycle_journal!(slug)
         session = ensure_managed_session!(slug)
+        recovery_state!(slug, session.codex_thread_id, 'running') if session.codex_thread_id
         reconcile_native_client!(slug, session)
       end
       attach_to_session(session)
+    end
+
+    # Rebuild terminal authority without thread/resume or a native client. The
+    # existing creation/start journals own partial terminal recovery as usual.
+    def resume(input, as_is:)
+      slug = lookup_slug(input, as_is:)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          raise Error, "archived session requires revive: #{slug}" unless File.directory?(work_dir(slug))
+          reject_conflicting_lifecycle_journal!(slug)
+          manifest = load_portal_manifest(portal_file(slug), required: true)
+          require_ordinary_manifest_ready!(slug, manifest)
+          thread = manifest.dig('codex', 'thread_id')
+          raise Error, "session has no retained conversation: #{slug}" unless thread
+          require_current_codex_provenance!(slug, manifest, thread)
+          select_tmux_for_slug!(slug)
+          journal = load_start_journal(slug)
+          if !manifest.key?('creation')
+            require_creationless_retained_ready!(slug, manifest, start_journal: journal)
+          else
+            identity = auto_archive_tracking_identity(slug, work_dir(slug), thread)
+            observation = auto_archive_session_observation(
+              slug, identity, start_tmux_identity: journal&.fetch('tmux_identity')
+            )
+            require_recovery_transport!(observation)
+            unless observation['activityKnown'] && observation['subjects'].any? do |subject|
+              subject['address'] == 'lead' && subject['threadId'] == thread && subject['archiveState'] == 'active'
+            end
+              raise Error, "retained recovery identity or submissions cannot be verified: #{slug}"
+            end
+          end
+          require_portal_thread_materialized(slug, thread)
+          selected = cleanup_session(slug)
+          if selected
+            selected = ensure_managed_session!(slug, session: selected)
+            unless session_codex_provenance_matches?(selected, thread)
+              raise Error, "live terminal does not match retained conversation: #{slug}"
+            end
+            if journal && selected.identity_token != journal.fetch('tmux_identity')
+              raise Error, "terminal differs from interrupted recovery: #{slug}"
+            end
+          else
+            # An authority left by tmux loss remains valid identity evidence;
+            # clearing it never adopts a differently named live terminal.
+            delete_session_authority(slug) if @selected_authority
+            journal ||= prepare_start_journal!(slug)
+            manifest['codex'] = codex_metadata(thread)
+            write_portal_manifest(slug, manifest)
+            selected = create_tmux_session(slug, run_codex: true, thread_id: thread,
+                                           launch_codex: false,
+                                           identity_token: journal.fetch('tmux_identity'))
+          end
+          selected = sync_slug(slug, require_session: true, session: selected)
+          write_session_authority(slug, selected, state: 'ready')
+          recovery_state!(slug, thread, 'restore')
+          delete_start_journal(slug) if journal
+          @out.puts "session restored; saved work is waiting: #{slug}"
+        end
+      end
+    end
+
+    def require_recovery_transport!(observation)
+      unknown = observation.fetch('diagnostics', []).select { |entry| entry['category'] == 'activity_unknown' }
+      if !observation['activityKnown'] && !unknown.empty? && unknown.all? { |entry| entry['code'] == 'transport_unavailable' }
+        raise TemporaryRecoveryError, 'Codex transport is temporarily unavailable; session recovery will retry'
+      end
     end
 
     def fork(
@@ -1605,6 +1675,7 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug)
           session = ensure_managed_session!(slug)
           close_session!(slug, session)
+          recovery_state!(slug, session.codex_thread_id, 'stop') if session.codex_thread_id
         end
       end
     end
@@ -1926,6 +1997,7 @@ module DevSession
               # generic retirement fallback to discover and adopt a late root.
               ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
             end
+            recovery_state!(slug, journal.fetch('retained_thread_id'), 'archive') if journal['retained_thread_id']
             advance_archive!(slug, journal, 'thread_retired')
           end
           if archive_phase_before?(journal, 'runtime_retired')
@@ -2090,6 +2162,8 @@ module DevSession
           if removal_phase_before?(removal, 'thread_retired')
             sync_team_lifecycle!(slug, removal.fetch('force') ? 'retire' : 'archive')
             retire_portal_thread!(slug, force: removal.fetch('force'))
+            retained_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
+            recovery_state!(slug, retained_root, 'delete') if retained_root
             advance_removal!(slug, removal, 'thread_retired')
           end
           seal_removal_worktrees!(slug, removal)
@@ -4166,6 +4240,7 @@ module DevSession
         slug, identity, start_tmux_identity: start_journal&.fetch('tmux_identity'),
         revive_operation_id: revive_journal&.fetch('operation_id')
       )
+      require_recovery_transport!(observation)
       unless observation['activityKnown'] && observation['subjects'].any? { |subject| subject['address'] == 'lead' && subject['threadId'] == root }
         raise Error, "retained conversation or submission readiness cannot be verified: #{slug}"
       end
@@ -8303,6 +8378,7 @@ module DevSession
     def reconcile_native_client!(slug, session, allow_creating: false, start_journal: nil, revive_journal: nil)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
+      return session if !allow_creating && recovery_held?(slug, session.codex_thread_id)
       require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal:, revive_journal:)
       unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
              @tmux.pane_session_id(session.codex_pane_id) == session.id
@@ -8329,6 +8405,21 @@ module DevSession
     def native_client_process_names
       command_name = File.basename(@codex_command_argv.first)
       [command_name, ".#{command_name}-wrapped"]
+    end
+
+    def recovery_state!(slug, thread, operation)
+      return unless @require_runtime && @portal_command && codex_provenance_configured?
+
+      stdout, = @command_runner.capture([
+        *@portal_command, 'recovery', '--operation', operation,
+        '--workspace', workspace, '--user-state-root', @workspace_state_root,
+        '--slug', slug, '--thread-id', thread, '--socket', @codex_socket
+      ])
+      operation == 'status' ? JSON.parse(stdout).fetch('held') : nil
+    end
+
+    def recovery_held?(slug, thread)
+      recovery_state!(slug, thread, 'status') == true
     end
 
     def require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal: nil, revive_journal: nil)
@@ -8547,6 +8638,15 @@ module DevSession
       end
 
       0
+    rescue TemporaryRecoveryError => e
+      @err.puts "error: #{e.message}"
+      75
+    rescue CommandError => e
+      @err.puts "error: #{e.message}"
+      command == 'resume' && e.status.exitstatus == 75 ? 75 : 1
+    rescue WorkspaceAutoArchive::ObservationFailure => e
+      @err.puts "error: #{e.message}"
+      command == 'resume' && e.code == 'transport_unavailable' ? 75 : 1
     rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error => e
       @err.puts "error: #{e.message}"
       1
@@ -8564,6 +8664,8 @@ module DevSession
         run_fork
       when 'attach'
         run_single_slug { |runner, slug, opts| runner.attach(slug, as_is: opts[:as_is]) }
+      when 'resume'
+        run_single_slug { |runner, slug, opts| runner.resume(slug, as_is: opts[:as_is]) }
       when 'sync'
         run_single_slug { |runner, slug, opts| runner.sync(slug, as_is: opts[:as_is]) }
       when 'quiesce'

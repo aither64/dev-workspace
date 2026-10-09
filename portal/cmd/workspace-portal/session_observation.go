@@ -74,7 +74,7 @@ func sessionCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	client := newCodexClient(*socket, *workspace)
+	client := newCodexClient(*socket, *workspace, *stateRoot)
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

@@ -116,6 +116,9 @@ func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expec
 		}
 		if expected.RequireActiveFile {
 			again, readErr := reader.ReadThreadMetadata(ctx, expected.ThreadID, false)
+			if readErr != nil {
+				return ArchiveUnknown, fmt.Errorf("recheck materialized Codex metadata: %w", readErr)
+			}
 			current, statErr := os.Lstat(path)
 			if readErr != nil || !reflect.DeepEqual(metadata, again) || statErr != nil || !os.SameFile(info, current) {
 				return ArchiveUnknown, errors.New("active rollout changed during materialization proof")
@@ -166,6 +169,9 @@ func ProveArchivedThread(ctx context.Context, reader ThreadMetadataReader, expec
 		return ArchiveUnknown, errors.New("archived rollout was replaced during proof")
 	}
 	again, err := reader.ReadThreadMetadata(ctx, expected.ThreadID, false)
+	if err != nil {
+		return ArchiveUnknown, fmt.Errorf("recheck archived Codex metadata: %w", err)
+	}
 	if err != nil || !reflect.DeepEqual(metadata, again) {
 		return ArchiveUnknown, errors.New("Codex thread metadata changed during archive proof")
 	}

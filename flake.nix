@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix";
     codex-web = {
-      url = "github:aither64/codex-web/7dab76305dc0084735095d6dbdaef607585d9bca";
+      url = "github:aither64/codex-web/c9878454f07da244c103b8a79340b92b6d5bf052";
       flake = false;
     };
   };
@@ -90,6 +90,9 @@
         '';
         host-module-idempotency = import ./nix/tests/host-module-idempotency.nix {
           inherit pkgs self;
+        };
+        session-recovery-boot = import ./nix/tests/session-recovery-boot.nix {
+          inherit pkgs self devWorkspace;
         };
         host-package-contract = import ./nix/tests/host-package-contract.nix {
           inherit devWorkspace hostPaths pkgs;

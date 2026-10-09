@@ -33,6 +33,7 @@ const checkSidebarMenu = async page => {
       const page = await browser.newPage({ignoreHTTPSErrors: true});
       const errors = [], notices = [];
       let details = 0, activity = 0, failActivity = false, holdDetails = false, releaseDetails;
+      let recoveryOverride = null;
       page.on("pageerror", error => errors.push(error.message));
       await page.exposeFunction("recordNotice", value => notices.push(value));
       await page.addInitScript(() => {
@@ -51,6 +52,11 @@ const checkSidebarMenu = async page => {
             holdDetails = false;
             await new Promise(resolve => { releaseDetails = resolve; });
             return route.abort("failed").catch(() => {});
+          }
+          if (recoveryOverride) {
+            const response = await route.fetch(), payload = await response.json();
+            return route.fulfill({response, json: {...payload,
+              interactive: recoveryOverride !== "stopped", recovery: {state: recoveryOverride}}});
           }
         }
         if (operation === "activity") {
@@ -85,6 +91,25 @@ const checkSidebarMenu = async page => {
       const beforeDownload = details;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect.poll(() => details).toBeGreaterThan(beforeDownload);
+
+      // Recovery updates the mounted composer in place through cold and live
+      // states. A draft and textarea identity survive every status refresh.
+      const composer = page.locator('#message-form textarea[name="message"]');
+      await composer.fill("Keep this unsent recovery draft");
+      await composer.evaluate(element => { window.recoveryComposer = element; });
+      for (const state of ["stopped", "recovering", "waiting", "active"]) {
+        recoveryOverride = state;
+        await expect.poll(async () => {
+          await page.evaluate(() => dispatchEvent(new Event("focus")));
+          return page.locator("#session-recovery").isVisible();
+        }).toBe(state !== "active");
+        if (state === "waiting") await expect(page.locator("#session-continue")).toBeVisible();
+        if (state === "stopped") await expect(page.locator("#message-send")).toBeDisabled();
+        await expect(composer).toHaveValue("Keep this unsent recovery draft");
+        assert(await composer.evaluate(element => element === window.recoveryComposer), "recovery replaced composer");
+      }
+      recoveryOverride = null;
+      await composer.fill("");
 
       // A hidden document retains the last display while it obtains fresh timing.
       await page.evaluate(() => {

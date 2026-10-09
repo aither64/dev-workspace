@@ -722,6 +722,9 @@ module WorkspaceAutoArchive
       activity
     rescue ObservationFailure
       raise
+    rescue DevSession::CommandError => e
+      code = e.status.exitstatus == 75 ? 'transport_unavailable' : 'observation_unavailable'
+      raise ObservationFailure.new(code, 'Conversation activity cannot be verified.')
     rescue StandardError
       raise ObservationFailure.new('observation_unavailable', 'Conversation activity cannot be verified.')
     end

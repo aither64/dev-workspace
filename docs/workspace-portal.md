@@ -229,6 +229,74 @@ mode is shown as pending and plan actions stay hidden. The tab retries metadata
 reads with backoff. Activity reads have a five-second budget while active and
 a thirty-second budget while idle; focus and reconnection prompt a fresh read.
 
+## Session recovery after runtime loss
+
+The portal restores access to previously running sessions when tmux runtime
+state is lost. It keeps the exact root thread and saved conversation. Native
+threads remain unloaded until Send, Continue, queue Start, or a team assignment
+explicitly activates the addressed thread. Cold history, pending-request and
+queue reads do not subscribe to native events or refresh thread instructions.
+Saved active goals and queues therefore remain dormant. A portal-only restart
+preserves execution permission when the App Server socket generation matches.
+
+The session page reports stopped, recovering, waiting, active or failed state.
+Recovery refreshes the mounted page without replacing the composer or draft.
+Continue reuses one durable decision across retries, including requests from
+another browser. If there is queued work or an active goal, it activates that
+work. Otherwise it queues one visible continuation prompt with a stable ID.
+Cold Send uses the same native queue and preserves FIFO order.
+
+Private schema-1 recovery files live under
+`$DEV_WORKSPACES_STATE/session-recovery/<workspace-sha256>/<slug>.json`.
+They bind the canonical workspace, slug, root and socket, automatic restoration
+intent, continuation receipt, and active thread IDs. Execution permission
+applies only to the socket's boot ID, device, inode and creation timestamp.
+Writers use a private interprocess lock and an atomic, synced replacement;
+invalid or mismatched records refuse recovery. The canonical
+`dev-session resume` command owns terminal creation and existing lifecycle,
+generation and identity locks. Automatic restoration has two concurrent slots.
+Timeouts or a missing socket may retry; identity and lifecycle refusals remain
+visible for manual Retry after repair.
+
+All portal, CLI and observation clients share schema-3 submission receipts at
+`$DEV_WORKSPACES_STATE/submissions/<socket-path-sha256>.json`. The first read
+imports the previous socket-adjacent ledger under both interprocess locks when
+the persistent ledger is absent. The old ledger remains in place. Stop old
+writers before changing paths; mixed writers using different paths are not
+supported. Queued Send retries reconcile their queue/history receipt and never
+fall through to a second turn or steer.
+
+The runtime contract declares `sessionRecoveryPolicy: 1`. Once recovery records
+or persistent receipts exist, normal package switches refuse a target without
+that policy. Recover forward with a compatible package. Historical package
+commands do not enforce the new gate and are outside the supported rollback
+procedure. Workspace manifests, lifecycle journals, team rosters and native
+rollouts retain their existing formats.
+
+On the first upgrade, the portal seeds intent only from an exact verified live
+terminal and records which root or ready member threads are already loaded.
+Stopped sessions remain stopped. Deploy the complete application composition
+and matching host substrate before relying on restoration. Existing enabled
+user services and user lingering provide boot startup; recovery runs after the
+portal has its configured native endpoint. Verify restart behavior with private
+native and terminal fixtures, rather than rebooting an occupied development host.
+
+Existing browser and activity subscriptions check the recovery permission before
+every implicit native resume, including after a connection loss. A new App Server
+socket generation holds those subscriptions until explicit activation. Restarting
+only the portal keeps the permission for the unchanged native socket.
+
+Observation distinguishes exact saved queue receipts from unknown submissions.
+Verified queued work permits terminal restoration and remains a busy condition
+for archival. Continue retires its decision after successful activation; a new
+socket generation or explicit stop also clears a pending decision. A lost
+activation response retains the same receipt for retry.
+
+Native connection failures and request deadlines cross the helper boundary as
+`transport_unavailable` observations or exit status 75. The recovery coordinator
+retries them after its backoff. Identity, lifecycle and malformed-state refusals
+require explicit Retry after repair.
+
 ## User-profile state
 
 The default paths are:

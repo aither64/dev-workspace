@@ -384,6 +384,7 @@ team member. That watcher has no persistent roster identity.
 
 ```sh
 dev-session attach api-token-rotation
+dev-session resume api-token-rotation
 dev-session fork api-token-rotation alternate-approach
 dev-session sync api-token-rotation
 dev-session stop api-token-rotation
@@ -411,10 +412,32 @@ Codex settings.
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no
 longer exists, and it leaves user-created windows untouched.
 
+`resume` restores terminal authority and portal access for the exact retained
+Codex conversation. It reads saved history without loading the thread or
+starting work. A ready creation or an ordinary retained manifest, positive
+native identity and submission evidence, and the selected runtime provenance
+are required. An interrupted terminal recovery reuses its start journal and
+tmux identity. Conflicting lifecycle work must finish first.
+
+After a host or App Server restart, the portal automatically restores sessions
+whose durable recovery intent was enabled while they were running. Saved
+messages, queues and active goals wait for user action. **Continue** activates
+the existing queue or active goal; when neither exists it queues one visible
+continuation prompt. **Send** queues the new message before activation, behind
+older queued messages. Retained team members stay on hold until addressed or
+assigned. **Resume session** restores a stopped session; **Retry recovery**
+retries a failed restoration. The composer keeps its draft during these status
+updates. A portal-only restart preserves work on the same App Server.
+
 `stop` only kills the exact managed tmux session and leaves all files and
 worktrees in place. It asks you to type the exact session slug before making
 the change. Use it when you want to pause terminal access without archiving the
 initiative.
+
+`stop` also disables automatic restoration. Archive disables restoration and
+execution permission; delete removes the matching private recovery record.
+Explicit `start` or `attach` permits the retained root to run. `sync` leaves a
+recovered conversation on hold.
 
 `current` prints the active slug and nothing else. It resolves the slug from the
 managed tmux session environment, the caller's exact managed tmux pane, or a

@@ -2284,9 +2284,12 @@ func TestStoppedCompleteAndArchivedSessionsKeepVerifiedReadOnlyTranscripts(t *te
 				t.Fatalf("page status/body = %d %q", page.Code, page.Body.String())
 			}
 			for _, control := range []string{`id="pending"`, `id="message-form"`, `id="interrupt"`} {
-				if strings.Contains(page.Body.String(), control) {
-					t.Fatalf("read-only page contains %s", control)
+				if strings.Contains(page.Body.String(), control) == testCase.finalized {
+					t.Fatalf("recovery/archived page has wrong visibility for %s", control)
 				}
+			}
+			if !testCase.finalized && !strings.Contains(page.Body.String(), `id="message-send" type="submit" disabled`) {
+				t.Fatal("stopped session enabled Send before recovery")
 			}
 
 			api := httptest.NewRecorder()

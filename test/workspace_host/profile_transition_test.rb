@@ -3,6 +3,27 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_recovery_state_blocks_a_predecessor_that_ignores_holds_and_receipts
+    with_transition_host do |host, paths|
+      state = host.instance_variable_get(:@state)
+      predecessor = make_package(paths.fetch(:root), 'predecessor', recovery_policy: nil)
+      compatible = make_package(paths.fetch(:root), 'compatible')
+      host.send(:require_compatible_session_recovery!, predecessor)
+      %w[session-recovery submissions].each do |kind|
+        directory = File.join(state, kind, 'scope')
+        FileUtils.mkdir_p(directory)
+        record = File.join(directory, 'example.json')
+        File.write(record, '{}')
+        error = assert_raises(DevWorkspaceHost::Error) do
+          host.send(:require_compatible_session_recovery!, predecessor)
+        end
+        assert_includes(error.message, 'execution holds and durable submission receipts')
+        host.send(:require_compatible_session_recovery!, compatible)
+        File.unlink(record)
+      end
+    end
+  end
+
   def test_switch_retains_codex_with_the_profile_generation_and_restarts_as_one_pair
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))

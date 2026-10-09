@@ -68,6 +68,9 @@ func (s *Server) startActivityMonitor() {
 	observer := codex.NewWithOptions(s.config.CodexSocket, codex.ClientOptions{
 		ClientInfo:   codex.ClientInfo{Name: "dev-workspace-observer", Title: "Workspace activity", Version: "0.1.0"},
 		ObserverOnly: true, ActivityRecorder: recorder,
+		AllowImplicitResume: func(thread string) bool {
+			return !s.config.RecoverSessions || s.recoveryStore().AllowsImplicitResume(s.config.CodexSocket, thread)
+		},
 	})
 	s.activity = &activityMonitor{server: s, observer: observer, recorder: recorder, workers: make(map[string]activityWorker)}
 	s.operationWG.Add(1)
@@ -217,6 +220,9 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 
 func (m *activityMonitor) owns(summary session.Summary) bool {
 	config := m.server.config
+	if m.server.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+		return false
+	}
 	if summary.Archived || summary.Codex.ThreadID == "" ||
 		summary.Codex.SocketPath != config.CodexSocket || summary.Creation.State != "ready" ||
 		(summary.Creation.GoalSHA256 != "" && !summary.Creation.InitialGoalSent) {

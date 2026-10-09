@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
@@ -140,7 +141,10 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 				return err
 			}
 			again, err := service.retainedMemberArchiveState(ctx, member, cwd)
-			if err != nil || archived != again {
+			if err != nil {
+				return err
+			}
+			if archived != again {
 				return errors.New("retained member identity changed during observation")
 			}
 			if !archived {
@@ -151,7 +155,10 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 			return err
 		}
 		rootAgain, err := observer.ProveArchivedRootThread(ctx, rootThreadID, cwd)
-		if err != nil || rootAgain != rootState {
+		if err != nil {
+			return err
+		}
+		if rootAgain != rootState {
 			return errors.New("retained root changed during observation")
 		}
 		after, err := load()
@@ -192,6 +199,10 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 	})
 	if err != nil {
 		code := "retained_set_unverified"
+		var transport *codex.TransportError
+		if errors.As(err, &transport) {
+			code = "transport_unavailable"
+		}
 		var failure *workspacecodex.ObservationError
 		if errors.As(err, &failure) {
 			code = failure.Code

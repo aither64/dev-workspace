@@ -2,6 +2,7 @@ package workspacecodex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,16 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/coder/websocket"
 )
+
+func TestObservationPreservesTemporaryTransportDiagnostic(t *testing.T) {
+	client := NewWithOptions(filepath.Join(t.TempDir(), "missing.sock"), "", codex.ClientOptions{})
+	defer client.Close()
+	_, err := client.ObserveThreadIdentity(context.Background(), "root", "/workspace/work/example", "", ArchiveActive)
+	var failure *ObservationError
+	if !errors.As(err, &failure) || failure.Code != "transport_unavailable" {
+		t.Fatal("transport became identity refusal", err)
+	}
+}
 
 func TestLatestTurnObservationValidatesSemanticBoundaries(t *testing.T) {
 	now := time.Unix(1000, 0)

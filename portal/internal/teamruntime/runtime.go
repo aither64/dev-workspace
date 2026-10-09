@@ -1915,13 +1915,19 @@ func (service Service) retainedMemberArchiveState(ctx context.Context, member Me
 	}
 	if member.ProjectID != "" {
 		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
-		if err != nil || !materialized {
-			return false, fmt.Errorf("retained member is not materialized: %v", err)
+		if err != nil {
+			return false, fmt.Errorf("retained member is not materialized: %w", err)
+		}
+		if !materialized {
+			return false, errors.New("retained member is not materialized")
 		}
 	} else {
 		active, err := service.Client.ProveMaterializedActiveThread(ctx, member.Thread, cwd)
-		if err != nil || active != workspacecodex.ArchiveActive {
-			return false, fmt.Errorf("legacy retained member is not materialized: %v", err)
+		if err != nil {
+			return false, fmt.Errorf("legacy retained member is not materialized: %w", err)
+		}
+		if active != workspacecodex.ArchiveActive {
+			return false, errors.New("legacy retained member is not materialized")
 		}
 	}
 	return false, nil

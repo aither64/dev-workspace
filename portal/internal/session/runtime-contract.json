@@ -3,6 +3,7 @@
   "developmentClusterTransitionPolicy": 3,
   "runtimeAuthorityIdentityPolicy": 1,
   "livePackageSwitchPolicy": 1,
+  "sessionRecoveryPolicy": 1,
   "agentTeamRegistration": {
     "helperSchema": 1,
     "policy": 1,

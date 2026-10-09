@@ -101,7 +101,7 @@ func RequireExactActiveConversations(ctx context.Context, client ArchiveDiscover
 func requireLoadedConversationScope(ctx context.Context, client ArchiveDiscoveryClient, cwd, rootID string, retained map[string]string, seen map[string]codex.ThreadMetadata) error {
 	ids, err := client.LoadedThreadIDs(ctx)
 	if err != nil {
-		return observationFailure("loaded_discovery_unverified", "Loaded conversation discovery cannot be verified.")
+		return observationReadFailure(err, "loaded_discovery_unverified", "Loaded conversation discovery cannot be verified.")
 	}
 	loaded := map[string]bool{}
 	for _, id := range ids {
@@ -110,7 +110,10 @@ func requireLoadedConversationScope(ctx context.Context, client ArchiveDiscovery
 		}
 		loaded[id] = true
 		metadata, err := client.ReadThreadMetadata(ctx, id, false)
-		if err != nil || metadata.ID != id || !canonicalObservationCWD(metadata.Cwd) {
+		if err != nil {
+			return observationReadFailure(err, "loaded_identity_unverified", "Loaded conversation directory cannot be verified.")
+		}
+		if metadata.ID != id || !canonicalObservationCWD(metadata.Cwd) {
 			return observationFailure("loaded_identity_unverified", "Loaded conversation directory cannot be verified.")
 		}
 		project, known := retained[id]
@@ -148,7 +151,7 @@ func RequireNoConversations(ctx context.Context, client ArchiveDiscoveryClient, 
 			Cwd: cwd, Archived: &archived, SourceKinds: ArchiveDiscoverySourceKinds(), Limit: 1, SortDirection: "asc",
 		})
 		if err != nil {
-			return observationFailure("absence_unavailable", "Conversation absence cannot be verified.")
+			return observationReadFailure(err, "absence_unavailable", "Conversation absence cannot be verified.")
 		}
 		if len(threads) != 0 || next != nil {
 			return observationFailure("conversation_residue", "A conversation or incomplete discovery contradicts threadless tracking.")

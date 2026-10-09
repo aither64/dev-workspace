@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/aither64/codex-web/codex"
 )
 
 // ObservationDiagnostic carries policy meaning independently of human text.
@@ -49,6 +51,16 @@ type latestTurn struct {
 
 func observationFailure(code, message string) error {
 	return &ObservationError{Code: code, Message: message}
+}
+
+// Transport failures remain distinct from positive identity/receipt refusals
+// when the observation crosses the Go/Ruby recovery helper boundary.
+func observationReadFailure(err error, code, message string) error {
+	var transport *codex.TransportError
+	if errors.As(err, &transport) {
+		return observationFailure("transport_unavailable", "Conversation transport is temporarily unavailable.")
+	}
+	return observationFailure(code, message)
 }
 
 func observationID(value string, required bool) bool {
@@ -120,7 +132,7 @@ func (c *Client) latestTurn(ctx context.Context, threadID string) (*latestTurn, 
 		"threadId": threadID, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded",
 	}, &raw)
 	if err != nil {
-		return nil, observationFailure("history_unavailable", "Latest conversation history is unavailable.")
+		return nil, observationReadFailure(err, "history_unavailable", "Latest conversation history is unavailable.")
 	}
 	turn, err := decodeLatestTurn(raw, time.Now())
 	if err != nil {
@@ -153,7 +165,10 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 	}
 	before, err := c.ReadThreadMetadata(ctx, threadID, false)
 	expected := ArchivedThreadIdentity{ThreadID: threadID, Cwd: cwd, ProjectID: projectID, SourceKind: threadSourceKind}
-	if err != nil || validateArchiveMetadata(before, expected) != nil {
+	if err != nil {
+		return ThreadObservation{}, observationReadFailure(err, "identity_unverified", "Conversation identity cannot be verified.")
+	}
+	if validateArchiveMetadata(before, expected) != nil {
 		return ThreadObservation{}, observationFailure("identity_unverified", "Conversation identity cannot be verified.")
 	}
 	turn, err := c.latestTurn(ctx, threadID)
@@ -184,7 +199,7 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 	} else if state == ArchiveActive || state == ArchiveFresh {
 		prompts, err := c.PromptsWithItems(ctx, threadID)
 		if err != nil {
-			return ThreadObservation{}, observationFailure("requests_unverified", "Pending conversation requests cannot be verified.")
+			return ThreadObservation{}, observationReadFailure(err, "requests_unverified", "Pending conversation requests cannot be verified.")
 		}
 		if len(prompts) > 256 {
 			return ThreadObservation{}, observationFailure("requests_unbounded", "Pending conversation requests exceed the observation bound.")
@@ -200,7 +215,7 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 		}
 		queue, err := c.ListQueue(ctx, threadID)
 		if err != nil {
-			return ThreadObservation{}, observationFailure("queue_unverified", "Queued conversation input cannot be verified.")
+			return ThreadObservation{}, observationReadFailure(err, "queue_unverified", "Queued conversation input cannot be verified.")
 		}
 		if len(queue) > 256 {
 			return ThreadObservation{}, observationFailure("queue_unbounded", "Queued conversation input exceeds the observation bound.")
@@ -216,8 +231,8 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 		}
 		// The public owner proves resolution but exposes no attempt snapshot.
 		// An error is unknown activity; no private ledger or error text is parsed.
-		if err := c.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
-			return ThreadObservation{}, observationFailure("submission_unverified", "Conversation submissions cannot be proved resolved.")
+		if err := c.RequireSubmissionAttemptsKnown(ctx, threadID); err != nil {
+			return ThreadObservation{}, observationReadFailure(err, "submission_unverified", "Conversation submissions cannot be proved resolved.")
 		}
 	} else {
 		return ThreadObservation{}, observationFailure("persistence_unverified", "Conversation persistence cannot be verified.")
@@ -230,7 +245,10 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 		return ThreadObservation{}, observationFailure("activity_changed", "Conversation activity changed during observation.")
 	}
 	after, err := c.ReadThreadMetadata(ctx, threadID, false)
-	if err != nil || validateArchiveMetadata(after, expected) != nil || !reflect.DeepEqual(before.Path, after.Path) {
+	if err != nil {
+		return ThreadObservation{}, observationReadFailure(err, "identity_changed", "Conversation identity changed during observation.")
+	}
+	if validateArchiveMetadata(after, expected) != nil || !reflect.DeepEqual(before.Path, after.Path) {
 		return ThreadObservation{}, observationFailure("identity_changed", "Conversation identity changed during observation.")
 	}
 	sort.Slice(requests, func(i, j int) bool { return fmt.Sprint(requests[i]) < fmt.Sprint(requests[j]) })

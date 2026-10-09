@@ -68,7 +68,8 @@ class WorkspaceHostTest < Minitest::Test
     authority_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch(
       'runtimeAuthorityIdentityPolicy'
     ),
-    live_switch_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('livePackageSwitchPolicy')
+    live_switch_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('livePackageSwitchPolicy'),
+    recovery_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('sessionRecoveryPolicy')
   )
     package = File.join(parent, name)
     command = File.join(package, 'bin', 'workspace-host')
@@ -87,6 +88,7 @@ class WorkspaceHostTest < Minitest::Test
       }
       contract_data['runtimeAuthorityIdentityPolicy'] = authority_policy if authority_policy
       contract_data['livePackageSwitchPolicy'] = live_switch_policy if live_switch_policy
+      contract_data['sessionRecoveryPolicy'] = recovery_policy if recovery_policy
       File.write(contract, JSON.generate(contract_data))
       %w[alpha beta].each do |kind|
         helper = File.join(package, 'libexec/workspace-portal', "#{kind}-devcluster")

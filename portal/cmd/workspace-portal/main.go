@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -37,16 +39,29 @@ const sessionLifecycleDeveloperInstructions = "Completing work, preparing a hand
 	"exact action for this exact session in the current conversation; otherwise leave the " +
 	"session open."
 
-func newCodexClient(socket, workspace string) *workspacecodex.Client {
-	return workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
+func newCodexClient(socket, workspace string, stateRoots ...string) *workspacecodex.Client {
+	stateRoot := os.Getenv("DEV_WORKSPACES_STATE")
+	if len(stateRoots) > 0 {
+		stateRoot = stateRoots[0]
+	}
+	ledgerPath := socket + ".submission-attempts-v3.json"
+	legacyPath := ""
+	if stateRoot != "" {
+		legacyPath = ledgerPath
+		identity := sha256.Sum256([]byte(socket))
+		ledgerPath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".json")
+	}
+	client := workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
 		ClientInfo: codex.ClientInfo{
 			Name: "dev-workspace", Title: "Development Workspace", Version: "0.1.0",
 		},
 		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
 		PreserveThreadInstructionsOnResume: true,
 		// Keep the deployed retry identity while making storage ownership explicit.
-		SubmissionLedgerPath: socket + ".submission-attempts-v3.json",
+		SubmissionLedgerPath: ledgerPath, LegacySubmissionLedgerPath: legacyPath,
 	})
+	client.RecoveryRoot = stateRoot
+	return client
 }
 
 func rootThreadSettings(model, effort, slug, workspace, leadInstructions string) codex.ThreadSettings {
@@ -91,6 +106,10 @@ func (runtime threadRuntime) environment() map[string]string {
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "workspace-portal:", err)
+		var transport *codex.TransportError
+		if errors.As(err, &transport) {
+			os.Exit(75)
+		}
 		os.Exit(1)
 	}
 }
@@ -106,6 +125,8 @@ func run(args []string) error {
 		return routeWorkspaces(args[1:])
 	case "session":
 		return sessionCommand(args[1:])
+	case "recovery":
+		return recoveryCommand(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
 	case "team":
@@ -286,7 +307,7 @@ func serve(args []string) error {
 	if naming != nil {
 		namingSocket, namingCatalog = naming.socket, naming.catalog
 	}
-	codexClient := newCodexClient(options.codexSocket, options.workspace)
+	codexClient := newCodexClient(options.codexSocket, options.workspace, options.userStateRoot)
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		ObserveActivity: true,
@@ -296,7 +317,8 @@ func serve(args []string) error {
 		HostLabel:      options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
-		PackageRoot: options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
+		RecoverSessions: true,
+		PackageRoot:     options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
 		CodexSocket: options.codexSocket, CodexVersion: options.codexVersion,
 		NamingSocket: namingSocket, NamingModelCatalogFile: namingCatalog,
 		ClusterProviders: options.clusterProviders,
@@ -489,7 +511,7 @@ func teamCommand(args []string) error {
 			teamCatalog = installed.Catalog
 		}
 	}
-	client := newCodexClient(*socket, *workspace)
+	client := newCodexClient(*socket, *workspace, *stateRoot)
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -662,7 +684,7 @@ func threadCommand(args []string) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	client := newCodexClient(*socket, *workspace)
+	client := newCodexClient(*socket, *workspace, *userStateRoot)
 	defer client.Close()
 	// Directory discovery can repair a large persisted history. Keep ordinary
 	// metadata commands short, but allow recovery to complete that scan.

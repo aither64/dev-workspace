@@ -604,6 +604,7 @@ module DevWorkspaceHost
       end
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
+      require_compatible_session_recovery!(candidate)
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
       system! candidate_host, 'check-codex', '--codex', current_codex
@@ -872,6 +873,7 @@ module DevWorkspaceHost
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
+      require_compatible_session_recovery!(package_root)
       # The stable dispatcher invokes this method from the selected candidate.
       # Relink package-specific commands and skills here so a successful switch
       # never leaves them attached to the generation that initiated it.
@@ -2398,6 +2400,23 @@ module DevWorkspaceHost
       raise Error,
             "workspace package transition is blocked by identity-bound runtime authorities: " \
             "#{authorities.join(', ')}; target package cannot validate their tmux identities"
+    end
+
+    # Once durable execution holds and submission receipts exist, a predecessor
+    # that ignores them cannot safely restore sessions or reconcile retries.
+    def require_compatible_session_recovery!(package)
+      state = %w[session-recovery submissions].flat_map do |name|
+        Dir.glob(File.join(@state, name, '**', '*.json'))
+      end
+      return if state.empty?
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path), 'session recovery contract', 64 * 1024)
+      return if contract['sessionRecoveryPolicy'] == RUNTIME_CONTRACT.fetch('sessionRecoveryPolicy')
+
+      raise Error, 'target workspace package cannot preserve session execution holds and durable submission receipts'
+    rescue SystemCallError
+      raise Error, 'target workspace package has no readable session recovery contract'
     end
 
     def identity_bound_runtime_authorities(entries = registry.entries)

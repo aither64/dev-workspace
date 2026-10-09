@@ -24,7 +24,7 @@ jobs:
         run: |
           check_names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
           mapfile -t checks < <(
-            jq -r '.[] | select(. != "host-module-idempotency") | ".#checks.x86_64-linux." + .' <<< "$check_names"
+            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot") | ".#checks.x86_64-linux." + .' <<< "$check_names"
           )
           nix build --no-link --print-build-logs "${checks[@]}"
   host:
@@ -41,5 +41,8 @@ jobs:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
             extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
-      - name: Activation, renewal and rollback smoke test
-        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.host-module-idempotency
+      - name: Activation, renewal, rollback and user-service boot tests
+        run: |
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.host-module-idempotency \
+            .#checks.x86_64-linux.session-recovery-boot

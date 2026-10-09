@@ -64,6 +64,7 @@ type codexController interface {
 }
 
 type Config struct {
+	RecoverSessions        bool
 	ObserveActivity        bool
 	CollectUploads         bool
 	Workspace              string
@@ -154,6 +155,9 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	recoveryMu             sync.Mutex
+	recoveryOperations     map[string]recoveryStatus
+	recoveryJobs           map[string]bool
 	uploadCreationMu       conversation.MutationLocker
 	uploadStore            *uploads.Store
 	uploadHandler          http.Handler
@@ -333,6 +337,14 @@ type agentTeamRow struct {
 }
 
 func New(config Config) (*Server, error) {
+	if config.RecoverSessions && (config.UserStateRoot == "" || config.AuthorityDir == "" || config.DevSession == "" || config.Codex == nil) {
+		return nil, errors.New("session recovery requires complete private runtime configuration")
+	}
+	if config.RecoverSessions {
+		if _, ok := config.Codex.(recoveryController); !ok {
+			return nil, errors.New("session recovery requires a cold recovery client")
+		}
+	}
 	var installedTeams *agentteams.Installed
 	if config.Logger == nil {
 		config.Logger = log.Default()
@@ -489,6 +501,7 @@ func New(config Config) (*Server, error) {
 	server.displayRefreshWG.Add(1)
 	go server.runDisplayRefreshes()
 	server.startUploadCollector()
+	server.startRecovery()
 	server.startActivityMonitor()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
@@ -558,7 +571,7 @@ func (s *Server) reconcileThreadInstructions() {
 		current := make(map[string]string)
 		currentSummaries := make(map[string]*session.Summary)
 		for _, summary := range summaries {
-			if !summary.Archived && summary.Codex.ThreadID != "" {
+			if !summary.Archived && summary.Codex.ThreadID != "" && !s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
 				current[summary.Slug] = summary.Codex.ThreadID
 				currentSummaries[summary.Slug] = &summary
 			}
@@ -1156,6 +1169,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	if lifecycleIdentityErr != nil {
 		data.Error = "Session lifecycle identity is unavailable: " + lifecycleIdentityErr.Error()
 	}
+	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, data.SelectedThreadID)
 	data.PendingLifecycle, err = session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil {
 		data.Error = "Session lifecycle state is unsafe: " + err.Error()
@@ -1258,8 +1272,22 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
+	recovery := s.recoveryStatus(summary)
+	if address := r.URL.Query().Get("member"); address != "" && data.DirectTeam != nil && summary.Interactive {
+		for _, member := range data.DirectTeam.Members {
+			if member.Address == address && member.State == "ready" && member.RetireIntent == "" {
+				if s.recoveryHeld(summary.Slug, member.Thread) {
+					recovery.State = "waiting"
+				} else {
+					recovery.State = "active"
+				}
+			}
+		}
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"currentTarget":    s.lifecycleSnapshot(summary.Slug),
+		"recovery":         recovery,
+		"interactive":      summary.Interactive,
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
 		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
 		"teamHTML":     members.String(),
@@ -1792,6 +1820,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && (parts[1] == "resume" || parts[1] == "continue" || parts[1] == "recovery") {
+		s.recoveryAPI(w, r, summary, parts[1])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "file" {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -3163,6 +3195,8 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 func (s *Server) normalizeInteractivity(parent context.Context, summary *session.Summary) {
 	persisted := summary.Codex
 	summary.Interactive = false
+	summary.RecoveryReady = false
+	summary.ExecutionHeld = s.config.RecoverSessions
 	summary.Codex = session.Codex{}
 	summary.Tmux = session.Tmux{}
 	if s.config.VerifyThread == nil || s.config.CodexSocket == "" || s.config.CodexVersion == "" ||
@@ -3183,7 +3217,11 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	if !summary.HasCreation() && RequireObservationReceipts(summary, s.config.UserStateRoot, "", "") != nil {
 		creationReady = false
 	}
-	if summary.Archived || !creationReady || s.config.AuthorityDir == "" {
+	if summary.Archived || !creationReady {
+		return
+	}
+	summary.RecoveryReady = true
+	if s.config.AuthorityDir == "" {
 		return
 	}
 	authority, err := session.LoadRuntimeAuthority(
@@ -3210,6 +3248,7 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 		CodexClientVersion: authority.CodexClientVersion,
 	}
 	summary.Interactive = true
+	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, persisted.ThreadID)
 }
 
 // Creation-less interaction uses the same current public root/team proof as
@@ -3375,6 +3414,16 @@ func (s *Server) resolveConversation(
 		conversationClient = memberClient
 		if _, ok := s.config.Codex.(conversation.TranscriptPageReader); ok {
 			conversationClient = memberPagedConversationClient{memberClient}
+		}
+	}
+	held := s.recoveryHeld(slug, threadID)
+	if interactive && held {
+		capabilities = conversation.Capabilities{Read: true, Pending: true, QueueRead: true, Send: true, Queue: true}
+		coldClient := recoveryConversationClient{Client: conversationClient, server: s, slug: slug, root: summary.Codex.ThreadID, thread: threadID, address: address}
+		if _, ok := conversationClient.(conversation.TranscriptPageReader); ok {
+			conversationClient = recoveryPagedConversationClient{coldClient}
+		} else {
+			conversationClient = coldClient
 		}
 	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)

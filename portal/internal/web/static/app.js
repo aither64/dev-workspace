@@ -10,7 +10,7 @@
     if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; throw error; }
     return data;
   };
-  const createSessionClient = (slug, request, conversation) => ({
+  const createSessionClient = (slug, request, conversation, selectedMember = "") => ({
     thread: conversation?.thread,
     threadPage: conversation?.threadPage,
     activity: conversation?.activity,
@@ -30,7 +30,7 @@
     releaseCluster: (kind) => request(apiPath(slug, "release-cluster"), {
       method: "POST", body: JSON.stringify({kind}),
     }),
-    details: (options) => request(apiPath(slug, "details"), options),
+    details: (options) => request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, options),
     autoArchive: () => request(apiPath(slug, "auto-archive")),
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
@@ -1073,7 +1073,9 @@
     const warning = document.getElementById("revive-abandoned-warning");
     if (warning) warning.hidden = current.lifecycle !== "abandoned";
   };
-  const interactive = body.dataset.interactive === "true";
+  let interactive = body.dataset.interactive === "true";
+  let executionHeld = body.dataset.executionHeld === "true";
+  let applyRecoveryStatus = () => {};
   const request = createRequest(fetch.bind(globalThis));
   if (body.hasAttribute("data-automatic-archival")) {
     const status = document.getElementById("workspace-auto-archive-status");
@@ -2271,7 +2273,7 @@
     basePath: "/codex",
     ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
-  const client = createSessionClient(slug, request, conversation);
+  const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "");
   document.getElementById("codex-member")?.addEventListener("change", (event) => {
     const target = new URL(location.href);
     const member = event.target.value;
@@ -2856,6 +2858,7 @@
       const payload = await client.details({signal: read.signal});
       if (!read.isCurrent()) return;
       refreshLifecycleTarget(payload.currentTarget);
+      applyRecoveryStatus(payload.recovery, payload.interactive);
       if (!releasingCluster && typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
@@ -3155,7 +3158,7 @@
   const status = document.getElementById("codex-status");
   if (!transcript) return;
 
-  const composerView = interactive ? createComposerView(
+  const composerView = document.getElementById("message-form") ? createComposerView(
     document.getElementById("plan-actions"), document.getElementById("message-form"), pending,
   ) : null;
   let sync = null;
@@ -3249,7 +3252,7 @@
     activityTimer = setTimeout(() => { activityTimer = null; void refreshActivity(); }, delay);
   };
   const refreshActivity = (force = false) => {
-    if (!client.activity || document.hidden || pageReads.paused) return Promise.resolve();
+    if (executionHeld || !client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead) return activityRead;
     const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
@@ -3523,15 +3526,15 @@
   const updateMessageActions = () => {
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !composerUploadReady || liveSettingsSaving; }
-    if (queueButton) queueButton.disabled = !composerUploadReady || liveSettingsSaving;
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving; }
+    if (queueButton) queueButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving;
     if (queueButton) queueButton.hidden = !threadActive;
-    if (queueStart) queueStart.disabled = threadActive || queueStartInFlight || liveSettingsSaving;
-    composerView?.setInterruptEnabled(threadActive);
+    if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
+    composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive);
   };
 
   const saveCollaborationMode = async (mode) => {
-    if (liveSettingsSaving) return;
+    if (!interactive || executionHeld || liveSettingsSaving) return;
     const controls = Array.from(document.querySelectorAll(
       "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
     ));
@@ -3554,6 +3557,7 @@
   };
 
   const loadCollaborationModes = async () => {
+    if (!interactive || executionHeld) return;
     try {
       collaborationModes = await client.modes();
       renderCollaborationModes(
@@ -4086,7 +4090,7 @@
       box.append(notice);
       return box;
     }
-    if (!interactive) return box;
+    if (!interactive || executionHeld) return box;
     if (!entry.authorityAvailable) {
       const notice = document.createElement("p");
       notice.className = "notice warning";
@@ -4440,7 +4444,7 @@
     if (queueStart) {
       queueStart.dataset.queuedSubmissionId = entries[0]?.id || "";
       queueStart.hidden = threadActive;
-      queueStart.disabled = threadActive || queueStartInFlight || liveSettingsSaving;
+      queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     }
   };
 
@@ -4460,7 +4464,7 @@
     queueRetryTimer = null;
     const read = pageReads.begin(refreshPolicy.queueDeadlineMs);
     queueNotice.begin({manual});
-    queueRead = client.reconcileQueue({signal: read.signal}).then(() => client.queue({signal: read.signal})).then((entries) => {
+    queueRead = (executionHeld ? Promise.resolve() : client.reconcileQueue({signal: read.signal})).then(() => client.queue({signal: read.signal})).then((entries) => {
       if (!read.isCurrent()) return;
       if (!Array.isArray(entries)) throw new Error("Invalid queue");
       renderQueue(entries);
@@ -4503,6 +4507,7 @@
   };
 
   const recoverPlanAttempts = (latestTurnId) => {
+    if (!interactive || executionHeld) return;
     for (const attempt of pendingMessages.values()) {
       if (["accepted", "observed"].includes(attempt.state) || inFlightMessageIDs.has(attempt.id)) continue;
       const request = planRecoveryRequest(attempt, latestTurnId);
@@ -4526,7 +4531,7 @@
   };
 
   const form = document.getElementById("message-form");
-  if (form && interactive) {
+  if (form) {
     const textarea = form.elements.message;
     composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
       basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
@@ -4539,7 +4544,7 @@
     let queueAttemptStorage = null;
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
-      if (liveSettingsSaving) return;
+      if (!interactive || liveSettingsSaving) return;
       const message = textarea.value.trim();
       if (!message && !composerUploads.count()) return;
       let attachments;
@@ -4819,8 +4824,8 @@
     liveSettingsController = {
       render() {
         summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
-        editButton.disabled = !interactive || !threadIdle || saving;
-        applyButton.disabled = !interactive || !threadIdle || saving || !dirty || !validPair();
+        editButton.disabled = !interactive || executionHeld || !threadIdle || saving;
+        applyButton.disabled = !interactive || executionHeld || !threadIdle || saving || !dirty || !validPair();
         cancelButton.disabled = saving;
         if (!models.length) return;
         restoreDraftSelect(liveModelSelect, draft.model, "Selected model is unavailable");
@@ -4830,7 +4835,7 @@
         restoreDraftSelect(liveEffortSelect, draft.effort, "Selected reasoning effort is unavailable");
         if (draft.effort) liveEffortSelect.value = draft.effort;
         else liveEffortSelect.selectedIndex = -1;
-        const editable = interactive && threadIdle && !saving;
+        const editable = interactive && !executionHeld && threadIdle && !saving;
         liveModelSelect.disabled = !editable;
         liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
         applyButton.disabled = !editable || !dirty || !validPair();
@@ -4861,7 +4866,7 @@
         notice = ""; dirty = false; this.render();
       },
       async apply() {
-        if (!interactive || !threadIdle || saving || !dirty || !validPair()) return;
+        if (!interactive || executionHeld || !threadIdle || saving || !dirty || !validPair()) return;
         const selected = {model: draft.model, effort: draft.effort};
         saving = true; liveSettingsSaving = true; const attempt = ++writeGeneration;
         if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings…";
@@ -4964,8 +4969,10 @@
   });
 
   let lastSyncStatus = "";
+  const restartConversationSync = () => {
+  sync?.destroy();
   sync = conversationAssets.createConversationSync({
-    live: interactive, eventsPath: interactive ? client.eventsPath() : null,
+    live: interactive && !executionHeld, eventsPath: interactive && !executionHeld ? client.eventsPath() : null,
     read: signal => {
       const settingsGeneration = settingsWriteGeneration;
       const reading = pagingHelpersAvailable ?
@@ -4995,7 +5002,62 @@
   void refreshPending();
   void refreshQueue();
   void refreshActivity(true);
+  if (interactive && !executionHeld) loadCollaborationModes();
+  };
   setInterval(() => { void refreshPending(); }, refreshPolicy.pendingMs);
   setInterval(() => { void refreshQueue(); }, refreshPolicy.queueMs);
-  if (interactive) loadCollaborationModes();
+  const recoveryPanel = document.getElementById("session-recovery");
+  const resumeButton = document.getElementById("session-resume");
+  const continueButton = document.getElementById("session-continue");
+  let continueRequestID = null;
+  try { continueRequestID = sessionStorage.getItem(`workspace-portal.continue.${slug}`); } catch (_) {}
+  applyRecoveryStatus = (recovery, runtimeInteractive) => {
+    if (!recoveryPanel || !recovery) return;
+    const wasInteractive = interactive, wasHeld = executionHeld;
+    interactive = runtimeInteractive === true;
+    executionHeld = recovery.state !== "active";
+    const labels = {stopped: "This session is stopped. Resume it to restore portal access.",
+      recovering: "Restoring session access…", waiting: "Session restored. Saved work is waiting for you.",
+      active: "Session is active.", failed: "Session recovery failed."};
+    document.getElementById("session-recovery-message").textContent = recovery.error || labels[recovery.state] || "Checking session recovery…";
+    recoveryPanel.hidden = recovery.state === "active";
+    if (recovery.state === "active" && continueRequestID) {
+      try { sessionStorage.removeItem(`workspace-portal.continue.${slug}`); } catch (_) {}
+      continueRequestID = null;
+    }
+    resumeButton.hidden = !["stopped", "failed"].includes(recovery.state);
+    resumeButton.textContent = recovery.state === "failed" ? "Retry recovery" : "Resume session";
+    continueButton.hidden = recovery.state !== "waiting" || Boolean(body.dataset.selectedMember);
+    document.getElementById("message-send")?.toggleAttribute("disabled", !interactive);
+    document.getElementById("interrupt")?.toggleAttribute("disabled", !interactive || executionHeld);
+    document.getElementById("codex-settings-open")?.toggleAttribute("disabled", !interactive || executionHeld);
+    const modes = document.getElementById("codex-mode");
+    if (modes) modes.hidden = !interactive || executionHeld;
+    updateMessageActions();
+    liveSettingsController?.render();
+    if (wasInteractive !== interactive || wasHeld !== executionHeld) {
+      restartConversationSync();
+    }
+  };
+  const recoveryAction = async (operation, button) => {
+    button.disabled = true;
+    try {
+      let payload = {};
+      if (operation === "continue") {
+        if (!continueRequestID) {
+          continueRequestID = crypto.randomUUID();
+          sessionStorage.setItem(`workspace-portal.continue.${slug}`, continueRequestID);
+        }
+        payload.requestId = continueRequestID;
+      }
+      const result = await request(apiPath(slug, operation), {method: "POST", body: JSON.stringify(payload)});
+      applyRecoveryStatus(result, operation === "continue" || interactive);
+      void refreshSessionDetails();
+    } catch (error) { document.getElementById("session-recovery-message").textContent = error.message; }
+    finally { button.disabled = false; }
+  };
+  resumeButton?.addEventListener("click", () => void recoveryAction("resume", resumeButton));
+  continueButton?.addEventListener("click", () => void recoveryAction("continue", continueButton));
+  restartConversationSync();
+  void refreshSessionDetails();
 })();

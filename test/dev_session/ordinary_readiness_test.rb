@@ -137,6 +137,60 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_cold_resume_restores_exact_busy_root_without_loading_or_sending
+    with_workspace do |workspace|
+      slug = '2026-06-06-cold-resume'
+      runner, calls, out = ordinary_retained_runner_fixture(workspace, slug)
+      File.write(File.join(workspace, 'known-busy'), 'saved queued input')
+      created = []
+      original = runner.method(:create_tmux_session)
+      runner.define_singleton_method(:create_tmux_session) do |*args, **options|
+        created << options
+        original.call(*args, **options)
+      end
+      runner.resume(slug, as_is: true)
+      assert_equal(1, created.length)
+      assert_equal('retained-root', created.first.fetch(:thread_id))
+      assert_equal(false, created.first.fetch(:launch_codex))
+      recorded = File.readlines(calls).map { |line| JSON.parse(line) }
+      assert(recorded.any? { |args| args[0, 2] == ['session', 'observe'] })
+      refute(recorded.any? { |args| args[0, 2] == ['thread', 'create'] || args.include?('ensure-initial') })
+      assert_includes(out.string, 'saved work is waiting')
+      authority = JSON.parse(File.read(File.join(workspace, 'authority', slug + '.json')))
+      assert_equal('ready', authority.fetch('state'))
+      refute(File.exist?(runner.send(:start_journal_file, slug)))
+    end
+  end
+
+  def test_cold_resume_refuses_unverified_submissions_before_terminal_creation
+    with_workspace do |workspace|
+      slug = '2026-06-06-cold-unknown'
+      runner, calls, = ordinary_retained_runner_fixture(workspace, slug)
+      File.write(File.join(workspace, 'unknown-submission'), 'unresolved')
+      before = File.binread(File.join(workspace, 'work', slug, 'portal.yml'))
+      assert_raises(DevSession::Error) { runner.resume(slug, as_is: true) }
+      assert_equal(before, File.binread(File.join(workspace, 'work', slug, 'portal.yml')))
+      refute(File.exist?(runner.send(:start_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'authority', slug + '.json')))
+      refute(File.readlines(calls).any? { |line| JSON.parse(line)[0, 2] == ['thread', 'create'] })
+    end
+  end
+
+  def test_cold_resume_reports_temporary_native_failure_without_publishing_runtime
+    with_workspace do |workspace|
+      slug = '2026-06-06-cold-temporary'
+      runner, = ordinary_retained_runner_fixture(workspace, slug)
+      File.write(File.join(workspace, 'temporary-transport'), 'socket exists but RPC is unavailable')
+      error = assert_raises(DevSession::TemporaryRecoveryError) { runner.resume(slug, as_is: true) }
+      assert_includes(error.message, 'temporarily unavailable')
+      refute(File.exist?(runner.send(:start_journal_file, slug)))
+      refute(File.exist?(File.join(workspace, 'authority', slug + '.json')))
+      File.unlink(File.join(workspace, 'temporary-transport'))
+      runner.resume(slug, as_is: true)
+      assert(File.exist?(File.join(workspace, 'authority', slug + '.json')))
+    end
+  end
+
   def test_creationless_revive_preserves_root_scope_and_absence_of_creation
     skip 'git is not available' unless command_available?('git')
 
@@ -188,11 +242,12 @@ class DevSessionTest < Minitest::Test
         thread = manifest.dig('codex', 'thread_id')
         stat = File.lstat(root)
         identity = Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, thread]))
-        known = !File.exist?(File.join(workspace, 'unknown-submission'))
+        temporary = File.exist?(File.join(workspace, 'temporary-transport'))
+        known = !temporary && !File.exist?(File.join(workspace, 'unknown-submission'))
         idle = known && !File.exist?(File.join(workspace, 'known-busy'))
         token = Digest::SHA256.hexdigest('actual test activity')
         diagnostics = known ? (idle ? [] : [{ 'code' => 'queued_input', 'category' => 'busy', 'message' => 'Queued input.' }]) :
-          [{ 'code' => 'submission_unverified', 'category' => 'activity_unknown', 'message' => 'Submission proof unavailable.' }]
+          [{ 'code' => temporary ? 'transport_unavailable' : 'submission_unverified', 'category' => 'activity_unknown', 'message' => 'Submission proof unavailable.' }]
         subjects = known ? [{ 'address' => 'lead', 'threadId' => thread, 'activityToken' => token, 'lastActivityAt' => nil, 'idle' => idle, 'archiveState' => 'active' }] : []
         puts JSON.generate('schema' => 1, 'workspace' => workspace, 'slug' => slug, 'identity' => identity, 'activityKnown' => known,
           'activityToken' => known ? token : '', 'lastActivityAt' => nil, 'idle' => idle, 'subjects' => subjects, 'diagnostics' => diagnostics)

@@ -104,6 +104,8 @@ type Summary struct {
 	Archived          bool      `json:"archived"`
 	Terminal          bool      `json:"terminal"`
 	Interactive       bool      `json:"interactive"`
+	ExecutionHeld     bool      `json:"executionHeld"`
+	RecoveryReady     bool      `json:"-"`
 	PersistedThread   bool      `json:"-"`
 	Lifecycle         string    `json:"lifecycle"`
 	UpdatedAt         time.Time `json:"updatedAt"`
