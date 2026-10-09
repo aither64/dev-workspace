@@ -255,7 +255,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .chat-form[hidden], .chat-panel.plan-decision #codex-work { display: none; }
 .chat-form textarea { margin: 0 0 .7rem; min-height: 3.5rem; max-height: min(25dvh, 14rem); }
 .chat-actions > div { display: flex; gap: .55rem; }
-.chat-actions .composer-controls { display: flex; gap: .55rem; }
+.chat-actions .composer-actions, .chat-actions .composer-controls { display: flex; align-items: center; gap: .55rem; }
+.composer-settings { display: flex; align-items: center; gap: .35rem; min-width: 0; }
+.composer-actions .mode-toggle { flex: none; }
+.composer-actions .lane-status { margin: 0; }
 #codex-settings-status { overflow-wrap: anywhere; }
 #codex-settings-status:empty { display: none; }
 .pending { display: grid; gap: .6rem; }
@@ -335,7 +338,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .message-footer .codex-entry-copy[data-copy-state="error"] { color: var(--danger); }
 .codex-limits { flex: none; min-width: 0; }
 .codex-limits-panel { padding: .75rem .5rem 0; border-top: 1px solid var(--line); color: var(--text); }
-.codex-limits-panel h2 { margin: 0 0 .7rem; color: var(--muted); font-size: .75rem; font-weight: 600; }
+.limits-heading { display: flex; align-items: center; justify-content: space-between; gap: .4rem; margin-bottom: .7rem; }
+.codex-limits-panel h2 { margin: 0; color: var(--muted); font-size: .75rem; font-weight: 600; }
 .codex-limits-toggle { display: none; }
 .limits-window + .limits-window { margin-top: .8rem; }
 .limits-window-heading { display: flex; justify-content: space-between; align-items: center; gap: .4rem; font-size: .75rem; }
@@ -432,7 +436,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .reset-credit { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 1rem 0; }
 .reset-credit span, [data-reset-status] { overflow-wrap: anywhere; }
 .reset-credit button { flex: none; }
-.limits-account-summary { width: 100%; text-align: left; }
+.limits-account-summary { display: grid; gap: .2rem; margin-top: 12px; color: var(--muted); font-size: .68rem; line-height: 1.4; font-weight: 400; overflow-wrap: anywhere; }
+button.icon-button { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
+button.icon-button:hover, button.icon-button:focus-visible { background: var(--panel-2); color: var(--text); }
+button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 480px) { .reset-credit { flex-wrap: wrap; } }
 .codex-work { flex-wrap: wrap; }
 .codex-work.waiting { border-color: #66532e; background: #211d14; color: var(--warning); }

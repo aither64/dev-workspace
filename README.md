@@ -113,8 +113,9 @@ the configured hostname and aliases; the registry stores the resolved values.
 The portal sidebar shows the main Codex allowance, with percentage remaining
 and reset times in the browser's local timezone. The weekly and 5-hour windows
 appear only when Codex reports them. Model-specific allowances are excluded.
-Reported credits and banked reset counts appear alongside the allowance.
-Select **Account details**, the account summary or the compact limit indicator
+Reported credits and banked reset counts appear below the allowance. Numeric
+credit balances round to whole credits in both the sidebar and account dialog.
+Select the information icon beside **Codex limits** or the compact limit indicator
 to see reset details and expiration times. Expired or unsupported reset rows
 cannot be used. If Codex reports only a count or partial details, **Use next
 available reset** lets Codex choose. Every use asks for confirmation.

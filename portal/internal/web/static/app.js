@@ -1132,6 +1132,12 @@
     const details = dialog.querySelector("[data-account-limits]");
     const resetStatus = dialog.querySelector("[data-reset-status]");
     let limitsSnapshot = null, resetAction = null, limits = null, limitsLeaving = false;
+    const creditFormatter = new Intl.NumberFormat(undefined, {maximumFractionDigits: 0});
+    const formatCreditBalance = balance => {
+      if (balance == null || String(balance).trim() === "") return null;
+      const value = Number(balance);
+      return Number.isFinite(value) ? creditFormatter.format(value) : null;
+    };
     const openDetails = () => { renderAccountDetails(); dialog.showModal(); void limits?.refresh(); };
     limitsPanel.querySelector("[data-limits-details]").addEventListener("click", openDetails);
     dialog.querySelector("[data-limits-close]").addEventListener("click", () => dialog.close());
@@ -1161,7 +1167,7 @@
       if (!snapshot) { line("Account details are unavailable."); return; }
       renderLimitWindows(details, snapshot.windows || []);
       const credits = snapshot.credits;
-      if (credits) line(credits.unlimited ? "Unlimited credits" : `Credits: ${credits.balance ?? (credits.hasCredits ? "Available" : "0")}`);
+      if (credits) line(credits.unlimited ? "Unlimited credits" : `Credits: ${formatCreditBalance(credits.balance) ?? (credits.hasCredits ? "Available" : "0")}`);
       else line("Credits were not reported.");
       const resets = snapshot.rateLimitResetCredits;
       line(resets ? `Banked resets: ${resets.availableCount}` : "Banked resets were not reported.");
@@ -1261,11 +1267,17 @@
       const resets = snapshot?.rateLimitResetCredits;
       const extra = [];
       if (credits?.unlimited) extra.push("Unlimited credits");
-      else if (credits?.hasCredits) extra.push(credits.balance != null ? `${credits.balance} credits` : "Credits available");
+      else if (credits?.hasCredits) {
+        const balance = formatCreditBalance(credits.balance);
+        extra.push(balance != null ? `${balance} credits` : "Credits available");
+      }
       if (resets?.availableCount > 0) extra.push(`${resets.availableCount} banked resets`);
       if (extra.length) {
-        const summary = document.createElement("button"); summary.type = "button"; summary.className = "quiet limits-account-summary";
-        summary.textContent = extra.join(" · "); summary.addEventListener("click", openDetails); content.append(summary);
+        const summary = document.createElement("div"); summary.className = "limits-account-summary";
+        for (const text of extra) {
+          const line = document.createElement("span"); line.textContent = text; summary.append(line);
+        }
+        content.append(summary);
       }
       if (failed) {
         const retry = document.createElement("button"); retry.type = "button"; retry.className = "quiet"; retry.textContent = "Retry";

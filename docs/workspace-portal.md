@@ -192,10 +192,14 @@ remain errors. A changed cursor keeps loaded messages visible while a fresh
 bounded history repair checks their continuity.
 
 In lead and member conversations, the composer shows the last confirmed model
-and reasoning effort. **Edit** opens a dialog with both selectors and **Save**
+and reasoning effort. The pencil icon opens a dialog with both selectors and **Save**
 sends the pair together. Closing the dialog or pressing Escape discards edits.
 An open dialog keeps its draft during polling and reconnects. Reloading starts
 from the server-confirmed pair.
+
+The Plan/Default switch sits with the attachment and Send controls on the left.
+The model summary, pencil icon and Interrupt control sit on the right, centered
+vertically within their row.
 
 Active or unknown turn state blocks saving. A failed or uncertain update keeps
 the dialog open and rereads the thread. The controls never send a compensating

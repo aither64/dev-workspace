@@ -12,9 +12,10 @@ const baseURL = process.argv[2];
     page.on("pageerror", error => errors.push(error.message));
     const accountScope = "a".repeat(64);
     let count = 3, consumed = false;
+    let credits = {hasCredits: true, unlimited: false, balance: "12.5"};
     const snapshot = () => ({windows: [{windowDurationMins: 10080, usedPercent: 20, resetsAt: 1900000000},
       {windowDurationMins: 300, usedPercent: 35, resetsAt: 1900000300}],
-      updatedAt: Date.now(), credits: {hasCredits: true, unlimited: false, balance: "12.5"},
+      updatedAt: Date.now(), credits,
       accountScope, canReset: true, rateLimitResetCredits: {availableCount: count, credits: [
         {id: "reset-1", title: "Available fixture reset", resetType: "codexRateLimits", status: consumed ? "redeemed" : "available", expiresAt: Math.floor(Date.now() / 1000) + 86400},
         {id: "reset-2", title: "Expired fixture reset", resetType: "codexRateLimits", status: "available", expiresAt: 1},
@@ -31,12 +32,39 @@ const baseURL = process.argv[2];
       return route.fulfill({json: {outcome: "alreadyRedeemed"}});
     });
     await page.goto(baseURL + "/example/");
-    await expect(page.locator(".limits-account-summary")).toContainText("12.5");
+    await expect(page.locator(".limits-account-summary")).toContainText("13 credits");
     await expect(page.locator(".limits-account-summary")).toContainText("3 banked resets");
+    const summaryLayout = await page.locator("[data-limits-content]").evaluate(content => {
+      const summary = content.querySelector(".limits-account-summary");
+      const windows = content.querySelectorAll(".limits-window");
+      const summaryStyle = getComputedStyle(summary);
+      return {tag: summary.tagName, lines: summary.children.length,
+        gap: summary.getBoundingClientRect().top - windows[windows.length - 1].getBoundingClientRect().bottom,
+        color: summaryStyle.color, metadataColor: getComputedStyle(content.querySelector(".limits-reset")).color,
+        weight: summaryStyle.fontWeight};
+    });
+    assert.equal(summaryLayout.tag, "DIV"); assert.equal(summaryLayout.lines, 2);
+    assert(summaryLayout.gap >= 12, JSON.stringify(summaryLayout));
+    assert.equal(summaryLayout.color, summaryLayout.metadataColor); assert.equal(summaryLayout.weight, "400");
+    const detailsButton = page.getByRole("button", {name: "Account details", exact: true});
+    await expect(detailsButton).toHaveText("");
+    assert.equal(await detailsButton.locator("svg").count(), 1);
     await page.getByRole("button", {name: "Account details", exact: true}).click();
     const dialog = page.locator("#codex-limits-dialog");
     await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("Credits: 13");
     await expect(dialog).toContainText("Expires");
+    await dialog.getByRole("button", {name: "Close", exact: true}).click();
+    for (const [balance, expected] of [["1234.567890123456", "1,235"], [null, "Available"]]) {
+      credits = {hasCredits: true, unlimited: false, balance};
+      await page.reload();
+      await expect(page.locator(".limits-account-summary")).toContainText(balance == null ? "Credits available" : `${expected} credits`);
+      await detailsButton.click(); await expect(dialog).toContainText(`Credits: ${expected}`);
+      await dialog.getByRole("button", {name: "Close", exact: true}).click();
+    }
+    credits = {hasCredits: true, unlimited: true};
+    await page.reload(); await expect(page.locator(".limits-account-summary")).toContainText("Unlimited credits");
+    await detailsButton.click(); await expect(dialog).toContainText("Unlimited credits");
     await page.setViewportSize({width:390, height:844});
     await expect(dialog.locator('[data-limit-duration="300"]')).toContainText('65% left');
     await expect(dialog.locator('[data-limit-duration="10080"]')).toContainText('80% left');

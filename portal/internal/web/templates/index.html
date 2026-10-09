@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=5">
+  <link rel="stylesheet" href="/static/style.css?v=6">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -91,7 +91,7 @@
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/app.js?v=26" defer></script>
+  <script src="/static/app.js?v=27" defer></script>
 </body>
 </html>
 {{end}}
@@ -109,9 +109,8 @@
     <span data-limits-compact-label>Limits</span><strong data-limits-compact-value>…</strong>
   </button>
   <div id="codex-limits-panel" class="codex-limits-panel">
-    <h2>Codex limits</h2>
+    <div class="limits-heading"><h2>Codex limits</h2><button type="button" class="quiet icon-button" data-limits-details title="Account details" aria-label="Account details" aria-haspopup="dialog" aria-controls="codex-limits-dialog"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v1"/></svg></button></div>
     <div data-limits-content></div>
-    <button type="button" class="quiet" data-limits-details>Account details</button>
   </div>
 </section>
 <dialog id="codex-limits-dialog" aria-labelledby="codex-limits-title"><div class="section-heading"><h2 id="codex-limits-title">Codex limits</h2><button type="button" class="quiet" data-limits-close>Close</button></div><div data-account-limits></div><p data-reset-status role="status"></p></dialog>

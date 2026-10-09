@@ -86,6 +86,10 @@ const baseURL = process.argv[2];
         const actions = document.querySelector("#message-form .chat-actions");
         const popup = document.getElementById("codex-settings-dialog");
         return {form: bounds(document.getElementById("message-form")), popup: popup.open ? bounds(popup) : null,
+          summary: bounds(document.getElementById("codex-settings-summary")),
+          edit: bounds(document.getElementById("codex-settings-open")),
+          mode: bounds(document.getElementById("codex-mode")),
+          modeBesideSend: document.getElementById("codex-mode").parentElement === document.getElementById("message-send").parentElement,
           controls: [...actions.querySelectorAll("button, select")].filter(el => el.getBoundingClientRect().width > 0)
             .map(el => ({id: el.id, ...bounds(el)})), width: innerWidth, height: innerHeight,
           documentWidth: document.documentElement.scrollWidth};
@@ -93,6 +97,9 @@ const baseURL = process.argv[2];
       await expect(page.locator("#codex-mode")).toBeVisible();
       const diagnostic = JSON.stringify(layout);
       assert(layout.documentWidth <= layout.width, diagnostic);
+      assert(layout.modeBesideSend, diagnostic);
+      assert(Math.abs(layout.summary.y + layout.summary.height / 2 - layout.edit.y - layout.edit.height / 2) <= 1, diagnostic);
+      if (layout.width >= 981) assert(layout.mode.right <= layout.summary.x, diagnostic);
       for (const control of layout.controls) {
         assert(control.x >= layout.form.x - 1 && control.right <= layout.form.right + 1, diagnostic);
         assert(control.width >= 28 && control.height >= 28, diagnostic);
@@ -112,6 +119,8 @@ const baseURL = process.argv[2];
       stalePollStarted = false; stalePollFinished = false;
       await page.goto(baseURL + "/example/");
       await expect(summary).toContainText("medium");
+      await expect(page.getByRole("button", {name: "Edit Codex settings", exact: true})).toHaveText("");
+      assert.equal(await edit.locator("svg").count(), 1);
       await expect(edit).toBeEnabled(); await expect(dialog).toBeHidden();
       await assertLayout();
       await edit.click(); await expect(liveModel).toHaveValue("model-1");
