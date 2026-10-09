@@ -908,14 +908,14 @@ assert.equal(loadRequestInputDraft(storage, "example", "thread-1", "request-1", 
 assert.deepEqual(loadQueueAttempts(storage, "example", "thread-2"), [firstAttempt]);
 
 // Hidden time never extends the last known working state. A stale value stays
-// visible during ten seconds of visible recovery, then reports unavailability.
+// visible during thirty seconds of visible recovery, then reports unavailability.
 let timingNow = 0;
 const clock = createTimingClock(() => timingNow);
 clock.received(); timingNow = 5000;
 assert.equal(clock.view().elapsed, 5000);
 clock.pause(); timingNow = 600_000; clock.resume();
 assert.deepEqual(clock.view(), {elapsed: 5000, stale: true, unavailable: false});
-timingNow += 9999; clock.failed(); assert.equal(clock.view().unavailable, false);
+timingNow += 29999; clock.failed(); assert.equal(clock.view().unavailable, false);
 timingNow += 1; assert.equal(clock.view().unavailable, true);
 clock.pause(); timingNow += 600_000; clock.resume(); assert.equal(clock.view().unavailable, false);
 clock.received(); assert.deepEqual(clock.view(), {elapsed: 0, stale: false, unavailable: false});
@@ -992,7 +992,9 @@ if (!unitOnly) {
   assert.match(sessionHTML, /id="lifecycle-operation-status"/);
   assert.match(sessionHTML, /id="codex-mode"[^>]*><\/div>/);
   assert.doesNotMatch(sessionHTML, /data-codex-mode=/);
-  assert.doesNotMatch(sessionHTML, /codex-settings-dialog|codex-settings-open/);
+  assert.match(sessionHTML, /codex-settings-dialog/);
+  assert.match(sessionHTML, /codex-settings-open/);
+  assert.doesNotMatch(sessionHTML, /codex-settings-apply|codex-settings-cancel/);
 
   const details = await client.details();
   assert.equal(details.repositoryCount, 0);

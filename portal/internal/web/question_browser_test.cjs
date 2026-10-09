@@ -110,8 +110,9 @@ const question = (id, isBlocking = true) => ({
     await expect(wizard().locator("textarea")).toHaveValue("Keep this answer");
     offline = true;
     await page.request.post(baseURL + "/fixture/refresh");
-    // The shared connection indicator intentionally waits ten seconds.
-    await expect(page.locator("#conversation-connection")).toBeVisible({timeout: 15000});
+    // Transient refresh failures stay quiet for thirty visible seconds.
+    await expect(page.locator("#conversation-connection")).toBeHidden();
+    await expect(page.locator("#conversation-connection")).toBeVisible({timeout: 35000});
     await expect(composer).toBeHidden();
     offline = false; failAnswer = false;
     await page.locator("#conversation-connection button").click();

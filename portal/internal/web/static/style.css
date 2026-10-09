@@ -425,6 +425,15 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 }
 
 .activity-summary { flex: none; padding: .4rem 0; color: var(--muted); font-size: .75rem; }
+.settings-summary { font-size: .8rem; overflow-wrap: anywhere; }
+#codex-settings-dialog, #codex-limits-dialog { max-width: min(36rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); overflow: auto; }
+#codex-settings-dialog select { width: 100%; }
+#codex-settings-status { overflow-wrap: anywhere; max-height: 12rem; overflow: auto; }
+.reset-credit { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 1rem 0; }
+.reset-credit span, [data-reset-status] { overflow-wrap: anywhere; }
+.reset-credit button { flex: none; }
+.limits-account-summary { width: 100%; text-align: left; }
+@media (max-width: 480px) { .reset-credit { flex-wrap: wrap; } }
 .codex-work { flex-wrap: wrap; }
 .codex-work.waiting { border-color: #66532e; background: #211d14; color: var(--warning); }
 #codex-work-counts { color: var(--muted); }

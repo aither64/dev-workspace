@@ -1468,12 +1468,12 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 			}
 			if testCase.authority {
 				body := response.Body.String()
-				for _, marker := range []string{`id="codex-model"`, `id="codex-effort"`, `class="compact-select"`} {
+				for _, marker := range []string{`id="codex-model"`, `id="codex-effort"`, `id="codex-settings-dialog"`} {
 					if !strings.Contains(body, marker) {
-						t.Fatalf("session page is missing inline setting %s", marker)
+						t.Fatalf("session page is missing setting %s", marker)
 					}
 				}
-				for _, marker := range []string{`id="codex-settings-open"`, `id="codex-settings-dialog"`} {
+				for _, marker := range []string{`id="codex-settings-apply"`, `id="codex-settings-cancel"`} {
 					if strings.Contains(body, marker) {
 						t.Fatalf("session page retained obsolete setting %s", marker)
 					}
@@ -1804,7 +1804,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"const signature = JSON.stringify([entries,", "client.operation().then((operation)",
 		"dialog.showModal()", `lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")`,
 		`openLifecycleConfirmation("delete")`, "confirmationForLifecycle",
-		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "setTimeout(refreshIndexProgress, Math.max(1000,",
+		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "setTimeout(refreshIndexProgress, Math.max(refreshPolicy.indexProgressMs,",
 		"renderIndexOperations(payload.operations)", "indexNavigationPending = true",
 		`timedProgress(progress, "Preparing session")`, `operation")}/retry`, "fork-progress",
 	} {
@@ -4215,7 +4215,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
-	for _, name := range []string{"uploads.js", "sync.js"} {
+	for _, name := range []string{"uploads.js", "sync.js", "refresh.js"} {
 		dependency, err := http.Get(httpServer.URL + "/codex/assets/" + name)
 		if err != nil {
 			t.Fatal(err)

@@ -191,24 +191,34 @@ legacy read succeeds. Authorization failures, timeouts and invalid cursors
 remain errors. A changed cursor keeps loaded messages visible while a fresh
 bounded history repair checks their continuity.
 
-In lead and member conversations, model and reasoning changes stay in a draft
-until **Apply** sends the pair as one settings update. **Cancel** restores the
-most recent server-confirmed pair. A dirty draft survives polling, reconnects
-and page reloads in that browser tab.
+In lead and member conversations, the composer shows the last confirmed model
+and reasoning effort. **Edit** opens a dialog with both selectors and **Save**
+sends the pair together. Closing the dialog or pressing Escape discards edits.
+An open dialog keeps its draft during polling and reconnects. Reloading starts
+from the server-confirmed pair.
 
-Active or unknown turn state blocks editing but keeps an existing draft. A
-failed or uncertain update also keeps the draft and rereads the thread before
-another attempt. The controls never send a compensating update automatically.
+Active or unknown turn state blocks saving. A failed or uncertain update keeps
+the dialog open and rereads the thread. The controls never send a compensating
+update automatically. Reads begun before a successful save cannot overwrite its
+confirmed pair.
 
-The centered history row shows loading progress and a Retry control after a
-page read fails. Automatic loading pauses until Retry repeats the failed older
-page or continuity repair. An expired cursor prompts reconnection and a check
-of retained history. Servers without paging keep the existing legacy behavior.
+Browser refresh timings come from codex-web's `conversation/assets/refresh.js`.
+That policy contains resource intervals, deadlines, retry backoff and notice
+delays. Background refreshes keep the last values visible. Initial loading
+appears after 750 ms and manual older-history loading after 250 ms. Refresh
+failures appear after 30 continuous visible seconds; returning to a hidden tab
+or restoring a page starts a fresh grace period. Access errors and failures of
+user actions appear immediately.
 
-Requests, queued messages and activity timing refresh separately from the
-transcript. A slow queue reconciliation does not delay the first conversation
-page. A failed request or queue refresh keeps the last visible result and shows
-a retry control. Transcript receipt and upload clearing require positive
+Automatic history repair retries with capped backoff without loading banners.
+A manual older-page failure offers Retry for that page. Expired cursors trigger
+reconnection and a check of retained history. Servers without paging keep the
+existing legacy behavior.
+
+Requests, queued messages, activity timing, session details and index status
+refresh separately from the transcript. A slow queue reconciliation does not
+delay the first conversation page. Failed refreshes retain their last result;
+request and queue warnings offer Retry after the shared grace period. Transcript receipt and upload clearing require positive
 server evidence across all retained pages, including automatically loaded older
 messages. While the server is still checking conversation metadata, the
 mode is shown as pending and plan actions stay hidden. The tab retries metadata

@@ -1,4 +1,5 @@
 (async () => {
+  let refreshPolicy = null;
   const apiPath = (slug, operation) => `/api/sessions/${encodeURIComponent(slug)}/${operation}`;
   const createRequest = (fetchRequest) => async (path, options = {}) => {
     const response = await fetchRequest(path, {
@@ -359,7 +360,7 @@
     const reads = new Set();
     return {
       get paused() { return paused; },
-      begin(timeout = 10_000) {
+      begin(timeout = refreshPolicy?.readDeadlineMs || 10_000) {
         const abort = new AbortController(), ticket = generation;
         const timer = setTimeout(() => abort.abort(), timeout);
         reads.add(abort);
@@ -383,7 +384,7 @@
         const stale = needsFresh || age > maxAge;
         if (!paused && !stale) elapsed = age;
         if (!paused && stale && recovery === null) recovery = now();
-        return {elapsed, stale, unavailable: !paused && stale && recovery !== null && now() - recovery >= 10_000};
+        return {elapsed, stale, unavailable: !paused && stale && recovery !== null && now() - recovery >= (refreshPolicy?.warningMs || 30_000)};
       },
     };
   };
@@ -1007,6 +1008,8 @@
     return;
   }
 
+  const conversationAssets = await import("/codex/assets/conversation.js?v=13");
+  refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");
   const sidebarMenuToggle = document.querySelector(".sidebar-menu-toggle");
@@ -1020,12 +1023,11 @@
   window.addEventListener("resize", positionSidebarMenu);
   document.querySelector(".sidebar-content")?.addEventListener("scroll", positionSidebarMenu, {passive: true});
   const narrowSidebar = globalThis.matchMedia("(max-width: 760px)");
-  let comparisonOpen = false, updateLimitsPopover = () => {};
+  let comparisonOpen = false;
   const updateSidebar = () => {
     const reviewing = comparisonOpen && document.getElementById("repositories")?.classList.contains("active");
     body.classList.toggle("compact-sidebar", narrowSidebar.matches || Boolean(reviewing));
     positionSidebarMenu();
-    updateLimitsPopover();
   };
   narrowSidebar.addEventListener("change", updateSidebar);
   document.addEventListener("session-section-change", updateSidebar);
@@ -1058,18 +1060,23 @@
     const list = document.getElementById("workspace-auto-archive-rows");
     const reads = createReadScope();
     let timer = null, running = false, checkedAt = 0, leaving = false;
+    let summary = status.textContent;
+    const notice = conversationAssets.createRefreshNotice({render: state => {
+      status.textContent = state.warning ? "Cached archival status is unavailable. Previously displayed rows are retained." : summary;
+    }});
     const refresh = async () => {
       clearTimeout(timer);
       if (document.hidden || leaving || reads.paused || running) return;
-      const remaining = 30_000 - (Date.now() - checkedAt);
+      const remaining = refreshPolicy.archivalMs - (Date.now() - checkedAt);
       if (remaining > 0) { timer = setTimeout(refresh, remaining); return; }
       running = true;
-      const read = reads.begin(60_000);
+      const read = reads.begin(refreshPolicy.archivalDeadlineMs);
       try {
         const payload = await request("/api/auto-archive", {signal: read.signal});
         if (!read.isCurrent()) return;
         const presentation = workspaceArchivePresentation(payload);
-        status.textContent = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
+        summary = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
+        notice.success();
         list.replaceChildren();
         for (const row of presentation.rows) {
           const item = document.createElement("div"); item.className = "auto-archive-overview-row";
@@ -1078,11 +1085,11 @@
           item.append(link, details); list.append(item);
         }
       } catch (error) {
-        if (read.isCurrent()) status.textContent = "Cached archival status is unavailable. Previously displayed rows are retained.";
+        if (read.isCurrent()) notice.failure(error);
       } finally {
         if (read.isCurrent()) checkedAt = Date.now();
         read.finish(); running = false;
-        if (!reads.paused && !leaving) timer = setTimeout(refresh, Math.max(0, 30_000 - (Date.now() - checkedAt)));
+        if (!reads.paused && !leaving) timer = setTimeout(refresh, Math.max(0, refreshPolicy.archivalMs - (Date.now() - checkedAt)));
       }
     };
     const pause = () => { reads.pause(); clearTimeout(timer); timer = null; };
@@ -1094,7 +1101,6 @@
     if (document.hidden) pause(); else void refresh();
     return;
   }
-  const conversationAssets = await import("/codex/assets/conversation.js?v=12");
   let composerUploads = null;
   let composerUploadReady = true;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -1195,6 +1201,16 @@
   let indexRefreshRunning = false, indexProgressRunning = false, indexHasRunningOperations = false;
   let indexFullNextAt = 0, indexProgressNextAt = 0;
   const indexReads = createReadScope();
+  let indexSnapshotWarning = "", indexFailure = null, progressFailure = null;
+  const renderIndexWarning = () => {
+    const warning = document.getElementById("index-status-warning");
+    if (!warning) return;
+    warning.textContent = indexFailure?.warning ? `Live session status is temporarily unavailable: ${indexFailure.error.message}` :
+      progressFailure?.warning ? `Operation status is temporarily unavailable: ${progressFailure.error.message}` : indexSnapshotWarning;
+    warning.hidden = !warning.textContent;
+  };
+  const indexNotice = conversationAssets.createRefreshNotice({render: state => {indexFailure = state; renderIndexWarning();}});
+  const progressNotice = conversationAssets.createRefreshNotice({render: state => {progressFailure = state; renderIndexWarning();}});
   const renderIndexOperations = (operations) => {
     const panel = document.getElementById("operations");
     const list = document.getElementById("operation-list");
@@ -1348,7 +1364,7 @@
     indexRefreshRunning = true;
     const read = indexReads.begin();
     const warning = document.getElementById("index-status-warning");
-    let nextRefresh = 15_000;
+    let nextRefresh = refreshPolicy.indexMs;
     try {
       const payload = await request("/api/index-status", {signal: read.signal});
       if (indexNavigationPending || !read.isCurrent()) return;
@@ -1425,17 +1441,12 @@
           .filter(Boolean);
         ordered.forEach((card) => grid.append(card));
       }
-      if (warning) {
-        warning.textContent = payload.warning || "";
-        warning.hidden = !warning.textContent;
-      }
+      indexSnapshotWarning = payload.warning || "";
+      indexNotice.success();
       if (sidebar) sidebar.scrollTop = previousSidebarTop;
     } catch (error) {
-      nextRefresh = 30_000;
-      if (read.isCurrent() && warning) {
-        warning.textContent = `Live session status is temporarily unavailable: ${error.message}`;
-        warning.hidden = false;
-      }
+      nextRefresh = refreshPolicy.indexRetryMs;
+      if (read.isCurrent()) indexNotice.failure(error);
     } finally {
       read.finish(); indexRefreshRunning = false;
       indexFullNextAt = Date.now() + nextRefresh;
@@ -1448,7 +1459,7 @@
     if (indexProgressTimer !== null) clearTimeout(indexProgressTimer);
     indexProgressTimer = null;
     if (indexHasRunningOperations && !indexNavigationPending && !document.hidden && !indexReads.paused && !indexProgressRunning) {
-      indexProgressTimer = setTimeout(refreshIndexProgress, Math.max(1000, indexProgressNextAt - Date.now()));
+      indexProgressTimer = setTimeout(refreshIndexProgress, Math.max(refreshPolicy.indexProgressMs, indexProgressNextAt - Date.now()));
     }
   };
   const refreshIndexProgress = async () => {
@@ -1456,17 +1467,16 @@
     if (indexNavigationPending || document.hidden || indexReads.paused || indexProgressRunning) return;
     indexProgressRunning = true;
     const read = indexReads.begin();
-    let delay = 1000;
+    let delay = refreshPolicy.indexProgressMs;
     try {
       const payload = await request("/api/index-status?progress=1", {signal: read.signal});
-      if (read.isCurrent() && !indexNavigationPending) indexHasRunningOperations = renderIndexOperations(payload.operations);
-    } catch (error) {
-      delay = 15_000;
-      const warning = document.getElementById("index-status-warning");
-      if (read.isCurrent() && warning) {
-        warning.textContent = `Operation status is temporarily unavailable: ${error.message}`;
-        warning.hidden = false;
+      if (read.isCurrent() && !indexNavigationPending) {
+        indexHasRunningOperations = renderIndexOperations(payload.operations);
+        progressNotice.success();
       }
+    } catch (error) {
+      delay = refreshPolicy.indexMs;
+      if (read.isCurrent()) progressNotice.failure(error);
     } finally {
       read.finish(); indexProgressRunning = false;
       indexProgressNextAt = Date.now() + delay;
@@ -2269,7 +2279,7 @@
   };
   const loadAutoArchive = (force = false) => {
     if (autoArchiveLoading) return autoArchiveLoading;
-    if (autoArchiveSaving || (!force && Date.now() - autoArchiveReadAt < 30_000)) return Promise.resolve();
+    if (autoArchiveSaving || (!force && Date.now() - autoArchiveReadAt < refreshPolicy.archivalMs)) return Promise.resolve();
     autoArchiveReadAt = Date.now();
     const read = ++autoArchiveRead;
     autoArchiveLoading = (async () => {
@@ -2656,7 +2666,7 @@
   });
 
   const pageReads = createReadScope();
-  let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {};
+  let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {}, resumeHistory = () => {};
   let repositoryReview = null;
   let repositoryReviewLoading = null;
   const loadRepositoryReview = async () => {
@@ -2691,11 +2701,17 @@
   let lastClustersHTML = "";
   let lastTeamHTML = "";
   let releasingCluster = false;
+  const detailsNotice = conversationAssets.createRefreshNotice({render: state => {
+    const warning = document.getElementById("session-details-warning");
+    if (!warning) return;
+    warning.textContent = state.warning ? `Session details could not be refreshed: ${state.error.message}` : "";
+    warning.hidden = !state.warning;
+  }});
   const refreshSessionDetails = async () => {
     if (detailsRunning || pageReads.paused || document.hidden || !artifactList) return;
     if (detailsTimer !== null) clearTimeout(detailsTimer);
     detailsRunning = true;
-    const read = pageReads.begin(15_000);
+    const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
     const warning = document.getElementById("session-details-warning");
     try {
       const payload = await client.details({signal: read.signal});
@@ -2780,14 +2796,13 @@
           tab.setAttribute("aria-label", title);
         }
       }
-      warning.hidden = true;
+      detailsNotice.success();
     } catch (error) {
       if (!read.isCurrent()) return;
-      warning.textContent = `Session details could not be refreshed: ${error.message}`;
-      warning.hidden = false;
+      detailsNotice.failure(error);
     } finally {
       read.finish(); detailsRunning = false;
-      if (!pageReads.paused) detailsTimer = setTimeout(refreshSessionDetails, 15_000);
+      if (!pageReads.paused) detailsTimer = setTimeout(refreshSessionDetails, refreshPolicy.detailsMs);
     }
   };
   const suspendPageReads = (leaving = false) => {
@@ -2800,6 +2815,7 @@
     const wasPaused = pageReads.paused;
     pageReads.resume();
     if (wasPaused) { resumeTiming(); repositoryReview?.resume(); }
+    resumeHistory();
     void refreshSessionDetails();
   };
   // Firefox can reject old-document fetches before pagehide. Stop these reads
@@ -2955,7 +2971,7 @@
   let archiveRefreshRunning = false, archiveRefreshAt = -Infinity;
   const refreshPendingArchive = async () => {
     if (pendingLifecycle !== "archive" || document.hidden || archiveRefreshRunning ||
-        Date.now() - archiveRefreshAt < 30_000 || lastLifecycleOperation.state === "complete") return;
+        Date.now() - archiveRefreshAt < refreshPolicy.archivalMs || lastLifecycleOperation.state === "complete") return;
     archiveRefreshRunning = true;
     archiveRefreshAt = Date.now();
     const observedOperation = lastLifecycleOperation;
@@ -2973,10 +2989,10 @@
     } finally { archiveRefreshRunning = false; }
   };
   if (pendingLifecycle === "archive") {
-    let timer = setInterval(() => void refreshPendingArchive(), 30_000);
+    let timer = setInterval(() => void refreshPendingArchive(), refreshPolicy.archivalMs);
     document.addEventListener("visibilitychange", () => void refreshPendingArchive());
     window.addEventListener("pageshow", () => {
-      if (timer === null) timer = setInterval(() => void refreshPendingArchive(), 30_000);
+      if (timer === null) timer = setInterval(() => void refreshPendingArchive(), refreshPolicy.archivalMs);
       void refreshPendingArchive();
     });
     window.addEventListener("pagehide", () => { clearInterval(timer); timer = null; });
@@ -3009,7 +3025,7 @@
   const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory() : null;
   let pagingUnavailable = !pagingHelpersAvailable;
   let historyRead = null, historyRetryTimer = null, historyError = "", historyFailure = null;
-  let metadataRetryTimer = null, metadataRetryDelay = 2000;
+  let metadataRetryTimer = null, metadataRetryDelay = refreshPolicy.retryInitialMs;
   let latestThreadPayload = null;
   let transcriptFilter = "messages";
   let transcriptEntries = [];
@@ -3035,7 +3051,7 @@
   const timingClock = createTimingClock();
   let activityRead = null;
   let activityTimer = null, lastActivityReadAt = -Infinity;
-  const activityFreshnessBudget = () => activitySnapshot?.currentState === "idle" ? 35_000 : 15_000;
+  const activityFreshnessBudget = () => activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleFreshMs : refreshPolicy.activityActiveFreshMs;
 
   let sendAttemptStorage = null;
   try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
@@ -3097,7 +3113,7 @@
     if (!client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead) return activityRead;
-    const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? 30_000 : 5000;
+    const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
     const elapsed = Date.now() - lastActivityReadAt;
     if (!force && elapsed < interval) {
       scheduleActivity(interval - elapsed);
@@ -3111,7 +3127,7 @@
     }).catch(() => { if (read.isCurrent()) { activityAvailable = false; timingClock.failed(); } }).finally(() => {
       read.finish(); activityRead = null;
       if (!pageReads.paused) updateCodexWork();
-      scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? 30_000 : 5000);
+      scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs);
     });
     return activityRead;
   };
@@ -3646,14 +3662,18 @@
   const historyControls = document.getElementById("history-controls");
   const repairHistoryButton = document.getElementById("repair-history");
   const historyStatus = document.getElementById("history-status");
+  let historyNoticeState = {loading: false, warning: false}, historyRetryDelay = refreshPolicy.retryInitialMs;
+  const historyNotice = conversationAssets.createRefreshNotice({render: state => {
+    historyNoticeState = state; renderHistoryControls();
+  }});
   const renderHistoryControls = () => {
     if (!historyControls) return;
     resetHistoryNavigation();
-    repairHistoryButton.hidden = !historyFailure && !(transcriptHistory?.gap && !pagingUnavailable);
+    repairHistoryButton.hidden = !historyNoticeState.warning;
     repairHistoryButton.disabled = Boolean(historyRead);
-    historyStatus.textContent = historyRead ? "Loading earlier messages…" :
-      (historyError || (transcriptHistory?.gap ? "Checking earlier messages…" :
-        pagingUnavailable ? "Older history is unavailable on this server." : ""));
+    historyStatus.textContent = historyNoticeState.warning ? historyError :
+      historyNoticeState.loading ? "Loading earlier messages…" :
+        pagingUnavailable ? "Older history is unavailable on this server." : "";
     historyControls.hidden = !historyStatus.textContent && repairHistoryButton.hidden;
   };
   const observePageReceipts = (entries, threadID) => {
@@ -3709,7 +3729,10 @@
             repairVersion: transcriptHistory.repairVersion};
         }
       }
-      if (!historyFailure) historyError = "";
+      if (!historyFailure) {
+        historyError = "";
+        if (!historyRead && !transcriptHistory?.gap) historyNotice.success();
+      }
       recoverPlanAttempts(payload.latestTurnId);
       const threadStatus = payload.status;
       threadActive = threadStatus === "active";
@@ -3736,8 +3759,8 @@
       metadataRetryTimer = null;
       if (payload.metadataPending && !pageReads.paused) {
         metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; scheduleRefresh(0); }, metadataRetryDelay);
-        metadataRetryDelay = Math.min(30_000, metadataRetryDelay * 2);
-      } else metadataRetryDelay = 2000;
+        metadataRetryDelay = Math.min(refreshPolicy.retryMaxMs, metadataRetryDelay * 2);
+      } else metadataRetryDelay = refreshPolicy.retryInitialMs;
     }
     transcriptInitialized = true;
     observePageReceipts(transcriptEntries, currentThreadId);
@@ -3746,15 +3769,16 @@
     renderPlanActions({...((latestThreadPayload) || payload), entries: transcriptEntries});
   };
 
-  const runHistoryRead = async (kind) => {
+  const runHistoryRead = async (kind, manual = kind === "older") => {
     if (!transcriptHistory || historyRead || pageReads.paused || document.hidden || pagingUnavailable || typeof client.threadPage !== "function") return;
     const cursor = kind === "older" ? transcriptHistory.olderCursor : transcriptHistory.repairCursor;
     if (!cursor) return;
     resetHistoryNavigation();
     const threadID = currentThreadId;
     const readVersion = transcriptHistory.repairVersion;
-    const read = pageReads.begin(35_000);
+    const read = pageReads.begin(refreshPolicy.transcriptDeadlineMs);
     historyRead = true;
+    historyNotice.begin({manual});
     historyError = "";
     historyFailure = null;
     renderHistoryControls();
@@ -3765,6 +3789,7 @@
       if (!read.isCurrent() || threadID !== currentThreadId ||
           readVersion !== transcriptHistory.repairVersion) return;
       renderThread(page, () => read.isCurrent() && threadID === currentThreadId, kind);
+      historyRetryDelay = refreshPolicy.retryInitialMs; historyNotice.success();
     } catch (error) {
       if (!read.isCurrent() || threadID !== currentThreadId ||
           readVersion !== transcriptHistory.repairVersion) return;
@@ -3781,18 +3806,25 @@
         historyFailure = {kind, threadId: threadID, repairVersion: readVersion};
         if (historyRetryTimer !== null) clearTimeout(historyRetryTimer);
         historyRetryTimer = null;
+        historyNotice.failure(error);
+        if (kind === "repair" && error.status !== 401 && error.status !== 403) {
+          historyRetryTimer = setTimeout(() => {historyRetryTimer = null; void runHistoryRead("repair");}, historyRetryDelay);
+          historyRetryDelay = Math.min(refreshPolicy.retryMaxMs, historyRetryDelay * 2);
+        }
       }
     } finally {
       read.finish();
       historyRead = null;
+      historyNotice.cancel();
       renderHistoryControls();
-      if (!historyError && transcriptHistory.gap && transcriptHistory.repairCursor) scheduleHistoryRepair(40);
+      if (!historyError && transcriptHistory.gap && transcriptHistory.repairCursor) scheduleHistoryRepair(refreshPolicy.historyPageMs);
     }
   };
   startOlderHistoryRead = () => { void runHistoryRead("older"); };
   const canRepairHistory = () => transcriptHistory?.gap && transcriptHistory.repairCursor &&
-    !historyError && !historyFailure && !pageReads.paused && !document.hidden && !pagingUnavailable;
-  const scheduleHistoryRepair = (delay = 40) => {
+    (!historyFailure || historyFailure.kind === "repair") && (!historyError || historyFailure?.kind === "repair") &&
+    !pageReads.paused && !document.hidden && !pagingUnavailable;
+  const scheduleHistoryRepair = (delay = refreshPolicy.historyPageMs) => {
     if (!canRepairHistory() || historyRetryTimer !== null) return;
     historyRetryTimer = setTimeout(() => {
       historyRetryTimer = null;
@@ -3801,16 +3833,17 @@
       else void runHistoryRead("repair");
     }, delay);
   };
+  resumeHistory = () => scheduleHistoryRepair(historyFailure ? historyRetryDelay : refreshPolicy.historyPageMs);
   repairHistoryButton?.addEventListener("click", () => {
     if (historyRead) return;
     const retryKind = historyFailure?.kind;
     if (retryKind) {
       const kind = transcriptHistory?.gap ? "repair" : retryKind;
       const cursor = kind === "repair" ? transcriptHistory?.repairCursor : transcriptHistory?.olderCursor;
-      if (cursor) { void runHistoryRead(kind); return; }
+      if (cursor) { clearTimeout(historyRetryTimer); historyRetryTimer = null; void runHistoryRead(kind, true); return; }
       if (transcriptHistory?.gap || transcriptHistory?.hasOlder) return;
       historyFailure = null; historyError = "";
-    } else if (transcriptHistory?.repairCursor) scheduleHistoryRepair(0);
+    } else if (transcriptHistory?.repairCursor) void runHistoryRead("repair", true);
     else scheduleRefresh(0);
     renderHistoryControls();
   });
@@ -4202,31 +4235,36 @@
 
   const pendingStatus = document.getElementById("pending-status");
   const pendingRetry = document.getElementById("pending-retry");
-  let pendingRead = null, pendingRetryTimer = null, pendingRetryDelay = 2000;
-  const refreshPending = (force = false) => {
+  const pendingNotice = conversationAssets.createRefreshNotice({render: state => {
+    pendingStatus.hidden = !state.loading && !state.warning;
+    if (state.loading) pendingStatus.querySelector("span").textContent = "Loading requests…";
+    pendingRetry.hidden = !state.warning;
+  }});
+  let pendingRead = null, pendingRetryTimer = null, pendingRetryDelay = refreshPolicy.retryInitialMs;
+  const refreshPending = (force = false, manual = false) => {
     if (!interactive || !client.pending || pageReads.paused || document.hidden) return Promise.resolve();
     if (pendingRead) return pendingRead;
     if (pendingRetryTimer !== null && !force) return Promise.resolve();
     if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
     pendingRetryTimer = null;
-    const read = pageReads.begin(10_000);
+    const read = pageReads.begin(refreshPolicy.pendingDeadlineMs);
+    pendingNotice.begin({manual});
     pendingRead = client.pending({signal: read.signal}).then((entries) => {
       if (!read.isCurrent()) return;
       if (!Array.isArray(entries)) throw new Error("Invalid request list");
       renderPendingEntries(entries);
-      pendingStatus.hidden = true;
-      pendingRetryDelay = 2000;
-    }).catch(() => {
+      pendingNotice.success();
+      pendingRetryDelay = refreshPolicy.retryInitialMs;
+    }).catch(error => {
       if (!read.isCurrent()) return;
       pendingStatus.querySelector("span").textContent = "Requests could not be refreshed. Previously shown questions remain available.";
-      pendingRetry.hidden = false;
-      pendingStatus.hidden = false;
+      pendingNotice.failure(error);
       pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
-      pendingRetryDelay = Math.min(30_000, pendingRetryDelay * 2);
+      pendingRetryDelay = Math.min(refreshPolicy.retryMaxMs, pendingRetryDelay * 2);
     }).finally(() => { read.finish(); pendingRead = null; });
     return pendingRead;
   };
-  pendingRetry?.addEventListener("click", () => { void refreshPending(true); });
+  pendingRetry?.addEventListener("click", () => { void refreshPending(true, true); });
 
   const queuePanel = document.getElementById("queue-panel");
   const queueList = document.getElementById("queue-list");
@@ -4269,31 +4307,36 @@
 
   const queueStatus = document.getElementById("queue-status");
   const queueRetry = document.getElementById("queue-retry");
-  let queueRead = null, queueRetryTimer = null, queueRetryDelay = 2000;
-  const refreshQueue = (force = false) => {
+  const queueNotice = conversationAssets.createRefreshNotice({render: state => {
+    queueStatus.hidden = !state.loading && !state.warning;
+    if (state.loading) queueStatus.querySelector("span").textContent = "Checking queued messages…";
+    queueRetry.hidden = !state.warning;
+  }});
+  let queueRead = null, queueRetryTimer = null, queueRetryDelay = refreshPolicy.retryInitialMs;
+  const refreshQueue = (force = false, manual = false) => {
     if (!interactive || !client.reconcileQueue || pageReads.paused || document.hidden) return Promise.resolve();
     if (queueRead) return queueRead;
     if (queueRetryTimer !== null && !force) return Promise.resolve();
     if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
     queueRetryTimer = null;
-    const read = pageReads.begin(12_000);
+    const read = pageReads.begin(refreshPolicy.queueDeadlineMs);
+    queueNotice.begin({manual});
     queueRead = client.reconcileQueue({signal: read.signal}).then(() => client.queue({signal: read.signal})).then((entries) => {
       if (!read.isCurrent()) return;
       if (!Array.isArray(entries)) throw new Error("Invalid queue");
       renderQueue(entries);
-      queueStatus.hidden = true;
-      queueRetryDelay = 2000;
-    }).catch(() => {
+      queueNotice.success();
+      queueRetryDelay = refreshPolicy.retryInitialMs;
+    }).catch(error => {
       if (!read.isCurrent()) return;
       queueStatus.querySelector("span").textContent = "Queued messages could not be refreshed. The last result may be out of date.";
-      queueRetry.hidden = false;
-      queueStatus.hidden = false;
+      queueNotice.failure(error);
       queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
-      queueRetryDelay = Math.min(30_000, queueRetryDelay * 2);
+      queueRetryDelay = Math.min(refreshPolicy.retryMaxMs, queueRetryDelay * 2);
     }).finally(() => { read.finish(); queueRead = null; });
     return queueRead;
   };
-  queueRetry?.addEventListener("click", () => { void refreshQueue(true); });
+  queueRetry?.addEventListener("click", () => { void refreshQueue(true, true); });
 
   function scheduleRefresh(delay = 200) {
     sync?.scheduleRefresh(delay);
@@ -4347,7 +4390,7 @@
   if (form && interactive) {
     const textarea = form.elements.message;
     composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
-      basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form,
+      basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
       controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,
       onChange: ({ready, count}) => { composerUploadReady = ready; textarea.required = !count; updateMessageActions(); },
@@ -4625,27 +4668,21 @@
   const liveEffortSelect = document.getElementById("codex-effort");
   const liveSettingsStatus = document.getElementById("codex-settings-status");
   if (liveModelSelect && liveEffortSelect) {
-    const applyButton = document.getElementById("codex-settings-apply");
-    const cancelButton = document.getElementById("codex-settings-cancel");
-    const storageKey = `workspace-portal.settings-draft.${location.origin}.${slug}.${conversationID}.${currentThreadId}`;
-    let storage = null, savedDraft = null;
-    try {
-      storage = sessionStorage;
-      const candidate = JSON.parse(storage.getItem(storageKey) || "null");
-      if (candidate && typeof candidate.model === "string" && candidate.model.length <= 128 &&
-          typeof candidate.effort === "string" && candidate.effort.length <= 128) savedDraft = candidate;
-    } catch (_) { /* The controls still work without browser storage. */ }
-    const draft = {model: savedDraft?.model || "", effort: savedDraft?.effort || ""};
-    let dirty = Boolean(savedDraft), saving = false, writeGeneration = 0, notice = "";
-    const persist = () => {
-      if (!storage || draft.model.length > 128 || draft.effort.length > 128) return;
-      try { storage.setItem(storageKey, JSON.stringify(draft)); } catch (_) {}
-    };
-    const clearStored = () => { try { storage?.removeItem(storageKey); } catch (_) {} };
+    const applyButton = document.getElementById("codex-settings-save");
+    const cancelButton = document.getElementById("codex-settings-close");
+    const dialog = document.getElementById("codex-settings-dialog");
+    const editButton = document.getElementById("codex-settings-open");
+    const summary = document.getElementById("codex-settings-summary");
+    const draft = {model: "", effort: ""};
+    let dirty = false, saving = false, writeGeneration = 0, notice = "";
     const validPair = () => models.some(model => model.model === draft.model &&
       model.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort));
     liveSettingsController = {
       render() {
+        summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
+        editButton.disabled = !interactive || !threadIdle || saving;
+        applyButton.disabled = !interactive || !threadIdle || saving || !dirty || !validPair();
+        cancelButton.disabled = saving;
         if (!models.length) return;
         restoreDraftSelect(liveModelSelect, draft.model, "Selected model is unavailable");
         if (draft.model) liveModelSelect.value = draft.model;
@@ -4658,7 +4695,7 @@
         liveModelSelect.disabled = !editable;
         liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
         applyButton.disabled = !editable || !dirty || !validPair();
-        cancelButton.disabled = saving || !dirty;
+        cancelButton.disabled = saving;
         if (liveSettingsStatus && !saving) liveSettingsStatus.textContent = notice;
       },
       confirm(model, effort) {
@@ -4673,16 +4710,16 @@
         if (!selected?.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort)) {
           draft.effort = selected?.defaultReasoningEffort || "";
         }
-        notice = ""; dirty = true; persist(); this.render();
+        notice = ""; dirty = true; this.render();
       },
       effortChanged() {
         draft.effort = liveEffortSelect.value;
-        notice = ""; dirty = true; persist(); this.render();
+        notice = ""; dirty = true; this.render();
       },
       cancel() {
         if (saving) return;
         draft.model = currentModel; draft.effort = currentEffort;
-        notice = ""; dirty = false; clearStored(); this.render();
+        notice = ""; dirty = false; this.render();
       },
       async apply() {
         if (!interactive || !threadIdle || saving || !dirty || !validPair()) return;
@@ -4699,7 +4736,7 @@
           ++settingsWriteGeneration;
           currentModel = saved.model; currentEffort = saved.reasoningEffort;
           draft.model = saved.model; draft.effort = saved.reasoningEffort;
-          notice = ""; dirty = false; clearStored(); scheduleRefresh(0);
+          notice = ""; dirty = false; dialog.close(); scheduleRefresh(0);
         } catch (error) {
           try {
             const observed = await client.thread();
@@ -4707,7 +4744,7 @@
               currentModel = observed.model; currentEffort = observed.reasoningEffort;
               if (observed.model === selected.model && observed.reasoningEffort === selected.effort) {
                 ++settingsWriteGeneration;
-                notice = ""; dirty = false; clearStored(); scheduleRefresh(0);
+                notice = ""; dirty = false; dialog.close(); scheduleRefresh(0);
               }
             }
           } catch (_) { /* Keep the draft if the write outcome cannot be read. */ }
@@ -4719,7 +4756,13 @@
       },
     };
     applyButton?.addEventListener("click", () => { void liveSettingsController.apply(); });
-    cancelButton?.addEventListener("click", () => liveSettingsController.cancel());
+    editButton.addEventListener("click", () => {
+      liveSettingsController.cancel(); dialog.showModal();
+      if (!models.length) void loadModels(dialog);
+    });
+    cancelButton.addEventListener("click", () => { if (!saving) {liveSettingsController.cancel(); dialog.close();} });
+    dialog.addEventListener("cancel", event => { if (saving) event.preventDefault(); else liveSettingsController.cancel(); });
+    dialog.addEventListener("close", () => liveSettingsController.cancel());
     liveSettingsController.render();
   }
 
@@ -4813,7 +4856,7 @@
   void refreshPending();
   void refreshQueue();
   void refreshActivity(true);
-  setInterval(() => { void refreshPending(); }, 15_000);
-  setInterval(() => { void refreshQueue(); }, 30_000);
+  setInterval(() => { void refreshPending(); }, refreshPolicy.pendingMs);
+  setInterval(() => { void refreshQueue(); }, refreshPolicy.queueMs);
   if (interactive) loadCollaborationModes();
 })();

@@ -80,7 +80,7 @@
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>
           <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         </div>
-        {{if .Session.Interactive}}<p id="pending-status" class="lane-status" role="status"><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
+        {{if .Session.Interactive}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
         <div class="composer-context">
         {{if .Session.Interactive}}
         <div id="message-receipts" class="message-receipts" hidden></div>
@@ -88,7 +88,7 @@
           <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
           <ol id="queue-list"></ol>
         </section>
-        {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status"><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
+        {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status" hidden><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
         {{end}}
         <div id="codex-work" class="codex-work" aria-live="polite" hidden><span id="codex-work-label">Codex is working</span><span id="codex-work-counts"></span><time id="codex-work-elapsed"></time></div>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
@@ -103,9 +103,15 @@
         <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
           <div id="message-uploads"></div>
-          <div class="chat-actions"><div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button></div><div class="composer-controls"><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span><label class="compact-select"><span>Model</span><select id="codex-model" data-model-select data-existing-settings="true" required><option value="">Loading models…</option></select></label><label class="compact-select"><span>Reasoning</span><select id="codex-effort" data-effort-select data-existing-settings="true"><option value="">Loading efforts…</option></select></label><button id="codex-settings-apply" type="button" class="quiet" disabled>Apply</button><button id="codex-settings-cancel" type="button" class="quiet" disabled>Cancel</button><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
-          <div id="codex-settings-status" class="lane-status" aria-live="polite"></div>
+          <div class="chat-actions"><div><span id="message-upload-controls"></span><button id="message-send" type="submit">Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button></div><div class="composer-controls"><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet" disabled>Edit</button><button id="interrupt" type="button" class="danger">Interrupt</button></div></div>
         </form>
+        <dialog id="codex-settings-dialog" aria-labelledby="codex-settings-title">
+          <div class="section-heading"><h2 id="codex-settings-title">Codex settings</h2><button id="codex-settings-close" type="button" class="quiet" aria-label="Close settings">Close</button></div>
+          <label>Model<select id="codex-model" data-model-select data-existing-settings="true" required><option value="">Loading models…</option></select></label>
+          <label>Reasoning<select id="codex-effort" data-effort-select data-existing-settings="true"><option value="">Loading efforts…</option></select></label>
+          <p id="codex-settings-status" class="lane-status" role="status"></p>
+          <button id="codex-settings-save" type="button" disabled>Save</button>
+        </dialog>
         {{end}}
       </section>
       {{end}}

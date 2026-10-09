@@ -180,12 +180,19 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
     repairScenario = true; newest = items(401, 500);
     await page.evaluate(() => fetch("/fixture/refresh"));
     await expect.poll(() => repairReads).toBe(1);
-    await expect(page.locator("#history-status")).toContainText("Earlier messages could not be loaded");
-    await page.evaluate(() => fetch("/fixture/refresh"));
-    await expect(page.locator("#repair-history")).toBeVisible();
-    assert.equal(repairReads, 1, "newest refresh must not retry a failed repair");
-    await page.locator("#repair-history").click();
+    await expect(page.locator("#repair-history")).toBeHidden();
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", {configurable: true, value: true});
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await page.waitForTimeout(2500);
+    assert.equal(repairReads, 1, "background tabs must pause failed automatic repair");
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", {configurable: true, value: false});
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
     await expect.poll(() => repairReads).toBe(2);
+    await expect(page.locator("#repair-history")).toBeHidden();
     await expect(page.locator("#transcript .message")).toHaveCount(500);
     repairScenario = false;
     smallPage = true;

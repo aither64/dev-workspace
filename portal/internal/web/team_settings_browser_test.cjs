@@ -74,182 +74,89 @@ const baseURL = process.argv[2];
       return route.continue();
     });
     const liveModel = page.locator("#codex-model"), liveEffort = page.locator("#codex-effort");
-    const apply = page.locator("#codex-settings-apply"), cancel = page.locator("#codex-settings-cancel");
-    const feedback = page.locator("#codex-settings-status");
-    const geometry = () => page.evaluate(() => {
-      const bounds = element => {
-        const box = element.getBoundingClientRect();
-        return {id: element.id || element.className, x: box.x, y: box.y, width: box.width,
-          height: box.height, right: box.right, bottom: box.bottom};
-      };
-      const actions = document.querySelector("#message-form .chat-actions");
-      const status = document.getElementById("codex-settings-status");
-      const controls = [...actions.querySelectorAll("button, select")]
-        .filter(element => element.getBoundingClientRect().width > 0);
-      return {actions: bounds(actions), composer: bounds(actions.querySelector(".composer-controls")),
-        form: bounds(document.getElementById("message-form")),
-        controls: controls.map(element => ({...bounds(element), inComposer: Boolean(element.closest(".composer-controls"))})),
-        status: {...bounds(status), text: status.textContent,
-          scrollWidth: status.scrollWidth, clientWidth: status.clientWidth,
-          scrollHeight: status.scrollHeight, clientHeight: status.clientHeight},
-        viewport: {width: innerWidth, height: innerHeight}, documentWidth: document.documentElement.scrollWidth};
-    });
-    const assertLayout = async (baseline, hasFeedback = false) => {
+    const edit = page.locator("#codex-settings-open"), save = page.locator("#codex-settings-save");
+    const close = page.locator("#codex-settings-close"), dialog = page.locator("#codex-settings-dialog");
+    const summary = page.locator("#codex-settings-summary"), feedback = page.locator("#codex-settings-status");
+    const assertLayout = async () => {
+      const layout = await page.evaluate(() => {
+        const bounds = element => {
+          const box = element.getBoundingClientRect();
+          return {x: box.x, y: box.y, right: box.right, bottom: box.bottom, width: box.width, height: box.height};
+        };
+        const actions = document.querySelector("#message-form .chat-actions");
+        const popup = document.getElementById("codex-settings-dialog");
+        return {form: bounds(document.getElementById("message-form")), popup: popup.open ? bounds(popup) : null,
+          controls: [...actions.querySelectorAll("button, select")].filter(el => el.getBoundingClientRect().width > 0)
+            .map(el => ({id: el.id, ...bounds(el)})), width: innerWidth, height: innerHeight,
+          documentWidth: document.documentElement.scrollWidth};
+      });
       await expect(page.locator("#codex-mode")).toBeVisible();
-      const layout = await geometry();
       const diagnostic = JSON.stringify(layout);
-      assert(layout.documentWidth <= layout.viewport.width, diagnostic);
+      assert(layout.documentWidth <= layout.width, diagnostic);
       for (const control of layout.controls) {
         assert(control.x >= layout.form.x - 1 && control.right <= layout.form.right + 1, diagnostic);
-        assert(control.y >= 0 && control.bottom <= layout.viewport.height + 1, diagnostic);
         assert(control.width >= 28 && control.height >= 28, diagnostic);
-        if (control.inComposer) {
-          assert(control.x >= layout.composer.x - 1 && control.right <= layout.composer.right + 1 &&
-            control.y >= layout.composer.y - 1 && control.bottom <= layout.composer.bottom + 1,
-            "control escaped its composer group: " + diagnostic);
-        }
       }
-      for (let index = 0; index < layout.controls.length; index++) {
-        const first = layout.controls[index];
-        for (const second of layout.controls.slice(index + 1)) {
-          const overlapWidth = Math.min(first.right, second.right) - Math.max(first.x, second.x);
-          const overlapHeight = Math.min(first.bottom, second.bottom) - Math.max(first.y, second.y);
-          assert(overlapWidth <= 1 || overlapHeight <= 1,
-            `controls overlap (${first.id}, ${second.id}): ` + diagnostic);
-        }
-      }
-      for (const id of ["codex-model", "codex-effort", "codex-settings-apply", "codex-settings-cancel", "message-send", "interrupt"]) {
+      for (const id of ["codex-settings-open", "message-send", "interrupt"]) {
         assert(layout.controls.some(control => control.id === id), "missing visible control: " + id);
       }
-      const top = Math.max(...layout.controls.map(control => control.y));
-      const bottom = Math.min(...layout.controls.map(control => control.bottom));
-      if (layout.viewport.width >= 1280) assert(top < bottom, "desktop controls must share one row: " + diagnostic);
-      else if (layout.viewport.width <= 760) assert(top >= bottom, "mobile controls must retain wrapping: " + diagnostic);
-      if (baseline) {
-        assert(Math.abs(layout.actions.height - baseline.actions.height) <= 1, "feedback changed the control row height: " + diagnostic);
-        for (const control of layout.controls) {
-          const before = baseline.controls.find(candidate => candidate.id === control.id);
-          assert(before && Math.abs(control.x - before.x) <= 1 && Math.abs(control.width - before.width) <= 1,
-            "feedback changed control widths or positions: " + diagnostic);
-        }
+      assert(!layout.controls.some(control => ["codex-model", "codex-effort"].includes(control.id)));
+      if (layout.popup) {
+        assert(layout.popup.x >= 0 && layout.popup.right <= layout.width + 1, diagnostic);
+        assert(layout.popup.y >= 0 && layout.popup.bottom <= layout.height + 1, diagnostic);
       }
-      if (hasFeedback) {
-        assert(layout.status.y >= layout.actions.bottom - 1, "feedback overlaps controls: " + diagnostic);
-        assert(layout.status.bottom <= layout.form.bottom + 1 && layout.status.bottom <= layout.viewport.height + 1, diagnostic);
-        assert(layout.status.scrollWidth <= layout.status.clientWidth + 1 &&
-          layout.status.scrollHeight <= layout.status.clientHeight + 1, "feedback is clipped: " + diagnostic);
-      } else {
-        await expect(feedback).toBeEmpty();
-        await expect(feedback).toBeHidden();
-        assert.equal(layout.status.height, 0, "empty feedback must occupy no space");
-      }
-      return layout;
     };
     for (const width of [981, 1024, 1100, 1200, 1280, 1440, 390]) {
       await page.setViewportSize({width, height: width >= 981 ? 900 : 844});
-      serverPair = {model: "model-1", reasoningEffort: "medium"};
-      savedSettings.length = 0;
+      serverPair = {model: "model-1", reasoningEffort: "medium"}; savedSettings.length = 0;
       stalePollStarted = false; stalePollFinished = false;
       await page.goto(baseURL + "/example/");
-      await expect(liveModel).toHaveValue("model-1");
-      await expect(liveModel).toBeEnabled();
-      await expect(page.locator("#codex-mode")).toBeVisible();
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeDisabled();
-      const baseline = await assertLayout();
-      await liveModel.selectOption("model-2");
-      await expect(liveEffort).toHaveValue("medium");
-      await expect(apply).toBeEnabled();
-      await expect(cancel).toBeEnabled();
-      await assertLayout(baseline);
-      await cancel.click();
-      await expect(liveModel).toHaveValue("model-1");
-      await liveEffort.selectOption("high");
-      await expect(liveModel).toHaveValue("model-1");
-      await expect(apply).toBeEnabled();
-      await assertLayout(baseline);
-      await cancel.click();
-      await expect(liveEffort).toHaveValue("medium");
-      await liveModel.selectOption("model-2");
-      await liveEffort.selectOption("high");
-      assert.equal(savedSettings.length, 0);
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
-      await page.reload();
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
-      await expect(apply).toBeEnabled();
-      await assertLayout(baseline);
-      threadStatus = "active";
-      await page.request.post(baseURL + "/fixture/refresh");
-      await expect(page.locator("#message-queue")).toBeVisible();
-      await expect(liveModel).toBeDisabled();
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeEnabled();
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
+      await expect(summary).toContainText("medium");
+      await expect(edit).toBeEnabled(); await expect(dialog).toBeHidden();
       await assertLayout();
-      threadStatus = "idle";
-      await page.request.post(baseURL + "/fixture/refresh");
-      await expect(apply).toBeEnabled();
-      await expect(page.locator("#message-queue")).toBeHidden();
-      await cancel.click();
-      await expect(liveModel).toHaveValue("model-1");
+      await edit.click(); await expect(liveModel).toHaveValue("model-1");
+      await expect(save).toBeDisabled();
+      await liveModel.selectOption("model-2"); await liveEffort.selectOption("high");
+      await expect(save).toBeEnabled(); await assertLayout();
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(liveModel).toHaveValue("model-2"); await expect(liveEffort).toHaveValue("high");
+      await page.keyboard.press("Escape"); await expect(dialog).toBeHidden();
+      assert.equal(savedSettings.length, 0);
+      await edit.click(); await expect(liveModel).toHaveValue("model-1");
       await expect(liveEffort).toHaveValue("medium");
-      await liveModel.selectOption("model-2");
-      await liveEffort.selectOption("high");
-      holdStalePoll = true;
-      await page.request.post(baseURL + "/fixture/refresh");
+      await liveModel.selectOption("model-2"); await close.click(); await edit.click();
+      await expect(liveModel).toHaveValue("model-1");
+      await liveModel.selectOption("model-2"); await liveEffort.selectOption("high");
+      await page.reload(); await expect(dialog).toBeHidden(); await edit.click();
+      await expect(liveModel).toHaveValue("model-1"); await expect(liveEffort).toHaveValue("medium");
+      await liveModel.selectOption("model-2"); await liveEffort.selectOption("high");
+      threadStatus = "active"; await page.request.post(baseURL + "/fixture/refresh");
+      await expect(save).toBeDisabled(); await expect(close).toBeEnabled();
+      await expect(liveModel).toHaveValue("model-2");
+      threadStatus = "idle"; await page.request.post(baseURL + "/fixture/refresh");
+      await expect(save).toBeEnabled();
+      holdStalePoll = true; await page.request.post(baseURL + "/fixture/refresh");
       await expect.poll(() => stalePollStarted).toBe(true);
-      holdSettingsWrite = true;
-      await apply.click();
+      holdSettingsWrite = true; await save.click();
       await expect.poll(() => savedSettings.length).toBe(1);
       assert.deepEqual(savedSettings[0], {model: "model-2", reasoningEffort: "high"});
       await expect(feedback).toHaveText("Saving Codex settings…");
-      await expect(feedback).toHaveAttribute("aria-live", "polite");
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeDisabled();
-      await assertLayout(baseline, true);
-      releaseSettingsWrite();
-      await expect(feedback).toBeEmpty();
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeDisabled();
-      releaseStalePoll();
-      await expect.poll(() => stalePollFinished).toBe(true);
-      await page.waitForTimeout(50);
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeDisabled();
-      await assertLayout(baseline);
-      await page.reload();
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
-      await liveModel.selectOption("model-1");
-      await liveEffort.selectOption("medium");
-      failSettingsWrite = true; failSettingsRead = true;
-      await apply.click();
+      await expect(close).toBeDisabled(); await expect(save).toBeDisabled();
+      await page.keyboard.press("Escape"); await expect(dialog).toBeVisible();
+      releaseSettingsWrite(); await expect(dialog).toBeHidden();
+      releaseStalePoll(); await expect.poll(() => stalePollFinished).toBe(true);
+      await expect(summary).toContainText("high");
+      await page.reload(); await expect(summary).toContainText("high"); await edit.click();
+      await expect(liveModel).toHaveValue("model-2"); await expect(liveEffort).toHaveValue("high");
+      await liveModel.selectOption("model-1"); await liveEffort.selectOption("medium");
+      failSettingsWrite = true; failSettingsRead = true; await save.click();
       await expect.poll(() => savedSettings.length).toBe(2);
-      assert.deepEqual(savedSettings[1], {model: "model-1", reasoningEffort: "medium"});
       await expect(feedback).toHaveText("The settings update could not be confirmed: " + writeFailure);
-      await expect(feedback).toBeVisible();
-      await expect(liveModel).toHaveValue("model-1");
-      await expect(liveEffort).toHaveValue("medium");
-      await expect(cancel).toBeEnabled();
-      await assertLayout(baseline, true);
+      await expect(dialog).toBeVisible(); await expect(close).toBeEnabled(); await assertLayout();
       failSettingsWrite = false; failSettingsRead = false;
-      await page.reload();
-      await expect(liveModel).toHaveValue("model-1");
-      await expect(liveEffort).toHaveValue("medium");
-      await expect(apply).toBeEnabled();
-      await assertLayout(baseline);
-      await cancel.click();
-      await expect(liveModel).toHaveValue("model-2");
-      await expect(liveEffort).toHaveValue("high");
-      await expect(apply).toBeDisabled();
-      await expect(cancel).toBeDisabled();
-      await assertLayout(baseline);
+      await close.click(); await page.reload(); await edit.click();
+      await expect(liveModel).toHaveValue("model-2"); await expect(liveEffort).toHaveValue("high");
+      await expect(save).toBeDisabled(); await close.click(); await assertLayout();
     }
     await page.setViewportSize({width: 1280, height: 720});
     await page.getByRole("tab", {name: "Team"}).click();

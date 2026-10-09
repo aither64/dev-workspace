@@ -294,8 +294,8 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.keyboard.press("End");
       assert.equal(await page.evaluate(() => history.length), historyLength, "same-tab key added a history entry");
       await width(250);
-      await expect(page.locator("#auto-archive-values")).toContainText("once all registered branches are merged");
-      await expect(page.locator("#auto-archive-values li")).toHaveText(["The session has uncommitted worktree changes.", "Codex has an active turn."]);
+      await expect(page.locator("#auto-archive-details dl")).toContainText("once all registered branches are merged");
+      await expect(page.locator("#auto-archive-values")).toHaveText("The session has uncommitted worktree changes. Codex has an active turn.");
       const technical = page.locator("#auto-archive-details");
       await expect(technical).not.toHaveAttribute("open");
       await expect(technical.locator("pre")).toBeHidden();
@@ -306,13 +306,13 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.getByRole("tab", {name: "Codex", exact: true}).click();
       await page.getByRole("tab", {name: "Settings", exact: true}).click();
       await expect(page.locator("#auto-archive-status")).toContainText("Showing the last available settings");
-      await expect(page.locator("#auto-archive-values")).toContainText("Not before");
+      await expect(page.locator("#auto-archive-details dl")).toContainText("Not before");
       await expect(technical.locator("pre")).toContainText("Fixture read failure");
       failArchive = false;
       await page.getByRole("checkbox", {name: "Keep open", exact: true}).check();
       await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeEnabled();
-      await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
-      await expect(technical).toBeHidden();
+      await expect(page.locator("#auto-archive-details dl")).not.toContainText("Not before");
+      await expect(technical.locator("pre")).toHaveText("");
       const hold = page.getByRole("checkbox", {name: "Keep open", exact: true});
       await expect(hold).toBeChecked();
       failHold = true;
@@ -331,8 +331,8 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         await expireAutoArchiveCache();
         await page.getByRole("tab", {name: "Codex", exact: true}).click();
         await page.getByRole("tab", {name: "Settings", exact: true}).click();
-        await expect(page.locator("#auto-archive-values")).toContainText("Waiting for the first scan");
-        await expect(page.locator("#auto-archive-values")).not.toContainText("Not before");
+        await expect(page.locator("#auto-archive-details dl")).toContainText("Waiting for the first scan");
+        await expect(page.locator("#auto-archive-details dl")).not.toContainText("Not before");
       }
       await expect(technical.locator("pre")).toHaveText("unknown <script>diagnostic</script>");
       await expect(page.locator("#auto-archive-values")).toContainText("An archival check could not be completed.");
@@ -398,6 +398,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable: true, value: false}); document.dispatchEvent(new Event("visibilitychange")); });
       assert.equal(workspaceArchiveReads, 0);
       await expect(page.locator("#workspace-auto-archive")).toHaveCount(0);
+      await page.getByRole("button", {name: "Workspace menu", exact: true}).click();
       await page.getByRole("link", {name: "Automatic archival", exact: true}).click();
       await page.waitForURL("**/automatic-archival");
       await expect(page.locator("#workspace-auto-archive-status")).toContainText("disabled");
@@ -413,6 +414,9 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       assert.equal(workspaceArchiveReads, 1);
       failWorkspaceArchive = true;
       await page.clock.runFor(30_000);
+      await expect.poll(() => workspaceArchiveReads).toBeGreaterThan(1);
+      await expect(page.locator("#workspace-auto-archive-status")).not.toContainText("unavailable");
+      await page.clock.runFor(30_001);
       await expect(page.locator("#workspace-auto-archive-status")).toContainText("unavailable");
       await expect(page.locator("#workspace-auto-archive-rows a")).toHaveCount(3);
       assert.equal(indexReads, overviewIndexReads);
