@@ -1028,7 +1028,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=13");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=14");
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");

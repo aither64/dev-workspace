@@ -40,7 +40,7 @@ func TestAutomaticArchivalPageIsSeparateFromIndex(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("dedicated route reached slug lookup: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{"data-automatic-archival", "workspace-auto-archive-status", "workspace-auto-archive-rows", `href="/"`, `/static/app.js?v=28`} {
+	for _, required := range []string{"data-automatic-archival", "workspace-auto-archive-status", "workspace-auto-archive-rows", `href="/"`, `/static/app.js?v=29`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("overview lacks %q: %s", required, page.Body.String())
 		}

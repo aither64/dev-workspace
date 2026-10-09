@@ -261,7 +261,11 @@ content available when selected.
 
 Drag files into the prompt area or choose **Attach files**. Ctrl+V or Cmd+V
 attaches binary clipboard files or images in both the New session initial request
-and conversation inputs. Text paste keeps its native behavior, including
+and conversation inputs. Pasted files are numbered from the first occurrence,
+for example `image-1.png` and `image-2.png`. Each original filename has its own
+sequence within the session, continuing after sending, removal and reload.
+New sessions start fresh. Selected and dropped filenames stay unchanged.
+Text paste keeps its native behavior, including
 clipboard data that contains both text and files. File cards show
 transfer progress and let you retry or remove a file. Above the cards, a summary
 shows the selected count and full total size, with the completed count while
