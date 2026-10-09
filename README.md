@@ -259,9 +259,10 @@ content available when selected.
 
 ## Prompt attachments
 
-Drag files into the prompt area or choose **Attach files**. In a conversation,
-Ctrl+V or Cmd+V also attaches binary clipboard files or images. Text paste keeps
-its native behavior, including clipboard data that contains both text and files. File cards show
+Drag files into the prompt area or choose **Attach files**. Ctrl+V or Cmd+V
+attaches binary clipboard files or images in both the New session initial request
+and conversation inputs. Text paste keeps its native behavior, including
+clipboard data that contains both text and files. File cards show
 transfer progress and let you retry or remove a file. Above the cards, a summary
 shows the selected count and full total size, with the completed count while
 uploads remain unfinished. Files stay in the summary until removed. The New

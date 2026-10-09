@@ -128,6 +128,92 @@ const baseURL = process.argv[2];
     }), true, "mixed paste leaves native text handling enabled");
     await expect(page.locator("#message-uploads")).toContainText("clipboard.bin");
     await expect(page.locator("#message-uploads")).toContainText("2 files");
+
+    // The index uses the same upload handler before a session exists. Uploads
+    // reach only the disposable server; every session creation POST is mocked.
+    let creationBody, releaseChunk;
+    const draftWrites = [];
+    context.on("request", request => {
+      if (new URL(request.url()).pathname.startsWith("/uploads/d-") && request.method() !== "GET") {
+        draftWrites.push(request.method());
+      }
+    });
+    await page.route("**/sessions", route => {
+      creationBody = route.request().postData();
+      return route.fulfill({status: 503, json: {error: "Fixture creation remains pending"}});
+    });
+    await page.route("**/api/session-creations/*", route => route.fulfill({status: 404, json: {error: "Not found"}}));
+    await page.route("**/uploads/d-*/**", async route => {
+      if (route.request().method() === "PATCH" && !releaseChunk) {
+        await new Promise(resolve => { releaseChunk = resolve; });
+      }
+      await route.continue();
+    });
+    await page.goto(baseURL + "/");
+    const creationForm = page.locator("#new-session-form");
+    const goal = creationForm.locator("[name=goal]");
+    const createButton = creationForm.getByRole("button", {name: "Create session", exact: true});
+    const creationFiles = page.locator("#creation-uploads");
+    await expect(creationForm.getByRole("button", {name: "Add attachments"})).toBeEnabled();
+    await goal.fill("Existing text ");
+    await page.evaluate(() => navigator.clipboard.writeText("initial clipboard text"));
+    await goal.focus(); await page.keyboard.press("Control+End"); await page.keyboard.press("Control+V");
+    await expect(goal).toHaveValue("Existing text initial clipboard text");
+    await page.keyboard.press("Control+Z");
+    await expect(goal).toHaveValue("Existing text ");
+    assert.equal(await goal.evaluate(field => {
+      const data = new DataTransfer();
+      data.items.add(new File([new Uint8Array([137, 80, 78, 71])], "initial.png", {type: "image/png"}));
+      return field.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+    }), false, "initial binary paste is handled as files");
+    await expect(creationFiles.locator(".codex-attachment")).toHaveCount(1);
+    await expect(creationFiles).toContainText("initial.png");
+    await expect.poll(() => Boolean(releaseChunk)).toBe(true);
+    await expect(createButton).toBeDisabled();
+    await expect(goal).toHaveValue("Existing text ");
+    releaseChunk();
+    await expect(creationFiles).toContainText("Ready");
+    assert.equal(await goal.evaluate(field => {
+      const data = new DataTransfer(); data.setData("text/plain", "mixed initial text");
+      data.items.add(new File(["initial binary file"], "initial.bin", {type: "application/octet-stream"}));
+      return field.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+    }), true, "initial mixed paste preserves native text handling");
+    await expect(creationFiles.locator(".codex-attachment")).toHaveCount(2);
+    await expect(creationFiles.locator(".codex-attachment-detail")).toHaveText([/Ready/, /Ready/]);
+    await goal.fill("");
+    assert.equal(await goal.getAttribute("required"), null, "file-only initial requests are valid");
+    await expect(createButton).toBeEnabled();
+    const scope = await creationForm.locator("[name=uploadScope]").inputValue();
+    const selectedIDs = await page.evaluate(scope => JSON.parse(
+      sessionStorage.getItem(`workspace-portal.upload-draft.${scope}`)).map(file => file.id), scope);
+    assert.equal(selectedIDs.length, 2); assert.equal(new Set(selectedIDs).size, 2);
+    await page.reload();
+    await expect(creationFiles.locator(".codex-attachment")).toHaveCount(2);
+    await expect(creationFiles.locator(".codex-attachment-detail")).toHaveText([/Ready/, /Ready/]);
+    await expect(goal).toHaveValue("");
+    await expect(createButton).toBeEnabled();
+    await expect(creationForm.locator("[name=uploadScope]")).toHaveValue(scope);
+    await createButton.click();
+    await expect.poll(() => Boolean(creationBody)).toBe(true);
+    const frozenCreationBody = creationBody;
+    const submitted = new URLSearchParams(frozenCreationBody);
+    assert.equal(submitted.get("goal"), ""); assert.equal(submitted.get("uploadScope"), scope);
+    assert.deepEqual(submitted.getAll("attachmentIds"), selectedIDs);
+    await expect(page.locator("#new-session-progress")).toHaveText("Fixture creation remains pending");
+    await expect(goal).toBeDisabled(); await expect(createButton).toBeDisabled();
+    const writesBeforeLockedPaste = draftWrites.length;
+    await goal.evaluate(field => {
+      const data = new DataTransfer(); data.items.add(new File(["locked"], "locked.bin"));
+      field.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+    });
+    await expect(creationFiles.locator(".codex-attachment")).toHaveCount(2);
+    await page.reload();
+    await expect(page.locator("#new-session-recovery")).toBeVisible();
+    await expect(goal).toBeDisabled(); await expect(createButton).toBeDisabled();
+    assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(
+      "workspace-portal.creation-draft")).body), frozenCreationBody);
+    assert.equal(creationBody, frozenCreationBody, "recovery reuses the exact submitted body");
+    assert.equal(draftWrites.length, writesBeforeLockedPaste, "locked recovery cannot upload more files");
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 })().catch(error => {console.error(error); process.exitCode = 1;});

@@ -1787,7 +1787,7 @@
             savedRequest.bindScope(scope);
           }
           creationUploads = conversationAssets.mountUploads(document.getElementById("creation-uploads"), {
-            basePath: scope.url, dropTarget: form, storage,
+            basePath: scope.url, dropTarget: form, pasteTarget: form.elements.goal, storage,
             controlsRoot: document.getElementById("creation-upload-controls"),
             storageKey: `workspace-portal.upload-draft.${scope.id}`,
             onChange: ({ready, count}) => {

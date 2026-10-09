@@ -39,6 +39,7 @@ func TestQuestionBrowser(t *testing.T) {
 	}}
 	httpServer := httptest.NewUnstartedServer(nil)
 	server.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
+	server.trustedOrigins = []string{server.config.BaseURL}
 	var err error
 	server.conversation, err = conversation.NewHandler(conversation.Options{
 		AllowedOrigins: []string{server.config.BaseURL}, BasePath: "/codex",
