@@ -60,6 +60,13 @@ keep their repository registration and artifact publication checks.
 
 Tracking files are limited to `plan.md`, `state.md` and artifacts declared in
 `portal.yml`. Their links continue to work when tracking moves into `archive/`.
+
+Repeated artifact paths are allowed. The portal shows one link per normalized
+relative path, using the first declaration's label and position. For example,
+`report.json` and `./report.json` refer to the same artifact. Every declaration
+must still have a nonempty label and a safe relative path. Browsing and validation
+leave the manifest unchanged.
+
 Untracked repository files, Git metadata, symlinks and other host files are not
 available. Text previews are limited to 512 KiB and 12,000 lines. Markdown files
 appear as source; binary files receive a notice instead of a text preview.

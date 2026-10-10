@@ -80,9 +80,23 @@ var builtInArtifacts = []Artifact{
 
 // AvailableArtifacts returns the complete portal artifact catalog. Plan and
 // state are built in; the manifest only declares additional curated files.
+// Repeated normalized paths retain their first label and position without
+// changing the manifest used by lifecycle projections.
 func AvailableArtifacts(summary *Summary) []Artifact {
 	artifacts := append([]Artifact(nil), builtInArtifacts...)
-	return append(artifacts, summary.Artifacts...)
+	seen := make(map[string]struct{}, len(artifacts)+len(summary.Artifacts))
+	for _, artifact := range artifacts {
+		seen[filepath.Clean(artifact.Path)] = struct{}{}
+	}
+	for _, artifact := range summary.Artifacts {
+		clean := filepath.Clean(artifact.Path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts
 }
 
 type Manifest struct {
@@ -199,7 +213,6 @@ func (m *Manifest) Validate(expectedSlug string) error {
 			}
 		}
 	}
-	seenArtifacts := make(map[string]struct{})
 	for _, artifact := range m.Artifacts {
 		if strings.TrimSpace(artifact.Label) == "" {
 			return errors.New("artifact label is empty")
@@ -208,15 +221,11 @@ func (m *Manifest) Validate(expectedSlug string) error {
 		if !ok {
 			return fmt.Errorf("artifact path escapes tracking directory: %q", artifact.Path)
 		}
-		if _, ok := seenArtifacts[clean]; ok {
-			return fmt.Errorf("duplicate artifact path %q", clean)
-		}
 		for _, builtIn := range builtInArtifacts {
 			if clean == builtIn.Path {
 				return fmt.Errorf("artifact path %q is built in", clean)
 			}
 		}
-		seenArtifacts[clean] = struct{}{}
 	}
 	if m.FinalizedAt != "" {
 		if !validRFC3339(m.FinalizedAt) {

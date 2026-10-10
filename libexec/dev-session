@@ -4515,7 +4515,7 @@ module DevSession
         raise Error, "duplicate portal repository in #{path}"
       end
 
-      artifact_paths = artifacts.map do |artifact|
+      artifacts.each do |artifact|
         unless artifact.is_a?(Hash) && artifact['label'].is_a?(String) &&
                !artifact['label'].strip.empty? && artifact['path'].is_a?(String)
           raise Error, "invalid portal artifact in #{path}"
@@ -4528,10 +4528,6 @@ module DevSession
            %w[. ..].include?(clean) || clean.start_with?("..#{File::SEPARATOR}")
           raise Error, "portal artifact escapes tracking directory in #{path}"
         end
-        clean
-      end
-      if artifact_paths.uniq.length != artifact_paths.length
-        raise Error, "duplicate portal artifact in #{path}"
       end
 
       finalized_at = manifest['finalized_at']

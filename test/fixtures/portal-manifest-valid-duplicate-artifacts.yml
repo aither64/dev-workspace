@@ -1,0 +1,21 @@
+schema: 1
+slug: 2026-09-03-example
+codex:
+  thread_id: thread-1
+  socket_path: /run/codex.sock
+  client_version: 0.160.0
+creation:
+  state: ready
+  initial_goal_sent: true
+repositories: []
+artifacts:
+  - label: First report
+    path: report.json
+  - label: First report
+    path: report.json
+  - label: Repeated report
+    path: report.json
+  - label: Equivalent report
+    path: ./report.json
+  - label: Notes
+    path: notes.txt

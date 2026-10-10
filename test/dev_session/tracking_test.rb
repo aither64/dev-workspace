@@ -129,6 +129,35 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_duplicate_artifacts_preserve_readiness_and_manifest_bytes
+    with_workspace do |workspace|
+      slug = '2026-09-03-example'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      path = File.join(workspace, 'work', slug, 'portal.yml')
+      original = File.binread(
+        File.expand_path('../fixtures/portal-manifest-valid-duplicate-artifacts.yml', __dir__)
+      )
+      File.binwrite(path, original)
+      manifest = runner.send(:load_portal_manifest, path, required: true)
+      before = Marshal.load(Marshal.dump(manifest))
+      assert_equal(manifest, runner.send(:require_ordinary_manifest_ready!, slug, manifest))
+      runner.send(:validate_portal_manifest!, manifest, slug, path)
+      runner.validate
+      assert_equal(before, manifest)
+      assert_equal(original, File.binread(path))
+      assert_equal('thread-1', manifest.dig('codex', 'thread_id'))
+      assert_equal(5, manifest.fetch('artifacts').length)
+
+      runner.send(:write_portal_manifest, slug, manifest)
+      assert_equal(before, runner.send(:load_portal_manifest, path, required: true))
+      manifest.fetch('artifacts') << { 'label' => '', 'path' => 'report.json' }
+      saved = File.binread(path)
+      assert_raises(DevSession::Error) { runner.send(:write_portal_manifest, slug, manifest) }
+      assert_equal(saved, File.binread(path))
+    end
+  end
+
   def test_validate_checks_all_persisted_portal_manifests
     with_workspace do |workspace|
       valid_directory = File.join(workspace, 'work', '2026-09-03-example')
