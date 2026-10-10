@@ -459,3 +459,5 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
   .auto-archive-fields { grid-template-columns: minmax(0, 1fr); gap: .3rem; }
   .auto-archive-fields dd { margin-bottom: .5rem; }
 }
+
+.team-statistics { white-space: pre-line; min-width: 22rem; font-size: .85rem; }

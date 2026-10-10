@@ -335,14 +335,15 @@
     const extension = stale ? 0 : elapsed;
     const state = snapshot.currentState || "unclassified";
     const working = Number(snapshot.workingMs || 0) + (state === "working" ? extension : 0);
-    const waiting = Number(snapshot.waitingMs || 0) + Number(snapshot.betweenTurnsMs || 0);
+    const waiting = Number(snapshot.waitingMs || 0) + (state === "waiting" ? Number(snapshot.openWaitingMs || 0) + extension : 0);
+    const idle = Number(snapshot.idleMs ?? snapshot.betweenTurnsMs ?? 0) + (state === "idle" ? extension : 0);
     const openWait = Number(snapshot.openWaitingMs || 0) +
       (["waiting", "idle"].includes(state) && snapshot.stateSinceMs ? extension : 0);
     const messages = Number(snapshot.messages || 0);
     const tools = Number(snapshot.toolCalls || 0);
     return {
       stale, state,
-      working: formatElapsed(working), waiting: formatElapsed(waiting),
+      working: formatElapsed(working), waiting: formatElapsed(waiting), idle: formatElapsed(idle),
       unclassified: Number(snapshot.unclassifiedMs || 0),
       openWait: formatElapsed(openWait),
       counts: `${messages} ${messages === 1 ? "message" : "messages"} · ${tools} ${tools === 1 ? "tool call" : "tool calls"}`,
@@ -351,6 +352,26 @@
           (!snapshot.completedAtMs ? extension : 0),
       ) : "",
     };
+  };
+
+  const activityWaitLabel = (snapshot) => {
+    if (snapshot?.currentState === "idle") return "Idle · waiting for instructions";
+    if (snapshot?.waitReason === "sleep") return "Sleeping · wakes automatically";
+    if (snapshot?.waitReason === "subagents") return "Waiting for team members · resumes automatically";
+    if (snapshot?.waitReason === "approval") return "Waiting for approval";
+    if (snapshot?.waitReason === "userInput") return "Waiting for your answer";
+    return "Waiting · reason unavailable";
+  };
+  const teamActivityPresentation = (row) => {
+    const snapshot = row.snapshot;
+    if (!snapshot) return `${row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable"} · statistics unavailable`;
+    const view = activityPresentation(snapshot);
+    const label = ["removed", "stopped"].includes(row.state) ? (row.state === "removed" ? "Removed" : "Stopped") :
+      view.state === "working" ? "Active" : view.state === "idle" ? "Idle" : view.state === "waiting" ? activityWaitLabel(snapshot) : "Activity unknown";
+    const counts = `${snapshot.sentMessages ?? "?"} sent · ${snapshot.receivedMessages ?? "?"} received · ${snapshot.totalToolCalls ?? "?"} tool calls`;
+    const time = `Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
+    const coverage = snapshot.countsComplete === false || snapshot.coverageComplete === false ? " · Partial statistics" : "";
+    return `${label}\n${counts}\n${time}${coverage}${view.unclassified ? ` · ${formatElapsed(view.unclassified)} unclassified` : ""}`;
   };
 
   // A read may settle after abort (for example from a cache or test transport).
@@ -1018,7 +1039,7 @@
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash, sessionTabFromLocation,
+      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, teamActivityPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
@@ -2974,6 +2995,27 @@
   addEventListener("pagehide", () => suspendPageReads(true));
   addEventListener("pageshow", () => { pageLeaving = false; resumePageReads(); });
   sessionTabs.forEach(tab => tab.addEventListener("click", refreshSessionDetails));
+  let teamStatsInFlight = false;
+  const refreshTeamStats = async () => {
+    const panel = document.getElementById("team");
+    if (!slug || document.hidden || pageReads.paused || !panel?.classList.contains("active") || teamStatsInFlight) return;
+    teamStatsInFlight = true;
+    const read = pageReads.begin();
+    try {
+      const payload = await request(`/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal});
+      if (!read.isCurrent()) return;
+      const rows = new Map((payload.members || []).map(row => [row.address, row]));
+      panel.querySelectorAll("[data-team-stats]").forEach(cell => {
+        cell.textContent = teamActivityPresentation(rows.get(cell.dataset.teamStats) || {state: "unavailable"});
+      });
+    } catch (_) {
+      if (read.isCurrent()) panel.querySelectorAll("[data-team-stats]").forEach(cell => { cell.textContent = "Statistics update unavailable"; });
+    } finally { read.finish(); teamStatsInFlight = false; }
+  };
+  document.querySelector('[data-session-tab="team"]')?.addEventListener("click", () => { void refreshTeamStats(); });
+  setInterval(() => { void refreshTeamStats(); }, 5000);
+  void refreshTeamStats();
+
   addEventListener("focus", resumePageReads);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) suspendPageReads(); else resumePageReads();
@@ -3209,11 +3251,11 @@
       ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
-    const label = waiting ? "Codex: waiting for instructions" : "Codex";
+    const label = waiting ? `Codex: ${activityWaitLabel(activitySnapshot)}` : activitySnapshot?.currentState === "waiting" ? `Codex: ${activityWaitLabel(activitySnapshot)}` : "Codex";
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
-  const updateCodexWork = (active = threadActive) => {
+  const updateCodexWork = (active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress") => {
     if (!codexWork || !codexWorkElapsed) return;
     const timing = timingClock.view(activityFreshnessBudget());
     if (!activitySnapshot) {
@@ -3230,19 +3272,19 @@
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? "Waiting for instructions" : active ? "Codex is working" : "";
+    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? "Codex is working" : "";
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
     const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
-    durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting}`;
+    durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
     if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) {
       durationSummary.textContent += view.unclassified > 0 ?
         ` · ${formatElapsed(view.unclassified)} unclassified` : " · Partial timing";
     }
     if (stale) durationSummary.textContent += " · Update unavailable";
     durationSummary.title = activitySnapshot.coverageReason ||
-      "Waiting includes answered blocking requests and gaps between turns. The current wait is shown separately.";
+      "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified.";
     updateCodexWaitingIndicator();
   };
   const scheduleActivity = (delay) => {

@@ -333,15 +333,19 @@ No session manifest, lifecycle journal or Codex receipt migration is required.
 
 ## Working and waiting time
 
-The conversation shows root-thread working time and completed waiting time.
-Blocking questions, approvals, and permission requests pause the working clock;
-nonblocking questions do not. Overlapping requests count once. Waiting totals
-also include gaps between turns, while the current open wait is shown separately.
-Forked conversations count only their own turns. The current turn shows counts
-of distinct assistant messages and tool calls, independent of the selected view.
-When Codex is idle after a turn or has a blocking request, its sidebar tab shows
-an amber dot while another session section is open. The dot clears when timing
-data is unavailable.
+The conversation and Team tab show separate working, waiting, and idle totals.
+Waiting includes blocking questions, approvals, permission requests, and automatic
+sleep or team waits. Overlapping waits count once; nonblocking questions do not
+pause work. Idle includes gaps between turns. Automatic waits say that Codex will
+resume automatically. An amber sidebar dot marks idle or a blocking request that
+needs your attention.
+
+The Team tab shows the lead and every retained member, with distinct incoming
+prompts, outgoing assistant or plan messages, and tool calls across their own
+conversation history. Forked conversations count their own turns. The conversation
+also retains counts for the current turn. Missing history or timing is marked as
+partial. A connection begun during sleep may leave the rest of that turn
+unclassified because native history cannot show whether the sleep has ended.
 
 The portal service observes activity without answering requests, even when no
 browser is open. Timing records contain identities, interval boundaries, and

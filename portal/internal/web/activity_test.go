@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type testActivityObserver struct {
@@ -365,4 +367,87 @@ func TestActivityMonitorDuplicateThreadReadsLeaveOtherWorkersAvailable(t *testin
 	if len(monitor.readGates) != 0 || len(monitor.readSlots) != 0 {
 		t.Fatalf("completed reads retained admission state: gates=%d slots=%d", len(monitor.readGates), len(monitor.readSlots))
 	}
+}
+
+func testActivityRetainedMembers(t *testing.T, held bool) {
+	s := newTestServer(t)
+	if held {
+		s.config.CodexSocket = filepath.Join(t.TempDir(), "codex.sock")
+		listener, err := net.Listen("unix", s.config.CodexSocket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+	}
+	defer s.Close()
+	directory := filepath.Join(s.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeWebTrackingFiles(t, directory, "active")
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: " + s.config.CodexSocket + "\n  client_version: 0.152.1\ncreation:\n  state: ready\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeWebRuntimeAuthority(t, s, "example")
+	s.config.UserStateRoot = t.TempDir()
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Update(context.Background(), "example", "thread-1", true, func(roster *teamruntime.Roster) error {
+		roster.Members = []teamruntime.Member{{Address: "reviewer0", Role: "reviewer", State: "ready", Thread: "member-thread", Model: "model-1", Effort: "medium", AddedAt: time.Now().UTC()}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &testActivityObserver{verified: make(chan string, 8), read: make(chan string, 8), stopped: make(chan string, 8)}
+	monitor := &activityMonitor{server: s, observer: observer, workers: make(map[string]activityWorker)}
+	ctx, cancel := context.WithCancel(context.Background())
+	if held {
+		s.config.RecoverSessions = true
+		// A held lead must not suppress an explicitly activated member.
+		if err := s.recoveryStore().Set(ctx, "example", "thread-1", s.config.CodexSocket, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.recoveryStore().Update(ctx, "example", func(record *session.Recovery) error {
+			record.ActiveThreads = []string{"member-thread"}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	monitor.reconcile(ctx)
+	seen := map[string]bool{}
+	count := 2
+	if held {
+		count = 1
+	}
+	for range count {
+		select {
+		case id := <-observer.read:
+			seen[id] = true
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("missing member observation")
+		}
+	}
+	cancel()
+	monitor.wg.Wait()
+	if seen["thread-1"] == held || !seen["member-thread"] {
+		t.Fatal(seen)
+	}
+	for range count {
+		if cwd := <-observer.verified; cwd != directory {
+			t.Fatal("member escaped session directory", cwd)
+		}
+	}
+}
+
+func TestActivityObservationWatchesRetainedMembersWithoutBrowser(t *testing.T) {
+	testActivityRetainedMembers(t, false)
+}
+func TestActivityObservationWatchesActiveMemberWithHeldLead(t *testing.T) {
+	testActivityRetainedMembers(t, true)
 }

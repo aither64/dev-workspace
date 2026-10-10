@@ -112,10 +112,16 @@ func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, for
 			m.snapshots = make(map[string]activityCachedSnapshot)
 		}
 		m.snapshots[threadID] = activityCachedSnapshot{value: snapshot, at: m.now()}
+
 	} else {
 		delete(m.snapshots, threadID)
 	}
 	m.readMu.Unlock()
+	if err == nil && m.server != nil && m.server.operationStore != nil {
+		if saveErr := m.server.saveThreadRecord("activity-final", threadID, snapshot); saveErr != nil {
+			m.server.config.Logger.Printf("save activity snapshot: %v", saveErr)
+		}
+	}
 	return snapshot, err
 }
 
@@ -196,7 +202,17 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 		if !m.owns(summary) {
 			continue
 		}
-		wanted[summary.Slug] = summary.Codex.ThreadID
+		if !m.server.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+			wanted[summary.Slug] = summary.Codex.ThreadID
+		}
+		roster, rosterErr := m.server.loadTeamRoster(&summary)
+		if rosterErr == nil && roster != nil {
+			for _, member := range roster.Members {
+				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && !m.server.recoveryHeld(summary.Slug, member.Thread) {
+					wanted[teamConversationID(summary.Slug, member.Address)] = member.Thread
+				}
+			}
+		}
 	}
 	for slug, worker := range m.workers {
 		if wanted[slug] != worker.threadID {
@@ -220,12 +236,10 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 
 func (m *activityMonitor) owns(summary session.Summary) bool {
 	config := m.server.config
-	if m.server.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
-		return false
-	}
 	if summary.Archived || summary.Codex.ThreadID == "" ||
-		summary.Codex.SocketPath != config.CodexSocket || summary.Creation.State != "ready" ||
-		(summary.Creation.GoalSHA256 != "" && !summary.Creation.InitialGoalSent) {
+		summary.Codex.SocketPath != config.CodexSocket ||
+		(summary.HasCreation() && (summary.Creation.State != "ready" || (summary.Creation.GoalSHA256 != "" && !summary.Creation.InitialGoalSent))) ||
+		(!summary.HasCreation() && session.RequireRetainedReady(&summary, config.CodexSocket) != nil) {
 		return false
 	}
 	authority, err := session.LoadRuntimeAuthority(config.AuthorityDir, summary.Slug, config.Workspace)
@@ -248,7 +262,8 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 			unsubscribe()
 		}
 	}()
-	cwd := filepath.Join(m.server.config.Workspace, "work", slug)
+	sessionSlug, _, _ := parseTeamConversationID(slug)
+	cwd := filepath.Join(m.server.config.Workspace, "work", sessionSlug)
 	nextRead := time.Time{}
 	nextActivityRead := time.Time{}
 	idleWakeUsed, forceNext, lastIdle := false, false, false
