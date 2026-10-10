@@ -1,5 +1,7 @@
-github.com/aither64/codex-web v0.0.0-20261009214156-c9878454f07d h1:b0/pP9v882UXhjVhZEVX+dD2rnrXuXXv9Hlu47DiLrU=
-github.com/aither64/codex-web v0.0.0-20261009214156-c9878454f07d/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20261010150700-4e0b9b29dde8 h1:4Bby9EAEUv6FH8fRICs6YUdVvheJSx/BScbAQsPfCp8=
+github.com/aither64/codex-web v0.0.0-20261010150700-4e0b9b29dde8/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20261010170127-7aff1632ee97 h1:wRO+/Tim6E8W9Xzf4eMhCR2ISHNZrdtcp7vhVSbRHNI=
+github.com/aither64/codex-web v0.0.0-20261010170127-7aff1632ee97/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

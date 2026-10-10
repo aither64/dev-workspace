@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix";
     codex-web = {
-      url = "github:aither64/codex-web/c9878454f07da244c103b8a79340b92b6d5bf052";
+      url = "github:aither64/codex-web/7aff1632ee97c177e68c8bc45258abe055a087dd";
       flake = false;
     };
   };
