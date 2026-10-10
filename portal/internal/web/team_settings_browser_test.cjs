@@ -12,6 +12,7 @@ const baseURL = process.argv[2];
     const savedSettings = [];
     let serverPair = {model: "model-1", reasoningEffort: "medium"};
     let threadStatus = "idle";
+    let stopped = false;
     let detailsVersion = 0;
     let detailsReads = 0;
     let threadReads = 0;
@@ -57,13 +58,14 @@ const baseURL = process.argv[2];
         serverPair = pair;
         return route.fulfill({json: pair});
       }
+      if (operation === "team-stats") return route.fulfill({json:{members:[{address:"architect0",state:"ready",snapshot:{currentState:"working",sentMessages:37,receivedMessages:12,totalToolCalls:81,workingMs:9000,idleMs:3000,waitingMs:1000}}]}});
       if (operation === "details") {
         detailsReads++;
         const teamHTML = `<form data-direct-team-form data-action="configure" data-address="architect0">
           <select name="model" data-model-select data-current-value="model-1" aria-label="architect0 model" required><option>Loading models</option></select>
           <select name="effort" data-effort-select data-current-value="medium" aria-label="architect0 reasoning" required><option>Loading efforts</option></select>
-          <button type="submit">Save</button><p role="status" hidden></p></form><span data-version="${detailsVersion}"></span>`;
-        return route.fulfill({json: {repositoriesHTML: "", artifactsHTML: "", teamHTML}});
+          <button type="submit">Save</button><p role="status" hidden></p></form><span data-version="${detailsVersion}"></span><span data-team-stats="architect0"></span>`;
+        return route.fulfill({json: {repositoriesHTML: "", artifactsHTML: "", teamHTML, ...(stopped ? {interactive:false, recovery:{state:"stopped"}} : {})}});
       }
       if (operation === "team" && route.request().method() === "POST") {
         saved.push(route.request().postDataJSON());
@@ -72,6 +74,10 @@ const baseURL = process.argv[2];
       if (operation === "pending") return route.fulfill({json: []});
       if (operation === "queue") return route.fulfill({json: []});
       return route.continue();
+    });
+    await page.route("**/codex/conversations/example~architect0/settings", async route => {
+      saved.push(route.request().postDataJSON());
+      return route.fulfill(saved.length < 3 ? {status: 409, json: {error: "Fixture save failure"}} : {json: {ok: true}});
     });
     const liveModel = page.locator("#codex-model"), liveEffort = page.locator("#codex-effort");
     const edit = page.locator("#codex-settings-open"), save = page.locator("#codex-settings-save");
@@ -140,9 +146,12 @@ const baseURL = process.argv[2];
       await expect(liveModel).toHaveValue("model-1"); await expect(liveEffort).toHaveValue("medium");
       await liveModel.selectOption("model-2"); await liveEffort.selectOption("high");
       threadStatus = "active"; await page.request.post(baseURL + "/fixture/refresh");
-      await expect(save).toBeDisabled(); await expect(close).toBeEnabled();
+      await expect(save).toBeEnabled(); await expect(close).toBeEnabled();
       await expect(liveModel).toHaveValue("model-2");
-      threadStatus = "idle"; await page.request.post(baseURL + "/fixture/refresh");
+      for (const state of ["systemError", "notLoaded", "idle"]) {
+         threadStatus = state; await page.request.post(baseURL + "/fixture/refresh");
+        await expect(save).toBeEnabled();
+      }
       await expect(save).toBeEnabled();
       holdStalePoll = true; await page.request.post(baseURL + "/fixture/refresh");
       await expect.poll(() => stalePollStarted).toBe(true);
@@ -191,6 +200,7 @@ const baseURL = process.argv[2];
     await model.selectOption("model-2");
     await effort.selectOption("high");
     await model.focus();
+    await expect(page.locator('[data-team-stats="architect0"]')).toContainText("37 sent · 12 received · 81 tool calls");
     detailsVersion++;
     const editingReads = detailsReads;
     await page.evaluate(() => dispatchEvent(new Event("focus")));
@@ -207,6 +217,12 @@ const baseURL = process.argv[2];
     assert.equal(saved[1].model, "model-2");
     assert.equal(saved[1].reasoningEffort, "high");
     await expect(model).toHaveValue("model-2");
+    stopped = true;
+    const stoppedReads = detailsReads;
+    await page.evaluate(() => dispatchEvent(new Event("focus")));
+    await expect.poll(() => detailsReads).toBeGreaterThan(stoppedReads);
+    await expect(page.locator("#message-send")).toBeDisabled();
+    await expect(edit).toBeEnabled();
     await page.getByRole("button", {name: "Save"}).click();
     await expect.poll(() => saved.length).toBe(3);
     assert.deepEqual(saved[2], saved[1]);

@@ -377,9 +377,43 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 	if record.ThreadID != root || record.SocketPath != s.config.CodexSocket {
 		return errors.New("saved recovery identity changed")
 	}
-	if err := controller.ActivateThread(ctx, thread, policy); err != nil {
+	settings := codex.ThreadSettings{Policy: policy}
+	if address != "" {
+		service, err := s.teamService()
+		if err != nil {
+			return err
+		}
+		member, err := readyConversationMember(service.Store, slug, root, address)
+		if err != nil {
+			return err
+		}
+		settings.Model, settings.ReasoningEffort = member.Model, member.Effort
+	} else {
+		saved, err := s.coldSettings(slug, root, thread)
+		if err != nil {
+			return err
+		}
+		if saved != nil {
+			settings.Model, settings.ReasoningEffort = saved.Model, saved.Effort
+		}
+	}
+	if settings.Model != "" {
+		activator, ok := s.config.Codex.(interface {
+			ActivateThreadWithSettings(context.Context, string, codex.ThreadSettings) error
+		})
+		if !ok {
+			return errors.New("activation with saved settings is unavailable")
+		}
+		if err := s.validateModelSettings(ctx, settings, false); err != nil {
+			return err
+		}
+		if err := activator.ActivateThreadWithSettings(ctx, thread, settings); err != nil {
+			return err
+		}
+	} else if err := controller.ActivateThread(ctx, thread, policy); err != nil {
 		return err
 	}
+
 	err = s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
 		if record.ThreadID != root || record.SocketPath != s.config.CodexSocket {
 			return errors.New("saved recovery identity changed")
@@ -402,6 +436,11 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 	})
 	if err == nil {
 		s.setRecoveryStatus(slug, recoveryStatus{State: "active"})
+		if address == "" && settings.Model != "" {
+			if removeErr := os.Remove(s.threadRecordPath("next-settings", thread)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+		}
 	}
 	return err
 }
@@ -473,7 +512,7 @@ func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID str
 }
 
 // Cold sends enter the existing durable native queue before loading. Reads and
-// enqueue-only actions remain cold; subscriptions and settings are withheld.
+// enqueue-only actions remain cold; subscriptions are withheld and model choices remain cold.
 type recoveryConversationClient struct {
 	conversation.Client
 	server                      *Server
@@ -499,7 +538,15 @@ func (c recoveryConversationClient) ReconcileQueueDeletionsWithCompletion(ctx co
 }
 
 func (c recoveryPagedConversationClient) ReadThreadPage(ctx context.Context, thread, cursor string) (codex.TranscriptPage, error) {
-	return c.Client.(conversation.TranscriptPageReader).ReadThreadPage(ctx, thread, cursor)
+	page, err := c.Client.(conversation.TranscriptPageReader).ReadThreadPage(ctx, thread, cursor)
+	if err != nil || c.address != "" {
+		return page, err
+	}
+	saved, err := c.server.coldSettings(c.slug, c.root, thread)
+	if err == nil && saved != nil {
+		page.Model, page.ReasoningEffort = saved.Model, saved.Effort
+	}
+	return page, err
 }
 
 func (c recoveryConversationClient) Send(ctx context.Context, thread, text, id, action string) (codex.SendReceipt, error) {

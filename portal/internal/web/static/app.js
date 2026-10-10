@@ -2316,9 +2316,10 @@
   };
   document.addEventListener("submit", async (event) => {
     const form = event.target.closest("[data-direct-team-form]");
-    if (!form || !interactive) return;
+    if (!form) return;
     event.preventDefault();
     const action = form.dataset.action;
+    if (!interactive && action !== "configure") return;
     const status = form.querySelector("[role=status]");
     const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
     const value = name => form.elements[name]?.value?.trim() || "";
@@ -2330,7 +2331,12 @@
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
-      await directTeamRequest(body);
+      if (action === "configure") {
+        const memberClient = conversationAssets.createConversationClient({id: `${slug}~${body.address}`, basePath: "/codex"});
+        await memberClient.settings(body.model, body.reasoningEffort);
+      } else {
+        await directTeamRequest(body);
+      }
       if (status) status.textContent = "Saved.";
       setTimeout(() => location.reload(), 250);
     } catch (error) {
@@ -3257,6 +3263,7 @@
   };
   const updateCodexWork = (active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress") => {
     if (!codexWork || !codexWorkElapsed) return;
+    active ||= activitySnapshot?.latestTurnStatus === "inProgress";
     const timing = timingClock.view(activityFreshnessBudget());
     if (!activitySnapshot) {
       codexWork.hidden = !active;
@@ -3272,7 +3279,7 @@
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? "Codex is working" : "";
+    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? (view.state === "unclassified" ? "Activity unknown" : "Codex is working") : "";
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
@@ -4860,14 +4867,15 @@
     const editButton = document.getElementById("codex-settings-open");
     const summary = document.getElementById("codex-settings-summary");
     const draft = {model: "", effort: ""};
+    const settingsEditable = () => Boolean(document.getElementById("message-form"));
     let dirty = false, saving = false, writeGeneration = 0, notice = "";
     const validPair = () => models.some(model => model.model === draft.model &&
       model.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort));
     liveSettingsController = {
       render() {
         summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
-        editButton.disabled = !interactive || executionHeld || !threadIdle || saving;
-        applyButton.disabled = !interactive || executionHeld || !threadIdle || saving || !dirty || !validPair();
+        editButton.disabled = !settingsEditable() || saving;
+        applyButton.disabled = !settingsEditable() || saving || !dirty || !validPair();
         cancelButton.disabled = saving;
         if (!models.length) return;
         restoreDraftSelect(liveModelSelect, draft.model, "Selected model is unavailable");
@@ -4877,7 +4885,7 @@
         restoreDraftSelect(liveEffortSelect, draft.effort, "Selected reasoning effort is unavailable");
         if (draft.effort) liveEffortSelect.value = draft.effort;
         else liveEffortSelect.selectedIndex = -1;
-        const editable = interactive && !executionHeld && threadIdle && !saving;
+        const editable = settingsEditable() && !saving;
         liveModelSelect.disabled = !editable;
         liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
         applyButton.disabled = !editable || !dirty || !validPair();
@@ -4908,7 +4916,7 @@
         notice = ""; dirty = false; this.render();
       },
       async apply() {
-        if (!interactive || executionHeld || !threadIdle || saving || !dirty || !validPair()) return;
+        if (!settingsEditable() || saving || !dirty || !validPair()) return;
         const selected = {model: draft.model, effort: draft.effort};
         saving = true; liveSettingsSaving = true; const attempt = ++writeGeneration;
         if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings…";
@@ -4922,7 +4930,7 @@
           ++settingsWriteGeneration;
           currentModel = saved.model; currentEffort = saved.reasoningEffort;
           draft.model = saved.model; draft.effort = saved.reasoningEffort;
-          notice = ""; dirty = false; dialog.close(); scheduleRefresh(0);
+          notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn."; dirty = false; dialog.close(); scheduleRefresh(0);
         } catch (error) {
           try {
             const observed = await client.thread();
@@ -4930,7 +4938,7 @@
               currentModel = observed.model; currentEffort = observed.reasoningEffort;
               if (observed.model === selected.model && observed.reasoningEffort === selected.effort) {
                 ++settingsWriteGeneration;
-                notice = ""; dirty = false; dialog.close(); scheduleRefresh(0);
+                notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn."; dirty = false; dialog.close(); scheduleRefresh(0);
               }
             }
           } catch (_) { /* Keep the draft if the write outcome cannot be read. */ }

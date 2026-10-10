@@ -1148,7 +1148,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	data.ConversationID = summary.Slug
 	if data.DirectTeam != nil {
 		for _, member := range data.DirectTeam.Members {
-			if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && summary.Interactive {
+			if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && summary.RecoveryReady {
 				data.ReadyMembers = append(data.ReadyMembers, member)
 			}
 		}
@@ -1235,7 +1235,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	} else {
 		data.DirectTeam = roster
 		data.RemovedMembers = removedTeamMembers(roster)
-		if roster != nil && summary.Interactive {
+		if roster != nil && summary.RecoveryReady {
 			for _, member := range roster.Members {
 				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" {
 					readyMembers = append(readyMembers, member.Address)
@@ -3372,18 +3372,21 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, errors.New("session state changed")
 		}
 		s.normalizeInteractivity(ctx, summary)
-		if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
-			return conversation.Target{}, err
+		if !(request.Operation == "settings" && !summary.Interactive && summary.RecoveryReady) {
+			if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
+				return conversation.Target{}, err
+			}
 		}
 	}
 	interactive := summary.Interactive
-	if request.Mutation && !interactive {
+	settingsReady := summary.RecoveryReady && !summary.Archived
+	if request.Mutation && !interactive && !(settingsReady && request.Operation == "settings") {
 		return conversation.Target{}, errors.New("session is not ready for browser changes")
 	}
 	if request.Operation == "events" && !interactive {
 		return conversation.Target{}, errors.New("session is not interactive")
 	}
-	capabilities := conversation.Capabilities{Read: true}
+	capabilities := conversation.Capabilities{Read: true, Settings: settingsReady}
 	if interactive {
 		capabilities = conversation.Capabilities{
 			Read: true, Pending: true, QueueRead: true,
@@ -3421,8 +3424,12 @@ func (s *Server) resolveConversation(
 		}
 	}
 	held := s.recoveryHeld(slug, threadID)
-	if interactive && held {
-		capabilities = conversation.Capabilities{Read: true, Pending: true, QueueRead: true, Send: true, Queue: true}
+	if (interactive && held) || (!interactive && settingsReady) {
+		if interactive {
+			capabilities = conversation.Capabilities{Read: true, Pending: true, QueueRead: true, Send: true, Queue: true, Settings: true}
+		} else {
+			capabilities = conversation.Capabilities{Read: true, Settings: true}
+		}
 		coldClient := recoveryConversationClient{Client: conversationClient, server: s, slug: slug, root: summary.Codex.ThreadID, thread: threadID, address: address}
 		if _, ok := conversationClient.(conversation.TranscriptPageReader); ok {
 			conversationClient = recoveryPagedConversationClient{coldClient}
