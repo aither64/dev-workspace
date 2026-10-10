@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=7">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -138,6 +138,14 @@
       {{if .Session.Codex.ThreadID}}
       <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
         <div id="team-member-status">{{template "member-status" .}}</div>
+        {{if not .Session.Archived}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
+          <div class="section-heading"><h2 id="team-settings-title">Member settings</h2><button id="team-settings-close" type="button" class="quiet">Close</button></div>
+          <label>Model<select id="team-model" data-model-select required><option value="">Loading models…</option></select></label>
+          <label>Reasoning<select id="team-effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
+          <p class="muted">Changes apply to the next turn. Stopped sessions keep the choice until activation.</p>
+          <p id="team-settings-status" class="lane-status" role="status" aria-live="polite"></p>
+          <button id="team-settings-save" type="button" disabled>Save</button>
+        </dialog>{{end}}
       </section>
       {{end}}
 
@@ -219,7 +227,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=29" defer></script>
+  <script src="/static/app.js?v=30" defer></script>
 </body>
 </html>
 {{end}}
@@ -236,21 +244,24 @@
   {{if .Session.Interactive}}
   <div id="team-role-defaults" hidden>{{range .TeamRoleDefaults}}<span data-role="{{.Role}}" data-model="{{.Model}}" data-effort="{{.Effort}}" data-source="{{.Source}}"></span>{{end}}</div>
   <form class="stack managed-team-form" data-direct-team-form data-action="add">
-    <h3>Add member</h3><div class="field-grid"><label>Role<select name="role" required>{{range .TeamRoles}}<option value="{{.ID}}"{{if eq .ID "implementer"}} selected{{end}}>{{.Label}}</option>{{end}}</select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+    <h3>Add member</h3><div class="field-grid team-add-fields"><label>Role<select name="role" required>{{range .TeamRoles}}<option value="{{.ID}}"{{if eq .ID "implementer"}} selected{{end}}>{{.Label}}</option>{{end}}</select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
     <button type="submit">Add member</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
   </form>
   {{end}}
   <h3>Members</h3>
   <p class="muted">Messages count incoming prompts and outgoing replies. Working, waiting and idle are separate lifetime totals. Partial statistics mark unobserved time or incomplete history.</p>
-  <div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>Roster state</th><th>Activity and session totals</th><th>Next-turn settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>
-  <tr><td><code>lead</code></td><td><span class="badge team-state-active">root</span></td><td class="team-statistics" data-team-stats="lead">Loading statistics…</td><td>Use the Codex controls</td><td><code>{{.Session.Codex.ThreadID}}</code></td><td></td></tr>
-  {{if .DirectTeam}}{{range .DirectTeam.Members}}{{if ne .State "removed"}}{{template "team-member-row" .}}{{end}}{{end}}{{else}}<tr><td colspan="6" class="muted">No team roster yet.</td></tr>{{end}}
+  <div class="team-table-scroll"><table class="team-table">{{template "team-table-header"}}<tbody>
+  <tr data-team-stats="lead"><td><code>lead</code><small class="team-member-detail muted">root</small>{{template "team-thread-id" .Session.Codex.ThreadID}}</td>{{template "team-statistic-cells"}}<td><div class="team-settings"><span data-team-settings-summary="lead">Loading settings…</span>{{if not .Session.Archived}}<button type="button" class="quiet icon-button" data-team-settings="lead" aria-label="Edit lead settings" title="Edit lead settings" aria-haspopup="dialog" aria-controls="team-settings-dialog">{{template "settings-edit-icon"}}</button>{{end}}</div></td><td></td></tr>
+  {{if .DirectTeam}}{{range .DirectTeam.Members}}{{if ne .State "removed"}}{{template "team-member-row" .}}{{end}}{{end}}{{else}}<tr><td colspan="10" class="muted">No team roster yet.</td></tr>{{end}}
   </tbody></table></div>
-  {{if .RemovedMembers}}<details class="removed-members"><summary>Removed members ({{len .RemovedMembers}})</summary><div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>Roster state</th><th>Activity and session totals</th><th>Last settings</th><th>Thread</th><th>Actions</th></tr></thead><tbody>{{range .RemovedMembers}}{{template "team-member-row" .}}{{end}}</tbody></table></div></details>{{end}}
+  {{if .RemovedMembers}}<details class="removed-members"><summary>Removed members ({{len .RemovedMembers}})</summary><div class="team-table-scroll"><table class="team-table">{{template "team-table-header"}}<tbody>{{range .RemovedMembers}}{{template "team-member-row" .}}{{end}}</tbody></table></div></details>{{end}}
   <p id="team-action-status" class="operation-progress" role="status" aria-live="polite" hidden></p>
-  <section class="panel" id="team-transcript" hidden><div class="section-heading"><h3>Member messages</h3><button type="button" class="quiet" data-team-transcript-close>Close</button></div><div class="transcript" role="log"></div></section>
 {{end}}
 
+{{define "team-table-header"}}<thead><tr><th scope="col">Member</th><th scope="col">Activity</th><th scope="col" class="team-number">Sent</th><th scope="col" class="team-number">Received</th><th scope="col" class="team-number">Tools</th><th scope="col" class="team-number">Working</th><th scope="col" class="team-number">Waiting</th><th scope="col" class="team-number">Idle</th><th scope="col">Model/reasoning</th><th scope="col">Actions</th></tr></thead>{{end}}
+{{define "team-statistic-cells"}}<td><span data-team-metric="activity">Loading…</span><small class="team-coverage muted" tabindex="0" hidden>Partial</small></td><td class="team-number" data-team-metric="sent">-</td><td class="team-number" data-team-metric="received">-</td><td class="team-number" data-team-metric="tools">-</td><td class="team-number" data-team-metric="working">-</td><td class="team-number" data-team-metric="waiting">-</td><td class="team-number" data-team-metric="idle">-</td>{{end}}
+{{define "settings-edit-icon"}}<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg>{{end}}
+{{define "team-thread-id"}}{{if .}}<div class="team-thread"><code title="{{.}}">{{shortThread .}}</code><button type="button" class="quiet icon-button" data-copy data-copy-value="{{.}}" title="Copy thread ID" aria-label="Copy thread ID"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/></svg></button><span class="copy-feedback visually-hidden" role="status"></span></div>{{end}}{{end}}
 {{define "team-member-row"}}
-<tr><td><code>{{.Address}}</code></td><td><span class="badge team-state-{{.State}}">{{.State}}</span><br><small class="muted">{{if eq .Access "workspace_write"}}Workspace write{{else if eq .Access "read_only"}}Read only{{else}}Access unrecorded{{end}}</small></td><td class="team-statistics" data-team-stats="{{.Address}}">Loading statistics…</td><td>{{if eq .State "ready"}}<form data-direct-team-form data-action="configure" data-address="{{.Address}}" class="member-settings"><select name="model" data-model-select data-current-value="{{.Model}}" aria-label="{{.Address}} model" required><option value="">Loading models…</option></select><select name="effort" data-effort-select data-current-value="{{.Effort}}" aria-label="{{.Address}} reasoning" required><option value="">Loading efforts…</option></select><button type="submit" class="quiet">Save</button><p class="operation-progress" role="status" aria-live="polite" hidden></p></form>{{else}}<code>{{.Model}}</code> <code>{{.Effort}}</code>{{end}}</td><td><code>{{.Thread}}</code></td><td>{{if .Thread}}<button type="button" class="quiet" data-team-thread="{{.Address}}">View messages</button>{{end}}{{if eq .State "ready"}}<button type="button" class="quiet" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>
+<tr data-team-stats="{{.Address}}"><td><code>{{.Address}}</code><small class="team-member-detail muted">{{.State}} · {{if eq .Access "workspace_write"}}Workspace write{{else if eq .Access "read_only"}}Read only{{else}}Access unrecorded{{end}}</small>{{template "team-thread-id" .Thread}}</td>{{template "team-statistic-cells"}}<td><div class="team-settings"><span data-team-settings-summary="{{.Address}}">{{.Model}} · {{.Effort}}</span>{{if eq .State "ready"}}<button type="button" class="quiet icon-button" data-team-settings="{{.Address}}" data-model="{{.Model}}" data-effort="{{.Effort}}" aria-label="Edit {{.Address}} settings" title="Edit {{.Address}} settings" aria-haspopup="dialog" aria-controls="team-settings-dialog">{{template "settings-edit-icon"}}</button>{{end}}</div></td><td>{{if eq .State "ready"}}<button type="button" class="quiet team-action" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet team-action" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>
 {{end}}

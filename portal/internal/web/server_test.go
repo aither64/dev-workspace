@@ -1687,7 +1687,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{`directTeamRequest`, `data-direct-team-form`, `data-team-remove`, `data-team-retry`, `data-team-thread`} {
+	for _, marker := range []string{`directTeamRequest`, `data-direct-team-form`, `data-team-remove`, `data-team-retry`, `data-team-settings`} {
 		if !strings.Contains(string(javascript), marker) {
 			t.Fatalf("direct team controls do not handle %q", marker)
 		}
@@ -1840,7 +1840,7 @@ func TestCreationAndMemberReasoningSelectorsRequireExplicitValues(t *testing.T) 
 		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	if count := strings.Count(body, `data-effort-select`); count != 4 {
+	if count := strings.Count(body, `data-effort-select`); count != 5 {
 		t.Fatalf("reasoning effort selects = %d", count)
 	}
 	if !strings.Contains(body, `name="effort" data-effort-select required`) {

@@ -11,6 +11,8 @@ const baseURL = process.argv[2];
     const saved = [];
     const savedSettings = [];
     let serverPair = {model: "model-1", reasoningEffort: "medium"};
+    let memberPair = {model: "model-1", reasoningEffort: "medium"};
+    let fixtureTeamHTML = "";
     let threadStatus = "idle";
     let stopped = false;
     let detailsVersion = 0;
@@ -58,13 +60,11 @@ const baseURL = process.argv[2];
         serverPair = pair;
         return route.fulfill({json: pair});
       }
-      if (operation === "team-stats") return route.fulfill({json:{members:[{address:"architect0",state:"ready",snapshot:{currentState:"working",sentMessages:37,receivedMessages:12,totalToolCalls:81,workingMs:9000,idleMs:3000,waitingMs:1000}}]}});
+      if (operation === "team-stats") return route.fulfill({json:{members:[{address:"architect0",state:"ready",snapshot:{currentState:"working",sentMessages:37,receivedMessages:12,totalToolCalls:81,workingMs:9000,idleMs:3000,waitingMs:1000,coverageComplete:false,unclassifiedMs:5000}}, {address:"reviewer-with-long-address0", state:"ready", snapshot:{currentState:"idle",sentMessages:654321,receivedMessages:456789,totalToolCalls:987654,workingMs:360000000,waitingMs:36000000,idleMs:360000000}}, {address:"lead",state:"ready",snapshot:{currentState:"waiting",waitReason:"subagents",sentMessages:12,receivedMessages:2,totalToolCalls:20}}]}});
       if (operation === "details") {
         detailsReads++;
-        const teamHTML = `<form data-direct-team-form data-action="configure" data-address="architect0">
-          <select name="model" data-model-select data-current-value="model-1" aria-label="architect0 model" required><option>Loading models</option></select>
-          <select name="effort" data-effort-select data-current-value="medium" aria-label="architect0 reasoning" required><option>Loading efforts</option></select>
-          <button type="submit">Save</button><p role="status" hidden></p></form><span data-version="${detailsVersion}"></span><span data-team-stats="architect0"></span>`;
+        if (!fixtureTeamHTML) fixtureTeamHTML = await (await page.request.get(baseURL + "/fixture/team")).text();
+        const teamHTML = fixtureTeamHTML + `<span data-version="${detailsVersion}"></span>`;
         return route.fulfill({json: {repositoriesHTML: "", artifactsHTML: "", teamHTML, ...(stopped ? {interactive:false, recovery:{state:"stopped"}} : {})}});
       }
       if (operation === "team" && route.request().method() === "POST") {
@@ -77,7 +77,15 @@ const baseURL = process.argv[2];
     });
     await page.route("**/codex/conversations/example~architect0/settings", async route => {
       saved.push(route.request().postDataJSON());
-      return route.fulfill(saved.length < 3 ? {status: 409, json: {error: "Fixture save failure"}} : {json: {ok: true}});
+      if (saved.length < 3) return route.fulfill({status: 409, json: {error: "Fixture save failure"}});
+      memberPair = route.request().postDataJSON();
+      return route.fulfill({json: memberPair});
+    });
+    await page.route("**/codex/conversations/example~architect0/thread", route => route.fulfill({json: {threadId: "member-thread", status: "active", ...memberPair, entries: []}}));
+    await page.route("**/codex/conversations/example/thread", route => route.fulfill({json: {threadId: "thread-1", status: threadStatus, ...serverPair, entries: []}}));
+    await page.route("**/codex/conversations/example/settings", route => {
+      serverPair = route.request().postDataJSON(); savedSettings.push(serverPair);
+      return route.fulfill({json: serverPair});
     });
     const liveModel = page.locator("#codex-model"), liveEffort = page.locator("#codex-effort");
     const edit = page.locator("#codex-settings-open"), save = page.locator("#codex-settings-save");
@@ -158,7 +166,7 @@ const baseURL = process.argv[2];
       holdSettingsWrite = true; await save.click();
       await expect.poll(() => savedSettings.length).toBe(1);
       assert.deepEqual(savedSettings[0], {model: "model-2", reasoningEffort: "high"});
-      await expect(feedback).toHaveText("Saving Codex settings…");
+      await expect(feedback).toHaveText("Saving settings…");
       await expect(close).toBeDisabled(); await expect(save).toBeDisabled();
       await page.keyboard.press("Escape"); await expect(dialog).toBeVisible();
       releaseSettingsWrite(); await expect(dialog).toBeHidden();
@@ -178,54 +186,76 @@ const baseURL = process.argv[2];
     }
     await page.setViewportSize({width: 1280, height: 720});
     await page.getByRole("tab", {name: "Team"}).click();
-    const model = page.getByLabel("architect0 model");
-    const effort = page.getByLabel("architect0 reasoning");
+    const row = page.locator('[data-team-stats="architect0"]');
+    await expect(row.locator('[data-team-metric="sent"]')).toHaveText("37");
+    await expect(row.locator('[data-team-metric="received"]')).toHaveText("12");
+    await expect(row.locator('[data-team-metric="tools"]')).toHaveText("81");
+    const checkTeamLayout = async () => {
+      const layout = await page.evaluate(() => {
+        const table = document.querySelector("#team .team-table");
+        const scroll = table.parentElement;
+        const fields = [...document.querySelectorAll(".team-add-fields label")].map(el => el.getBoundingClientRect());
+        const form = document.querySelector('[data-action="add"]');
+        return {documentWidth: document.documentElement.scrollWidth, viewport: innerWidth,
+          sidebar: document.querySelector(".workspace-sidebar").getBoundingClientRect().width,
+          tableWidth: table.scrollWidth, available: scroll.clientWidth,
+          cells: [...table.querySelectorAll("th, td")].map(el => ({width:el.clientWidth, content:el.scrollWidth})),
+          fieldY: fields.map(box => box.y), buttonWidth: form.querySelector("button").getBoundingClientRect().width,
+          formWidth: form.getBoundingClientRect().width};
+      });
+      assert(layout.sidebar > 200, JSON.stringify(layout));
+      assert(layout.documentWidth <= layout.viewport, JSON.stringify(layout));
+      assert(layout.tableWidth <= layout.available, JSON.stringify(layout));
+      assert(layout.cells.every(cell => cell.content <= cell.width + 1), JSON.stringify(layout));
+      assert.equal(new Set(layout.fieldY).size, 1);
+      assert(layout.buttonWidth < layout.formWidth / 2);
+    };
+    await checkTeamLayout();
+    await expect(page.locator('[data-team-thread], #team-transcript')).toHaveCount(0);
+    const fullID = "01a10c52-451d-78b2-a8f9-63da636e13fd";
+    await expect(row.locator(".team-thread code")).toHaveText("01a10c52…13fd");
+    await expect(row.locator(".team-thread code")).toHaveAttribute("title", fullID);
+    await page.evaluate(() => { window.copiedText = ""; Object.defineProperty(navigator, "clipboard", {value: {writeText: async text => {window.copiedText = text;}}}); });
+    await row.getByRole("button", {name: "Copy thread ID"}).click();
+    assert.equal(await page.evaluate(() => window.copiedText), fullID);
+    await expect(row.locator(".team-thread svg")).toBeVisible();
+    const model = page.locator("#team-model"), effort = page.locator("#team-effort");
+    const teamSave = page.locator("#team-settings-save"), teamFeedback = page.locator("#team-settings-status");
+    await page.getByRole("button", {name: "Edit architect0 settings"}).click();
     await expect(model).toHaveValue("model-1");
-    detailsVersion++;
-    const idleReads = detailsReads;
-    await page.evaluate(() => dispatchEvent(new Event("focus")));
-    await expect.poll(() => detailsReads).toBeGreaterThan(idleReads);
-    await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
-    await page.getByRole("button", {name: "Save"}).click();
+    await model.selectOption("model-2"); await effort.selectOption("high");
+    await teamSave.click();
     await expect.poll(() => saved.length).toBe(1);
-    await expect(page.getByText("Fixture save failure")).toBeVisible();
-    assert.equal(saved[0].model, "model-1");
-    assert.equal(saved[0].reasoningEffort, "medium");
-    detailsVersion++;
-    const failedReads = detailsReads;
-    await page.getByRole("tab", {name: "Team"}).click();
-    await expect.poll(() => detailsReads).toBeGreaterThan(failedReads);
-    await expect(page.getByText("Fixture save failure")).toBeVisible();
-    await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
-    await model.selectOption("model-2");
-    await effort.selectOption("high");
-    await model.focus();
-    await expect(page.locator('[data-team-stats="architect0"]')).toContainText("37 sent · 12 received · 81 tool calls");
+    await expect(teamFeedback).toContainText("Fixture save failure");
+    assert.deepEqual(saved[0], {model: "model-2", reasoningEffort: "high"});
+    const rootWritesBefore = savedSettings.length;
     detailsVersion++;
     const editingReads = detailsReads;
+    await model.focus();
     await page.evaluate(() => dispatchEvent(new Event("focus")));
     await expect.poll(() => detailsReads).toBeGreaterThan(editingReads);
-    await expect(model).toBeFocused();
-    await page.request.post(baseURL + "/fixture/refresh");
-    await expect.poll(() => threadReads).toBeGreaterThan(1);
-    await expect(model).toHaveValue("model-2");
-    await expect(effort).toHaveValue("high");
-    await expect(page.locator("[data-version]")).toHaveAttribute("data-version", "1");
-    await page.getByRole("button", {name: "Save"}).click();
+    await expect(model).toBeFocused(); await expect(model).toHaveValue("model-2"); await expect(effort).toHaveValue("high");
+    await expect(teamFeedback).toContainText("Fixture save failure");
+    await teamSave.click();
     await expect.poll(() => saved.length).toBe(2);
-    await expect(page.getByText("Fixture save failure")).toBeVisible();
-    assert.equal(saved[1].model, "model-2");
-    assert.equal(saved[1].reasoningEffort, "high");
-    await expect(model).toHaveValue("model-2");
+    await expect(teamFeedback).toContainText("Fixture save failure");
     stopped = true;
     const stoppedReads = detailsReads;
     await page.evaluate(() => dispatchEvent(new Event("focus")));
     await expect.poll(() => detailsReads).toBeGreaterThan(stoppedReads);
     await expect(page.locator("#message-send")).toBeDisabled();
-    await expect(edit).toBeEnabled();
-    await page.getByRole("button", {name: "Save"}).click();
-    await expect.poll(() => saved.length).toBe(3);
-    assert.deepEqual(saved[2], saved[1]);
+    await expect(edit).toBeEnabled(); await expect(teamSave).toBeEnabled();
+    await teamSave.click(); await expect.poll(() => saved.length).toBe(3);
+    await expect(page.locator("#team-settings-dialog")).not.toBeVisible();
+    assert.equal(savedSettings.length, rootWritesBefore, "member edits must not write the lead settings");
+    assert.deepEqual(saved[2], saved[0]);
+    await page.getByRole("button", {name: "Edit lead settings"}).click();
+    await expect(model).toHaveValue(serverPair.model);
+    await model.selectOption("model-1"); await effort.selectOption("medium");
+    await teamSave.click(); await expect.poll(() => savedSettings.length).toBe(rootWritesBefore + 1);
+    await expect(page.locator("#team-settings-dialog")).not.toBeVisible();
+    await page.locator(".removed-members summary").click();
+    await checkTeamLayout();
     assert.deepEqual(errors, []);
   } finally {
     await browser.close();

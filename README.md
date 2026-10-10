@@ -344,8 +344,14 @@ The Team tab shows the lead and every retained member, with distinct incoming
 prompts, outgoing assistant or plan messages, and tool calls across their own
 conversation history. Forked conversations count their own turns. The conversation
 also retains counts for the current turn. Missing history or timing is marked as
-partial. A connection begun during sleep may leave the rest of that turn
-unclassified because native history cannot show whether the sleep has ended.
+partial. A connection begun during sleep leaves time unclassified until fresh
+native activity establishes that work has resumed. That observation starts new
+coverage; earlier unknown intervals remain unclassified.
+
+Each Team metric has its own column. Member details include an abbreviated thread
+ID with its complete value on hover and a copy icon. Model and reasoning values
+open a settings popup through the edit icon. Editing a member targets its own
+thread independently of the conversation selected in the Codex tab.
 
 The portal service observes activity without answering requests, even when no
 browser is open. Timing records contain identities, interval boundaries, and

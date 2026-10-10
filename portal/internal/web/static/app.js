@@ -364,14 +364,22 @@
   };
   const teamActivityPresentation = (row) => {
     const snapshot = row.snapshot;
-    if (!snapshot) return `${row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable"} · statistics unavailable`;
+    const missing = {activity: row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable",
+      sent: "-", received: "-", tools: "-", working: "-", waiting: "-", idle: "-", partial: false,
+      detail: row.error || "Statistics unavailable"};
+    if (!snapshot) return missing;
     const view = activityPresentation(snapshot);
-    const label = ["removed", "stopped"].includes(row.state) ? (row.state === "removed" ? "Removed" : "Stopped") :
-      view.state === "working" ? "Active" : view.state === "idle" ? "Idle" : view.state === "waiting" ? activityWaitLabel(snapshot) : "Activity unknown";
-    const counts = `${snapshot.sentMessages ?? "?"} sent · ${snapshot.receivedMessages ?? "?"} received · ${snapshot.totalToolCalls ?? "?"} tool calls`;
-    const time = `Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
-    const coverage = snapshot.countsComplete === false || snapshot.coverageComplete === false ? " · Partial statistics" : "";
-    return `${label}\n${counts}\n${time}${coverage}${view.unclassified ? ` · ${formatElapsed(view.unclassified)} unclassified` : ""}`;
+    const activity = ["removed", "stopped"].includes(row.state) ? missing.activity :
+      view.state === "working" ? "Active" : view.state === "idle" ? "Idle" : view.state === "waiting" ?
+        snapshot.waitReason === "sleep" ? "Sleeping" : snapshot.waitReason === "subagents" ? "Waiting for team" :
+          snapshot.waitReason === "approval" ? "Awaiting approval" : snapshot.waitReason === "userInput" ? "Awaiting answer" : "Waiting" :
+        snapshot.latestTurnStatus === "inProgress" ? "Turn in progress" : "Activity unavailable";
+    const partial = snapshot.countsComplete === false || snapshot.coverageComplete === false;
+    const detail = [view.state === "waiting" ? activityWaitLabel(snapshot) : "", partial ? "Partial statistics" : "",
+      snapshot.coverageReason || "", snapshot.countsComplete === false ? "Message or tool history is incomplete." : "",
+      view.unclassified ? `${formatElapsed(view.unclassified)} unclassified` : ""].filter(Boolean).join(" · ");
+    return {activity, sent: snapshot.sentMessages ?? "-", received: snapshot.receivedMessages ?? "-",
+      tools: snapshot.totalToolCalls ?? "-", working: view.working, waiting: view.waiting, idle: view.idle, partial, detail};
   };
 
   // A read may settle after abort (for example from a cache or test transport).
@@ -1867,7 +1875,9 @@
   let threadIdle = false;
   let liveSettingsSaving = false;
   let settingsWriteGeneration = 0;
-  let liveSettingsController = null;
+  let liveSettingsController = null, teamSettingsController = null;
+  let teamSettingsTarget = null, teamSettingsGeneration = 0, teamSettingsReadGeneration = 0;
+  let teamLeadSettingsInFlight = false;
   const teamSelects = Array.from(document.querySelectorAll("[data-team-select]"));
 
   const updateTeamDescription = (teamSelect) => {
@@ -2077,12 +2087,14 @@
   };
 
   const pairedEffortSelect = (modelSelect) => modelSelect.id === "codex-model" ?
-    document.getElementById("codex-effort") : modelSelect.closest("form")?.elements.effort;
+    document.getElementById("codex-effort") : modelSelect.id === "team-model" ?
+      document.getElementById("team-effort") : modelSelect.closest("form")?.elements.effort;
   const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       if (modelSelect.closest("form")?.id === "new-session-form") return;
       if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
       if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
+      if (modelSelect.id === "team-model") { teamSettingsController?.render(); return; }
       const effortSelect = pairedEffortSelect(modelSelect);
       const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
       const retainedValue = modelSelect.dataset.currentValue || "";
@@ -2100,9 +2112,8 @@
       // A plan/new-session override is a pending creation choice, not a view
       // of the source conversation. Preserve both its explicit value and its
       // intentional empty default across background settings refreshes.
-      const retainedEffort = modelSelect.closest('[data-action="configure"]') ? effortSelect.dataset.currentValue : "";
       populateEfforts(modelSelect, effortSelect, team && effortSelect.dataset.userEdited !== "true" ?
-        team.dataset.leadEffort : retainedEffort || effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
+        team.dataset.leadEffort : effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
       if (modelSelect.dataset.existingSettings === "true") {
         modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
       }
@@ -2176,11 +2187,13 @@
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       modelSelect.addEventListener("change", () => {
         if (modelSelect.id === "codex-model") { liveSettingsController?.modelChanged(); return; }
+        if (modelSelect.id === "team-model") { teamSettingsController?.modelChanged(); return; }
         modelSelect.dataset.userEdited = "true";
         populateEfforts(modelSelect, pairedEffortSelect(modelSelect));
       });
       pairedEffortSelect(modelSelect)?.addEventListener("change", (event) => {
         if (modelSelect.id === "codex-model") { liveSettingsController?.effortChanged(); return; }
+        if (modelSelect.id === "team-model") { teamSettingsController?.effortChanged(); return; }
         event.currentTarget.dataset.userEdited = "true";
       });
     });
@@ -2241,11 +2254,25 @@
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy]");
     if (!button) return;
-    const input = button.parentElement.querySelector("input, textarea");
-    await navigator.clipboard.writeText(input.value);
+    const value = button.dataset.copyValue ?? button.parentElement.querySelector("input, textarea")?.value;
+    if (value == null) return;
+    const icon = button.hasAttribute("data-copy-value");
+    const feedback = button.parentElement.querySelector(".copy-feedback");
     const old = button.textContent;
-    button.textContent = "Copied";
-    setTimeout(() => { button.textContent = old; }, 1000);
+    try {
+      await navigator.clipboard.writeText(value);
+      if (icon) {
+        button.title = "Copied";
+        if (feedback) feedback.textContent = "Thread ID copied";
+      } else button.textContent = "Copied";
+      setTimeout(() => {
+        if (icon) { button.title = "Copy thread ID"; if (feedback) feedback.textContent = ""; }
+        else button.textContent = old;
+      }, 1000);
+    } catch (_) {
+      if (icon) { button.title = "Copy failed"; if (feedback) feedback.textContent = "Could not copy thread ID"; }
+      else button.textContent = "Copy failed";
+    }
   });
 
   const sessionTabBar = document.querySelector('[aria-label="Session sections"]');
@@ -2319,24 +2346,18 @@
     if (!form) return;
     event.preventDefault();
     const action = form.dataset.action;
-    if (!interactive && action !== "configure") return;
+    if (!interactive) return;
     const status = form.querySelector("[role=status]");
     const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
     const value = name => form.elements[name]?.value?.trim() || "";
     const body = {action, model: value("model"), reasoningEffort: value("effort")};
     if (action === "preset") body.preset = value("preset");
     if (action === "add") body.role = value("role");
-    if (action === "configure") body.address = form.dataset.address;
     form.dataset.teamSubmitting = "true";
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
-      if (action === "configure") {
-        const memberClient = conversationAssets.createConversationClient({id: `${slug}~${body.address}`, basePath: "/codex"});
-        await memberClient.settings(body.model, body.reasoningEffort);
-      } else {
-        await directTeamRequest(body);
-      }
+      await directTeamRequest(body);
       if (status) status.textContent = "Saved.";
       setTimeout(() => location.reload(), 250);
     } catch (error) {
@@ -2350,39 +2371,6 @@
   document.addEventListener("change", (event) => {
     const form = event.target.closest("[data-direct-team-form]");
     if (form) form.dataset.teamDirty = "true";
-  });
-  document.addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-team-thread]");
-    if (!button) return;
-    const panel = document.getElementById("team-transcript");
-    const output = panel?.querySelector(".transcript");
-    if (!panel || !output) return;
-    button.disabled = true;
-    output.replaceChildren();
-    const loading = document.createElement("p"); loading.className = "empty"; loading.textContent = "Loading member messages…";
-    output.append(loading); panel.hidden = false;
-    try {
-      const result = await request(`/api/sessions/${encodeURIComponent(slug)}/team-thread?member=${encodeURIComponent(button.dataset.teamThread)}`);
-      output.replaceChildren();
-      for (const entry of result.transcript.entries || []) {
-        if (!entry.text && !entry.displayText) continue;
-        const item = document.createElement("article"); item.className = "message";
-        const heading = document.createElement("strong"); heading.textContent = entry.kind || "message";
-        const text = document.createElement("pre"); text.textContent = entry.text || entry.displayText || "";
-        const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
-        const time = document.createElement("time"); time.className = "message-time";
-        time.textContent = timestamp.text;
-        time.title = timestamp.title;
-        if (timestamp.dateTime) time.dateTime = timestamp.dateTime;
-        item.append(heading, text, time); output.append(item);
-      }
-      if (!output.childElementCount) output.append(Object.assign(document.createElement("p"), {className: "empty", textContent: "This member has no visible messages yet."}));
-    } catch (error) {
-      output.replaceChildren(Object.assign(document.createElement("p"), {className: "notice error", textContent: error.message}));
-    } finally { button.disabled = false; }
-  });
-  document.addEventListener("click", (event) => {
-    if (event.target.closest("[data-team-transcript-close]")) document.getElementById("team-transcript").hidden = true;
   });
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-team-retry]");
@@ -2880,6 +2868,7 @@
     if (detailsTimer !== null) clearTimeout(detailsTimer);
     detailsRunning = true;
     const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
+    const teamGeneration = teamSettingsGeneration;
     const warning = document.getElementById("session-details-warning");
     try {
       const payload = await client.details({signal: read.signal});
@@ -2923,7 +2912,7 @@
           artifactPreview.textContent = "Choose an artifact to preview it.";
         }
       }
-      if (typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
+      if (teamGeneration === teamSettingsGeneration && typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
         const editingTeam = teamStatus?.querySelector("[data-direct-team-form]:focus-within, [data-direct-team-form][data-team-dirty], [data-direct-team-form][data-team-submitting]");
         if (teamStatus && !editingTeam) {
@@ -2934,6 +2923,7 @@
           if (removed) removed.open = removedOpen;
           bindModelSelects(teamStatus);
           void loadModels(teamStatus);
+          void refreshTeamLeadSettings();
         }
       }
       if (Array.isArray(payload.readyMembers)) {
@@ -3011,11 +3001,18 @@
       const payload = await request(`/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal});
       if (!read.isCurrent()) return;
       const rows = new Map((payload.members || []).map(row => [row.address, row]));
-      panel.querySelectorAll("[data-team-stats]").forEach(cell => {
-        cell.textContent = teamActivityPresentation(rows.get(cell.dataset.teamStats) || {state: "unavailable"});
+      panel.querySelectorAll("[data-team-stats]").forEach(element => {
+        const view = teamActivityPresentation(rows.get(element.dataset.teamStats) || {state: "unavailable"});
+        element.querySelectorAll("[data-team-metric]").forEach(cell => {
+          cell.textContent = view[cell.dataset.teamMetric];
+          cell.title = view.detail;
+        });
+        const coverage = element.querySelector(".team-coverage");
+        if (coverage) { coverage.hidden = !view.partial; coverage.title = view.detail; coverage.setAttribute("aria-label", view.detail); }
       });
+      void refreshTeamLeadSettings();
     } catch (_) {
-      if (read.isCurrent()) panel.querySelectorAll("[data-team-stats]").forEach(cell => { cell.textContent = "Statistics update unavailable"; });
+      if (read.isCurrent()) panel.querySelectorAll('[data-team-metric="activity"]').forEach(cell => { cell.textContent = "Update unavailable"; });
     } finally { read.finish(); teamStatsInFlight = false; }
   };
   document.querySelector('[data-session-tab="team"]')?.addEventListener("click", () => { void refreshTeamStats(); });
@@ -3279,7 +3276,7 @@
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? (view.state === "unclassified" ? "Activity unknown" : "Codex is working") : "";
+    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? (view.state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working") : "";
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
@@ -4857,108 +4854,162 @@
     }
   });
 
-  const liveModelSelect = document.getElementById("codex-model");
-  const liveEffortSelect = document.getElementById("codex-effort");
-  const liveSettingsStatus = document.getElementById("codex-settings-status");
-  if (liveModelSelect && liveEffortSelect) {
-    const applyButton = document.getElementById("codex-settings-save");
-    const cancelButton = document.getElementById("codex-settings-close");
-    const dialog = document.getElementById("codex-settings-dialog");
-    const editButton = document.getElementById("codex-settings-open");
-    const summary = document.getElementById("codex-settings-summary");
-    const draft = {model: "", effort: ""};
-    const settingsEditable = () => Boolean(document.getElementById("message-form"));
-    let dirty = false, saving = false, writeGeneration = 0, notice = "";
+  // Both settings popups share the same draft, validation and uncertain-save rules.
+  const createSettingsPopup = ({prefix, editable, targetClient, onConfirm, onSaved, onBusy = () => {}}) => {
+    const dialog = document.getElementById(`${prefix}-settings-dialog`);
+    if (!dialog) return null;
+    const modelSelect = document.getElementById(`${prefix}-model`);
+    const effortSelect = document.getElementById(`${prefix}-effort`);
+    const status = document.getElementById(`${prefix}-settings-status`);
+    const save = document.getElementById(`${prefix}-settings-save`);
+    const close = document.getElementById(`${prefix}-settings-close`);
+    const pair = {model: "", effort: ""}, draft = {model: "", effort: ""};
+    let dirty = false, saving = false, notice = "";
     const validPair = () => models.some(model => model.model === draft.model &&
       model.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort));
-    liveSettingsController = {
+    const controller = {
       render() {
-        summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
-        editButton.disabled = !settingsEditable() || saving;
-        applyButton.disabled = !settingsEditable() || saving || !dirty || !validPair();
-        cancelButton.disabled = saving;
+        save.disabled = !editable() || saving || !dirty || !validPair();
+        close.disabled = saving;
         if (!models.length) return;
-        restoreDraftSelect(liveModelSelect, draft.model, "Selected model is unavailable");
-        if (draft.model) liveModelSelect.value = draft.model;
-        else liveModelSelect.selectedIndex = -1;
-        populateEfforts(liveModelSelect, liveEffortSelect, draft.effort);
-        restoreDraftSelect(liveEffortSelect, draft.effort, "Selected reasoning effort is unavailable");
-        if (draft.effort) liveEffortSelect.value = draft.effort;
-        else liveEffortSelect.selectedIndex = -1;
-        const editable = settingsEditable() && !saving;
-        liveModelSelect.disabled = !editable;
-        liveEffortSelect.disabled = !editable || !models.some(model => model.model === draft.model);
-        applyButton.disabled = !editable || !dirty || !validPair();
-        cancelButton.disabled = saving;
-        if (liveSettingsStatus && !saving) liveSettingsStatus.textContent = notice;
+        restoreDraftSelect(modelSelect, draft.model, "Selected model is unavailable");
+        if (draft.model) modelSelect.value = draft.model;
+        else modelSelect.selectedIndex = -1;
+        populateEfforts(modelSelect, effortSelect, draft.effort);
+        restoreDraftSelect(effortSelect, draft.effort, "Selected reasoning effort is unavailable");
+        if (draft.effort) effortSelect.value = draft.effort;
+        else effortSelect.selectedIndex = -1;
+        modelSelect.disabled = !editable() || saving;
+        effortSelect.disabled = !editable() || saving || !models.some(model => model.model === draft.model);
+        if (!saving) status.textContent = notice;
       },
       confirm(model, effort) {
         if (!model || !effort) return;
-        currentModel = model; currentEffort = effort;
-        if (!dirty && !saving) { draft.model = model; draft.effort = effort; }
+        pair.model = model; pair.effort = effort;
+        onConfirm(model, effort);
+        if (!dirty && !saving) Object.assign(draft, pair);
         this.render();
       },
       modelChanged() {
-        draft.model = liveModelSelect.value;
+        draft.model = modelSelect.value;
         const selected = models.find(model => model.model === draft.model);
         if (!selected?.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort)) {
           draft.effort = selected?.defaultReasoningEffort || "";
         }
         notice = ""; dirty = true; this.render();
       },
-      effortChanged() {
-        draft.effort = liveEffortSelect.value;
-        notice = ""; dirty = true; this.render();
-      },
+      effortChanged() { draft.effort = effortSelect.value; notice = ""; dirty = true; this.render(); },
       cancel() {
         if (saving) return;
-        draft.model = currentModel; draft.effort = currentEffort;
-        notice = ""; dirty = false; this.render();
+        Object.assign(draft, pair); notice = ""; dirty = false; this.render();
+      },
+      open(model = pair.model, effort = pair.effort) {
+        if (saving) return;
+        pair.model = model || ""; pair.effort = effort || "";
+        this.cancel(); dialog.showModal();
+        if (!models.length) void loadModels(dialog);
       },
       async apply() {
-        if (!settingsEditable() || saving || !dirty || !validPair()) return;
-        const selected = {model: draft.model, effort: draft.effort};
-        saving = true; liveSettingsSaving = true; const attempt = ++writeGeneration;
-        if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings…";
-        this.render(); updateMessageActions(); applyCurrentSettings();
+        if (!editable() || saving || !dirty || !validPair()) return;
+        const selected = {...draft}, client = targetClient();
+        if (!client) return;
+        saving = true; status.textContent = "Saving settings…"; this.render(); onBusy(true);
+        const accept = saved => {
+          this.confirm(saved.model, saved.reasoningEffort);
+          Object.assign(draft, pair); dirty = false;
+          notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn.";
+          onSaved(saved); dialog.close();
+        };
         try {
           const saved = await client.settings(selected.model, selected.effort);
-          if (attempt !== writeGeneration) return;
           if (saved.model !== selected.model || saved.reasoningEffort !== selected.effort) {
             throw new Error("Codex returned different settings; check the current thread before retrying.");
           }
-          ++settingsWriteGeneration;
-          currentModel = saved.model; currentEffort = saved.reasoningEffort;
-          draft.model = saved.model; draft.effort = saved.reasoningEffort;
-          notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn."; dirty = false; dialog.close(); scheduleRefresh(0);
+          accept(saved);
         } catch (error) {
           try {
             const observed = await client.thread();
             if (observed.model && observed.reasoningEffort) {
-              currentModel = observed.model; currentEffort = observed.reasoningEffort;
-              if (observed.model === selected.model && observed.reasoningEffort === selected.effort) {
-                ++settingsWriteGeneration;
-                notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn."; dirty = false; dialog.close(); scheduleRefresh(0);
-              }
+              this.confirm(observed.model, observed.reasoningEffort);
+              if (observed.model === selected.model && observed.reasoningEffort === selected.effort) accept(observed);
             }
           } catch (_) { /* Keep the draft if the write outcome cannot be read. */ }
           if (dirty) notice = `The settings update could not be confirmed: ${error.message}`;
-        } finally {
-          saving = false; liveSettingsSaving = false;
-          this.render(); updateMessageActions(); applyCurrentSettings();
-        }
+        } finally { saving = false; this.render(); onBusy(false); }
       },
     };
-    applyButton?.addEventListener("click", () => { void liveSettingsController.apply(); });
-    editButton.addEventListener("click", () => {
-      liveSettingsController.cancel(); dialog.showModal();
-      if (!models.length) void loadModels(dialog);
+    save.addEventListener("click", () => { void controller.apply(); });
+    close.addEventListener("click", () => { if (!saving) {controller.cancel(); dialog.close();} });
+    dialog.addEventListener("cancel", event => { if (saving) event.preventDefault(); else controller.cancel(); });
+    dialog.addEventListener("close", () => controller.cancel());
+    controller.render();
+    return controller;
+  };
+  const editButton = document.getElementById("codex-settings-open");
+  const renderCodexSettingsSummary = () => {
+    const summary = document.getElementById("codex-settings-summary");
+    if (summary) summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
+    if (editButton) editButton.disabled = !document.getElementById("message-form") || liveSettingsSaving;
+  };
+  liveSettingsController = createSettingsPopup({prefix: "codex",
+    editable: () => Boolean(document.getElementById("message-form")), targetClient: () => client,
+    onConfirm(model, effort) { currentModel = model; currentEffort = effort; renderCodexSettingsSummary(); },
+    onSaved() { ++settingsWriteGeneration; scheduleRefresh(0); },
+    onBusy(busy) { liveSettingsSaving = busy; renderCodexSettingsSummary(); updateMessageActions(); applyCurrentSettings(); },
+  });
+  editButton?.addEventListener("click", () => liveSettingsController.open());
+  renderCodexSettingsSummary();
+
+  const teamConversation = address => conversationAssets.createConversationClient({
+    id: address === "lead" ? slug : `${slug}~${address}`, basePath: "/codex",
+  });
+  const showTeamSettings = (address, model, effort) => {
+    document.querySelectorAll("[data-team-settings-summary]").forEach(summary => {
+      if (summary.dataset.teamSettingsSummary === address) summary.textContent = [model, effort].filter(Boolean).join(" · ") || "Settings unavailable";
     });
-    cancelButton.addEventListener("click", () => { if (!saving) {liveSettingsController.cancel(); dialog.close();} });
-    dialog.addEventListener("cancel", event => { if (saving) event.preventDefault(); else liveSettingsController.cancel(); });
-    dialog.addEventListener("close", () => liveSettingsController.cancel());
-    liveSettingsController.render();
-  }
+    document.querySelectorAll("[data-team-settings]").forEach(button => {
+      if (button.dataset.teamSettings === address) { button.dataset.model = model; button.dataset.effort = effort; }
+    });
+  };
+  const refreshTeamLeadSettings = async () => {
+    if (teamLeadSettingsInFlight || !document.getElementById("team")?.classList.contains("active") || pageReads.paused || document.hidden) return;
+    teamLeadSettingsInFlight = true;
+    const read = pageReads.begin(), generation = teamSettingsGeneration;
+    try {
+      const observed = await teamConversation("lead").thread({signal: read.signal});
+      if (read.isCurrent() && generation === teamSettingsGeneration) showTeamSettings("lead", observed.model, observed.reasoningEffort);
+    } catch (_) { /* Retain the last confirmed values when refresh is unavailable. */ }
+    finally { read.finish(); teamLeadSettingsInFlight = false; }
+  };
+  teamSettingsController = createSettingsPopup({prefix: "team",
+    editable: () => Boolean(teamSettingsTarget), targetClient: () => teamSettingsTarget?.client,
+    onConfirm(model, effort) { showTeamSettings(teamSettingsTarget.address, model, effort); },
+    onBusy(busy) { if (busy) ++teamSettingsReadGeneration; },
+    onSaved(saved) {
+      ++teamSettingsGeneration;
+      if (teamSettingsTarget.address === (selectedMember || "lead")) {
+        ++settingsWriteGeneration;
+        liveSettingsController?.confirm(saved.model, saved.reasoningEffort); scheduleRefresh(0);
+      }
+      void refreshSessionDetails();
+    },
+  });
+  document.addEventListener("click", async event => {
+    const button = event.target.closest("[data-team-settings]");
+    if (!button || !teamSettingsController) return;
+    const address = button.dataset.teamSettings;
+    const target = teamSettingsTarget = {address, client: teamConversation(address)};
+    const generation = ++teamSettingsReadGeneration;
+    document.getElementById("team-settings-title").textContent = `${address} settings`;
+    teamSettingsController.open(button.dataset.model || "", button.dataset.effort || "");
+    try {
+      const observed = await target.client.thread();
+      if (generation === teamSettingsReadGeneration && teamSettingsTarget === target && document.getElementById("team-settings-dialog").open) {
+        teamSettingsController.confirm(observed.model, observed.reasoningEffort);
+      }
+    } catch (_) { /* Retained roster values remain editable if the read fails. */ }
+  });
+  document.getElementById("team-settings-dialog")?.addEventListener("close", () => { ++teamSettingsReadGeneration; });
 
   const forkDialog = document.getElementById("fork-dialog");
   const forkForm = document.getElementById("fork-form");

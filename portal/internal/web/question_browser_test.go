@@ -10,6 +10,8 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 // Run with PORTAL_BROWSER_TEST=1 and Nix-provided Node, Playwright modules and
@@ -56,6 +58,22 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	handler := server.Handler()
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/team" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			data := pageData{
+				Session:   &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "01a12199-96b2-7773-8d2a-4f54a78c7f6e"}}, Interactive: true},
+				TeamRoles: teamRoles(teamruntime.Presets()),
+				DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
+					{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "medium", Thread: "01a10c52-451d-78b2-a8f9-63da636e13fd"},
+					{Address: "reviewer-with-long-address0", State: "ready", Access: "read_only", Model: "gpt-6.1-sol-with-a-long-model-name", Effort: "xhigh", Thread: "01a12617-e2db-7a50-8e60-9ba7687670d3"},
+				}},
+				RemovedMembers: []teamruntime.Member{{Address: "removed0", State: "removed", Model: "model-1", Effort: "medium", Thread: "01a1265c-f81e-7100-8915-dda1ef347a0e"}},
+			}
+			if err := server.templates.ExecuteTemplate(w, "member-status", data); err != nil {
+				t.Error(err)
+			}
+			return
+		}
 		if r.URL.Path == "/fixture/download" {
 			w.Header().Set("Content-Type", "text/plain")
 			w.Header().Set("Content-Disposition", `attachment; filename="fixture.txt"`)

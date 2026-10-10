@@ -426,6 +426,12 @@ func New(config Config) (*Server, error) {
 			}
 			return value
 		},
+		"shortThread": func(value string) string {
+			if len(value) > 13 {
+				return value[:8] + "…" + value[len(value)-4:]
+			}
+			return value
+		},
 		"timeAgo":         timeAgo,
 		"workflowSummary": workflowSummary,
 	}).ParseFS(assets, "templates/*.html")
