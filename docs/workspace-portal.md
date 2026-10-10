@@ -208,7 +208,12 @@ The Plan/Default switch sits with the attachment and Send controls on the left.
 The model summary, pencil icon and Interrupt control sit on the right, centered
 vertically within their row.
 
-Active or unknown turn state blocks saving. A failed or uncertain update keeps
+Model and reasoning settings can be saved during active, idle, interrupted and
+unknown turn states. Native settings become defaults for the next turn; the
+current turn continues with its original settings. Stopped or recovery-held
+sessions save the choice without loading a thread. Explicit activation applies
+it before queued messages or a saved goal can resume. Archived sessions remain
+read-only. A failed or uncertain update keeps
 the dialog open and rereads the thread. The controls never send a compensating
 update automatically. Reads begun before a successful save cannot overwrite its
 confirmed pair.
