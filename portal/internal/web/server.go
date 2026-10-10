@@ -1840,6 +1840,10 @@ func (s *Server) sessionAPIForSummary(
 		s.sessionDetails(w, r, summary)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "team-stats" && r.Method == http.MethodGet {
+		s.teamStatsAPI(w, r, summary)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "team" {
 		s.teamAPI(w, r, summary)
 		return

@@ -841,6 +841,33 @@ The catalog defines a verification watcher separately from the team. The
 site selects its model and effort for each fresh, operation-scoped subagent;
 it is not a persistent team member.
 
+## Team activity statistics
+
+The Team tab shows activity separately from roster state for the lead and every
+retained member. Sent messages count assistant replies and plans; received
+messages count conversation prompts, including team reports. Tool calls count
+distinct native tool items. Lifecycle notifications and tool results do not
+increase these counters. Totals span each thread's own history and exclude
+inherited fork turns. Utility subagents are not persistent roster members.
+
+Working, waiting and idle durations are separate session lifetime totals. Sleep
+and collaboration waits say that execution resumes automatically. Blocking
+questions and approvals show the action needed from the user. Idle means there
+is no current turn. Unobserved turn time stays unclassified and partial history
+is labeled. Counts are rebuilt from native history after a portal restart;
+observed timing survives in private activity checkpoints. Stopped and removed
+members show the last saved snapshot, without extending its time. Missing
+snapshots show statistics unavailable.
+
+The observer watches ready members without a browser connection and never
+answers requests or starts turns. Reads share a four-request limit and per-thread
+cache. Team polling updates statistics cells without replacing settings forms.
+The read-only `GET /api/sessions/<slug>/team-stats` resolves every live member
+through the normal conversation authorization. Statistics and pending model
+choices use additive private records; roster and recovery schemas stay unchanged.
+An older package ignores these records. A forward recovery package retains them;
+an older package cannot apply pending cold model choices.
+
 ## Session creation progress
 
 The [session preparation contract](session-preparations.md) describes

@@ -34,7 +34,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
         await route.continue();
       });
-      let threadStatus = "idle", activityState = "idle", pending = [];
+      let threadStatus = "idle", activityState = "idle", automaticWait = "", pending = [];
       let workspaceArchiveReads = 0, indexReads = 0, indexProgressReads = 0, failWorkspaceArchive = false;
       await page.route("**/api/auto-archive", route => {
         workspaceArchiveReads++;
@@ -67,11 +67,11 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
             return route.fulfill(failArchive ? {status: 503, json: {error: "Fixture read failure"}} : {json: archive});
           case "thread": return route.fulfill({json: {threadId: "thread-1", latestTurnId: "turn-1", status: threadStatus, collaborationMode: "plan", model: "model-1", reasoningEffort: "medium", entries: []}});
           case "pending": return route.fulfill({json: pending});
-          case "respond": return route.fulfill({json: {ok: true}});
+          case "respond": activityState = "working"; return route.fulfill({json: {ok: true}});
           case "queue": return route.fulfill({json: []});
           case "reconcile": return route.fulfill({json: {ok: true}});
           case "activity": return route.fulfill(failActivity ? {status: 503, json: {error: "Fixture timing failure"}} : {json: {
-            currentState: activityState, workingMs: 30000, waitingMs: 10000,
+            currentState: activityState, waitReason: automaticWait || (activityState === "waiting" && pending.length ? "userInput" : ""), workingMs: 30000, waitingMs: 10000,
             stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
           }});
           case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion, workflowMode, workflowBodyVersion, workflowRunURL), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
@@ -127,7 +127,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       const codexTab = page.locator("#session-tab-codex");
       const waitingIndicator = page.locator("#codex-waiting-indicator");
       await expect(waitingIndicator).toBeVisible();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex: waiting for instructions");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex: Idle · waiting for instructions");
       await width(250);
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await expect(waitingIndicator).toBeVisible();
@@ -239,10 +239,16 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.evaluate(() => dispatchEvent(new Event("pagehide")));
       await expect(waitingIndicator).toBeHidden();
       await page.reload();
-      threadStatus = "active"; activityState = "waiting"; pending = [blockingPrompt];
+      threadStatus = "idle"; activityState = "waiting"; automaticWait = "sleep";
+      await page.reload(); await expect(waitingIndicator).toBeHidden();
+      await expect(page.locator("#codex-work-label")).toHaveText("Sleeping · wakes automatically");
+      automaticWait = "subagents"; await page.reload();
+      await expect(waitingIndicator).toBeHidden();
+      await expect(page.locator("#codex-work-label")).toHaveText("Waiting for team members · resumes automatically");
+      automaticWait = ""; threadStatus = "active"; activityState = "waiting"; pending = [blockingPrompt];
       await page.reload();
       await expect(waitingIndicator).toBeVisible();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex: waiting for instructions");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex: Waiting for your answer");
       await codexTab.click();
       await page.locator(".wizard-option").filter({hasText: "Continue"}).click();
       await page.getByRole("button", {name: "Submit answers"}).click();

@@ -20,7 +20,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
-  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, indexStatusFreshForPage, indexStatusOrder,
+  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, teamActivityPresentation, indexStatusFreshForPage, indexStatusOrder,
   createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
   renderCollaborationModes, storeCreationDraft, creationCLICommand,
@@ -261,7 +261,7 @@ finishLimitsRead(unreportedLimits);
 await unreportedLimitsRead;
 assert.deepEqual(limitsChanges.pop(), {snapshot: unreportedLimits, failed: false});
 
-// Waiting totals include completed gaps, while the current open wait stays separate.
+// Waiting excludes idle gaps and includes the open wait.
 const timing = {
   currentState: "waiting", workingMs: 60_000, waitingMs: 10_000,
   betweenTurnsMs: 120_000, openWaitingMs: 5_000, stateSinceMs: 1000,
@@ -269,7 +269,11 @@ const timing = {
 };
 const waitingView = activityPresentation(timing, 2000);
 assert.equal(waitingView.working, "1m 00s");
-assert.equal(waitingView.waiting, "2m 10s");
+assert.equal(waitingView.waiting, "17s");
+assert.equal(waitingView.idle, "2m 00s");
+assert.equal(activityWaitLabel({...timing,waitReason:"sleep"}),"Sleeping · wakes automatically");
+assert.equal(activityWaitLabel({...timing,waitReason:"subagents"}),"Waiting for team members · resumes automatically");
+assert.match(teamActivityPresentation({state:"ready", snapshot:{...timing,sentMessages:42,receivedMessages:9,totalToolCalls:100}}),/42 sent · 9 received · 100 tool calls/);
 assert.equal(waitingView.openWait, "7s");
 assert.equal(waitingView.counts, "3 messages · 7 tool calls");
 assert.equal(activityPresentation({...timing,currentState:"working"},2000).working,"1m 02s");
