@@ -668,7 +668,7 @@ and does not replace final review. A preset reviewer receives no automatic
 assignment. See the [session guide](dev-sessions.md#team-members) for orchestration.
 
 After creation, the Team tab can add, remove, and configure members, and
-inspect their messages. Adding, replacing or reconfiguring members requires
+show their activity and statistics. Adding, replacing or reconfiguring members requires
 explicit user direction; agents do not automatically grow a Solo roster or add
 a designer to a Lead-designed team. The mandatory-review workflow uses a
 temporary independent final reviewer when no eligible retained reviewer exists,
@@ -690,6 +690,22 @@ Server's ordinary turn-steer behavior. Members send results and blocking
 questions to `lead` through the package-owned `report_to_lead` tool. Each
 message has a unique ID that the member reuses only if delivery needs a retry.
 The member's work remains in its own transcript.
+
+When the focused conversation is idle or waiting, the Codex panel shows ongoing
+work by other ready members. It lists up to three addresses and the remaining
+count, including sleeping members and members waiting for subagents with short
+state labels. Unclassified active turns say **turn in progress**. Members awaiting
+approval or an answer are not included. The focused member keeps its own status;
+an idle member says **Idle** without an attention indicator while other members
+have ongoing work. Approval and answer requests remain visible. This notice
+reports activity, not a dependency or a promise that another member will wake
+the focused conversation.
+
+Team activity refreshes every five seconds while the page is visible, including
+when the Team tab is closed. The table and notice share one read. Observations
+older than 15 seconds or invalidated by a failed read show **Team activity update
+unavailable** instead of asserting ongoing work. Returning to the page requests
+a fresh observation. This read does not activate held or stopped threads.
 
 The new-session form labels presets by size and role counts, such as
 `Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer`. It also shows

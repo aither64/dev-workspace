@@ -20,7 +20,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
-  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, teamActivityPresentation, indexStatusFreshForPage, indexStatusOrder,
+  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, teamActivityPresentation, teamWorkPresentation, indexStatusFreshForPage, indexStatusOrder,
   createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
   renderCollaborationModes, storeCreationDraft, creationCLICommand,
@@ -280,6 +280,25 @@ assert.equal(uncertainTeam.activity, "Turn in progress"); assert.equal(uncertain
 assert.match(uncertainTeam.detail, /5s unclassified/);
 assert.equal(teamActivityPresentation({state:"ready",snapshot:{currentState:"working",coverageComplete:false}}).activity, "Active");
 assert.equal(teamActivityPresentation({state:"ready",snapshot:{currentState:"waiting",waitReason:"subagents"}}).activity, "Waiting for team");
+const teamMember = (address, currentState, waitReason, latestTurnStatus, state = "ready") =>
+  ({address, state, snapshot: {currentState, waitReason, latestTurnStatus, observedAtMs: Date.now()}});
+const ongoingMembers = [teamMember("reviewer0", "waiting", "subagents"), teamMember("implementer0", "working"),
+  teamMember("architect0", "waiting", "sleep"), teamMember("analyst0", "unclassified", "", "inProgress"),
+  teamMember("lead", "working"), teamMember("idle0", "idle"), teamMember("approval0", "waiting", "approval"),
+  teamMember("answer0", "waiting", "userInput"), teamMember("unknown0", "unclassified"),
+  teamMember("removed0", "working", "", "inProgress", "removed"), {address: "missing0", state: "ready"}];
+assert.deepEqual(teamWorkPresentation(ongoingMembers).members.map(row => row.address), ["analyst0", "architect0", "implementer0", "reviewer0"]);
+assert.equal(teamWorkPresentation(ongoingMembers).text,
+  "Other team members are working: analyst0 (turn in progress), architect0 (sleeping), implementer0, and 1 other.");
+assert.deepEqual(teamWorkPresentation(ongoingMembers, "implementer0").members.map(row => row.address), ["lead", "analyst0", "architect0", "reviewer0"]);
+assert.equal(teamWorkPresentation([teamMember("lead", "idle")]).text, "");
+assert.equal(teamWorkPresentation([teamMember("implementer0", "working")]).text, "Other team members are working: implementer0.");
+assert.match(teamWorkPresentation([...ongoingMembers, teamMember("worker0", "working")]).text, /and 2 others\.$/);
+assert.equal(teamWorkPresentation(ongoingMembers).stale, false);
+const expiredMember = teamMember("implementer0", "working");
+expiredMember.snapshot.observedAtMs = Date.now() - 20000;
+assert.equal(teamWorkPresentation([expiredMember]).stale, true, "delivery must not renew expired observations");
+assert.equal(teamWorkPresentation([{address:"implementer0",state:"ready",snapshot:{currentState:"working"}}]).stale, true);
 assert.equal(waitingView.openWait, "7s");
 assert.equal(waitingView.counts, "3 messages · 7 tool calls");
 assert.equal(activityPresentation({...timing,currentState:"working"},2000).working,"1m 02s");

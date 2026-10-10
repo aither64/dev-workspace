@@ -381,6 +381,26 @@
     return {activity, sent: snapshot.sentMessages ?? "-", received: snapshot.receivedMessages ?? "-",
       tools: snapshot.totalToolCalls ?? "-", working: view.working, waiting: view.waiting, idle: view.idle, partial, detail};
   };
+  const teamWorkPresentation = (rows, focusedAddress = "lead", now = Date.now()) => {
+    const members = rows.filter(row => {
+      if (row.address === focusedAddress || row.state !== "ready" || !row.snapshot) return false;
+      const snapshot = row.snapshot;
+      return snapshot.currentState === "working" ||
+        snapshot.currentState === "waiting" && ["sleep", "subagents"].includes(snapshot.waitReason) ||
+        snapshot.currentState === "unclassified" && snapshot.latestTurnStatus === "inProgress";
+    }).sort((left, right) => left.address === "lead" ? -1 : right.address === "lead" ? 1 :
+      left.address.localeCompare(right.address, "en", {numeric: true}));
+    const labels = members.slice(0, 3).map(row => {
+      const snapshot = row.snapshot;
+      const state = snapshot.currentState === "unclassified" ? "turn in progress" :
+        snapshot.waitReason === "sleep" ? "sleeping" : snapshot.waitReason === "subagents" ? "waiting for team" : "";
+      return `${row.address}${state ? ` (${state})` : ""}`;
+    });
+    if (members.length > 3) labels.push(`and ${members.length - 3} ${members.length === 4 ? "other" : "others"}`);
+    const stale = members.some(row => !Number.isFinite(row.snapshot.observedAtMs) || row.snapshot.observedAtMs <= 0 ||
+      now - row.snapshot.observedAtMs > 15_000);
+    return {members, stale, text: members.length ? `Other team members are working: ${labels.join(", ")}.` : ""};
+  };
 
   // A read may settle after abort (for example from a cache or test transport).
   // Consumers must check its generation before applying either data or errors.
@@ -1047,7 +1067,7 @@
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, teamActivityPresentation,
+      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
@@ -2940,6 +2960,8 @@
           if (JSON.stringify([...selector.options].map((option) => option.value)) !== JSON.stringify(addresses)) {
             selector.replaceChildren(...addresses.map((address) => new Option(address, address)));
             selector.value = selectedMember || "lead";
+            updateTeamWork();
+            void refreshTeamStats();
           }
         }
       }
@@ -2967,6 +2989,7 @@
   const suspendPageReads = (leaving = false) => {
     pageLeaving ||= leaving;
     pageReads.pause(); clearTimeout(detailsTimer); detailsTimer = null;
+    teamStatsReceivedAt = 0;
     repositoryReview?.suspend(); pauseTiming();
   };
   const resumePageReads = () => {
@@ -2976,6 +2999,7 @@
     if (wasPaused) { resumeTiming(); repositoryReview?.resume(); }
     resumeHistory();
     void refreshSessionDetails();
+    void refreshTeamStats();
   };
   // Firefox can reject old-document fetches before pagehide. Stop these reads
   // as soon as ordinary document navigation starts.
@@ -2992,14 +3016,20 @@
   addEventListener("pageshow", () => { pageLeaving = false; resumePageReads(); });
   sessionTabs.forEach(tab => tab.addEventListener("click", refreshSessionDetails));
   let teamStatsInFlight = false;
+  let teamStatsPayload = null, teamStatsReceivedAt = 0, teamStatsFailed = false;
+  let updateTeamWork = () => {};
   const refreshTeamStats = async () => {
     const panel = document.getElementById("team");
-    if (!slug || document.hidden || pageReads.paused || !panel?.classList.contains("active") || teamStatsInFlight) return;
+    const visibleTeam = panel?.classList.contains("active");
+    const hasMembers = document.querySelector('#codex-member option:not([value="lead"])');
+    if (!slug || document.hidden || pageReads.paused || teamStatsInFlight ||
+        !visibleTeam && (!interactive || executionHeld || !hasMembers)) return;
     teamStatsInFlight = true;
     const read = pageReads.begin();
     try {
       const payload = await request(`/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal});
       if (!read.isCurrent()) return;
+      teamStatsPayload = payload; teamStatsReceivedAt = Date.now(); teamStatsFailed = false;
       const rows = new Map((payload.members || []).map(row => [row.address, row]));
       panel.querySelectorAll("[data-team-stats]").forEach(element => {
         const view = teamActivityPresentation(rows.get(element.dataset.teamStats) || {state: "unavailable"});
@@ -3012,8 +3042,11 @@
       });
       void refreshTeamLeadSettings();
     } catch (_) {
-      if (read.isCurrent()) panel.querySelectorAll('[data-team-metric="activity"]').forEach(cell => { cell.textContent = "Update unavailable"; });
-    } finally { read.finish(); teamStatsInFlight = false; }
+      if (read.isCurrent()) {
+        teamStatsFailed = true;
+        panel?.querySelectorAll('[data-team-metric="activity"]').forEach(cell => { cell.textContent = "Update unavailable"; });
+      }
+    } finally { read.finish(); teamStatsInFlight = false; updateTeamWork(); }
   };
   document.querySelector('[data-session-tab="team"]')?.addEventListener("click", () => { void refreshTeamStats(); });
   setInterval(() => { void refreshTeamStats(); }, 5000);
@@ -3230,6 +3263,7 @@
   const codexWorkElapsed = document.getElementById("codex-work-elapsed");
   const codexWorkLabel = document.getElementById("codex-work-label");
   const codexWorkCounts = document.getElementById("codex-work-counts");
+  const codexTeamWork = document.getElementById("codex-team-work");
   const durationSummary = document.getElementById("codex-duration");
   const codexTab = document.getElementById("session-tab-codex");
   const codexWaitingIndicator = document.getElementById("codex-waiting-indicator");
@@ -3246,15 +3280,25 @@
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
   const actionablePrompts = () => currentPrompts.filter(entry => !answeredOffers.has(entry.token));
+  const otherTeamWork = () => {
+    const addresses = new Set([...document.querySelectorAll("#codex-member option")].map(option => option.value));
+    const view = teamWorkPresentation((teamStatsPayload?.members || []).filter(row => addresses.has(row.address)), selectedMember || "lead");
+    const stale = view.stale || teamStatsFailed || !teamStatsReceivedAt || Date.now() - teamStatsReceivedAt > 15_000;
+    return {...view, stale, present: interactive && !executionHeld && view.members.length > 0};
+  };
+  const focusedWaitLabel = () => activitySnapshot?.currentState === "idle" && otherTeamWork().present ?
+    "Idle" : activityWaitLabel(activitySnapshot);
   const updateCodexWaitingIndicator = () => {
     const state = activitySnapshot?.currentState;
     const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
     const timing = timingClock.view(activityFreshnessBudget());
     const waiting = interactive && activityAvailable && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
-      ((state === "idle" && !threadActive) || (state === "waiting" && blockingRequest));
+      ((state === "idle" && !threadActive && !otherTeamWork().present) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
-    const label = waiting ? `Codex: ${activityWaitLabel(activitySnapshot)}` : activitySnapshot?.currentState === "waiting" ? `Codex: ${activityWaitLabel(activitySnapshot)}` : "Codex";
+    const team = otherTeamWork();
+    const label = state === "idle" && !threadActive && team.present ? `Codex: Idle · ${team.stale ? "Team activity update unavailable" : team.text}` :
+      waiting || state === "waiting" ? `Codex: ${focusedWaitLabel()}` : "Codex";
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
@@ -3262,6 +3306,13 @@
     if (!codexWork || !codexWorkElapsed) return;
     active ||= activitySnapshot?.latestTurnStatus === "inProgress";
     const timing = timingClock.view(activityFreshnessBudget());
+    const team = otherTeamWork();
+    if (codexTeamWork) {
+      codexTeamWork.hidden = !(team.present && (activitySnapshot?.currentState === "waiting" ||
+        activitySnapshot?.currentState === "idle" && !active));
+      const text = team.stale ? "Team activity update unavailable." : team.text;
+      if (codexTeamWork.textContent !== text) codexTeamWork.textContent = text;
+    }
     if (!activitySnapshot) {
       codexWork.hidden = !active;
       codexWorkLabel.textContent = "Codex is working";
@@ -3276,7 +3327,7 @@
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive);
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? activityWaitLabel(activitySnapshot) : active ? (view.state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working") : "";
+    codexWorkLabel.textContent = waiting ? focusedWaitLabel() : active ? (view.state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working") : "";
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
@@ -3291,6 +3342,7 @@
       "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified.";
     updateCodexWaitingIndicator();
   };
+  updateTeamWork = () => updateCodexWork();
   const scheduleActivity = (delay) => {
     if (activityTimer !== null) clearTimeout(activityTimer);
     activityTimer = null;

@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -98,6 +98,7 @@
         {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status" hidden><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
         {{end}}
         <div id="codex-work" class="codex-work" aria-live="polite" hidden><span id="codex-work-label">Codex is working</span><span id="codex-work-counts"></span><time id="codex-work-elapsed"></time></div>
+        <p id="codex-team-work" class="codex-team-work" role="status" hidden></p>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
         {{if .Session.Interactive}}
         <section id="plan-actions" class="plan-actions" hidden>
@@ -227,7 +228,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=30" defer></script>
+  <script src="/static/app.js?v=31" defer></script>
 </body>
 </html>
 {{end}}
