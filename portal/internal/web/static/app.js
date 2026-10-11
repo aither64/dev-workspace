@@ -3286,6 +3286,11 @@
     disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
   }]));
   let planRenderGeneration = 0;
+  const recordSettingsWrite = () => {
+    ++settingsWriteGeneration;
+    ++planRenderGeneration;
+    composerView.setPlanVisible(false);
+  };
   let dismissedPlanIdentity = "";
   let planImplementationInFlight = false;
   const pendingMessages = new Map();
@@ -3481,7 +3486,8 @@
     if (selectedMember) { composerView.setPlanVisible(false); return; }
     const generation = ++planRenderGeneration;
     const plan = currentCompletedPlan(payload);
-    const eligibleMode = ["plan", "default"].includes(payload.collaborationMode);
+    const eligibleMode = (payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration &&
+      ["plan", "default"].includes(payload.collaborationMode);
     if (!plan || payload.status === "active" || !eligibleMode || planImplementationInFlight) {
       composerView.setPlanVisible(false);
       return;
@@ -3491,7 +3497,8 @@
       composerView.setPlanVisible(false);
     }
     const digest = await sha256Hex(plan.text);
-    if (generation !== planRenderGeneration) return;
+    if (generation !== planRenderGeneration ||
+        (payload.settingsGeneration ?? settingsWriteGeneration) < settingsWriteGeneration) return;
     const pendingImplementation = pendingPlanImplementation(pendingMessages.values(), plan.turnId, digest);
     if (payload.collaborationMode === "default" && !pendingImplementation) {
       composerView.setPlanVisible(false);
@@ -3664,6 +3671,30 @@
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive);
   };
 
+  const modeStatus = document.getElementById("codex-mode-status");
+  let modeMetadataPending = false;
+  const createModeNotice = () => conversationAssets.createRefreshNotice({render: state => {
+    if (!modeStatus) return;
+    modeStatus.hidden = !state.loading && !state.warning;
+    modeStatus.textContent = state.warning ?
+      (currentMode ? "Mode could not be refreshed." : "Mode unavailable") :
+      state.loading ? "Checking mode…" : "";
+  }});
+  let modeNotice = createModeNotice();
+  const confirmMode = (mode) => {
+    if (!mode) return;
+    currentMode = mode;
+    modeMetadataPending = false;
+    modeNotice.success();
+  };
+  const resetMode = () => {
+    currentMode = "";
+    modeMetadataPending = false;
+    modeNotice.destroy();
+    modeNotice = createModeNotice();
+    if (modeStatus) { modeStatus.hidden = true; modeStatus.textContent = ""; }
+  };
+
   const saveCollaborationMode = async (mode) => {
     if (!interactive || executionHeld || liveSettingsSaving) return;
     const controls = Array.from(document.querySelectorAll(
@@ -3674,9 +3705,9 @@
       const saved = await client.settings(undefined, undefined, mode);
       currentModel = saved.model;
       currentEffort = saved.reasoningEffort;
-      ++settingsWriteGeneration;
+      recordSettingsWrite();
       liveSettingsController?.confirm(saved.model, saved.reasoningEffort);
-      currentMode = saved.collaborationMode || currentMode;
+      confirmMode(saved.collaborationMode);
       applyCurrentSettings();
       scheduleRefresh(0);
     } catch (error) { alert(error.message); }
@@ -3967,6 +3998,7 @@
     if (!payload.threadId) throw new Error("Codex returned no thread");
     if (!isCurrent()) return;
     if (currentThreadId && currentThreadId !== payload.threadId) {
+      resetMode();
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
       pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
       historyError = ""; historyFailure = null;
@@ -3981,7 +4013,6 @@
     transcriptEntries = transcriptHistory ? transcriptHistory.entries : payload.entries || [];
     if (update.reset) {
       transcriptInitialized = false;
-      currentMode = "";
     }
     if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
     else refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
@@ -4019,13 +4050,19 @@
         liveSettingsController?.confirm(currentModel, currentEffort);
       }
       threadIdle = threadStatus === "idle";
-      currentMode = payload.collaborationMode || "";
-      applyCurrentSettings();
-      const modeStatus = document.getElementById("codex-mode-status");
-      if (modeStatus) {
-        modeStatus.hidden = Boolean(currentMode);
-        modeStatus.textContent = payload.metadataPending ? "Checking mode…" : "Mode unavailable";
+      // Rollout enrichment can temporarily withhold mode metadata. Retain the
+      // confirmed selection for display; plan actions still use the fresh payload.
+      if ((payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration) {
+        if (payload.collaborationMode) confirmMode(payload.collaborationMode);
+        else if (payload.metadataPending) {
+          if (!modeMetadataPending) modeNotice.begin();
+          modeMetadataPending = true;
+        } else {
+          modeMetadataPending = false;
+          modeNotice.failure(new Error("Mode unavailable"));
+        }
       }
+      applyCurrentSettings();
       updateMessageActions();
       status.textContent = threadStatus || "Connected";
       status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
@@ -4827,11 +4864,10 @@
         clientUserMessageId: id,
       });
       acceptMessageReceipt(attempt, receipt);
-      currentMode = "default";
+      recordSettingsWrite();
+      confirmMode("default");
       followTranscript();
       dismissedPlanIdentity = implementingIdentity;
-      ++planRenderGeneration;
-      composerView.setPlanVisible(false);
       renderMessageReceipts();
       applyCurrentSettings();
       scheduleRefresh(0);
@@ -5039,7 +5075,7 @@
   liveSettingsController = createSettingsPopup({prefix: "codex",
     editable: () => Boolean(document.getElementById("message-form")), targetClient: () => client,
     onConfirm(model, effort) { currentModel = model; currentEffort = effort; renderCodexSettingsSummary(); },
-    onSaved() { ++settingsWriteGeneration; scheduleRefresh(0); },
+    onSaved() { recordSettingsWrite(); scheduleRefresh(0); },
     onBusy(busy) { liveSettingsSaving = busy; renderCodexSettingsSummary(); updateMessageActions(); applyCurrentSettings(); },
   });
   editButton?.addEventListener("click", () => liveSettingsController.open());
@@ -5073,7 +5109,7 @@
     onSaved(saved) {
       ++teamSettingsGeneration;
       if (teamSettingsTarget.address === (selectedMember || "lead")) {
-        ++settingsWriteGeneration;
+        recordSettingsWrite();
         liveSettingsController?.confirm(saved.model, saved.reasoningEffort); scheduleRefresh(0);
       }
       void refreshSessionDetails();

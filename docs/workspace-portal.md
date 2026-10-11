@@ -236,10 +236,15 @@ refresh separately from the transcript. A slow queue reconciliation does not
 delay the first conversation page. Failed refreshes retain their last result;
 request and queue warnings offer Retry after the shared grace period. Transcript receipt and upload clearing require positive
 server evidence across all retained pages, including automatically loaded older
-messages. While the server is still checking conversation metadata, the
-mode is shown as pending and plan actions stay hidden. The tab retries metadata
-reads with backoff. Activity reads have a five-second budget while active and
-a thirty-second budget while idle; focus and reconnection prompt a fresh read.
+messages. While the server checks conversation metadata, the mode buttons retain
+the conversation's last confirmed selection and remain usable. Before the first
+confirmation, "Checking mode…" appears after the shared initial-loading delay.
+Mode refresh failures use the shared warning grace and keep the confirmed
+selection visible. A different thread starts without a retained selection.
+Plan actions stay hidden until fresh metadata identifies the mode. The tab
+retries metadata reads with backoff. Activity reads have a five-second budget
+while active and a thirty-second budget while idle; focus and reconnection prompt
+a fresh read.
 
 ## Session recovery after runtime loss
 
