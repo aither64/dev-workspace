@@ -253,23 +253,23 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.locator(".wizard-option").filter({hasText: "Continue"}).click();
       await page.getByRole("button", {name: "Submit answers"}).click();
       await expect(waitingIndicator).toBeHidden();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex is working");
       // The pending endpoint intentionally remains stale. A confirmed response
       // must still remove the attention signal in this page immediately.
       await expect(page.locator('input[type="radio"][value="Continue"]')).toHaveCount(0);
       failActivity = true;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(waitingIndicator).toBeHidden();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex is working");
       failActivity = false;
       pending = [{...blockingPrompt, isBlocking: false}];
       await page.reload();
       await expect(waitingIndicator).toBeHidden();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex is working");
       activityState = "working"; pending = [];
       await page.reload();
       await expect(waitingIndicator).toBeHidden();
-      await expect(codexTab).toHaveAttribute("aria-label", "Codex");
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex is working");
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await page.locator("[data-review-branch]").first().click();
       await expect(page.locator(".repository-review-heading")).toBeVisible();
@@ -289,7 +289,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.goBack(); await width(58);
       await page.goForward(); await width(250);
       await page.setViewportSize({width: 600, height: 720}); await width(58);
-      await page.getByRole("tab", {name: "Codex", exact: true}).click(); await width(58);
+      await page.locator("#session-tab-codex").click(); await width(58);
       await page.setViewportSize({width: 1440, height: 450}); await width(250);
       await page.goto(baseURL + "/example/?tab=repositories&repository=project&review=frozen&view=file");
       await width(58);
@@ -309,7 +309,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(technical.locator("pre")).toHaveText(diagnostic);
       failArchive = true;
       await expireAutoArchiveCache();
-      await page.getByRole("tab", {name: "Codex", exact: true}).click();
+      await page.locator("#session-tab-codex").click();
       await page.getByRole("tab", {name: "Settings", exact: true}).click();
       await expect(page.locator("#auto-archive-status")).toContainText("Showing the last available settings");
       await expect(page.locator("#auto-archive-details dl")).toContainText("Not before");
@@ -335,7 +335,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       for (const fixture of [{enabled: false, eligible_at: "2026-09-21T18:01:59Z"}, {}, {enabled: true, tier: "complete", result: "deferred", blockers: ["unknown <script>diagnostic</script>"]}]) {
         archive = fixture;
         await expireAutoArchiveCache();
-        await page.getByRole("tab", {name: "Codex", exact: true}).click();
+        await page.locator("#session-tab-codex").click();
         await page.getByRole("tab", {name: "Settings", exact: true}).click();
         await expect(page.locator("#auto-archive-details dl")).toContainText("Waiting for the first scan");
         await expect(page.locator("#auto-archive-details dl")).not.toContainText("Not before");

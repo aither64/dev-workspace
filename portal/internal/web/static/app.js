@@ -362,6 +362,14 @@
     if (snapshot?.waitReason === "userInput") return "Waiting for your answer";
     return "Waiting · reason unavailable";
   };
+  const activityStatusLabel = (snapshot, active, team = {}) => {
+    const state = snapshot?.currentState;
+    const otherWork = team.present && (state === "waiting" || state === "idle" && !active) ?
+      team.stale ? "Team activity update unavailable." : team.text : "";
+    if (state === "idle" && !active) return otherWork || activityWaitLabel(snapshot);
+    if (state === "waiting") return [activityWaitLabel(snapshot), otherWork].filter(Boolean).join(" · ");
+    return active ? state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working" : "";
+  };
   const teamActivityPresentation = (row) => {
     const snapshot = row.snapshot;
     const missing = {activity: row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable",
@@ -1067,7 +1075,7 @@
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, teamActivityPresentation, teamWorkPresentation,
+      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
@@ -3263,7 +3271,6 @@
   const codexWorkElapsed = document.getElementById("codex-work-elapsed");
   const codexWorkLabel = document.getElementById("codex-work-label");
   const codexWorkCounts = document.getElementById("codex-work-counts");
-  const codexTeamWork = document.getElementById("codex-team-work");
   const durationSummary = document.getElementById("codex-duration");
   const codexTab = document.getElementById("session-tab-codex");
   const codexWaitingIndicator = document.getElementById("codex-waiting-indicator");
@@ -3286,8 +3293,6 @@
     const stale = view.stale || teamStatsFailed || !teamStatsReceivedAt || Date.now() - teamStatsReceivedAt > 15_000;
     return {...view, stale, present: interactive && !executionHeld && view.members.length > 0};
   };
-  const focusedWaitLabel = () => activitySnapshot?.currentState === "idle" && otherTeamWork().present ?
-    "Idle" : activityWaitLabel(activitySnapshot);
   const updateCodexWaitingIndicator = () => {
     const state = activitySnapshot?.currentState;
     const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
@@ -3297,8 +3302,9 @@
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
     const team = otherTeamWork();
-    const label = state === "idle" && !threadActive && team.present ? `Codex: Idle · ${team.stale ? "Team activity update unavailable" : team.text}` :
-      waiting || state === "waiting" ? `Codex: ${focusedWaitLabel()}` : "Codex";
+    const active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress";
+    const text = activityStatusLabel(activitySnapshot, active, team);
+    const label = text ? text.startsWith("Codex") ? text : `Codex: ${text}` : "Codex";
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
@@ -3307,16 +3313,16 @@
     active ||= activitySnapshot?.latestTurnStatus === "inProgress";
     const timing = timingClock.view(activityFreshnessBudget());
     const team = otherTeamWork();
-    if (codexTeamWork) {
-      codexTeamWork.hidden = !(team.present && (activitySnapshot?.currentState === "waiting" ||
-        activitySnapshot?.currentState === "idle" && !active));
-      const text = team.stale ? "Team activity update unavailable." : team.text;
-      if (codexTeamWork.textContent !== text) codexTeamWork.textContent = text;
-    }
+    const peerStatus = team.present && (activitySnapshot?.currentState === "waiting" || activitySnapshot?.currentState === "idle" && !active);
+    codexWork.classList.toggle("team-work", peerStatus);
+    const label = activityStatusLabel(activitySnapshot, active, team);
+    codexWorkLabel.textContent = label;
+    codexWorkLabel.title = label;
+    codexWorkLabel.setAttribute("aria-label", label);
     if (!activitySnapshot) {
       codexWork.hidden = !active;
-      codexWorkLabel.textContent = "Codex is working";
       codexWorkCounts.textContent = "";
+      codexWorkCounts.title = "";
       codexWorkElapsed.textContent = "";
       durationSummary.textContent = timing.unavailable ? "Timing unavailable" : "Loading timing…";
       updateCodexWaitingIndicator();
@@ -3325,10 +3331,10 @@
     const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
     const stale = interactive && timing.unavailable;
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
-    codexWork.hidden = !active && !(waiting && interactive);
+    codexWork.hidden = !active && !(waiting && interactive) && !peerStatus;
     codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkLabel.textContent = waiting ? focusedWaitLabel() : active ? (view.state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working") : "";
     codexWorkCounts.textContent = active ? view.counts : "";
+    codexWorkCounts.title = codexWorkCounts.textContent;
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
     const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";

@@ -695,14 +695,17 @@ When the focused conversation is idle or waiting, the Codex panel shows ongoing
 work by other ready members. It lists up to three addresses and the remaining
 count, including sleeping members and members waiting for subagents with short
 state labels. Unclassified active turns say **turn in progress**. Members awaiting
-approval or an answer are not included. The focused member keeps its own status;
-an idle member says **Idle** without an attention indicator while other members
-have ongoing work. Approval and answer requests remain visible. This notice
-reports activity, not a dependency or a promise that another member will wake
-the focused conversation.
+approval or an answer are not included. The status row shows **Other team members
+are working** in place of the focused member's idle label, without an attention
+indicator. During waits, the focused member's explanation comes first, followed
+by the other-member summary on the same line. Approval and answer requests
+remain first. The elapsed timer stays visible; long status text uses an ellipsis,
+with its full value in the hover title and accessible label. This summary reports
+activity, not a dependency or a promise that another member will wake the focused
+conversation.
 
 Team activity refreshes every five seconds while the page is visible, including
-when the Team tab is closed. The table and notice share one read. Observations
+when the Team tab is closed. The table and status row share one read. Observations
 older than 15 seconds or invalidated by a failed read show **Team activity update
 unavailable** instead of asserting ongoing work. Returning to the page requests
 a fresh observation. This read does not activate held or stopped threads.

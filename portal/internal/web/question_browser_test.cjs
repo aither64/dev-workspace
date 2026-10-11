@@ -77,7 +77,7 @@ const question = (id, isBlocking = true) => ({
     await expect(page.locator("#auto-archive-panel")).toBeHidden();
     await page.getByRole("tab", {name: "Settings", exact: true}).click();
     await expect(page.locator("#auto-archive-panel")).toBeVisible();
-    await page.getByRole("tab", {name: "Codex", exact: true}).click();
+    await page.locator("#session-tab-codex").click();
     await expect(page.locator("#auto-archive-panel")).toBeHidden();
     await expect(page.locator(".codex-upload-toggle")).toBeEnabled();
     await prompt.fill("Keep my prompt draft");
