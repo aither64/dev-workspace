@@ -241,10 +241,10 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.reload();
       threadStatus = "idle"; activityState = "waiting"; automaticWait = "sleep";
       await page.reload(); await expect(waitingIndicator).toBeHidden();
-      await expect(page.locator("#codex-work-label")).toHaveText("Sleeping · wakes automatically");
+      await expect(page.locator("#codex-work-label")).toHaveText("Sleeping (auto)");
       automaticWait = "subagents"; await page.reload();
       await expect(waitingIndicator).toBeHidden();
-      await expect(page.locator("#codex-work-label")).toHaveText("Waiting for team members · resumes automatically");
+      await expect(page.locator("#codex-work-label")).toHaveText("Waiting for team (auto)");
       automaticWait = ""; threadStatus = "active"; activityState = "waiting"; pending = [blockingPrompt];
       await page.reload();
       await expect(waitingIndicator).toBeVisible();
@@ -253,6 +253,9 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.locator(".wizard-option").filter({hasText: "Continue"}).click();
       await page.getByRole("button", {name: "Submit answers"}).click();
       await expect(waitingIndicator).toBeHidden();
+      // Fetch the changed activity after the response instead of racing the
+      // five-second activity poll against the assertion's five-second timeout.
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(codexTab).toHaveAttribute("aria-label", "Codex is working");
       // The pending endpoint intentionally remains stale. A confirmed response
       // must still remove the attention signal in this page immediately.

@@ -20,7 +20,7 @@ const {
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter,
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed, autoArchivePresentation, archiveFailurePresentation,
-  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, activityStatusLabel, teamActivityPresentation, teamWorkPresentation, indexStatusFreshForPage, indexStatusOrder,
+  createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation, indexStatusFreshForPage, indexStatusOrder,
   createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
   renderCollaborationModes, storeCreationDraft, creationCLICommand,
@@ -294,15 +294,30 @@ assert.deepEqual(teamWorkPresentation(ongoingMembers, "implementer0").members.ma
 assert.equal(teamWorkPresentation([teamMember("lead", "idle")]).text, "");
 assert.equal(teamWorkPresentation([teamMember("implementer0", "working")]).text, "Other team members are working: implementer0.");
 assert.match(teamWorkPresentation([...ongoingMembers, teamMember("worker0", "working")]).text, /and 2 others\.$/);
-const peerWork = {present: true, stale: false, text: "Other team members are working: architect0."};
-assert.equal(activityStatusLabel({currentState: "idle"}, false, peerWork), peerWork.text);
+const peerWork = {present: true, stale: false, label: "architect0 is working", text: "Other team members are working: architect0."};
+assert.equal(activityStatusLabel({currentState: "idle"}, false, peerWork), peerWork.label);
 assert.equal(activityStatusLabel({currentState: "waiting", waitReason: "sleep"}, true, peerWork),
-  "Sleeping · wakes automatically · " + peerWork.text);
+  "Sleeping (auto) · " + peerWork.label);
 assert.equal(activityStatusLabel({currentState: "waiting", waitReason: "approval"}, true, peerWork),
-  "Waiting for approval · " + peerWork.text);
-assert.equal(activityStatusLabel({currentState: "idle"}, false, {...peerWork, stale: true}), "Team activity update unavailable.");
-assert.equal(activityStatusLabel({currentState: "working"}, true, peerWork), "Codex is working");
-assert.equal(activityStatusLabel({currentState: "idle"}, false), "Idle · waiting for instructions");
+  "Approval needed · " + peerWork.label);
+assert.equal(activityStatusLabel({currentState: "idle"}, false, {...peerWork, stale: true}), "Team status unavailable");
+assert.equal(activityStatusLabel({currentState: "working"}, true, peerWork), "Working");
+assert.equal(activityStatusLabel({currentState: "idle"}, false), "Idle");
+assert.deepEqual(activityStatusPresentation({currentState: "working"}, true), {label: "Working", detail: "Codex is working"});
+assert.deepEqual(activityStatusPresentation({currentState: "idle"}, false, peerWork), {label: peerWork.label, detail: peerWork.text});
+assert.equal(activityStatusPresentation({currentState: "waiting", waitReason: "sleep"}, true, peerWork).detail,
+  "Sleeping · wakes automatically · " + peerWork.text);
+assert.equal(activityStatusPresentation({currentState: "waiting"}, true).label, "Waiting (reason unknown)");
+assert.equal(activityStatusPresentation({currentState: "waiting", waitReason: "subagents"}, true).label, "Waiting for team (auto)");
+assert.equal(activityStatusPresentation({currentState: "waiting", waitReason: "userInput"}, true).label, "Answer needed");
+assert.equal(activityStatusPresentation({currentState: "unclassified"}, true).label, "In progress");
+assert.equal(teamWorkPresentation(ongoingMembers).label,
+  "analyst0 in progress; architect0 sleeping (auto); implementer0 working; +1");
+assert.equal(teamWorkPresentation([teamMember("architect0", "waiting", "sleep")]).label, "architect0 is sleeping (auto)");
+assert.equal(teamWorkPresentation([teamMember("reviewer0", "waiting", "subagents")]).label, "reviewer0 is waiting for team (auto)");
+assert.equal(teamWorkPresentation([teamMember("worker0", "unclassified", "", "inProgress")]).label, "worker0: in progress");
+assert.equal(teamWorkPresentation([teamMember("implementer10", "working"), teamMember("implementer2", "working")]).label,
+  "implementer2 working; implementer10 working");
 assert.equal(teamWorkPresentation(ongoingMembers).stale, false);
 const expiredMember = teamMember("implementer0", "working");
 expiredMember.snapshot.observedAtMs = Date.now() - 20000;

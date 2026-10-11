@@ -692,22 +692,28 @@ message has a unique ID that the member reuses only if delivery needs a retry.
 The member's work remains in its own transcript.
 
 When the focused conversation is idle or waiting, the Codex panel shows ongoing
-work by other ready members. It lists up to three addresses and the remaining
-count, including sleeping members and members waiting for subagents with short
-state labels. Unclassified active turns say **turn in progress**. Members awaiting
-approval or an answer are not included. The status row shows **Other team members
-are working** in place of the focused member's idle label, without an attention
+work by other ready members. A single peer appears as `architect0 is working`,
+`architect0 is sleeping (auto)`, `architect0 is waiting for team (auto)` or
+`architect0: in progress`. For several peers it lists up to three addresses with
+short states and a `+N` remaining count. Members awaiting approval or an answer
+are not included. Peer activity replaces the idle label without an attention
 indicator. During waits, the focused member's explanation comes first, followed
-by the other-member summary on the same line. Approval and answer requests
-remain first. The elapsed timer stays visible; long status text uses an ellipsis,
-with its full value in the hover title and accessible label. This summary reports
-activity, not a dependency or a promise that another member will wake the focused
-conversation.
+by the peer summary on the same line. Approval and answer requests remain first.
+
+The row uses short labels such as `Working`, `Idle`, `Sleeping (auto)` and
+`Waiting for team (auto)`. Full descriptions remain in hover titles and
+accessible labels on the status and Codex tab. Long status text uses an ellipsis.
+Message and tool counters stay on the right, separated from the elapsed timer
+by a middle dot when both have values. Tabular digits and a fixed timer slot
+keep ticking time from shifting the counters, including duration-unit changes.
+Unusually long timing text uses an ellipsis with the full value in its title.
+The peer summary reports activity, not a dependency or a promise that another
+member will wake the focused conversation.
 
 Team activity refreshes every five seconds while the page is visible, including
 when the Team tab is closed. The table and status row share one read. Observations
-older than 15 seconds or invalidated by a failed read show **Team activity update
-unavailable** instead of asserting ongoing work. Returning to the page requests
+older than 15 seconds or invalidated by a failed read show `Team status
+unavailable` instead of asserting ongoing work. Returning to the page requests
 a fresh observation. This read does not activate held or stopped threads.
 
 The new-session form labels presets by size and role counts, such as
