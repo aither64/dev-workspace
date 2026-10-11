@@ -2307,23 +2307,26 @@
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-copy]");
     if (!button) return;
-    const value = button.dataset.copyValue ?? button.parentElement.querySelector("input, textarea")?.value;
+    const row = button.closest(".copy-row") || button.parentElement;
+    const value = button.dataset.copyValue ?? row.querySelector("input, textarea")?.value;
     if (value == null) return;
-    const icon = button.hasAttribute("data-copy-value");
-    const feedback = button.parentElement.querySelector(".copy-feedback");
+    const icon = button.classList.contains("icon-button");
+    const feedback = row.querySelector(".copy-feedback");
+    const label = button.dataset.copyLabel ||= button.getAttribute("aria-label") || button.title || "Copy";
+    const subject = label.replace(/^Copy\s+/i, "");
     const old = button.textContent;
     try {
       await navigator.clipboard.writeText(value);
       if (icon) {
         button.title = "Copied";
-        if (feedback) feedback.textContent = "Thread ID copied";
+        if (feedback) feedback.textContent = `${subject.charAt(0).toUpperCase() + subject.slice(1)} copied`;
       } else button.textContent = "Copied";
       setTimeout(() => {
-        if (icon) { button.title = "Copy thread ID"; if (feedback) feedback.textContent = ""; }
+        if (icon) { button.title = label; if (feedback) feedback.textContent = ""; }
         else button.textContent = old;
       }, 1000);
     } catch (_) {
-      if (icon) { button.title = "Copy failed"; if (feedback) feedback.textContent = "Could not copy thread ID"; }
+      if (icon) { button.title = "Copy failed"; if (feedback) feedback.textContent = `Could not copy ${subject}`; }
       else button.textContent = "Copy failed";
     }
   });
@@ -5183,10 +5186,13 @@
     }
     const reveal = event.target.closest("[data-reveal-secret]");
     if (reveal) {
-      const input = reveal.parentElement.querySelector("[data-secret-field]");
+      const input = reveal.closest(".copy-row").querySelector("[data-secret-field]");
       const visible = input.type === "password";
       input.type = visible ? "text" : "password";
-      reveal.textContent = visible ? "Hide" : "Reveal";
+      reveal.title = `${visible ? "Hide" : "Reveal"} ${reveal.dataset.secretLabel}`;
+      reveal.setAttribute("aria-label", reveal.title);
+      reveal.setAttribute("aria-pressed", String(visible));
+      reveal.querySelectorAll("[data-secret-icon]").forEach(icon => { icon.toggleAttribute("hidden", icon.dataset.secretIcon !== (visible ? "hide" : "reveal")); });
     }
   });
 
