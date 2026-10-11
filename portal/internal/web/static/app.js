@@ -362,14 +362,30 @@
     if (snapshot?.waitReason === "userInput") return "Waiting for your answer";
     return "Waiting · reason unavailable";
   };
-  const activityStatusLabel = (snapshot, active, team = {}) => {
+  const activityWaitPresentation = (snapshot) => {
+    const label = snapshot?.currentState === "idle" ? "Idle" :
+      snapshot?.waitReason === "sleep" ? "Sleeping (auto)" :
+        snapshot?.waitReason === "subagents" ? "Waiting for team (auto)" :
+          snapshot?.waitReason === "approval" ? "Approval needed" :
+            snapshot?.waitReason === "userInput" ? "Answer needed" : "Waiting (reason unknown)";
+    return {label, detail: activityWaitLabel(snapshot)};
+  };
+  const activityStatusPresentation = (snapshot, active, team = {}) => {
     const state = snapshot?.currentState;
     const otherWork = team.present && (state === "waiting" || state === "idle" && !active) ?
-      team.stale ? "Team activity update unavailable." : team.text : "";
-    if (state === "idle" && !active) return otherWork || activityWaitLabel(snapshot);
-    if (state === "waiting") return [activityWaitLabel(snapshot), otherWork].filter(Boolean).join(" · ");
-    return active ? state === "unclassified" ? "Turn in progress · activity unavailable" : "Codex is working" : "";
+      team.stale ? {label: "Team status unavailable", detail: "Team activity update unavailable."} :
+        {label: team.label, detail: team.text} : null;
+    if (state === "idle" && !active) return otherWork || activityWaitPresentation(snapshot);
+    if (state === "waiting") {
+      const wait = activityWaitPresentation(snapshot);
+      return {label: [wait.label, otherWork?.label].filter(Boolean).join(" · "),
+        detail: [wait.detail, otherWork?.detail].filter(Boolean).join(" · ")};
+    }
+    return !active ? {label: "", detail: ""} : state === "unclassified" ?
+      {label: "In progress", detail: "Turn in progress · activity unavailable"} :
+      {label: "Working", detail: "Codex is working"};
   };
+  const activityStatusLabel = (snapshot, active, team) => activityStatusPresentation(snapshot, active, team).label;
   const teamActivityPresentation = (row) => {
     const snapshot = row.snapshot;
     const missing = {activity: row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable",
@@ -405,9 +421,18 @@
       return `${row.address}${state ? ` (${state})` : ""}`;
     });
     if (members.length > 3) labels.push(`and ${members.length - 3} ${members.length === 4 ? "other" : "others"}`);
+    const compact = members.slice(0, 3).map(row => {
+      const snapshot = row.snapshot;
+      const state = snapshot.currentState === "unclassified" ? "in progress" :
+        snapshot.currentState === "working" ? "working" :
+          snapshot.waitReason === "sleep" ? "sleeping (auto)" : "waiting for team (auto)";
+      return members.length === 1 ? `${row.address}${state === "in progress" ? ":" : " is"} ${state}` :
+        `${row.address} ${state}`;
+    });
+    if (members.length > 3) compact.push(`+${members.length - 3}`);
     const stale = members.some(row => !Number.isFinite(row.snapshot.observedAtMs) || row.snapshot.observedAtMs <= 0 ||
       now - row.snapshot.observedAtMs > 15_000);
-    return {members, stale, text: members.length ? `Other team members are working: ${labels.join(", ")}.` : ""};
+    return {members, stale, label: compact.join("; "), text: members.length ? `Other team members are working: ${labels.join(", ")}.` : ""};
   };
 
   // A read may settle after abort (for example from a cache or test transport).
@@ -1075,7 +1100,7 @@
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, teamActivityPresentation, teamWorkPresentation,
+      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
@@ -3303,7 +3328,7 @@
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
     const team = otherTeamWork();
     const active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress";
-    const text = activityStatusLabel(activitySnapshot, active, team);
+    const text = activityStatusPresentation(activitySnapshot, active, team).detail;
     const label = text ? text.startsWith("Codex") ? text : `Codex: ${text}` : "Codex";
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
@@ -3315,15 +3340,16 @@
     const team = otherTeamWork();
     const peerStatus = team.present && (activitySnapshot?.currentState === "waiting" || activitySnapshot?.currentState === "idle" && !active);
     codexWork.classList.toggle("team-work", peerStatus);
-    const label = activityStatusLabel(activitySnapshot, active, team);
-    codexWorkLabel.textContent = label;
-    codexWorkLabel.title = label;
-    codexWorkLabel.setAttribute("aria-label", label);
+    const status = activityStatusPresentation(activitySnapshot, active, team);
+    codexWorkLabel.textContent = status.label;
+    codexWorkLabel.title = status.detail;
+    codexWorkLabel.setAttribute("aria-label", status.detail);
     if (!activitySnapshot) {
       codexWork.hidden = !active;
       codexWorkCounts.textContent = "";
       codexWorkCounts.title = "";
       codexWorkElapsed.textContent = "";
+      codexWorkElapsed.title = "";
       durationSummary.textContent = timing.unavailable ? "Timing unavailable" : "Loading timing…";
       updateCodexWaitingIndicator();
       return;
@@ -3337,6 +3363,7 @@
     codexWorkCounts.title = codexWorkCounts.textContent;
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
       `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
+    codexWorkElapsed.title = codexWorkElapsed.textContent;
     const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
     durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
     if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) {
