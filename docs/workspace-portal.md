@@ -87,6 +87,25 @@ their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
+## Development cluster controls
+
+Each cluster card shows its state and readiness above the services. Its toolbar
+offers Start or Stop and Release when the provider supports them. Start uses the
+existing cluster's saved topology and network with the provider's normal build
+and boot behavior. Stop keeps its disks and configuration. Release stops the
+cluster and deletes its persistent disks and cluster state after confirmation.
+First-time cluster setup and maintenance recovery remain CLI operations.
+
+Controls show elapsed progress and provider errors beside the toolbar. The page
+refreshes cluster state without reloading or changing the selected service tab.
+An admitted operation continues if the browser disconnects. After a failed or
+lost response, check refreshed status before trying again; the portal never
+automatically repeats a mutation. Busy or unavailable status disables controls.
+
+Credential fields keep Reveal/Hide before Copy, with Copy aligned at the right
+of every row. Passwords begin hidden, and copying works while they are hidden.
+Both icon controls have accessible names and keyboard support.
+
 ## Repository comparisons
 
 The repository overview puts each card on its own row. The review controls
@@ -1080,6 +1099,32 @@ providers return it promptly without a status document. The portal keeps the
 last valid state and displays a local update notice. Other failures indicate
 unavailable status. Readiness and credentials are replaced by the next complete
 status response, including an empty response after reset.
+
+The portal requests controls by setting `DEVCLUSTER_PORTAL_CONTROLS=1` in the
+helper environment. A found schema-2 response may then include `actions`, an
+array containing a unique subset of `start`, `stop` and `release`. Omission
+retains legacy Release-only behavior; an empty array disables every action.
+Start requires stopped state, Stop requires running or stale state, and pending
+maintenance permits only Stop. Providers must omit `actions` for ordinary
+readers so older portals can still validate their status documents.
+
+`POST /api/sessions/<slug>/start-cluster`, `stop-cluster` and `release-cluster`
+accept `{ "kind": "provider-id" }` and return `{ "ok": true }` after the
+operation finishes. The portal selects the registered helper, checks fresh
+status, and invokes `start <slug> --existing`, `stop <slug>` or `reset <slug>`.
+The control environment also requests nonblocking provider locking: a busy
+helper exits 75 rather than queuing a mutation. The provider must validate
+retained configuration and selection under that lock for `--existing` and
+refuse absent state. Archive's unconditional provider reset barrier keeps its
+ordinary blocking lock behavior.
+
+These HTTP operations retain generation, runtime and lifecycle admission checks
+and reject overlapping requests for the same session/provider. Start has a
+30-minute deadline; Stop uses the release shutdown budget below. Browser
+disconnection leaves admitted work running; portal shutdown cancels its helper
+process group. A timeout can leave a detached VM runner active, so refreshed
+provider status remains the authority and Stop can clean up an owned runner.
+This interface adds no persisted state or session journal format.
 
 Schema-2 responses may include optional `webuiSource` and `maintenance`
 metadata. The portal validates these objects without adding them to the rendered

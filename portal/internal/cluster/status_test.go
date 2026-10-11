@@ -304,7 +304,7 @@ func TestReleaseUsesConfiguredHelperAndWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	output := filepath.Join(t.TempDir(), "release")
 	helper := filepath.Join(t.TempDir(), "helper")
-	script := "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$DEVCLUSTER_WORKSPACE\" > \"$OUTPUT\"\n"
+	script := "#!/bin/sh\nif [ \"$1\" = status ]; then printf '%s' '{\"schema\":2,\"kind\":\"alpha\",\"found\":true,\"state\":\"stopped\",\"ready\":false,\"services\":[]}'; exit; fi\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$DEVCLUSTER_WORKSPACE\" > \"$OUTPUT\"\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestReleaseDeadlineKillsAHelperBlockedOnFlock(t *testing.T) {
 
 	pidFile := filepath.Join(t.TempDir(), "flock.pid")
 	helper := filepath.Join(t.TempDir(), "helper")
-	script := "#!/bin/sh\nflock \"$LOCK_PATH\" sh -c 'sleep 30' &\n" +
+	script := "#!/bin/sh\nif [ \"$1\" = status ]; then printf '%s' '{\"schema\":2,\"kind\":\"alpha\",\"found\":true,\"state\":\"stopped\",\"ready\":false,\"services\":[]}'; exit; fi\nflock \"$LOCK_PATH\" sh -c 'sleep 30' &\n" +
 		"printf '%s\\n' \"$!\" > \"$PID_FILE.tmp\"\n" +
 		"mv \"$PID_FILE.tmp\" \"$PID_FILE\"\nwait\n"
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {

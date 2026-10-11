@@ -10,6 +10,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
@@ -58,6 +59,31 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	handler := server.Handler()
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/clusters" {
+			state := r.URL.Query().Get("state")
+			status := cluster.Status{Kind: "alpha", Label: "Alpha", State: state, Ready: state == "running", Topology: "dual", Network: "bridge",
+				Services: []cluster.Service{
+					{Label: "Web UI", Accounts: []cluster.Account{{Label: "Administrator", Fields: []cluster.Field{{Label: "Login", Value: "test-user"}, {Label: "Password", Value: "fixture-secret", Secret: true}}}}},
+					{Label: "Database", Accounts: []cluster.Account{{Label: "Database", Fields: []cluster.Field{{Label: "Login", Value: "database-user"}}}}},
+				}, Commands: []cluster.Command{{Label: "services", Value: "alpha-devcluster ssh example services"}}}
+			if r.URL.Query().Get("legacy") != "1" {
+				status.Actions = []string{"start", "release"}
+				if state == "running" {
+					status.Actions = []string{"stop", "release"}
+				}
+			}
+			if r.URL.Query().Get("busy") == "1" {
+				status.Notice = "Cluster is changing. Status will update when the operation finishes."
+			}
+			data := pageData{Session: &session.Summary{Interactive: true}, Clusters: []cluster.Status{status}}
+			if state == "absent" {
+				data.Clusters = nil
+			}
+			if err := server.templates.ExecuteTemplate(w, "clusters", data); err != nil {
+				t.Error(err)
+			}
+			return
+		}
 		if r.URL.Path == "/fixture/team" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			data := pageData{
@@ -92,7 +118,7 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"question_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs"} {
+	for _, script := range []string{"question_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
 			command := exec.Command("node", script, httpServer.URL)
 			if output, err := command.CombinedOutput(); err != nil {

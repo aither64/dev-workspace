@@ -1799,7 +1799,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 	for _, marker := range []string{
 		"shouldSubmitMessage(event)", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"await beforeRequestInputAction(snoozeAutoResolution)",
-		"entry.html", "archive-session", "revive-session", "artifactPreview", "release-cluster", "fork-dialog",
+		"entry.html", "archive-session", "revive-session", "artifactPreview", "controlCluster", "fork-dialog",
 		"data-cluster-service-tab", "data-reveal-secret", "index-status", "modelSelect.required",
 		"const signature = JSON.stringify([entries,", "client.operation().then((operation)",
 		"dialog.showModal()", `lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")`,
@@ -1896,7 +1896,7 @@ func TestSessionPageGroupsClusterServicesAndRepositoryRevisionState(t *testing.T
 		`data-cluster-service-tab="0"`,
 		`data-cluster-service-panel="0"`, `<div class="service-link"><span>Link</span>`,
 		`href="https://webui.example.test/" target="_blank" rel="noreferrer">https://webui.example.test/</a>`, "Administrator",
-		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-footer"`,
+		`type="password"`, `data-reveal-secret`, "Connect", `class="cluster-toolbar"`, `data-cluster-action="release"`,
 		`class="run-state queued" title="Status: queued">queued</span>queued workflow`,
 		`class="run-state in_progress" title="Status: in_progress">in progress</span>running workflow`,
 	} {

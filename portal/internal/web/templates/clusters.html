@@ -3,9 +3,17 @@
         <div class="repo-grid">
         {{range .Clusters}}
           <article class="panel repo-card cluster-card" data-cluster="{{.Kind}}">
-            <div class="repo-title"><h3>{{.Label}}</h3><span data-cluster-state class="badge {{if eq .State "running"}}active{{else if or (eq .State "stale") (eq .State "unavailable")}}warning{{end}}">{{.State}}</span></div>
+            <h3>{{.Label}}</h3>
+            <div class="cluster-toolbar" role="group" aria-label="{{.Label}} controls">
+              <div class="cluster-status"><span data-cluster-state class="badge {{if eq .State "running"}}active{{else if or (eq .State "stale") (eq .State "unavailable")}}warning{{end}}">{{.State}}</span><span class="muted">Ready: <strong data-cluster-ready>{{if .Ready}}yes{{else}}no{{end}}</strong></span></div>
+              {{if $.Session.Interactive}}<div class="cluster-actions">
+                {{if .HasPowerControls}}{{if or (eq .State "running") (eq .State "stale")}}<button type="button" class="quiet" data-cluster-action="stop" {{if not (.CanControl "stop")}}disabled{{end}}><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Stop</button>{{else}}<button type="button" class="quiet" data-cluster-action="start" {{if not (.CanControl "start")}}disabled{{end}}><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>Start</button>{{end}}{{end}}
+                <button type="button" class="danger" data-cluster-action="release" {{if not (.CanControl "release")}}disabled{{end}}><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg>Release</button>
+              </div>{{end}}
+            </div>
+            <p class="cluster-control-status muted" data-cluster-control-status role="status" hidden></p>
             <p data-cluster-notice class="muted" role="status" {{if not .Notice}}hidden{{end}}>{{.Notice}}</p>
-            <dl>{{if .Topology}}<dt>Topology</dt><dd>{{.Topology}}</dd>{{end}}{{if .Network}}<dt>Network</dt><dd>{{.Network}}</dd>{{end}}<dt>Ready</dt><dd data-cluster-ready>{{if .Ready}}yes{{else}}no{{end}}</dd></dl>
+            <dl>{{if .Topology}}<dt>Topology</dt><dd>{{.Topology}}</dd>{{end}}{{if .Network}}<dt>Network</dt><dd>{{.Network}}</dd>{{end}}</dl>
             {{if .Services}}
             {{$cluster := .}}
             <div class="cluster-services">
@@ -28,7 +36,6 @@
             </div>
             {{end}}
             {{if .Commands}}<section class="cluster-commands"><h4>Connect</h4>{{range .Commands}}<label>{{.Label}}<div class="copy-row cluster-copy-row"><input readonly value="{{.Value}}"><span class="cluster-reveal-slot"></span>{{template "cluster-copy" .Label}}</div></label>{{end}}</section>{{end}}
-            {{if $.Session.Interactive}}<footer class="cluster-footer"><button type="button" class="danger" data-release-cluster="{{.Kind}}">Release cluster</button></footer>{{end}}
           </article>
         {{else}}<p class="empty">No development cluster state for this session.</p>{{end}}
         </div>

@@ -159,7 +159,13 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .cluster-account h4, .cluster-commands h4 { margin: 0 0 .65rem; }
 .cluster-account .copy-row:last-child { margin-bottom: 0; }
 .cluster-commands { margin-top: 1rem; }
-.cluster-footer { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; }
+.cluster-toolbar, .cluster-status, .cluster-actions { display: flex; align-items: center; gap: .65rem; flex-wrap: wrap; }
+.cluster-toolbar { justify-content: space-between; margin-top: .75rem; }
+.cluster-status { font-size: .85rem; }
+.cluster-actions { margin-left: auto; gap: .4rem; }
+.cluster-actions button { display: inline-flex; align-items: center; gap: .3rem; padding: .4rem .55rem; font-size: .8rem; }
+.cluster-control-status { margin: .6rem 0 0; font-size: .85rem; }
+.cluster-control-status.error { color: var(--danger); }
 .cluster-copy-row.copy-row { display: grid; grid-template-columns: minmax(0, 1fr) 28px 28px; align-items: center; }
 .cluster-copy-row input { min-width: 0; width: 100%; }
 .cluster-reveal-slot { width: 28px; height: 28px; }

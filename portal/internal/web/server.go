@@ -184,6 +184,8 @@ type Server struct {
 	messageMu              sync.Mutex
 	messageLocks           map[string]conversation.MutationLocker
 	clusters               cluster.Runner
+	clusterControlMu       sync.Mutex
+	clusterControls        map[string]bool
 	operationMu            sync.Mutex
 	operationRevisions     map[string]uint64
 	operationSnapshotMu    sync.RWMutex
@@ -1858,8 +1860,9 @@ func (s *Server) sessionAPIForSummary(
 		s.teamThreadAPI(w, r, summary)
 		return
 	}
-	if len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "release-cluster" {
-		s.releaseCluster(w, r, summary)
+	if len(parts) == 2 && r.Method == http.MethodPost &&
+		(parts[1] == "start-cluster" || parts[1] == "stop-cluster" || parts[1] == "release-cluster") {
+		s.controlCluster(w, r, summary, strings.TrimSuffix(parts[1], "-cluster"))
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodGet && parts[1] == "artifact-preview" {
@@ -2499,7 +2502,7 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 	s.writeJSON(w, http.StatusAccepted, receipt)
 }
 
-func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+func (s *Server) controlCluster(w http.ResponseWriter, r *http.Request, summary *session.Summary, action string) {
 	if summary.Archived {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "archived sessions cannot have live development clusters"})
 		return
@@ -2528,9 +2531,40 @@ func (s *Server) releaseCluster(w http.ResponseWriter, r *http.Request, summary 
 	if !s.decodeJSON(w, r, &body) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(session.ClusterProvider().ReleaseTimeoutSeconds)*time.Second)
+	kind := strings.TrimSpace(body.Kind)
+	key := summary.Slug + "\x00" + kind
+	s.clusterControlMu.Lock()
+	if s.clusterControls[key] {
+		s.clusterControlMu.Unlock()
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "cluster is changing; wait for the current operation"})
+		return
+	}
+	if s.clusterControls == nil {
+		s.clusterControls = make(map[string]bool)
+	}
+	s.clusterControls[key] = true
+	s.clusterControlMu.Unlock()
+	defer func() {
+		s.clusterControlMu.Lock()
+		delete(s.clusterControls, key)
+		s.clusterControlMu.Unlock()
+	}()
+	s.operationMu.Lock()
+	if s.closing {
+		s.operationMu.Unlock()
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is stopping; refresh cluster status"})
+		return
+	}
+	s.operationWG.Add(1)
+	s.operationMu.Unlock()
+	defer s.operationWG.Done()
+	timeout := time.Duration(session.ClusterProvider().ReleaseTimeoutSeconds) * time.Second
+	if action == "start" {
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(s.operationContext, timeout)
 	defer cancel()
-	if err := s.clusters.Release(ctx, strings.TrimSpace(body.Kind), summary.Slug); err != nil {
+	if err := s.clusters.Control(ctx, kind, summary.Slug, action); err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}

@@ -27,7 +27,7 @@
     fork: (name, creationDate, model, reasoningEffort) => request(apiPath(slug, "fork"), {
       method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort}),
     }),
-    releaseCluster: (kind) => request(apiPath(slug, "release-cluster"), {
+    controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
     }),
     details: (options) => request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, options),
@@ -2912,7 +2912,19 @@
   let lastArtifactsHTML = "";
   let lastClustersHTML = "";
   let lastTeamHTML = "";
-  let releasingCluster = false;
+  const clusterControls = new Map();
+  const applyClusterControls = () => {
+    document.querySelectorAll("#clusters [data-cluster]").forEach(card => {
+      const state = clusterControls.get(card.dataset.cluster);
+      if (state?.pending) card.querySelectorAll("[data-cluster-action]").forEach(button => { button.disabled = true; });
+      const notice = card.querySelector("[data-cluster-control-status]");
+      if (notice) {
+        notice.hidden = !state;
+        notice.classList.toggle("error", Boolean(state?.error));
+        notice.textContent = state?.pending ? `${state.label}… ${Math.floor((Date.now() - state.startedAt) / 1000)}s` : state?.error || "";
+      }
+    });
+  };
   const detailsNotice = conversationAssets.createRefreshNotice({render: state => {
     const warning = document.getElementById("session-details-warning");
     if (!warning) return;
@@ -2931,7 +2943,7 @@
       if (!read.isCurrent()) return;
       refreshLifecycleTarget(payload.currentTarget);
       applyRecoveryStatus(payload.recovery, payload.interactive);
-      if (!releasingCluster && typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
+      if (typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
         clusters.innerHTML = payload.clustersHTML;
@@ -2940,6 +2952,7 @@
           const card = Array.from(clusters.querySelectorAll("[data-cluster]")).find(card => card.dataset.cluster === kind);
           Array.from(card?.querySelectorAll("[data-cluster-service-tab]") || []).find(tab => tab.dataset.clusterServiceTab === service)?.click();
         }
+        applyClusterControls();
       }
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
@@ -5162,15 +5175,25 @@
   }
 
   document.getElementById("clusters")?.addEventListener("click", async (event) => {
-    const release = event.target.closest("[data-release-cluster]");
-    if (release) {
-      if (releasingCluster || !confirm("Stop this development cluster and remove its temporary state?")) return;
-      releasingCluster = true;
-      release.disabled = true;
-      release.textContent = "Releasing…";
-      try { await client.releaseCluster(release.dataset.releaseCluster); location.reload(); }
-      catch (error) { alert(error.message); release.disabled = false; release.textContent = "Release cluster"; }
-      finally { releasingCluster = false; }
+    const control = event.target.closest("[data-cluster-action]");
+    if (control) {
+      const kind = control.closest("[data-cluster]").dataset.cluster, action = control.dataset.clusterAction;
+      if (!interactive || control.disabled || clusterControls.get(kind)?.pending) return;
+      if (action === "release" && !confirm("Release this development cluster? This stops it and deletes its persistent disks and cluster state.")) return;
+      clusterControls.set(kind, {pending: true, label: {start: "Starting", stop: "Stopping", release: "Releasing"}[action], startedAt: Date.now()});
+      applyClusterControls();
+      const progress = setInterval(applyClusterControls, 1000);
+      try {
+        await client.controlCluster(kind, action);
+        clusterControls.delete(kind);
+      } catch (error) {
+        clusterControls.set(kind, {error: error.message + " Refresh cluster status before trying again."});
+      } finally {
+        clearInterval(progress);
+        lastClustersHTML = "";
+        applyClusterControls();
+        void refreshSessionDetails();
+      }
       return;
     }
     const tab = event.target.closest("[data-cluster-service-tab]");

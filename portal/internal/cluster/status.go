@@ -84,6 +84,24 @@ type Status struct {
 	Commands    []Command    `json:"commands,omitempty"`
 	Credentials []Credential `json:"credentials,omitempty"`
 	Services    []Service    `json:"services,omitempty"`
+	Actions     []string     `json:"actions,omitempty"`
+}
+
+func (s Status) HasPowerControls() bool { return s.Actions != nil }
+
+func (s Status) CanControl(action string) bool {
+	if s.Notice != "" || s.State == "changing" || s.State == "unavailable" {
+		return false
+	}
+	if s.Actions == nil {
+		return action == "release"
+	}
+	for _, available := range s.Actions {
+		if available == action {
+			return true
+		}
+	}
+	return false
 }
 
 // Provider metadata is validated at the wire boundary without changing the
@@ -241,32 +259,68 @@ func (r Runner) ReleaseAll(ctx context.Context, slug string) error {
 }
 
 func (r Runner) Release(ctx context.Context, kind, slug string) error {
+	return r.Control(ctx, kind, slug, "release")
+}
+
+// Control uses fresh, uncached provider permissions. Helpers recheck native
+// state under their own lock and refuse overlapping portal mutations.
+func (r Runner) Control(ctx context.Context, kind, slug, action string) error {
 	if !validSlug(slug) {
 		return errors.New("invalid session slug")
 	}
+	if action != "start" && action != "stop" && action != "release" {
+		return errors.New("unknown development cluster action")
+	}
 	for _, provider := range r.Providers {
 		if provider.Name == kind {
-			return r.releaseProvider(ctx, provider, slug)
+			status, found, err := r.inspectProvider(ctx, provider, slug)
+			if err != nil {
+				return err
+			}
+			if status.Notice != "" {
+				return errors.New("cluster is changing; wait for the current operation")
+			}
+			if (!found && action != "release") || (found && !status.CanControl(action)) {
+				return fmt.Errorf("cluster %s is unavailable in its current state", action)
+			}
+			args := []string{action, slug}
+			if action == "release" {
+				args[0] = "reset"
+			} else if action == "start" {
+				args = append(args, "--existing")
+			}
+			return r.runProvider(ctx, provider, slug, true, args...)
 		}
 	}
 	return errors.New("unknown development cluster")
 }
 
 func (r Runner) releaseProvider(ctx context.Context, provider Provider, slug string) error {
+	return r.runProvider(ctx, provider, slug, false, "reset", slug)
+}
+
+func (r Runner) runProvider(ctx context.Context, provider Provider, slug string, portalControl bool, args ...string) error {
 	if provider.Helper == "" || !filepath.IsAbs(provider.Helper) {
 		return errors.New("development cluster helper is unavailable")
 	}
-	command := exec.Command(provider.Helper, "reset", slug)
+	command := exec.Command(provider.Helper, args...)
 	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace)
+	if portalControl {
+		command.Env = append(command.Env, "DEVCLUSTER_PORTAL_CONTROLS=1")
+	}
+	defer r.Cache.forget(slug + "\x00" + provider.Name)
 	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == session.ClusterProvider().StatusBusyExitCode {
+			return errors.New("cluster is changing; wait for the current operation")
+		}
 		message := strings.TrimSpace(string(output))
 		if message == "" {
 			message = err.Error()
 		}
 		return errors.New(message)
 	}
-	r.Cache.forget(slug + "\x00" + provider.Name)
 	return nil
 }
 
@@ -280,7 +334,7 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	command := exec.Command(provider.Helper, "status", slug, "--json")
-	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace)
+	command.Env = append(os.Environ(), "DEVCLUSTER_WORKSPACE="+r.Workspace, "DEVCLUSTER_PORTAL_CONTROLS=1")
 	output, err := processgroup.CombinedOutput(ctx, command)
 	if err != nil {
 		var exitError *exec.ExitError
@@ -330,6 +384,26 @@ func (r Runner) inspectProvider(parent context.Context, provider Provider, slug 
 }
 
 func (response helperResponse) validateMetadata() error {
+	if response.Actions != nil {
+		if response.Schema != 2 || !response.Found {
+			return errors.New("actions require a found schema 2 cluster")
+		}
+		seen := make(map[string]bool)
+		for _, action := range response.Actions {
+			if seen[action] || (action != "start" && action != "stop" && action != "release") {
+				return errors.New("cluster actions are invalid")
+			}
+			seen[action] = true
+			if action == "start" && response.State != "stopped" ||
+				action == "stop" && response.State != "running" && response.State != "stale" {
+				return errors.New("cluster actions disagree with state")
+			}
+			if response.Maintenance != nil && response.Maintenance.Pending != nil &&
+				*response.Maintenance.Pending && action != "stop" {
+				return errors.New("cluster actions bypass pending maintenance")
+			}
+		}
+	}
 	if response.WebUISource == nil && response.Maintenance == nil {
 		return nil
 	}
