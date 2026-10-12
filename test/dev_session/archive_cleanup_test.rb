@@ -648,6 +648,28 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_archive_accepts_multiple_integration_targets_in_one_canonical_repository
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, _feature|
+      release_target = File.join(workspace, 'worktrees', slug, 'release-target')
+      assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '-b', 'release', release_target, 'master')
+      File.write(File.join(release_target, 'release-only'), 'release change')
+      assert_git_success('git', '-C', release_target, 'add', 'release-only')
+      assert_git_success('git', '-C', release_target, 'commit', '-m', 'release fixture')
+      assert_git_success('git', '-C', release_target, 'push', 'origin', 'release')
+      runner.worktree_add(slug, 'sample', as_is: true, name: 'release', branch: "#{slug}-release", base: 'release', fetch: false)
+      path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = YAML.safe_load(File.read(path))
+      manifest.fetch('repositories').find { |entry| entry['name'] == 'release' }['default_branch'] = 'release'
+      File.write(path, YAML.dump(manifest))
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
+      detached = File.join(workspace, 'worktrees', slug, 'nested', 'release-detached')
+      assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '--detach', detached, 'release')
+      runner.archive(slug, as_is: true)
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      assert_equal('complete', runner.send(:lifecycle_state, File.read(File.join(workspace, 'archive', slug, 'state.md'))))
+    end
+  end
+
   private
 
   def with_archive_cleanup_instance(cleanup)

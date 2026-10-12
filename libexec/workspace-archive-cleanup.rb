@@ -204,9 +204,12 @@ module DevSession
         next if repositories.any? { |repository| repository.fetch('name') == checkout.fetch('path') }
 
         common = checkout.fetch('common_dir')
-        default = default_branch(common, repositories, required: mode == 'complete')
         branch = checkout.fetch('branch')
-        kind = branch.nil? ? 'detached' : branch == default ? 'default' : 'additional'
+        targets = integration_targets(common, repositories)
+        default = if mode == 'complete'
+                    select_integration_target(common, targets, checkout.fetch('head'), branch)
+                  end
+        kind = branch.nil? ? 'detached' : targets.include?(branch) ? 'default' : 'additional'
         repository = { 'project' => checkout.fetch('project'), 'branch' => branch, 'default_branch' => default }
         proof = make_proof(kind, checkout.fetch('path'), repository, common, mode,
                            head: checkout.fetch('head'), allow_unpushed: false)
@@ -235,7 +238,7 @@ module DevSession
     def additional_features?(inventory, repositories)
       inventory.fetch('worktrees').any? do |record|
         branch = record.fetch('branch')
-        branch && branch != default_branch(record.fetch('common_dir'), repositories, required: false)
+        branch && !integration_targets(record.fetch('common_dir'), repositories).include?(branch)
       end
     end
 
@@ -542,27 +545,35 @@ module DevSession
       @runner.archive_cleanup_manifest(@slug)
     end
 
-    def default_branch(common, repositories, required:)
-      defaults = repositories.filter_map do |repository|
+    # A registration's default_branch is its integration target. One canonical
+    # repository can legitimately have work aimed at master and release branches.
+    def integration_targets(common, repositories)
+      targets = repositories.filter_map do |repository|
         repository.fetch('default_branch') if @runner.archive_cleanup_repository(repository.fetch('project')) == common
       end.uniq
-      raise Error, "conflicting registered defaults for archive repository: #{common}" if defaults.length > 1
+      origin_default = origin_default_branch(common)
+      return origin_default ? [origin_default] : [] if targets.empty?
 
+      targets.sort_by { |target| [target == origin_default ? 0 : 1, target] }
+    end
+
+    def origin_default_branch(common)
       output, _stderr, status = @runner.archive_cleanup_capture(
         ['git', "--git-dir=#{common}", 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], allow_failure: true
       )
       value = output.strip.delete_prefix('refs/remotes/origin/')
-      recorded_origin = status.success? && output.strip.start_with?('refs/remotes/origin/') && !value.empty?
-      if defaults.length == 1
-        if recorded_origin && value != defaults.first
-          raise Error, "registered default conflicts with origin HEAD: #{common}"
-        end
-        return defaults.first
-      end
-      return value if recorded_origin
-      raise Error, "archive repository has no recorded origin default; register it explicitly: #{common}" if required
+      value if status.success? && output.strip.start_with?('refs/remotes/origin/') && !value.empty?
+    end
 
-      nil
+    def select_integration_target(common, targets, head, branch)
+      raise Error, "archive repository has no recorded integration target: #{common}" if targets.empty?
+
+      candidates = targets.include?(branch) ? [branch] : targets
+      fetch_refs!(common, candidates)
+      target = candidates.find { |candidate| ancestor?(common, head, resolve_commit(common, "refs/remotes/origin/#{candidate}")) }
+      return target if target
+
+      raise Error, "checkout head is not merged: #{branch || head} -> #{candidates.map { |candidate| "origin/#{candidate}" }.join(', ')}"
     end
 
     def make_proof(kind, name, repository, common, mode, head: nil, allow_unpushed:)
@@ -577,9 +588,6 @@ module DevSession
         raise Error, "archive checkout HEAD differs from retained branch: #{name}"
       end
       if mode == 'complete'
-        unless default_branch(common, current_manifest&.fetch('repositories', []) || [], required: true) == default
-          raise Error, "archive origin default does not match proof: #{name}"
-        end
         if %w[registered additional].include?(kind)
           proof = @runner.archive_cleanup_branch_proof(repository, common, branch, default, allow_unpushed:)
           unless proof.fetch(:local_head) == head && (!proof.fetch(:feature_remote) || proof.fetch(:remote_head) == head)
@@ -645,10 +653,7 @@ module DevSession
         raise Error, "#{detail}: #{proof.fetch('name')}"
       end
       if mode == 'complete'
-        current_default = default_branch(common, current_manifest&.fetch('repositories', []) || [], required: true)
-        unless current_default == proof.fetch('default_branch')
-          raise Error, "archive origin default changed: #{proof.fetch('name')}"
-        end
+        current_default = proof.fetch('default_branch')
         if !shared_master && %w[registered additional].include?(proof.fetch('kind'))
           repository = proof.slice('branch', 'default_branch', 'initial_base_sha')
           actual = @runner.archive_cleanup_branch_proof(repository, common, proof.fetch('branch'), current_default,
