@@ -17,7 +17,7 @@ func TestObservationArchiveContextRequiresPairedIDAndMode(t *testing.T) {
 		id, mode string
 		valid    bool
 	}{
-		{"", "", true}, {id, "complete", true}, {id, "abandoned", true},
+		{"", "", true}, {id, "complete", true}, {id, "abandoned", true}, {id, "archived", true},
 		{id, "", false}, {"", "complete", false}, {id, "other", false}, {"receipt", "complete", false},
 	} {
 		if err := ValidateObservationArchiveContext(test.id, test.mode); (err == nil) != test.valid {
@@ -27,7 +27,7 @@ func TestObservationArchiveContextRequiresPairedIDAndMode(t *testing.T) {
 }
 
 func TestObservationReceiptOwnerBindsBrowserJournalPreparedAndMovedArchive(t *testing.T) {
-	for _, scenario := range []string{"manual", "browser", "wrong id", "wrong mode", "wrong kind", "changed target", "missing journal", "journal", "changed evidence", "moved", "moved replaced", "prepared", "prepared missing expected", "invalid store", "creation residue"} {
+	for _, scenario := range []string{"manual", "browser", "explicit browser", "wrong id", "wrong mode", "wrong kind", "changed target", "missing journal", "journal", "changed evidence", "moved", "moved replaced", "prepared", "prepared missing expected", "invalid store", "creation residue"} {
 		t.Run(scenario, func(t *testing.T) {
 			workspace, stateRoot := t.TempDir(), t.TempDir()
 			directory := filepath.Join(workspace, "work", "example")
@@ -56,6 +56,8 @@ func TestObservationReceiptOwnerBindsBrowserJournalPreparedAndMovedArchive(t *te
 			expected, mode, allowed := id, "complete", true
 			withReceipt := scenario != "manual" && scenario != "prepared"
 			switch scenario {
+			case "explicit browser":
+				mode, operation.Options.Mode = "archived", "archived"
 			case "manual":
 				expected, mode = "", ""
 			case "wrong id":

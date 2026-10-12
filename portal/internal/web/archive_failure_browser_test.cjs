@@ -7,7 +7,7 @@ const {chromium, firefox, expect} = require("@playwright/test");
     try {
       const page = await browser.newPage({ignoreHTTPSErrors: true});
       const errors = [];
-      page.on("pageerror", error => { errors.push(error.message); console.error("Page error:", error.message); });
+      page.on("pageerror", error => { errors.push(error.message); console.error("Page error:", error.stack); });
       page.on("requestfailed", request => console.error("Request failed:", request.url(), request.failure()));
       await page.addInitScript(() => {
         const realNow = Date.now;

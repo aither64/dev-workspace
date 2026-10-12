@@ -1,0 +1,10 @@
+schema: 3
+slug: 2026-09-03-example
+repositories:
+  - name: example
+    project: example
+    branch: 2026-09-03-example
+    default_branch: master
+artifacts: []
+finalized_at: "2026-09-03T12:00:00Z"
+archive_operation_id: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

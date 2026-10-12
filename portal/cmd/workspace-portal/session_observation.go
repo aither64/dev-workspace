@@ -94,7 +94,11 @@ func sessionCommand(args []string) error {
 			if err := store.RequireNoRoster(*slug); err != nil {
 				return err
 			}
-			if err := session.RequireNoRuntime(ctx, *workspace, *slug, *authorityDir, os.Getenv("DEV_SESSION_TMUX_SOCKET")); err != nil {
+			requireRuntime := session.RequireNoRuntime
+			if *expectedMode == "archived" {
+				requireRuntime = session.RequireThreadlessArchiveRuntime
+			}
+			if err := requireRuntime(ctx, *workspace, *slug, *authorityDir, os.Getenv("DEV_SESSION_TMUX_SOCKET")); err != nil {
 				return err
 			}
 			return portalweb.RequireObservationReceipts(current, *stateRoot, *expectedID, *expectedMode, retainedContext)

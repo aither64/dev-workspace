@@ -2592,8 +2592,8 @@ func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *s
 		})
 		return
 	}
-	if body.Mode != "complete" && body.Mode != "abandoned" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "select completed or abandoned archival"})
+	if body.Mode != "complete" && body.Mode != "abandoned" && body.Mode != "archived" {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid archival policy"})
 		return
 	}
 	targetID, err := validateLifecycleTarget(summary, body.TargetID, "archive")
@@ -2608,6 +2608,8 @@ func (s *Server) startArchive(w http.ResponseWriter, r *http.Request, summary *s
 	args := []string{"archive", summary.Slug, "--as-is", "--portal-authorized"}
 	if body.Mode == "abandoned" {
 		args = append(args, "--abandoned")
+	} else if body.Mode == "complete" {
+		args = append(args, "--require-merged")
 	}
 	journalID, err := newLifecycleOperationID()
 	if err != nil {
@@ -3080,12 +3082,14 @@ func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request,
 	args := []string{operation.Kind, slug, "--as-is", "--portal-authorized"}
 	switch operation.Kind {
 	case "archive":
-		if operation.Options.Mode != "complete" && operation.Options.Mode != "abandoned" {
+		if operation.Options.Mode != "complete" && operation.Options.Mode != "abandoned" && operation.Options.Mode != "archived" {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "archive retry mode is unavailable"})
 			return
 		}
 		if operation.Options.Mode == "abandoned" {
 			args = append(args, "--abandoned")
+		} else if operation.Options.Mode == "complete" {
+			args = append(args, "--require-merged")
 		}
 	case "delete":
 		deletionTargetID, deletedThreadID, targetErr := s.resolveDeletionTarget(

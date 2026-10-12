@@ -222,7 +222,7 @@ func readLifecycleProgressFile(
 	if _, ok := lifecyclePhases[operation][payload.Phase]; !ok {
 		return nil, false, fmt.Errorf("lifecycle journal has an invalid %s phase", operation)
 	}
-	if operation == "archive" && payload.Mode != "complete" && payload.Mode != "abandoned" {
+	if operation == "archive" && payload.Mode != "complete" && payload.Mode != "abandoned" && payload.Mode != "archived" {
 		return nil, false, errors.New("archive journal progress has an invalid mode")
 	}
 	if operation == "delete" && payload.Force == nil {

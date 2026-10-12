@@ -648,10 +648,92 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_explicit_archive_recovers_dirty_unpublished_checkout_and_detached_auxiliary
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
+      File.write(File.join(feature, 'staged'), "staged content\n")
+      assert_git_success('git', '-C', feature, 'add', 'staged')
+      File.write(File.join(feature, 'staged'), "working content\n")
+      File.binwrite(File.join(feature, 'untracked'), "\x00\xff".b)
+      File.write(File.join(feature, '.gitignore'), "ignored\n")
+      File.write(File.join(feature, 'ignored'), 'retained ignored content')
+      auxiliary = File.join(workspace, 'worktrees', slug, 'nested', 'detached')
+      assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '--detach', auxiliary, 'master')
+      File.write(File.join(auxiliary, 'local'), 'detached local content')
+      assert_git_success('git', "--git-dir=#{common}", 'worktree', 'lock', auxiliary)
+      assert_git_success('git', "--git-dir=#{common}", 'config', 'remote.origin.url', '/unavailable-origin')
+      runner.archive(slug, as_is: true, explicit: true)
+      refute(File.exist?(File.join(workspace, 'worktrees', slug)))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(3, manifest['schema'])
+      assert_equal('archived', runner.send(:lifecycle_state, File.read(File.join(workspace, 'archive', slug, 'state.md'))))
+      message = git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%B')
+      assert_includes(message, 'explicitly archived session')
+      refute_includes(message, 'feature heads are merged')
+      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+      assert_equal(2, recovery.records.length)
+      assert_git_success('git', "--git-dir=#{common}", 'gc', '--prune=now')
+      runner.revive(slug, as_is: true)
+      assert_equal("staged content\n", git_capture_success('git', '-C', feature, 'show', ':staged'))
+      assert_equal("working content\n", File.binread(File.join(feature, 'staged')))
+      assert_equal("\x00\xff".b, File.binread(File.join(feature, 'untracked')))
+      assert_equal('retained ignored content', File.read(File.join(feature, 'ignored')))
+      assert_equal('detached local content', File.read(File.join(auxiliary, 'local')))
+      assert_equal(1, YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))['schema'])
+    end
+  end
+
+  def test_explicit_archive_retry_preserves_saved_policy_after_forced_removal
+    with_archive_cleanup_fixture do |runner, workspace, slug, _common, feature|
+      File.write(File.join(feature, 'untracked'), 'recover me')
+      runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause before commit' }
+      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
+      runner.singleton_class.remove_method(:commit_tracking_transition!)
+      runner.archive(slug, as_is: true, explicit: true)
+      refute(File.exist?(feature))
+      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_completed_restore_never_overwrites_later_edits_after_interruption
+    [false, true].each do |edited|
+      with_archive_cleanup_fixture do |runner, workspace, slug, _common, feature|
+        File.write(File.join(feature, 'local'), 'saved content')
+        runner.archive(slug, as_is: true, explicit: true)
+        manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+        recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+        record = recovery.records.first
+        receipt = nil
+        recovery.define_singleton_method(:write_json) do |path, contents|
+          super(path, contents)
+          if File.basename(path) == 'restored.json'
+            receipt = path
+            raise DevSession::Error, 'interrupted after completion receipt'
+          end
+        end
+        assert_raises(DevSession::Error) { recovery.restore!(record) }
+        recovery.singleton_class.remove_method(:write_json)
+        intent = File.join(File.dirname(receipt), 'restoring.json')
+        assert(File.file?(receipt))
+        assert(File.file?(intent))
+        if edited
+          File.write(File.join(feature, 'local'), 'later operator edit')
+          error = assert_raises(DevSession::Error) { recovery.restore!(record) }
+          assert_includes(error.message, 'completed archive recovery checkout changed')
+          assert_equal('later operator edit', File.read(File.join(feature, 'local')))
+        else
+          recovery.restore!(record)
+          refute(File.exist?(intent))
+          assert_equal('saved content', File.read(File.join(feature, 'local')))
+        end
+      end
+    end
+  end
+
   def test_archive_accepts_multiple_integration_targets_in_one_canonical_repository
     with_archive_cleanup_fixture do |runner, workspace, slug, common, _feature|
       release_target = File.join(workspace, 'worktrees', slug, 'release-target')
       assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '-b', 'release', release_target, 'master')
+      configure_git_identity(release_target)
       File.write(File.join(release_target, 'release-only'), 'release change')
       assert_git_success('git', '-C', release_target, 'add', 'release-only')
       assert_git_success('git', '-C', release_target, 'commit', '-m', 'release fixture')

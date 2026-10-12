@@ -3145,10 +3145,10 @@
   archiveDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => archiveDialog.close());
   archiveForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const mode = event.submitter?.value === "abandoned" ? "abandoned" : "complete";
+    const mode = "archived";
     const button = event.submitter;
     const controls = Array.from(archiveForm.querySelectorAll("button"));
-    const idleLabel = mode === "abandoned" ? "Archive as abandoned" : "Archive completed session";
+    const idleLabel = "Archive";
     const resetControls = () => {
       controls.forEach((control) => { control.disabled = false; });
       button.textContent = idleLabel;
@@ -4563,6 +4563,7 @@
   const pendingStatus = document.getElementById("pending-status");
   const pendingRetry = document.getElementById("pending-retry");
   const pendingNotice = conversationAssets.createRefreshNotice({render: state => {
+    if (!pendingStatus || !pendingRetry) return;
     pendingStatus.hidden = !state.loading && !state.warning;
     if (state.loading) pendingStatus.querySelector("span").textContent = "Loading requests…";
     pendingRetry.hidden = !state.warning;
@@ -4635,6 +4636,7 @@
   const queueStatus = document.getElementById("queue-status");
   const queueRetry = document.getElementById("queue-retry");
   const queueNotice = conversationAssets.createRefreshNotice({render: state => {
+    if (!queueStatus || !queueRetry) return;
     queueStatus.hidden = !state.loading && !state.warning;
     if (state.loading) queueStatus.querySelector("span").textContent = "Checking queued messages…";
     queueRetry.hidden = !state.warning;

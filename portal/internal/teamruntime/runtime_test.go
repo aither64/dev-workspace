@@ -427,6 +427,21 @@ func (client *testClient) CompactAcceptedSendOptions(prefix string) error {
 	return client.compactError
 }
 
+func (client *testClient) QuiesceExplicitArchive(_ context.Context, thread, _ string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.ledgerEvents = append(client.ledgerEvents, "preserve:"+thread)
+	client.interrupts = append(client.interrupts, thread)
+	client.activeTurn = ""
+	return nil
+}
+func (client *testClient) QuiesceNativeDescendants(_ context.Context, thread, _ string) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.ledgerEvents = append(client.ledgerEvents, "descendants:"+thread)
+	return nil
+}
+
 func (client *testClient) ClearRetiredThreadAttempts(threadID string) error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -2973,5 +2988,50 @@ func TestForkKnownThreadRetryUsesFrozenSnapshot(t *testing.T) {
 			member.Model != original.Model || member.Effort != original.Effort || member.Access != original.Access {
 			t.Fatalf("fork changed retained member policy: %#v, source %#v", member, original)
 		}
+	}
+}
+
+func TestArchiveExplicitAllPreservesPromptsAndRetainedMemberWithoutRecreation(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "implementer", "gpt-6-sol", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := len(client.starts)
+	client.activeTurn = "active-turn"
+	if err := service.ArchiveExplicitAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.starts) != starts || len(roster.Members) != 1 || roster.Members[0].Thread != member.Thread || roster.Members[0].State != "archived" {
+		t.Fatalf("retained member was changed or recreated: %#v", roster)
+	}
+	events := client.ledgerEvents
+	preserve, clear := -1, -1
+	for i, event := range events {
+		if event == "preserve:"+member.Thread {
+			preserve = i
+		}
+		if event == "clear" {
+			clear = i
+		}
+	}
+	if preserve < 0 || clear <= preserve {
+		t.Fatalf("member prompt recovery did not precede receipt cleanup: %v", events)
+	}
+	if err := service.ArchiveExplicitAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.starts) != starts {
+		t.Fatal("retry recreated archived member")
 	}
 }

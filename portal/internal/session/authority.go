@@ -233,6 +233,7 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 		fields[7] != a.CodexThreadID || fields[8] != a.CodexSocketPath ||
 		fields[9] != a.CodexClientVersion ||
 		(a.CodexThreadID != "" && (len(fields[10]) < 2 || fields[10][0] != '%' || strings.Trim(fields[10][1:], "0123456789") != "")) ||
+		(a.CodexThreadID == "" && fields[10] != "") ||
 		(fields[11] != "" && !isLowerHex(fields[11], 64)) ||
 		(a.TmuxIdentity != "" && fields[11] != a.TmuxIdentity) {
 		return errors.New("live tmux session does not match runtime authority")

@@ -670,7 +670,7 @@ module WorkspaceAutoArchive
 
     def auto_archive_session_observation(slug, identity, operation_id: nil, archive_mode: nil, start_tmux_identity: nil, revive_operation_id: nil)
       unless (!operation_id && !archive_mode) ||
-             (operation_id.is_a?(String) && operation_id.match?(/\A[0-9a-f]{64}\z/) && %w[complete abandoned].include?(archive_mode))
+             (operation_id.is_a?(String) && operation_id.match?(/\A[0-9a-f]{64}\z/) && %w[complete abandoned archived].include?(archive_mode))
         raise ObservationFailure.new('operation_invalid', 'Archive observation needs its exact operation and mode together.')
       end
       unless [start_tmux_identity, revive_operation_id].all? { |value| value.nil? || value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/) } &&

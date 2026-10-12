@@ -614,6 +614,8 @@ func teamCommand(args []string) error {
 		} else {
 			err = service.ArchiveAll(ctx, *slug, *rootThread)
 		}
+	case "archive-explicit":
+		err = service.ArchiveExplicitAll(ctx, *slug, *rootThread)
 	case "retire":
 		err = service.RetireAll(ctx, *slug, *rootThread)
 	case "revive":
@@ -689,7 +691,7 @@ func threadCommand(args []string) error {
 	// Directory discovery can repair a large persisted history. Keep ordinary
 	// metadata commands short, but allow recovery to complete that scan.
 	timeout := time.Minute
-	if command == "create" || command == "fork" || command == "retire" {
+	if command == "create" || command == "fork" || command == "retire" || command == "quiesce-explicit" {
 		timeout = 3 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -896,6 +898,21 @@ func threadCommand(args []string) error {
 			return errors.New("thread require-materialized requires --thread-id and --cwd")
 		}
 		return client.RequireThreadMaterialized(ctx, *threadID, *cwd)
+	case "quiesce-explicit":
+		if *threadID == "" || *cwd == "" {
+			return errors.New("explicit archive requires thread and directory")
+		}
+		state, err := client.ProveArchivedRootThread(ctx, *threadID, *cwd)
+		if err != nil {
+			return err
+		}
+		if state == workspacecodex.ArchiveArchived {
+			return nil
+		}
+		if err := client.QuiesceExplicitArchive(ctx, *threadID, *cwd); err != nil {
+			return err
+		}
+		return client.QuiesceNativeDescendants(ctx, *threadID, *cwd)
 	case "retire":
 		if *cwd == "" {
 			return errors.New("thread retire requires --cwd")

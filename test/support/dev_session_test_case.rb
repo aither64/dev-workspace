@@ -33,7 +33,7 @@ class DevSessionTest < Minitest::Test
         cwd = File.join(workspace, 'work', slug)
         cwd = File.join(workspace, 'archive', slug) unless File.directory?(cwd)
         manifest = YAML.safe_load(File.read(File.join(cwd, 'portal.yml')))
-        abort 'fixture requires normalized threadless tracking' unless manifest['schema'] == 1 &&
+        abort 'fixture requires normalized threadless tracking' unless [1, 3].include?(manifest['schema']) &&
           manifest['repositories'].is_a?(Array) && manifest['artifacts'].is_a?(Array) &&
           %w[codex creation forked_from].none? { |key| manifest.key?(key) }
         File.open(File.join(workspace, 'archive-observations.jsonl'), 'a') do |file|

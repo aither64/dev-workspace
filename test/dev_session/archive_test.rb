@@ -3,6 +3,33 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_explicit_archive_shutdown_passes_selected_private_recovery_context
+    with_workspace do |workspace|
+      slug = '2026-06-06-explicit-recovery-context'
+      state_root = File.join(workspace, 'selected-private-state')
+      runner = archive_runner_for(workspace, env: { 'DEV_WORKSPACES_STATE' => state_root })
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      archive_retained_identity_fixture(workspace, slug)
+      runner.define_singleton_method(:ensure_retirement_identity!) { |*| }
+      runner.define_singleton_method(:quiesce_native_client!) { |*| }
+      runner.define_singleton_method(:recovery_state!) { |*| }
+      runner.define_singleton_method(:sync_team_lifecycle!) { |*| }
+      commands = []
+      command_runner = runner.instance_variable_get(:@command_runner)
+      command_runner.define_singleton_method(:capture) { |command| commands << command; ['', ''] }
+
+      runner.send(:quiesce_explicit_archive!, slug)
+
+      command = commands.fetch(0)
+      assert_includes(command, 'quiesce-explicit')
+      assert_includes(command, '--workspace')
+      assert_equal(workspace, command.fetch(command.index('--workspace') + 1))
+      assert_includes(command, '--user-state-root')
+      assert_equal(state_root, command.fetch(command.index('--user-state-root') + 1))
+    end
+  end
+
   def test_threadless_archive_threads_owned_context_through_preflights_and_never_adopts_a_root
     [nil, 'b' * 64].each do |accepted_id|
       with_workspace do |workspace|
@@ -51,6 +78,115 @@ class DevSessionTest < Minitest::Test
       assert(File.directory?(File.join(workspace, 'work', slug)))
     end
   end
+
+  def test_explicit_threadless_archive_retains_negative_ownership_proof
+    %w[team conversation].each do |contradiction|
+      with_workspace do |workspace|
+        slug = '2026-06-06-explicit-threadless-residue'
+        runner = archive_runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        if contradiction == 'team'
+          roster = runner.send(:direct_team_state_path, slug)
+          FileUtils.mkdir_p(File.dirname(roster))
+          File.write(roster, '{}')
+        else
+          File.write(File.join(workspace, 'work', slug, 'conversation-residue'), 'loaded conversation')
+        end
+        commit_archive_fixture(workspace, slug, lifecycle: 'active')
+        configure_workspace_origin(workspace)
+        assert_raises(contradiction == 'team' ? DevSession::Error : WorkspaceAutoArchive::ObservationFailure) do
+          runner.archive(slug, as_is: true, explicit: true)
+        end
+        if contradiction == 'team'
+          refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+          refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        else
+          assert(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+          assert(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        end
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+      end
+    end
+  end
+
+  def test_explicit_threadless_archive_stops_proven_terminal_without_adopting_codex
+    [nil, 'unexpected-root'].each do |thread|
+      with_workspace do |workspace|
+        slug = '2026-06-06-explicit-threadless-terminal'
+        tmux = ManagedTmux.new(slug, workspace:, id: '$11', socket_path: '/run/test.sock', codex_thread_id: thread,
+                               codex_socket_path: thread && '/run/test/codex.sock', codex_client_version: thread && '0.160.0')
+        runner = archive_runner_for(workspace, tmux:)
+        runner.ensure_tracking_files(slug)
+        runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+        commit_archive_fixture(workspace, slug, lifecycle: 'active')
+        configure_workspace_origin(workspace)
+        runner.define_singleton_method(:retire_portal_thread!) { |*| raise 'must not adopt a conversation' }
+        if thread
+          error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
+          assert_includes(error.message, 'live runtime contradicts threadless archive')
+          refute(tmux.killed)
+          assert(File.directory?(File.join(workspace, 'work', slug)))
+        else
+          runner.define_singleton_method(:retire_session_runtime!) do |input, session|
+            raise 'terminal was stopped before tracking committed' if tmux.killed
+            raise 'archive tracking was not committed' unless File.directory?(File.join(workspace, 'archive', input))
+            super(input, session)
+          end
+          runner.archive(slug, as_is: true, explicit: true)
+          assert(tmux.killed)
+          assert(File.directory?(File.join(workspace, 'archive', slug)))
+          refute(File.exist?(runner.send(:authority_file, slug)))
+        end
+      end
+    end
+  end
+
+  def test_archive_final_retirement_survives_its_own_real_tmux_terminal
+    skip 'tmux cannot run in this environment' unless tmux_test_available?
+
+    with_workspace do |workspace|
+      socket = File.join(workspace, 'archive-terminal.sock')
+      script = File.join(workspace, 'terminal-probe.rb')
+      result = File.join(workspace, 'terminal-result')
+      executable = File.expand_path('../../libexec/dev-session', __dir__)
+      File.write(script, <<~RUBY)
+      begin
+        load #{executable.inspect}
+        $stdout.sync = true
+        runner = DevSession::Runner.new(workspace: #{workspace.inspect}, tmux_socket: #{socket.inspect}, require_runtime: false)
+        journal = {'schema' => 3, 'slug' => 'archive-terminal', 'workspace' => #{workspace.inspect},
+                   'operation_id' => 'a' * 64, 'phase' => 'thread_retired', 'mode' => 'archived',
+                   'proven_heads' => {}, 'finalized_at' => Time.now.utc.iso8601,
+                   'retained_thread_id' => nil, 'target_tracking_sha256' => 'b' * 64}
+        path = runner.send(:lifecycle_journal_file, 'archive-terminal', 'archive')
+        FileUtils.mkdir_p(File.dirname(path), mode: 0700)
+        runner.send(:write_lifecycle_journal, path, journal, command: 'archive', create: true)
+        runner.send(:with_archive_terminal_retirement, 'archive-terminal') do |own_terminal|
+          raise 'caller terminal not recognized' unless own_terminal
+          runner.instance_variable_get(:@tmux).run('kill-session', '-t', 'archive-terminal')
+          runner.send(:advance_archive!, 'archive-terminal', journal, 'runtime_retired')
+          runner.send(:finish_archive_journal!, 'archive-terminal', journal)
+          raise 'archive journal remains' if File.exist?(path)
+        end
+        File.write(#{result.inspect}, 'finished with handler restored')
+      rescue Exception => error
+        File.write(#{result.inspect}, "failed: " + error.full_message)
+      end
+      RUBY
+      command = [RbConfig.ruby, script].map { |part| Shellwords.escape(part) }.join(' ')
+      assert(system('tmux', '-S', socket, 'new-session', '-d', '-s', 'archive-terminal', "exec #{command}"))
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      until File.file?(result) || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep 0.05
+      end
+      assert(File.file?(result), 'archive command died when its terminal was retired')
+      assert_equal('finished with handler restored', File.read(result))
+      refute(system('tmux', '-S', socket, 'has-session', '-t', '=archive-terminal', out: File::NULL, err: File::NULL))
+    ensure
+      system('tmux', '-S', socket, 'kill-server', out: File::NULL, err: File::NULL) if socket
+    end
+  end
+
   def test_archive_rejects_an_unmerged_registered_branch_before_mutating_state
     skip 'git is not available' unless command_available?('git')
 

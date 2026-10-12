@@ -13,8 +13,16 @@ module DevSession
         @command_runner.capture(argv, **options)
       end
 
-      def archive_cleanup_remove!(common_dir, path)
-        @command_runner.run(['git', "--git-dir=#{common_dir}", 'worktree', 'remove', path])
+      def archive_cleanup_remove!(common_dir, path, force: false)
+        arguments = ['git', "--git-dir=#{common_dir}", 'worktree', 'remove']
+        arguments += ['--force', '--force'] if force
+        @command_runner.run(arguments + [path])
+      end
+
+      def archive_cleanup_recovery(slug, operation_id)
+        workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+        root = File.join(@workspace_state_root, 'archived-worktrees', workspace_id, slug, operation_id)
+        ArchiveRecovery.new(root, worktrees_dir(slug), @command_runner)
       end
 
       def archive_cleanup_repository(project)
@@ -151,7 +159,7 @@ module DevSession
     def discover(clean: true)
       reject_symlink_components!(@group)
       directory_identity(@group) if exists?(@group)
-      candidates = registrations.select { |record| below_group?(record.fetch('path')) }
+      candidates = registrations(allow_locked: !clean).select { |record| below_group?(record.fetch('path')) }
       paths = candidates.map { |record| record.fetch('path') }
       if paths.uniq.length != paths.length || paths.any? { |a| paths.any? { |b| a != b && a.start_with?(b + '/') } }
         raise Error, "duplicate or overlapping archive worktrees: #{@slug}"
@@ -170,7 +178,9 @@ module DevSession
       canonical_repositories.map { |project, common| { 'project' => project, 'common_dir' => common } }
     end
 
-    def prove(inventory, mode)
+    def prove(inventory, mode, operation_id: nil)
+      return prove_explicit(inventory, operation_id) if mode == 'archived'
+
       manifest = current_manifest
       repositories = manifest&.fetch('repositories', []) || []
       if !manifest && mode == 'complete' && !inventory.fetch('worktrees').empty?
@@ -243,11 +253,14 @@ module DevSession
     end
 
     def create(journal, inventory)
+      if journal.fetch('mode') == 'archived'
+        @runner.archive_cleanup_recovery(@slug, journal.fetch('operation_id')).capture!(inventory.fetch('worktrees'))
+      end
       source = source_path
       inventory = inventory.merge('tracking_identity' => directory_identity(source),
                                   'source_sha256' => @runner.archive_cleanup_source_digest(@slug))
       sidecar = journal.slice(*BINDING_KEYS).merge(
-        'schema' => 1, 'sealed' => true, 'inventory' => inventory,
+        'schema' => journal.fetch('mode') == 'archived' ? 2 : 1, 'sealed' => true, 'inventory' => inventory,
         'inventory_sha256' => inventory_digest(inventory), 'completed' => false
       )
       @runner.archive_cleanup_prepare_storage!
@@ -274,12 +287,12 @@ module DevSession
              inventory.fetch('containers').none? { |record| record.fetch('removed') }
         raise Error, "prepared archive cleanup source changed: #{@slug}"
       end
-      current = discover
+      current = discover(clean: sidecar.fetch('mode') != 'archived')
       unless %w[worktrees containers].all? { |kind| current.fetch(kind) == inventory.fetch(kind) }
         raise Error, "prepared archive cleanup inventory changed: #{@slug}"
       end
       sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => 2, 'phase' => 'prepared',
+        'schema' => sidecar.fetch('mode') == 'archived' ? 3 : 2, 'phase' => 'prepared',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? inventory.fetch('registered_heads') : {}
       )
     end
@@ -288,7 +301,7 @@ module DevSession
       validate!(sidecar)
       match_journal!(sidecar, journal) if journal
       inventory = sidecar.fetch('inventory')
-      current = discover
+      current = discover(clean: sidecar.fetch('mode') != 'archived')
       %w[worktrees containers].each do |kind|
         expected = inventory.fetch(kind).to_h { |record| [record.fetch('path'), record] }
         actual = current.fetch(kind).to_h { |record| [record.fetch('path'), record] }
@@ -311,6 +324,10 @@ module DevSession
         end
       end
       inventory.fetch('proofs').each { |proof| reprove!(proof, sidecar.fetch('mode')) }
+      if sidecar.fetch('mode') == 'archived'
+        recovery = @runner.archive_cleanup_recovery(@slug, sidecar.fetch('operation_id'))
+        inventory.fetch('worktrees').each { |record| recovery.verify_checkout!(record) unless record.fetch('removed') }
+      end
       tracking = exists?(source_path) ? source_path : archive_path
       unless directory_identity(tracking) == inventory.fetch('tracking_identity')
         raise Error, "archive tracking directory identity changed: #{@slug}"
@@ -327,7 +344,11 @@ module DevSession
 
         revalidate!(sidecar, journal:)
         next if record.fetch('removed')
-        @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
+        if sidecar.fetch('mode') == 'archived'
+          @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')), force: true)
+        else
+          @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
+        end
         prove_absent!(record)
         record['removed'] = true
         write(sidecar)
@@ -360,7 +381,7 @@ module DevSession
       raise Error, "archive cleanup is not completed: #{@slug}" unless sidecar.fetch('completed')
 
       journal = sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => 2, 'phase' => 'archived',
+        'schema' => sidecar.fetch('mode') == 'archived' ? 3 : 2, 'phase' => 'archived',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
       )
       revalidate!(sidecar, journal:)
@@ -374,6 +395,45 @@ module DevSession
     end
 
     private
+
+    def prove_explicit(inventory, operation_id)
+      raise Error, 'explicit archive requires an operation identity' unless operation_id&.match?(DIGEST)
+
+      repositories = current_manifest&.fetch('repositories', []) || []
+      registered_heads = {}
+      proofs = []
+      rows = inventory.fetch('worktrees').map do |record|
+        repository = repositories.find { |item| item.fetch('name') == record.fetch('path') }
+        registered_heads[repository.fetch('name')] = record.fetch('head') if repository
+        [record.fetch('path'), record.fetch('project'), record.fetch('common_dir'), record.fetch('head'), record['branch'], repository]
+      end
+      repositories.each do |repository|
+        next if inventory.fetch('worktrees').any? { |record| record.fetch('path') == repository.fetch('name') }
+
+        begin
+          common = @runner.archive_cleanup_repository(repository.fetch('project'))
+          head = resolve_commit(common, "refs/heads/#{repository.fetch('branch')}")
+          registered_heads[repository.fetch('name')] = head
+          rows << [repository.fetch('name'), repository.fetch('project'), common, head, repository['branch'], repository]
+        rescue Error, CommandError
+          next
+        end
+      end
+      rows.each do |name, project, common, head, branch, repository|
+        ref = "refs/dev-session-archives/#{operation_id}/#{Digest::SHA256.hexdigest(name)}/head"
+        git(['git', "--git-dir=#{common}", 'update-ref', ref, head])
+        origin, = @runner.archive_cleanup_capture(['git', "--git-dir=#{common}", 'config', '--get', 'remote.origin.url'], allow_failure: true)
+        proofs << {
+          'kind' => repository ? 'registered' : branch ? 'additional' : 'detached',
+          'name' => name, 'project' => project, 'common_dir' => common,
+          'common_identity' => directory_identity(common), 'origin' => origin.strip,
+          'branch' => branch, 'default_branch' => repository&.fetch('default_branch', nil),
+          'head' => head, 'ref' => ref, 'tip' => head,
+          'initial_base_sha' => repository&.fetch('initial_base_sha', nil), 'allow_unpushed' => false
+        }
+      end
+      inventory.merge('proofs' => proofs, 'registered_heads' => registered_heads)
+    end
 
     def source_path
       File.join(@workspace, 'work', @slug)
@@ -456,7 +516,7 @@ module DevSession
       sources.uniq { |_project, common| common }
     end
 
-    def registrations
+    def registrations(allow_locked: false)
       canonical_repositories.flat_map do |project, common|
         output = git(['git', "--git-dir=#{common}", 'worktree', 'list', '--porcelain', '-z'])
         output.split("\0\0").filter_map do |stanza|
@@ -475,7 +535,7 @@ module DevSession
           unless raw_path == normalized && !raw_path.match?(/[[:cntrl:]]/)
             raise Error, "invalid archive worktree registration path: #{raw_path.inspect}"
           end
-          if values.key?('locked') || values.key?('prunable') || values.key?('bare')
+          if values.key?('locked') && !allow_locked || values.key?('prunable') || values.key?('bare')
             raise Error, "locked, prunable or missing archive worktree registration: #{raw_path}"
           end
           branch = values['branch']
@@ -513,7 +573,10 @@ module DevSession
       unless head == registration.fetch('head') && branch == registration.fetch('branch')
         raise Error, "archive worktree HEAD disagrees with registration: #{checkout}"
       end
-      dirty = !git(['git', '-C', checkout, 'status', '--porcelain', '--untracked-files=all']).empty?
+      status_output, = @runner.archive_cleanup_capture(
+        ['git', '-C', checkout, 'status', '--porcelain', '--untracked-files=all'], env: { 'GIT_OPTIONAL_LOCKS' => '0' }
+      )
+      dirty = !status_output.empty?
       raise Error, "worktree has uncommitted changes: #{checkout}" if clean && dirty
 
       registration.merge(
@@ -642,6 +705,13 @@ module DevSession
 
     def reprove!(proof, mode)
       common = @runner.archive_cleanup_repository(proof.fetch('project'))
+      if mode == 'archived'
+        unless common == proof.fetch('common_dir') && directory_identity(common) == proof.fetch('common_identity') &&
+               resolve_commit(common, proof.fetch('ref')) == proof.fetch('head')
+          raise Error, "archive local recovery ref changed: #{proof.fetch('name')}"
+        end
+        return
+      end
       unless common == proof.fetch('common_dir') && directory_identity(common) == proof.fetch('common_identity') &&
              git(['git', "--git-dir=#{common}", 'config', '--get', 'remote.origin.url']).strip == proof.fetch('origin')
         raise Error, "archive retained repository identity changed: #{proof.fetch('name')}"
@@ -674,7 +744,7 @@ module DevSession
 
     def prove_absent!(record)
       if exists?(absolute(record.fetch('path'))) || exists?(record.fetch('admin_dir')) ||
-         registrations.any? { |registration| registration.fetch('path') == absolute(record.fetch('path')) }
+         registrations(allow_locked: true).any? { |registration| registration.fetch('path') == absolute(record.fetch('path')) }
         raise Error, "archive worktree path or registration remains after removal: #{absolute(record.fetch('path'))}"
       end
     end
@@ -715,10 +785,10 @@ module DevSession
 
     def validate!(sidecar)
       inventory = sidecar['inventory'] if sidecar.is_a?(Hash)
-      valid = keys?(sidecar, KEYS) && sidecar['schema'] == 1 && sidecar['sealed'] == true &&
+      valid = keys?(sidecar, KEYS) && [1, 2].include?(sidecar['schema']) && sidecar['sealed'] == true &&
         sidecar['workspace'] == @workspace && sidecar['slug'] == @slug &&
         sidecar['operation_id'].is_a?(String) && sidecar['operation_id'].match?(DIGEST) &&
-        %w[complete abandoned].include?(sidecar['mode']) &&
+        (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode'])) &&
         timestamp?(sidecar['finalized_at']) &&
         sidecar['target_tracking_sha256'].is_a?(String) && sidecar['target_tracking_sha256'].match?(DIGEST) &&
         (sidecar['retained_thread_id'].nil? || sidecar['retained_thread_id'].is_a?(String) && sidecar['retained_thread_id'].match?(/\A[0-9A-Za-z-]+\z/)) &&
@@ -733,14 +803,15 @@ module DevSession
             record['admin_dir'].is_a?(String) && File.dirname(record['admin_dir']) == File.join(record['common_dir'], 'worktrees') &&
             %w[identity admin_identity common_identity].all? { |key| identity?(record[key]) } &&
             record['head'].is_a?(String) && record['head'].match?(SHA) &&
-            (record['branch'].nil? || valid_branch?(record['branch'])) && record['dirty'] == false && boolean?(record['removed'])
+            (record['branch'].nil? || valid_branch?(record['branch'])) &&
+            (sidecar['mode'] == 'archived' ? boolean?(record['dirty']) : record['dirty'] == false) && boolean?(record['removed'])
         end
         valid &&= inventory['containers'].all? { |record| keys?(record, %w[path identity removed]) && valid_relative?(record['path'], empty: true) && identity?(record['identity']) && boolean?(record['removed']) }
         valid &&= inventory['proofs'].all? do |proof|
           keys?(proof, PROOF_KEYS) && %w[registered additional default detached].include?(proof['kind']) &&
             valid_relative?(proof['name']) && valid_part?(proof['project']) &&
             proof['common_dir'] == @runner.archive_cleanup_repository(proof['project']) && identity?(proof['common_identity']) &&
-            proof['origin'].is_a?(String) && !proof['origin'].empty? && !proof['origin'].include?("\0") &&
+            proof['origin'].is_a?(String) && (sidecar['mode'] == 'archived' || !proof['origin'].empty?) && !proof['origin'].include?("\0") &&
             (proof['branch'].nil? || valid_branch?(proof['branch'])) &&
             (proof['default_branch'].nil? || valid_branch?(proof['default_branch'])) &&
             %w[head tip].all? { |key| proof[key].is_a?(String) && proof[key].match?(SHA) } &&
@@ -765,7 +836,7 @@ module DevSession
           if proof['kind'] == 'detached'
             proof['branch'].nil? && !proof['allow_unpushed']
           else
-            !proof['branch'].nil? && (proof['kind'] == 'registered' || !proof['allow_unpushed'])
+            (sidecar['mode'] == 'archived' || !proof['branch'].nil?) && (proof['kind'] == 'registered' || !proof['allow_unpushed'])
           end && (sidecar['mode'] != 'complete' || !proof['default_branch'].nil?)
         end
         valid &&= sidecar['inventory_sha256'] == inventory_digest(inventory)
@@ -786,7 +857,7 @@ module DevSession
     end
 
     def valid_retained_ref?(value)
-      return false unless value.is_a?(String) && value.match?(%r{\Arefs/(?:heads/|tags/|remotes/origin/)})
+      return false unless value.is_a?(String) && value.match?(%r{\Arefs/(?:heads/|tags/|remotes/origin/|dev-session-archives/)})
 
       _stdout, _stderr, status = @runner.archive_cleanup_capture(
         ['git', 'check-ref-format', value], allow_failure: true

@@ -208,14 +208,13 @@
   {{end}}
   <dialog id="archive-session-dialog">
     <form id="archive-session-form" class="stack">
-      <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>This checks that Codex has no pending work, removes clean worktrees, releases development clusters, records the archive on workspace <code>master</code>, and stops the session runtime.</p></div>
-      <p class="notice warning">Completed work can be archived only when every registered feature head is merged into its configured default branch.</p>
-      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" name="mode" value="abandoned" class="danger">Archive as abandoned</button><button type="submit" name="mode" value="complete">Archive completed session</button></div>
+      <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>Archive stops active agents, saves local changes for revival, removes worktrees, and releases development clusters. Conversations and queued prompt records are kept.</p></div>
+      <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" name="mode" value="archived">Archive</button></div>
     </form>
   </dialog>
   <dialog id="revive-session-dialog">
     <form id="revive-session-form" class="stack">
-      <div><p class="eyebrow">Continue work</p><h2>Revive session</h2><p>This restores active tracking and the retained Codex conversation. Repository worktrees stay removed until you add them again.</p></div>
+      <div><p class="eyebrow">Continue work</p><h2>Revive session</h2><p>This restores active tracking and the retained conversation. Worktrees saved by explicit Archive are restored with their local changes. Queued prompts stay held.</p></div>
       <p id="revive-abandoned-warning" class="notice warning"{{if ne .Session.Lifecycle "abandoned"}} hidden{{end}}>This session was explicitly abandoned. Reviving it reopens discarded work as an active initiative.</p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Revive session</button></div>
     </form>
@@ -227,7 +226,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=35" defer></script>
+  <script src="/static/app.js?v=36" defer></script>
 </body>
 </html>
 {{end}}

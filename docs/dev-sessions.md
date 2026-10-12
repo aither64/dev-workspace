@@ -518,7 +518,7 @@ Symlinks, unmanaged entries, foreign repositories, path escapes, and ambiguous
 ownership are always refused. `--force` permits dirty worktrees and interrupts
 active lead and independent team-member turns, waits for each turn to stop, then
 archives their threads. The wait is bounded; a member that does not stop leaves
-the deletion journal retryable. Ordinary archive and non-forced deletion still
+the deletion journal retryable. Non-forced deletion and strict completion archival
 require every member to be idle. A forced deletion can also retire a member
 whose thread was confirmed while member creation remained unfinished; a missing
 thread identity still blocks deletion. If a non-forced attempt stops at an
@@ -586,7 +586,7 @@ team, creation and conflicting operation state, directory submission binding,
 and saved active/archived or loaded conversations at its exact original work CWD.
 Loaded-only threads count even before their first turn or persisted history;
 unreadable discovery is unknown. Missing `portal.yml` alone proves no absence.
-Ordinary archive repeats this proof and never adopts a conversation during
+Automatic archival repeats this proof and never adopts a conversation during
 retirement. Archived members retain the bounded unloaded proof described in
 [archive recovery](session-archive-recovery.md#retained-conversations-and-selected-executor-recovery).
 
@@ -632,73 +632,35 @@ worker and removes its timer when the target generation lacks this feature.
 
 ### Manual archival
 
-Use `archive` only after the initiative is fully integrated and has no
-session-owned work, or after the user explicitly abandons it:
+Use Archive when you want to close a session, including unfinished work:
 
 ```sh
 dev-session archive api-token-rotation
-dev-session archive api-token-rotation --abandoned
 ```
 
-Before archiving completed work:
+The CLI asks for one yes/no confirmation; the browser has one Archive action.
+Explicit archival writes `lifecycle: archived`. It stops active owned agents,
+pauses active goals, saves queued prompt records, releases development clusters,
+saves local checkout contents for revival, removes owned worktrees, moves tracking
+into `archive/`, and retires the session runtime. It preserves conversations and
+Git branches. Unmerged, unpublished, detached and dirty work do not prevent
+explicit closure. Snapshot capture and verified ownership protect local recovery.
 
-- merge every registered feature branch's exact final head into its configured
-  remote default branch; a branch that is still exactly at its recorded
-  `initial_base_sha` may remain unpushed, because there is no feature commit to
-  merge;
-- make sure plan and state have an earlier commit under `work/<slug>/` whose
-  state front matter has `lifecycle: active`;
-- resolve all review, CI, merge, approval, deployment, and cleanup work owned by
-  the session;
-- stop shells, editors, builds, and background processes that can still write
-  into an initiative worktree;
-- remove credentials, caches, reproducible bulk captures, and transient
-  outputs, keeping plan, state, and intentionally durable evidence.
+Plan and state need an earlier tracking commit. Stop external editors and builds
+that can still write into a worktree. The command commits only the tracking
+transition and preserves unrelated workspace changes. Missing registered refs
+stay recorded without a fabricated final head.
 
-The command asks for one yes/no confirmation. It writes `lifecycle: complete`
-or `lifecycle: abandoned` itself, so no separate terminal tracking commit is
-needed. The browser offers the same two modes with one confirmation dialog.
-Agents must not treat a completed response, a handoff, "finish the work", or
-"implement the plan" as permission to archive a session.
+Automatic archival keeps its merge, publication, cleanliness and idle checks.
+`dev-session archive api-token-rotation --require-merged` explicitly requests the
+same completion policy. `--abandoned` retains the older discard policy. Pending
+operations resume the policy sealed in their journal, including operations
+started by an older package. They do not silently change policy on retry.
 
-For completed work, `archive` fetches every registered default branch and fetches
-a feature branch when its remote ref exists. The local and remote feature tips
-must be identical when that ref exists. A branch whose local tip is exactly its
-recorded `initial_base_sha` may have no remote feature ref; that base commit
-must still be an ancestor of `origin/<default_branch>`. The command reports
-every branch whose merge status cannot be proven. A squash merge or partial
-cherry-pick does not satisfy this rule, and a branch with feature commits still
-requires a matching remote ref. Coordination-only initiatives
-with no registered branches remain valid. Legacy records need positively
-resolved scope before a new archive, including exact-slug retained refs whose
-checkouts have gone. Repair those records offline before exposing them to writers
-or workers. A missing manifest or empty manifest left by revival cannot certify
-empty scope.
-Pending older journals retain their existing recovery checks. `--abandoned` skips only
-publication and merge proof. A retry fetches and
-reproves the exact heads stored in the archive journal before every remaining
-destructive phase; another merged commit on the feature branch cannot replace
-the head originally approved for archival.
-
-Before changing state, `archive` verifies the exact retained root and every
-nonremoved team member, including already archived conversations. It checks for
-active turns, pending requests, runnable queued input and unresolved submission
-attempts, and refuses active same-directory threads outside that retained set.
-It verifies the tracking commit and clean worktrees, checks the atomic move, and verifies
-that the shared workspace can make an exact-path commit. It then quiesces the
-terminal client, releases both development cluster types, records immutable
-repository heads, removes worktrees without force, atomically moves tracking
-into `archive/`, commits only the tracking transition, archives and verifies
-retained members, retires
-the root Codex thread, and removes the tmux session and authority. Branches are
-retained. The host-wide transition gate prevents portal mutations and cluster
-starts from racing this operation.
-
-Archive cleanup also inventories nested and detached Git-registered checkouts.
-Detached commits need existing retained refs; empty containers are removed only
-with `rmdir`. Its private sealed cleanup sidecar survives interruptions alongside
-the ordinary archive journal. See [archive cleanup and recovery](session-archive-recovery.md)
-for the ownership checks, prepared intents and supported old-journal recovery.
+Agents must not infer archive authorization from a completed response, a handoff,
+"finish the work" or "implement the plan". Explicit user direction or the enabled
+automatic worker owns closure. See [archive cleanup and recovery](session-archive-recovery.md)
+for private snapshots, retained prompts, operation formats and legacy recovery.
 
 Each irreversible phase is journaled in private runtime state. If a command or
 deployment interruption stops the operation, run the same `archive` command
@@ -774,8 +736,9 @@ commit, commits only that transition, and preserves branch, base, repository,
 and Codex identity.
 
 When the archive retains a Codex thread, revive restores and starts that exact
-conversation without forking it or resending the initial request. It does not
-recreate worktrees. Creation-less ordinary archives preserve the same root and do
+conversation without forking it or resending the initial request. Explicit
+archives restore their saved worktrees and local changes before starting it.
+Older complete/abandoned archives do not recreate worktrees. Creation-less ordinary archives preserve the same root and do
 not gain invented creation/goal evidence. Verified threadless archives revive
 without creating a conversation. Unknown historical bases remain omitted;
 `--base` cannot establish them from today's refs.

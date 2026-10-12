@@ -781,6 +781,8 @@ type Client interface {
 	SendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, error)
 	CompactAcceptedSendOptions(string) error
 	ClearRetiredThreadAttempts(string) error
+	QuiesceExplicitArchive(context.Context, string, string) error
+	QuiesceNativeDescendants(context.Context, string, string) error
 }
 
 type Service struct {
@@ -1723,6 +1725,45 @@ func (service Service) ArchiveRetainedAll(ctx context.Context, slug, rootThreadI
 	})
 }
 
+// ArchiveExplicitAll keeps retained identities and saves prompts before forced
+// retirement. Fresh members are archived as they stand, without recreation.
+func (service Service) ArchiveExplicitAll(ctx context.Context, slug, rootThreadID string) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		roster, err := service.Store.Load(slug, rootThreadID)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		for _, member := range roster.Members {
+			if member.State == "removed" || member.State == "archived" {
+				continue
+			}
+			if member.Thread == "" {
+				return fmt.Errorf("member %s has no retained identity", member.Address)
+			}
+			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			if err != nil {
+				return err
+			}
+			if !archived {
+				if err := service.Client.QuiesceExplicitArchive(ctx, member.Thread, cwd); err != nil {
+					return err
+				}
+				if err := service.Client.QuiesceNativeDescendants(ctx, member.Thread, cwd); err != nil {
+					return err
+				}
+			}
+		}
+		return service.archiveAllLocked(ctx, slug, rootThreadID, true, true)
+	})
+}
+
 // RetireAll is reserved for a confirmed forced session deletion. Its bounded
 // context covers interruption, the wait for each turn to stop, and archival.
 func (service Service) RetireAll(ctx context.Context, slug, rootThreadID string) error {
@@ -1745,7 +1786,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		return err
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
-	if retainedOnly {
+	if retainedOnly && !force {
 		for _, member := range roster.Members {
 			if member.State == "removed" {
 				continue
@@ -1820,7 +1861,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
 		archivedMembers[member.Address] = archived
-		if retainedOnly && !archived {
+		if retainedOnly && !force && !archived {
 			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
 				return fmt.Errorf("recheck retained %s: %w", member.Address, err)
 			}
@@ -1841,7 +1882,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.State == "removed" {
 			continue
 		}
-		if force && !archivedMembers[member.Address] {
+		if force && !retainedOnly && !archivedMembers[member.Address] {
 			activeTurn, err := service.Client.ActiveTurnID(ctx, member.Thread)
 			if err != nil {
 				return fmt.Errorf("inspect active turn for %s: %w", member.Address, err)
@@ -1862,7 +1903,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 				}
 			}
 		}
-		if retainedOnly && !archivedMembers[member.Address] {
+		if retainedOnly && !force && !archivedMembers[member.Address] {
 			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
 			if err != nil {
 				return fmt.Errorf("recheck retained %s before archive: %w", member.Address, err)

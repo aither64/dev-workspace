@@ -197,5 +197,5 @@ func ValidateObservationArchiveContext(id, mode string) error {
 }
 
 func validObservationArchiveContext(id, mode string) bool {
-	return id == "" && mode == "" || messageDigestPattern.MatchString(id) && (mode == "complete" || mode == "abandoned")
+	return id == "" && mode == "" || messageDigestPattern.MatchString(id) && (mode == "complete" || mode == "abandoned" || mode == "archived")
 }

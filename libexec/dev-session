@@ -16,6 +16,7 @@ require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
+require_relative 'workspace-archive-recovery'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -178,7 +179,7 @@ module DevSession
   ].freeze
 
   LIFECYCLE_HEADER = Regexp.new(
-    '\\A---\\r?\\nlifecycle: (active|complete|abandoned)' \
+    '\\A---\\r?\\nlifecycle: (active|complete|abandoned|archived)' \
     '\\r?\\n---(?:\\r?\\n|\\z)'
   )
 
@@ -1847,9 +1848,10 @@ module DevSession
 	  File.join(@workspace_state_root, 'codex-teams', workspace_id, "#{slug}.json")
 	end
 
-    def archive(input, as_is:, abandoned: false, operation_id: nil, automatic: nil)
+    def archive(input, as_is:, abandoned: false, explicit: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
-      mode = abandoned ? 'abandoned' : 'complete'
+      mode = abandoned ? 'abandoned' : (explicit ? 'archived' : 'complete')
+      @explicit_archive_operation_id = nil
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session archive operation identity'
       end
@@ -1860,6 +1862,15 @@ module DevSession
           journal = load_archive_journal(slug, operation_id:)
           cleanup = ArchiveCleanup.new(self, slug)
           sidecar = cleanup.load(journal:, operation_id:)
+          # A retry retains the policy sealed by the previous package.
+          mode = (journal || sidecar).fetch('mode') if explicit && (journal || sidecar)
+          if automatic && mode == 'archived'
+            raise Error, 'automatic archival cannot resume explicit archival'
+          end
+          if mode == 'archived'
+            operation_id ||= (journal || sidecar)&.fetch('operation_id') || SecureRandom.hex(32)
+            @explicit_archive_operation_id = operation_id
+          end
           if sidecar && sidecar.fetch('mode') != mode
             raise Error, "resuming archival of #{slug} requires mode #{sidecar.fetch('mode')}"
           end
@@ -1877,7 +1888,7 @@ module DevSession
             raise Error, "archive already exists: #{destination}" if path_exists?(destination)
 
             lifecycle = validate_tracking_files!(slug)
-            unless lifecycle == 'active' || lifecycle == mode
+            unless mode == 'archived' || lifecycle == 'active' || lifecycle == mode
               raise Error,
                     "initiative lifecycle is #{lifecycle}; use the matching archive mode"
             end
@@ -1886,13 +1897,18 @@ module DevSession
               cleanup.revalidate!(sidecar, journal: prepared)
               inventory = sidecar.fetch('inventory')
             else
-              inventory = cleanup.prove(cleanup.discover, mode)
+              quiesce_explicit_archive!(slug) if mode == 'archived'
+              inventory = cleanup.prove(cleanup.discover(clean: mode != 'archived'), mode, operation_id:)
             end
             plan = cleanup.plan(inventory)
             proven_heads = mode == 'complete' ? inventory.fetch('registered_heads') : {}
             preflight_id = prepared&.fetch('operation_id') || (automatic ? nil : operation_id)
-            ensure_archive_conversations_ready!(slug, expected_operation_id: preflight_id,
-                                                archive_mode: preflight_id ? mode : nil)
+            # Fresh explicit operations obtain their full conversation proof
+            # after the capture journal exists, before any checkout removal.
+            unless mode == 'archived' && !prepared
+              ensure_archive_conversations_ready!(slug, expected_operation_id: preflight_id,
+                                                  archive_mode: preflight_id ? mode : nil)
+            end
             ensure_retirement_identity!(slug, cleanup_session(slug))
             validate_development_cluster_helpers!
             validate_archive_move_command!
@@ -1988,10 +2004,10 @@ module DevSession
             cleanup.revalidate!(sidecar, journal:) if sidecar
             ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
             if journal.fetch('retained_thread_id')
-              sync_team_lifecycle!(slug, 'archive-retained')
+              sync_team_lifecycle!(slug, mode == 'archived' ? 'archive-explicit' : 'archive-retained')
               sync_team_lifecycle!(slug, 'require-archived')
               ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
-              retire_portal_thread!(slug, force: false)
+              retire_portal_thread!(slug, force: mode == 'archived')
             else
               # Negative proof owns this threadless operation. Do not use the
               # generic retirement fallback to discover and adopt a late root.
@@ -2000,16 +2016,24 @@ module DevSession
             recovery_state!(slug, journal.fetch('retained_thread_id'), 'archive') if journal['retained_thread_id']
             advance_archive!(slug, journal, 'thread_retired')
           end
-          if archive_phase_before?(journal, 'runtime_retired')
-            cleanup.revalidate!(sidecar, journal:) if sidecar
-            verify_committed_archive_tracking!(slug, journal)
-            retire_session_runtime!(slug, @tmux.session(slug))
-            advance_archive!(slug, journal, 'runtime_retired')
+          with_archive_terminal_retirement(slug) do |own_terminal|
+            if archive_phase_before?(journal, 'runtime_retired')
+              cleanup.revalidate!(sidecar, journal:) if sidecar
+              verify_committed_archive_tracking!(slug, journal)
+              retire_session_runtime!(slug, @tmux.session(slug))
+              advance_archive!(slug, journal, 'runtime_retired')
+            end
+            finish_archive_journal!(slug, journal, cleanup: sidecar ? cleanup : nil, sidecar:)
+            begin
+              @out.puts "archived session: #{slug}"
+            rescue Errno::EIO, Errno::EPIPE
+              raise unless own_terminal
+            end
           end
-          finish_archive_journal!(slug, journal, cleanup: sidecar ? cleanup : nil, sidecar:)
-          @out.puts "archived session: #{slug}"
         end
       end
+    ensure
+      @explicit_archive_operation_id = nil
     end
 
     def with_verified_committed_archive(slug, expected_journal)
@@ -2073,6 +2097,14 @@ module DevSession
             verify_revived_tracking_tree!(slug, current)
             advance_revive!(slug, current, 'tracking_committed')
             current
+          end
+        end
+      end
+      if journal['schema'] == 4 && revive_phase_before?(journal, 'runtime_started')
+        with_creation_lock(slug) do
+          with_slug_lock(slug) do
+            recovery = archive_cleanup_recovery(slug, journal.fetch('archive_operation_id'))
+            recovery.records.each { |record| recovery.restore!(record) }
           end
         end
       end
@@ -2327,7 +2359,7 @@ module DevSession
           end
           read_bounded_file(plan, 'plan.md')
           lifecycle = lifecycle_state(read_bounded_file(state, 'state.md'))
-          terminal = %w[complete abandoned].include?(lifecycle)
+          terminal = %w[complete abandoned archived].include?(lifecycle)
           if root_name == 'archive' && (!terminal || manifest['finalized_at'].to_s.empty?)
             raise Error, "archived session lacks terminal lifecycle or finalization metadata: #{path}"
           end
@@ -4158,7 +4190,7 @@ module DevSession
     # This is ordinary manifest readiness, not historical scope reconstruction.
     # Present creation evidence never falls back to creation-less readiness.
     def require_ordinary_manifest_ready!(slug, manifest)
-      unless manifest && manifest['schema'] == 1
+      unless manifest && [1, 3].include?(manifest['schema'])
         raise Error, "explicit ordinary tracking is required; repair unresolved metadata offline: #{slug}"
       end
       if manifest.key?('creation')
@@ -4397,12 +4429,12 @@ module DevSession
 
     def validate_portal_manifest!(manifest, expected_slug, path)
       unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
-             [1, 2].include?(manifest['schema'])
+             [1, 2, 3].include?(manifest['schema'])
         raise Error, "unsupported portal manifest: #{path}"
       end
       validate_mapping_keys!(
         manifest,
-        %w[schema slug forked_from codex creation repositories artifacts finalized_at],
+        %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id],
         'portal manifest',
         path
       )
@@ -4530,6 +4562,13 @@ module DevSession
         end
       end
 
+      if manifest['schema'] == 3
+        unless manifest['archive_operation_id']&.match?(/\A[0-9a-f]{64}\z/) && manifest.key?('finalized_at')
+          raise Error, "invalid explicit archive identity in #{path}"
+        end
+      elsif manifest.key?('archive_operation_id')
+        raise Error, "archive identity requires portal schema 3 in #{path}"
+      end
       finalized_at = manifest['finalized_at']
       if manifest.key?('finalized_at')
         unless finalized_at.is_a?(String) && valid_rfc3339_timestamp?(finalized_at)
@@ -4538,6 +4577,7 @@ module DevSession
         Time.iso8601(finalized_at)
 
         manifest.fetch('repositories', []).each do |repository|
+          next if manifest['schema'] == 3 && !repository.key?('final_head_sha')
           unless repository['final_head_sha']&.match?(/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/)
             raise Error,
                   "finalized portal repository has no immutable final head in #{path}"
@@ -4952,6 +4992,17 @@ module DevSession
     def finalized_portal_manifest(slug, plan, proven_heads:, finalized_at:)
       manifest = load_portal_manifest(portal_file(slug), required: false)
       return unless manifest
+
+      if @explicit_archive_operation_id
+        manifest['schema'] = 3
+        manifest['archive_operation_id'] = @explicit_archive_operation_id
+        manifest['finalized_at'] = finalized_at
+        manifest.fetch('repositories', []).each do |repository|
+          repository['final_head_sha'] = proven_heads[repository.fetch('name')] if proven_heads.key?(repository.fetch('name'))
+        end
+        validate_portal_manifest!(manifest, slug, portal_file(slug))
+        return manifest
+      end
 
       entries = plan.entries.to_h { |entry| [entry.fetch(:name), entry] }
       repositories = manifest.fetch('repositories', [])
@@ -6579,7 +6630,7 @@ module DevSession
 
     def revived_state_content(content)
       lifecycle = lifecycle_state(content)
-      unless %w[complete abandoned].include?(lifecycle)
+      unless %w[complete abandoned archived].include?(lifecycle)
         raise Error, "archived initiative is not terminal: #{lifecycle}"
       end
 
@@ -6613,6 +6664,10 @@ module DevSession
     end
 
     def apply_revived_portal_transition!(manifest, slug, path, plan_sha256:, state_sha256:)
+      if manifest['schema'] == 3
+        manifest['schema'] = 1
+        manifest.delete('archive_operation_id')
+      end
       manifest.delete('finalized_at')
       manifest.fetch('repositories', []).each { |repository| repository.delete('final_head_sha') }
       creation = manifest['creation']
@@ -6713,10 +6768,11 @@ module DevSession
         retained_thread_id target_tracking_sha256
       ]
       unless journal.keys.sort == keys.sort &&
-             journal['schema'] == 2 && ARCHIVE_PHASES.include?(journal['phase']) &&
+             ((journal['schema'] == 2 && %w[complete abandoned].include?(journal['mode'])) ||
+               (journal['schema'] == 3 && journal['mode'] == 'archived')) && ARCHIVE_PHASES.include?(journal['phase']) &&
              journal['operation_id'].is_a?(String) &&
              journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
-             %w[complete abandoned].include?(journal['mode']) &&
+             %w[complete abandoned archived].include?(journal['mode']) &&
              journal['finalized_at'].is_a?(String) &&
              valid_rfc3339_timestamp?(journal['finalized_at']) &&
              journal['target_tracking_sha256'].is_a?(String) &&
@@ -6745,7 +6801,7 @@ module DevSession
         slug, plan, mode, inventory ? inventory.fetch('registered_heads') : proven_heads, finalized_at
       )
       journal = {
-        'schema' => 2,
+        'schema' => mode == 'archived' ? 3 : 2,
         'slug' => slug,
         'workspace' => workspace,
         'operation_id' => operation_id || SecureRandom.hex(32),
@@ -6875,15 +6931,18 @@ module DevSession
         plan_sha256 state_sha256 target_state_sha256 portal_sha256
         target_portal_sha256
       ]
+      keys << 'archive_operation_id' if journal['schema'] == 4
       digests = %w[
         target_tracking_sha256 plan_sha256 state_sha256 target_state_sha256
         target_portal_sha256
       ]
       unless journal.keys.sort == keys.sort &&
-             journal['schema'] == 3 && REVIVE_PHASES.include?(journal['phase']) &&
+             ((journal['schema'] == 3 && %w[complete abandoned].include?(journal['lifecycle'])) ||
+               (journal['schema'] == 4 && journal['lifecycle'] == 'archived' &&
+                journal['archive_operation_id']&.match?(/\A[0-9a-f]{64}\z/))) && REVIVE_PHASES.include?(journal['phase']) &&
              journal['operation_id'].is_a?(String) &&
              journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
-             %w[complete abandoned].include?(journal['lifecycle']) &&
+             %w[complete abandoned archived].include?(journal['lifecycle']) &&
              [true, false].include?(journal['legacy_without_portal']) &&
              [true, false].include?(journal['abandoned_confirmed']) &&
              (journal['lifecycle'] != 'abandoned' || journal['abandoned_confirmed']) &&
@@ -6951,7 +7010,7 @@ module DevSession
                       end
       archived_manifest = portal && YAML.safe_load(portal)
       journal = {
-        'schema' => 3,
+        'schema' => lifecycle == 'archived' ? 4 : 3,
         'slug' => slug,
         'workspace' => workspace,
         'operation_id' => operation_id || SecureRandom.hex(32),
@@ -6973,6 +7032,9 @@ module DevSession
         'portal_sha256' => portal && Digest::SHA256.hexdigest(portal),
         'target_portal_sha256' => Digest::SHA256.hexdigest(target_portal)
       }
+      if lifecycle == 'archived'
+        journal['archive_operation_id'] = archived_manifest.fetch('archive_operation_id')
+      end
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'revive'), journal, command: 'revive', create: true
       )
@@ -6998,6 +7060,8 @@ module DevSession
 
     def announce_lifecycle_phase(operation, phase)
       @out.puts "#{operation}: #{phase.tr('_', ' ')}"
+    rescue Errno::EIO, Errno::EPIPE
+      raise unless operation == 'archive' && @archive_retiring_own_terminal
     end
 
     def recover_revive_phase!(slug, journal)
@@ -7165,6 +7229,7 @@ module DevSession
                 else
                   raise Error, "unsupported lifecycle journal writer: #{command}"
                 end
+      allowed << 'archive_operation_id' if command == 'revive' && journal['schema'] == 4
       unless journal.keys.sort == allowed.sort
         raise Error, "invalid lifecycle journal fields: #{path}"
       end
@@ -7236,9 +7301,14 @@ module DevSession
           message.chmod(0o600)
           if direction == 'archive'
             message.write("workspace: archive #{slug}\n\n")
-            message.write(mode == 'abandoned' ?
-              "Record the explicitly abandoned session and retire its active tracking.\n" :
-              "Record the completed session after verifying its feature heads are merged.\n")
+            message.write(case mode
+                          when 'abandoned'
+                            "Record the explicitly abandoned session and retire its active tracking.\n"
+                          when 'archived'
+                            "Record the explicitly archived session and retain local work for revival.\n"
+                          else
+                            "Record the completed session after verifying its feature heads are merged.\n"
+                          end)
           else
             message.write("workspace: revive #{slug}\n\n")
             message.write("Restore archived tracking so development can continue in the same session.\n")
@@ -8161,7 +8231,7 @@ module DevSession
     def validate_terminal_lifecycle_content!(content)
       lifecycle = lifecycle_state(content)
 
-      return if %w[complete abandoned].include?(lifecycle)
+      return if %w[complete abandoned archived].include?(lifecycle)
 
       raise Error, "initiative lifecycle is not terminal: #{lifecycle}"
     end
@@ -8221,7 +8291,7 @@ module DevSession
 
       raise Error,
             'state.md must start with lifecycle YAML front matter set to ' \
-            'active, complete, or abandoned'
+            'active, complete, abandoned, or archived'
     end
 
     def close_session!(slug, session, idle_checked: false)
@@ -8292,13 +8362,20 @@ module DevSession
     def ensure_archive_conversations_ready!(slug, expected_operation_id: nil, archive_mode: nil)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
+      explicit = archive_mode == 'archived' || @explicit_archive_operation_id
+      if explicit && manifest&.dig('codex', 'thread_id')
+        require_ordinary_manifest_ready!(slug, manifest)
+        root = manifest&.dig('codex', 'thread_id')
+        require_current_codex_provenance!(slug, manifest, root) if root
+        return
+      end
       unless manifest&.dig('codex', 'thread_id')
-        raise Error, "archive team has no retained root: #{slug}" if direct_team_state_present?(slug)
-        unless manifest && manifest['schema'] == 1 && %w[repositories artifacts].all? { |key| manifest[key].is_a?(Array) } &&
-               %w[codex creation forked_from].none? { |key| manifest.key?(key) }
-          raise Error, "normalized threadless tracking is required before archive: #{slug}"
+        require_threadless_archive_tracking!(slug, manifest, explicit:)
+        if explicit
+          require_threadless_archive_runtime!(slug)
+        elsif @tmux.session(slug) || @selected_authority
+          raise Error, "live runtime contradicts threadless archive: #{slug}"
         end
-        raise Error, "live runtime contradicts threadless archive: #{slug}" if @tmux.session(slug) || @selected_authority
         directory = File.dirname(tracking)
         identity = auto_archive_tracking_identity(slug, directory, nil)
         observation = auto_archive_session_observation(slug, identity, operation_id: expected_operation_id, archive_mode:)
@@ -8323,6 +8400,66 @@ module DevSession
       @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) do
         team(slug, action: 'require-archive-ready', lifecycle: true)
       end
+    end
+
+    def require_threadless_archive_tracking!(slug, manifest, explicit:)
+      raise Error, "archive team has no retained root: #{slug}" if direct_team_state_present?(slug)
+      schemas = explicit ? [1, 3] : [1]
+      unless manifest && schemas.include?(manifest['schema']) && %w[repositories artifacts].all? { |key| manifest[key].is_a?(Array) } &&
+             %w[codex creation forked_from].none? { |key| manifest.key?(key) }
+        raise Error, "normalized threadless tracking is required before archive: #{slug}"
+      end
+    end
+
+    def quiesce_explicit_archive!(slug)
+      manifest = load_portal_manifest(portal_file(slug), required: true)
+      root = manifest.dig('codex', 'thread_id')
+      unless root
+        require_threadless_archive_tracking!(slug, manifest, explicit: true)
+        return require_threadless_archive_runtime!(slug)
+      end
+
+      ensure_retirement_identity!(slug, cleanup_session(slug))
+      quiesce_native_client!(slug, cleanup_session(slug))
+      recovery_state!(slug, root, 'archive')
+      command = [*@portal_command, 'thread', 'quiesce-explicit', '--thread-id', root,
+                 '--cwd', work_dir(slug), '--socket', @codex_socket,
+                 '--workspace', workspace, '--user-state-root', @workspace_state_root]
+      @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { @command_runner.capture(command) }
+      sync_team_lifecycle!(slug, 'archive-explicit')
+    end
+
+    def require_threadless_archive_runtime!(slug)
+      selected = cleanup_session(slug)
+      if [selected&.codex_thread_id, selected&.codex_socket_path, selected&.codex_pane_id,
+          @selected_authority&.fetch('codex_thread_id', nil),
+          @selected_authority&.fetch('codex_socket_path', nil),
+          @selected_authority&.fetch('codex_pane_id', nil)].any? { |value| value && !value.empty? }
+        raise Error, "live runtime contradicts threadless archive: #{slug}"
+      end
+      return unless selected
+
+      ensure_retirement_identity!(slug, selected)
+      ensure_managed_session!(slug, session: selected)
+      validate_authority_session!(slug, selected, require_creation_identity: true)
+      unless selected.identity_token&.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "tmux session lacks a trusted creation identity: #{slug}"
+      end
+      # Keep an owned shell alive until final runtime retirement: the archive
+      # command itself may be running in that terminal.
+    end
+
+    def with_archive_terminal_retirement(slug)
+      session = cleanup_session(slug)
+      pane = @env['TMUX_PANE']
+      own_terminal = session && pane && @env['TMUX'].to_s.partition(',').first == session.socket_path &&
+                     @tmux.pane_session_id(pane) == session.id
+      previous_hup = Signal.trap('HUP', 'IGNORE') if own_terminal
+      @archive_retiring_own_terminal = own_terminal
+      yield own_terminal
+    ensure
+      @archive_retiring_own_terminal = nil
+      Signal.trap('HUP', previous_hup) if own_terminal
     end
 
     def quiesce_and_require_idle!(slug, session, archive: false, expected_operation_id: nil, archive_mode: nil)
@@ -9154,12 +9291,13 @@ module DevSession
 
     def run_archive
       opts = {
-        as_is: false, abandoned: false, portal_authorized: false,
+        as_is: false, abandoned: false, require_merged: false, portal_authorized: false,
         portal_operation_id: nil
       }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--abandoned') { opts[:abandoned] = true }
+        parser_opts.on('--require-merged') { opts[:require_merged] = true }
         parser_opts.on('--portal-authorized') { opts[:portal_authorized] = true }
         parser_opts.on('--portal-operation-id ID') { |value| opts[:portal_operation_id] = value }
       end
@@ -9179,13 +9317,13 @@ module DevSession
         warnings = if opts.fetch(:abandoned)
                      ['This explicitly discards the initiative without requiring merged feature heads.']
                    else
-                     ['Every registered feature head must already be merged into its default branch.']
+                     ['Local changes are saved for revival; owned worktrees are removed and active agents are stopped.']
                    end
         authorize_yes_no!(
           slug,
           command: 'archive',
           question: opts.fetch(:abandoned) ?
-            "Archive #{slug} as abandoned?" : "Archive completed session #{slug}?",
+            "Archive #{slug} as abandoned?" : "Archive session #{slug}?",
           warnings:
         )
       end
@@ -9194,6 +9332,7 @@ module DevSession
           slug,
           as_is: true,
           abandoned: opts.fetch(:abandoned),
+          explicit: !opts.fetch(:require_merged),
           operation_id: opts.fetch(:portal_operation_id)
         )
       end

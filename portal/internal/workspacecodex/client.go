@@ -18,10 +18,11 @@ const threadSourceKind = "vscode"
 // reusable App Server client.
 type Client struct {
 	*codex.Client
-	CodexHome         string
-	RecoveryRoot      string
-	workspace, socket string
-	archiveProof      func(context.Context, string, string, string) (ArchiveState, error)
+	CodexHome            string
+	RecoveryRoot         string
+	workspace, socket    string
+	submissionLedgerPath string
+	archiveProof         func(context.Context, string, string, string) (ArchiveState, error)
 }
 
 func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Client {
@@ -34,6 +35,7 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
 	options.AllowImplicitResume = client.allowImplicitResume
+	client.submissionLedgerPath = options.SubmissionLedgerPath
 	client.Client = codex.NewWithOptions(socket, options)
 	return client
 }

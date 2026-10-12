@@ -3798,10 +3798,16 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 		operation string
 	}{
 		{
+			name: "explicit archive", start: (*Server).startArchive,
+			body:     `{"mode":"archived"}`,
+			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
+			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
+		},
+		{
 			name: "complete archive", start: (*Server).startArchive,
 			body:     `{"mode":"complete"}`,
 			summary:  &session.Summary{Manifest: session.Manifest{Slug: "example"}, Lifecycle: "active"},
-			expected: "archive\nexample\n--as-is\n--portal-authorized\n", operation: "archive",
+			expected: "archive\nexample\n--as-is\n--portal-authorized\n--require-merged\n", operation: "archive",
 		},
 		{
 			name: "abandoned archive", start: (*Server).startArchive,

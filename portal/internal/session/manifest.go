@@ -31,7 +31,7 @@ var gitHubPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 var gitObjectPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 var rfc3339Pattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$`)
 var legacyBooleanPattern = regexp.MustCompile(`(?i)^(?:yes|no|on|off)$`)
-var lifecyclePattern = regexp.MustCompile(`\A---\r?\nlifecycle: (active|complete|abandoned)\r?\n---(?:\r?\n|\z)`)
+var lifecyclePattern = regexp.MustCompile(`\A---\r?\nlifecycle: (active|complete|abandoned|archived)\r?\n---(?:\r?\n|\z)`)
 var socketPathPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
 var clientVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
@@ -100,16 +100,17 @@ func AvailableArtifacts(summary *Summary) []Artifact {
 }
 
 type Manifest struct {
-	creationPresent bool
-	scopeExplicit   bool
-	Schema          int          `yaml:"schema" json:"schema"`
-	Slug            string       `yaml:"slug" json:"slug"`
-	ForkedFrom      string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
-	Codex           Codex        `yaml:"codex,omitempty" json:"codex"`
-	Creation        Creation     `yaml:"creation,omitempty" json:"creation"`
-	Repositories    []Repository `yaml:"repositories,omitempty" json:"repositories"`
-	Artifacts       []Artifact   `yaml:"artifacts,omitempty" json:"artifacts"`
-	FinalizedAt     string       `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
+	creationPresent    bool
+	scopeExplicit      bool
+	Schema             int          `yaml:"schema" json:"schema"`
+	Slug               string       `yaml:"slug" json:"slug"`
+	ForkedFrom         string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
+	Codex              Codex        `yaml:"codex,omitempty" json:"codex"`
+	Creation           Creation     `yaml:"creation,omitempty" json:"creation"`
+	Repositories       []Repository `yaml:"repositories,omitempty" json:"repositories"`
+	Artifacts          []Artifact   `yaml:"artifacts,omitempty" json:"artifacts"`
+	ArchiveOperationID string       `yaml:"archive_operation_id,omitempty" json:"archiveOperationId,omitempty"`
+	FinalizedAt        string       `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
 }
 
 type Summary struct {
@@ -137,7 +138,7 @@ func validSocketPath(path string) bool {
 }
 
 func (m *Manifest) Validate(expectedSlug string) error {
-	if m.Schema != 1 && m.Schema != 2 {
+	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
 	}
 	if !ValidSlug(m.Slug) {
@@ -172,7 +173,7 @@ func (m *Manifest) Validate(expectedSlug string) error {
 		!sha256Pattern.MatchString(m.Creation.TrackingStateSHA256)) {
 		return errors.New("invalid preserved tracking provenance")
 	}
-	if m.Schema == 1 && m.Creation.InitialGoalAttempted != nil {
+	if (m.Schema == 1 || m.Schema == 3) && m.Creation.InitialGoalAttempted != nil {
 		return errors.New("schema 1 must not contain an initial goal attempt marker")
 	}
 	if m.Schema == 2 && (m.Creation.State != "creating" || m.Creation.InitialGoalSent ||
@@ -227,6 +228,13 @@ func (m *Manifest) Validate(expectedSlug string) error {
 			}
 		}
 	}
+	if m.Schema == 3 {
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(m.ArchiveOperationID) || m.FinalizedAt == "" {
+			return errors.New("invalid explicit archive identity")
+		}
+	} else if m.ArchiveOperationID != "" {
+		return errors.New("archive identity requires schema 3")
+	}
 	if m.FinalizedAt != "" {
 		if !validRFC3339(m.FinalizedAt) {
 			return errors.New("invalid finalized_at: expected an RFC3339 timestamp")
@@ -235,7 +243,7 @@ func (m *Manifest) Validate(expectedSlug string) error {
 			return fmt.Errorf("invalid finalized_at: %w", err)
 		}
 		for _, repository := range m.Repositories {
-			if repository.FinalHeadSHA == "" {
+			if repository.FinalHeadSHA == "" && m.Schema != 3 {
 				return fmt.Errorf("finalized repository %q has no immutable final head", repository.Name)
 			}
 		}
@@ -389,7 +397,7 @@ func loadSummary(workspace, root, slug string, archived bool) (*Summary, error) 
 	if err != nil {
 		return nil, fmt.Errorf("validate %s/%s/plan.md: %w", root, slug, err)
 	}
-	terminal := lifecycle == "complete" || lifecycle == "abandoned"
+	terminal := lifecycle == "complete" || lifecycle == "abandoned" || lifecycle == "archived"
 	if archived && (!terminal || manifest.FinalizedAt == "") {
 		return nil, fmt.Errorf("validate %s: archived session lacks terminal lifecycle or finalization metadata", relative)
 	}
@@ -488,7 +496,7 @@ func decodeManifest(data []byte, manifest *Manifest) error {
 		return err
 	}
 	fields, _ := strictMapping(document.Content[0], []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id",
 	}, []string{"schema", "slug"})
 	manifest.creationPresent = fields["creation"] != nil
 	manifest.scopeExplicit = fields["repositories"] != nil && fields["artifacts"] != nil
@@ -506,7 +514,7 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	fields, err := strictMapping(root, []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id",
 	}, []string{"schema", "slug"})
 	if err != nil {
 		return err
@@ -515,6 +523,9 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	if err := scalarTag(fields["slug"], "!!str", "slug"); err != nil {
+		return err
+	}
+	if err := optionalString(fields, "archive_operation_id"); err != nil {
 		return err
 	}
 	if err := optionalString(fields, "forked_from"); err != nil {

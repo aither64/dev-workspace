@@ -273,7 +273,7 @@ func validateLifecycleOperation(operation lifecycleOperation) error {
 	}
 	switch operation.Kind {
 	case "archive":
-		if operation.Options.Mode != "complete" && operation.Options.Mode != "abandoned" ||
+		if operation.Options.Mode != "complete" && operation.Options.Mode != "abandoned" && operation.Options.Mode != "archived" ||
 			operation.Options.DeletedThreadID != "" {
 			return errors.New("invalid archive retry mode")
 		}

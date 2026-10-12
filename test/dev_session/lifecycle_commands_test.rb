@@ -989,7 +989,7 @@ class DevSessionTest < Minitest::Test
     assert_equal(
       [[
         '2026-06-06-demo',
-        { as_is: true, abandoned: false, operation_id: nil }
+        { as_is: true, abandoned: false, explicit: true, operation_id: nil }
       ]],
       calls
     )
@@ -1116,7 +1116,7 @@ class DevSessionTest < Minitest::Test
       assert_equal(
         [[
           '2026-06-06-demo',
-          { as_is: true, abandoned: false, operation_id: 'a' * 64 }
+          { as_is: true, abandoned: false, explicit: true, operation_id: 'a' * 64 }
         ]],
         calls
       )

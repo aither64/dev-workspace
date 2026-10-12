@@ -1,20 +1,79 @@
 # Archive cleanup and recovery
 
-Archival discovers Git-registered worktrees beneath the exact session
-group, including checkouts in containers such as `integration-targets/` and
-detached auxiliary checkouts. The canonical bare repositories and the shared
-workspace repository establish ownership. A checkout inside another checkout,
-foreign or unregistered repository, symlink, locked or prunable registration,
-unknown file, or dirty checkout blocks cleanup.
+Normal `dev-session archive` and the portal's Archive button use explicit
+archival. They write `lifecycle: archived`, which records closure without claiming
+that work was integrated or discarded. Automatic archival keeps its completion
+policy and merge proofs. `--require-merged` selects that strict policy for a
+manual command; `--abandoned` retains the discard policy.
 
-Every registered feature branch remains an obligation even after its checkout
-has been removed. Complete archival proves exact local and origin feature heads
-merged into the recorded origin default. An additional attached feature branch
-needs the same proof without an invented initial-base exception. Default-branch
-checkouts may lag the fetched default. A detached checkout must be reachable from
-that fetched default. Abandoned archival skips publication and merge proof, but
-still requires an existing shared branch, tag or origin tracking ref to retain
-each detached commit. Archival creates no rescue ref and never removes branches.
+## Explicit archival and local recovery
+
+Explicit archival stops the managed terminal client, pauses active goals,
+interrupts retained agents and their proven loaded native descendants, and saves
+queued prompts with their complete structured input in private `archived-prompts/`
+storage. Saved prompts stay held through revival; they are not automatically
+queued again. Conversations remain in Codex history. Native parent links establish
+utility ownership; sharing a working directory alone does not authorize retirement.
+Parents stop before their descendants. Discovery repeats after interruption to
+catch children spawned during shutdown, then retires children before parents.
+Threadless sessions still require proof that no conversations or retained team
+contradict their recorded ownership.
+
+A threadless session can retain its verified shell until tracking is committed.
+The capture journal exists before the full conversation absence check, so fresh
+CLI attempts and browser attempts use the same accepted operation proof. A failed
+check leaves the journal retryable and worktrees intact. Archive can finish its
+journal after closing the terminal from which it was invoked; closed-terminal
+status output does not interrupt completion.
+
+Git-registered checkouts beneath the exact session group belong to canonical bare
+repositories or the shared workspace repository. This includes nested containers
+and detached or locked checkouts. Explicit archival does not fetch, compare published heads,
+require merged work or require clean checkouts. It pins checkout heads and index
+objects under `refs/dev-session-archives/`, then saves working files and index and
+operation state in private `archived-worktrees/` storage. Staged, unstaged,
+untracked, ignored and binary contents survive. Captures are synced and checked
+against the source before forced Git removal. Branches are retained.
+
+Wrong repository ownership, symlinked checkout paths, conflicting operation
+identities and changed recovery contents still refuse destructive cleanup.
+Stop external editors and builds before archival: session locks cannot stop an
+unmanaged writer. A failed filesystem copy or removal leaves the operation
+retryable with its recovery contents retained.
+
+Explicit archival uses a schema-3 archive journal, schema-2 cleanup sidecar and
+schema-3 finalized manifest. The manifest's `archive_operation_id` selects private
+recovery without exposing local storage paths. A registration with no available
+local head stays recorded without an invented final SHA. Existing schema-2
+complete/abandoned journals keep their saved policy on retry.
+
+Revival uses a schema-4 journal for these archives. Before starting the retained
+conversation, it recreates each saved checkout and restores its files and Git
+index. An unchanged retained branch is attached again; an advanced or missing
+branch produces a detached checkout at the saved head without resetting a shared
+ref. Restoration has private intent and completion receipts and can resume after
+interruption. New manifests and journals require this capable executor; finish
+pending operations before switching packages. Older archives keep their previous
+revival behavior and do not gain worktree snapshots.
+Once a restoration completion receipt exists, retry cannot replace the checkout
+again. It removes a leftover intent when the contents still match, and refuses
+if the operator has since changed them.
+
+## Completion and abandoned cleanup
+
+Strict completion discovers the same canonical checkout inventory and requires
+clean worktrees. Every registration proves its exact local and origin feature head
+against its own `default_branch`, the integration target. One repository may have
+registrations targeting both master and a release branch. Auxiliary checkouts
+select a recorded target containing their exact head, preferring origin/HEAD when
+it is among those targets. An attached target checkout uses that target only.
+When no target is registered, origin/HEAD supplies the fallback.
+
+Additional feature branches need publication and ancestry proof without an
+invented initial-base exception. Target checkouts may lag their fetched target.
+Abandoned archival skips publication and merge proof but requires an existing
+shared branch, tag or origin tracking ref to retain detached commits. These two
+policies use non-force removal and create no recovery snapshots.
 
 Record checksums cover paths, entry types, file contents and symlink targets.
 Permission changes alone do not change the recorded content. Archival and revival
@@ -37,7 +96,7 @@ Before cleanup, the operation records checkout, Git administration, common
 repository and container identities, exact heads and selected retention refs in
 a sealed inventory. It checks that inventory, cleanliness, tracking projection
 and retained-head proof before removal and each remaining destructive phase.
-Cleanup uses non-force `git worktree remove` and `rmdir` for verified empty
+Completion and abandoned cleanup use non-force `git worktree remove` and `rmdir` for verified empty
 containers. Stop external writers first; helper locks do not serialize arbitrary
 Git commands, editors or native clients.
 
@@ -56,7 +115,7 @@ arbitrary operator Git commands.
 
 Run the same installed `dev-session archive SLUG --as-is` command again. Include
 `--abandoned` only when it matches the recorded mode. Keep both the ordinary
-schema-2 journal and its private schema-1 `SLUG.archive-cleanup.json` sidecar under
+journal and its private `SLUG.archive-cleanup.json` sidecar under
 `worktrees/.locks/`. Their immutable operation identity, root, tracking digest
 and timestamp must agree. Never remove receipts to bypass a refusal.
 
@@ -99,7 +158,7 @@ not satisfy that gate. Schema-2 journals themselves remain a supported format.
 
 ## Retained conversations and selected-executor recovery
 
-Ordinary archival verifies the exact retained root and every nonremoved member
+Strict completion and abandoned archival verify the exact retained root and every nonremoved member
 before publishing its operation, at cleanup, and at conversation retirement.
 Active same-directory discovery must match the retained set, even when the root
 is already archived. Discovery includes native subagents, exec/App Server and
@@ -201,7 +260,7 @@ Ordinary schema-1 tracking may retain the exact root without creation or goal
 metadata. It needs explicit repository and artifact lists, complete Codex
 provenance, receipt checks and current proof of the root, team, runtime authority
 and submissions. Incomplete creation evidence keeps its original recovery path.
-Archive requires an idle conversation and repeats these proofs. Revival preserves
+Strict completion and abandoned archival require an idle conversation and repeat these proofs. Revival preserves
 the exact root, absent creation metadata and unknown historical bases.
 
 Repair unresolved older tracking offline before exposing it to ordinary writers

@@ -49,7 +49,7 @@ func ObservationIdentity(workspace, slug, directory, rootThreadID string) (strin
 // field in a partial/legacy manifest. The normal manifest owner still validates
 // all repository and artifact content before this additional presence check.
 func RequireNormalizedThreadless(summary *Summary) error {
-	if summary == nil || summary.Schema != 1 || summary.Codex.ThreadID != "" {
+	if summary == nil || (summary.Schema != 1 && summary.Schema != 3) || summary.Codex.ThreadID != "" {
 		return errors.New("normalized threadless tracking is required")
 	}
 	file, err := openConfined(summary.Workspace, filepath.Join(summary.Root, summary.Slug, ManifestName), unix.O_RDONLY, 0)
@@ -99,7 +99,7 @@ func RequireRetainedReady(summary *Summary, socket string) error {
 		}
 		return nil
 	}
-	if summary.Schema != 1 || summary.ForkedFrom != "" ||
+	if (summary.Schema != 1 && summary.Schema != 3) || summary.ForkedFrom != "" ||
 		!summary.scopeExplicit && (summary.Repositories == nil || summary.Artifacts == nil) {
 		return errors.New("creation-less retained tracking requires explicit ordinary scope")
 	}
@@ -121,20 +121,53 @@ func RequireNoRuntime(ctx context.Context, workspace, slug, authorityDir, tmuxSo
 	if _, err := os.Lstat(filepath.Join(authorityDir, slug+".json")); !errors.Is(err, os.ErrNotExist) {
 		return errors.New("runtime authority contradicts threadless tracking")
 	}
+	return requireNoTmuxRuntime(ctx, slug, tmuxSocket, "")
+}
+
+// Explicit archive retains an exactly owned shell until tracking is committed.
+// This permits no conversation identity and never adopts a live terminal.
+func RequireThreadlessArchiveRuntime(ctx context.Context, workspace, slug, authorityDir, tmuxSocket string) error {
+	authority, err := LoadRuntimeAuthority(authorityDir, slug, workspace)
+	if errors.Is(err, os.ErrNotExist) {
+		return RequireNoRuntime(ctx, workspace, slug, authorityDir, tmuxSocket)
+	}
+	if err != nil {
+		return err
+	}
+	if authority.State != "ready" || authority.TmuxSocket != tmuxSocket || authority.TmuxIdentity == "" ||
+		authority.CodexThreadID != "" || authority.CodexSocketPath != "" || authority.CodexClientVersion != "" {
+		return errors.New("runtime authority contradicts threadless archive")
+	}
+	if err := authority.VerifyTmux(ctx, ""); err == nil {
+		return nil
+	}
+	// A retained authority can outlive an absent terminal. Prove both its exact
+	// id and same-name absence; an inspection failure is never absence.
+	return requireNoTmuxRuntime(ctx, slug, tmuxSocket, authority.TmuxSessionID)
+}
+
+func requireNoTmuxRuntime(ctx context.Context, slug, tmuxSocket, expectedID string) error {
+	if !ValidSlug(slug) || !validSocketPath(tmuxSocket) {
+		return errors.New("selected threadless runtime coordinates are unavailable")
+	}
 	if _, err := os.Lstat(tmuxSocket); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	output, err := exec.CommandContext(ctx, "tmux", "-S", tmuxSocket, "list-sessions", "-F", "#{session_name}").Output()
+	output, err := exec.CommandContext(ctx, "tmux", "-S", tmuxSocket, "list-sessions", "-F", "#{session_id}\t#{session_name}").Output()
 	if err != nil {
 		return errors.New("selected tmux absence cannot be verified")
 	}
 	if len(output) > 64*1024 {
 		return errors.New("selected tmux inventory is too large")
 	}
-	for _, name := range strings.Split(strings.TrimSuffix(string(output), "\n"), "\n") {
-		if name == slug {
+	for _, line := range strings.Split(strings.TrimSuffix(string(output), "\n"), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 2 || !strings.HasPrefix(fields[0], "$") || fields[1] == "" {
+			return errors.New("selected tmux inventory cannot be verified")
+		}
+		if fields[1] == slug || expectedID != "" && fields[0] == expectedID {
 			return errors.New("live tmux contradicts threadless tracking")
 		}
 	}
