@@ -102,8 +102,9 @@ An admitted operation continues if the browser disconnects. After a failed or
 lost response, check refreshed status before trying again; the portal never
 automatically repeats a mutation. Busy or unavailable status disables controls.
 
-Credential fields keep Reveal/Hide before Copy, with Copy aligned at the right
-of every row. Passwords begin hidden, and copying works while they are hidden.
+Password fields contain a Reveal/Hide icon at the right edge. Copy sits beside
+each input and aligns across rows. Passwords begin hidden, and copying works
+while they are hidden.
 Both icon controls have accessible names and keyboard support.
 
 ## Repository comparisons

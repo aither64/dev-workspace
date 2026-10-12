@@ -27,7 +27,7 @@
                 <section class="cluster-account">
                   <h4>{{.Label}}</h4>
                   {{range .Fields}}
-                  <label>{{.Label}}<div class="copy-row cluster-copy-row"><input readonly value="{{.Value}}" {{if .Secret}}type="password" autocomplete="off" data-secret-field{{end}}><span class="cluster-reveal-slot">{{if .Secret}}<button type="button" class="quiet icon-button cluster-reveal" data-reveal-secret data-secret-label="{{.Label}}" title="Reveal {{.Label}}" aria-label="Reveal {{.Label}}" aria-pressed="false"><svg data-secret-icon="reveal" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg><svg data-secret-icon="hide" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" hidden><path d="m3 3 18 18M10 5c7-2 12 7 12 7a21 21 0 0 1-3 4M6 6a23 23 0 0 0-4 6s4 7 10 7a12 12 0 0 0 5-1M10 10a3 3 0 0 0 4 4"/></svg></button>{{end}}</span>{{template "cluster-copy" .Label}}</div></label>
+                  <label>{{.Label}}<div class="copy-row cluster-copy-row">{{if .Secret}}<span class="cluster-secret-input">{{end}}<input readonly value="{{.Value}}" {{if .Secret}}type="password" autocomplete="off" data-secret-field{{end}}>{{if .Secret}}<button type="button" class="quiet icon-button cluster-reveal" data-reveal-secret data-secret-label="{{.Label}}" title="Reveal {{.Label}}" aria-label="Reveal {{.Label}}" aria-pressed="false"><svg data-secret-icon="reveal" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg><svg data-secret-icon="hide" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" hidden><path d="m3 3 18 18M10 5c7-2 12 7 12 7a21 21 0 0 1-3 4M6 6a23 23 0 0 0-4 6s4 7 10 7a12 12 0 0 0 5-1M10 10a3 3 0 0 0 4 4"/></svg></button></span>{{end}}{{template "cluster-copy" .Label}}</div></label>
                   {{end}}
                 </section>
                 {{end}}
@@ -35,7 +35,7 @@
               {{end}}
             </div>
             {{end}}
-            {{if .Commands}}<section class="cluster-commands"><h4>Connect</h4>{{range .Commands}}<label>{{.Label}}<div class="copy-row cluster-copy-row"><input readonly value="{{.Value}}"><span class="cluster-reveal-slot"></span>{{template "cluster-copy" .Label}}</div></label>{{end}}</section>{{end}}
+            {{if .Commands}}<section class="cluster-commands"><h4>Connect</h4>{{range .Commands}}<label>{{.Label}}<div class="copy-row cluster-copy-row"><input readonly value="{{.Value}}">{{template "cluster-copy" .Label}}</div></label>{{end}}</section>{{end}}
           </article>
         {{else}}<p class="empty">No development cluster state for this session.</p>{{end}}
         </div>

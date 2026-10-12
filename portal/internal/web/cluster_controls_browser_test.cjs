@@ -57,17 +57,46 @@ const baseURL = process.argv[2];
       await expect(card.locator(".copy-feedback").first()).toHaveText("Could not copy Login");
       await expect(card.getByRole("button", {name: "Copy Login", exact: true}).first().locator("svg")).toHaveCount(1);
       await page.evaluate(() => { window.failCopy = false; });
+      const longSecret = "fixture-secret-".repeat(20);
+      await password.evaluate((input, value) => { input.value = value; }, longSecret);
       for (const width of [1280, 375]) {
         await page.setViewportSize({width, height: 850});
         const loginCopy = await card.getByRole("button", {name: "Copy Login", exact: true}).first().boundingBox();
         const secretCopy = await card.getByRole("button", {name: "Copy Password", exact: true}).boundingBox();
         assert(Math.abs(loginCopy.x - secretCopy.x) < 1, "copy buttons are misaligned");
         assert(secretCopy.x + secretCopy.width <= width, "credential controls overflow");
+        const loginInput = await card.locator('.cluster-account input:not([data-secret-field])').first().boundingBox();
+        const secretInput = await password.boundingBox();
+        assert(Math.abs(loginInput.x + loginInput.width - secretInput.x - secretInput.width) < 1, "input edges are misaligned");
+        for (const row of await card.locator('.cluster-copy-row:visible').all()) {
+          const inputBounds = await row.locator('input').boundingBox();
+          const copyBounds = await row.locator('[data-copy]').boundingBox();
+          const gap = await row.evaluate(element => parseFloat(getComputedStyle(element).columnGap));
+          assert(Math.abs(copyBounds.x - inputBounds.x - inputBounds.width - gap) < 1, "empty space before Copy");
+        }
+        for (const type of ["password", "text"]) {
+          if (await password.getAttribute("type") !== type) await card.locator('[data-reveal-secret]').click();
+          const eye = await card.locator('[data-reveal-secret]').boundingBox();
+          assert(eye.x >= secretInput.x && eye.x + eye.width <= secretInput.x + secretInput.width, "Reveal is outside the input");
+          assert(eye.y >= secretInput.y && eye.y + eye.height <= secretInput.y + secretInput.height, "Reveal overflows vertically");
+          const padding = await password.evaluate(input => parseFloat(getComputedStyle(input).paddingRight));
+          assert(secretInput.x + secretInput.width - padding < eye.x, "credential text overlaps Reveal");
+        }
         assert(await card.locator(".cluster-actions").evaluate(element => {
           const bounds = element.getBoundingClientRect();
           return bounds.left >= 0 && bounds.right <= innerWidth;
         }), "toolbar overflows");
       }
+      await card.locator('[data-reveal-secret]').click();
+      await expect(password).toHaveAttribute("type", "password");
+      await password.focus(); await page.keyboard.press("Tab");
+      await expect(card.locator('[data-reveal-secret]')).toBeFocused();
+      await page.keyboard.press("Space");
+      await expect(password).toHaveAttribute("type", "text");
+      await page.keyboard.press("Tab");
+      await expect(card.getByRole("button", {name: "Copy Password", exact: true})).toBeFocused();
+      await card.getByRole("button", {name: "Copy Password", exact: true}).click();
+      assert.deepEqual(await page.evaluate(() => window.copiedValues), ["fixture-secret", longSecret]);
       await page.setViewportSize({width: 1280, height: 850});
       await card.getByRole("tab", {name: "Database", exact: true}).click();
       await card.getByRole("button", {name: "Stop", exact: true}).click();
