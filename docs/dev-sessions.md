@@ -274,7 +274,9 @@ creation markers retain their meaning.
 Keep the current summary easy to scan. Summarize superseded checkpoints and link
 detailed commands, failures, and review evidence. Link project documentation
 from the session instead of copying it. Register useful session files as portal
-artifacts using the existing manifest format. Repository documents stay in their
+artifacts with `dev-session artifact add SLUG PATH --label "Caption" --as-is`.
+Use this validated command instead of editing the artifact YAML by hand.
+Repository documents stay in their
 repositories and can be linked from the plan or state.
 
 Before review, reconcile the documentation with the final code, tests, and

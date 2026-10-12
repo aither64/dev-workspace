@@ -67,6 +67,17 @@ relative path, using the first declaration's label and position. For example,
 must still have a nonempty label and a safe relative path. Browsing and validation
 leave the manifest unchanged.
 
+Use `dev-session artifact add SLUG report.json --label "Report" --as-is` to
+register a file or update its caption. The command validates the complete
+manifest and replaces it atomically under the session locks. It refuses pending
+creation or lifecycle operations and detects a concurrent edit before replacement.
+It preserves repository and conversation metadata and does not create a session.
+
+Artifact readers also accept `name` as a caption when `label` is absent or blank.
+A nonempty `label` takes precedence. Writers use only `label`. Both spellings
+retain the same string and path validation; an alias cannot authorize files
+outside the tracking directory.
+
 Untracked repository files, Git metadata, symlinks and other host files are not
 available. Text previews are limited to 512 KiB and 12,000 lines. Markdown files
 appear as source; binary files receive a notice instead of a text preview.

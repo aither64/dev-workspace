@@ -21,6 +21,7 @@ require_relative 'workspace-archive-recovery'
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
   AGENT_TEAM_BINDING_PATTERN = /\Av1\.[A-Za-z0-9_-]+\.([0-9a-f]{64})\z/
+  BLANK_ARTIFACT_CAPTION = /\A\p{Space}*\z/
 
   # JSON accepts duplicate object keys by default and keeps the last value.
   # Durable managed-creation authorities must reject that ambiguity at every
@@ -219,6 +220,7 @@ module DevSession
       dev-session worktree remove <name-or-slug> <name> [--as-is] [--force]
       dev-session worktree capture-comparison <name-or-slug> <name> [--as-is]
         [--base SHA --head SHA]
+      dev-session artifact add <name-or-slug> <path> --label TEXT [--as-is]
       dev-session team list <name-or-slug> [--as-is]
 	  dev-session team preset <name-or-slug> <package-team-id> [--as-is]
         [--model MODEL] [--effort EFFORT]
@@ -2399,6 +2401,40 @@ module DevSession
       value
     end
 
+    def artifact_add(input, path, label:, as_is:)
+      slug = build_slug(input, as_is:)
+      unless path.is_a?(String) && label.is_a?(String) && !label.match?(BLANK_ARTIFACT_CAPTION)
+        raise Error, 'artifact requires a path and nonempty label'
+      end
+      clean = Pathname.new(path).cleanpath.to_s
+      if %w[plan.md state.md].include?(clean)
+        raise Error, 'plan.md and state.md are built-in artifacts'
+      end
+
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          select_tmux_for_slug!(slug)
+          reject_conflicting_lifecycle_journal!(slug)
+          if path_exists?(creation_journal_file(slug))
+            raise Error, "session creation is unfinished: #{slug}; retry dev-session start"
+          end
+          validate_work_directory!(slug)
+          source = read_bounded_file(portal_file(slug), 'portal manifest', max_size: PORTAL_MANIFEST_MAX_SIZE)
+          manifest = load_portal_manifest(portal_file(slug), required: true)
+          require_ordinary_manifest_ready!(slug, manifest)
+          artifacts = manifest['artifacts'] ||= []
+          existing = artifacts.find { |item| Pathname.new(item.fetch('path')).cleanpath.to_s == clean }
+          if existing
+            existing['label'] = label
+          else
+            artifacts << { 'label' => label, 'path' => path }
+          end
+          write_portal_manifest(slug, manifest, expected_contents: source)
+        end
+      end
+      @out.puts "Registered artifact #{path}"
+    end
+
     def worktree_add(input, project, as_is:, name:, branch:, base:, fetch:)
       slug = build_slug(input, as_is:)
       validate_part!(project, 'project')
@@ -4402,10 +4438,14 @@ module DevSession
       raise Error, "cannot read #{label}: #{e.message}"
     end
 
-    def write_portal_manifest(slug, manifest)
+    def write_portal_manifest(slug, manifest, expected_contents: nil)
       path = portal_file(slug)
       validate_work_directory!(slug)
       validate_portal_manifest!(manifest, slug, path)
+      data = YAML.dump(manifest)
+      if data.bytesize > PORTAL_MANIFEST_MAX_SIZE
+        raise Error, "portal manifest exceeds #{PORTAL_MANIFEST_MAX_SIZE / (1024 * 1024)} MiB: #{path}"
+      end
       raise Error, "portal manifest is a symlink: #{path}" if File.symlink?(path)
       if path_exists?(path) && !File.file?(path)
         raise Error, "portal manifest is not a file: #{path}"
@@ -4416,9 +4456,12 @@ module DevSession
 
       begin
         File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
-          file.write(YAML.dump(manifest))
+          file.write(data)
           file.flush
           file.fsync
+        end
+        if expected_contents && read_bounded_file(path, 'portal manifest', max_size: PORTAL_MANIFEST_MAX_SIZE) != expected_contents
+          raise Error, "portal manifest changed during artifact registration: #{slug}; retry"
         end
         File.rename(temporary, path)
         fsync_directory(File.dirname(path))
@@ -4548,8 +4591,17 @@ module DevSession
       end
 
       artifacts.each do |artifact|
+        if artifact.is_a?(Hash) && artifact.key?('name')
+          unless artifact['name'].is_a?(String)
+            raise Error, "invalid portal artifact name in #{path}"
+          end
+          if !artifact.key?('label') || artifact['label'].is_a?(String) && artifact['label'].match?(BLANK_ARTIFACT_CAPTION)
+            artifact['label'] = artifact['name']
+          end
+          artifact.delete('name')
+        end
         unless artifact.is_a?(Hash) && artifact['label'].is_a?(String) &&
-               !artifact['label'].strip.empty? && artifact['path'].is_a?(String)
+               !artifact['label'].match?(BLANK_ARTIFACT_CAPTION) && artifact['path'].is_a?(String)
           raise Error, "invalid portal artifact in #{path}"
         end
         validate_mapping_keys!(artifact, %w[label path], 'portal artifact', path)
@@ -8825,6 +8877,8 @@ module DevSession
         run_url
       when 'worktree'
         run_worktree
+      when 'artifact'
+        run_artifact
       when 'team'
         run_team
       else
@@ -9459,6 +9513,20 @@ module DevSession
           operation_id: opts.fetch(:portal_operation_id)
         )
       end
+    end
+
+    def run_artifact
+      raise Error, 'artifact requires add' unless @argv.shift == 'add'
+
+      opts = { as_is: false, label: nil }
+      OptionParser.new do |parser|
+        parser.on('--as-is') { opts[:as_is] = true }
+        parser.on('--label TEXT') { |value| opts[:label] = value }
+      end.parse!(@argv)
+      require_arity!(2, @argv, 'artifact add')
+      raise Error, 'artifact add requires --label' unless opts[:label]
+
+      runner.artifact_add(@argv.fetch(0), @argv.fetch(1), **opts)
     end
 
     def run_worktree

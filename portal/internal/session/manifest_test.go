@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const fixtureSlug = "2026-09-03-example"
@@ -650,5 +652,31 @@ func TestOrdinaryRetainedReadinessDistinguishesAbsentAndPresentCreation(t *testi
 		if err := RequireRetainedReady(&Summary{Manifest: manifest}, "/run/codex.sock"); err == nil {
 			t.Fatalf("incomplete creation-less scope or tuple accepted: %q", bad)
 		}
+	}
+}
+
+func TestArtifactNameCaptionIsReadAndWrittenCanonically(t *testing.T) {
+	data, err := os.ReadFile("../../../test/fixtures/portal-manifest-valid-artifact-names.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := decodeManifest(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.Validate(fixtureSlug); err != nil {
+		t.Fatal(err)
+	}
+	for index, label := range []string{"Report", "Canonical caption", "Fallback caption", "Unicode fallback caption"} {
+		if manifest.Artifacts[index].Label != label {
+			t.Fatalf("artifact %d label = %q", index, manifest.Artifacts[index].Label)
+		}
+	}
+	encoded, err := yaml.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "name:") {
+		t.Fatalf("noncanonical artifact: %s", encoded)
 	}
 }

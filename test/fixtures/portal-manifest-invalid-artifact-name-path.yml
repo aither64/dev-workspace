@@ -1,0 +1,6 @@
+schema: 1
+slug: 2026-09-03-example
+repositories: []
+artifacts:
+  - name: Report
+    path: ../secret.json

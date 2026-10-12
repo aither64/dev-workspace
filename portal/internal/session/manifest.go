@@ -73,6 +73,22 @@ type Artifact struct {
 	Path  string `yaml:"path" json:"path"`
 }
 
+func (a *Artifact) UnmarshalYAML(node *yaml.Node) error {
+	var value struct {
+		Label string `yaml:"label"`
+		Name  string `yaml:"name"`
+		Path  string `yaml:"path"`
+	}
+	if err := node.Decode(&value); err != nil {
+		return err
+	}
+	a.Label, a.Path = value.Label, value.Path
+	if strings.TrimSpace(a.Label) == "" {
+		a.Label = value.Name
+	}
+	return nil
+}
+
 var builtInArtifacts = []Artifact{
 	{Label: "Plan", Path: "plan.md"},
 	{Label: "State", Path: "state.md"},
@@ -615,11 +631,14 @@ func validateManifestNode(root *yaml.Node) error {
 			return errors.New("artifacts must be a sequence")
 		}
 		for index, artifact := range node.Content {
-			items, err := strictMapping(artifact, []string{"label", "path"}, []string{"label", "path"})
+			items, err := strictMapping(artifact, []string{"label", "name", "path"}, []string{"path"})
 			if err != nil {
 				return fmt.Errorf("artifact %d: %w", index, err)
 			}
-			for _, key := range []string{"label", "path"} {
+			if items["label"] == nil && items["name"] == nil {
+				return fmt.Errorf("artifact %d: missing field %q", index, "label")
+			}
+			for _, key := range []string{"label", "name", "path"} {
 				if err := optionalString(items, key); err != nil {
 					return fmt.Errorf("artifact %d: %w", index, err)
 				}

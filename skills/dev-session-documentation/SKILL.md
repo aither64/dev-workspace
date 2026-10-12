@@ -24,6 +24,11 @@ link new material from the project's README or documentation index. Add a short
 pointer in repository instructions when agents would otherwise miss that entry
 point.
 
+Register useful session artifacts with
+`dev-session artifact add SLUG PATH --label "Caption" --as-is`. Use the validated
+atomic writer instead of editing `portal.yml` by hand; it preserves session
+identity and repository scope while updating the artifact catalog.
+
 ## Choose the smallest useful explanation
 
 Use judgment about the change rather than creating a fixed set of files:
