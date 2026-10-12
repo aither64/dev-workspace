@@ -261,8 +261,8 @@ func (o *limitedActivityObserver) ReadActivity(ctx context.Context, thread strin
 }
 
 func TestActivityMonitorBoundsStartupAndBrowserReads(t *testing.T) {
-	s := newTestServer(t)
-	defer s.Close()
+	// Slot fairness does not depend on snapshot fsync latency.
+	s := &Server{config: Config{Workspace: t.TempDir()}}
 	const workers = 40
 	observer := &limitedActivityObserver{
 		testActivityObserver: testActivityObserver{stopped: make(chan string, workers)},
