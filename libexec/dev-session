@@ -14,6 +14,7 @@ require 'tempfile'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-provider-admission'
 require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
 require_relative 'workspace-archive-recovery'
@@ -7603,7 +7604,7 @@ module DevSession
 
         if launch_codex
           command = if codex_provenance_configured?
-                      @codex_command_argv.map(&:shellescape).join(' ')
+                      (@codex_command_argv + native_provider_arguments).map(&:shellescape).join(' ')
                     else
                       @codex_command.dup
                     end
@@ -8544,6 +8545,7 @@ module DevSession
         raise Error,
               "managed Codex pane for #{slug} is running unexpected command #{current.inspect}"
       end
+      WorkspaceProviderAdmission.record_terminal!(@env, workspace, session, session.socket_path)
       @tmux.run(
         'respawn-pane', '-k', '-t', session.codex_pane_id,
         '-c', path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug),
@@ -8632,11 +8634,31 @@ module DevSession
     end
 
     def send_native_client_command(session)
-      command = @codex_command_argv.map(&:shellescape).join(' ')
+      command = (@codex_command_argv + native_provider_arguments).map(&:shellescape).join(' ')
       remote = "unix://#{session.codex_socket_path}"
       command = "#{command} --remote #{remote.shellescape} resume #{session.codex_thread_id.shellescape}"
       @tmux.run('send-keys', '-t', session.codex_pane_id, '-l', command)
       @tmux.run('send-keys', '-t', session.codex_pane_id, 'Enter')
+    end
+
+    def native_provider_arguments
+      name = @env['DEV_WORKSPACE_NAME']
+      return [] unless name
+      catalog = @env.fetch('DEV_WORKSPACES_CODEX_PROVIDERS', '/etc/dev-workspaces/codex-providers.json')
+      state = File.join(@workspace_state_root, 'providers', name, 'state.json')
+      return [] unless File.exist?(catalog) || File.exist?(state)
+      output = @runner.capture(
+        [File.join(@host_profile, 'bin/workspace-host'), 'provider', 'native-args', name], env: @env
+      )
+      raise Error, 'provider native arguments exceed bounds' if output.bytesize > 256 * 1024
+      data = JSON.parse(output)
+      unless data.is_a?(Hash) && data.keys == ['argv'] && data['argv'].is_a?(Array) &&
+             data['argv'].length.even? && data['argv'].each_slice(2).all? { |flag, value| flag == '-c' && value.is_a?(String) && value.bytesize <= 8192 }
+        raise Error, 'invalid provider native arguments'
+      end
+      data.fetch('argv')
+    rescue JSON::ParserError
+      raise Error, 'invalid provider native arguments'
     end
 
     def update_native_client_version!(slug, session)
@@ -8810,6 +8832,9 @@ module DevSession
       command = @argv.shift
       raise Error, USAGE unless command
 
+      @provider_read_only = %w[current list url validate quiesce].include?(command) ||
+                            (command == 'team' && @argv.first == 'list')
+
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
         read_only = %w[current list url validate].include?(command) ||
                     (command == 'team' && @argv.first == 'list')
@@ -8916,6 +8941,11 @@ module DevSession
     end
 
     def validate_host_generation!
+      begin
+        WorkspaceProviderAdmission.require!(@env, @workspace, @codex_socket) unless @provider_read_only
+      rescue StandardError => e
+        raise Error, e.message
+      end
       return unless @host_profile || @expected_host_generation || @expected_host_profile_token
       unless @host_profile && @expected_host_generation && @expected_host_profile_token &&
              @expected_host_profile_token.match?(/\A[0-9a-f]{64}\z/) &&

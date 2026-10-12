@@ -970,6 +970,10 @@
           try {
             const value = await request("/api/codex-limits", {signal: read.abort.signal});
             if (read.generation !== generation || read.abort.signal.aborted) return;
+            if (options.acceptSnapshot && !options.acceptSnapshot(value)) {
+              snapshot = null; render(null, false); options.onMismatch?.();
+              throw new Error("Active provider changed. Refreshing limits.");
+            }
             snapshot = value; lastSuccessAt = now(); retryDelay = options.retryInitialMs || 2000;
             render(snapshot, false);
           } catch (error) {
@@ -987,7 +991,10 @@
         })();
         return read.promise;
       },
-      invalidate() { ++generation; lastSuccessAt = -Infinity; },
+      invalidate({clearSnapshot = false} = {}) {
+        ++generation; lastSuccessAt = -Infinity;
+        if (clearSnapshot) {snapshot = null; render(null, false);}
+      },
       pause() { ++generation; pending?.abort.abort(); clearTimeout(retryTimer); retryTimer = null; },
     };
     return reader;
@@ -1215,14 +1222,15 @@
     const dialog = document.getElementById("codex-limits-dialog");
     const details = dialog.querySelector("[data-account-limits]");
     const resetStatus = dialog.querySelector("[data-reset-status]");
-    let limitsSnapshot = null, resetAction = null, limits = null, limitsLeaving = false;
+    let limitsSnapshot = null, resetAction = null, limits = null, limitsLeaving = false, providers = null;
+    let providerBusy = false, providerAttempt = null, observedActiveProvider = "";
     const creditFormatter = new Intl.NumberFormat(undefined, {maximumFractionDigits: 0});
     const formatCreditBalance = balance => {
       if (balance == null || String(balance).trim() === "") return null;
       const value = Number(balance);
       return Number.isFinite(value) ? creditFormatter.format(value) : null;
     };
-    const openDetails = () => { renderAccountDetails(); dialog.showModal(); void limits?.refresh(); };
+    const openDetails = () => { renderAccountDetails(); dialog.showModal(); void limits?.refresh(); void providers?.refresh(); };
     limitsPanel.querySelector("[data-limits-details]").addEventListener("click", openDetails);
     dialog.querySelector("[data-limits-close]").addEventListener("click", () => dialog.close());
     toggle.removeAttribute("popovertarget");
@@ -1246,21 +1254,42 @@
     };
     const renderAccountDetails = () => {
       details.replaceChildren();
-      const snapshot = limitsSnapshot;
+      const preview = providers?.state();
+      const snapshot = preview?.catalog ? preview.snapshot : limitsSnapshot;
       const line = text => { const p = document.createElement("p"); p.textContent = text; details.append(p); };
       if (!snapshot) { line("Account details are unavailable."); return; }
+      if (preview?.failed) line(`Update failed. Last updated ${new Date(snapshot.updatedAt).toLocaleString()}.`);
       renderLimitWindows(details, snapshot.windows || []);
+      if (snapshot.metrics) {
+        const quotaRows = (title, rows) => {
+          line(title);
+          if (!rows?.length) { line("Quota details were not reported."); return; }
+          for (const row of rows) {
+            const scope = row.model_filter ? ` · ${row.model_filter}` : "";
+            line(`${row.limit_type} · ${row.limit_window}${scope}: ${creditFormatter.format(row.remaining_value)} of ${creditFormatter.format(row.max_value)} remaining`);
+            if (row.reset_at) line(`Resets ${new Date(row.reset_at).toLocaleString()}`);
+          }
+        };
+        quotaRows("API-key quotas", snapshot.metrics.keyQuotas);
+        quotaRows("Upstream pool quotas", snapshot.metrics.upstreamQuotas);
+        if (snapshot.metrics.requests != null) line(`Reported requests: ${creditFormatter.format(snapshot.metrics.requests)}`);
+        if (snapshot.metrics.tokens != null) line(`Reported tokens: ${creditFormatter.format(snapshot.metrics.tokens)}`);
+        if (snapshot.metrics.costUSD != null) line(`Reported estimated cost: $${snapshot.metrics.costUSD.toFixed(2)}`);
+        line(`Updated ${new Date(snapshot.updatedAt).toLocaleString()}`); return;
+      }
       const credits = snapshot.credits;
       if (credits) line(credits.unlimited ? "Unlimited credits" : `Credits: ${formatCreditBalance(credits.balance) ?? (credits.hasCredits ? "Available" : "0")}`);
       else line("Credits were not reported.");
       const resets = snapshot.rateLimitResetCredits;
       line(resets ? `Banked resets: ${resets.availableCount}` : "Banked resets were not reported.");
       const state = resetAction?.state();
-      const blocked = !snapshot.canReset || !snapshot.accountScope || !state || state.busy || state.unavailable || Boolean(state.pending);
+      const canReset = snapshot.canReset && (!preview?.catalog ||
+        snapshot.provider?.id === preview.catalog.active && !["applying", "recovery-required"].includes(preview.catalog.operation?.phase));
+      const blocked = !canReset || !snapshot.accountScope || !state || state.busy || state.unavailable || Boolean(state.pending);
       if (state?.pending) {
         line("A saved reset attempt has an unconfirmed outcome. Resolve it before using another reset.");
         const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "Retry saved attempt";
-        retry.disabled = state.busy || state.unavailable || state.pending.accountScope !== snapshot.accountScope;
+        retry.disabled = !canReset || state.busy || state.unavailable || state.pending.accountScope !== snapshot.accountScope;
         retry.addEventListener("click", async () => { try { resetFeedback(await resetAction.retry()); } catch (error) { resetStatus.textContent = error.message; } });
         details.append(retry);
         if (state.pending.accountScope !== snapshot.accountScope) line("The saved attempt belongs to a different Codex account.");
@@ -1332,6 +1361,9 @@
       return summaries;
     };
     const renderLimits = (snapshot, failed) => {
+      const catalog = providers?.state().catalog;
+      const activeLabel = catalog?.providers.find(provider => provider.id === catalog.active)?.label;
+      limitsPanel.querySelector("[data-limits-provider]").textContent = snapshot?.provider?.label || activeLabel || "";
       content.replaceChildren();
       const windows = snapshot?.windows || [];
       const summaries = renderLimitWindows(content, windows);
@@ -1350,6 +1382,9 @@
       const credits = snapshot?.credits;
       const resets = snapshot?.rateLimitResetCredits;
       const extra = [];
+      for (const quota of snapshot?.metrics?.keyQuotas || []) {
+        extra.push(`${creditFormatter.format(quota.remaining_value)} ${quota.limit_type} remaining · ${quota.limit_window}${quota.model_filter ? ` · ${quota.model_filter}` : ""}`);
+      }
       if (credits?.unlimited) extra.push("Unlimited credits");
       else if (credits?.hasCredits) {
         const balance = formatCreditBalance(credits.balance);
@@ -1372,7 +1407,7 @@
       compactValue.textContent = compactWindow ? `${Math.max(0, Math.min(100, 100 - compactWindow.usedPercent))}%` : "?";
       toggle.dataset.stale = String(failed);
       const summary = summaries.length ? summaries.join(". ") : content.textContent;
-      toggle.title = `Codex limits. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
+      toggle.title = `Codex limits${snapshot?.provider?.label || activeLabel ? ` · ${snapshot?.provider?.label || activeLabel}` : ""}. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
       toggle.setAttribute("aria-label", toggle.title);
     };
     const notice = conversationAssets.createRefreshNotice({render: state => {
@@ -1388,7 +1423,9 @@
       else { limitsSnapshot = snapshot; notice.success(); }
     }, {freshnessMs: refreshPolicy.limitsMs, deadlineMs: refreshPolicy.limitsDeadlineMs,
       retryInitialMs: refreshPolicy.retryInitialMs, retryMaxMs: refreshPolicy.retryMaxMs,
-      isVisible: () => !document.hidden, onStart: () => notice.begin()});
+      isVisible: () => !document.hidden, onStart: () => notice.begin(),
+      acceptSnapshot: snapshot => !observedActiveProvider || snapshot?.provider?.id === observedActiveProvider,
+      onMismatch: () => {void providers?.refresh();}});
     const {createResetCreditAction} = await import("/static/reset-credits.js?v=1");
     let resetStorage = null;
     try { resetStorage = localStorage; } catch (_) {}
@@ -1405,6 +1442,51 @@
     resetAction = createResetCreditAction({request, store, withLock,
       confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
       refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
+    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=1");
+    const providerControls = dialog.querySelector("[data-provider-controls]");
+    const providerSelect = dialog.querySelector("[data-provider-select]");
+    const switchProvider = dialog.querySelector("[data-provider-switch]");
+    const cancelProvider = dialog.querySelector("[data-provider-cancel]");
+    const providerStatus = dialog.querySelector("[data-provider-status]");
+    providers = createProviderPreview({request, onChange: preview => {
+      const catalog = preview.catalog;
+      if (!catalog) return;
+      providerControls.hidden = false;
+      if (JSON.stringify([...providerSelect.options].map(option => [option.value, option.textContent])) !== JSON.stringify(catalog.providers.map(provider => [provider.id, provider.label]))) {
+        providerSelect.replaceChildren(...catalog.providers.map(provider => {const option = document.createElement("option"); option.value = provider.id; option.textContent = provider.label; return option;}));
+      }
+      providerSelect.value = preview.selected;
+      const active = catalog.providers.find(provider => provider.id === catalog.active);
+      dialog.querySelector("[data-provider-active]").textContent = `Active provider: ${active.label}`;
+      const pending = ["waiting", "applying", "recovery-required"].includes(catalog.operation?.phase);
+      switchProvider.disabled = providerBusy || pending || !preview.selected || preview.selected === catalog.active;
+      cancelProvider.hidden = catalog.operation?.phase !== "waiting";
+      cancelProvider.disabled = providerBusy;
+      providerStatus.textContent = providerOperationText(catalog.operation, catalog.providers);
+      if (providerAttempt && (catalog.operation?.id === providerAttempt.id || catalog.active === providerAttempt.target)) providerAttempt = null;
+      const activeChanged = observedActiveProvider && observedActiveProvider !== catalog.active;
+      observedActiveProvider = catalog.active;
+      if (activeChanged || (limitsSnapshot?.provider && limitsSnapshot.provider.id !== catalog.active)) {
+        limits.invalidate({clearSnapshot:true}); void limits.refresh(true);
+      }
+      renderAccountDetails();
+    }});
+    providerSelect.addEventListener("change", () => providers.select(providerSelect.value));
+    const providerMutation = async cancel => {
+      if (providerBusy) return;
+      const preview = providers.state();
+      if (!cancel && (!providerAttempt || providerAttempt.target !== preview.selected)) providerAttempt = {id: crypto.randomUUID(), target: preview.selected};
+      providerBusy = true; switchProvider.disabled = true; cancelProvider.disabled = true;
+      try {
+        await request(`/api/codex-providers/${cancel ? "cancel" : "switch"}`, {method:"POST", body:JSON.stringify(cancel ? {operationId:preview.catalog.operation.id} : {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id})});
+      } catch (error) {providerStatus.textContent = error.message;}
+      finally {providerBusy = false; await providers.refresh();}
+    };
+    switchProvider.addEventListener("click", () => {void providerMutation(false);});
+    cancelProvider.addEventListener("click", () => {void providerMutation(true);});
+    void providers.refresh();
+    const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !limitsLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 5000);
+    globalThis.addEventListener("pagehide", event => {if (!event.persisted) {globalThis.clearInterval(providerPoll); providers.stop();}});
     globalThis.addEventListener("storage", event => {
       if (event.key === resetStorageKey || event.key === null) resetAction.reload();
     });

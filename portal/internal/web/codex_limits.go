@@ -5,19 +5,24 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"golang.org/x/sys/unix"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 )
 
 type codexLimitsSnapshot struct {
-	Windows      []codex.RateLimitWindow      `json:"windows"`
-	UpdatedAt    time.Time                    `json:"updatedAt"`
-	Credits      *codex.CreditsSnapshot       `json:"credits,omitempty"`
-	ResetCredits *codex.RateLimitResetCredits `json:"rateLimitResetCredits,omitempty"`
-	AccountScope string                       `json:"accountScope,omitempty"`
-	CanReset     bool                         `json:"canReset"`
+	Provider     codexproviders.PublicProvider `json:"provider"`
+	Metrics      *codexproviders.Metrics       `json:"metrics,omitempty"`
+	Windows      []codex.RateLimitWindow       `json:"windows"`
+	UpdatedAt    time.Time                     `json:"updatedAt"`
+	Credits      *codex.CreditsSnapshot        `json:"credits,omitempty"`
+	ResetCredits *codex.RateLimitResetCredits  `json:"rateLimitResetCredits,omitempty"`
+	AccountScope string                        `json:"accountScope,omitempty"`
+	CanReset     bool                          `json:"canReset"`
 }
 
 type codexLimitsCall struct {
@@ -28,7 +33,11 @@ type codexLimitsCall struct {
 
 func (s *Server) codexLimits(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	result, err := s.loadCodexLimits(r.Context())
+	if len(r.URL.Query()["provider"]) > 1 {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid provider"})
+		return
+	}
+	result, err := s.loadProviderLimits(r.Context(), r.URL.Query().Get("provider"))
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Limits unavailable"})
 		return
@@ -112,6 +121,32 @@ func (s *Server) invalidateCodexLimits() {
 }
 
 func (s *Server) consumeCodexReset(w http.ResponseWriter, r *http.Request) {
+	_, unlock, err := s.acquireTransitionContext(r.Context(), unix.LOCK_SH)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Workspace runtime is changing"})
+		return
+	}
+	defer unlock()
+	if s.config.HostProfile != "" {
+		err = s.requireCurrentHostProfile()
+	} else {
+		err = s.requireProviderAdmission()
+	}
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Provider state unavailable"})
+		return
+	}
+	catalog, state, providerErr := s.providerState()
+	if providerErr == nil {
+		provider, _ := catalog.Find(state.Active)
+		if provider.Kind != "subscription" || state.Operation.Reserved() {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Resets require the active subscription provider"})
+			return
+		}
+	} else if !errors.Is(providerErr, os.ErrNotExist) {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Provider state unavailable"})
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var body struct {
 		IdempotencyKey string `json:"idempotencyKey"`

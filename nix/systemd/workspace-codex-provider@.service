@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex provider switch and recovery for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-provider-worker %i
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

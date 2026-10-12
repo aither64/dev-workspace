@@ -244,6 +244,8 @@ buildGoModule {
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
+    node --check internal/web/static/codex-providers.js
+    node --test internal/web/codex_providers_browser_test.cjs
     node --check internal/web/static/repository-review.js
     node --check internal/web/static/source-file.js
     node --check internal/web/static/review-editor.js
@@ -266,6 +268,12 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
+    install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
+      "$out/libexec/workspace-codex-providers.rb"
+    install -Dm644 ${src}/libexec/workspace-provider-admission.rb \
+      "$out/libexec/workspace-provider-admission.rb"
+    ln -s ../workspace-provider-admission.rb \
+      "$out/libexec/workspace-portal/workspace-provider-admission.rb"
     ln -s ../workspace-profile-identity.rb \
       "$out/libexec/workspace-portal/workspace-profile-identity.rb"
     install -Dm644 ${src}/libexec/workspace-auto-archive.rb \

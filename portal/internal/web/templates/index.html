@@ -110,10 +110,22 @@
   </button>
   <div id="codex-limits-panel" class="codex-limits-panel">
     <div class="limits-heading"><h2>Codex limits</h2><button type="button" class="quiet icon-button" data-limits-details title="Account details" aria-label="Account details" aria-haspopup="dialog" aria-controls="codex-limits-dialog"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v1"/></svg></button></div>
-    <div data-limits-content></div>
+    <p data-limits-provider class="muted"></p><div data-limits-content></div>
   </div>
 </section>
-<dialog id="codex-limits-dialog" aria-labelledby="codex-limits-title"><div class="section-heading"><h2 id="codex-limits-title">Codex limits</h2><button type="button" class="quiet" data-limits-close>Close</button></div><div data-account-limits></div><p data-reset-status role="status"></p></dialog>
+<dialog id="codex-limits-dialog" aria-labelledby="codex-limits-title">
+  <div class="section-heading"><h2 id="codex-limits-title">Codex limits</h2><button type="button" class="quiet" data-limits-close>Close</button></div>
+  <div data-provider-controls hidden>
+    <label for="codex-provider-preview">Preview provider limits</label>
+    <select id="codex-provider-preview" data-provider-select></select>
+    <p data-provider-active class="muted"></p>
+    <p>Switching changes the provider for every thread in this workspace. It waits until all threads are idle.</p>
+    <button type="button" data-provider-switch>Switch to this provider</button>
+    <button type="button" data-provider-cancel hidden>Cancel waiting switch</button>
+    <p data-provider-status role="status"></p>
+  </div>
+  <div data-account-limits></div><p data-reset-status role="status"></p>
+</dialog>
 {{end}}
 
 {{define "session-card"}}

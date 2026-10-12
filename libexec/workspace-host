@@ -13,6 +13,7 @@ require 'tmpdir'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-codex-providers'
 
 module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
@@ -363,6 +364,7 @@ module DevWorkspaceHost
   end
 
   class Host
+    include CodexProviderHost
     def initialize(env: ENV, out: $stdout, err: $stderr)
       @env = env
       @out = out
@@ -428,6 +430,8 @@ module DevWorkspaceHost
       when 'run-router' then run_router(argv)
       when 'run-portal' then run_portal(argv)
       when 'run-codex' then run_codex(argv)
+      when 'provider' then provider_command(argv)
+      when 'run-provider-worker' then run_provider_worker(argv)
       when 'run-tmux' then run_tmux(argv)
       when 'run-auto-archive'
         entry = instance_argument(argv, 'run-auto-archive')
@@ -515,9 +519,11 @@ module DevWorkspaceHost
       raise Error, "workspace is not registered: #{name}" unless entry
       require_no_unfinished_lifecycle_operations!([entry], operation: 'workspace unregister')
       require_no_development_cluster_state!([entry], operation: 'workspace unregister')
+      require_no_pending_provider!([entry])
 
       quiesced = quiesce_sessions([entry])
       units = %w[portal codex tmux].map { |kind| "workspace-#{kind}@#{name}.service" }
+      units << provider_worker_unit(entry) if File.exist?(provider_state_path(entry))
       disable_started = false
       retired_runtime = nil
       begin
@@ -605,6 +611,7 @@ module DevWorkspaceHost
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
+      require_compatible_provider_state!(candidate)
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
       system! candidate_host, 'check-codex', '--codex', current_codex
@@ -874,6 +881,7 @@ module DevWorkspaceHost
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
       require_compatible_session_recovery!(package_root)
+      require_compatible_provider_state!(package_root)
       # The stable dispatcher invokes this method from the selected candidate.
       # Relink package-specific commands and skills here so a successful switch
       # never leaves them attached to the generation that initiated it.
@@ -913,6 +921,7 @@ module DevWorkspaceHost
     def suspend(argv)
       raise Error, 'suspend takes no arguments' unless argv.empty?
       require_no_unfinished_lifecycle_operations!(operation: 'workspace suspension')
+      require_no_pending_provider!(registry.entries)
       quiesced = quiesce_sessions
       stop_auto_archive_services
       common = %w[
@@ -930,6 +939,7 @@ module DevWorkspaceHost
         ]
       end
       system! 'systemctl', '--user', 'stop', 'workspace-codex-reconcile-pending.service'
+      instances.concat(registry.entries.select { |entry| File.exist?(provider_state_path(entry)) }.map { |entry| provider_worker_unit(entry) })
       system! 'systemctl', '--user', 'disable', '--now', *instances, *common
       @out.puts 'workspace portal user services are suspended'
     rescue StandardError => primary_error
@@ -1151,7 +1161,8 @@ module DevWorkspaceHost
       end
       environment = @env.to_h.merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
-        'DEV_WORKSPACE_CODEX_HOME' => codex_home
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home,
+        'DEV_WORKSPACES_STATE' => @state
       )
       [environment, private_command, arguments]
     end
@@ -1235,7 +1246,8 @@ module DevWorkspaceHost
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
       environment = @env.to_h.merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
-        'DEV_WORKSPACE_CODEX_HOME' => codex_home
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home,
+        'DEV_WORKSPACES_STATE' => @state
       )
       arguments = [
         'serve',
@@ -1312,8 +1324,11 @@ module DevWorkspaceHost
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       codex = File.realpath(active_codex)
       plan = registration_plan_for(entry, package: package_root)
+      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'stage') != 'shared-start'
+        raise Error, 'provider recovery must finish before the shared native daemon can start'
+      end
       write_registration_marker(entry, codex, plan)
-      exec(codex, *plan.argv, 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+      exec(codex, *plan.argv, *provider_argv(entry), 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
     end
 
     # The package helper is the sole catalog, retained-root, and state reader.
@@ -1908,7 +1923,7 @@ module DevWorkspaceHost
       raise Error, "cannot execute Codex registration probe: #{e.message}"
     end
 
-    def quiesce_sessions(entries = registry.entries)
+    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil)
       quiesced = []
       predecessor_package = preselection_session_package
       entries.each do |entry|
@@ -1927,6 +1942,7 @@ module DevWorkspaceHost
             transition_lock: false,
             package: predecessor_package
           )
+          environment['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = provider_terminal_snapshot if provider_terminal_snapshot
           output = capture_env!(environment, command, *arguments)
           quiesced << [entry, slug] if output.lines.any? do |line|
             line.strip == "quiesced terminal: #{slug}"
@@ -1948,6 +1964,7 @@ module DevWorkspaceHost
       entries = registry.entries,
       operation: 'workspace operation'
     )
+      entries.each { |entry| require_provider_admission!(entry) }
       operations = entries.flat_map do |entry|
         root = File.join(entry.fetch('root'), 'worktrees', '.locks')
         lifecycle = LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.flat_map do |kind|

@@ -180,6 +180,7 @@ type Server struct {
 	codexLimitsCache       codexLimitsSnapshot
 	codexLimitsWait        *codexLimitsCall
 	codexLimitsGeneration  uint64
+	providerLimits         map[string]*codexLimitsCall
 	codexResetMu           sync.Mutex
 	messageMu              sync.Mutex
 	messageLocks           map[string]conversation.MutationLocker
@@ -714,6 +715,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.models(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/codex-limits":
 		s.codexLimits(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/codex-providers":
+		s.codexProviders(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/switch":
+		s.providerMutation(w, r, false)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/cancel":
+		s.providerMutation(w, r, true)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-limits/reset":
 		s.consumeCodexReset(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
@@ -852,7 +859,7 @@ func (s *Server) requireCurrentHostProfile() error {
 	if err != nil || current != s.hostProfile {
 		return errors.New("portal belongs to a superseded workspace package generation; reload it")
 	}
-	return nil
+	return s.requireProviderAdmission()
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {

@@ -261,6 +261,23 @@ finishLimitsRead(unreportedLimits);
 await unreportedLimitsRead;
 assert.deepEqual(limitsChanges.pop(), {snapshot: unreportedLimits, failed: false});
 
+// After switching A to B, an unavailable B must never retain A's quotas.
+let activeProvider = "A", providerRead = null;
+const providerChanges = [];
+const activeLimits = createCodexLimitsReader(() => new Promise((resolve, reject) => {providerRead = {resolve, reject};}),
+  (snapshot, failed) => providerChanges.push({snapshot, failed}),
+  {acceptSnapshot: snapshot => snapshot.provider.id === activeProvider});
+let providerRefresh = activeLimits.refresh();
+const aLimits = {provider:{id:"A"},windows:[{usedPercent:10}]};
+providerRead.resolve(aLimits); await providerRefresh;
+assert.deepEqual(providerChanges.pop(), {snapshot:aLimits,failed:false});
+activeProvider = "B"; activeLimits.invalidate({clearSnapshot:true});
+assert.deepEqual(providerChanges.pop(), {snapshot:null,failed:false});
+providerRefresh = activeLimits.refresh(); providerRead.reject(new Error("B unavailable")); await providerRefresh;
+assert.deepEqual(providerChanges.pop(), {snapshot:null,failed:true});
+providerRefresh = activeLimits.refresh(); providerRead.resolve(aLimits); await providerRefresh;
+assert.deepEqual(providerChanges.pop(), {snapshot:null,failed:true});
+
 // Waiting excludes idle gaps and includes the open wait.
 const timing = {
   currentState: "waiting", workingMs: 60_000, waitingMs: 10_000,

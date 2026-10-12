@@ -16,6 +16,23 @@ def validate(schema_directory):
     response_schema = json.loads((schema_directory / "v2/ThreadTurnsListResponse.json").read_text())
     request_schema = json.loads((schema_directory / "ClientRequest.json").read_text())
     Draft7Validator(request_schema).validate(request)
+    provider_params = {"threadId": "thread-1", "excludeTurns": True,
+        "modelProvider": "pool", "model": "retained", "cwd": "/workspace/work/example",
+        "runtimeWorkspaceRoots": ["/workspace"], "approvalPolicy": "never",
+        "approvalsReviewer": "user", "sandbox": "workspace-write",
+        "config": {"model_reasoning_effort": "low",
+            "sandbox_workspace_write": {"writable_roots": ["/workspace"], "network_access": True},
+            "shell_environment_policy": {"set": {"DEV_SESSION_SLUG": "example"}}}}
+    Draft7Validator(request_schema).validate({"id": 2, "method": "thread/resume", "params": provider_params})
+    Draft7Validator(request_schema).validate({"id": 3, "method": "thread/settings/update",
+        "params": {"threadId": "thread-1", "disabledPluginIds": [],
+            "multiAgentMode": "explicitRequestOnly", "collaborationMode": {
+                "mode": "default", "settings": {"model": "retained",
+                    "reasoning_effort": "low", "developer_instructions": None}}}})
+    resume = json.loads((schema_directory / "v2/ThreadResumeResponse.json").read_text())
+    for field in ("modelProvider", "model", "cwd", "approvalPolicy", "approvalsReviewer", "sandbox"):
+        if field not in resume.get("required", []):
+            raise ValueError(f"provider transition requires effective resume field {field}")
     turn_properties = response_schema.get("definitions", {}).get("Turn", {}).get("properties", {})
     for field in ("id", "status", "startedAt", "completedAt"):
         if field not in turn_properties:

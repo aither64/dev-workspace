@@ -4,6 +4,10 @@ The workspace portal keeps long-running development sessions available through
 both a browser and tmux. One installed package generation supplies the portal,
 Codex CLI, session helper, user units and any configured extensions.
 
+The [Codex provider guide](codex-providers.md) describes the limits popup's
+provider preview and workspace-wide switch, including operator catalog and
+recovery contracts.
+
 ## Workspace configuration
 
 Each workspace can contain `.dev-workspace.json`:

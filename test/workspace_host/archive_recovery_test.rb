@@ -19,14 +19,14 @@ class WorkspaceHostTest < Minitest::Test
       packaged_session = File.join(packaged_libexec, 'workspace-portal')
       package_contract = File.join(root, 'share', 'workspace-portal')
       FileUtils.mkdir_p([packaged_session, package_contract])
-      %w[workspace-host workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb].each do |name|
+      %w[workspace-host workspace-codex-providers.rb workspace-provider-admission.rb workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb].each do |name|
         FileUtils.cp(File.join(source, name), File.join(packaged_libexec, name))
       end
       public_wrapper = File.join(packaged_session, 'dev-session')
       File.write(public_wrapper, "#!/bin/sh\nexit 0\n")
       wrapped_source = File.join(packaged_session, '.dev-session-wrapped')
       FileUtils.cp(File.join(source, 'dev-session'), wrapped_source)
-      %w[workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb].each do |name|
+      %w[workspace-provider-admission.rb workspace-profile-identity.rb workspace-auto-archive.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb].each do |name|
         File.symlink(File.join('..', name), File.join(packaged_session, name))
       end
       FileUtils.cp(File.expand_path('../../portal/internal/session/runtime-contract.json', __dir__),

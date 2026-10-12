@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 )
 
@@ -35,9 +36,55 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
 	options.AllowImplicitResume = client.allowImplicitResume
+	options.LifecycleSettings = client.providerSettings
 	client.submissionLedgerPath = options.SubmissionLedgerPath
 	client.Client = codex.NewWithOptions(socket, options)
 	return client
+}
+
+func (c *Client) providerState() (*codexproviders.State, error) {
+	name := os.Getenv("DEV_WORKSPACE_NAME")
+	if c.RecoveryRoot == "" || name == "" {
+		return nil, nil
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if errors.Is(err, os.ErrNotExist) {
+		path, pathErr := codexproviders.StatePath(c.RecoveryRoot, name)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		if _, stateErr := os.Lstat(path); errors.Is(stateErr, os.ErrNotExist) {
+			return nil, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	state, err := codexproviders.ReadState(c.RecoveryRoot, name, c.workspace, c.socket, catalog)
+	return &state, err
+}
+
+func (c *Client) providerSettings(ctx context.Context, thread string) (codex.ThreadSettings, error) {
+	state, err := c.providerState()
+	if err != nil {
+		return codex.ThreadSettings{}, err
+	}
+	if state == nil {
+		return codex.ThreadSettings{}, nil
+	}
+	if state.Operation.Reserved() {
+		return codex.ThreadSettings{}, errors.New("workspace provider transition is reserved")
+	}
+	settings := codex.ThreadSettings{ModelProvider: state.Active}
+	if thread != "" {
+		retained, err := c.ReadThreadSettings(ctx, thread)
+		if err != nil {
+			return codex.ThreadSettings{}, err
+		}
+		settings.Model = retained.Model
+		settings.ReasoningEffort = retained.ReasoningEffort
+	}
+	return settings, nil
 }
 
 func ResolveNewThreadSettings(

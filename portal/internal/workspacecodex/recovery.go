@@ -14,6 +14,10 @@ import (
 // Watches survive transport loss. Recheck private execution permission at the
 // actual implicit resume boundary, without making recursive App Server calls.
 func (c *Client) allowImplicitResume(thread string) bool {
+	state, err := c.providerState()
+	if err != nil || (state != nil && state.Operation.Reserved()) {
+		return false
+	}
 	if c.RecoveryRoot == "" || c.workspace == "" {
 		return true
 	}

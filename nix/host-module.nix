@@ -413,6 +413,24 @@ in
 {
   options.services.dev-workspaces = {
     enable = lib.mkEnableOption "the shared host substrate for development workspaces";
+
+    codexInitialProvider = lib.mkOption {
+      type = lib.types.str;
+      default = "openai";
+      description = "Initial provider for workspaces without saved provider state.";
+    };
+    codexProviders = lib.mkOption {
+      default = [ ];
+      description = "Operator-managed Codex load balancers; subscription is added automatically. Tokens remain in private files.";
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          id = lib.mkOption { type = lib.types.str; };
+          label = lib.mkOption { type = lib.types.str; };
+          baseURL = lib.mkOption { type = lib.types.str; };
+          tokenFile = lib.mkOption { type = lib.types.str; };
+        };
+      });
+    };
     owner = lib.mkOption {
       type = lib.types.str;
       description = "User that owns runtime sockets and can read the generated portal password.";
@@ -532,6 +550,14 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
+        assertion =
+          builtins.length cfg.codexProviders <= 31
+          && builtins.length (lib.unique (map (provider: provider.id) cfg.codexProviders)) == builtins.length cfg.codexProviders
+          && lib.all (provider: provider.id != "openai" && builtins.match "[a-z0-9][a-z0-9_-]{0,62}" provider.id != null) cfg.codexProviders
+          && lib.elem cfg.codexInitialProvider ([ "openai" ] ++ map (provider: provider.id) cfg.codexProviders);
+        message = "Codex provider IDs must be unique and the initial provider must be configured";
+      }
+      {
         assertion = cfg.owner != "" && cfg.hostName != "" && certificateNames != [ ];
         message = "services.dev-workspaces requires non-empty owner and hostName values";
       }
@@ -568,6 +594,16 @@ in
     };
 
     environment.systemPackages = [ reconcile ];
+
+    environment.etc."dev-workspaces/codex-providers.json" = lib.mkIf (cfg.codexProviders != [ ]) {
+      mode = "0644";
+      text = builtins.toJSON {
+        schema = 1;
+        initialProvider = cfg.codexInitialProvider;
+        providers = [ { id = "openai"; label = "Codex subscription"; kind = "subscription"; } ]
+          ++ map (provider: provider // { kind = "codex-lb"; }) cfg.codexProviders;
+      };
+    };
 
     systemd.services.workspace-portal-certificate-renewal = {
       description = "Renew the development workspace portal TLS certificate";

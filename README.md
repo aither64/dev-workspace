@@ -25,6 +25,8 @@ Repair unresolved older tracking offline before enabling session writers or
 automatic archival.
 The [archive recovery guide](docs/session-archive-recovery.md) owns retry and
 compatibility removal procedures.
+The [Codex provider guide](docs/codex-providers.md) covers limits previews,
+workspace-wide selection, catalog configuration and interrupted-switch recovery.
 
 ## Nix interfaces
 

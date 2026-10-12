@@ -137,6 +137,8 @@ func run(args []string) error {
 		return teamPresetCommand(args[1:])
 	case "agent-teams":
 		return agentTeamsCommand(args[1:])
+	case "codex-provider":
+		return codexProviderCommand(args[1:])
 	case "capture-comparison":
 		return captureComparisonCommand(args[1:])
 	case "uploads":
