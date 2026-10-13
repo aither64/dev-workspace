@@ -1442,12 +1442,18 @@
     resetAction = createResetCreditAction({request, store, withLock,
       confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
       refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
-    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=1");
+    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=2");
     const providerControls = dialog.querySelector("[data-provider-controls]");
     const providerSelect = dialog.querySelector("[data-provider-select]");
     const switchProvider = dialog.querySelector("[data-provider-switch]");
     const cancelProvider = dialog.querySelector("[data-provider-cancel]");
     const providerStatus = dialog.querySelector("[data-provider-status]");
+    let providerFeedbackOperationId = "";
+    const renderProviderStatus = preview => {
+      providerStatus.textContent = providerOperationText(preview.catalog?.operation, preview.catalog?.providers || [], providerFeedbackOperationId);
+    };
+    const clearProviderFeedback = () => {providerFeedbackOperationId = ""; renderProviderStatus(providers.state());};
+    dialog.addEventListener("close", clearProviderFeedback);
     providers = createProviderPreview({request, onChange: preview => {
       const catalog = preview.catalog;
       if (!catalog) return;
@@ -1462,7 +1468,7 @@
       switchProvider.disabled = providerBusy || pending || !preview.selected || preview.selected === catalog.active;
       cancelProvider.hidden = catalog.operation?.phase !== "waiting";
       cancelProvider.disabled = providerBusy;
-      providerStatus.textContent = providerOperationText(catalog.operation, catalog.providers);
+      renderProviderStatus(preview);
       if (providerAttempt && (catalog.operation?.id === providerAttempt.id || catalog.active === providerAttempt.target)) providerAttempt = null;
       const activeChanged = observedActiveProvider && observedActiveProvider !== catalog.active;
       observedActiveProvider = catalog.active;
@@ -1471,11 +1477,12 @@
       }
       renderAccountDetails();
     }});
-    providerSelect.addEventListener("change", () => providers.select(providerSelect.value));
+    providerSelect.addEventListener("change", () => {clearProviderFeedback(); providers.select(providerSelect.value);});
     const providerMutation = async cancel => {
       if (providerBusy) return;
       const preview = providers.state();
       if (!cancel && (!providerAttempt || providerAttempt.target !== preview.selected)) providerAttempt = {id: crypto.randomUUID(), target: preview.selected};
+      providerFeedbackOperationId = cancel ? preview.catalog.operation.id : providerAttempt.id;
       providerBusy = true; switchProvider.disabled = true; cancelProvider.disabled = true;
       try {
         await request(`/api/codex-providers/${cancel ? "cancel" : "switch"}`, {method:"POST", body:JSON.stringify(cancel ? {operationId:preview.catalog.operation.id} : {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id})});

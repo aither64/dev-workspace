@@ -55,12 +55,13 @@ export function createProviderPreview({request, onChange, now = Date.now, freshn
     stop() {stopped = true; revision++;}};
 }
 
-export function providerOperationText(operation, providers) {
+export function providerOperationText(operation, providers, feedbackOperationId = "") {
   if (!operation) return "";
   const target = providers.find(provider => provider.id === operation.target)?.label || operation.target;
   if (operation.phase === "waiting") return `Waiting to switch to ${target} when all workspace threads are idle.${operation.blockers?.length ? ` ${operation.blockers.join(" ")}` : ""}`;
   if (operation.phase === "applying") return `Switching workspace threads to ${target}…`;
   if (operation.phase === "applied") return operation.message || `Workspace now uses ${target}.`;
-  if (operation.phase === "canceled") return "Provider switch canceled.";
+  // Terminal cancellation receipts outlive the popup that initiated the action.
+  if (operation.phase === "canceled") return feedbackOperationId && operation.id === feedbackOperationId ? "Provider switch canceled." : "";
   return operation.message || "Provider switch failed. Refresh its status before retrying.";
 }

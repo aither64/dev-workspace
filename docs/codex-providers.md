@@ -53,6 +53,11 @@ questions, queues, goals, unfinished lifecycle operations or unowned threads.
 **Cancel waiting switch** cancels that exact request. Cancellation is refused
 after **applying** starts.
 
+Cancellation confirmation appears only in the popup where you requested a switch
+or canceled a waiting switch. Closing the popup or changing its preview selection
+clears that confirmation. Waiting, applying, failure and recovery status remain
+visible across tabs and page reloads.
+
 Application holds the package-transition lock, repeats ownership and idle checks,
 and probes authentication and retained models without inference. It records
 private settings and terminal identities, quiesces managed terminal clients,
