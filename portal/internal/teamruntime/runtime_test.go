@@ -1898,7 +1898,8 @@ func TestForcedMemberRetirementStopsAtContextDeadline(t *testing.T) {
 	if err := service.RetireAll(ctx, "one", "root-one"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("retirement deadline = %v", err)
 	}
-	if len(client.interrupts) != 1 || len(client.archives) != 0 {
+	// The deadline may expire during inventory, before interruption is reached.
+	if len(client.interrupts) > 1 || len(client.archives) != 0 {
 		t.Fatalf("retirement after deadline: interrupts=%#v archives=%#v", client.interrupts, client.archives)
 	}
 	roster, err := store.Load("one", "root-one")
