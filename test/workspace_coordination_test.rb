@@ -77,6 +77,19 @@ class WorkspaceCoordinationTest < Minitest::Test
     {'schema' => 1, 'requestId' => SecureRandom.uuid}.merge(values)
   end
 
+  def test_session_projection_excludes_a_recreated_slugs_retained_history
+    first = owner('replacement-history')
+    submit_merge(first)
+    assert_equal 1, @engine.status(first['slug'], portal: true)['jobs'].length
+    directory = File.join(@workspace, 'work', first['slug'])
+    File.rename(directory, File.join(@tmp, 'previous-session'))
+    owner(first['slug'])
+    result = @engine.status(first['slug'], portal: true)
+    assert_empty result['jobs']
+    assert_equal 1, result['owners'].length
+    assert result['owners'].first['observationIdentity']
+  end
+
   def approval(owner, snapshot, kind: 'merge', scope: nil)
     @engine.mutate(owner, 'approve', request('kind' => kind, 'scope' => scope || [{'repository' => 'code', 'target' => 'refs/heads/master'}],
       'source' => {'kind' => 'user_instruction', 'reference' => 'fixture approval', 'quote' => 'integrate code into master'}, 'reviewedSnapshot' => snapshot['id']))['id']
@@ -495,8 +508,12 @@ class WorkspaceCoordinationTest < Minitest::Test
       if %w[requested released].include?(state)
         assert_empty holders
       else
-        assert_equal [{'ownerId' => first['id'], 'slug' => first['slug'], 'portalUrl' => first['portalUrl'], 'observationIdentity' => observation,
-          'machines' => [{'machine' => 'fixture:machine', 'state' => state}]}], holders
+        assert_equal 1, holders.length
+        assert_equal first.slice('slug', 'portalUrl').merge('ownerId' => first['id'], 'observationIdentity' => observation), holders.first.reject { |key, _| key == 'machines' }
+        machine = holders.first['machines'].first
+        assert_equal({'machine' => 'fixture:machine', 'state' => state}, machine.slice('machine', 'state'))
+        assert_equal 'machine', machine['shortName']
+        assert_equal reservation['id'], machine['id']
       end
       assert_equal before, File.binread(File.join(@engine.store.root, 'ledger.json'))
     end

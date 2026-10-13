@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=11">
+  <link rel="stylesheet" href="/static/style.css?v=13">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -25,6 +25,7 @@
         {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" title="Team" aria-label="Team"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
+        <a id="session-tab-reservations" class="tab" href="#reservations" role="tab" aria-selected="false" aria-controls="reservations" data-session-tab="reservations" title="Reservations" aria-label="Reservations"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Reservations</span></a>
         <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
         <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Settings" aria-label="Settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Settings</span></a>
       </nav>
@@ -61,6 +62,13 @@
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
     <section class="session-tabs">
+      <section id="reservations" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-reservations">
+        <div class="section-heading"><h2>Reservations</h2><a href="/operations">Workspace operations</a></div>
+        <p>Machines held by this session stay reserved during review and feedback.</p>
+        <p data-coordination-warning class="notice warning" role="status" hidden></p>
+        <p class="muted" data-coordination-refreshed role="status"></p>
+        <div data-coordination data-coordination-session="{{.Session.Slug}}" data-coordination-observation="{{.Session.ObservationIdentity}}" class="coordination-layout">Loading reservations…</div>
+      </section>
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Settings</h2></div>
         <section id="auto-archive-panel" class="panel">
@@ -125,6 +133,7 @@
       {{end}}
 
       <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel" aria-labelledby="session-tab-handoff">
+        <p><a href="/operations">View operations</a></p>
         <div class="section-heading"><h2>Handoff</h2></div>
         {{if not .Session.Codex.ThreadID}}<p class="notice warning">This session has no shared Codex conversation. Start new sessions with <code>dev-session start &lt;short-name&gt;</code>.</p>{{end}}
         {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
@@ -227,6 +236,7 @@
     </form>
   </dialog>
   <script src="/static/app.js?v=37" defer></script>
+  <script src="/static/coordination.js?v=4" defer></script>
 </body>
 </html>
 {{end}}

@@ -131,18 +131,19 @@ type Manifest struct {
 
 type Summary struct {
 	Manifest
-	Tmux              Tmux      `json:"tmux"`
-	Archived          bool      `json:"archived"`
-	Terminal          bool      `json:"terminal"`
-	Interactive       bool      `json:"interactive"`
-	ExecutionHeld     bool      `json:"executionHeld"`
-	RecoveryReady     bool      `json:"-"`
-	PersistedThread   bool      `json:"-"`
-	Lifecycle         string    `json:"lifecycle"`
-	UpdatedAt         time.Time `json:"updatedAt"`
-	ManifestUpdatedAt time.Time `json:"-"`
-	Workspace         string    `json:"-"`
-	Root              string    `json:"-"`
+	ObservationIdentity string    `json:"-"`
+	Tmux                Tmux      `json:"tmux"`
+	Archived            bool      `json:"archived"`
+	Terminal            bool      `json:"terminal"`
+	Interactive         bool      `json:"interactive"`
+	ExecutionHeld       bool      `json:"executionHeld"`
+	RecoveryReady       bool      `json:"-"`
+	PersistedThread     bool      `json:"-"`
+	Lifecycle           string    `json:"lifecycle"`
+	UpdatedAt           time.Time `json:"updatedAt"`
+	ManifestUpdatedAt   time.Time `json:"-"`
+	Workspace           string    `json:"-"`
+	Root                string    `json:"-"`
 }
 
 func ValidSlug(slug string) bool {

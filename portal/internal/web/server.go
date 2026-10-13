@@ -107,13 +107,14 @@ type cachedRepositories struct {
 }
 
 type indexSessionStatus struct {
-	Slug             string    `json:"slug"`
-	UpdatedAt        time.Time `json:"updatedAt"`
-	Archived         bool      `json:"archived"`
-	RepositoryCount  int       `json:"repositoryCount"`
-	RunningClusters  int       `json:"runningClusters"`
-	ClusterNotice    string    `json:"clusterNotice,omitempty"`
-	PendingLifecycle string    `json:"pendingLifecycle,omitempty"`
+	ObservationIdentity string    `json:"observationIdentity"`
+	Slug                string    `json:"slug"`
+	UpdatedAt           time.Time `json:"updatedAt"`
+	Archived            bool      `json:"archived"`
+	RepositoryCount     int       `json:"repositoryCount"`
+	RunningClusters     int       `json:"runningClusters"`
+	ClusterNotice       string    `json:"clusterNotice,omitempty"`
+	PendingLifecycle    string    `json:"pendingLifecycle,omitempty"`
 }
 
 type cachedIndexStatus struct {
@@ -707,6 +708,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.index(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/automatic-archival":
 		s.render(w, "automatic-archival", pageData{})
+	case r.Method == http.MethodGet && r.URL.Path == "/operations":
+		s.render(w, "operations", pageData{})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/upload-drafts":
 		s.withCreationMutation(w, r, func() { s.newUploadDraft(w, r) })
 	case r.Method == http.MethodPost && r.URL.Path == "/sessions":
@@ -727,6 +730,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.collaborationModes(w, r)
 	case r.URL.Path == "/api/auto-archive":
 		s.autoArchiveWorkspaceAPI(w, r)
+	case r.URL.Path == "/api/coordination":
+		s.coordinationAPI(w, r, "")
 	case r.Method == http.MethodGet && r.URL.Path == "/api/index-status":
 		s.indexStatus(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/artifacts/"):
@@ -900,7 +905,7 @@ func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
 	} else {
 		for _, status := range cached.statuses {
 			summaries = append(summaries, session.Summary{Manifest: session.Manifest{Slug: status.Slug,
-				Repositories: make([]session.Repository, status.RepositoryCount)}, Archived: status.Archived, UpdatedAt: status.UpdatedAt})
+				Repositories: make([]session.Repository, status.RepositoryCount)}, Archived: status.Archived, UpdatedAt: status.UpdatedAt, ObservationIdentity: status.ObservationIdentity})
 		}
 	}
 	now := time.Now().UTC()
@@ -1068,7 +1073,7 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 			}
 		}
 		result.statuses = append(result.statuses, indexSessionStatus{
-			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived,
+			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived, ObservationIdentity: summary.ObservationIdentity,
 			RepositoryCount: len(summary.Repositories),
 			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pendingKind,
 		})
@@ -1084,8 +1089,16 @@ func (s *Server) listSessions() ([]session.Summary, error) {
 func (s *Server) listSessionsWithPending(pending map[string]session.LifecycleProgress, pendingErr error) ([]session.Summary, error) {
 	summaries, listErr := session.List(s.config.Workspace)
 	seen := make(map[string]struct{}, len(summaries))
-	for _, summary := range summaries {
+	for index := range summaries {
+		summary := &summaries[index]
 		seen[summary.Slug] = struct{}{}
+		identity, err := session.ObservationIdentity(summary.Workspace, summary.Slug,
+			filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
+		if err != nil {
+			s.config.Logger.Printf("observe session card %s: %v", summary.Slug, err)
+			continue
+		}
+		summary.ObservationIdentity = identity
 	}
 	for slug, progress := range pending {
 		if _, ok := seen[slug]; ok || progress.Operation != "delete" {
@@ -1142,6 +1155,13 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		s.render(w, "session", data)
 		return
 	}
+	observation, observationErr := session.ObservationIdentity(summary.Workspace, summary.Slug,
+		filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
+	if observationErr != nil {
+		s.writeError(w, r, http.StatusConflict, "Session identity changed. Reload the session.")
+		return
+	}
+	summary.ObservationIdentity = observation
 	lifecycleTargetID, lifecycleIdentityErr := lifecycleTargetIdentity(summary)
 	s.normalizeInteractivity(r.Context(), summary)
 	data := pageData{
@@ -1835,6 +1855,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && parts[1] == "coordination" {
+		s.coordinationAPI(w, r, summary.Slug)
+		return
+	}
 	if len(parts) == 2 && (parts[1] == "resume" || parts[1] == "continue" || parts[1] == "recovery") {
 		s.recoveryAPI(w, r, summary, parts[1])
 		return

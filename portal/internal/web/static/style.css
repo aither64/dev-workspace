@@ -100,6 +100,34 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .operation-progress[hidden], .badge[hidden] { display: none; }
 .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: .25rem .62rem; border: 1px solid var(--line); color: var(--muted); font-size: .76rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 .badge.active { color: var(--accent); border-color: #2b6652; }
+.badge.reserved { color: var(--accent-2); border-color: var(--accent-2); justify-self: start; }
+.coordination-layout { display: grid; gap: 1.2rem; min-width: 0; }
+.coordination-intro p { margin: .3rem 0; }
+.coordination-section { min-width: 0; }
+.coordination-machines { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 1rem; }
+.coordination-machine { padding: 1rem; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); min-width: 0; }
+.coordination-machine p { margin: .65rem 0; line-height: 1.5; overflow-wrap: anywhere; }
+.coordination-machine-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .5rem; }
+.coordination-machine-heading h3 { margin: 0; font-size: 1.15rem; overflow-wrap: anywhere; }
+.coordination-table { width: 100%; border-collapse: collapse; text-align: left; font-size: .9rem; }
+.coordination-table th { color: var(--muted); font-weight: 600; }
+.coordination-table th, .coordination-table td { padding: .9rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.coordination-table td { overflow-wrap: anywhere; max-width: 28rem; }
+.coordination-table th:first-child, .coordination-table td:first-child { padding-left: 0; }
+.coordination-table tr:last-child td { border-bottom: 0; }
+.coordination-table td > p { margin: .5rem 0 0; }
+.coordination-table td > a { display: block; min-width: 10rem; }
+.coordination-table time { display: block; min-width: 8rem; }
+.coordination-details { margin-top: .65rem; font-size: .85rem; }
+.coordination-details summary { cursor: pointer; color: var(--muted); }
+.coordination-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.coordination-details pre { margin: .7rem 0 0; padding: .8rem; border-radius: 8px; background: var(--bg); max-height: 22rem; max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.coordination-table .coordination-details pre { width: min(28rem, 65vw); }
+@media (max-width: 720px) {
+  .coordination-section { padding: .85rem; }
+  .coordination-table th, .coordination-table td { padding: .65rem .5rem; }
+  .coordination-table { min-width: 680px; }
+}
 .badge.archived { color: var(--muted); }
 .badge.warning { color: var(--warning); border-color: #66532e; }
 .badge.danger { color: var(--danger); border-color: #713b46; }

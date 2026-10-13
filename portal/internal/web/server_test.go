@@ -1595,7 +1595,7 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 	for _, marker := range []string{
 		`class="workspace-sidebar"`, `aria-orientation="vertical"`, `class="session-tabs"`, `href="#codex"`, `data-session-tab="codex"`,
 		`aria-label="Workspace menu"`, `popovertarget="sidebar-menu"`, `popover="auto"`,
-		`href="/automatic-archival" autofocus`, `class="sidebar-home"`, `<h1>example</h1>`,
+		`href="/operations" autofocus`, `class="sidebar-home"`, `<h1>example</h1>`,
 		`data-lifecycle-target-id="` + strings.Repeat("a", 64) + `"`,
 		`href="#handoff"`, `data-session-tab="handoff"`,
 		`href="#repositories"`, `data-session-tab="repositories"`,

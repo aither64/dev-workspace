@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=13">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -36,6 +36,7 @@
   <main class="page index-page">
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
     <p id="index-status-warning" class="notice warning" hidden></p>
+    <p data-coordination-warning class="notice warning" role="status" hidden></p>
     <section class="panel new-session">
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
@@ -91,7 +92,8 @@
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/app.js?v=37" defer></script>
+  <script src="/static/app.js?v=38" defer></script>
+  <script src="/static/coordination.js?v=4" defer></script>
 </body>
 </html>
 {{end}}
@@ -99,7 +101,8 @@
 {{define "sidebar-menu"}}
 <button class="sidebar-menu-toggle quiet" type="button" popovertarget="sidebar-menu" title="Workspace menu" aria-label="Workspace menu"><span aria-hidden="true">⋮</span></button>
 <nav id="sidebar-menu" class="sidebar-menu" popover="auto" aria-label="Workspace navigation">
-  <a href="/automatic-archival" autofocus>Automatic archival</a>
+  <a href="/operations" autofocus>Operations</a>
+  <a href="/automatic-archival">Automatic archival</a>
 </nav>
 {{end}}
 
@@ -129,12 +132,13 @@
 {{end}}
 
 {{define "session-card"}}
-<a class="session-card{{with .}}{{if .Archived}} archived{{end}}{{end}}" href="{{with .}}/{{.Slug}}/{{end}}" data-session-slug="{{with .}}{{.Slug}}{{end}}">
+<a class="session-card{{with .}}{{if .Archived}} archived{{end}}{{end}}" href="{{with .}}/{{.Slug}}/{{end}}" data-session-slug="{{with .}}{{.Slug}}{{end}}" data-session-observation="{{with .}}{{.ObservationIdentity}}{{end}}">
   <span class="status-dot{{with .}}{{if not .Archived}} active{{end}}{{end}}"></span>
   <strong>{{with .}}{{.Slug}}{{end}}</strong>
   <span class="muted" data-session-updated data-updated-at="{{with .}}{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}{{end}}">{{with .}}{{if .Archived}}Finalized{{else}}Updated{{end}} {{timeAgo .UpdatedAt}}{{end}}</span>
   <span data-session-repositories>{{with .}}{{len .Repositories}} repositories{{end}}</span>
   <span class="cluster-summary" data-session-clusters hidden></span>
   <span class="badge warning" data-session-lifecycle hidden></span>
+  <span class="badge reserved" data-session-reservation hidden></span>
 </a>
 {{end}}

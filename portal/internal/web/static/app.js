@@ -1703,6 +1703,7 @@
           card.href = `/${encodeURIComponent(item.slug)}/`;
           card.querySelector("strong").textContent = item.slug;
         }
+        card.dataset.sessionObservation = item.observationIdentity || "";
         card.classList.toggle("archived", item.archived);
         card.querySelector(".status-dot").classList.toggle("active", !item.archived);
         document.querySelector(`[data-session-list="${item.archived ? "archived" : "active"}"]`).append(card);
@@ -1754,6 +1755,7 @@
         ordered.forEach((card) => grid.append(card));
       }
       indexSnapshotWarning = payload.warning || "";
+      document.dispatchEvent(new Event("session-list-updated"));
       indexNotice.success();
       if (sidebar) sidebar.scrollTop = previousSidebarTop;
     } catch (error) {

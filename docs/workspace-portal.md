@@ -557,6 +557,19 @@ this lifecycle conversion. An already open predecessor JavaScript bundle is not
 hot upgraded; it may need a normal reload after a stale-target refusal. Pages
 loaded with the new bundle perform the refresh and confirmation flow in place.
 
+## Operations overview
+
+The workspace menu links to **Operations** at `/operations`. This read-only
+page shows machine reservations, queued and completed jobs, blocking sessions and
+agent notification status. Active jobs appear first. Session-list cards name a
+single reserved machine or show the distinct machine count, including during idle
+review and recovery. The badge tooltip lists the machines and their states. The
+session's [Reservations tab](coordination.md) shows its
+held machines, pending requests and related operations.
+Operations and badges refresh every five seconds while visible; failed reads keep
+the previous display with a warning. The coordination contract owns reservation
+and recovery semantics; the page provides no release or deployment controls.
+
 ## Automatic archival overview
 
 The ⋮ menu at the top of the workspace and session sidebars contains
