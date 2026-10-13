@@ -547,6 +547,7 @@ module WorkspaceAutoArchive
         Policy.observe(auto_archive_store.session(slug), snapshot, auto_archive_store.policy, Time.now)
       end
       initial = persist ? auto_archive_store.lock(&read) : read.call
+      coordination_blockers = WorkspaceCoordination::Store.new(@workspace_state_root).session_blockers(workspace, slug)
       proof_error = nil
       if initial['eligible']
         begin
@@ -563,6 +564,11 @@ module WorkspaceAutoArchive
       end
       observe = lambda do
         state = read.call
+        unless coordination_blockers.empty?
+          state['eligible'] = false
+          state['blockers'].concat(coordination_blockers)
+          state['result'] = 'deferred'
+        end
         if state['eligible'] && !initial['eligible']
           state['eligible'] = false
           state['blockers'] << 'Automatic archive eligibility changed during observation.'

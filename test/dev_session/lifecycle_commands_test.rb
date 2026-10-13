@@ -1,8 +1,93 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/coordination_capacity_fixture'
 
 class DevSessionTest < Minitest::Test
+  include CoordinationCapacityFixture
+  def test_coordination_capacity_refusal_precedes_all_lifecycle_authority_publication
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      store = runner.send(:coordination_store)
+      slug = 'capacity-publication'
+      tracking = File.join(workspace, 'work', slug)
+      FileUtils.mkdir_p(tracking)
+      File.write(File.join(tracking, 'portal.yml'), YAML.dump('slug' => slug, 'codex' => {}))
+      stat = File.stat(tracking)
+      id = SecureRandom.uuid
+      identity = WorkspaceCoordination.digest([workspace, 'fixture', slug, stat.dev, stat.ino, nil, nil])
+      store.transaction do |data|
+        data['owners'][id] = {'id' => id, 'identity' => identity, 'workspace' => workspace,
+          'workspaceName' => 'fixture', 'slug' => slug, 'thread' => nil, 'socket' => '/fixture',
+          'portalUrl' => 'https://fixture.test', 'bootstrap' => true, 'fence' => nil}
+      end
+      store.require_lifecycle_capacity!(workspace, slug, 'archive')
+      store.bind_lifecycle(workspace, slug, 'archive', 'a' * 64)
+      store.lifecycle_completed(workspace, slug, 'archive', operation_id: 'a' * 64)
+      fill_coordination_admission_bytes(store)
+      archive = {'schema' => 2, 'slug' => slug, 'workspace' => workspace, 'operation_id' => 'a' * 64,
+        'phase' => 'prepared', 'mode' => 'complete', 'proven_heads' => {}, 'finalized_at' => Time.now.utc.iso8601,
+        'retained_thread_id' => nil, 'target_tracking_sha256' => 'b' * 64}
+      # Exact already-admitted publication remains recoverable at capacity.
+      runner.send(:write_lifecycle_journal, runner.send(:lifecycle_journal_file, slug, 'archive'), archive, command: 'archive', create: true)
+      assert File.file?(runner.send(:lifecycle_journal_file, slug, 'archive'))
+      store.transaction { |data| data['owners'][id]['fence'] = nil }
+      File.unlink(runner.send(:lifecycle_journal_file, slug, 'archive'))
+      archive['operation_id'] = 'c' * 64
+      error = assert_raises(WorkspaceCoordination::Error) do
+        runner.send(:write_lifecycle_journal, runner.send(:lifecycle_journal_file, slug, 'archive'), archive, command: 'archive', create: true)
+      end
+      assert_match(/capacity/, error.message)
+      refute File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive'))
+      assert_raises(WorkspaceCoordination::Error) do
+        runner.archive_cleanup_publish_binding(archive) { flunk 'published sidecar before capacity admission' }
+      end
+      removal = {'operation_id' => 'd' * 64}
+      assert_raises(WorkspaceCoordination::Error) { runner.send(:write_removal_journal!, slug, removal) }
+      refute File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete'))
+      store.transaction { |data| data['owners'][id]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => true, 'operationId' => 'a' * 64} }
+      revive = {'schema' => 3, 'slug' => slug, 'workspace' => workspace, 'operation_id' => 'e' * 64,
+        'phase' => 'prepared', 'lifecycle' => 'complete', 'legacy_without_portal' => false,
+        'abandoned_confirmed' => true, 'retained_thread_id' => nil, 'target_tracking_sha256' => 'b' * 64,
+        'plan_sha256' => 'b' * 64, 'state_sha256' => 'b' * 64, 'target_state_sha256' => 'b' * 64,
+        'portal_sha256' => 'b' * 64, 'target_portal_sha256' => 'b' * 64}
+      assert_raises(WorkspaceCoordination::Error) do
+        runner.send(:write_lifecycle_journal, runner.send(:lifecycle_journal_file, slug, 'revive'), revive, command: 'revive', create: true)
+      end
+      refute File.exist?(runner.send(:lifecycle_journal_file, slug, 'revive'))
+    end
+  end
+
+  def test_coordination_failure_retains_lifecycle_journals_for_exact_retry
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      runner.define_singleton_method(:write_removal_metadata!) { |*| nil }
+      %w[archive delete revive].each do |command|
+        slug = "coordination-#{command}"
+        path = runner.send(:lifecycle_journal_file, slug, command)
+        FileUtils.mkdir_p(File.dirname(path))
+        File.write(path, 'retained recovery journal')
+        journal = {'operation_id' => command[0] * 64, 'phase' => {'archive' => 'archived', 'delete' => 'removed', 'revive' => 'revived'}[command], 'recovery' => workspace}
+        calls = []
+        failing = Object.new
+        failing.define_singleton_method(:lifecycle_completed) { |*args, **kwargs| calls << [args, kwargs]; raise WorkspaceCoordination::Error, 'injected coordination write failure' }
+        failing.define_singleton_method(:revived) { |*args, **kwargs| calls << [args, kwargs]; raise WorkspaceCoordination::Error, 'injected coordination write failure' }
+        method = {'archive' => :finish_archive_journal!, 'delete' => :finalize_removal!, 'revive' => :finish_revive_journal!}[command]
+        runner.define_singleton_method(:coordination_store) { failing }
+        assert_raises(WorkspaceCoordination::Error) { runner.send(method, slug, journal) }
+        assert File.file?(path), "#{command} discarded its recovery journal before coordination completion"
+        assert_equal journal['operation_id'], calls.first.last[:operation_id]
+        completing = Object.new
+        completing.define_singleton_method(:lifecycle_completed) { |*args, **kwargs| calls << [args, kwargs] }
+        completing.define_singleton_method(:revived) { |*args, **kwargs| calls << [args, kwargs] }
+        runner.define_singleton_method(:coordination_store) { completing }
+        runner.send(method, slug, journal)
+        refute File.exist?(path)
+        assert_equal calls.first, calls.last
+      end
+    end
+  end
+
   def test_current_uses_a_read_only_transition_lock
     Dir.mktmpdir('dev-session-read-only-lock-test') do |directory|
       path = File.join(directory, 'transition.lock')

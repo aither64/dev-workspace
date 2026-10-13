@@ -30,6 +30,7 @@
           extensions ? { },
           routerSocket ? hostPaths.routerSocket,
           teamConfig ? null,
+          coordinationConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
@@ -38,7 +39,9 @@
             inherit pkgs;
             codex = llm-agents.packages.${pkgs.system}.codex;
           };
-          codexModelCatalog = "${llm-agents.packages.${pkgs.system}.codex.src}/codex-rs/models-manager/models.json";
+          codexModelCatalog = "${
+            llm-agents.packages.${pkgs.system}.codex.src
+          }/codex-rs/models-manager/models.json";
           codexWebSrc = codex-web;
           codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
           inherit
@@ -46,6 +49,7 @@
             extensions
             routerSocket
             teamConfig
+            coordinationConfig
             userNamespace
             ;
         };
@@ -55,6 +59,7 @@
     in
     {
       lib = {
+        coordinationCommandLibrary = "${self}/libexec/workspace-coordination-command.rb";
         inherit
           hostPaths
           mkCodexPackage

@@ -227,7 +227,7 @@ func memberPolicy(workspace, slug string, member Member) (codex.ThreadPolicy, er
 	if !session.ValidSlug(slug) || workspace == "" || member.Address == "" {
 		return codex.ThreadPolicy{}, errors.New("member policy has incomplete session identity")
 	}
-	identity := fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working on session files, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch.\n\n", slug, workspace, member.Address)
+	identity := fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working on session files, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch. Before merging or deploying, read the selected package instructions with workspace-host coordination guide. Use its queue and machine review reservation for catalog-covered operations; keep resource waits interruptible and keep the turn open.\n\n", slug, workspace, member.Address)
 	return codex.ThreadPolicy{DeveloperInstructions: identity + instructions, Sandbox: sandbox}, nil
 }
 

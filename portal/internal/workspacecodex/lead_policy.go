@@ -40,7 +40,10 @@ func LeadThreadPolicy(slug, workspace, roleInstructions string) codex.ThreadPoli
 			"and require its result to match this exact session slug. DEV_SESSION_SLUG and "+
 			"DEV_SESSION_WORKSPACE must either both be absent or both match this binding; a mismatch "+
 			"means stop rather than claiming another session. A missing shell environment "+
-			"marker alone does not negate this thread-bound identity.\n\n%s",
+			"marker alone does not negate this thread-bound identity. Before merging or deploying, "+
+			"read the selected package's instructions with workspace-host coordination guide. "+
+			"Use its queue and machine review reservation when the configured catalog covers the operation; "+
+			"keep resource waits interruptible and keep the turn open.\n\n%s",
 			slug, workspace, instructions)
 	}
 	return codex.ThreadPolicy{DeveloperInstructions: instructions}

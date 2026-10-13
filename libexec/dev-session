@@ -14,6 +14,7 @@ require 'tempfile'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-coordination'
 require_relative 'workspace-provider-admission'
 require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
@@ -1884,7 +1885,9 @@ module DevSession
           end
           prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
           automatic&.call(journal || prepared)
+          coordination_store.require_lifecycle_idle!(workspace, slug)
           unless journal
+            coordination_store.require_lifecycle_capacity!(workspace, slug, 'archive')
             require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
               source = validate_work_directory!(slug)
             destination = archive_dir(slug)
@@ -1939,6 +1942,7 @@ module DevSession
           unless journal.fetch('mode') == mode
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
           end
+          coordination_store.bind_lifecycle(workspace, slug, 'archive', journal.fetch('operation_id'))
           recover_archive_phase!(slug, journal)
           # Prove the journal's tracking before any retry reads its retained
           # conversation. A replaced manifest must not select another root.
@@ -2064,6 +2068,7 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug, operation: 'revive')
           current = load_revive_journal(slug, operation_id:)
           unless current
+            coordination_store.require_lifecycle_capacity!(workspace, slug, 'revive')
             require_ordinary_manifest_ready!(slug, load_portal_manifest(File.join(archive_dir(slug), PORTAL_MANIFEST), required: true, expected_slug: slug))
             lifecycle = lifecycle_state(
               read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
@@ -2078,6 +2083,7 @@ module DevSession
               operation_id:
             )
           end
+          coordination_store.bind_revival(workspace, slug, operation_id: current.fetch('operation_id'), archive_operation_id: current['archive_operation_id'])
           recover_revive_phase!(slug, current)
           current
         end
@@ -2178,8 +2184,11 @@ module DevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'delete')
+          coordination_store.require_lifecycle_idle!(workspace, slug)
+          coordination_store.require_lifecycle_capacity!(workspace, slug, 'delete') unless load_removal_journal(slug)
           ensure_retirement_identity!(slug, cleanup_session(slug))
           removal = prepare_removal!(slug, force:, operation_id:)
+          coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id'))
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')
             validate_removal_tracking!(slug)
@@ -6028,8 +6037,10 @@ module DevSession
         file.flush
         file.fsync
       end
-      File.rename(temporary, path)
-      fsync_directory(File.dirname(path))
+      coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id')) do
+        File.rename(temporary, path)
+        fsync_directory(File.dirname(path))
+      end
     ensure
       File.unlink(temporary) if temporary && path_exists?(temporary)
     end
@@ -6268,6 +6279,7 @@ module DevSession
       removal['state'] = 'removed'
       removal['removed_at'] = Time.now.utc.iso8601(6)
       write_removal_metadata!(removal.fetch('recovery'), removal)
+      coordination_store.lifecycle_completed(workspace, slug, 'delete', operation_id: removal.fetch('operation_id'))
       path = lifecycle_journal_file(slug, 'delete')
       File.unlink(path) if path_exists?(path)
       fsync_directory(File.dirname(path))
@@ -6916,11 +6928,16 @@ module DevSession
       end
     end
 
+    def coordination_store
+      @coordination_store ||= WorkspaceCoordination::Store.new(@workspace_state_root)
+    end
+
     def finish_archive_journal!(slug, journal, cleanup: nil, sidecar: nil)
       if archive_phase_before?(journal, 'archived')
         advance_archive!(slug, journal, 'archived')
       end
       cleanup.complete!(sidecar, journal) if cleanup
+      coordination_store.lifecycle_completed(workspace, slug, 'archive', operation_id: journal.fetch('operation_id'))
       path = lifecycle_journal_file(slug, 'archive')
       File.unlink(path)
       fsync_directory(File.dirname(path))
@@ -7240,6 +7257,7 @@ module DevSession
       if revive_phase_before?(journal, 'revived')
         advance_revive!(slug, journal, 'revived')
       end
+      coordination_store.revived(workspace, slug, operation_id: journal.fetch('operation_id'), archive_operation_id: journal['archive_operation_id'])
       path = lifecycle_journal_file(slug, 'revive')
       File.unlink(path)
       fsync_directory(File.dirname(path))
@@ -7293,10 +7311,19 @@ module DevSession
         file.flush
         file.fsync
       end
-      raise Error, "lifecycle journal already exists: #{path}" if create && path_exists?(path)
-
-      File.rename(temporary, path)
-      fsync_directory(File.dirname(path))
+      publish = lambda do
+        raise Error, "lifecycle journal already exists: #{path}" if create && path_exists?(path)
+        File.rename(temporary, path)
+        fsync_directory(File.dirname(path))
+      end
+      if !create
+        publish.call
+      elsif command == 'revive'
+        coordination_store.bind_revival(workspace, journal.fetch('slug'),
+          operation_id: journal.fetch('operation_id'), archive_operation_id: journal['archive_operation_id'], &publish)
+      else
+        coordination_store.bind_lifecycle(workspace, journal.fetch('slug'), command, journal.fetch('operation_id'), &publish)
+      end
     ensure
       File.unlink(temporary) if temporary && path_exists?(temporary)
     end

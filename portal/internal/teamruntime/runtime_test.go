@@ -2363,6 +2363,7 @@ func TestMemberPolicyBindsSessionAndRetainsInstructions(t *testing.T) {
 	if policy.Sandbox != "read-only" || !strings.Contains(policy.DeveloperInstructions, "2026-09-24-example") ||
 		!strings.Contains(policy.DeveloperInstructions, "/srv/workspace") ||
 		!strings.Contains(policy.DeveloperInstructions, "analyst0") ||
+		!strings.Contains(policy.DeveloperInstructions, "workspace-host coordination guide") ||
 		!strings.HasSuffix(policy.DeveloperInstructions, member.Instructions) {
 		t.Fatalf("member policy = %#v", policy)
 	}

@@ -121,6 +121,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
+	case "coordination-notify":
+		return coordinationNotify(args[1:])
 	case "router":
 		return routeWorkspaces(args[1:])
 	case "session":

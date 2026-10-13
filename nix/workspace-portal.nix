@@ -16,11 +16,13 @@
   nodejs,
   nix,
   openssl,
+  openssh,
   python3,
   ruby,
   routerSocket,
   systemd,
   teamConfig ? null,
+  coordinationConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
   util-linux,
@@ -146,6 +148,27 @@ let
     }) providerNames;
   };
   extensionCatalog = writeText "dev-workspace-extensions.json" (builtins.toJSON extensionCatalogData);
+  coordinationData =
+    if coordinationConfig == null then
+      builtins.fromJSON (builtins.readFile ./coordination-empty.json)
+    else
+      coordinationConfig;
+  coordinationCatalog = writeText "dev-workspace-coordination.json" (
+    builtins.toJSON coordinationData
+  );
+  validCoordination =
+    coordinationData.schema == 1
+    &&
+      builtins.attrNames coordinationData == [
+        "adapters"
+        "machines"
+        "profileMachine"
+        "repositories"
+        "schema"
+      ]
+    && builtins.all (adapter: adapter.protocol == 1 && validTarget adapter.command) (
+      builtins.attrValues coordinationData.adapters
+    );
   packageConfiguration = writeText "dev-workspace-package.json" (
     builtins.toJSON {
       schema = 1;
@@ -193,6 +216,8 @@ assert lib.assertMsg targetsValid
   "dev-workspace extension targets must be immutable Nix store references: ${builtins.toJSON (map toString invalidTargets)}";
 assert lib.assertMsg programsValid "dev-workspace extension commands must not collide";
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
+assert lib.assertMsg validCoordination
+  "dev-workspace coordination catalog requires immutable protocol-1 adapters";
 buildGoModule {
   pname = "dev-workspace";
   version = "0.2.0";
@@ -254,6 +279,7 @@ buildGoModule {
       ruby test/dev_session_test.rb
       ruby test/auto_archive_test.rb
       ruby test/workspace_host_test.rb
+      ruby test/workspace_coordination_test.rb
     )
     runHook postCheck
   '';
@@ -268,6 +294,11 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
+    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command; do
+      install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
+    done
+    ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"
+    ln -s ../workspace-coordination-command.rb "$out/libexec/workspace-portal/workspace-coordination-command.rb"
     install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
       "$out/libexec/workspace-codex-providers.rb"
     install -Dm644 ${src}/libexec/workspace-provider-admission.rb \
@@ -306,6 +337,10 @@ buildGoModule {
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
+    install -Dm644 ${coordinationCatalog} "$out/share/dev-workspace/coordination.json"
+    install -Dm644 ${src}/nix/coordination-contract.json "$out/share/dev-workspace/coordination-contract.json"
+    install -Dm644 ${src}/docs/coordination.md "$out/share/dev-workspace/coordination.md"
+    install -Dm644 ${src}/docs/coordination-operations.md "$out/share/dev-workspace/coordination-operations.md"
     install -Dm644 ${packageConfiguration} "$out/share/dev-workspace/package.json"
     ${lib.optionalString agentTeams.configured ''
       install -Dm644 ${agentTeams.catalog} "$out/${agentTeams.catalogPath}"
@@ -358,6 +393,7 @@ buildGoModule {
         gh
         git
         nix
+        openssh
         contractPython
         ruby
         systemd
@@ -384,6 +420,9 @@ buildGoModule {
     test -f "$out/share/workspace-portal/runtime-contract.json"
     test -f "$out/share/dev-workspace/extensions.json"
     test -f "$out/share/dev-workspace/package.json"
+    (cd "$TMPDIR/workspace"; "$out/bin/workspace-host" coordination guide) > "$TMPDIR/installed-coordination-guide"
+    grep -Fq '# Coordinated workspace operations' "$TMPDIR/installed-coordination-guide"
+    grep -Fq '# Coordination operations and recovery' "$TMPDIR/installed-coordination-guide"
     test -x "$out/bin/workspace-portal"
     cmp ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
     test "$(sha256sum "$out/share/workspace-portal/codex-models.json" | cut -d' ' -f1)" = fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b

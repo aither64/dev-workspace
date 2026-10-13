@@ -14,6 +14,7 @@ require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-codex-providers'
+require_relative 'workspace-coordination-host'
 
 module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
@@ -365,6 +366,7 @@ module DevWorkspaceHost
 
   class Host
     include CodexProviderHost
+    include WorkspaceCoordinationHost
     def initialize(env: ENV, input: $stdin, out: $stdout, err: $stderr)
       @env = env
       @input = input
@@ -401,6 +403,9 @@ module DevWorkspaceHost
       else
         workspace_host(argv)
       end
+    rescue WorkspaceCoordination::Error => e
+      @err.puts "error: #{e.message}"
+      e.code
     rescue Error, OptionParser::ParseError, SystemCallError, Psych::Exception => e
       @err.puts "error: #{e.message}"
       1
@@ -414,14 +419,18 @@ module DevWorkspaceHost
       when 'register' then with_current_generation_lock(allow_first_install: true) { register(argv) }
       when 'unregister' then with_current_generation_lock(allow_first_install: true) { unregister(argv) }
       when 'switch'
-        if argv.include?('--from-candidate')
-          with_candidate_generation_lock { switch(argv, from_candidate: true) }
-        else
-          with_current_generation_lock(allow_first_install: true) { switch(argv) }
-        end
+        switch(argv, from_candidate: argv.include?('--from-candidate'))
+      when 'prepare' then prepare_profile_command(argv)
+      when 'activate-prepared' then activate_prepared_command(argv)
+      when 'coordination' then coordination_host_command(argv)
+      when 'coordination-worker' then coordination_worker_command(argv)
+      when 'coordination-reconcile' then coordination_reconcile_command(argv)
+      when 'run-coordinator' then run_coordinator(argv)
+      when 'coordination-bootstrap' then coordination_bootstrap(argv)
       when 'recover-archive' then recover_archive(argv)
       when 'rollback' then with_current_generation_lock { rollback(argv) }
       when 'suspend' then with_current_generation_lock { suspend(argv) }
+      when 'resume' then with_current_generation_lock { resume_services(argv) }
       when 'status' then status(argv)
       when 'check-codex' then check_codex_command(argv)
       when 'reconcile-codex' then with_current_generation_lock { reconcile_codex(argv) }
@@ -463,6 +472,7 @@ module DevWorkspaceHost
           workspace-host switch --source PATH [--from-candidate]
           workspace-host rollback
           workspace-host suspend
+          workspace-host resume
           workspace-host status
           dev-session [--workspace NAME] COMMAND [OPTIONS]
       USAGE
@@ -501,14 +511,26 @@ module DevWorkspaceHost
         operation: 'workspace register'
       )
 
+      if File.exist?(@profile)
+        require_registration_reconciliation!
+        require_compatible_development_cluster_helpers!(package_root)
+        require_compatible_runtime_authorities!(package_root)
+        require_compatible_session_recovery!(package_root)
+        require_compatible_provider_state!(package_root)
+        coordination_store.require_compatible!(package_root)
+      end
+
       entry = registry.register(
         name: argv.fetch(0), root: argv.fetch(1), hostname:,
         aliases:, replace: options.fetch(:replace)
       )
       if File.exist?(@profile)
+        @registration_reconciliation = profile_link_token
         activate_installed(File.join(@profile, 'bin/workspace-host'))
       end
       @out.puts "registered #{entry.fetch('name')}: https://#{entry.fetch('hostname')}/"
+    ensure
+      @registration_reconciliation = nil
     end
 
     def unregister(argv)
@@ -521,6 +543,8 @@ module DevWorkspaceHost
       require_no_unfinished_lifecycle_operations!([entry], operation: 'workspace unregister')
       require_no_development_cluster_state!([entry], operation: 'workspace unregister')
       require_no_pending_provider!([entry])
+      blockers = coordination_store.read['owners'].values.select { |owner| owner['workspace'] == entry['root'] }.flat_map { |owner| coordination_store.session_blockers(entry['root'], owner['slug']) }
+      raise Error, "workspace unregister has coordination blockers: #{blockers.join(', ')}" unless blockers.empty?
 
       quiesced = quiesce_sessions([entry])
       units = %w[portal codex tmux].map { |kind| "workspace-#{kind}@#{name}.service" }
@@ -583,6 +607,26 @@ module DevWorkspaceHost
     end
 
     def switch(argv, from_candidate: false)
+      prepared = prepare_profile(argv, from_candidate:)
+      if coordination_catalog.data['profileMachine']
+        return coordinated_profile_switch(prepared, from_candidate:)
+      end
+      activation = nil
+      action = lambda do
+        unless prepared.fetch('profileToken') == profile_link_token
+          raise Error, 'workspace package changed during preparation; rerun the stable command'
+        end
+        activation = activate_candidate(prepared.fetch('candidatePackage'), from_candidate:, prepared:)
+      end
+      if from_candidate
+        with_candidate_generation_lock(&action)
+      else
+        with_current_generation_lock(allow_first_install: true, &action)
+      end
+      complete_candidate_activation(activation)
+    end
+
+    def prepare_profile(argv, from_candidate: false)
       options = {}
       parser = OptionParser.new do |opts|
         opts.on('--source PATH') { |value| options[:source] = value }
@@ -595,9 +639,9 @@ module DevWorkspaceHost
       end
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition') unless from_candidate
       source = File.realpath(File.expand_path(options.fetch(:source)))
-      output = capture!(
-        'nix', 'build', '--no-link', '--print-out-paths', source
-      )
+      source_identity = coordination_source_identity(source)
+      observed_token = profile_link_token
+      output = coordination_build(source)
       candidates = output.lines.map(&:strip).reject(&:empty?).uniq
       raise Error, "workspace build returned #{candidates.length} package paths" unless candidates.length == 1
       candidate = File.realpath(candidates.fetch(0))
@@ -613,15 +657,48 @@ module DevWorkspaceHost
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
+      coordination_store.require_compatible!(candidate)
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
-      system! candidate_host, 'check-codex', '--codex', current_codex
+      coordination_check_codex(candidate_host, current_codex)
       if candidate_codex != current_codex
-        system! candidate_host, 'check-codex', '--codex', candidate_codex
+        coordination_check_codex(candidate_host, candidate_codex)
       end
 
       candidate_plans = registration_plans(package: candidate)
       probe_registration_plans!(candidate_codex, candidate_plans)
+      raise Error, 'workspace source changed during preparation; prepare again' unless source_identity == coordination_source_identity(source)
+      {'schema' => 1, 'kind' => 'profile', 'source' => source,
+       'sourceIdentity' => source_identity,
+       'candidatePackage' => candidate, 'profileToken' => observed_token,
+       'catalogDigest' => coordination_catalog.digest,
+       'registryDigest' => WorkspaceCoordination.digest(registry.entries),
+       'plansDigest' => WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] }),
+       'candidateCodex' => candidate_codex}
+    end
+
+    def activate_candidate(candidate, from_candidate: false, prepared:)
+      candidate_host = File.join(candidate, 'bin/workspace-host')
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
+      require_compatible_development_cluster_helpers!(candidate)
+      require_compatible_runtime_authorities!(candidate)
+      require_compatible_session_recovery!(candidate)
+      require_compatible_provider_state!(candidate)
+      coordination_store.require_compatible!(candidate)
+      require_coordination_profile_claim!(candidate)
+      unless prepared.fetch('sourceIdentity') == coordination_source_identity(prepared.fetch('source'))
+        raise Error, 'prepared workspace source changed; prepare again'
+      end
+      unless prepared.fetch('registryDigest') == WorkspaceCoordination.digest(registry.entries)
+        raise Error, 'workspace registry changed during package preparation; prepare again'
+      end
+      candidate_codex = File.realpath(codex_for_package(candidate))
+      current_codex = File.realpath(active_codex)
+      candidate_plans = registration_plans(package: candidate)
+      unless prepared.fetch('candidateCodex') == candidate_codex &&
+             prepared.fetch('plansDigest') == WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] })
+        raise Error, 'candidate registration changed during preparation; prepare again'
+      end
       predecessor_package = preselection_session_package
       restart_required = codex_restart_required?(
         candidate_plans, candidate_codex, package: candidate, predecessor: predecessor_package
@@ -660,15 +737,29 @@ module DevWorkspaceHost
         clear_pending_codex_update
         reraise_after_terminal_restoration(transition_error, quiesced, package: predecessor_package)
       end
+      {'candidate' => candidate, 'plans' => candidate_plans, 'codex' => candidate_codex,
+       'profileToken' => profile_link_token, 'pending' => pending_codex_update,
+       'quiesced' => quiesced, 'restartRequired' => restart_required}
+    end
+
+    def complete_candidate_activation(activation)
+      candidate, candidate_plans, candidate_codex = activation.values_at('candidate', 'plans', 'codex')
       wait_for_codex_sockets
       verify_registration_semantics!(candidate_plans, candidate_codex)
-      clear_pending_codex_update
-      begin
-        restore_quiesced_sessions(quiesced, package: candidate) if restart_required
-      rescue StandardError => restore_error
-        raise Error,
-              "workspace package transition completed, but terminal clients need dev-session sync: " \
-              "#{restore_error.message}"
+      with_transition_lock do
+        require_coordination_profile_claim!(candidate) if @coordination_attempt
+        unless profile_link_token == activation.fetch('profileToken') && File.realpath(@profile) == candidate &&
+               (pending_codex_update.nil? || pending_codex_update == activation.fetch('pending'))
+          raise Error, 'workspace activation completion was superseded; retain the selected generation recovery'
+        end
+        clear_pending_codex_update
+        begin
+          restore_quiesced_sessions(activation.fetch('quiesced'), package: candidate) if activation.fetch('restartRequired')
+        rescue StandardError => restore_error
+          raise Error,
+                "workspace package transition completed, but terminal clients need dev-session sync: " \
+                "#{restore_error.message}"
+        end
       end
       @out.puts "workspace package: #{candidate}"
     end
@@ -883,6 +974,12 @@ module DevWorkspaceHost
       require_compatible_runtime_authorities!(package_root)
       require_compatible_session_recovery!(package_root)
       require_compatible_provider_state!(package_root)
+      coordination_store.require_compatible!(package_root)
+      if @env['DEV_WORKSPACE_REGISTRATION_TOKEN']
+        require_registration_reconciliation!(token: @env['DEV_WORKSPACE_REGISTRATION_TOKEN'])
+      else
+        require_coordination_profile_claim!(package_root)
+      end
       # The stable dispatcher invokes this method from the selected candidate.
       # Relink package-specific commands and skills here so a successful switch
       # never leaves them attached to the generation that initiated it.
@@ -909,6 +1006,8 @@ module DevWorkspaceHost
 
     def activate_installed(command)
       environment = @env.to_h.merge('DEV_WORKSPACE_ACTIVATION' => '1')
+      environment['DEV_WORKSPACE_COORDINATION_ATTEMPT'] = @coordination_attempt if @coordination_attempt
+      environment['DEV_WORKSPACE_REGISTRATION_TOKEN'] = @registration_reconciliation if @registration_reconciliation
       system_env!(environment, command, '_activate')
     end
 
@@ -923,7 +1022,12 @@ module DevWorkspaceHost
       raise Error, 'suspend takes no arguments' unless argv.empty?
       require_no_unfinished_lifecycle_operations!(operation: 'workspace suspension')
       require_no_pending_provider!(registry.entries)
+      raise Error, 'workspace suspension waits for admitted coordination workers' if coordination_store.read['jobs'].values.any? { |job| WorkspaceCoordination::CLAIMED.include?(job['state']) }
+      prior_suspension = coordination_store.read['suspended']
+      suspension_written = File.file?(File.join(coordination_store.root, 'ledger.json'))
+      coordination_store.transaction { |data| data['suspended'] = true } if suspension_written
       quiesced = quiesce_sessions
+      service_changes_started = true
       stop_auto_archive_services
       common = %w[
         workspace-router.service
@@ -941,10 +1045,33 @@ module DevWorkspaceHost
       end
       system! 'systemctl', '--user', 'stop', 'workspace-codex-reconcile-pending.service'
       instances.concat(registry.entries.select { |entry| File.exist?(provider_state_path(entry)) }.map { |entry| provider_worker_unit(entry) })
+      common << 'workspace-coordinator.service'
       system! 'systemctl', '--user', 'disable', '--now', *instances, *common
       @out.puts 'workspace portal user services are suspended'
     rescue StandardError => primary_error
+      if suspension_written || service_changes_started
+        begin
+          if service_changes_started
+            configure_user_services
+            configure_auto_archive_services
+          end
+          coordination_store.transaction { |data| data['suspended'] = prior_suspension } if suspension_written
+        rescue StandardError => recovery_error
+          raise Error, "#{primary_error.message}; services remain suspended: #{recovery_error.message}; run workspace-host resume"
+        end
+      end
       reraise_after_terminal_restoration(primary_error, quiesced || [])
+    end
+
+    def resume_services(argv)
+      raise Error, 'resume takes no arguments' unless argv.empty?
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace resumption')
+      coordination_store.require_compatible!(package_root)
+      configure_user_services
+      reconcile_codex_update(defer_busy: true)
+      configure_auto_archive_services
+      coordination_store.transaction { |data| data['suspended'] = false } if File.file?(File.join(coordination_store.root, 'ledger.json'))
+      @out.puts 'workspace portal user services are resumed'
     end
 
     def install_links(package: package_root)
@@ -1079,6 +1206,7 @@ module DevWorkspaceHost
     def configure_user_services
       system! 'systemctl', '--user', 'daemon-reload'
       common = %w[workspace-router.service workspace-codex-reconcile.path workspace-codex-reconcile.timer]
+      common << 'workspace-coordinator.service' if File.file?(File.join(package_root, 'share/systemd/user/workspace-coordinator.service'))
       instances = registry.entries.flat_map do |entry|
         name = entry.fetch('name')
         ["workspace-tmux@#{name}.service", "workspace-codex@#{name}.service", "workspace-portal@#{name}.service"]
@@ -1092,6 +1220,7 @@ module DevWorkspaceHost
         "workspace-portal@#{entry.fetch('name')}.service"
       end
       system! 'systemctl', '--user', 'try-restart', 'workspace-router.service', *portals
+      system! 'systemctl', '--user', 'try-restart', 'workspace-coordinator.service' if common.include?('workspace-coordinator.service')
     end
 
     def status(argv)
@@ -1111,6 +1240,10 @@ module DevWorkspaceHost
 
       name = extract_workspace_option!(argv)
       entry = registry.select(name:, cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
+      if argv.first == 'coordination'
+        coordination_session_command(entry, argv.drop(1))
+        return
+      end
       if %w[archive delete revive auto-archive].include?(argv.first)
         if inherited_exclusive_transition_lock?
           environment, command, arguments = dev_session_invocation(
@@ -2996,7 +3129,12 @@ module DevWorkspaceHost
     end
 
     def capture!(*argv)
-      stdout, stderr, status = Open3.capture3(*argv)
+      if @coordination_diagnostics
+        stdout, stderr, status, overflow = WorkspaceCoordination::Command.run(argv, env: @env.to_h, log: @coordination_diagnostics)
+        raise Error, 'workspace preparation protocol output exceeds its bound' if overflow
+      else
+        stdout, stderr, status = Open3.capture3(*argv)
+      end
       unless status.success?
         detail = stderr.strip.empty? ? stdout.strip : stderr.strip
         raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}#{detail.empty? ? '' : "\n#{detail}"}"

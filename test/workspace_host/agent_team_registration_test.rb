@@ -27,6 +27,10 @@ class WorkspaceHostTest < Minitest::Test
       active_override || super
     end
 
+    def provider_argv(_entry)
+      []
+    end
+
     def run_registration_helper(package, entry)
       @helper_invocations << [package, entry.fetch('name')]
       responses.fetch(entry.fetch('name'))

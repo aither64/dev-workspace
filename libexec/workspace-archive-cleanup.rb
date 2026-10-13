@@ -90,6 +90,10 @@ module DevSession
         lifecycle_journal_root
       end
 
+      def archive_cleanup_publish_binding(sidecar, &block)
+        coordination_store.bind_lifecycle(workspace, sidecar.fetch('slug'), 'archive', sidecar.fetch('operation_id'), &block)
+      end
+
       def archive_cleanup_check_tracking!(slug, journal, plan, heads)
         if path_exists?(work_dir(slug))
           verify_pending_archive_tracking!(slug, journal, plan, final_heads: heads)
@@ -877,8 +881,15 @@ module DevSession
         file.flush
         file.fsync
       end
-      File.rename(temporary, path)
-      fsync_directory(File.dirname(path))
+      publish = lambda do
+        File.rename(temporary, path)
+        fsync_directory(File.dirname(path))
+      end
+      if create
+        @runner.archive_cleanup_publish_binding(sidecar, &publish)
+      else
+        publish.call
+      end
     ensure
       File.unlink(temporary) if temporary && exists?(temporary)
     end

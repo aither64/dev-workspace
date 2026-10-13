@@ -1,0 +1,165 @@
+# Coordinated workspace operations
+
+The user-profile coordinator schedules three operations: fast-forward Git
+integration, machine activation and workspace profile activation. Sessions keep
+their own branches, reviews and conversations. They prepare independently and
+submit exact reviewed snapshots under existing user authorization.
+
+Builds, input updates, rebases, conflict resolution and verification run before
+resource claims. An admitted worker holds only the resources its mutation needs.
+Different repository targets and machines can proceed concurrently. Eligible work
+uses FIFO order; waiting on approval or dependencies does not block unrelated work.
+
+## Machine ownership during review
+
+A reservation belongs to a session and physical machine. It survives successful
+deployment, idle agents, browser closure, UI review, feedback and repeated fixes.
+It also covers workspace profile selection on that machine. Other sessions can
+build and merge while their deployment waits.
+
+Normal release requires every exact final owned feature head to be integrated,
+all deployed input revisions to be integrated, settled operations and deliveries,
+unchanged live identities, and an explicit declaration that deployment and review
+work is finished. Integration alone does not release a machine. Deployment or
+review does not supply merge approval.
+
+Archive and deletion retain deployed or uncertain reservations as recovery
+blockers. Revival preserves ownership. An uncertain effect retains its execution
+claim too; a dead process, failed SSH command or timeout cannot prove no effect.
+The first implementation refuses exceptional release without integration. Resolve
+it through an explicitly authorized, reviewed recovery operation rather than
+editing or deleting the ledger.
+
+## Session commands
+
+Commands select the registered workspace normally and require the exact slug:
+
+```text
+dev-session coordination status SESSION --as-is --json
+dev-session coordination prepare SESSION --as-is --request FILE --json
+dev-session coordination approve SESSION --as-is --request FILE --json
+dev-session coordination reserve SESSION --as-is --request FILE --json
+dev-session coordination submit SESSION --as-is --request FILE --json
+dev-session coordination refresh SESSION JOB --as-is --request FILE --json
+dev-session coordination cancel SESSION JOB --as-is --request FILE --json
+dev-session coordination reconcile SESSION JOB --as-is --json
+dev-session coordination finish SESSION RESERVATION --as-is --request FILE --json
+workspace-host coordination status --json
+```
+
+JSON requests use `schema: 1` and a caller-generated lowercase UUID `requestId`.
+An exact retry returns its retained receipt; changing input under the same ID
+refuses. Updates use `expectedRevision`. Exit 0 reports acceptance or status, not
+necessarily successful execution. Exit 2 means invalid input, 3 stale evidence or
+baseline, 4 missing authorization or ownership, 5 recovery required, and 75 a
+temporary admission conflict.
+
+Preparation takes `kind`, session evidence (`kind`, `path`, SHA-256 `sha256`), and
+the registered `repository` for a merge or catalog `target` for a machine. Profile
+preparation uses the session's registered workspace branch. Evidence lives under
+the owning session's active tracking directory. Preparation retains committed
+sources, artifacts and a content-addressed snapshot; it returns that snapshot.
+
+Approval records `kind` (`merge` or `deploy`), exact `scope`, `reviewedSnapshot`,
+and `source: {kind: "user_instruction", reference, quote}`. Merge scope entries
+contain `repository` and full `target` ref. Deployment entries contain canonical
+`machine`, `actions` (`switch`, `profile_activate`) and `reboot: false`. Quote the
+actual user direction. An optional `iterationScope` must be explicitly authorized;
+the prepared snapshot's `changeScope` must match it. A digest without an existing
+owner-prepared snapshot cannot become an approval.
+
+A reservation request contains `target`, `mode` (`deploy_first` or `integrated`),
+`approvalId` and `integrationObligations` (`repository`, full `target`). Current
+registrations are also frozen as obligations. Removing a registration cannot
+erase them. Reservations are requested near the first prepared deployment, and
+are granted only with its eligible first operation.
+
+Submission contains `kind`, `dependsOn`, `approvalId`, `reservationId` and the
+complete returned `snapshot`. Dependencies name earlier jobs of the same owner.
+Merge-only jobs use a null reservation. A null approval stores waiting work and
+cannot execute. `refresh` supplies `expectedRevision`, a fresh snapshot and its
+applicable approval; it cannot replace an admitted or uncertain attempt.
+
+`workspace-host switch --source PATH` prepares outside locks, finds an exact
+retained approved profile snapshot and machine reservation, submits it once and
+waits outside locks. It preserves an existing job's dependency graph. If another
+deployment is pending, use explicit submission to specify order. This command
+cannot manufacture review or approval. Coordinated source selection requires a
+clean committed source; `workspace-host prepare --source PATH --json` can also
+inspect a local source before it is committed.
+
+## Completion and cumulative deployments
+
+`finish` takes `expectedRevision`, `deploymentWorkFinished: true`, a nonempty
+acceptance `evidence` reference and `finalHeads` entries with `repository`, full
+`target` and exact `head`. Those heads must match current owned registrations and
+be contained in freshly fetched targets. Unregistered inputs use their sealed
+catalog `defaultTarget` and canonical clone; the coordinator proves their actual
+deployed revisions are already integrated. It never invents feature registrations
+for unchanged dependencies.
+
+Completion retains both proof categories. The machine frontier records final
+owned heads and actual deployed unowned revisions separately for system and
+profile activation. Later prepared deployments must include those integrated
+changes. Immediately before machine activation, the worker also fetches the
+configuration repository target and proves that the prepared source includes it. An older prepared deployment returns `needs_refresh` rather than undoing
+previously completed work.
+
+Rebased deployed features need exact reviewed replacement lineage in
+`finish.replacements`. It binds the repository/target, deployed and final ranges,
+applicable integration approval and a checksummed independent review receipt.
+See [operations and recovery](coordination-operations.md). Original deployed
+artifacts and source roots remain retained.
+
+## Runtime and compatibility
+
+Ruby owns a private schema-1 ledger under the selected runtime's state root.
+Transactions atomically replace fsynced JSON under one short mutex. Commands and
+physical-lock waits run outside that mutex. Workers publish separate immutable
+attempt requests and phase/result receipts. Each runs in an independent systemd
+service, so restarting the portal or coordinator does not stop it.
+
+Package candidates must support the retained coordination contract, adapters and
+machine mappings. Old packages that ignore coordination state cannot be selected
+once that state exists. Profile failure after selection recovers forward to the
+same approved candidate; the original machine reservation remains held.
+
+The installed `coordination.json` catalog comes from optional `coordinationConfig`
+in `lib.mkPackage`. It owns immutable adapter executables, exact machine selectors,
+aliases, canonical SSH repositories, full default targets and flake `inputPaths`.
+Input mappings are keyed by source repository and contain lists of input paths.
+The separate extension catalog and session manifest formats remain unchanged.
+The pure Ruby `lib.coordinationCommandLibrary` is also used by packaged adapters
+for bounded protocol capture and diagnostics; it does not import the ledger.
+
+The Operations panels are authenticated, bounded, read-only views. They show
+machine ownership, blocked jobs and notification delivery separately. An idle
+owner still reserves its machine.
+
+Notifications use the existing Codex submission ledger, exact retained thread,
+model, effort and lead policy. Busy threads receive steering; idle threads receive
+a new turn. The coordinator preserves message IDs and reconciles lost replies.
+Each snapshot has one retained notification per reported state; repeated resource
+waits or reconciliation reuse that event. Native options and receipts live in
+immutable checksummed artifacts, so large retained instructions do not fill the
+operation ledger. Retries verify and load the original options.
+A crash after recording submission but before the native RPC can leave delivery
+ambiguous. That event remains visible and retries only reconciliation; it never
+creates another message ID or conversation to escape the ambiguity.
+
+Selected-package registration reconciles services under the transition lock and
+refuses a pending package transition or held machine review reservation before
+changing the registry. Private profile activation still requires its exact claim.
+Managed lead and member technical bindings point to the installed guide without
+changing retained role instructions, model, effort or access.
+
+Lifecycle preparation runs outside the ledger mutex. Publication of a new
+ordinary journal or archive cleanup sidecar checks capacity and binds its exact
+operation while holding that mutex. Competing admissions cannot consume the
+checked space before publication. Existing bindings remain recoverable at the
+admission ceiling.
+
+The guarantees cover cooperating commands in one user runtime. The local operator
+is trusted; arbitrary external Git, confctl, SSH and old store binaries can bypass
+coordination. Remote clients remain subject to the portal's authentication and
+authorization rules.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Development workspace operation coordinator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-coordinator
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+[Install]
+WantedBy=default.target
