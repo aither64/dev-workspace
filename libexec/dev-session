@@ -8674,7 +8674,7 @@ module DevSession
       catalog = @env.fetch('DEV_WORKSPACES_CODEX_PROVIDERS', '/etc/dev-workspaces/codex-providers.json')
       state = File.join(@workspace_state_root, 'providers', name, 'state.json')
       return [] unless File.exist?(catalog) || File.exist?(state)
-      output = @runner.capture(
+      output, = @command_runner.capture(
         [File.join(@host_profile, 'bin/workspace-host'), 'provider', 'native-args', name], env: @env
       )
       raise Error, 'provider native arguments exceed bounds' if output.bytesize > 256 * 1024

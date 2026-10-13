@@ -540,6 +540,105 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_creation_launches_terminal_with_configured_provider_arguments
+    with_workspace do |workspace|
+      slug = '2026-06-06-provider-start'
+      native = ['-c', 'model_provider="workspace provider"', '-c', 'model_providers.workspace.name="quoted \\\"value\\\""']
+      profile = File.join(workspace, 'profile')
+      FileUtils.mkdir_p(File.join(profile, 'bin'))
+      catalog = File.join(workspace, 'providers.json')
+      File.write(catalog, '{}')
+      host = File.join(profile, 'bin', 'workspace-host')
+      File.write(host, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'json'
+        abort 'wrong provider command' unless ARGV == ['provider', 'native-args', 'demo']
+        abort 'missing provider environment' unless ENV['DEV_WORKSPACE_NAME'] == 'demo'
+        puts #{JSON.generate('argv' => native).dump}
+      RUBY
+      File.chmod(0o755, host)
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      portal = File.join(workspace, 'portal.rb')
+      calls = File.join(workspace, 'portal-calls.jsonl')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.open(#{calls.dump}, 'a') { |file| file.puts JSON.generate(ARGV) }
+        puts JSON.generate(threadId: 'thread-provider') if ARGV[0, 2] == ['thread', 'create']
+      RUBY
+      tmux = ManagedTmux.new(slug, workspace:, codex_thread_id: 'thread-provider',
+                             codex_socket_path: '/run/test/codex.sock',
+                             codex_client_version: '0.153.2', pane_current_command: 'sh')
+      session = tmux.session(slug)
+      created = false
+      tmux.define_singleton_method(:session) { |name| super(name) if created }
+      tmux.define_singleton_method(:managed_session_identities) { created ? super() : [] }
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:cleanup_session) { |_slug| nil }
+        define_method(:create_tmux_session) do |*_args, **keywords|
+          raise 'native client launched before initial goal' if keywords.fetch(:launch_codex)
+          session.identity_token = keywords.fetch(:identity_token)
+          created = true
+          session
+        end
+        define_method(:sync_slug) { |*_args, **_keywords| session }
+        define_method(:revalidate_session!) { |expected| expected }
+      end
+      runner = runner_class.new(workspace:, tmux:, codex_socket: '/run/test/codex.sock',
+                                codex_version: '0.153.2', codex_command: codex, host_profile: profile,
+                                portal_command: [RbConfig.ruby, portal], today: TODAY,
+                                out: StringIO.new, err: StringIO.new,
+                                env: { 'SHELL' => '/bin/sh', 'DEV_WORKSPACE_NAME' => 'demo',
+                                       'DEV_WORKSPACES_CODEX_PROVIDERS' => catalog,
+                                       'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') })
+
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: true,
+                   goal_text: 'Use the configured provider.', json: true)
+
+      assert_equal(1, tmux.sent_commands.length)
+      assert_equal([codex, *native, '--remote', 'unix:///run/test/codex.sock', 'resume', 'thread-provider'],
+                   Shellwords.split(tmux.sent_commands.first))
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      assert_equal(true, manifest.dig('creation', 'initial_goal_sent'))
+      commands = File.readlines(calls).map { |line| JSON.parse(line).first(2) }
+      assert_equal(1, commands.count(['thread', 'create']))
+      assert_equal(1, commands.count(['thread', 'ensure-initial']))
+    end
+  end
+
+  def test_terminal_provider_arguments_are_validated_before_dispatch
+    with_workspace do |workspace|
+      slug = '2026-06-06-provider-invalid'
+      profile = File.join(workspace, 'profile')
+      FileUtils.mkdir_p(File.join(profile, 'bin'))
+      catalog = File.join(workspace, 'providers.json')
+      File.write(catalog, '{}')
+      host = File.join(profile, 'bin', 'workspace-host')
+      File.write(host, "#!/bin/sh\nprintf '%s\\n' '{\"argv\":[\"--remote\",\"unexpected\"]}'\n")
+      File.chmod(0o755, host)
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.153.2'\n")
+      File.chmod(0o755, codex)
+      tmux = ManagedTmux.new(slug, workspace:, codex_thread_id: 'thread-provider',
+                             codex_socket_path: '/run/test/codex.sock',
+                             codex_client_version: '0.153.2', pane_current_command: 'sh')
+      runner = DevSession::Runner.new(workspace:, tmux:, codex_socket: '/run/test/codex.sock',
+                                      codex_version: '0.153.2', codex_command: codex,
+                                      host_profile: profile, out: StringIO.new, err: StringIO.new,
+                                      env: { 'SHELL' => '/bin/sh', 'DEV_WORKSPACE_NAME' => 'demo',
+                                             'DEV_WORKSPACES_CODEX_PROVIDERS' => catalog,
+                                             'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') })
+
+      error = assert_raises(DevSession::Error) do
+        runner.send(:reconcile_native_client!, slug, tmux.session(slug))
+      end
+      assert_includes(error.message, 'invalid provider native arguments')
+      assert_empty(tmux.sent_commands)
+    end
+  end
+
   def test_terminal_reconciliation_refuses_an_incomplete_creation
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
