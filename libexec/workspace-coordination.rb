@@ -10,6 +10,7 @@ require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-coordination-command'
+require_relative 'workspace-coordination-timing'
 
 # The ledger mutex protects JSON transactions only. External commands and
 # physical locks always belong outside it. Admitted workers publish separate
@@ -162,6 +163,7 @@ module WorkspaceCoordination
       lock do
         data = read
         before = WorkspaceCoordination.digest(data)
+        previous_states = Timing.states(data)
         result = yield(data)
         if WorkspaceCoordination.digest(data) != before
           data['revision'] += 1
@@ -169,6 +171,7 @@ module WorkspaceCoordination
           payload = JSON.generate(data)
           raise Error.new('coordination ledger is full; retain unresolved state', 5) if payload.bytesize + 1 > MAX_LEDGER
           WorkspaceCoordination.atomic(File.join(root, 'ledger.json'), data)
+          Timing.new(root).publish(previous_states, data)
           wake
         end
         result
@@ -1226,6 +1229,8 @@ module WorkspaceCoordination
        'notifications' => data['outbox'].values.select { |event| ids.include?(event['ownerId']) }.map { |event| event.reject { |key, _| %w[text options].include?(key) } },
        'foreignReservations' => data['reservations'].values.reject { |item| ids.include?(item['ownerId']) || item['state'] == 'released' }.map { |item| item.slice('machine', 'state').merge('portalUrl' => data['owners'][item['ownerId']]['portalUrl']) }}
       if portal
+        timing = Timing.new(store.root)
+        dates = timing.read
         observations = {}
         owners.map { |owner| owner['slug'] }.uniq.each do |name|
           store.lifecycle_owners(data, workspace, name) { |owner, observation| observations[owner['id']] = observation }
@@ -1240,7 +1245,8 @@ module WorkspaceCoordination
           name = catalog.data.fetch('machines').find { |_key, value| value['id'] == item['machine'] }&.first
           item.slice('id', 'ownerId', 'machine', 'state', 'revision', 'mode').merge(
             'shortName' => name || item['machine'].split(':').last,
-            'deployments' => item.fetch('history', []).length)
+            'deployments' => item.fetch('history', []).length,
+            'timestamps' => timing.matching(dates, 'reservations', item))
         end
         held = result['reservations'].reject { |item| %w[requested released].include?(item['state']) }.group_by { |item| item['ownerId'] }
         result['reservationHolders'] = []
@@ -1257,6 +1263,7 @@ module WorkspaceCoordination
         result['jobs'] = result['jobs'].sort_by { |job| [TERMINAL.include?(job['state']) ? 1 : 0, -job['sequence']] }.first(128).map do |job|
           job.slice('id', 'ownerId', 'kind', 'state', 'reason', 'revision', 'sequence', 'readySequence', 'dependsOn', 'reservationId').merge(
             'snapshotId' => job.dig('snapshot', 'id'), 'source' => job.dig('snapshot', 'operation').slice('repository', 'target', 'featureHead', 'configurationHead', 'candidatePackage'),
+            'timestamps' => timing.matching(dates, 'jobs', job),
             'result' => job['result'] && job['result'].slice('outcome', 'observed', 'phase', 'error'))
         end
         result['reservations'] = result['reservations'].sort_by { |item| [item['state'] == 'released' ? 1 : 0, -item['sequence']] }.first(128).map { |item| machine_details.call(item) }

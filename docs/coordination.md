@@ -159,6 +159,29 @@ to the same observation identity as badges; a recreated session cannot inherit
 an earlier incarnation's history. The tab reads only while it and the document
 are visible. Read failures retain the last successful view with a warning.
 
+### Operation dates
+
+Dates describe when the coordinator records creation, a state change, completion
+or the first reservation grant. They do not measure the exact moment a remote
+worker changed the machine. Dates use UTC in status responses and the browser's
+local timezone in the interface. Missing dates appear as Time unavailable.
+
+Optional private `coordination/timing.json` metadata records entity UUID,
+revision and state. It is published after each relevant authoritative ledger
+commit, under the existing mutex, and is exposed only when those values match
+the current record. Creation time is recorded only for new records; reads and
+idempotent retries never populate it. Existing records stay undated until a new
+event occurs. A reservation's grant time remains unknown if it predates timing
+support. File modification times and worker phase receipts do not backfill dates.
+
+The ledger schema, deployment history, worker envelopes and receipts remain
+unchanged. Older packages ignore timing metadata. A predecessor can therefore
+continue an admitted operation across forward package selection; any timing
+that becomes stale is omitted. Missing, corrupt, oversized or unwritable metadata
+affects dates only. A crash after ledger publication can leave an event without
+a date. Timing failure never rolls back successful work or affects scheduling,
+ownership, completion proofs or scheduler wake-up.
+
 Notifications use the existing Codex submission ledger, exact retained thread,
 model, effort and lead policy. Busy threads receive steering; idle threads receive
 a new turn. The coordinator preserves message IDs and reconciles lost replies.

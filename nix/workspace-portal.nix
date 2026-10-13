@@ -296,11 +296,12 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
-    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command; do
+    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
     ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"
     ln -s ../workspace-coordination-command.rb "$out/libexec/workspace-portal/workspace-coordination-command.rb"
+    ln -s ../workspace-coordination-timing.rb "$out/libexec/workspace-portal/workspace-coordination-timing.rb"
     install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
       "$out/libexec/workspace-codex-providers.rb"
     install -Dm644 ${src}/libexec/workspace-provider-admission.rb \
