@@ -27,7 +27,7 @@ func TestAutomaticArchivalPageIsSeparateFromIndex(t *testing.T) {
 			t.Fatalf("index still renders overview %q", removed)
 		}
 	}
-	for _, required := range []string{`class="sidebar-heading sidebar-toolbar"`, `aria-label="Workspace menu"`, `popovertarget="sidebar-menu"`, `popover="auto"`, `href="/automatic-archival" autofocus`} {
+	for _, required := range []string{`class="sidebar-heading sidebar-toolbar"`, `aria-label="Workspace menu"`, `popovertarget="sidebar-menu"`, `popover="auto"`, `href="/operations" autofocus`} {
 		if !strings.Contains(index.Body.String(), required) {
 			t.Fatalf("index sidebar menu lacks %q", required)
 		}

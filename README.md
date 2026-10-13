@@ -397,6 +397,11 @@ nix develop --command go -C portal test -mod=readonly ./internal/teamruntime
 The explicit `-mod=readonly` uses the pinned module files. The Nix package sets
 `GOFLAGS` to vendor mode, while the source checkout has no `portal/vendor`.
 
+On a configured workspace host, focused portal WebUI tests must use an absent
+test catalog through `DEV_WORKSPACES_CODEX_PROVIDERS`. Otherwise their disposable,
+unregistered workspaces read the host's provider catalog. Package checks run in
+the isolated Nix build environment.
+
 CI runs package and focused checks on every push and pull request. On `master`
 and manual dispatch, it also runs a small NixOS VM test for activation,
 idempotency, nginx authentication, renewal, recovery and rollback. Dispatch

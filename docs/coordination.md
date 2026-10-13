@@ -132,9 +132,32 @@ The separate extension catalog and session manifest formats remain unchanged.
 The pure Ruby `lib.coordinationCommandLibrary` is also used by packaged adapters
 for bounded protocol capture and diagnostics; it does not import the ledger.
 
-The Operations panels are authenticated, bounded, read-only views. They show
+The Operations page is an authenticated, bounded, read-only view. It shows
 machine ownership, blocked jobs and notification delivery separately. An idle
-owner still reserves its machine.
+owner still reserves its machine. The workspace menu links to `/operations`
+above Automatic archival. Reserved machines appear as cards with their owning
+session and the reason for the hold. Running and waiting operations appear
+separately from recent completed results. System configuration deployment and
+workspace application updates have distinct labels. A completed step does not
+mean that review or integration has ended or that the machine has been released.
+IDs, source revisions and diagnostics are available under Technical details.
+Session-list badges mark held machine reservations, including review and recovery;
+queued requests and brief execution claims do not receive badges. Ownership is
+matched to the retained active or archived session incarnation. The portal's
+`reservationHolders` summary covers all current holders before history truncation.
+The established tracking observation identity also matches cached holders to
+session cards, so a replacement session cannot inherit the old badge. Visible
+pages refresh every five seconds. Failed reads preserve the last known status
+with a warning for the same incarnation; a successful read confirms release.
+
+A single-machine badge uses its configured short name, such as BUILDHOST
+RESERVED. Multiple-machine badges show the distinct count. The tooltip lists
+every held machine and its status. The session's Reservations tab, between
+Clusters and Artifacts, shows its held machines, pending requests and related
+operations. Links to `#reservations` open that tab. Session results are matched
+to the same observation identity as badges; a recreated session cannot inherit
+an earlier incarnation's history. The tab reads only while it and the document
+are visible. Read failures retain the last successful view with a warning.
 
 Notifications use the existing Codex submission ledger, exact retained thread,
 model, effort and lead policy. Busy threads receive steering; idle threads receive

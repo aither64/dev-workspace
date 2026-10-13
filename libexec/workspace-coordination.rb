@@ -1226,6 +1226,22 @@ module WorkspaceCoordination
        'notifications' => data['outbox'].values.select { |event| ids.include?(event['ownerId']) }.map { |event| event.reject { |key, _| %w[text options].include?(key) } },
        'foreignReservations' => data['reservations'].values.reject { |item| ids.include?(item['ownerId']) || item['state'] == 'released' }.map { |item| item.slice('machine', 'state').merge('portalUrl' => data['owners'][item['ownerId']]['portalUrl']) }}
       if portal
+        observations = {}
+        owners.map { |owner| owner['slug'] }.uniq.each do |name|
+          store.lifecycle_owners(data, workspace, name) { |owner, observation| observations[owner['id']] = observation }
+        end
+        # A session pane must not attribute retained jobs to a recreated slug.
+        if slug
+          ids.select! { |id| observations.key?(id) }
+          %w[owners jobs reservations notifications].each { |kind| result[kind].select! { |item| ids.include?(kind == 'owners' ? item['id'] : item['ownerId']) } }
+        end
+        result['owners'].each { |owner| owner['observationIdentity'] = observations[owner['id']] }
+        machine_details = lambda do |item|
+          name = catalog.data.fetch('machines').find { |_key, value| value['id'] == item['machine'] }&.first
+          item.slice('id', 'ownerId', 'machine', 'state', 'revision', 'mode').merge(
+            'shortName' => name || item['machine'].split(':').last,
+            'deployments' => item.fetch('history', []).length)
+        end
         held = result['reservations'].reject { |item| %w[requested released].include?(item['state']) }.group_by { |item| item['ownerId'] }
         result['reservationHolders'] = []
         owners.select { |owner| held.key?(owner['id']) }.map { |owner| owner['slug'] }.uniq.each do |name|
@@ -1233,7 +1249,7 @@ module WorkspaceCoordination
             next unless held.key?(owner['id'])
             result['reservationHolders'] << owner.slice('slug', 'portalUrl').merge('ownerId' => owner['id'],
               'observationIdentity' => observation,
-              'machines' => held.fetch(owner['id']).sort_by { |item| item['machine'] }.map { |item| item.slice('machine', 'state') })
+              'machines' => held.fetch(owner['id']).sort_by { |item| item['machine'] }.map { |item| machine_details.call(item) })
           end
         end
         result['counts'] = result.slice('owners', 'jobs', 'reservations', 'notifications', 'foreignReservations').transform_values(&:length)
@@ -1243,7 +1259,7 @@ module WorkspaceCoordination
             'snapshotId' => job.dig('snapshot', 'id'), 'source' => job.dig('snapshot', 'operation').slice('repository', 'target', 'featureHead', 'configurationHead', 'candidatePackage'),
             'result' => job['result'] && job['result'].slice('outcome', 'observed', 'phase', 'error'))
         end
-        result['reservations'] = result['reservations'].sort_by { |item| [item['state'] == 'released' ? 1 : 0, -item['sequence']] }.first(128).map { |item| item.slice('id', 'ownerId', 'machine', 'state', 'revision', 'mode').merge('deployments' => item['history'].length) }
+        result['reservations'] = result['reservations'].sort_by { |item| [item['state'] == 'released' ? 1 : 0, -item['sequence']] }.first(128).map { |item| machine_details.call(item) }
         result['notifications'] = result['notifications'].last(128)
         result['foreignReservations'] = result['foreignReservations'].first(128)
       end

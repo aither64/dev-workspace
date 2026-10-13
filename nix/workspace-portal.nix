@@ -269,6 +269,8 @@ buildGoModule {
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
+    node --check internal/web/static/coordination.js
+    node --test internal/web/coordination_browser_test.cjs
     node --check internal/web/static/codex-providers.js
     node --test internal/web/codex_providers_browser_test.cjs
     node --check internal/web/static/repository-review.js
