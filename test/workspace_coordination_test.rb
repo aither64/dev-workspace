@@ -77,6 +77,94 @@ class WorkspaceCoordinationTest < Minitest::Test
     {'schema' => 1, 'requestId' => SecureRandom.uuid}.merge(values)
   end
 
+  def with_time(value)
+    original = Time.method(:now)
+    Time.define_singleton_method(:now) { value }
+    yield
+  ensure
+    Time.define_singleton_method(:now, original)
+  end
+
+  def test_event_dates_track_committed_states_and_idempotent_retries
+    first = owner('dated-events')
+    job = with_time(Time.utc(2026, 1, 1)) { submit_merge(first) }
+    timing = WorkspaceCoordination::Timing.new(@engine.store.root)
+    assert_equal '2026-01-01T00:00:00Z', timing.read['jobs'][job['id']]['createdAt']
+    payload = request('expectedRevision' => job['revision'], 'reason' => 'finished fixture')
+    with_time(Time.utc(2026, 1, 2)) { @engine.mutate(first, 'cancel', payload, job_id: job['id']) }
+    dates = timing.read['jobs'][job['id']]
+    assert_equal '2026-01-01T00:00:00Z', dates['createdAt']
+    assert_equal '2026-01-02T00:00:00Z', dates['stateChangedAt']
+    assert_equal dates['stateChangedAt'], dates['finishedAt']
+    before = File.binread(File.join(@engine.store.root, 'timing.json'))
+    with_time(Time.utc(2026, 1, 3)) { @engine.mutate(first, 'cancel', payload, job_id: job['id']) }
+    assert_equal before, File.binread(File.join(@engine.store.root, 'timing.json'))
+    assert_equal dates.slice(*WorkspaceCoordination::Timing::FIELDS), @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+  end
+
+  def test_missing_corrupt_and_stale_dates_never_repair_on_status_reads
+    first = owner('legacy-dates')
+    job = submit_merge(first)
+    path = File.join(@engine.store.root, 'timing.json')
+    File.unlink(path)
+    assert_empty @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+    refute File.exist?(path)
+    File.write(path, '{corrupt')
+    assert_empty @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+    assert_equal '{corrupt', File.read(path)
+    timing = WorkspaceCoordination::Timing.new(@engine.store.root)
+    ledger = @engine.store.read
+    metadata = timing.empty
+    metadata['jobs'][job['id']] = {'revision' => job['revision'] + 1, 'state' => 'succeeded', 'finishedAt' => '2026-01-01T00:00:00Z'}
+    WorkspaceCoordination.atomic(path, metadata)
+    assert_empty @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+    assert_equal ledger, @engine.store.read
+    payload = request('expectedRevision' => job['revision'], 'reason' => 'new event')
+    @engine.mutate(first, 'cancel', payload, job_id: job['id'])
+    dates = @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+    refute dates.key?('createdAt')
+    assert dates.key?('finishedAt')
+  end
+
+  def test_timing_write_failure_does_not_fail_committed_work_or_scheduler_wake
+    first = owner('unavailable-dates')
+    job = submit_merge(first)
+    path = File.join(@engine.store.root, 'timing.json')
+    File.unlink(path)
+    FileUtils.mkdir_p(path)
+    wakes = 0
+    @engine.store.define_singleton_method(:wake) { wakes += 1 }
+    payload = request('expectedRevision' => job['revision'], 'reason' => 'still successful')
+    _out, err = capture_io { assert_equal 'canceled', @engine.mutate(first, 'cancel', payload, job_id: job['id'])['state'] }
+    assert_match(/coordination timing is unavailable/, err)
+    assert_equal 1, wakes
+    assert_empty @engine.status(first['slug'], portal: true)['jobs'].first['timestamps']
+    @engine.store.validate!(@engine.store.read)
+  end
+
+  def test_reservation_grant_time_is_distinct_from_request_and_covers_lifecycle_release
+    first = owner('dated-reservation')
+    @engine.store.transaction do |data|
+      id = SecureRandom.uuid
+      data['reservations'][id] = {'id' => id, 'ownerId' => first['id'], 'machine' => 'fixture:buildhost', 'target' => 'buildhost',
+        'state' => 'requested', 'revision' => 1, 'sequence' => @engine.store.sequence(data), 'mode' => 'deploy_first',
+        'approvalId' => nil, 'integrationObligations' => [], 'history' => []}
+      @reservation_id = id
+    end
+    timing = WorkspaceCoordination::Timing.new(@engine.store.root)
+    refute timing.read['reservations'][@reservation_id].key?('heldAt')
+    with_time(Time.utc(2026, 1, 2)) do
+      @engine.store.transaction do |data|
+        value = data['reservations'][@reservation_id]; value['state'] = 'held'; value['revision'] += 1
+      end
+    end
+    assert_equal '2026-01-02T00:00:00Z', timing.read['reservations'][@reservation_id]['heldAt']
+    with_time(Time.utc(2026, 1, 3)) { @engine.store.transaction { |data| @engine.store.fence_owners!(data, [data['owners'][first['id']]], 'archive') } }
+    dates = timing.read['reservations'][@reservation_id]
+    assert_equal '2026-01-02T00:00:00Z', dates['heldAt']
+    assert_equal '2026-01-03T00:00:00Z', dates['finishedAt']
+  end
+
   def test_session_projection_excludes_a_recreated_slugs_retained_history
     first = owner('replacement-history')
     submit_merge(first)
