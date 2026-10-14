@@ -224,6 +224,43 @@ func TestLoadInstalledCatalogAndPin(t *testing.T) {
 	}
 }
 
+func TestPackageMetadataSupportsOptionalIntegrationCapability(t *testing.T) {
+	for _, managed := range []bool{false, true} {
+		root, _ := writeCatalogFixture(t, managed)
+		path := filepath.Join(root, packageMetadataRelativePath)
+		original, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadInstalled(root); err != nil {
+			t.Fatalf("predecessor metadata: %v", err)
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal(original, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		metadata["integration"] = map[string]int{"journalSchema": 1, "certificationSchema": 1}
+		if err := os.WriteFile(path, marshalFixture(t, metadata), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		installed, err := LoadInstalled(root)
+		if err != nil || installed.Metadata.Integration == nil || installed.Metadata.Integration.JournalSchema != 1 {
+			t.Fatalf("integration capability: %#v, %v", installed.Metadata.Integration, err)
+		}
+		for _, invalid := range []any{nil, map[string]int{"journalSchema": 1},
+			map[string]int{"journalSchema": 2, "certificationSchema": 1},
+			map[string]int{"journalSchema": 1, "certificationSchema": 1, "unexpected": 1}} {
+			metadata["integration"] = invalid
+			if err := os.WriteFile(path, marshalFixture(t, metadata), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadInstalled(root); err == nil {
+				t.Fatalf("invalid capability accepted: %#v", invalid)
+			}
+		}
+	}
+}
+
 func TestLoadInstalledUnmanagedAndRejectsUnsafeNativeFile(t *testing.T) {
 	root, _ := writeCatalogFixture(t, false)
 	installed, err := LoadInstalled(root)

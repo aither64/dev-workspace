@@ -31,6 +31,7 @@
           routerSocket ? hostPaths.routerSocket,
           teamConfig ? null,
           coordinationConfig ? null,
+          integrationConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
@@ -50,6 +51,7 @@
             routerSocket
             teamConfig
             coordinationConfig
+            integrationConfig
             userNamespace
             ;
         };

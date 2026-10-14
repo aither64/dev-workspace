@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-coordination'
+require_relative 'workspace-integration-certification'
 
 module WorkspaceCoordination
   class Engine
@@ -534,21 +535,27 @@ module WorkspaceCoordination
         unless ancestor?(path, item['fromBase'], item['from']) && ancestor?(path, item['toBase'], item['to']) && !ancestor?(path, item['from'], item['to'])
           raise Error.new('replacement ranges are invalid or mapping is unused', 4)
         end
-        raise Error, 'replacement must reference review evidence' unless item.dig('evidence', 'kind') == 'review'
-        receipt = WorkspaceCoordination.parse(File.binread(lineage_evidence(owner, item['evidence']), MAX_REQUEST + 1))
-        WorkspaceCoordination.keys!(receipt, %w[schema ownerId reservationId mapping decision reviewer artifacts])
-        unless receipt['schema'] == 1 && receipt['ownerId'] == owner['id'] && receipt['reservationId'] == reservation['id'] &&
-               receipt['mapping'] == item.reject { |key, _| key == 'evidence' } && receipt['decision'] == 'accepted' && receipt['reviewer'].is_a?(String) && !receipt['reviewer'].empty?
-          raise Error.new('replacement review does not bind this exact owner and ranges', 4)
+        if item['relation'] == 'certified_equivalent'
+          raise Error, 'certified replacement must reference equivalence evidence' unless item.dig('evidence', 'kind') == 'equivalence'
+          receipt = Certification.new(self).validate_receipt(owner, item)
+          raise Error.new('equivalence reservation differs', 4) unless receipt['reservationId'] == reservation['id']
+        else
+          raise Error, 'replacement must reference review evidence' unless item.dig('evidence', 'kind') == 'review'
+          receipt = WorkspaceCoordination.parse(File.binread(lineage_evidence(owner, item['evidence']), MAX_REQUEST + 1))
+          WorkspaceCoordination.keys!(receipt, %w[schema ownerId reservationId mapping decision reviewer artifacts])
+          unless receipt['schema'] == 1 && receipt['ownerId'] == owner['id'] && receipt['reservationId'] == reservation['id'] &&
+                 receipt['mapping'] == item.reject { |key, _| key == 'evidence' } && receipt['decision'] == 'accepted' && receipt['reviewer'].is_a?(String) && !receipt['reviewer'].empty?
+            raise Error.new('replacement review does not bind this exact owner and ranges', 4)
+          end
+          artifacts = receipt.fetch('artifacts')
+          unless artifacts.is_a?(Array) && artifacts.map { |artifact| artifact['kind'] }.sort == %w[migration_review range_diff verification]
+            raise Error.new('replacement review needs range, verification and migration evidence', 4)
+          end
+          artifacts.each { |artifact| lineage_evidence(owner, artifact) }
+          range = artifacts.find { |artifact| artifact['kind'] == 'range_diff' }
+          actual = capture('git', '-C', path, 'range-diff', '--no-color', '--creation-factor=80', "#{item['fromBase']}..#{item['from']}", "#{item['toBase']}..#{item['to']}", digest: true)
+          raise Error.new('retained range-diff does not match replacement ranges', 4) unless actual == "sha256:#{range['sha256']}"
         end
-        artifacts = receipt.fetch('artifacts')
-        unless artifacts.is_a?(Array) && artifacts.map { |artifact| artifact['kind'] }.sort == %w[migration_review range_diff verification]
-          raise Error.new('replacement review needs range, verification and migration evidence', 4)
-        end
-        artifacts.each { |artifact| lineage_evidence(owner, artifact) }
-        range = artifacts.find { |artifact| artifact['kind'] == 'range_diff' }
-        actual = capture('git', '-C', path, 'range-diff', '--no-color', '--creation-factor=80', "#{item['fromBase']}..#{item['from']}", "#{item['toBase']}..#{item['to']}", digest: true)
-        raise Error.new('retained range-diff does not match replacement ranges', 4) unless actual == "sha256:#{range['sha256']}"
         approval = store.read['approvals'][item['approvalId']]
         unless approval && approval['ownerId'] == owner['id'] && approval['kind'] == 'merge' && approval['scope'].include?(item.slice('repository', 'target'))
           raise Error.new('replacement needs applicable user integration approval', 4)
@@ -563,6 +570,10 @@ module WorkspaceCoordination
           expected_base = approved_operation['featureHead'] == item['from'] ? item['fromBase'] : item['toBase']
           unless [item['from'], item['to']].include?(approved_operation['featureHead']) && approved_operation['comparisonBase'] == expected_base && ordered_patch_ids(path, item['fromBase'], item['from']) == ordered_patch_ids(path, item['toBase'], item['to'])
             raise Error.new('replacement does not preserve the approved ordered patches', 4)
+          end
+        when 'certified_equivalent'
+          unless approved_operation['featureHead'] == item['to'] && approved_operation['comparisonBase'] == item['toBase']
+            raise Error.new('certified replacement requires approval of the final prepared head', 4)
           end
         when 'reviewed_change'
           redeployed = records.all? do |old|

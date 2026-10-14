@@ -94,6 +94,52 @@ class DevSessionTest < Minitest::Test
     assert_equal([[['example', 'report.json'], { label: 'Report', as_is: true }]], calls)
   end
 
+  def test_artifact_registration_binds_expected_owner_under_the_session_lock
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-09-03-example'
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:new_threadless_portal_manifest, slug)
+      runner.send(:write_portal_manifest, slug, manifest)
+      root = File.join(workspace, 'work', slug)
+      stat = File.lstat(root)
+      id = SecureRandom.uuid
+      retained = {'workspace' => workspace, 'workspaceName' => 'fixture', 'slug' => slug, 'fence' => nil,
+        'identity' => WorkspaceCoordination.digest([workspace, 'fixture', slug, stat.dev, stat.ino,
+          manifest.dig('codex', 'thread_id'), WorkspaceCoordination.creation_identity(manifest)])}
+      store = Object.new
+      store.define_singleton_method(:read) { {'owners' => {id => retained}} }
+      runner.define_singleton_method(:coordination_store) { store }
+      runner.artifact_add(slug, 'first.json', label: 'Original', as_is: true, expected_owner: id)
+      path = File.join(root, 'portal.yml')
+      before = File.binread(path)
+      File.rename(root, root + '.previous')
+      FileUtils.mkdir_p(root)
+      File.binwrite(path, before) # Even identical bytes belong to a new inode.
+      error = assert_raises(DevSession::Error) do
+        runner.artifact_add(slug, 'second.json', label: 'Old run', as_is: true, expected_owner: id)
+      end
+      assert_match(/another session incarnation/, error.message)
+      assert_equal before, File.binread(path)
+      assert_raises(DevSession::Error) do
+        runner.artifact_add(slug, 'second.json', label: 'Old run', as_is: true, expected_owner: SecureRandom.uuid)
+      end
+      assert_equal before, File.binread(path)
+    end
+  end
+
+  def test_artifact_registration_cli_forwards_expected_owner
+    calls = []
+    fake = Object.new
+    fake.define_singleton_method(:artifact_add) { |*args, **options| calls << [args, options] }
+    id = SecureRandom.uuid
+    cli = DevSession::CLI.new(['artifact', 'add', 'example', 'report.json', '--label', 'Report',
+      '--expected-owner', id, '--as-is'], out: StringIO.new, err: StringIO.new)
+    cli.define_singleton_method(:runner) { fake }
+    assert_equal 0, cli.run
+    assert_equal id, calls.first.last[:expected_owner]
+  end
+
   def test_artifact_registration_preserves_a_concurrent_manifest_edit
     with_workspace do |workspace|
       runner = runner_for(workspace)

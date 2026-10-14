@@ -2,6 +2,7 @@
 
 require_relative 'workspace-coordination-execution'
 require_relative 'workspace-coordination-admission'
+require_relative 'workspace-integration'
 
 module DevWorkspaceHost
   # Host-owned command composition. The engine owns ledger writes; the existing
@@ -72,7 +73,7 @@ module DevWorkspaceHost
       action = argv.shift
       slug = argv.shift
       raise WorkspaceCoordination::Error, 'coordination requires an exact session slug and --as-is' unless slug && slug.match?(WorkspaceCoordination::PART)
-      id = argv.shift if %w[refresh cancel finish reconcile].include?(action)
+      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume].include?(action)
       options = {}
       OptionParser.new do |opts|
         opts.on('--as-is') { options[:as_is] = true }
@@ -81,6 +82,7 @@ module DevWorkspaceHost
         opts.on('--request FILE') { |value| options[:request] = value }
         opts.on('--bootstrap-owner ID') { |value| options[:bootstrap_owner] = value }
         opts.on('--admission-timeout SECONDS', Float) { |value| options[:admission_timeout] = value }
+        opts.on('--no-wait') { options[:no_wait] = true }
       end.parse!(argv)
       raise WorkspaceCoordination::Error, 'use coordination ACTION SLUG [ID] --as-is --request FILE' unless argv.empty? && options[:as_is]
       engine = coordination_engine(entry)
@@ -94,6 +96,30 @@ module DevWorkspaceHost
         return
       end
       request = options[:request] && coordination_input(options[:request])
+      if %w[integrate integration-status integration-resume].include?(action)
+        owner = nil
+        resumable_finalization = action == 'integration-resume' && id && id.match?(WorkspaceCoordination::UUID) &&
+          File.file?(File.join(engine.store.root, 'integrations', "#{id}.json")) &&
+          %w[finalizing complete].include?(WorkspaceCoordination.private_read(File.join(engine.store.root, 'integrations', "#{id}.json"))['phase'])
+        if action == 'integration-status' || resumable_finalization
+          raise WorkspaceCoordination::Error, 'invalid integration run ID' unless id && id.match?(WorkspaceCoordination::UUID)
+          journal = WorkspaceCoordination.private_read(File.join(engine.store.root, 'integrations', "#{id}.json"))
+          owner = engine.store.read['owners'].fetch(journal['ownerId'])
+          raise WorkspaceCoordination::Error.new('integration status belongs to another session', 4) unless owner['slug'] == slug && owner['workspace'] == entry['root']
+        else
+          with_coordination_session_admission(entry, slug) { owner = engine.owner(slug) }
+        end
+        admission = ->(&block) { with_coordination_session_admission(entry, slug, &block) }
+        driver = WorkspaceCoordination::Integration.new(engine, owner, admission:,
+          prepare: ->(fields) { coordination_prepare(engine, owner, fields) }, diagnostics: @err)
+        result = case action
+        when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait])
+        when 'integration-status' then driver.status(id)
+        when 'integration-resume' then driver.drive(id, wait: !options[:no_wait])
+        end
+        @out.puts JSON.generate(result)
+        return
+      end
       if action == 'reconcile'
         owner = nil
         with_coordination_session_admission(entry, slug) do
@@ -108,22 +134,7 @@ module DevWorkspaceHost
         raise WorkspaceCoordination::Error, 'prepare requires a request' unless request
         owner = nil
         with_coordination_session_admission(entry, slug) { owner = engine.owner(slug) }
-        result = case request.fetch('kind')
-        when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
-        when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
-        when 'profile_activate'
-          path, _common, _identity, registration = engine.repository(owner, 'workspace')
-          head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
-          source = engine.retain_commit(path, head)
-          artifact = prepare_profile(['--source', source])
-          artifact['coverage'] = engine.coverage(source, 'workspace', head)
-          artifact = engine.save_artifact(artifact)
-          engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
-          operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
-            'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
-          engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
-        else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
-        end
+        result = coordination_prepare(engine, owner, request)
         @out.puts JSON.generate(result)
         return
       end
@@ -131,11 +142,31 @@ module DevWorkspaceHost
         owner = options[:bootstrap_owner] ? engine.existing_bootstrap_owner(slug, options[:bootstrap_owner]) : engine.owner(slug)
         result = case action
         when 'finish' then engine.finish(owner, id, request || raise(WorkspaceCoordination::Error, 'finish requires a request'))
+        when 'submit-batch' then engine.submit_batch(owner, request || raise(WorkspaceCoordination::Error, 'batch submission requires a request'))
         else
           raise WorkspaceCoordination::Error, 'mutation requires --request FILE' unless request
           engine.mutate(owner, action, request, job_id: id)
         end
         @out.puts JSON.generate(result)
+      end
+    end
+
+    def coordination_prepare(engine, owner, request)
+      case request.fetch('kind')
+      when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
+      when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
+      when 'profile_activate'
+        path, _common, _identity, registration = engine.repository(owner, 'workspace')
+        head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
+        source = engine.retain_commit(path, head)
+        artifact = prepare_profile(['--source', source])
+        artifact['coverage'] = engine.coverage(source, 'workspace', head)
+        artifact = engine.save_artifact(artifact)
+        engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
+        operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
+          'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
+        engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
+      else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
       end
     end
 

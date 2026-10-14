@@ -24,6 +24,7 @@
   systemd,
   teamConfig ? null,
   coordinationConfig ? null,
+  integrationConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
   util-linux,
@@ -188,9 +189,35 @@ let
     && builtins.all (adapter: adapter.protocol == 1 && validTarget adapter.command) (
       builtins.attrValues coordinationData.adapters
     );
+  integrationData =
+    if integrationConfig == null then
+      {
+        schema = 1;
+        recipes = { };
+      }
+    else
+      integrationConfig;
+  integrationCatalog = writeText "dev-workspace-integration.json" (builtins.toJSON integrationData);
+  validIntegration =
+    integrationData.schema == 1
+    && builtins.all (
+      name:
+      builtins.elem name [
+        "recipes"
+        "refreshes"
+        "schema"
+      ]
+    ) (builtins.attrNames integrationData)
+    && builtins.all (recipe: recipe.protocol == 1 && validTarget recipe.command) (
+      builtins.attrValues integrationData.recipes
+    );
   packageConfiguration = writeText "dev-workspace-package.json" (
     builtins.toJSON {
       schema = 1;
+      integration = {
+        journalSchema = 1;
+        certificationSchema = 1;
+      };
       inherit activationEnvironmentAliases routerSocket userNamespace;
       agent_teams =
         if agentTeams.configured then
@@ -237,6 +264,7 @@ assert lib.assertMsg programsValid "dev-workspace extension commands must not co
 assert lib.assertMsg providersValid "dev-workspace cluster providers require label and command";
 assert lib.assertMsg validCoordination
   "dev-workspace coordination catalog requires immutable protocol-1 adapters";
+assert lib.assertMsg validIntegration "integration recipes require immutable protocol-1 commands";
 buildGoModule {
   pname = "dev-workspace";
   version = "0.2.0";
@@ -310,7 +338,7 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
-    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission; do
+    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
     ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"
@@ -356,6 +384,7 @@ buildGoModule {
     install -Dm644 ${src}/portal/internal/session/runtime-contract.json \
       "$out/share/workspace-portal/runtime-contract.json"
     install -Dm644 ${extensionCatalog} "$out/share/dev-workspace/extensions.json"
+    install -Dm644 ${integrationCatalog} "$out/share/dev-workspace/integration.json"
     install -Dm644 ${coordinationCatalog} "$out/share/dev-workspace/coordination.json"
     install -Dm644 ${src}/nix/coordination-contract.json "$out/share/dev-workspace/coordination-contract.json"
     install -Dm644 ${src}/docs/coordination.md "$out/share/dev-workspace/coordination.md"

@@ -187,11 +187,17 @@ type AgentTeamsMetadata struct {
 }
 
 type PackageMetadata struct {
-	Schema                       int                `json:"schema"`
-	ActivationEnvironmentAliases []string           `json:"activationEnvironmentAliases"`
-	RouterSocket                 string             `json:"routerSocket"`
-	UserNamespace                string             `json:"userNamespace"`
-	AgentTeams                   AgentTeamsMetadata `json:"agent_teams"`
+	Schema                       int                  `json:"schema"`
+	ActivationEnvironmentAliases []string             `json:"activationEnvironmentAliases"`
+	RouterSocket                 string               `json:"routerSocket"`
+	UserNamespace                string               `json:"userNamespace"`
+	AgentTeams                   AgentTeamsMetadata   `json:"agent_teams"`
+	Integration                  *IntegrationMetadata `json:"integration,omitempty"`
+}
+
+type IntegrationMetadata struct {
+	JournalSchema       int `json:"journalSchema"`
+	CertificationSchema int `json:"certificationSchema"`
 }
 
 type CatalogPin struct {
@@ -342,6 +348,9 @@ func decodePackageMetadata(data []byte) (PackageMetadata, error) {
 	}
 	if metadata.Schema != PackageMetadataSchema {
 		return PackageMetadata{}, errors.New("unsupported package metadata schema")
+	}
+	if metadata.Integration != nil && (metadata.Integration.JournalSchema != 1 || metadata.Integration.CertificationSchema != 1) {
+		return PackageMetadata{}, errors.New("unsupported integration capability")
 	}
 	if err := metadata.AgentTeams.Validate(); err != nil {
 		return PackageMetadata{}, err
@@ -932,9 +941,19 @@ func validateNativeIdentityShape(raw json.RawMessage) error {
 }
 
 func validateMetadataShape(data []byte) error {
-	root, err := strictObject(data, "schema", "activationEnvironmentAliases", "routerSocket", "userNamespace", "agent_teams")
+	root, err := objectWithOnly(data, "schema", "activationEnvironmentAliases", "routerSocket", "userNamespace", "agent_teams", "integration")
 	if err != nil {
 		return err
+	}
+	for _, required := range []string{"schema", "activationEnvironmentAliases", "routerSocket", "userNamespace", "agent_teams"} {
+		if _, ok := root[required]; !ok {
+			return errors.New("package metadata has missing fields")
+		}
+	}
+	if integration, ok := root["integration"]; ok {
+		if _, err := strictObject(integration, "journalSchema", "certificationSchema"); err != nil {
+			return err
+		}
 	}
 	var union map[string]json.RawMessage
 	if err := json.Unmarshal(root["agent_teams"], &union); err != nil || union == nil {

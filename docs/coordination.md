@@ -10,6 +10,11 @@ resource claims. An admitted worker holds only the resources its mutation needs.
 Different repository targets and machines can proceed concurrently. Eligible work
 uses FIFO order; waiting on approval or dependencies does not block unrelated work.
 
+Ordinary coordinator commands share session lifecycle admission and wait up to
+30 seconds for an exclusive lifecycle writer. Notification delivery runs in a
+separate worker under the shared guard. See [integration](integration.md) for
+admission options, operation batches and mechanical refreshes.
+
 Workers wait for temporary contention on package admission, session admission and
 shared Git locks within their original attempt. They recheck ownership, approval
 and prepared evidence after acquiring admission, and Git baselines after acquiring

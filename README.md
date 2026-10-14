@@ -29,6 +29,8 @@ The [Codex provider guide](docs/codex-providers.md) covers limits previews,
 workspace-wide selection, catalog configuration and interrupted-switch recovery.
 The [coordination guide](docs/coordination.md) covers queued merges, persistent
 machine review reservations and [operations/recovery](docs/coordination-operations.md).
+The [integration guide](docs/integration.md) covers resumable operation batches,
+mechanical refresh certificates and cached verification.
 
 ## Nix interfaces
 

@@ -575,6 +575,18 @@ module WorkspaceCoordination
       unless File.file?(path) && WorkspaceCoordination.parse(File.binread(path)) == CONTRACT
         raise Error.new('target package cannot preserve coordination state; recover forward with a compatible package', 5)
       end
+      pending_runs = Dir[File.join(root, 'integrations', '*.json')].any? do |run|
+        value = WorkspaceCoordination.private_read(run)
+        raise Error.new('unsupported integration journal requires forward recovery', 5) unless value['schema'] == 1 && value['id'].is_a?(String) && value['id'].match?(UUID)
+        value['phase'] != 'complete'
+      end
+      if pending_runs
+        metadata_path = File.join(package, 'share/dev-workspace/package.json')
+        metadata = File.file?(metadata_path) && WorkspaceCoordination.parse(File.binread(metadata_path))
+        unless metadata && metadata['integration'] == {'journalSchema' => 1, 'certificationSchema' => 1}
+          raise Error.new('candidate cannot resume pending integration journals', 5)
+        end
+      end
       catalog = Catalog.new(package)
       data['reservations'].each_value do |reservation|
         next if reservation['state'] == 'released'
@@ -1085,28 +1097,7 @@ module WorkspaceCoordination
               reply(value, owner)
             end
           when 'submit'
-            WorkspaceCoordination.keys!(request, %w[schema requestId kind dependsOn approvalId reservationId snapshot])
-            raise Error, 'coordination job capacity exhausted' if data['jobs'].values.count { |job| !TERMINAL.include?(job['state']) } >= 4096
-            dependencies = request.fetch('dependsOn')
-            unless dependencies.is_a?(Array) && dependencies.uniq == dependencies && dependencies.all? { |id| data['jobs'][id]&.fetch('ownerId') == owner['id'] }
-              raise Error, 'dependencies must be unique, earlier operations of this owner'
-            end
-            if request['kind'] != 'merge'
-              reservation = data['reservations'][request['reservationId']]
-              unless reservation && reservation['ownerId'] == owner['id'] && reservation['state'] != 'released' && prepared[1].include?("machine:#{reservation['machine']}")
-                raise Error.new('deployment requires the owner reservation for this machine', 4)
-              end
-            elsif request['reservationId']
-              raise Error, 'merge-only operations do not acquire machine reservations'
-            end
-            id = SecureRandom.uuid
-            value = {'id' => id, 'ownerId' => owner['id'], 'kind' => request['kind'], 'dependsOn' => dependencies,
-              'approvalId' => request['approvalId'], 'reservationId' => request['reservationId'], 'snapshot' => prepared[0],
-              'resources' => prepared[1], 'state' => 'waiting_approval', 'reason' => nil, 'revision' => 1,
-              'sequence' => store.sequence(data), 'readySequence' => nil, 'attempt' => nil, 'result' => nil, 'history' => []}
-            value['coverageContracts'] = contracts || []
-            data['jobs'][id] = value
-            reply(value, owner)
+            create_job(data, owner, request, prepared, contracts)
           when 'cancel', 'refresh'
             value = data['jobs'].fetch(job_id) { raise Error, 'unknown coordinated operation' }
             raise Error.new('operation belongs to another owner', 4) unless value['ownerId'] == owner['id']
@@ -1128,6 +1119,68 @@ module WorkspaceCoordination
           else raise Error, "unsupported coordination mutation: #{action}"
           end
           result.merge('requestId' => request.fetch('requestId'))
+        end
+      end
+    end
+
+    def create_job(data, owner, request, prepared, contracts)
+      WorkspaceCoordination.keys!(request, %w[schema requestId kind dependsOn approvalId reservationId snapshot])
+      raise Error, 'coordination job capacity exhausted' if data['jobs'].values.count { |job| !TERMINAL.include?(job['state']) } >= 4096
+      dependencies = request.fetch('dependsOn')
+      unless dependencies.is_a?(Array) && dependencies.uniq == dependencies && dependencies.all? { |id| data['jobs'][id]&.fetch('ownerId') == owner['id'] }
+        raise Error, 'dependencies must be unique, earlier operations of this owner'
+    end
+      if request['kind'] != 'merge'
+        reservation = data['reservations'][request['reservationId']]
+        unless reservation && reservation['ownerId'] == owner['id'] && reservation['state'] != 'released' && prepared[1].include?("machine:#{reservation['machine']}")
+          raise Error.new('deployment requires the owner reservation for this machine', 4)
+        end
+      elsif request['reservationId']
+        raise Error, 'merge-only operations do not acquire machine reservations'
+    end
+      id = SecureRandom.uuid
+      value = {'id' => id, 'ownerId' => owner['id'], 'kind' => request['kind'], 'dependsOn' => dependencies,
+        'approvalId' => request['approvalId'], 'reservationId' => request['reservationId'], 'snapshot' => prepared[0],
+        'resources' => prepared[1], 'state' => 'waiting_approval', 'reason' => nil, 'revision' => 1,
+        'sequence' => store.sequence(data), 'readySequence' => nil, 'attempt' => nil, 'result' => nil, 'history' => []}
+      value['coverageContracts'] = contracts || []
+      data['jobs'][id] = value
+      reply(value, owner)
+    end
+
+
+    def submit_batch(owner, request)
+      current_generation!
+      if store.read['receipts'].key?(request['requestId'])
+        return store.transaction { |data| store.request(data, owner['id'], ['submit-batch', nil], request) { raise Error, 'batch receipt disappeared' } }
+      end
+      WorkspaceCoordination.keys!(request, %w[schema requestId jobs])
+      jobs = request.fetch('jobs')
+      raise Error, 'batch requires a nonempty list of jobs' unless jobs.is_a?(Array) && !jobs.empty?
+      keys = jobs.map { |job| job.fetch('key') }
+      unless keys.uniq == keys && keys.all? { |key| key.is_a?(String) && key.match?(PART) && !key.match?(UUID) }
+        raise Error, 'batch job keys must be unique names, not UUIDs'
+      end
+      preparation_capacity!
+      prepared = jobs.map do |job|
+        WorkspaceCoordination.keys!(job, %w[key kind dependsOn approvalId reservationId snapshot])
+        snapshot(owner, job.fetch('snapshot'), job.fetch('kind'))
+      end
+      contracts = prepared.map { |value| value[0].dig('operation', 'coverage') && coverage_contracts(owner, value[0].dig('operation', 'coverage')) }
+      store.transaction do |data|
+        raise Error.new('session is fenced by a lifecycle operation', 5) if data['owners'].fetch(owner['id'])['fence']
+        store.request(data, owner['id'], ['submit-batch', nil], request) do
+          ids = {}
+          replies = jobs.each_with_index.map do |job, index|
+            raise Error, 'batch dependencies must be a list' unless job['dependsOn'].is_a?(Array)
+            dependencies = job['dependsOn'].map { |dependency| ids.fetch(dependency, dependency) }
+            item = job.reject { |key, _| key == 'key' }.merge('schema' => 1,
+              'requestId' => request['requestId'], 'dependsOn' => dependencies)
+            value = create_job(data, owner, item, prepared[index], contracts[index])
+            ids[job['key']] = value['id']
+            value.merge('key' => job['key'])
+          end
+          {'schema' => 1, 'jobs' => replies, 'requestId' => request['requestId']}
         end
       end
     end

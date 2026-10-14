@@ -2417,7 +2417,7 @@ module DevSession
       value
     end
 
-    def artifact_add(input, path, label:, as_is:)
+    def artifact_add(input, path, label:, as_is:, expected_owner: nil)
       slug = build_slug(input, as_is:)
       unless path.is_a?(String) && label.is_a?(String) && !label.match?(BLANK_ARTIFACT_CAPTION)
         raise Error, 'artifact requires a path and nonempty label'
@@ -2435,6 +2435,19 @@ module DevSession
           source = read_bounded_file(portal_file(slug), 'portal manifest', max_size: PORTAL_MANIFEST_MAX_SIZE)
           manifest = load_portal_manifest(portal_file(slug), required: true)
           require_ordinary_manifest_ready!(slug, manifest)
+          if expected_owner
+            unless expected_owner.is_a?(String) && expected_owner.match?(WorkspaceCoordination::UUID)
+              raise Error, 'artifact expected owner must be an exact coordination UUID'
+            end
+            retained = coordination_store.read['owners'][expected_owner]
+            stat = File.lstat(work_dir(slug))
+            identity = retained && WorkspaceCoordination.digest([workspace, retained['workspaceName'], slug,
+              stat.dev, stat.ino, manifest.dig('codex', 'thread_id'), WorkspaceCoordination.creation_identity(manifest)])
+            unless retained && retained['workspace'] == workspace && retained['slug'] == slug &&
+                   !retained['fence'] && retained['identity'] == identity
+              raise Error, 'artifact registration belongs to another session incarnation'
+            end
+          end
           journal_path = creation_journal_file(slug)
           if path_exists?(journal_path)
             journal = read_private_json_object(
@@ -9622,6 +9635,7 @@ module DevSession
       OptionParser.new do |parser|
         parser.on('--as-is') { opts[:as_is] = true }
         parser.on('--label TEXT') { |value| opts[:label] = value }
+        parser.on('--expected-owner UUID') { |value| opts[:expected_owner] = value }
       end.parse!(@argv)
       require_arity!(2, @argv, 'artifact add')
       raise Error, 'artifact add requires --label' unless opts[:label]
