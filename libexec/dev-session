@@ -2425,13 +2425,20 @@ module DevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug)
-          if path_exists?(creation_journal_file(slug))
-            raise Error, "session creation is unfinished: #{slug}; retry dev-session start"
-          end
           validate_work_directory!(slug)
           source = read_bounded_file(portal_file(slug), 'portal manifest', max_size: PORTAL_MANIFEST_MAX_SIZE)
           manifest = load_portal_manifest(portal_file(slug), required: true)
           require_ordinary_manifest_ready!(slug, manifest)
+          journal_path = creation_journal_file(slug)
+          if path_exists?(journal_path)
+            journal = read_private_json_object(
+              journal_path, 'creation journal', max_size: 64 * 1024, mode: 0o600
+            )
+            unless manifest.dig('creation', 'state') == 'ready' &&
+                   valid_stored_creation_journal?(journal, slug, manifest)
+              raise Error, "session creation is unfinished or invalid: #{slug}; retry dev-session start"
+            end
+          end
           artifacts = manifest['artifacts'] ||= []
           existing = artifacts.find { |item| Pathname.new(item.fetch('path')).cleanpath.to_s == clean }
           if existing

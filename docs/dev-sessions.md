@@ -276,6 +276,9 @@ detailed commands, failures, and review evidence. Link project documentation
 from the session instead of copying it. Register useful session files as portal
 artifacts with `dev-session artifact add SLUG PATH --label "Caption" --as-is`.
 Use this validated command instead of editing the artifact YAML by hand.
+Completed creation receipts remain available for retries and do not block
+artifact registration. Registration validates a retained receipt against the
+ready manifest; incomplete or invalid creation state still refuses the update.
 Repository documents stay in their
 repositories and can be linked from the plan or state.
 

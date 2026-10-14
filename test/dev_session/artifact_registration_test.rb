@@ -115,4 +115,107 @@ class DevSessionTest < Minitest::Test
       assert_empty(Dir[File.join(File.dirname(path), '.portal.yml.*.tmp')])
     end
   end
+  def test_artifact_registration_accepts_completed_creation_receipts
+    [1, 2, 3, :preserved].each do |schema|
+      with_artifact_creation_receipt(schema) do |runner, slug, manifest_path, journal_path|
+        before = YAML.safe_load(File.read(manifest_path))
+        receipt = File.binread(journal_path)
+        runner.artifact_add(slug, 'new.json', label: 'New report', as_is: true)
+        runner.artifact_add(slug, 'new.json', label: 'Updated report', as_is: true)
+        after = YAML.safe_load(File.read(manifest_path))
+        assert_equal(before.reject { |key, _| key == 'artifacts' },
+                     after.reject { |key, _| key == 'artifacts' })
+        assert_equal(before['artifacts'] + [{ 'label' => 'Updated report', 'path' => 'new.json' }], after['artifacts'])
+        assert_equal(receipt, File.binread(journal_path), 'registration must preserve the completion receipt')
+      end
+    end
+  end
+
+  def test_artifact_registration_rejects_invalid_or_incomplete_creation_receipts
+    changes = [
+      ->(journal, _manifest) { journal['state'] = 'creating'; journal['tmux_identity'] = 'c' * 64 },
+      ->(journal, _manifest) { journal['slug'] = '2026-09-03-other' },
+      ->(journal, _manifest) { journal['goal_sha256'] = 'b' * 64 },
+      ->(journal, _manifest) { journal['schema'] = 99 },
+      ->(journal, _manifest) { journal['unexpected'] = true },
+      ->(_journal, manifest) { manifest['creation']['state'] = 'creating' },
+      ->(_journal, manifest) { manifest['creation']['initial_goal_sent'] = false },
+      ->(_journal, manifest) { manifest.delete('creation') }
+    ]
+    changes.each do |change|
+      with_artifact_creation_receipt(1) do |runner, slug, manifest_path, journal_path|
+        manifest = YAML.safe_load(File.read(manifest_path))
+        journal = JSON.parse(File.read(journal_path))
+        change.call(journal, manifest)
+        File.write(manifest_path, YAML.dump(manifest))
+        File.write(journal_path, JSON.generate(journal))
+        before = File.binread(manifest_path)
+        receipt = File.binread(journal_path)
+        assert_raises(DevSession::Error) do
+          runner.artifact_add(slug, 'new.json', label: 'New report', as_is: true)
+        end
+        assert_equal(before, File.binread(manifest_path))
+        assert_equal(receipt, File.binread(journal_path))
+      end
+    end
+  end
+
+  def test_artifact_registration_requires_a_private_bounded_json_receipt
+    ['not json', '{"schema":1,"schema":1}', 'x' * (64 * 1024 + 1)].each do |payload|
+      with_artifact_creation_receipt(1) do |runner, slug, manifest_path, journal_path|
+        File.write(journal_path, payload)
+        before = File.binread(manifest_path)
+        assert_raises(DevSession::Error) { runner.artifact_add(slug, 'new.json', label: 'New report', as_is: true) }
+        assert_equal(before, File.binread(manifest_path))
+        assert_equal(payload, File.binread(journal_path))
+      end
+    end
+    with_artifact_creation_receipt(1) do |runner, slug, manifest_path, journal_path|
+      File.chmod(0o644, journal_path)
+      before = File.binread(manifest_path)
+      assert_raises(DevSession::Error) { runner.artifact_add(slug, 'new.json', label: 'New report', as_is: true) }
+      assert_equal(before, File.binread(manifest_path))
+    end
+  end
+
+  private
+
+  def with_artifact_creation_receipt(schema)
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-09-03-example'
+      runner.ensure_tracking_files(slug)
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      fixture = File.expand_path('../fixtures/portal-manifest-valid.yml', __dir__)
+      FileUtils.cp(fixture, manifest_path)
+      manifest = YAML.safe_load(File.read(manifest_path))
+      journal = {
+        'schema' => schema == :preserved ? 1 : schema, 'slug' => slug,
+        'goal_sha256' => manifest.dig('creation', 'goal_sha256'),
+        'run_codex' => true, 'state' => 'ready'
+      }
+      if [2, 3].include?(schema)
+        journal.merge!('model' => 'model-lead', 'effort' => 'high')
+      end
+      if schema == 2
+        journal.merge!('agent_team_binding' => "v1.eyJ4IjoieSJ9.#{'b' * 64}",
+                       'agent_team_binding_digest' => 'b' * 64)
+      elsif schema == 3
+        journal['direct_team'] = {
+          'id' => 'solo', 'name' => 'Solo', 'description' => 'One lead thread.',
+          'catalogDigest' => 'a' * 64, 'teamDigest' => 'b' * 64,
+          'leadModel' => 'model-lead', 'leadEffort' => 'high',
+          'roles' => ['lead'], 'members' => []
+        }
+      elsif schema == :preserved
+        journal.merge!('preserve_tracking' => true, 'tracking_origin' => 'retained',
+                       'tracking_plan_sha256' => 'c' * 64, 'tracking_state_sha256' => 'd' * 64)
+      end
+      journal_path = runner.send(:creation_journal_file, slug)
+      File.write(journal_path, JSON.generate(journal))
+      File.chmod(0o600, journal_path)
+      yield runner, slug, manifest_path, journal_path
+    end
+  end
+
 end
