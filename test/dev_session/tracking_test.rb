@@ -3,6 +3,43 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_tracking_lifecycle_conversion_preserves_explicit_and_strict_policies
+    runner = DevSession::Runner.allocate
+    %w[active complete abandoned archived].each do |source|
+      %w[active complete abandoned archived].each do |target|
+        ["\n", "\r\n"].each do |newline|
+          body = "# State#{newline}#{newline}lifecycle: active#{newline}"
+          content = "---#{newline}lifecycle: #{source}#{newline}---#{newline}#{body}"
+          if source == target
+            assert_same(content, runner.send(:tracking_lifecycle_content, content, target))
+          elsif source == 'active' || target == 'archived'
+            expected = "---#{newline}lifecycle: #{target}#{newline}---#{newline}#{body}"
+            assert_equal(expected, runner.send(:tracking_lifecycle_content, content, target))
+          else
+            error = assert_raises(DevSession::Error) do
+              runner.send(:tracking_lifecycle_content, content, target)
+            end
+            assert_equal("initiative lifecycle is #{source}; cannot archive it as #{target}", error.message)
+          end
+        end
+      end
+    end
+  end
+
+  def test_tracking_lifecycle_conversion_rejects_invalid_anchored_headers
+    runner = DevSession::Runner.allocate
+    [
+      "# State\n\n---\nlifecycle: complete\n---\n",
+      "---\nlifecycle: unknown\n---\n",
+      "---\nlifecycle: complete\nowner: lead\n---\n",
+      " \n---\nlifecycle: complete\n---\n"
+    ].each do |content|
+      assert_raises(DevSession::Error) do
+        runner.send(:tracking_lifecycle_content, content, 'archived')
+      end
+    end
+  end
+
   def test_tracking_commits_serialize_on_fresh_head_and_preserve_unrelated_index_with_hooks
     with_workspace do |workspace|
       slugs = %w[first-tracking second-tracking]

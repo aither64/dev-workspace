@@ -683,14 +683,59 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_explicit_archive_retry_preserves_saved_policy_after_forced_removal
-    with_archive_cleanup_fixture do |runner, workspace, slug, _common, feature|
-      File.write(File.join(feature, 'untracked'), 'recover me')
-      runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause before commit' }
-      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
-      runner.singleton_class.remove_method(:commit_tracking_transition!)
-      runner.archive(slug, as_is: true, explicit: true)
-      refute(File.exist?(feature))
-      assert(File.directory?(File.join(workspace, 'archive', slug)))
+    %w[active complete].each do |lifecycle|
+      with_archive_cleanup_fixture(lifecycle:) do |runner, workspace, slug, _common, feature|
+        File.write(File.join(feature, 'untracked'), 'recover me')
+        runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause before commit' }
+        error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
+        assert_equal('pause before commit', error.message)
+        journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        assert_equal('archived', journal.fetch('mode'))
+        runner.singleton_class.remove_method(:commit_tracking_transition!)
+        resumed_operation = nil
+        runner.define_singleton_method(:finish_archive_journal!) do |current_slug, current, **options|
+          resumed_operation = current.fetch('operation_id')
+          super(current_slug, current, **options)
+        end
+        runner.archive(slug, as_is: true, explicit: true)
+        assert_equal(journal.fetch('operation_id'), resumed_operation)
+        refute(File.exist?(feature))
+        assert(File.directory?(File.join(workspace, 'archive', slug)))
+        manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+        assert_equal(journal.fetch('operation_id'), manifest.fetch('archive_operation_id'))
+        runner.revive(slug, as_is: true)
+        assert_equal('recover me', File.read(File.join(feature, 'untracked')))
+      end
+    end
+  end
+
+  def test_explicit_archive_revives_completed_and_abandoned_sources_with_local_changes
+    %w[complete abandoned].each do |lifecycle|
+      with_archive_cleanup_fixture(lifecycle:) do |runner, workspace, slug, common, feature|
+        branch = git_capture_success('git', '-C', feature, 'symbolic-ref', 'HEAD').strip
+        head = git_capture_success('git', '-C', feature, 'rev-parse', 'HEAD').strip
+        File.write(File.join(feature, 'staged'), "staged content\n")
+        assert_git_success('git', '-C', feature, 'add', 'staged')
+        File.write(File.join(feature, 'staged'), "working content\n")
+        File.binwrite(File.join(feature, 'untracked'), "\x00\xff".b)
+        File.write(File.join(feature, '.gitignore'), "ignored\n")
+        File.write(File.join(feature, 'ignored'), 'ignored content')
+        runner.archive(slug, as_is: true, explicit: true)
+        archive = File.join(workspace, 'archive', slug)
+        assert_equal('archived', runner.send(:lifecycle_state, File.read(File.join(archive, 'state.md'))))
+        assert_equal(head, git_capture_success('git', "--git-dir=#{common}", 'rev-parse', branch).strip)
+        refute(File.exist?(feature))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+        runner.revive(slug, as_is: true)
+        assert_equal('active', runner.send(:lifecycle_state, File.read(File.join(workspace, 'work', slug, 'state.md'))))
+        assert_equal(branch, git_capture_success('git', '-C', feature, 'symbolic-ref', 'HEAD').strip)
+        assert_equal(head, git_capture_success('git', '-C', feature, 'rev-parse', 'HEAD').strip)
+        assert_equal("staged content\n", git_capture_success('git', '-C', feature, 'show', ':staged'))
+        assert_equal("working content\n", File.binread(File.join(feature, 'staged')))
+        assert_equal("\x00\xff".b, File.binread(File.join(feature, 'untracked')))
+        assert_equal('ignored content', File.read(File.join(feature, 'ignored')))
+      end
     end
   end
 
@@ -762,13 +807,13 @@ class DevSessionTest < Minitest::Test
     DevSession::ArchiveCleanup.define_singleton_method(:new, original)
   end
 
-  def with_archive_cleanup_fixture
+  def with_archive_cleanup_fixture(lifecycle: 'active')
     with_workspace do |workspace|
       create_bare_repo(workspace, 'sample')
       slug = '2026-06-06-cleanup'
       runner = archive_runner_for(workspace)
       runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
-      commit_archive_fixture(workspace, slug, lifecycle: 'active')
+      commit_archive_fixture(workspace, slug, lifecycle:)
       configure_workspace_origin(workspace)
       common = File.join(workspace, 'repos', 'sample.git')
       feature = File.join(workspace, 'worktrees', slug, 'sample')

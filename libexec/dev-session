@@ -7338,12 +7338,13 @@ module DevSession
     def tracking_lifecycle_content(content, target)
       current = lifecycle_state(content)
       return content if current == target
-      unless current == 'active'
+      # Explicit archival closes any valid lifecycle; strict modes retain theirs.
+      unless current == 'active' || target == 'archived'
         raise Error, "initiative lifecycle is #{current}; cannot archive it as #{target}"
       end
 
       content.sub(LIFECYCLE_HEADER) do |header|
-        header.sub('lifecycle: active', "lifecycle: #{target}")
+        header.sub("lifecycle: #{current}", "lifecycle: #{target}")
       end
     end
 
