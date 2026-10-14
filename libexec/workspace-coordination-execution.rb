@@ -824,8 +824,8 @@ module WorkspaceCoordination
         end
         begin
           @engine.snapshot(@owner, @job.fetch('snapshot'), @job.fetch('kind'))
-          @engine.frontier_valid!(@owner, @job.fetch('snapshot').fetch('operation'))
           admit!
+          @engine.frontier_valid!(@owner, @job.fetch('snapshot').fetch('operation'))
           case @job.fetch('kind')
           when 'merge' then merge
           when 'machine_activate' then machine
@@ -848,11 +848,13 @@ module WorkspaceCoordination
     def admit!
       state = @request.fetch('stateRoot')
       File.open(File.join(state, 'transition.lock'), File::RDWR | File::CREAT, 0o600) do |transition|
-        raise Error.new('profile transition admission is busy', 3) unless transition.flock(File::LOCK_SH | File::LOCK_NB)
+        # Contention is a wait, not stale evidence. Revalidate the retained
+        # attempt after acquisition, including a generation changed while waiting.
+        transition.flock(File::LOCK_SH)
         authority = @request.fetch('entry').fetch('authority')
         FileUtils.mkdir_p(authority, mode: 0o700)
         File.open(File.join(authority, "#{@owner.fetch('slug')}.lock"), File::RDWR | File::CREAT, 0o600) do |session_lock|
-          raise Error.new('session admission is busy', 3) unless session_lock.flock(File::LOCK_EX | File::LOCK_NB)
+          session_lock.flock(File::LOCK_EX)
           live = @engine.owner(@owner['slug'], bootstrap: @owner['bootstrap'])
           raise Error.new('attempt owner identity changed', 4) unless live['id'] == @owner['id']
           ledger = @engine.store.read
@@ -879,7 +881,7 @@ module WorkspaceCoordination
       raise Error.new('prepared feature is not a fast-forward', 3) unless @engine.ancestor?(path, observed, operation.fetch('featureHead'))
       checkout = operation['repository'] == 'workspace' ? path : operation.fetch('targetCheckout')
       File.open(File.join(common, 'dev-session-tracking.lock'), File::RDWR | File::CREAT, 0o600) do |lock|
-        raise Error.new('shared Git mutation is busy; refresh coordination admission', 3) unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+        lock.flock(File::LOCK_EX)
         raise Error.new('remote target changed before local integration', 3) unless @engine.remote_head(path, operation.fetch('target')) == observed
         if operation['repository'] == 'workspace'
           branch = @engine.capture('git', '-C', checkout, 'symbolic-ref', 'HEAD').strip

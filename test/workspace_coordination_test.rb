@@ -2,6 +2,7 @@
 
 require 'minitest/autorun'
 require 'tmpdir'
+require 'timeout'
 require_relative 'support/coordination_capacity_fixture'
 require_relative '../libexec/workspace-coordination-execution'
 load File.expand_path('../libexec/workspace-host', __dir__)
@@ -585,6 +586,98 @@ class WorkspaceCoordinationTest < Minitest::Test
     path = write_attempt(job)
     WorkspaceCoordination::Worker.new(path, fixtures: true).run
     @engine.reconcile_attempts
+  end
+
+  def contend_worker(lock_kind)
+    first = owner('contended-worker')
+    submit_merge(first)
+    job = @engine.claim.first
+    path = write_attempt(job)
+    lock_path = case lock_kind
+    when :transition then File.join(@state, 'transition.lock')
+    when :session then File.join(@entry['authority'], "#{first['slug']}.lock")
+    when :git then File.join(@bare, 'dev-session-tracking.lock')
+    end
+    FileUtils.mkdir_p(File.dirname(lock_path))
+    File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+      lock.flock(File::LOCK_EX)
+      worker = WorkspaceCoordination::Worker.new(path, fixtures: true)
+      started = Queue.new
+      boundary = lock_kind == :git ? :merge : :admit!
+      worker.define_singleton_method(boundary) { started << true; super() }
+      thread = Thread.new { worker.run }
+      begin
+        Timeout.timeout(5) { started.pop }
+        refute thread.join(0.2), 'temporary lock contention must wait in the original attempt'
+        refute File.exist?(File.join(File.dirname(path), 'result.json'))
+        assert_equal @base, git('-C', @remote, 'rev-parse', 'master').strip
+        assert_equal @base, git('-C', @bare, 'rev-parse', 'master').strip
+        yield first, job if block_given?
+      ensure
+        lock.flock(File::LOCK_UN)
+        assert thread.join(5), 'worker must wake after lock release'
+      end
+    end
+    @engine.reconcile_attempts
+    [@engine.store.read['jobs'].fetch(job['id']), WorkspaceCoordination.private_read(File.join(File.dirname(path), 'result.json'))]
+  end
+
+  def test_worker_waits_for_transition_admission
+    job, result = contend_worker(:transition)
+    assert_equal 'succeeded', job['state']
+    assert_equal 'applied', result['outcome']
+    assert_equal job.dig('snapshot', 'operation', 'featureHead'), git('-C', @remote, 'rev-parse', 'master').strip
+  end
+
+  def test_worker_waits_for_session_admission
+    job, result = contend_worker(:session)
+    assert_equal 'succeeded', job['state']
+    assert_equal 'applied', result['outcome']
+  end
+
+  def test_worker_waits_for_shared_git_mutation
+    job, result = contend_worker(:git)
+    assert_equal 'succeeded', job['state']
+    assert_equal 'applied', result['outcome']
+  end
+
+  def test_worker_revalidates_generation_after_transition_wait
+    job, result = contend_worker(:transition) do
+      replacement = File.join(@tmp, 'replacement-profile')
+      File.symlink(@package, replacement)
+      File.rename(replacement, @profile)
+    end
+    assert_equal 'needs_refresh', job['state']
+    assert_equal 'baseline_changed', result['outcome']
+    assert_nil result['phase']
+    assert_match(/generation changed/, result['error'])
+    assert_equal @base, git('-C', @remote, 'rev-parse', 'master').strip
+  end
+
+  def test_worker_revalidates_admission_after_session_wait
+    job, result = contend_worker(:session) { @engine.store.transaction { |data| data['suspended'] = true } }
+    assert_equal 'failed', job['state']
+    assert_equal 'not_applied', result['outcome']
+    assert_nil result['phase']
+    assert_match(/no longer admitted/, result['error'])
+    assert_equal @base, git('-C', @remote, 'rev-parse', 'master').strip
+  end
+
+  def test_worker_revalidates_remote_after_git_wait
+    advanced = nil
+    job, result = contend_worker(:git) do
+      seed = File.join(@tmp, 'seed')
+      File.write(File.join(seed, 'base'), 'advanced')
+      git('-C', seed, 'commit', '-am', 'concurrent fixture update')
+      git('-C', seed, 'push', 'origin', 'master')
+      advanced = git('-C', seed, 'rev-parse', 'master').strip
+    end
+    assert_equal 'needs_refresh', job['state']
+    assert_equal 'baseline_changed', result['outcome']
+    assert_equal 'admitted', result['phase']
+    assert_match(/remote target changed/, result['error'])
+    assert_equal advanced, git('-C', @remote, 'rev-parse', 'master').strip
+    assert_equal @base, git('-C', @bare, 'rev-parse', 'master').strip
   end
 
   def test_refreshed_history_stays_in_ledger_and_worker_request_executes

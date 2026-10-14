@@ -10,6 +10,11 @@ resource claims. An admitted worker holds only the resources its mutation needs.
 Different repository targets and machines can proceed concurrently. Eligible work
 uses FIFO order; waiting on approval or dependencies does not block unrelated work.
 
+Workers wait for temporary contention on package admission, session admission and
+shared Git locks within their original attempt. They recheck ownership, approval
+and prepared evidence after acquiring admission, and Git baselines after acquiring
+the tracking lock. A busy lock does not require snapshot refresh.
+
 Merge preparation enters the repository's declared Nix shell, including its
 shell initialization, before retaining the hook environment. Bundler-based
 Overcommit dependencies and the runtime SSH transport are checked before a job
