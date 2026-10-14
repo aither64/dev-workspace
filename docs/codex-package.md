@@ -121,13 +121,15 @@ any changed invocation require idle sessions; see
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with
-exact `gpt-5.5`/`low`. The package installs the full unchanged original
-`codex.src/codex-rs/models-manager/models.json` as
-`share/workspace-portal/codex-models.json`. A startup CLI override selects the
-native static models manager for this child; the ordinary App Server retains
-its dynamic catalog. The helper checks the immutable file and startup
-`sessionFlags` origin before inference. It does not patch Codex, edit model
-entries or rewrite shared Codex home.
+exact `gpt-6-luna`/`low`. The package installs codex-web's derived Luna catalog as
+`share/workspace-portal/codex-models.json`. The
+[preparation contract](session-preparations.md#naming-and-reservation) defines
+the profile's tool restrictions, disabled Responses Lite mode and startup
+catalog checks, and links to codex-web's exact metadata contract. A startup CLI
+override selects the native static models manager for this child; the ordinary
+App Server retains its dynamic catalog. The helper checks the immutable file
+and startup `sessionFlags` origin before inference. It does not patch Codex or
+rewrite shared Codex home.
 Global user instructions remain trusted serving-instance policy. File/network
 action tools and project/workspace/team/skill injection must be excluded;
 questions fail immediately. The supported Direct profile exposes no model tools.
@@ -139,14 +141,14 @@ fixed restriction-key/type validator against that candidate's generated App
 Server schema and `core/config.schema.json`. After mandatory review, run the
 tagged exact-binary mock-provider fixture described in codex-web's technical
 reference. Record the exact native binary hash, assembled package/profile and
-unchanged model metadata, actual advertised tool schemas, forbidden dispatch,
+supported catalog metadata, actual advertised tool schemas, forbidden dispatch,
 question rejection and ephemeral teardown evidence. Include the startup
 catalog path/origin, local-only child launch and actual managed-service
 start/loss/stop/forced-exit checks with ordinary-daemon continuity. The real
 positive naming canary must use this same child profile and obtain a valid model
-result within the ten-second budget. Missing prerequisites or
-unsupported behavior block release. Deterministic fallback after a helper error
-does not establish isolation.
+result within the ten-second budget. Missing prerequisites or unsupported
+behavior block release. Naming errors must stop preparation before reservation
+and preserve the request for retry or a custom name.
 
 The child reads the existing host-selected account/provider configuration and
 uses the pinned version's local-only launch marker; credentials are not copied
@@ -165,4 +167,4 @@ fresh calls capture and disable all literal names then present. This support
 condition does not include deliberate administrator reconfiguration during a
 call. Use the existing service/package procedures, without a global config
 lease or another process manager. Package-generation cancellation must prevent
-the old worker from committing a fallback or reservation.
+the old worker from publishing a name or reservation.

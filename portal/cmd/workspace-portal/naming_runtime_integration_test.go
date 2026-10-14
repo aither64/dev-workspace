@@ -38,7 +38,7 @@ import (
 // Explicit invocation requires the reviewed VM and frozen assembled package.
 // This fixture owns only disposable synthetic processes and state in that VM.
 // It never discovers an installed profile or registers a workspace.
-const managedSmokeCatalogHash = "fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b"
+const managedSmokeCatalogHash = "1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b"
 const managedSmokeOrigin = "https://managed-smoke.example.test"
 const managedSmokeCanaryPort = "39991"
 
@@ -383,10 +383,10 @@ func (p *managedSmokeProvider) respond(w http.ResponseWriter, r *http.Request) {
 		nameProperty, _ := properties["name"].(map[string]any)
 		required, _ := schema["required"].([]any)
 		input, inputOK := request["input"].([]any)
-		if request["model"] != "gpt-5.5" || reasoning["effort"] != "low" || !ok || len(tools) != 0 || request["store"] != false || request["stream"] != true || format["type"] != "json_schema" || schema["type"] != "object" || name == "" || !inputOK {
+		if request["model"] != "gpt-6-luna" || reasoning["effort"] != "low" || !ok || len(tools) != 0 || request["store"] != false || request["stream"] != true || format["type"] != "json_schema" || schema["type"] != "object" || name == "" || !inputOK {
 			p.failure = "native-naming-request-shape"
 		}
-		if len(properties) != 1 || nameProperty["type"] != "string" || nameProperty["maxLength"] != float64(48) || nameProperty["pattern"] != "^[a-z0-9]+(?:-[a-z0-9]+){2,5}$" || len(required) != 1 || required[0] != "name" || schema["additionalProperties"] != false {
+		if len(properties) != 1 || nameProperty["type"] != "string" || nameProperty["maxLength"] != float64(48) || nameProperty["pattern"] != "^[a-z0-9]+(?:-[a-z0-9]+){1,5}$" || len(required) != 1 || required[0] != "name" || schema["additionalProperties"] != false {
 			p.failure = "native-naming-output-schema"
 		}
 		for _, value := range input {
@@ -487,8 +487,8 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	}
 	h.catalog, err = filepath.EvalSymlinks(filepath.Join(h.manifest.PackageRoot, "share/workspace-portal/codex-models.json"))
 	info, statErr := os.Stat(h.catalog)
-	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 472512 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
-		managedSmokeFail(t, "full original catalog mismatch")
+	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62843 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
+		managedSmokeFail(t, "fixed naming-only catalog mismatch")
 	}
 	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.160.0\n" {
 		managedSmokeFail(t, "native version mismatch")
@@ -496,7 +496,11 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	h.ordinaryProvider, h.namingProvider = managedSmokeNewProvider(t, true), managedSmokeNewProvider(t, false)
 	for _, entry := range []struct{ home, base string }{{"ordinary-home", h.ordinaryProvider.url}, {"naming-home", h.namingProvider.url}} {
 		managedSmokeWrite(t, filepath.Join(root, entry.home, "auth.json"), "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"synthetic-fixture-only\"}\n", 0600)
-		managedSmokeWrite(t, filepath.Join(root, entry.home, "config.toml"), "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\nopenai_base_url = "+strconv.Quote(entry.base)+"\n", 0600)
+		model := "gpt-6-luna"
+		if entry.home == "ordinary-home" {
+			model = "gpt-5.5"
+		}
+		managedSmokeWrite(t, filepath.Join(root, entry.home, "config.toml"), "model_provider = \"openai\"\nmodel = "+strconv.Quote(model)+"\nmodel_reasoning_effort = \"low\"\nopenai_base_url = "+strconv.Quote(entry.base)+"\n", 0600)
 	}
 	h.canaryListener, err = net.Listen("tcp4", "127.0.0.1:"+managedSmokeCanaryPort)
 	if err != nil {
@@ -762,6 +766,7 @@ func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess 
 			return false
 		}
 		count := 0
+		ready := false
 		for _, entry := range entries {
 			pid, err := strconv.Atoi(entry.Name())
 			if err != nil {
@@ -797,11 +802,16 @@ func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess 
 			}
 			found = process
 			count++
+			// A forked native process can precede its RPC listener. Keep the
+			// process-count/ownership checks while waiting for that same child.
+			if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+				ready = true
+			}
 		}
 		if count > 1 {
 			managedSmokeFail(h.t, "multiple naming children in one lifetime")
 		}
-		return count == 1
+		return count == 1 && ready
 	})
 	return found
 }
@@ -838,7 +848,10 @@ func (h *managedSmokeHarness) probe(root string) managedSmokeProcess {
 			} `json:"name"`
 		} `json:"origins"`
 	}
-	if client.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result) != nil || result.Config.Catalog != h.catalog || result.Origins["model_catalog_json"].Name.Type != "sessionFlags" {
+	managedSmokeAwait(h.t, 2*time.Second, "native catalog probe request unavailable", func() bool {
+		return client.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result) == nil
+	})
+	if result.Config.Catalog != h.catalog || result.Origins["model_catalog_json"].Name.Type != "sessionFlags" {
 		managedSmokeFail(h.t, "actual native static catalog or sessionFlags origin missing")
 	}
 	h.t.Logf("owned nativePID=%d start=%s cgroup=%s nativeSHA256=%s catalogSHA256=%s", process.pid, process.start, process.group, h.manifest.NativeSHA256, managedSmokeCatalogHash)
@@ -860,7 +873,11 @@ func (h *managedSmokeHarness) privateCase() string {
 	}
 	for _, entry := range []struct{ home, base string }{{"ordinary-home", h.ordinaryProvider.url}, {"naming-home", h.namingProvider.url}} {
 		managedSmokeWrite(h.t, filepath.Join(root, entry.home, "auth.json"), "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"synthetic-fixture-only\"}\n", 0600)
-		managedSmokeWrite(h.t, filepath.Join(root, entry.home, "config.toml"), "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\nopenai_base_url = "+strconv.Quote(entry.base)+"\n", 0600)
+		model := "gpt-6-luna"
+		if entry.home == "ordinary-home" {
+			model = "gpt-5.5"
+		}
+		managedSmokeWrite(h.t, filepath.Join(root, entry.home, "config.toml"), "model_provider = \"openai\"\nmodel = "+strconv.Quote(model)+"\nmodel_reasoning_effort = \"low\"\nopenai_base_url = "+strconv.Quote(entry.base)+"\n", 0600)
 	}
 	if os.Symlink(h.manifest.PackageRoot, filepath.Join(root, "profile")) != nil {
 		managedSmokeFail(h.t, "private profile failed")

@@ -86,7 +86,7 @@ func modelSessionName(ctx context.Context, input string, client ephemeralTurnCli
 		return "", codex.ErrEphemeralIsolation
 	}
 	result, err := client.RunEphemeralTurn(ctx, codex.EphemeralTurnOptions{
-		Directory: directory, InstructionFile: filepath.Join(private, "instructions.txt"), ModelCatalogFile: catalog, Model: "gpt-5.5", Effort: "low", Instructions: sessionNamingInstructions,
+		Directory: directory, InstructionFile: filepath.Join(private, "instructions.txt"), ModelCatalogFile: catalog, Model: "gpt-6-luna", Effort: "low", Instructions: sessionNamingInstructions,
 		Input: input, OutputSchema: json.RawMessage(sessionNamingSchema),
 	})
 	if ctx.Err() != nil {

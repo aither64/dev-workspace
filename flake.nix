@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix";
     codex-web = {
-      url = "github:aither64/codex-web/5f15b9293f9b1eef7469a34d7b2044c743160283";
+      url = "github:aither64/codex-web/c9aa6dc2f8cd6e80eeb711a3f9c569e08b7b2016";
       flake = false;
     };
   };
@@ -40,9 +40,7 @@
             inherit pkgs;
             codex = llm-agents.packages.${pkgs.system}.codex;
           };
-          codexModelCatalog = "${
-            llm-agents.packages.${pkgs.system}.codex.src
-          }/codex-rs/models-manager/models.json";
+          codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models.json";
           codexWebSrc = codex-web;
           codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
           inherit

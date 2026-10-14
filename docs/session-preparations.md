@@ -123,7 +123,7 @@ including queue time. No more than two adapter calls run concurrently per
 workspace. Attachment names, paths and contents are excluded.
 
 The adapter calls codex-web's public `RunEphemeralTurn` with exactly
-`gpt-5.5`/`low`, fixed instructions and a bounded name schema. Each call uses
+`gpt-6-luna`/`low`, fixed instructions and a bounded name schema. Each call uses
 an empty private mode-0700 cwd outside the workspace and a separate mode-0600
 instruction override file containing exactly codex-web's
 `EphemeralInstructionFileContent`. The adapter writes that provider-owned constant
@@ -135,8 +135,13 @@ The call supplies no attachments or team policy.
 The worker retains ownership of the whole deadline and concurrency limit.
 Scratch state is removed after the call; durable session state is untouched.
 
-The child uses the package's pinned native Codex executable and full unchanged
-original model catalog at `share/workspace-portal/codex-models.json`. A startup
+The child uses the package's pinned native Codex executable and naming-only Luna
+model catalog at `share/workspace-portal/codex-models.json`. The catalog retains the original Luna metadata with its tool mode set to
+`direct` and experimental tool list emptied. The model profile cannot enable a
+code executor, user questions or the clock tool. Responses Lite is disabled for
+this profile, preserving the standard request shape with top-level `tools: []`
+and no `additional_tools` input role. Its exact
+contents are checked by codex-web; normal conversations keep their own catalog. A startup
 `model_catalog_json` CLI override selects the native static catalog manager;
 ordinary catalog refresh cannot replace it. The helper validates the immutable
 file and requires `config/read` to identify its exact path with `sessionFlags`
