@@ -2634,12 +2634,45 @@
   let lifecycleClock = null;
   let lifecyclePollTimer = null;
   let lastLifecycleOperation = {state: pendingLifecycle ? "idle" : "idle"};
+  let archivePageReloading = false, archiveCompletionRead = null;
+  const reconcileCompletedArchive = payload => {
+    if (archivePageReloading) return true;
+    const target = payload?.currentTarget;
+    if (pendingLifecycle !== "archive" || payload?.pendingLifecycle !== "" ||
+        target?.slug !== slug || !target.archived || target.location !== "archive") return false;
+    archivePageReloading = true;
+    pendingLifecycle = "";
+    body.dataset.pendingLifecycle = "";
+    stopLifecycleTimers();
+    refreshLifecycleTarget(target);
+    if (lifecycleStatus) lifecycleStatus.hidden = true;
+    if (lifecycleRetry) lifecycleRetry.hidden = true;
+    location.reload();
+    return true;
+  };
+  const refreshArchiveCompletion = async () => {
+    if (archivePageReloading) return true;
+    if (pendingLifecycle !== "archive") return false;
+    if (pageReads.paused || pageLeaving) throw new DOMException("Archive status check was canceled.", "AbortError");
+    if (!archiveCompletionRead) {
+      const observedOperation = lastLifecycleOperation;
+      const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
+      archiveCompletionRead = client.details({signal: read.signal}).then(payload => {
+        if (!read.isCurrent() || lastLifecycleOperation !== observedOperation) {
+          throw new DOMException("Archive status check was canceled.", "AbortError");
+        }
+        return reconcileCompletedArchive(payload);
+      }).finally(() => { read.finish(); archiveCompletionRead = null; });
+    }
+    return archiveCompletionRead;
+  };
   const lifecycleOperationBelongsToPage = (kind, operation) => lifecycleOperationMatches(
     kind, lifecycleTargetId, pendingLifecycle, operation,
   );
   const operationForRetry = async (kind) => {
     let operation = lastLifecycleOperation;
-    if (!lifecycleOperationBelongsToPage(kind, operation)) operation = await client.operation();
+    if (kind === "archive" || !lifecycleOperationBelongsToPage(kind, operation)) operation = await client.operation();
+    if (kind === "archive" && await refreshArchiveCompletion()) return null;
     refreshLifecycleTarget(operation.currentTarget);
     if (operation.code === "target_changed") {
       const error = new Error(operation.error || "Review the current session and confirm it again.");
@@ -3032,6 +3065,7 @@
     try {
       const payload = await client.details({signal: read.signal});
       if (!read.isCurrent()) return;
+      if (reconcileCompletedArchive(payload)) return;
       refreshLifecycleTarget(payload.currentTarget);
       applyRecoveryStatus(payload.recovery, payload.interactive);
       if (typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
@@ -3211,12 +3245,17 @@
     let operation = null;
     try {
       operation = await operationForRetry("archive");
+      if (!operation) return;
       await client.retryOperation(
         operation.receiptId || "",
         operation.options?.journalId || "",
       );
       location.assign("/");
     } catch (error) {
+      if (error.name === "AbortError") {
+        if (lastLifecycleOperation.state !== "running") resetControl();
+        return;
+      }
       if (operation?.options?.journalExpected) {
         await adoptLifecycleAfterRequestFailure("archive", {
           journalId: operation.options.journalId,
@@ -3339,6 +3378,8 @@
       await Promise.all([loadAutoArchive(), (async () => {
         const operation = await client.operation();
         if (lastLifecycleOperation === observedOperation && observedOperation.state !== "running") {
+          if (operation.state === "idle" && await refreshArchiveCompletion()) return;
+          if (lastLifecycleOperation !== observedOperation || archivePageReloading) return;
           if (operation.state === "running") monitorLifecycle("archive", operation);
           else showLifecycle(operation, operation.state === "complete" ? "" : pendingLifecycle);
           if (operation.state === "complete") location.reload();
@@ -3357,7 +3398,10 @@
     });
     window.addEventListener("pagehide", () => { clearInterval(timer); timer = null; });
   }
-  client.operation().then((operation) => {
+  client.operation().then(async (operation) => {
+    const observedOperation = lastLifecycleOperation;
+    if (operation.state === "idle" && await refreshArchiveCompletion()) return;
+    if (lastLifecycleOperation !== observedOperation || archivePageReloading) return;
     refreshLifecycleTarget(operation.currentTarget);
     if (operation.code === "target_changed") { lifecycleKind = operation.kind; showLifecycle(operation); return; }
     if (!pendingLifecycle && !lifecycleOperationBelongsToPage(operation.kind, operation)) return;
@@ -3369,6 +3413,7 @@
     }
     void refreshPendingArchive();
   }).catch((error) => {
+    if (error.name === "AbortError") return;
     if (pendingLifecycle) failLifecycle(pendingLifecycle, error.message);
   });
   const transcript = document.getElementById("transcript");

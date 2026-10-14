@@ -1251,6 +1251,11 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 
 // sessionDetails refreshes the existing sections without replacing the conversation.
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	pendingLifecycle, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	if err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Unable to verify session lifecycle: " + err.Error()})
+		return
+	}
 	s.normalizeInteractivity(r.Context(), summary)
 	var warning string
 	if !summary.Archived {
@@ -1321,6 +1326,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"currentTarget":    s.lifecycleSnapshot(summary.Slug),
+		"pendingLifecycle": pendingLifecycle,
 		"recovery":         recovery,
 		"interactive":      summary.Interactive,
 		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),

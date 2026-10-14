@@ -1801,7 +1801,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"await beforeRequestInputAction(snoozeAutoResolution)",
 		"entry.html", "archive-session", "revive-session", "artifactPreview", "controlCluster", "fork-dialog",
 		"data-cluster-service-tab", "data-reveal-secret", "index-status", "modelSelect.required",
-		"const signature = JSON.stringify([entries,", "client.operation().then((operation)",
+		"const signature = JSON.stringify([entries,", "client.operation().then(async (operation)",
 		"dialog.showModal()", `lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")`,
 		`openLifecycleConfirmation("delete")`, "confirmationForLifecycle",
 		"void retryRevive(lifecycleRetry)", "indexStatusFreshForPage", "setTimeout(refreshIndexProgress, Math.max(refreshPolicy.indexProgressMs,",

@@ -492,6 +492,14 @@ session inventory. `GET /api/index-status?progress=1` reads only these snapshots
 Ordinary index-status requests ask the single background task to refresh when
 due, with a six-second pass deadline. Session operation GETs also stay cache-only.
 
+Session details include `pendingLifecycle` from a fresh validated journal check.
+An empty string confirms no pending journal; inspection errors fail the read.
+An old pending archive page uses this field and archived tracking to reload once
+to the current archived page, including before Retry. An idle cached operation
+alone cannot clear pending state or authorize another archive request. Older
+servers that omit the field and failed reads retain the last display. This is
+display reconciliation; it does not complete or replace any operation receipt.
+
 Archive, revive, delete and Keep open use target identity version 2. The target
 contains the canonical workspace, slug, tracking location (`work` or `archive`),
 tracking directory device/inode and retained root conversation, including an

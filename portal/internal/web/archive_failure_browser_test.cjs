@@ -15,15 +15,46 @@ const {chromium, firefox, expect} = require("@playwright/test");
         Date.now = () => realNow() + window.archiveTestOffset;
       });
       let reads = 0, offline = false, held = false, release;
+      let detailsMode = "actual", mutations = 0;
+      let operationReads = 0, holdOperation = false, releaseOperation;
+      let documents = 0, clearNextDocument = false;
       let operation = {kind: "archive", state: "paused", phase: "tracking_committed", receiptId: "receipt-1",
         startedAt: "2026-09-16T13:02:17Z", updatedAt: "2026-09-16T13:02:17Z",
         options: {journalId: "a".repeat(64), journalExpected: true}};
       const failure = {identity: "thread-1", operation: {id: "a".repeat(64), identity: "thread-1"}, result: "deferred",
         checked_at: "2026-09-16T20:02:12Z", blockers: ["command failed with exit 124: /nix/store/fixture/bin/workspace-portal thread retire"]};
+      await page.route("**/example/", async route => {
+        documents++;
+        const response = await route.fetch();
+        let html = await response.text();
+        if (operation.state === "complete" || clearNextDocument && documents > 1) {
+          html = html.replace('data-pending-lifecycle="archive"', 'data-pending-lifecycle=""')
+            .replace(/(<button[^>]*id="archive-session-open")/, "$1 hidden");
+        }
+        return route.fulfill({response, body: html});
+      });
       await page.route("**/api/sessions/example/**", async route => {
         const method = new URL(route.request().url()).pathname.split("/").at(-1);
         const json = (value, status = 200) => route.fulfill({status, contentType: "application/json", body: JSON.stringify(value)});
-        if (method === "operation") return json(operation);
+        if (route.request().method() !== "GET") {
+          mutations++;
+          return json({error: "Unexpected mutation in read-only archive fixture"}, 503);
+        }
+        if (method === "details" && detailsMode !== "actual") {
+          if (detailsMode === "offline") return json({error: "Fixture unavailable"}, 503);
+          const response = await route.fetch(), payload = await response.json();
+          if (detailsMode === "older") delete payload.pendingLifecycle;
+          else payload.pendingLifecycle = "";
+          return json(payload);
+        }
+        if (method === "operation") {
+          operationReads++;
+          if (holdOperation) {
+            holdOperation = false;
+            await new Promise(resolve => { releaseOperation = resolve; });
+          }
+          return json(operation);
+        }
         if (method === "auto-archive") {
           reads++;
           if (held) await new Promise(resolve => { release = resolve; });
@@ -139,11 +170,94 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await page.locator("#auto-archive-details summary").click();
       await expect(page.locator("#auto-archive-details pre")).toContainText("The cached observation is older than two hours.");
       // Completion must clear the historical warning and reload the final page.
+      operationReads = 0;
       operation = {...operation, state: "complete"};
       const nextNavigation = page.waitForEvent("framenavigated", {predicate: frame => frame === page.mainFrame()});
       await wake();
       await nextNavigation;
       await expect(banner).toBeHidden();
+      await expect.poll(() => operationReads).toBeGreaterThanOrEqual(2);
+
+      // Expired receipts leave idle status. Neither idle nor an unavailable
+      // journal check proves completion; an actual journal retains recovery.
+      operation = {state: "idle", options: {}};
+      for (const mode of ["actual", "older", "offline"]) {
+        detailsMode = mode;
+        documents = 0;
+        operationReads = 0;
+        await page.goto(process.argv[2] + "/example/");
+        await expect.poll(() => operationReads).toBeGreaterThanOrEqual(1);
+        await expect(page.locator("#lifecycle-operation-retry")).toBeVisible();
+        const response = responseFor("operation");
+        await wake();
+        await response;
+        await expect(page.locator("#lifecycle-operation-retry")).toBeVisible();
+        assert.equal(documents, 1, `${mode} read incorrectly reloaded`);
+      }
+
+      // Hiding the page while Retry awaits operation status cancels its
+      // details preflight. It must not fall through to the cached receipt.
+      detailsMode = "actual";
+      operation = {kind: "archive", state: "paused", receiptId: "receipt-1",
+        options: {journalId: "a".repeat(64), journalExpected: true}};
+      operationReads = 0;
+      documents = 0;
+      await page.goto(process.argv[2] + "/example/");
+      await expect(page.locator("#lifecycle-operation-retry")).toBeVisible();
+      await expect.poll(() => operationReads).toBeGreaterThanOrEqual(2);
+      holdOperation = true;
+      await page.locator("#archive-session-open").click();
+      await expect.poll(() => Boolean(releaseOperation)).toBe(true);
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", {configurable: true, value: true});
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      detailsMode = "completed";
+      releaseOperation();
+      await expect(page.locator("#archive-session-open")).toBeEnabled();
+      assert.equal(mutations, 0, "canceled preflight issued a mutation");
+      assert.equal(documents, 1);
+
+      // A fresh details response clears an old tab even with no receipt.
+      operation = {state: "idle", options: {}};
+      detailsMode = "completed";
+      clearNextDocument = true;
+      documents = 0;
+      operationReads = 0;
+      await page.goto(process.argv[2] + "/example/");
+      await expect.poll(() => documents).toBe(2);
+      await expect.poll(() => operationReads).toBeGreaterThanOrEqual(2);
+      await expect(page.locator("body")).toHaveAttribute("data-pending-lifecycle", "");
+      await expect(page.locator("#archive-session-open")).toBeHidden();
+      await expect(page.locator("#lifecycle-operation-retry")).toBeHidden();
+      await wake();
+      assert.equal(documents, 2, "completed page entered a reload loop");
+
+      // Retry must check fresh details even when its old receipt still matches.
+      detailsMode = "actual";
+      operation = {kind: "archive", state: "paused", receiptId: "receipt-1",
+        options: {journalId: "a".repeat(64), journalExpected: true}};
+      documents = 0;
+      operationReads = 0;
+      await page.goto(process.argv[2] + "/example/");
+      await expect(page.locator("#lifecycle-operation-retry")).toBeVisible();
+      await expect.poll(() => operationReads).toBeGreaterThanOrEqual(2);
+      await page.evaluate(() => Object.defineProperty(document, "hidden", {configurable: true, value: true}));
+      detailsMode = "completed";
+      await page.locator("#archive-session-open").click();
+      await expect.poll(() => documents).toBe(2);
+      await expect.poll(() => operationReads).toBeGreaterThanOrEqual(4);
+      await expect(page.locator("#lifecycle-operation-retry")).toBeHidden();
+      assert.equal(mutations, 0, "completed archive issued a mutation");
+      await page.route("**/api/index-status*", async route => {
+        const response = await route.fetch(), payload = await response.json();
+        payload.authoritative = true;
+        payload.operations = [];
+        for (const item of payload.sessions || []) delete item.pendingLifecycle;
+        return route.fulfill({response, json: payload});
+      });
+      await page.goto(process.argv[2] + "/");
+      await expect(page.locator('[data-session-slug="example"] [data-session-lifecycle]')).toBeHidden();
       assert.deepEqual(errors, []);
       console.log(engine.name() + ": archive diagnostics, throttling, recovery and read-only state passed");
     } finally { await browser.close(); }
