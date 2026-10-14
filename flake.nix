@@ -74,16 +74,29 @@
         workspace-host = devWorkspace;
         workspace-portal = devWorkspace;
       };
+      devShells.${system}.default = pkgs.mkShell {
+        inputsFrom = [ devWorkspace ];
+        packages = [
+          pkgs.go
+          pkgs.ruby
+          pkgs.git
+          pkgs.nix
+          pkgs.nodejs
+          pkgs.jq
+        ];
+        GOFLAGS = "-mod=readonly";
+      };
       apps.${system}.workspace-host = {
         type = "app";
         program = "${devWorkspace}/bin/workspace-host";
       };
-      checks.${system} = {
+      checks.${system} = devWorkspace.rubyChecks // {
         codex-package = import ./nix/tests/codex-package.nix {
           inherit mkCodexPackage pkgs;
           codex = llm-agents.packages.${system}.codex;
         };
         package = devWorkspace;
+        ruby-source-filter = import ./nix/tests/ruby-source-filter.nix { inherit pkgs; };
         host-module = import ./nix/tests/host-module.nix {
           inherit pkgs nixpkgs self;
         };

@@ -19,6 +19,7 @@
   openssh,
   python3,
   ruby,
+  runCommand,
   routerSocket,
   systemd,
   teamConfig ? null,
@@ -33,6 +34,24 @@
 let
   reviewAssets = import ./review-ui.nix {
     inherit buildNpmPackage lib git;
+  };
+  rubyChecks = import ./ruby-checks.nix {
+    inherit
+      bash
+      coreutils
+      git
+      jq
+      lib
+      nodejs
+      openssl
+      openssh
+      python3
+      ruby
+      runCommand
+      src
+      tmux
+      util-linux
+      ;
   };
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
   validActivationEnvironmentAliases =
@@ -256,6 +275,7 @@ buildGoModule {
 
   checkPhase = ''
     runHook preCheck
+    test -e ${rubyChecks.all}
     export HOME="$TMPDIR/home"
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
@@ -277,13 +297,6 @@ buildGoModule {
     node --check internal/web/static/repository-review.js
     node --check internal/web/static/source-file.js
     node --check internal/web/static/review-editor.js
-    (
-      cd ..
-      ruby test/dev_session_test.rb
-      ruby test/auto_archive_test.rb
-      ruby test/workspace_host_test.rb
-      ruby test/workspace_coordination_test.rb
-    )
     runHook postCheck
   '';
 
@@ -504,6 +517,10 @@ buildGoModule {
     fi
     grep -q 'workspace activation is private' "$TMPDIR/hostile-activation"
   '';
+
+  passthru.rubyChecks = rubyChecks.checks // {
+    ruby-verification = rubyChecks.all;
+  };
 
   meta = {
     description = "Persistent development workspaces backed by Codex App Server";
