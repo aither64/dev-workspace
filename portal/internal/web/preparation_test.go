@@ -86,12 +86,12 @@ func TestSessionNameDeterministicFallbackAndValidation(t *testing.T) {
 			t.Errorf("fallback(%q)=%q, want %q", test.raw, got, test.want)
 		}
 	}
-	for _, output := range []string{`{"name":"one-two-three"}`, `{"name":"one-two-three-four-five-six"}`} {
+	for _, output := range []string{`{"name":"workspace-notifications"}`, `{"name":"one-two-three"}`, `{"name":"one-two-three-four-five-six"}`} {
 		if _, err := parseSessionName(output); err != nil {
 			t.Error(err)
 		}
 	}
-	for _, output := range []string{`{"name":"one-two"}`, `{"name":"One-two-three"}`, `{"name":"one--two-three"}`, `{"name":"one-two-three","extra":0}`, `{"name":"one-two-three","name":"four-five-six"}`, `{"name":"one-two-three"} {}`, `null`, `[]`} {
+	for _, output := range []string{`{"name":"one"}`, `{"name":"one-two-three-four-five-six-seven"}`, `{"name":"` + strings.Repeat("a", 47) + `-b"}`, `{"name":"One-two-three"}`, `{"name":"one--two-three"}`, `{"name":"one-two-three","extra":0}`, `{"name":"one-two-three","name":"four-five-six"}`, `{"name":"one-two-three"} {}`, `null`, `[]`} {
 		if _, err := parseSessionName(output); err == nil {
 			t.Errorf("accepted %s", output)
 		}

@@ -15,7 +15,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-var generatedSessionName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+){2,5}$`)
+var generatedSessionName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+){1,5}$`)
 
 // The adapter supplies exactly one JSON object. It owns model selection and
 // isolation; no caller may derive utility settings from a development team.
