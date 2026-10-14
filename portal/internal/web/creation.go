@@ -401,6 +401,10 @@ func (s *Server) installCreationLocked(request creationRequest, receiptID, expec
 }
 
 func sameCreationRequest(left, right creationRequest) bool {
+	if (left.BrowserNotificationsEnabled == nil || *left.BrowserNotificationsEnabled) != (right.BrowserNotificationsEnabled == nil || *right.BrowserNotificationsEnabled) {
+		return false
+	}
+	left.BrowserNotificationsEnabled, right.BrowserNotificationsEnabled = nil, nil
 	left.directTeam = nil
 	right.directTeam = nil
 	left.teamSubmitted, left.digestSubmitted, left.modelSubmitted, left.effortSubmitted = false, false, false, false

@@ -219,7 +219,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 
 func preparationCreationRequest(record sessionPreparation) creationRequest {
 	input := record.Snapshot.Input
-	request := creationRequest{Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
+	request := creationRequest{BrowserNotificationsEnabled: input.BrowserNotificationsEnabled, Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
 		Model: strings.TrimSpace(input.Model.Value), Effort: strings.TrimSpace(input.Effort.Value)}
 	if record.Snapshot.Preset != nil {
 		request.Team, request.CatalogDigest = record.Snapshot.Preset.ID, record.Snapshot.Preset.CatalogDigest
@@ -308,6 +308,13 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 	input = preparationInput{Sensitive: r.FormValue("sensitive") == "true", RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
 		UploadScope: r.FormValue("uploadScope"), Attachments: append([]string{}, r.Form["attachmentIds"]...),
 		Team: present("team"), Catalog: present("catalogDigest"), Model: present("model"), Effort: present("effort")}
+	if value, found := r.Form["browserNotificationsEnabled"]; found {
+		if len(value) != 1 || (value[0] != "true" && value[0] != "false") {
+			return "", input, errors.New("invalid browser notification preference")
+		}
+		enabled := value[0] == "true"
+		input.BrowserNotificationsEnabled = &enabled
+	}
 	return id, input, nil
 }
 

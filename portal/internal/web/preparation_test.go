@@ -947,7 +947,7 @@ func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
 	if prompt < 0 || options < prompt || name < options {
 		t.Fatal("initial request must precede optional settings")
 	}
-	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=3`) {
+	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=4`) {
 		t.Fatal("index is missing durable-request recovery controls")
 	}
 	if !strings.Contains(body, `href="/" target="_blank" rel="noopener noreferrer"`) || !strings.Contains(body, `Copy saved text`) || !strings.Contains(body, `The original request may still finish.`) {

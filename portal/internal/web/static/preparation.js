@@ -37,7 +37,8 @@
     ["", "true"].includes(value.sensitive) && /^\d{4}-\d{2}-\d{2}$/.test(value.date);
   const normalizeDraft = (value) => {
     if (value && value.sensitive === undefined) value = {...value, sensitive: ""};
-    if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) ||
+    if (value && value.browserNotificationsEnabled === undefined) value = {...value, browserNotificationsEnabled: true};
+    if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
         !Array.isArray(value.attachmentIds) || value.attachmentIds.length > 50 ||
@@ -49,11 +50,12 @@
       if (value.attachmentIds.length && !value.scope) return null;
       const fields = new URLSearchParams(value.body);
       const scalars = ["clientRequestId", "name", "goal", "creation_date", "model", "effort", "uploadScope"];
-      const optional = ["team", "catalogDigest", "sensitive"];
+      const optional = ["team", "catalogDigest", "sensitive", "browserNotificationsEnabled"];
       if (scalars.some((key) => fields.getAll(key).length !== 1) ||
           optional.some((key) => fields.getAll(key).length > 1) ||
           [...fields.keys()].some((key) => ![...scalars, ...optional, "attachmentIds"].includes(key)) ||
           fields.get("clientRequestId") !== value.requestId ||
+          (fields.has("browserNotificationsEnabled") && fields.get("browserNotificationsEnabled") !== String(value.browserNotificationsEnabled)) ||
           fields.get("uploadScope") !== (value.scope?.id || "") ||
           fieldNames.some((key) => (fields.get(key === "date" ? "creation_date" : key) || "") !== value[key]) ||
           JSON.stringify(fields.getAll("attachmentIds")) !== JSON.stringify(value.attachmentIds)) return null;
@@ -88,7 +90,7 @@
       }
       const original = saved ? {...fields, ...saved} : fields;
       draft = {schema: 2, requestId: randomUUID(), ...Object.fromEntries(fieldNames.map((key) => [key, original[key] || ""])),
-        scope: null, attachmentIds: [], body: null, accepted: null, migratedUploads};
+        browserNotificationsEnabled: original.browserNotificationsEnabled !== false, scope: null, attachmentIds: [], body: null, accepted: null, migratedUploads};
       if (!normalizeDraft(draft)) throw new Error("Unable to allocate a valid session request identity.");
     }
     const persist = () => verifyWrite(storage, draftKey, JSON.stringify(draft));
@@ -123,7 +125,7 @@
       get draft() { return JSON.parse(JSON.stringify(draft)); },
       update(fields) {
         if (draft.body !== null) throw new Error("Recover the saved request before starting another session.");
-        const next = {...draft, ...Object.fromEntries(fieldNames.map((key) => [key, fields[key] ?? draft[key]]))};
+        const next = {...draft, browserNotificationsEnabled: fields.browserNotificationsEnabled ?? draft.browserNotificationsEnabled, ...Object.fromEntries(fieldNames.map((key) => [key, fields[key] ?? draft[key]]))};
         if (!normalizeDraft(next)) throw new Error("The session draft is invalid.");
         draft = next; persist();
       },
@@ -138,6 +140,7 @@
             if (Boolean(draft.model) !== Boolean(draft.effort)) throw new Error("Choose both a model and reasoning effort, or use the team defaults.");
             const body = new URLSearchParams({clientRequestId: draft.requestId, name: draft.name, goal: draft.goal,
               creation_date: draft.date, model: draft.model, effort: draft.effort, uploadScope: draft.scope?.id || ""});
+            body.set("browserNotificationsEnabled", String(draft.browserNotificationsEnabled));
             if (includeTeam) { body.set("team", draft.team); body.set("catalogDigest", draft.catalogDigest); }
             if (draft.sensitive === "true") body.set("sensitive", "true");
             for (const id of attachmentIds) body.append("attachmentIds", id);

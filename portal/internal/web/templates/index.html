@@ -37,10 +37,12 @@
     {{if .Error}}<p class="notice error">{{.Error}}</p>{{end}}
     <p id="index-status-warning" class="notice warning" hidden></p>
     <p data-coordination-warning class="notice warning" role="status" hidden></p>
+    {{template "browser-notifications"}}
     <section class="panel new-session">
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
+        <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         {{if .AgentTeams.Managed}}
         <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
@@ -92,9 +94,10 @@
   </main>
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
-  <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/app.js?v=39" defer></script>
+  <script src="/static/preparation.js?v=4" defer></script>
+  <script src="/static/app.js?v=40" defer></script>
   <script src="/static/coordination.js?v=4" defer></script>
+  <script src="/static/browser-notifications.js" defer></script>
 </body>
 </html>
 {{end}}

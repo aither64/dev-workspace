@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=14">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -51,6 +51,7 @@
       <button id="session-recovery-dismiss" type="button" class="quiet icon-button" title="Dismiss restored-session notice" aria-label="Dismiss restored-session notice" hidden><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
     </section>
     {{end}}
+    <p id="session-attention-status" class="muted full" role="status"></p>
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
     {{if .MemberNotice}}<p class="notice warning full">{{.MemberNotice}}</p>{{end}}
     {{if .Error}}<p class="notice error full">{{.Error}}</p>{{end}}
@@ -78,6 +79,13 @@
           <dl><dt>Sensitive</dt><dd data-session-sensitivity>{{if .Session.Sensitive}}Yes{{else}}No{{end}}</dd></dl>
           <p class="muted">Sensitivity is set when the session is created.</p>
         </section>
+        <section class="panel">
+          <h3>Session attention</h3>
+          <p><code>?</code> means an unseen answer or approval request. <code>✓</code> means the lead finished a response and the team is idle. Visiting this session clears attention. <code>R</code> means one machine is reserved; <code>R2</code> means two. Reservations remain until released.</p>
+          <label class="checkbox"><input id="session-notifications-enabled" type="checkbox" checked disabled> Browser notifications for this session</label>
+          <p class="muted">This setting applies to every subscribed browser. Title markers stay enabled.</p>
+        </section>
+        {{template "browser-notifications"}}
         <section id="auto-archive-panel" class="panel">
           <h3>Automatic archival</h3>
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
@@ -189,6 +197,7 @@
   {{if .Session.Interactive}}
   <dialog id="fork-dialog">
     <form id="fork-form" class="stack">
+      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Worktrees, files, and development clusters stay with this session.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
@@ -205,6 +214,7 @@
   {{if .Session.Interactive}}
   <dialog id="plan-session-dialog">
     <form id="plan-session-form" class="stack">
+      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
@@ -244,7 +254,10 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=39" defer></script>
+  <script src="/static/app.js?v=40" defer></script>
+  <script src="/static/session-attention-store.js" defer></script>
+  <script src="/static/browser-notifications.js" defer></script>
+  <script src="/static/session-attention.js" defer></script>
   <script src="/static/coordination.js?v=4" defer></script>
 </body>
 </html>

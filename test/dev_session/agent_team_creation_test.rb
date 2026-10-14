@@ -3,6 +3,37 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_direct_creation_browser_notification_preference_is_optional_boolean
+    with_workspace do |workspace|
+      runner = DevSession::Runner.new(workspace:, out: StringIO.new, err: StringIO.new)
+      preset = direct_team_preset
+      current = {
+        'schema' => 3, 'workspace' => workspace, 'receiptId' => 'c' * 64,
+        'deletionHistorySha256' => 'd' * 64, 'attempt' => 1,
+        'validated' => true, 'state' => 'running', 'phase' => 'initializing',
+        'startedAt' => '2026-10-14T12:00:00Z', 'updatedAt' => '2026-10-14T12:00:00Z',
+        'directTeam' => preset, 'model' => preset.fetch('leadModel'),
+        'effort' => preset.fetch('leadEffort'),
+        'request' => {'kind' => 'new', 'slug' => 'example', 'goal' => 'Work',
+                      'team' => preset.fetch('id'), 'catalogDigest' => preset.fetch('catalogDigest')}
+      }
+      validate = lambda do
+        runner.send(:validate_current_direct_portal_receipt!, current,
+                    {'receipt_id' => 'c' * 64}, 'example',
+                    model: preset.fetch('leadModel'), effort: preset.fetch('leadEffort'), direct_team: preset)
+      end
+      validate.call
+      [true, false].each do |value|
+        current['request']['browserNotificationsEnabled'] = value
+        validate.call
+      end
+      [nil, 0, 'false', [], {}].each do |value|
+        current['request']['browserNotificationsEnabled'] = value
+        assert_raises(DevSession::Error) { validate.call }
+      end
+    end
+  end
+
   # This file must remain runnable by itself. The aggregate suite happens to
   # define a richer NullTmux later, but this focused journal test only needs
   # the absence of a live session.

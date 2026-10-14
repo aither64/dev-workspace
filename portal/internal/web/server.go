@@ -166,6 +166,7 @@ type Server struct {
 	reviewOnce             sync.Once
 	reviewService          *repositoryReviewService
 	activity               *activityMonitor
+	notifications          *notificationService
 	config                 Config
 	hostProfile            hostProfileIdentity
 	templates              *template.Template
@@ -503,6 +504,7 @@ func New(config Config) (*Server, error) {
 		cancelOperations()
 		return nil, err
 	}
+	server.initNotifications()
 	if err := server.reconcilePreparations(); err != nil {
 		cancelOperations()
 		return nil, err
@@ -515,6 +517,7 @@ func New(config Config) (*Server, error) {
 	server.startUploadCollector()
 	server.startRecovery()
 	server.startActivityMonitor()
+	server.startNotifications()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
 		go server.reconcileThreadInstructions()
@@ -674,6 +677,12 @@ func (s *Server) Handler() http.Handler {
 	if s.uploadHandler != nil {
 		mux.Handle("/uploads/", s.uploadHandler)
 	}
+	mux.HandleFunc("GET /notification-worker.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set("Service-Worker-Allowed", "/")
+		data, _ := assets.ReadFile("static/notification-worker.js")
+		w.Write(data)
+	})
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("/", s.route)
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -732,6 +741,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.collaborationModes(w, r)
 	case r.URL.Path == "/api/auto-archive":
 		s.autoArchiveWorkspaceAPI(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/browser-notifications"):
+		s.browserNotificationsAPI(w, r)
 	case r.URL.Path == "/api/coordination":
 		s.coordinationAPI(w, r, "")
 	case r.Method == http.MethodGet && r.URL.Path == "/api/index-status":
@@ -1160,6 +1171,10 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	observation, observationErr := session.ObservationIdentity(summary.Workspace, summary.Slug,
 		filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
 	if observationErr != nil {
+		s.writeError(w, r, http.StatusConflict, "Session identity changed. Reload the session.")
+		return
+	}
+	if expected := r.URL.Query().Get("attentionIdentity"); expected != "" && expected != observation {
 		s.writeError(w, r, http.StatusConflict, "Session identity changed. Reload the session.")
 		return
 	}
@@ -1857,6 +1872,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && parts[1] == "attention" {
+		s.attentionAPI(w, r, summary.Slug)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "coordination" {
 		s.coordinationAPI(w, r, summary.Slug)
 		return
@@ -2324,19 +2343,20 @@ func planDigest(text string) string {
 }
 
 type implementPlanRequest struct {
-	Sensitive           bool    `json:"sensitive,omitempty"`
-	PlanContextVersion  int     `json:"planContextVersion"`
-	PlanText            string  `json:"planText"`
-	Model               *string `json:"model"`
-	ReasoningEffort     *string `json:"reasoningEffort"`
-	Team                *string `json:"team"`
-	CatalogDigest       *string `json:"catalogDigest"`
-	Action              string  `json:"action"`
-	PlanTurnID          string  `json:"planTurnId"`
-	PlanSHA256          string  `json:"planSha256"`
-	ClientUserMessageID string  `json:"clientUserMessageId"`
-	Name                string  `json:"name"`
-	CreationDate        string  `json:"creationDate"`
+	Sensitive                   bool    `json:"sensitive,omitempty"`
+	PlanContextVersion          int     `json:"planContextVersion"`
+	PlanText                    string  `json:"planText"`
+	Model                       *string `json:"model"`
+	ReasoningEffort             *string `json:"reasoningEffort"`
+	Team                        *string `json:"team"`
+	CatalogDigest               *string `json:"catalogDigest"`
+	Action                      string  `json:"action"`
+	PlanTurnID                  string  `json:"planTurnId"`
+	PlanSHA256                  string  `json:"planSha256"`
+	ClientUserMessageID         string  `json:"clientUserMessageId"`
+	Name                        string  `json:"name"`
+	CreationDate                string  `json:"creationDate"`
+	BrowserNotificationsEnabled *bool   `json:"browserNotificationsEnabled,omitempty"`
 }
 
 func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
@@ -2352,6 +2372,10 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil || raw == nil {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if err := validateBrowserNotificationPreference(raw); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	var body implementPlanRequest
@@ -2374,7 +2398,7 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 			return
 		}
 		request := creationRequest{
-			Sensitive: body.Sensitive, Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
+			BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, Sensitive: body.Sensitive, Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
 			PlanSHA256: strings.TrimSpace(body.PlanSHA256), PlanText: body.PlanText,
 		}
 		if body.Model != nil {
@@ -3231,12 +3255,23 @@ func commandFailure(action, stdout, stderr string, err error) error {
 
 func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *session.Summary) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var payload json.RawMessage
+	if !s.decodeJSON(w, r, &payload) {
+		return
+	}
+	var raw map[string]json.RawMessage
+	if rejectDuplicateCreationJSONKeys(payload) != nil || json.Unmarshal(payload, &raw) != nil || validateBrowserNotificationPreference(raw) != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid browser notification preference")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(payload))
 	var body struct {
-		Sensitive       bool   `json:"sensitive,omitempty"`
-		Name            string `json:"name"`
-		CreationDate    string `json:"creationDate"`
-		Model           string `json:"model"`
-		ReasoningEffort string `json:"reasoningEffort"`
+		Sensitive                   bool   `json:"sensitive,omitempty"`
+		Name                        string `json:"name"`
+		CreationDate                string `json:"creationDate"`
+		Model                       string `json:"model"`
+		ReasoningEffort             string `json:"reasoningEffort"`
+		BrowserNotificationsEnabled *bool  `json:"browserNotificationsEnabled,omitempty"`
 	}
 	if !s.decodeJSON(w, r, &body) {
 		return
@@ -3264,7 +3299,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		return
 	}
 	receipt, err := s.acceptCreation(creationRequest{
-		Sensitive: body.Sensitive, Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
+		BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, Sensitive: body.Sensitive, Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
 		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity,
 		Model: body.Model, Effort: body.ReasoningEffort,
 	})

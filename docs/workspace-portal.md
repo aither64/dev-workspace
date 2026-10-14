@@ -8,6 +8,15 @@ The [Codex provider guide](codex-providers.md) describes the limits popup's
 provider preview and workspace-wide switch, including operator catalog and
 recovery contracts.
 
+## Session attention and notifications
+
+Session titles show unseen input (`?`), a finished response (`✓`) and persistent
+machine reservations (`R`, `R2`, …). Browser notifications use server observation
+and Web Push with every portal tab closed. The [feature guide](browser-notifications.md)
+explains permission, per-session mute, event identity and delivery limits;
+[operations](browser-notifications-operations.md) covers provider egress and
+private-state recovery.
+
 ## Workspace configuration
 
 Each workspace can contain `.dev-workspace.json`:

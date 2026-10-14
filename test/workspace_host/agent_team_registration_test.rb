@@ -3,6 +3,48 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_portal_creation_notification_preference_survives_host_inspection
+    Dir.mktmpdir do |directory|
+      _package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-10-14-notifications'
+      receipt = managed_portal_creation_receipt(workspace, slug, 'c' * 64, state: 'ready')
+      receipt.delete('agentTeamBinding')
+      receipt.delete('agentTeamBindingDigest')
+      receipt['schema'] = 3
+      receipt['directTeam'] = {
+        'id' => receipt.fetch('request').fetch('team'), 'name' => 'Full team', 'description' => 'Direct threads',
+        'catalogDigest' => receipt.fetch('request').fetch('catalogDigest'), 'teamDigest' => 'b' * 64,
+        'leadModel' => receipt.fetch('model'), 'leadEffort' => receipt.fetch('effort'),
+        'roles' => ['lead'], 'members' => []
+      }
+      assert(host.send(:valid_portal_managed_creation_request?, receipt.fetch('request'), slug))
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+                           "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      File.chmod(0o700, creations)
+      path = File.join(creations, "#{slug}.json")
+      write = lambda do
+        File.write(path, JSON.generate(receipt))
+        File.chmod(0o600, path)
+      end
+      [true, false].each do |value|
+        receipt.fetch('request')['browserNotificationsEnabled'] = value
+        write.call
+        assert_equal([], host.send(:unfinished_portal_managed_creations, entry))
+        receipt['state'] = 'running'
+        write.call
+        assert_equal(["#{entry.fetch('name')}/#{slug} (portal direct creation)"], host.send(:unfinished_portal_managed_creations, entry))
+        receipt['state'] = 'ready'
+      end
+      [nil, 'false', 0, [], {}].each do |value|
+        receipt.fetch('request')['browserNotificationsEnabled'] = value
+        write.call
+        assert_raises(DevWorkspaceHost::Error) { host.send(:unfinished_portal_managed_creations, entry) }
+      end
+    end
+  end
+
   class RegistrationExecStop < StandardError; end
 
   class RegistrationHost < DevWorkspaceHost::Host

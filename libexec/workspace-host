@@ -2415,6 +2415,8 @@ module DevWorkspaceHost
 							end
     allowed << 'sensitive'
     return false if request.key?('sensitive') && request['sensitive'] != true
+    allowed << 'browserNotificationsEnabled'
+    return false unless !request.key?('browserNotificationsEnabled') || [true, false].include?(request['browserNotificationsEnabled'])
     return false unless (request.keys - allowed).empty? && (required - request.keys).empty?
 	  return false unless request['slug'] == slug && valid_session_identity?(request['slug']) &&
 						  valid_portal_team_identifier?(request['team']) &&

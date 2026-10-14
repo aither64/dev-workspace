@@ -24,8 +24,8 @@
     deleteQueued: conversation?.deleteQueued,
     startQueue: conversation?.startQueue,
     settings: conversation?.settings,
-    fork: (name, creationDate, model, reasoningEffort, sensitive = false) => request(apiPath(slug, "fork"), {
-      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, ...(sensitive ? {sensitive: true} : {})}),
+    fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true) => request(apiPath(slug, "fork"), {
+      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, browserNotificationsEnabled, ...(sensitive ? {sensitive: true} : {})}),
     }),
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
@@ -1014,6 +1014,7 @@
       effort: typeof value.effort === "string" ? value.effort : "",
       team: typeof value.team === "string" ? value.team : "",
       catalogDigest: typeof value.catalogDigest === "string" ? value.catalogDigest : "",
+      ...(value.browserNotificationsEnabled === undefined ? {} : {browserNotificationsEnabled: value.browserNotificationsEnabled !== false}),
     };
     if (kind === "new") draft.goal = value.goal;
     return draft;
@@ -1850,6 +1851,7 @@
       const separateRequest = document.getElementById("new-session-separate");
       const readFields = () => ({
         sensitive: form.elements.sensitive?.checked ? "true" : "", name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
+        browserNotificationsEnabled: form.elements.browserNotificationsEnabled?.checked !== false,
         ...managedDraftPolicyForStorage(form, {
           model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
           team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
@@ -1931,6 +1933,7 @@
         savedRequest = sessionPreparation.createRequestDraft({storage, fields: readFields(), fetch: fetch.bind(globalThis),
           legacyStorage: () => globalThis.localStorage});
         creationDraft = savedRequest.draft;
+        if (form.elements.browserNotificationsEnabled) form.elements.browserNotificationsEnabled.checked = creationDraft.browserNotificationsEnabled;
         for (const [key, name] of [["name", "name"], ["goal", "goal"], ["date", "creation_date"]]) {
           form.elements[name].value = creationDraft[key];
         }
@@ -5061,6 +5064,7 @@
     });
     const draft = normalizeCreationDraft({
       name: planSessionForm.elements.name.value,
+      browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
       date: planSessionForm.elements.creationDate.value,
       ...policy,
     }, "plan");
@@ -5086,6 +5090,7 @@
     managedDraftRecoveries.delete(planSessionForm);
     if (planSessionDraft) {
       planSessionForm.elements.name.value = planSessionDraft.name;
+      if (planSessionForm.elements.browserNotificationsEnabled) planSessionForm.elements.browserNotificationsEnabled.checked = planSessionDraft.browserNotificationsEnabled !== false;
       planSessionForm.elements.creationDate.value = planSessionDraft.date;
       restoreManagedCreationDrafts();
     }
@@ -5118,6 +5123,7 @@
       const result = await client.implementPlan({
         action: "new",
         sensitive: Boolean(planSessionForm.elements.sensitive?.checked),
+        browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
         ...planSessionSnapshot,
         name: planSessionForm.elements.name.value,
         creationDate: planSessionForm.elements.creationDate.value,
@@ -5308,6 +5314,7 @@
           forkForm.elements.model.value,
           forkForm.elements.effort.value,
           Boolean(forkForm.elements.sensitive?.checked),
+          forkForm.elements.browserNotificationsEnabled?.checked !== false,
         );
         progress.stop();
         location.assign(result.url);

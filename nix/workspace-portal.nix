@@ -271,7 +271,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-TtTCKkMtvnGo+2nRxuuBDDJVRsxK4Yhbic/DYhn1rII=";
+  vendorHash = "sha256-iyydGWryLmh8P+YxQcQ2SqGIj1Lds+WBDgsKQV4uFqA=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}
@@ -318,6 +318,11 @@ buildGoModule {
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
+    node --check internal/web/static/session-attention-store.js
+    node --check internal/web/static/session-attention.js
+    node --check internal/web/static/browser-notifications.js
+    node --check internal/web/static/notification-worker.js
+    node --test internal/web/attention_browser_test.cjs
     node --check internal/web/static/coordination.js
     node --test internal/web/coordination_browser_test.cjs
     node --check internal/web/static/codex-providers.js

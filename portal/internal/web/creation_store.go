@@ -25,18 +25,19 @@ import (
 // Old packages ignore these private files; the existing CLI journals retain
 // their original format and continue to own runtime initialization.
 type creationRequest struct {
-	Sensitive      bool   `json:"sensitive,omitempty"`
-	Kind           string `json:"kind"`
-	Slug           string `json:"slug"`
-	Goal           string `json:"goal,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Effort         string `json:"effort,omitempty"`
-	Source         string `json:"source,omitempty"`
-	SourceThreadID string `json:"sourceThreadId,omitempty"`
-	SourceIdentity string `json:"sourceIdentity,omitempty"`
-	PlanTurnID     string `json:"planTurnId,omitempty"`
-	PlanSHA256     string `json:"planSha256,omitempty"`
-	PlanText       string `json:"planText,omitempty"`
+	Sensitive                   bool   `json:"sensitive,omitempty"`
+	Kind                        string `json:"kind"`
+	Slug                        string `json:"slug"`
+	Goal                        string `json:"goal,omitempty"`
+	Model                       string `json:"model,omitempty"`
+	Effort                      string `json:"effort,omitempty"`
+	Source                      string `json:"source,omitempty"`
+	SourceThreadID              string `json:"sourceThreadId,omitempty"`
+	SourceIdentity              string `json:"sourceIdentity,omitempty"`
+	PlanTurnID                  string `json:"planTurnId,omitempty"`
+	PlanSHA256                  string `json:"planSha256,omitempty"`
+	PlanText                    string `json:"planText,omitempty"`
+	BrowserNotificationsEnabled *bool  `json:"browserNotificationsEnabled,omitempty"`
 	// Team and CatalogDigest identify a schema-2 virtual receipt or a schema-3
 	// direct-thread receipt. Schema 3 retains its exact resolved roster below.
 	// Empty advanced model/effort fields remain absent via omitempty.
@@ -432,9 +433,12 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	if marker, ok := request["sensitive"]; ok && string(marker) != "true" {
 		return errors.New("sensitive must be true when present")
 	}
+	if err := validateBrowserNotificationPreference(request); err != nil {
+		return err
+	}
 	if schema == 1 {
 		requestAllowed := map[string]bool{}
-		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive"} {
+		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive", "browserNotificationsEnabled"} {
 			requestAllowed[field] = true
 		}
 		for field := range request {
@@ -447,7 +451,7 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 				return fmt.Errorf("creation receipt request lacks %q", field)
 			}
 		}
-		if err := rejectCreationNulls(request, "kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest"); err != nil {
+		if err := rejectCreationNulls(request, "kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "browserNotificationsEnabled"); err != nil {
 			return err
 		}
 		if _, ok := raw["agentTeamBinding"]; ok {
@@ -583,6 +587,10 @@ func validateManagedCreationRequestShape(request map[string]json.RawMessage) err
 		optional = []string{"planText", "model", "effort", "sensitive"}
 	default:
 		return errors.New("schema-2 creation request has an invalid kind")
+	}
+	optional = append(optional, "browserNotificationsEnabled")
+	if err := validateBrowserNotificationPreference(request); err != nil {
+		return err
 	}
 	if err := exactCreationRequestFields(request, required, optional); err != nil {
 		return err
@@ -818,4 +826,13 @@ func (s *Server) saveCreation(receipt creationReceipt) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func validateBrowserNotificationPreference(request map[string]json.RawMessage) error {
+	if raw, present := request["browserNotificationsEnabled"]; present {
+		if string(bytes.TrimSpace(raw)) != "true" && string(bytes.TrimSpace(raw)) != "false" {
+			return errors.New("browser notification preference must be a boolean")
+		}
+	}
+	return nil
 }

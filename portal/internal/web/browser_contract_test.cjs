@@ -1151,7 +1151,7 @@ if (!unitOnly) {
     },
     {
       path: "/api/sessions/example/fork",
-      body: {name: "forked", creationDate: "2026-09-05", model: "model-1", reasoningEffort: ""},
+      body: {name: "forked", creationDate: "2026-09-05", model: "model-1", reasoningEffort: "", browserNotificationsEnabled: true},
     },
     {
       path: "/api/sessions/example/archive",

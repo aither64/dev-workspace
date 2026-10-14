@@ -36,16 +36,17 @@ type preparationValue struct {
 }
 
 type preparationInput struct {
-	Sensitive   bool             `json:"sensitive,omitempty"`
-	RawPrompt   string           `json:"rawPrompt"`
-	Date        string           `json:"date"`
-	CustomName  string           `json:"customName"`
-	UploadScope string           `json:"uploadScope"`
-	Attachments []string         `json:"attachments"`
-	Team        preparationValue `json:"team"`
-	Catalog     preparationValue `json:"catalog"`
-	Model       preparationValue `json:"model"`
-	Effort      preparationValue `json:"effort"`
+	Sensitive                   bool             `json:"sensitive,omitempty"`
+	RawPrompt                   string           `json:"rawPrompt"`
+	Date                        string           `json:"date"`
+	CustomName                  string           `json:"customName"`
+	UploadScope                 string           `json:"uploadScope"`
+	Attachments                 []string         `json:"attachments"`
+	Team                        preparationValue `json:"team"`
+	Catalog                     preparationValue `json:"catalog"`
+	Model                       preparationValue `json:"model"`
+	Effort                      preparationValue `json:"effort"`
+	BrowserNotificationsEnabled *bool            `json:"browserNotificationsEnabled,omitempty"`
 }
 
 type preparationSnapshot struct {

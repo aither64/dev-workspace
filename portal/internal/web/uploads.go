@@ -131,6 +131,9 @@ func (s *Server) prepareCreationAttachments(ctx context.Context, slug, scopeID, 
 }
 
 func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceipt) error {
+	if err := s.bindCreationNotificationPreference(receipt); err != nil {
+		return err
+	}
 	summary, err := session.Find(s.config.Workspace, receipt.Request.Slug)
 	if err != nil {
 		return err
