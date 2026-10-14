@@ -1221,8 +1221,9 @@ change persisted cluster state or its transition policy.
 
 ## Sensitive sessions
 
-Choose **Sensitive session** when creating a session. The badge remains visible
-in the session list and session page. Forks and new sessions implementing a
+Choose **Sensitive session** above **Options** when creating a session. Settings
+shows **Sensitive: Yes** or **Sensitive: No**. The badge remains visible in the
+session list and session page. Forks and new sessions implementing a
 sensitive plan inherit the setting. Records remain local while portal access and
 Codex processing retain their existing behavior. See the
 [session guide](dev-sessions.md#sensitive-sessions) for storage and recovery.

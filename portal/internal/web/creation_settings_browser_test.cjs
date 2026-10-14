@@ -23,7 +23,13 @@ const baseURL = process.argv[2];
       ]});
     });
     await page.route("**/api/upload-drafts", route => route.fulfill({status: 503, json: {error: "Fixture has no files"}}));
-    await page.route("**/api/index-status*", route => route.fulfill({json: {sessions: [], operations: []}}));
+    const sessions = [false, true].flatMap(archived => [false, true].map(sensitive => ({
+      slug: `${archived ? "archived" : "active"}-${sensitive ? "sensitive" : "ordinary"}`,
+      archived, sensitive, updatedAt: new Date().toISOString(), repositoryCount: 0, runningClusters: 0,
+    })));
+    await page.route("**/api/index-status*", route => route.fulfill({json: {
+      sessions, operations: [], authoritative: true, generatedAt: new Date(Date.now() + 60000).toISOString(),
+    }}));
     const form = page.locator("#new-session-form");
     const model = form.locator("[name=model]"), effort = form.locator("[name=effort]");
     const team = form.locator("[name=team]");
@@ -33,6 +39,43 @@ const baseURL = process.argv[2];
       await form.locator("summary").click();
     };
     await open();
+    await page.locator(".archive-list > summary").click();
+    const sensitive = form.getByRole("checkbox", {name: "Sensitive session (records stay local)", exact: true});
+    for (const width of [1280, 375]) {
+      await page.setViewportSize({width, height: 900});
+      const geometry = await sensitive.evaluate(input => {
+        const label = input.closest("label"), range = document.createRange();
+        range.selectNodeContents(label.lastChild);
+        const box = input.getBoundingClientRect(), text = range.getBoundingClientRect();
+        return {width: box.width, centerDelta: Math.abs(box.y + box.height / 2 - text.y - text.height / 2),
+          afterTeam: Boolean(document.querySelector("[name=team]").compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING),
+          beforeOptions: label.nextElementSibling?.tagName === "DETAILS"};
+      });
+      assert.ok(geometry.width < 24 && geometry.centerDelta < 2, JSON.stringify(geometry));
+      assert.ok(geometry.afterTeam && geometry.beforeOptions, JSON.stringify(geometry));
+      for (const item of sessions) {
+        const card = page.locator(`[data-session-list='${item.archived ? "archived" : "active"}'] [data-session-slug='${item.slug}']`);
+        const badge = card.locator("[data-session-sensitive]");
+        if (item.sensitive) {
+          await expect(badge).toBeVisible();
+          const sizing = await badge.evaluate(element => {
+            const style = getComputedStyle(element), range = document.createRange();
+            range.selectNodeContents(element);
+            const decoration = [style.paddingLeft, style.paddingRight, style.borderLeftWidth, style.borderRightWidth]
+              .reduce((total, value) => total + parseFloat(value), 0);
+            return {actual: element.getBoundingClientRect().width, intrinsic: range.getBoundingClientRect().width + decoration};
+          });
+          assert.ok(Math.abs(sizing.actual - sizing.intrinsic) < 2, JSON.stringify(sizing));
+        } else await expect(badge).toBeHidden();
+      }
+    }
+    await sensitive.locator("..").click();
+    await expect(sensitive).toBeChecked();
+    await sensitive.focus();
+    await page.keyboard.press("Space");
+    await expect(sensitive).not.toBeChecked();
+    await page.keyboard.press("Space");
+    await expect(sensitive).toBeChecked();
     await expect.poll(() => Boolean(releaseModels)).toBe(true);
     await expect(team).toHaveValue("lead_reviewed");
     await pair("model-lead", "xhigh");
@@ -47,6 +90,7 @@ const baseURL = process.argv[2];
     await pair("model-lead", "xhigh");
     await page.reload({waitUntil: "domcontentloaded"});
     await form.locator("summary").click();
+    await expect(sensitive).toBeChecked();
     await pair("model-lead", "xhigh");
     await expect(team).toHaveValue("solo");
     await team.selectOption("lead_reviewed");
@@ -103,6 +147,15 @@ const baseURL = process.argv[2];
     await expect.poll(() => retryBody).toBe(frozenBody);
     await expect(team).toBeDisabled();
     assert.equal(await page.evaluate(key => JSON.parse(sessionStorage.getItem(key)).body, draftKey), frozenBody);
+    for (const width of [1280, 375]) {
+      await page.setViewportSize({width, height: 900});
+      for (const item of sessions) {
+        await page.goto(`${baseURL}/fixture/session?sensitive=${item.sensitive}&archived=${item.archived}#settings`);
+        await expect(page.locator("[data-session-sensitivity]")).toBeVisible();
+        await expect(page.locator("[data-session-sensitivity]")).toHaveText(item.sensitive ? "Yes" : "No");
+        assert.equal(await page.locator("#settings [name=sensitive]").count(), 0);
+      }
+    }
     assert.deepEqual(errors, []);
     console.log("Concrete creation settings, drafts and recovery passed");
   } finally {

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 func TestNewSessionSettingsBrowser(t *testing.T) {
@@ -15,6 +17,7 @@ func TestNewSessionSettingsBrowser(t *testing.T) {
 		t.Skip("set PORTAL_BROWSER_TEST=1 to run the Playwright creation settings regression")
 	}
 	server := newTestServer(t)
+	defer server.Close()
 	server.installedTeams = &agentteams.Installed{Managed: true, Catalog: &agentteams.Catalog{
 		CatalogDigest: strings.Repeat("a", 64), DefaultTeam: "lead_reviewed",
 		Teams: map[string]agentteams.Team{
@@ -29,7 +32,17 @@ func TestNewSessionSettingsBrowser(t *testing.T) {
 	}}
 	httpServer := httptest.NewUnstartedServer(nil)
 	server.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
-	httpServer.Config.Handler = server.Handler()
+	handler := server.Handler()
+	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/session" {
+			server.render(w, "session", pageData{Session: &session.Summary{
+				Manifest: session.Manifest{Slug: "fixture", Sensitive: r.URL.Query().Get("sensitive") == "true"},
+				Archived: r.URL.Query().Get("archived") == "true",
+			}})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
 	command := exec.Command("node", "creation_settings_browser_test.cjs", httpServer.URL)

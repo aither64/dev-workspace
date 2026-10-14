@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=13">
+  <link rel="stylesheet" href="/static/style.css?v=14">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -73,6 +73,11 @@
       </section>
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Settings</h2></div>
+        <section class="panel">
+          <h3>Session</h3>
+          <dl><dt>Sensitive</dt><dd data-session-sensitivity>{{if .Session.Sensitive}}Yes{{else}}No{{end}}</dd></dl>
+          <p class="muted">Sensitivity is set when the session is created.</p>
+        </section>
         <section id="auto-archive-panel" class="panel">
           <h3>Automatic archival</h3>
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
@@ -186,7 +191,7 @@
     <form id="fork-form" class="stack">
       <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Worktrees, files, and development clusters stay with this session.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
-      <label><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
+      <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>
       <div class="field-grid">
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
@@ -202,7 +207,7 @@
     <form id="plan-session-form" class="stack">
       <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
-      <label><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
+      <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
       {{if .AgentTeams.Managed}}
       <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">

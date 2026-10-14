@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=13">
+  <link rel="stylesheet" href="/static/style.css?v=14">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -41,7 +41,6 @@
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
-        <label><input type="checkbox" name="sensitive" value="true"> Sensitive session (records stay local)</label>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         {{if .AgentTeams.Managed}}
         <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
@@ -50,6 +49,7 @@
         <p class="notice warning" data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed since you saved this draft. Check the team and lead settings before creating the session.</p>
         <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>
         {{end}}
+        <label class="checkbox"><input type="checkbox" name="sensitive" value="true"> Sensitive session (records stay local)</label>
         <details><summary>Options</summary>
         <div class="stack">
         <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
@@ -139,7 +139,7 @@
   <span class="muted" data-session-updated data-updated-at="{{with .}}{{.UpdatedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}{{end}}">{{with .}}{{if .Archived}}Finalized{{else}}Updated{{end}} {{timeAgo .UpdatedAt}}{{end}}</span>
   <span data-session-repositories>{{with .}}{{len .Repositories}} repositories{{end}}</span>
   <span class="cluster-summary" data-session-clusters hidden></span>
-  <span class="badge" data-session-sensitive {{if not .Sensitive}}hidden{{end}}>Sensitive</span>
+  <span class="badge sensitive" data-session-sensitive {{if not .Sensitive}}hidden{{end}}>Sensitive</span>
   <span class="badge warning" data-session-lifecycle hidden></span>
   <span class="badge reserved" data-session-reservation hidden></span>
 </a>
