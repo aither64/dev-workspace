@@ -715,6 +715,23 @@ module WorkspaceCoordination
       end
     end
 
+    def dispatch_notifications(owner)
+      eligible = store.read['outbox'].values.any? do |event|
+        event['ownerId'] == owner['id'] && %w[pending retry].include?(event['state']) && event['retryAt'] <= Time.now.to_i
+      end
+      return unless eligible
+      unit = "workspace-notifications-#{owner.fetch('id')}"
+      return if %w[active activating deactivating].include?(capture('systemctl', '--user', 'show', "#{unit}.service", '--property=ActiveState', '--value').strip)
+      request = {'schema' => 1, 'ownerId' => owner['id'], 'identity' => owner['identity'],
+        'workspace' => workspace, 'entry' => entry, 'package' => package, 'profile' => profile}
+      path = File.join(store.root, 'notification-workers', "#{owner['id']}.json")
+      WorkspaceCoordination.atomic(path, request, limit: MAX_REQUEST)
+      retain_root("#{owner['id']}-#{Digest::SHA256.hexdigest(package)[0, 12]}", 'notification', package)
+      capture('systemd-run', '--user', '--quiet', '--collect', "--unit=#{unit}",
+        '--property=Type=exec', '--property=UMask=0077', '--property=Restart=no',
+        File.join(package, 'bin/workspace-host'), 'coordination-notifications', '--request', path)
+    end
+
     def reconcile_attempts
       store.read.fetch('jobs').values.select { |job| CLAIMED.include?(job['state']) }.each do |job|
         result_path = attempt_path(job.fetch('attempt'), 'result.json')
@@ -854,7 +871,7 @@ module WorkspaceCoordination
         authority = @request.fetch('entry').fetch('authority')
         FileUtils.mkdir_p(authority, mode: 0o700)
         File.open(File.join(authority, "#{@owner.fetch('slug')}.lock"), File::RDWR | File::CREAT, 0o600) do |session_lock|
-          session_lock.flock(File::LOCK_EX)
+          session_lock.flock(File::LOCK_SH)
           live = @engine.owner(@owner['slug'], bootstrap: @owner['bootstrap'])
           raise Error.new('attempt owner identity changed', 4) unless live['id'] == @owner['id']
           ledger = @engine.store.read

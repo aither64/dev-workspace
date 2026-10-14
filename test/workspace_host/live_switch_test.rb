@@ -72,7 +72,7 @@ class WorkspaceHostTest < Minitest::Test
       host.define_singleton_method(:coordination_engine) { |_entry| engine }
       claimed = []
       engine.define_singleton_method(:claim) { |owner_id:| claimed << owner_id; [] }
-      engine.define_singleton_method(:deliver_notifications) { |owner_id:| throw :scheduler_tick_completed }
+      engine.define_singleton_method(:dispatch_notifications) { |_owner| throw :scheduler_tick_completed }
       catch(:scheduler_tick_completed) { host.send(:run_coordinator, []) }
       assert_equal [admitted['id']], claimed
       assert_equal before, File.binread(path)

@@ -297,7 +297,7 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
-    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing; do
+    for name in workspace-coordination workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
     ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"

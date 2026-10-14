@@ -425,6 +425,7 @@ module DevWorkspaceHost
       when 'coordination' then coordination_host_command(argv)
       when 'coordination-worker' then coordination_worker_command(argv)
       when 'coordination-reconcile' then coordination_reconcile_command(argv)
+      when 'coordination-notifications' then coordination_notifications_command(argv)
       when 'run-coordinator' then run_coordinator(argv)
       when 'coordination-bootstrap' then coordination_bootstrap(argv)
       when 'recover-archive' then recover_archive(argv)

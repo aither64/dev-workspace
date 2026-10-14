@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-coordination-execution'
+require_relative 'workspace-coordination-admission'
 
 module DevWorkspaceHost
   # Host-owned command composition. The engine owns ledger writes; the existing
@@ -79,9 +80,11 @@ module DevWorkspaceHost
         opts.on('--portal') { options[:portal] = true }
         opts.on('--request FILE') { |value| options[:request] = value }
         opts.on('--bootstrap-owner ID') { |value| options[:bootstrap_owner] = value }
+        opts.on('--admission-timeout SECONDS', Float) { |value| options[:admission_timeout] = value }
       end.parse!(argv)
       raise WorkspaceCoordination::Error, 'use coordination ACTION SLUG [ID] --as-is --request FILE' unless argv.empty? && options[:as_is]
       engine = coordination_engine(entry)
+      @coordination_admission_timeout = options.fetch(:admission_timeout, 30)
       if options[:bootstrap_owner] && !%w[status reconcile cancel finish].include?(action)
         raise WorkspaceCoordination::Error.new('bootstrap maintenance cannot enqueue or approve new work', 4)
       end
@@ -136,14 +139,14 @@ module DevWorkspaceHost
       end
     end
 
-    def with_coordination_session_admission(entry, slug)
+    def with_coordination_session_admission(entry, slug, timeout: @coordination_admission_timeout || 30)
       with_current_generation_lock(mode: File::LOCK_SH) do
         runtime = instance_runtime(entry)
         FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
         path = File.join(runtime.fetch(:authority), "#{slug}.lock")
         raise WorkspaceCoordination::Error, 'session lock is a symlink' if File.symlink?(path)
         File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
-          raise WorkspaceCoordination::Error.new('session lifecycle admission is busy', 75) unless file.flock(File::LOCK_EX | File::LOCK_NB)
+          WorkspaceCoordination::Admission.acquire(file, timeout:, diagnostics: @err)
           raise WorkspaceCoordination::Error.new('session lifecycle recovery must finish first', 5) if Dir[File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.{archive,removal,revive,fork,start}.json")].any?
           creation_path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json")
           if File.exist?(creation_path) || File.symlink?(creation_path)
@@ -297,6 +300,29 @@ module DevWorkspaceHost
       WorkspaceCoordination::Worker.new(argv[1]).reconcile
     end
 
+    def coordination_notifications_command(argv)
+      raise WorkspaceCoordination::Error, 'coordination-notifications requires --request PATH' unless argv.length == 2 && argv[0] == '--request'
+      request = WorkspaceCoordination.private_read(argv[1], limit: WorkspaceCoordination::MAX_REQUEST)
+      WorkspaceCoordination.keys!(request, %w[schema ownerId identity workspace entry package profile])
+      unless request['schema'] == 1 && request['ownerId'].match?(WorkspaceCoordination::UUID) &&
+             request['package'] == File.realpath(package_root) && request['profile'] == @profile
+        raise WorkspaceCoordination::Error.new('notification worker generation differs', 3)
+      end
+      entry = registry.entries.find { |value| value['root'] == request['workspace'] && value['name'] == request.dig('entry', 'name') }
+      raise WorkspaceCoordination::Error.new('notification workspace changed', 4) unless entry
+      engine = coordination_engine(entry)
+      engine.store.lock("notifications-#{request['ownerId']}", nonblock: true) do
+        owner = engine.store.read['owners'].fetch(request['ownerId'])
+        with_coordination_session_admission(entry, owner['slug']) do
+          current = engine.owner(owner['slug'])
+          unless current['id'] == request['ownerId'] && current['identity'] == request['identity']
+            raise WorkspaceCoordination::Error.new('notification owner changed', 4)
+          end
+          engine.deliver_notifications(owner_id: current['id'])
+        end
+      end
+    end
+
     def run_coordinator(argv)
       raise WorkspaceCoordination::Error, 'run-coordinator takes no arguments' unless argv.empty?
       coordination_store.lock('scheduler', nonblock: true) do
@@ -315,7 +341,7 @@ module DevWorkspaceHost
             engine.store.read['owners'].values.select { |owner| owner['workspace'] == entry['root'] && !owner['fence'] }.each do |owner|
               next if owner['bootstrap']
               claimed = []
-              with_coordination_session_admission(entry, owner['slug']) do
+              with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
                 current = engine.owner(owner['slug'])
                 raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
               end
@@ -326,13 +352,13 @@ module DevWorkspaceHost
                   raise unless [5, 75].include?(e.code)
                 end
               end
-              with_coordination_session_admission(entry, owner['slug']) do
+              with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
                 current = engine.owner(owner['slug'])
                 raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
                 claimed = engine.claim(owner_id: owner['id'])
-                engine.deliver_notifications(owner_id: owner['id'])
               end
               claimed.each { |job| engine.dispatch(job) }
+              engine.dispatch_notifications(owner)
             rescue WorkspaceCoordination::Error => e
               @err.puts "coordinator owner #{owner['slug']}: #{e.message}"
             end
