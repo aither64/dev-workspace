@@ -355,7 +355,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         slug: "example", kind: "archive", state: "failed", receiptId, phase: "starting",
         code: confirmations.length === 1 ? "target_changed" : undefined,
         error: "Fixture refusal", currentTarget,
-        options: {mode: "complete", journalId: allocatedJournalId, journalExpected: false, targetId: currentTarget.targetId},
+        options: {mode: "archived", journalId: allocatedJournalId, journalExpected: false, targetId: currentTarget.targetId},
       } : {state: "idle"}}));
       await page.route("**/api/sessions/example/archive", route => {
         confirmations.push(route.request().postDataJSON());
@@ -363,12 +363,12 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
           {status: 503, json: {error: "Fixture refusal after explicit confirmation"}});
       });
       await page.locator("#archive-session-open").click();
-      await page.locator('#archive-session-form button[value="complete"]').click();
+      await page.locator('#archive-session-form button[value="archived"]').click();
       await expect(page.locator("#archive-session-dialog")).toBeVisible();
       await expect(page.locator("[data-lifecycle-target-summary]")).toContainText("replacement-root");
       assert.equal(confirmations.length, 1, "changed pre-journal request replayed without confirmation");
       assert.equal(confirmations[0].targetId, oldTarget);
-      await page.locator('#archive-session-form button[value="complete"]').click();
+      await page.locator('#archive-session-form button[value="archived"]').click();
       await expect.poll(() => confirmations.length).toBe(2);
       assert.equal(confirmations[1].targetId, currentTarget.targetId);
       assert.equal(confirmations[1].receiptId, receiptId);

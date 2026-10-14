@@ -8,7 +8,7 @@ const checkSidebarMenu = async page => {
   await toggle.focus();
   await page.keyboard.press("Enter");
   await expect(menu).toBeVisible();
-  await expect(menu.getByRole("link", {name: "Automatic archival", exact: true})).toBeFocused();
+  await expect(menu.getByRole("link", {name: "Operations", exact: true})).toBeFocused();
   await expect.poll(async () => {
     const button = await toggle.boundingBox(), bounds = await menu.boundingBox(), viewport = page.viewportSize();
     return bounds.x >= 0 && bounds.x + bounds.width <= viewport.width &&

@@ -223,6 +223,7 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
       await page.clock.install();
       await page.reload();
       const counts = page.locator("#codex-work-counts"), timer = page.locator("#codex-work-elapsed");
+      await expect(counts).toHaveText("3 messages · 7 tool calls");
       await expect(page.locator("#codex-work-separator")).toHaveCount(0);
       const geometry = () => work.evaluate(element => {
         const counts = element.querySelector("#codex-work-counts").getBoundingClientRect();
