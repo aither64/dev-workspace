@@ -75,17 +75,7 @@ func fixturePreparation(t *testing.T, server *Server, number int, state string) 
 	return record
 }
 
-func TestSessionNameDeterministicFallbackAndValidation(t *testing.T) {
-	for _, test := range []struct{ raw, want string }{
-		{"\n  Příliš žluťoučký KŮŇ opravil přenos souborů sedmý\nignored", "prilis-zlutoucky-kun-opravil-prenos-souboru"},
-		{"cafe\u0301 numéro 42", "cafe-numero-42"}, {"東京 / łódź", "odz"},
-		{"  \n 🔧 \nsecond line", "session"}, {strings.Repeat("x", 49) + " short", "session"},
-		{"alpha beta gamma delta epsilon zeta eta", "alpha-beta-gamma-delta-epsilon-zeta"},
-	} {
-		if got := fallbackSessionName(test.raw); got != test.want {
-			t.Errorf("fallback(%q)=%q, want %q", test.raw, got, test.want)
-		}
-	}
+func TestSessionNameValidation(t *testing.T) {
 	for _, output := range []string{`{"name":"workspace-notifications"}`, `{"name":"one-two-three"}`, `{"name":"one-two-three-four-five-six"}`} {
 		if _, err := parseSessionName(output); err != nil {
 			t.Error(err)
@@ -104,7 +94,7 @@ func TestSessionNameDeterministicFallbackAndValidation(t *testing.T) {
 	}
 }
 
-func TestSessionNameAdapterFallbackAndWorkspaceConcurrency(t *testing.T) {
+func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
 	for _, test := range []struct {
@@ -118,8 +108,8 @@ func TestSessionNameAdapterFallbackAndWorkspaceConcurrency(t *testing.T) {
 	} {
 		server.config.SessionNamer = func(context.Context, string) (string, error) { return test.output, test.err }
 		name, outcome, err := server.namePreparation(context.Background(), "Příliš short prompt")
-		if err != nil || name != "prilis-short-prompt" || outcome != test.outcome {
-			t.Fatalf("fallback=%q %q %v", name, outcome, err)
+		if !errors.Is(err, errSessionNaming) || name != "" || outcome != test.outcome {
+			t.Fatalf("failure=%q %q %v", name, outcome, err)
 		}
 	}
 	entered, release := make(chan time.Time, 3), make(chan struct{})
@@ -188,7 +178,7 @@ func TestSessionNameTimeoutIncludesSemaphoreQueue(t *testing.T) {
 	}
 	started := time.Now()
 	name, outcome, err := server.namePreparation(context.Background(), "queued naming prompt")
-	if err != nil || name != "queued-naming-prompt" || outcome != "timeout" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "timeout" {
 		t.Fatal(name, outcome, err)
 	}
 	if elapsed := time.Since(started); elapsed < 9*time.Second || elapsed > 12*time.Second {
@@ -918,7 +908,7 @@ func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing
 	for _, expected := range []string{
 		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
 		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
-		`/static/preparation.js?v=3`, `/static/creation.js?v=3`,
+		`/static/preparation.js?v=3`, `/static/creation.js?v=4`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("preparation page omits %q", expected)

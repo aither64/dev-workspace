@@ -172,7 +172,7 @@ func TestSessionNamingUtilityUnsafePrivateStateNeverCallsClient(t *testing.T) {
 	}
 }
 
-func TestSessionNamingUtilityErrorUsesExistingFallback(t *testing.T) {
+func TestSessionNamingUtilityErrorStopsNaming(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
 	store := namingTestStore(t)
@@ -183,7 +183,7 @@ func TestSessionNamingUtilityErrorUsesExistingFallback(t *testing.T) {
 		return modelSessionName(ctx, input, client, store, "/trusted/models.json")
 	}
 	name, outcome, err := server.namePreparation(context.Background(), "Fix runtime session names")
-	if err != nil || name != "fix-runtime-session-names" || outcome != "utility_error" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q err=%v", name, outcome, err)
 	}
 }
@@ -230,7 +230,7 @@ func TestSessionNamingUtilityNormalConstructionAndInjectedBoundary(t *testing.T)
 	}
 }
 
-func TestSessionNamingUtilityUnavailableOwnedSocketUsesFallback(t *testing.T) {
+func TestSessionNamingUtilityUnavailableOwnedSocketStopsNaming(t *testing.T) {
 	original := newTestServer(t)
 	defer original.Close()
 	config := original.config
@@ -245,7 +245,7 @@ func TestSessionNamingUtilityUnavailableOwnedSocketUsesFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	name, outcome, err := server.namePreparation(ctx, "Fix runtime session names")
-	if err != nil || name != "fix-runtime-session-names" || outcome != "utility_error" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q error=%v", name, outcome, err)
 	}
 	if server.config.CodexSocket != original.config.CodexSocket || server.config.NamingSocket == server.config.CodexSocket {

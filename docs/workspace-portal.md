@@ -1002,7 +1002,7 @@ an older package cannot apply pending cold model choices.
 ## Session creation progress
 
 The [session preparation contract](session-preparations.md) describes
-request-ID admission, automatic-name fallback, receipt handoff, upload
+request-ID admission, naming recovery, receipt handoff, upload
 ownership and recovery for New session API callers.
 
 New session needs an initial request or attachments and a starting team. Options
@@ -1022,8 +1022,10 @@ unchanged, and package updates follow the existing forward-only transition polic
 
 Automatic naming uses a private Codex child owned by the portal service, with a
 fixed original catalog and `gpt-5.5`/`low`. Ordinary conversations keep their
-existing socket and dynamic model catalog. If the naming child is unavailable,
-creation uses the deterministic prompt-based name. Its supported profile,
+existing socket and dynamic model catalog. Generated names use two to six words,
+preferably two or three. If naming fails,
+creation pauses with **Retry naming** and a custom-name field. The accepted
+request, files and settings remain saved. The supported naming profile,
 shutdown ownership and native diagnostic retention are described in the
 [preparation contract](session-preparations.md#naming-and-reservation).
 

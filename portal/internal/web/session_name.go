@@ -9,13 +9,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
-	"golang.org/x/text/unicode/norm"
+	"github.com/aither64/codex-web/codex"
 )
 
 var generatedSessionName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+){1,5}$`)
+
+var errSessionNaming = errors.New("Automatic naming failed. Retry naming or enter a custom name.")
 
 // The adapter supplies exactly one JSON object. It owns model selection and
 // isolation; no caller may derive utility settings from a development team.
@@ -39,35 +40,6 @@ func parseSessionName(output string) (string, error) {
 		return "", errors.New("invalid generated name")
 	}
 	return name, nil
-}
-
-func fallbackSessionName(raw string) string {
-	line := ""
-	for _, candidate := range strings.Split(raw, "\n") {
-		if strings.TrimSpace(candidate) != "" {
-			line = candidate
-			break
-		}
-	}
-	folded := norm.NFD.String(strings.ToLower(line))
-	folded = strings.Map(func(r rune) rune {
-		if unicode.Is(unicode.Mn, r) {
-			return -1
-		}
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
-			return r
-		}
-		return ' '
-	}, folded)
-	words := strings.Fields(folded)
-	if len(words) > 6 {
-		words = words[:6]
-	}
-	name := boundedSessionWords(strings.Join(words, "-"), 48)
-	if name == "" {
-		return "session"
-	}
-	return name
 }
 
 func boundedSessionWords(name string, limit int) string {
@@ -115,7 +87,7 @@ func (s *Server) namePreparation(ctx context.Context, raw string) (string, strin
 	started := time.Now()
 	budget, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	result, outcome := "", "unavailable"
+	result, outcome, category := "", "unavailable", "unavailable"
 	if s.config.SessionNamer != nil {
 		select {
 		case s.namingSlots <- struct{}{}:
@@ -124,32 +96,49 @@ func (s *Server) namePreparation(ctx context.Context, raw string) (string, strin
 			if ctx.Err() != nil {
 				return "", "", ctx.Err()
 			}
-			s.config.Logger.Printf("session naming duration_ms=%d outcome=timeout", time.Since(started).Milliseconds())
-			return fallbackSessionName(raw), "timeout", nil
+			s.config.Logger.Printf("session naming duration_ms=%d outcome=timeout category=queue", time.Since(started).Milliseconds())
+			return "", "timeout", errSessionNaming
 		}
 		output, err := s.config.SessionNamer(budget, namingPrompt(raw))
 		if ctx.Err() != nil {
 			return "", "", ctx.Err()
 		}
-		if budget.Err() != nil {
-			outcome = "timeout"
+		if budget.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			outcome, category = "timeout", "deadline"
 		} else if err != nil {
 			outcome = "utility_error"
+			category = sessionNamingErrorCategory(err)
 		} else {
 			result, err = parseSessionName(output)
 			if err != nil {
-				outcome = "invalid_output"
+				outcome, category = "invalid_output", "output"
 			} else {
-				outcome = "model"
+				outcome, category = "model", "ok"
 			}
 		}
 	}
 	if ctx.Err() != nil {
 		return "", "", ctx.Err()
 	}
+	s.config.Logger.Printf("session naming duration_ms=%d outcome=%s category=%s", time.Since(started).Milliseconds(), outcome, category)
 	if result == "" {
-		result = fallbackSessionName(raw)
+		return "", outcome, errSessionNaming
 	}
-	s.config.Logger.Printf("session naming duration_ms=%d outcome=%s", time.Since(started).Milliseconds(), outcome)
 	return result, outcome, nil
+}
+
+// Only provider-owned categories cross this boundary, never remote diagnostics.
+func sessionNamingErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, codex.ErrEphemeralIsolation):
+		return "isolation"
+	case errors.Is(err, codex.ErrEphemeralSettings):
+		return "settings"
+	case errors.Is(err, codex.ErrEphemeralProtocol):
+		return "protocol"
+	case errors.Is(err, codex.ErrEphemeralServer):
+		return "server"
+	default:
+		return "utility"
+	}
 }

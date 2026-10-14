@@ -1,7 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const helpers = require("./static/preparation.js");
-const {preparationProgress} = require("./static/creation.js");
+const {preparationProgress, ignorePreparationStatus, createNameSelection} = require("./static/creation.js");
 const {creationCLICommand, planSessionDraftKey, storeCreationDraft, loadCreationDraft} = require("./static/app.js");
 const id = "00000000-0000-4000-8000-000000000001";
 const otherID = "00000000-0000-4000-8000-000000000002";
@@ -320,6 +320,43 @@ module.exports = async () => {
     assert(!saved.getItem(helpers.draftKey));
     assert.equal(creationCLICommand({...fields,name:""}),"");
     assert(creationCLICommand({...fields,name:"explicit",model:"exact",effort:"high"}).startsWith("dev-session start 'explicit'"));
+  });
+  await test("custom name recovery resends the exact saved choice after a lost response and reload", async () => {
+    const saved = storage(), identity = {requestId: id, receiptId: status.receiptId, startedAt: status.startedAt};
+    let posted;
+    const first = createNameSelection({storage: saved, identity, helpers, fetch: async (url, options) => {
+      assert.equal(url, `/api/session-creations/${id}/name`);
+      posted = options.body;
+      assert.equal(saved.getItem(`workspace-portal.creation-name.${id}`), posted);
+      throw new Error("lost response");
+    }});
+    await assert.rejects(first.submit(1, "workspace-notifications"), /lost response/);
+    assert.equal(first.pending.name, "workspace-notifications");
+    const reloaded = createNameSelection({storage: saved, identity, helpers, fetch: async (_url, options) => {
+      assert.equal(options.body, posted);
+      return response({...status, attempt: 1, preparationAttempt: 2, phase: "initializing"});
+    }});
+    await reloaded.submit(99, "different-name");
+    assert.equal(reloaded.pending, null);
+    assert.equal(saved.getItem(`workspace-portal.creation-name.${id}`), null);
+  });
+  await test("name selection cannot send without verified storage or clear an uncertain response", async () => {
+    const identity = {requestId: id, receiptId: status.receiptId, startedAt: status.startedAt};
+    const denied = storage(); denied.setItem = () => {};
+    const choice = createNameSelection({storage: denied, identity, helpers, fetch: () => assert.fail("POST")});
+    await assert.rejects(choice.submit(1, "manual-name"), /storage/);
+    for (const result of [response({...status, requestId: otherID, attempt: 1, preparationAttempt: 2}), response({error: "unconfirmed"}, 503)]) {
+      const saved = storage();
+      const uncertain = createNameSelection({storage: saved, identity, helpers, fetch: async () => result});
+      await assert.rejects(uncertain.submit(1, "manual-name"));
+      assert(uncertain.pending);
+      assert(saved.getItem(`workspace-portal.creation-name.${id}`));
+    }
+    const rejected = createNameSelection({storage: storage(), identity, helpers, fetch: async () => response({error: "stale"}, 409)});
+    await assert.rejects(rejected.submit(1, "manual-name"), /stale/);
+    assert.equal(rejected.pending, null);
+    assert(preparationProgress({...status, state: "failed", canSetName: true}, identity, helpers).canSetName);
+    assert(!preparationProgress({...status, canSetName: true}, identity, helpers).canSetName);
   });
   console.log(`Preparation browser contracts passed: ${cases} cases`);
 };

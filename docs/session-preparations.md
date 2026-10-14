@@ -23,7 +23,7 @@ text.
 Repeating POST does not retry a failed operation.
 
 JSON acceptance is HTTP 202 with `requestId`, `receiptId`, `attempt`, `url`,
-state, phase, timestamps and `initialRequest`. Form callers receive a 303 to
+state, phase, timestamps, `preparationAttempt` and `initialRequest`. Form callers receive a 303 to
 `/creations/<request-id>/`. The initial request is the raw textual prompt,
 independent of attachment-expanded text sent to the session. The preparation
 page renders it before browser scripts load.
@@ -34,7 +34,11 @@ exact receipt installation, a server-generated `canonicalUrl` and final slug.
 `receiptId` and `attempt`; stale offers conflict. Before handoff a retry starts
 a new preparation attempt, or resumes an attempt already published but not
 launched. After handoff the ordinary creation receipt owns
-attempts and progress. These endpoints require canonical unescaped UUID paths;
+attempts and progress. `preparationAttempt` retains the preparation generation
+through initialization and terminal compaction. `attempt` identifies the current
+retry owner: preparation before handoff, initialization afterward. Name-selection
+confirmation uses `preparationAttempt`; initialization retry uses `attempt`.
+These endpoints require canonical unescaped UUID paths;
 mutations retain the portal's exact-origin and package-generation checks.
 
 An unconfirmed preparation or upload-claim write returns HTTP 503 with the
@@ -109,11 +113,11 @@ continues to serve forks, plan sessions and explicit-name callers.
 The portal owns one naming-only Codex App Server for its service lifetime.
 The text-only adapter uses that private socket; ordinary conversations keep
 their existing App Server and dynamic catalog. An injected adapter remains
-available for tests. Startup, readiness or runtime failure leaves naming
-unavailable and uses the existing deterministic fallback.
+available for tests. Startup, readiness or runtime failure stops preparation before reserving a
+slug. The request and accepted files remain saved for retry or a custom name.
 The adapter receives at most 8192 raw UTF-8 bytes and
 returns one JSON object containing only `name`. A generated name must contain
-three to six lowercase ASCII alphanumeric words separated by hyphens and fit
+two to six lowercase ASCII alphanumeric words separated by hyphens and fit
 within 48 bytes. The adapter must honor cancellation and the ten-second deadline,
 including queue time. No more than two adapter calls run concurrently per
 workspace. Attachment names, paths and contents are excluded.
@@ -173,7 +177,7 @@ Operators must pause/stop naming through existing service/package procedures
 before MCP reconfiguration, then let fresh calls capture all new literal server
 names. Validate actual tool schemas, hostile dispatch, both question paths and
 teardown against the exact candidate binary before live enablement. Fake client
-tests and deterministic fallback do not prove model isolation.
+tests do not prove model isolation.
 
 Native ephemeral mode omits resumable conversations but its diagnostic SQLite
 logger can retain plaintext copies of the naming input and thread/turn identities
@@ -187,13 +191,33 @@ without prompt text or model output.
 Changing authentication, provider configuration, managed policy or the fixed
 resource requires restarting the naming child through the portal procedure.
 
-With no adapter, or after an unavailable/invalid result, naming uses the first
-nonempty line: lowercase, Unicode diacritic decomposition, removal of combining
-marks, then up to six ASCII alphanumeric words joined with hyphens. Other
-characters separate words. Truncation keeps whole words; if the first word
-cannot fit or no words remain, the name is `session`. Attachment-only prompts
-skip the adapter. Operational logs contain duration and outcome codes, not
-prompt text or model output.
+Generated names describe the subject and intended work, with a preference for
+two or three words. Conversational openings are omitted. For example, a request
+for workspace session attention markers and browser notifications can receive
+`workspace-notifications`. The date is added during reservation.
+
+Without an adapter, or after an error, timeout or invalid output, preparation
+stops without selecting a base or creating a session. **Retry naming** makes
+another attempt using the saved request. **Use name and continue** accepts a
+custom short name. Attachment-only prompts skip naming and use `session`.
+Operational logs contain duration, outcome and a fixed helper error category,
+without prompt text, model output or remote diagnostics.
+
+The status response includes `canSetName` when a stopped automatic-name request
+can accept a custom name. `POST /api/session-creations/<request-id>/name` takes
+`receiptId`, `attempt` and `name`. It requires the current receipt and attempt,
+a stopped request, and no reserved destination. The selected name uses existing
+custom-name syntax and the 48-character limit. The selection advances the
+attempt and resumes preparation while preserving the original submission,
+identity digests, prompt, settings and accepted files. A custom-name collision
+stops preparation and allows another selection before reservation. An identical
+replay of the immediately preceding selection returns its result without another
+attempt; different names and older offers conflict.
+
+The preparation page saves the exact name selection in its tab before sending
+it. After a lost response or reload, **Retry saved name** resends that selection.
+Naming retries stay disabled until the saved selection is resolved. Browser
+storage must be writable to submit a custom choice.
 
 The selected base is saved before reservation. Automatic collisions add `-2`,
 `-3` and subsequent suffixes, truncating whole words to retain the 48-byte limit.
@@ -224,7 +248,10 @@ that already stopped after later I/O instead exposes stopped progress for an
 explicit retry. Confirmation alone never repeats its naming call. Explicit retry
 retains any published base and reservation; ordinary restart still pauses work.
 Existing creation receipts, manifests, lifecycle journals and upload catalogs
-retain their schemas.
+retain their schemas. Earlier preparation readers can load naming failures and
+manual selections; their writers retain the previous naming and collision
+behavior. Use the current runtime and refreshed browser assets for naming
+recovery. Previously selected bases and final slugs remain unchanged.
 
 At most 512 unfinished requests and 10,000 total admitted replay identities are
 allowed. Mapping capacity is reserved on admission. Full records are bounded
@@ -260,7 +287,7 @@ A saved intent without a catalog claim is not completed acceptance. Recovery
 finishes the same intent or reports unavailable files. A pending claim without
 an acceptance response resumes from the frozen snapshot. Restart pauses naming;
 explicit retry uses any saved base and reservation. Shutdown cancellation never
-commits a fallback merely because the server is stopping.
+selects a name merely because the server is stopping.
 
 Receipt installation checks the exact predetermined ID, request, resolved team
 and epoch. An equal-content receipt belonging to another request is a conflict.

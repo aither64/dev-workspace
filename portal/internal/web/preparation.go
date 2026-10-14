@@ -23,19 +23,21 @@ import (
 )
 
 type preparationStatus struct {
-	RequestID      string `json:"requestId"`
-	ReceiptID      string `json:"receiptId"`
-	Attempt        int    `json:"attempt"`
-	URL            string `json:"url"`
-	Slug           string `json:"slug,omitempty"`
-	CanonicalURL   string `json:"canonicalUrl,omitempty"`
-	State          string `json:"state"`
-	Phase          string `json:"phase"`
-	Detail         string `json:"detail,omitempty"`
-	Error          string `json:"error,omitempty"`
-	InitialRequest string `json:"initialRequest,omitempty"`
-	StartedAt      string `json:"startedAt"`
-	UpdatedAt      string `json:"updatedAt"`
+	RequestID          string `json:"requestId"`
+	ReceiptID          string `json:"receiptId"`
+	Attempt            int    `json:"attempt"`
+	PreparationAttempt int    `json:"preparationAttempt"`
+	URL                string `json:"url"`
+	Slug               string `json:"slug,omitempty"`
+	CanonicalURL       string `json:"canonicalUrl,omitempty"`
+	State              string `json:"state"`
+	Phase              string `json:"phase"`
+	Detail             string `json:"detail,omitempty"`
+	Error              string `json:"error,omitempty"`
+	InitialRequest     string `json:"initialRequest,omitempty"`
+	CanSetName         bool   `json:"canSetName,omitempty"`
+	StartedAt          string `json:"startedAt"`
+	UpdatedAt          string `json:"updatedAt"`
 }
 
 // A pending launch is repaired once in this process. A dispatched worker that
@@ -102,36 +104,42 @@ func looksLikePreparationPath(value *url.URL) bool {
 	return false
 }
 
-func preparationPathID(value *url.URL) (string, bool, bool) {
+func preparationPathID(value *url.URL) (string, string, bool) {
 	if value.RawPath != "" || value.EscapedPath() != value.Path {
-		return "", false, false
+		return "", "", false
 	}
 	if strings.HasPrefix(value.Path, "/creations/") {
 		id := strings.TrimSuffix(strings.TrimPrefix(value.Path, "/creations/"), "/")
-		return id, false, validPreparationID(id) && value.Path == "/creations/"+id+"/"
+		return id, "", validPreparationID(id) && value.Path == "/creations/"+id+"/"
 	}
 	rest, ok := strings.CutPrefix(value.Path, "/api/session-creations/")
 	if !ok {
-		return "", false, false
+		return "", "", false
 	}
-	id := strings.TrimSuffix(rest, "/retry")
-	retry := rest != id
-	return id, retry, validPreparationID(id) && (rest == id || rest == id+"/retry")
+	id, action, found := strings.Cut(rest, "/")
+	validAction := !found || action == "retry" || action == "name"
+	return id, action, validPreparationID(id) && validAction
 }
 
 func validPreparationPath(value *url.URL) bool { _, _, valid := preparationPathID(value); return valid }
 
 func (s *Server) preparationRoute(w http.ResponseWriter, r *http.Request) {
-	id, retry, valid := preparationPathID(r.URL)
+	id, action, valid := preparationPathID(r.URL)
 	if !valid {
 		http.NotFound(w, r)
 		return
 	}
-	if r.Method == http.MethodPost && retry {
-		s.withCreationMutation(w, r, func() { s.retryPreparation(w, r, id) })
+	if r.Method == http.MethodPost && action != "" {
+		s.withCreationMutation(w, r, func() {
+			if action == "name" {
+				s.setPreparationName(w, r, id)
+			} else {
+				s.retryPreparation(w, r, id)
+			}
+		})
 		return
 	}
-	if r.Method != http.MethodGet || retry {
+	if r.Method != http.MethodGet || action != "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -165,7 +173,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 		return preparationStatus{}, false
 	}
 	record, work := snapshot.record, snapshot.work
-	status := preparationStatus{RequestID: id, ReceiptID: record.ReceiptID, Attempt: record.Attempt,
+	status := preparationStatus{RequestID: id, ReceiptID: record.ReceiptID, Attempt: record.Attempt, PreparationAttempt: record.Attempt,
 		URL: "/creations/" + id + "/", State: record.State, Phase: record.Phase, Error: record.Error,
 		StartedAt: record.StartedAt, UpdatedAt: record.UpdatedAt}
 	if record.Snapshot != nil {
@@ -175,6 +183,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 		status.State, status.Phase = "paused", "stopped"
 		status.Error = "Session preparation stopped. Retry to continue."
 	}
+	status.CanSetName = canSetPreparationName(record, status.State)
 	if record.Slug == "" {
 		return status, true
 	}
@@ -496,6 +505,7 @@ func (s *Server) runPreparation(id string, attempt int) {
 	record := s.preparations[id]
 	s.operationMu.Unlock()
 	var err error
+	var namingOutcome string
 	if record.Snapshot.Goal == "" || len(record.Snapshot.Input.Attachments) > 0 {
 		err = s.mutatePreparation(s.operationContext, id, attempt, func(current *sessionPreparation) error {
 			return s.finishAcceptingPreparationLocked(s.operationContext, current)
@@ -505,6 +515,7 @@ func (s *Server) runPreparation(id string, attempt int) {
 		base, outcome := record.Snapshot.Input.CustomName, "custom"
 		if base == "" {
 			base, outcome, err = s.namePreparation(s.operationContext, record.Snapshot.Input.RawPrompt)
+			namingOutcome = outcome
 		}
 		if err == nil {
 			err = s.mutatePreparation(s.operationContext, id, attempt, func(current *sessionPreparation) error {
@@ -524,6 +535,9 @@ func (s *Server) runPreparation(id string, attempt int) {
 		}
 		_ = s.mutatePreparation(s.operationContext, id, attempt, func(current *sessionPreparation) error {
 			current.State, current.Phase, current.Error = "failed", "stopped", err.Error()
+			if namingOutcome != "" && current.Base == "" {
+				current.NamingOutcome = namingOutcome
+			}
 			if len(current.Error) > 4096 {
 				current.Error = current.Error[:4096]
 			}
@@ -581,7 +595,7 @@ func (s *Server) reservePreparationLocked(record *sessionPreparation) error {
 		err = s.handoffPreparationLocked(record, slug)
 		lock.Close()
 		creationLock.Close()
-		if errors.Is(err, errPreparationOccupied) && record.Slug == "" && record.Snapshot.Input.CustomName == "" {
+		if errors.Is(err, errPreparationOccupied) && record.Slug == "" && record.Snapshot.Input.CustomName == "" && record.NamingOutcome != "custom" {
 			continue
 		}
 		return err
@@ -708,6 +722,88 @@ func (s *Server) retryPreparation(w http.ResponseWriter, r *http.Request, id str
 		record.Phase = "naming"
 	}
 	err := s.savePreparationForDispatchLocked(record)
+	if err == nil {
+		s.launchPreparationLocked(record)
+	}
+	s.operationMu.Unlock()
+	if err != nil {
+		s.writePreparationError(w, r, id, http.StatusInternalServerError, err)
+		return
+	}
+	status, _ := s.preparationStatus(id)
+	s.writeJSON(w, http.StatusAccepted, status)
+}
+
+func canSetPreparationName(record sessionPreparation, state string) bool {
+	return (state == "failed" || state == "paused") && record.Snapshot != nil &&
+		record.Snapshot.Goal != "" && record.Snapshot.Input.CustomName == "" &&
+		record.Slug == "" && record.Handoff == nil &&
+		(record.Base == "" || record.NamingOutcome == "custom")
+}
+
+func (s *Server) setPreparationName(w http.ResponseWriter, r *http.Request, id string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var body struct {
+		ReceiptID string `json:"receiptId"`
+		Attempt   int    `json:"attempt"`
+		Name      string `json:"name"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if _, err := creationDestination(body.Name, "2000-01-01"); err != nil || body.Attempt < 1 {
+		s.writeError(w, r, http.StatusBadRequest, "Enter a valid short session name.")
+		return
+	}
+	if err := s.uploadCreationMu.Lock(r.Context()); err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer s.uploadCreationMu.Unlock()
+	s.operationMu.Lock()
+	record, ok := s.preparations[id]
+	if !ok {
+		s.operationMu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.confirmPreparationLocked(id); err != nil {
+		s.operationMu.Unlock()
+		s.writePreparationError(w, r, id, http.StatusServiceUnavailable, err)
+		return
+	}
+	// A lost response can replay the immediately preceding accepted selection.
+	// Completed mappings retain the exact custom slug after Base is compacted.
+	selected := record.Base
+	if record.State == "terminal" && len(record.Slug) > 11 {
+		selected = record.Slug[11:]
+	}
+	replay := body.ReceiptID == record.ReceiptID && record.Attempt == body.Attempt+1 &&
+		record.NamingOutcome == "custom" && selected == body.Name
+	work := s.preparationWork[id]
+	state := record.State
+	if state == "running" && work.attempt == record.Attempt && (!work.dispatched || work.stopped) {
+		state = "paused"
+	}
+	if !replay && (body.ReceiptID != record.ReceiptID || body.Attempt != record.Attempt || !canSetPreparationName(record, state)) {
+		s.operationMu.Unlock()
+		s.writeError(w, r, http.StatusConflict, "Creation status changed. Reload before choosing a name.")
+		return
+	}
+	if s.closing {
+		s.operationMu.Unlock()
+		s.writeError(w, r, http.StatusServiceUnavailable, "Portal is stopping.")
+		return
+	}
+	var err error
+	if !replay {
+		record.Base, record.NamingOutcome = body.Name, "custom"
+		record.Attempt++
+		record.State, record.Phase, record.Error = "running", "reserving", ""
+		record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		err = s.savePreparationForDispatchLocked(record)
+	}
 	if err == nil {
 		s.launchPreparationLocked(record)
 	}
@@ -859,7 +955,8 @@ func (s *Server) compactPreparationsLocked(receipt creationReceipt) error {
 			}
 		}
 		record.State, record.Terminal, record.Phase = "terminal", receipt.State, "initializing"
-		record.Attempt, record.Error = receipt.Attempt, receipt.Error
+		// Keep selection replay identity independent of initialization retries.
+		record.Error = receipt.Error
 		if len(record.Error) > 512 {
 			record.Error = record.Error[:512]
 		}

@@ -18,6 +18,14 @@
       <p id="creation-elapsed" role="timer"></p>
       <p id="creation-error" class="notice error" hidden></p>
       <button id="creation-retry" type="button" hidden>{{if .Preparation}}Retry creation{{else}}Retry initialization{{end}}</button>
+      {{if .Preparation}}
+      <form id="creation-name-form" hidden>
+        <p><label for="creation-name">Custom session name</label></p>
+        <input id="creation-name" name="name" type="text" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="workspace-notifications" autocomplete="off">
+        <button id="creation-name-submit" type="submit">Use name and continue</button>
+        <p>Your request, files and settings stay saved.</p>
+      </form>
+      {{end}}
       <p><a id="creation-source" hidden>Return to the source session</a></p>
       <p id="creation-leave-note">You can leave this page while initialization continues.</p>
     </section>
@@ -27,7 +35,7 @@
     </section>
   </main>
   <script src="/static/preparation.js?v=3" defer></script>
-  <script src="/static/creation.js?v=3" defer></script>
+  <script src="/static/creation.js?v=4" defer></script>
 </body>
 </html>
 {{end}}

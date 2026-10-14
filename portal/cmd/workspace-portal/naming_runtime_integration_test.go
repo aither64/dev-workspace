@@ -1039,6 +1039,9 @@ func (h *managedSmokeHarness) named(root string, accepted managedSmokePreparatio
 		if record.NamingOutcome == "" {
 			return false
 		}
+		if base == "" && (record.State != "failed" || record.Slug != "") {
+			managedSmokeFail(h.t, "naming failure reserved or initialized a session")
+		}
 		if record.Base != base || record.NamingOutcome != outcome {
 			managedSmokeFail(h.t, "naming outcome or exact base mismatch")
 		}
@@ -1210,11 +1213,11 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		_ = h.namingProvider.server.Close()
 		h.namingProvider = managedSmokeNewProvider(h.t, false)
 	}
-	run("missing home fallback", func(t *testing.T) {
+	run("missing home pauses naming", func(t *testing.T) {
 		reset()
 		unit := h.startUnit(true)
-		accepted := h.admit(unit.socket, "Fallback smoke request")
-		h.named(unit.root, accepted, "fallback-smoke-request", "unavailable")
+		accepted := h.admit(unit.socket, "Unavailable naming smoke request")
+		h.named(unit.root, accepted, "", "unavailable")
 		entries, err := os.ReadDir(filepath.Join(unit.root, "runtime"))
 		if err != nil {
 			managedSmokeFail(t, "unavailable runtime read failed")
@@ -1237,7 +1240,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		h.noRoute()
 		h.control()
 	})
-	run("child loss fallback no restart", func(t *testing.T) {
+	run("child loss pauses naming without restart", func(t *testing.T) {
 		reset()
 		unit := h.startUnit(false)
 		child := h.probe(unit.root)
@@ -1245,8 +1248,8 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 			managedSmokeFail(t, "owned child fault failed")
 		}
 		managedSmokeAwait(t, 3*time.Second, "captured naming child survived fault", func() bool { return !managedSmokeAlive(child) })
-		accepted := h.admit(unit.socket, "Fallback smoke request")
-		h.named(unit.root, accepted, "fallback-smoke-request", "utility_error")
+		accepted := h.admit(unit.socket, "Unavailable naming smoke request")
+		h.named(unit.root, accepted, "", "utility_error")
 		entries, err := os.ReadDir(filepath.Join(unit.root, "runtime"))
 		if err != nil {
 			managedSmokeFail(t, "lost runtime directory unavailable")
@@ -1285,7 +1288,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		})
 	}
 	// Naming success here ends before fixed-failure CLI initialization. The
-	// existing TestSessionNameAdapterFallbackAndWorkspaceConcurrency supplies the owning
+	// existing TestSessionNameAdapterFailureAndWorkspaceConcurrency supplies the owning
 	// unit semaphore proof; this case adds real native/systemd observations.
 }
 
