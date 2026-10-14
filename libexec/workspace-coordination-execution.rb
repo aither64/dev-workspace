@@ -196,12 +196,26 @@ module WorkspaceCoordination
       destination = File.join(store.root, 'sources', revision)
       source = File.join(destination, 'checkout')
       FileUtils.mkdir_p(destination, mode: 0o700)
-      unless File.directory?(source)
-        capture('git', '-C', path, 'worktree', 'add', '--detach', source, revision)
+      fresh = !File.directory?(source)
+      if fresh
+        if block_given?
+          # Materialize the exact tree before initializing dependencies, then
+          # run the ordinary checkout hook in its prepared environment below.
+          capture('git', '-C', path, 'worktree', 'add', '--detach', '--no-checkout', source, revision)
+          capture('git', '-C', source, 'read-tree', '-mu', revision)
+        else
+          capture('git', '-C', path, 'worktree', 'add', '--detach', source, revision)
+        end
       end
       actual = capture('git', '-C', source, 'rev-parse', 'HEAD').strip
       dirty = capture('git', '-C', source, 'status', '--porcelain').strip
       raise Error.new('retained source is dirty or changed', 5) unless actual == revision && dirty.empty?
+      if block_given?
+        hooks = yield source
+        with_merge_hooks('hookArtifact' => hooks && hooks['id']) do
+          capture('git', '-C', source, 'checkout', '--detach', revision)
+        end
+      end
       source
     end
 
@@ -267,6 +281,7 @@ module WorkspaceCoordination
     def prepare_merge(owner, name, evidence)
       @diagnostics = Command::Log.new
       preparation_capacity!
+      capture('ssh', '-V')
       path, _common, _identity, reg = repository(owner, name)
       head = capture('git', '-C', path, 'rev-parse', "#{reg.fetch('branch')}^{commit}").strip
       target = "refs/heads/#{reg.fetch('default_branch')}"
@@ -278,13 +293,15 @@ module WorkspaceCoordination
       raise Error.new('local default branch has unpublished changes; reconcile it before preparation', 3) if local_head && !ancestor?(path, local_head, expected)
       ref = "refs/dev-workspace-coordination/#{SecureRandom.uuid}"
       capture('git', '-C', path, 'update-ref', ref, head)
-      source = retain_commit(path, head)
-      hooks = prepare_merge_hooks(source, name, head)
+      hooks = nil
+      source = retain_commit(path, head) { |retained| hooks = prepare_merge_hooks(retained, name, head) }
       checkout = nil
       unless name == 'workspace'
         checkout = File.join(store.root, 'sources', SecureRandom.uuid, 'target')
         FileUtils.mkdir_p(File.dirname(checkout), mode: 0o700)
-        capture('git', '-C', path, 'worktree', 'add', '--detach', checkout, expected)
+        with_merge_hooks('hookArtifact' => hooks && hooks['id']) do
+          capture('git', '-C', path, 'worktree', 'add', '--detach', checkout, expected)
+        end
       end
       operation = {'repository' => name, 'target' => target, 'featureBranch' => reg.fetch('branch'),
         'featureHead' => head, 'expectedRemoteHead' => expected, 'comparisonBase' => expected,
@@ -309,9 +326,32 @@ module WorkspaceCoordination
       frameworks = %w[.overcommit.yml .pre-commit-config.yaml lefthook.yml .husky]
       return unless frameworks.any? { |file| File.exist?(File.join(source, file)) }
       raise Error, 'coordinated hooks require the repository flake development environment' unless File.file?(File.join(source, 'flake.nix'))
-      result = WorkspaceCoordination.parse(capture('nix', 'print-dev-env', '--json', source, limit: MAX_LEDGER), limit: MAX_LEDGER)
-      allowed = %w[PATH GEM_HOME GEM_PATH BUNDLE_GEMFILE BUNDLE_PATH NIX_SSL_CERT_FILE SSL_CERT_FILE]
-      environment = result.fetch('variables').select { |key, value| allowed.include?(key) && value['type'] == 'exported' }.transform_values { |value| value.fetch('value') }
+      allowed = %w[PATH GEM_HOME GEM_PATH BUNDLE_GEMFILE BUNDLE_PATH BUNDLE_APP_CONFIG BUNDLER_VERSION NIX_SSL_CERT_FILE SSL_CERT_FILE]
+      # print-dev-env describes a shell before shellHook initializes local
+      # dependencies. Enter the declared shell in the retained source instead.
+      marker = 'WORKSPACE_MERGE_HOOK_ENV='
+      program = <<~'RUBY'
+        require 'json'
+        if File.file?('.overcommit.yml') && File.file?('Gemfile')
+          require 'bundler'
+          Bundler.setup
+          require 'overcommit'
+        end
+        puts "WORKSPACE_MERGE_HOOK_ENV=#{JSON.generate(ENV.to_h.slice(*ARGV))}"
+      RUBY
+      original = @env
+      begin
+        @env = @env.merge(allowed.reject { |key| %w[PATH NIX_SSL_CERT_FILE SSL_CERT_FILE].include?(key) }.to_h { |key| [key, nil] })
+        output = capture('nix', 'develop', source, '--command', RbConfig.ruby, '-e', program, *allowed, cwd: source, limit: MAX_LEDGER)
+      ensure
+        @env = original
+      end
+      lines = output.lines.select { |value| value.start_with?(marker) }
+      raise Error, 'repository shell did not publish one prepared hook environment' unless lines.length == 1
+      environment = WorkspaceCoordination.parse(lines.first.delete_prefix(marker), limit: MAX_LEDGER)
+      unless environment.is_a?(Hash) && (environment.keys - allowed).empty? && environment.values.all? { |value| value.is_a?(String) }
+        raise Error, 'invalid prepared hook environment'
+      end
       raise Error, 'prepared hook environment has no executable path' unless environment['PATH'].is_a?(String)
       artifact = save_artifact('kind' => 'merge_hooks', 'repository' => name, 'featureHead' => head, 'environment' => environment)
       paths = environment.values.flat_map { |value| value.scan(%r{/nix/store/[^/:\s]+}) }.uniq
@@ -322,7 +362,10 @@ module WorkspaceCoordination
     def with_merge_hooks(operation)
       original = @env
       artifact = artifact!(operation['hookArtifact']) if operation['hookArtifact']
-      @env = @env.merge(artifact.fetch('environment')) if artifact
+      if artifact
+        environment = artifact.fetch('environment')
+        @env = @env.merge(environment).merge('PATH' => [environment.fetch('PATH'), @env.fetch('PATH')].join(File::PATH_SEPARATOR))
+      end
       yield
     ensure
       @env = original

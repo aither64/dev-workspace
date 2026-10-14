@@ -10,6 +10,14 @@ resource claims. An admitted worker holds only the resources its mutation needs.
 Different repository targets and machines can proceed concurrently. Eligible work
 uses FIFO order; waiting on approval or dependencies does not block unrelated work.
 
+Merge preparation enters the repository's declared Nix shell, including its
+shell initialization, before retaining the hook environment. Bundler-based
+Overcommit dependencies and the runtime SSH transport are checked before a job
+can be admitted. Dependency installation happens in the retained source outside
+claims. Target checkout creation and merge/push hooks use that same prepared
+environment, with the runtime transport path retained. Workers install no
+dependencies while holding Git resources.
+
 ## Machine ownership during review
 
 A reservation belongs to a session and physical machine. It survives successful

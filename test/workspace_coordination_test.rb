@@ -85,6 +85,115 @@ class WorkspaceCoordinationTest < Minitest::Test
     Time.define_singleton_method(:now, original)
   end
 
+  def test_prepared_hook_path_preserves_transport_and_restores_environment
+    tools = File.join(@tmp, 'hook-tools')
+    FileUtils.mkdir_p(tools)
+    File.write(File.join(tools, 'prepared-hook'), "#!/bin/sh\nprintf 'hook ready'\n")
+    File.chmod(0o700, File.join(tools, 'prepared-hook'))
+    artifact = @engine.save_artifact('kind' => 'merge_hooks', 'repository' => 'code',
+      'featureHead' => @base, 'environment' => {'PATH' => tools, 'BUNDLE_PATH' => tools})
+    original = @engine.instance_variable_get(:@env)
+    @engine.with_merge_hooks('hookArtifact' => artifact['id']) do
+      assert_equal 'hook ready', @engine.capture('prepared-hook')
+      assert_match(/git version/, @engine.capture('git', '--version'))
+      @engine.capture('ssh', '-V')
+    end
+    assert_same original, @engine.instance_variable_get(:@env)
+    assert_raises(RuntimeError) do
+      @engine.with_merge_hooks('hookArtifact' => artifact['id']) { raise 'fixture failure' }
+    end
+    assert_same original, @engine.instance_variable_get(:@env)
+  end
+
+  def test_hook_preparation_enters_initialized_shell_and_captures_only_allowlisted_values
+    source = File.join(@tmp, 'hook-source')
+    tools = File.join(@tmp, 'preparation-tools')
+    FileUtils.mkdir_p([source, tools, File.join(source, '.husky')])
+    File.write(File.join(source, 'flake.nix'), 'fixture declared shell')
+    script = <<~SH
+      #!/bin/sh
+      test "$1" = develop || exit 41
+      test "$2" = "$PWD" || exit 42
+      test "$3" = --command || exit 43
+      shift 3
+      export PATH="$PWD/prepared-tools"
+      export BUNDLE_PATH="$PWD/prepared-gems"
+      export BUNDLE_APP_CONFIG="$PWD/prepared-config"
+      export PRIVATE_FIXTURE_SECRET=do-not-capture
+      printf 'fixture shell initialized\\n'
+      exec "$@"
+    SH
+    File.write(File.join(tools, 'nix'), script)
+    File.chmod(0o700, File.join(tools, 'nix'))
+    @engine.instance_variable_set(:@env, ENV.to_h.merge('PATH' => tools, 'BUNDLE_PATH' => '/wrong/inherited/path'))
+    artifact = @engine.prepare_merge_hooks(source, 'code', @base)
+    assert_equal File.join(source, 'prepared-gems'), artifact['environment']['BUNDLE_PATH']
+    assert_equal File.join(source, 'prepared-config'), artifact['environment']['BUNDLE_APP_CONFIG']
+    refute_includes artifact['environment'].keys, 'PRIVATE_FIXTURE_SECRET'
+    assert_equal '/wrong/inherited/path', @engine.instance_variable_get(:@env)['BUNDLE_PATH']
+  end
+
+  def test_missing_overcommit_dependency_refuses_during_preparation
+    source = File.join(@tmp, 'missing-hook-source')
+    tools = File.join(@tmp, 'missing-preparation-tools')
+    FileUtils.mkdir_p([source, tools])
+    File.write(File.join(source, '.overcommit.yml'), "gemfile: Gemfile\n")
+    File.write(File.join(source, 'Gemfile'), "source 'https://rubygems.org'\ngem 'absent_coordination_fixture', '= 0.0.0'\n")
+    File.write(File.join(source, 'flake.nix'), 'fixture declared shell')
+    File.write(File.join(tools, 'nix'), "#!/bin/sh\nshift 3\nexec \"$@\"\n")
+    File.chmod(0o700, File.join(tools, 'nix'))
+    @engine.instance_variable_set(:@env, ENV.to_h.merge('PATH' => tools))
+    assert_raises(WorkspaceCoordination::Error) { @engine.prepare_merge_hooks(source, 'code', @base) }
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_fresh_merge_source_initializes_dependencies_before_real_checkout_hooks
+    first = owner('fresh-hook-source')
+    checkout = feature(first)
+    FileUtils.mkdir_p(File.join(checkout, '.husky'))
+    File.write(File.join(checkout, '.husky/pre-commit'), 'fixture hook declaration')
+    File.write(File.join(checkout, 'flake.nix'), 'fixture declared shell')
+    git('-C', checkout, 'add', '.husky', 'flake.nix')
+    git('-C', checkout, 'commit', '-m', 'fixture hook declaration')
+    calls = File.join(@tmp, 'checkout-hook-calls')
+    hook = File.join(@bare, 'hooks/post-checkout')
+    File.write(hook, "#!/bin/sh\nprepared-checkout-dependency || exit 43\nprintf '%s\\n' \"$PWD\" >> '#{calls}'\n")
+    File.chmod(0o700, hook)
+    tools = File.join(@tmp, 'fresh-preparation-tools')
+    FileUtils.mkdir_p(tools)
+    fail_once = File.join(@tmp, 'fail-first-shell-init')
+    File.write(fail_once, 'fixture initialization failure')
+    script = <<~SH
+      #!/bin/sh
+      test "$1" = develop || exit 41
+      test "$2" = "$PWD" || exit 42
+      shift 3
+      if [ -f "#{fail_once}" ]; then
+        rm "#{fail_once}"
+        exit 44
+      fi
+      mkdir -p "$PWD/.prepared-tools"
+      printf '#!/bin/sh\\nexit 0\\n' > "$PWD/.prepared-tools/prepared-checkout-dependency"
+      chmod 700 "$PWD/.prepared-tools/prepared-checkout-dependency"
+      export PATH="$PWD/.prepared-tools:$PATH"
+      exec "$@"
+    SH
+    File.write(File.join(tools, 'nix'), script)
+    File.chmod(0o700, File.join(tools, 'nix'))
+    # Ignore the fixture's shell-created tools, as real repository shells do.
+    File.open(File.join(@bare, 'info/exclude'), 'a') { |file| file.puts '.prepared-tools/' }
+    @engine.instance_variable_set(:@env, ENV.to_h.merge('PATH' => [tools, ENV.fetch('PATH')].join(File::PATH_SEPARATOR)))
+    assert_raises(WorkspaceCoordination::Error) { @engine.prepare_merge(first, 'code', evidence(first)) }
+    refute File.exist?(calls)
+    assert_empty @engine.store.read['jobs']
+    snapshot = @engine.prepare_merge(first, 'code', evidence(first))
+    recorded = File.readlines(calls, chomp: true)
+    assert_equal 2, recorded.length
+    assert_includes recorded, snapshot['operation']['targetCheckout']
+    assert_equal snapshot['operation']['featureHead'], git('-C', recorded.first, 'rev-parse', 'HEAD').strip
+    assert_empty @engine.store.read['jobs']
+  end
+
   def test_event_dates_track_committed_states_and_idempotent_retries
     first = owner('dated-events')
     job = with_time(Time.utc(2026, 1, 1)) { submit_merge(first) }

@@ -247,6 +247,7 @@ buildGoModule {
     jq
     nodejs
     openssl
+    openssh
     contractPython
     ruby
     tmux
