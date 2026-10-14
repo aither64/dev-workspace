@@ -434,6 +434,11 @@ assigned. **Resume session** restores a stopped session; **Retry recovery**
 retries a failed restoration. The composer keeps its draft during these status
 updates. A portal-only restart preserves work on the same App Server.
 
+The restored-session banner's X hides the notice without continuing work. The
+server remembers this choice across reloads and browser visits; a later runtime
+restoration shows the notice again. Saved queues and goals remain paused until
+you explicitly activate work. Dismissing the notice sends no continuation message.
+
 `stop` only kills the exact managed tmux session and leaves all files and
 worktrees in place. It asks you to type the exact session slug before making
 the change. Use it when you want to pause terminal access without archiving the

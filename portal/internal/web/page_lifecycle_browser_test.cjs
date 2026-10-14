@@ -34,6 +34,8 @@ const checkSidebarMenu = async page => {
       const errors = [], notices = [];
       let details = 0, activity = 0, failActivity = false, holdDetails = false, releaseDetails;
       let recoveryOverride = null;
+      let recoveryNoticeID = "notice-one", noticeDismissed = false, failDismissal = false, staleNoticeRead = false;
+      let dismissals = 0, continuationRequests = 0;
       page.on("pageerror", error => errors.push(error.message));
       await page.exposeFunction("recordNotice", value => notices.push(value));
       await page.addInitScript(() => {
@@ -46,6 +48,14 @@ const checkSidebarMenu = async page => {
       });
       await page.route("**/api/sessions/example/**", async route => {
         const operation = new URL(route.request().url()).pathname.split("/").at(-1);
+        if (operation === "continue" || operation === "message") continuationRequests++;
+        if (operation === "dismiss-recovery") {
+          dismissals++;
+          assert.equal(route.request().postDataJSON().noticeId, recoveryNoticeID);
+          if (failDismissal) return route.fulfill({status: 503, json: {error: "Unable to save dismissal"}});
+          noticeDismissed = true;
+          return route.fulfill({json: {state: "waiting", noticeId: recoveryNoticeID, noticeDismissed: true}});
+        }
         if (operation === "details") {
           details++;
           if (holdDetails) {
@@ -56,7 +66,9 @@ const checkSidebarMenu = async page => {
           if (recoveryOverride) {
             const response = await route.fetch(), payload = await response.json();
             return route.fulfill({response, json: {...payload,
-              interactive: recoveryOverride !== "stopped", recovery: {state: recoveryOverride}}});
+              interactive: recoveryOverride !== "stopped", recovery: {state: recoveryOverride,
+                ...(recoveryOverride === "waiting" ? {noticeId: recoveryNoticeID,
+                  noticeDismissed: noticeDismissed && !staleNoticeRead} : {})}}});
           }
         }
         if (operation === "activity") {
@@ -108,6 +120,49 @@ const checkSidebarMenu = async page => {
         await expect(composer).toHaveValue("Keep this unsent recovery draft");
         assert(await composer.evaluate(element => element === window.recoveryComposer), "recovery replaced composer");
       }
+      recoveryOverride = "waiting";
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      const dismiss = page.getByRole("button", {name: "Dismiss restored-session notice", exact: true});
+      await expect(dismiss).toBeVisible();
+      const sendsBeforeDismissal = continuationRequests;
+      failDismissal = true;
+      await dismiss.click();
+      await expect(page.locator("#session-recovery-message")).toContainText("Unable to save dismissal");
+      await expect(page.locator("#session-recovery")).toBeVisible();
+      failDismissal = false;
+      await page.setViewportSize({width: 420, height: 720});
+      assert(await dismiss.evaluate(element => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.left >= 0 && bounds.right <= innerWidth;
+      }), "dismiss control fits the mobile viewport");
+      await dismiss.focus();
+      await page.keyboard.press("Enter");
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      await expect(page.locator("#codex-settings-open")).toBeDisabled();
+      await expect(composer).toHaveValue("Keep this unsent recovery draft");
+      assert(await composer.evaluate(element => element === window.recoveryComposer));
+      staleNoticeRead = true;
+      const beforeStaleRefresh = details;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect.poll(() => details).toBeGreaterThan(beforeStaleRefresh);
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      staleNoticeRead = false;
+      await page.reload();
+      const beforeReloadRefresh = details;
+      await expect.poll(() => details).toBeGreaterThan(beforeReloadRefresh);
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      recoveryNoticeID = "notice-two"; noticeDismissed = false;
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(dismiss).toBeVisible();
+      await dismiss.click();
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      assert.equal(dismissals, 3);
+      assert.equal(continuationRequests, sendsBeforeDismissal, "dismissal never sends a message or continues work");
+      recoveryOverride = "failed";
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(page.locator("#session-recovery")).toBeVisible();
+      await expect(dismiss).toBeHidden();
+      await page.setViewportSize({width: 1280, height: 720});
       recoveryOverride = null;
       await composer.fill("");
 

@@ -5398,6 +5398,8 @@
   const recoveryPanel = document.getElementById("session-recovery");
   const resumeButton = document.getElementById("session-resume");
   const continueButton = document.getElementById("session-continue");
+  const dismissRecoveryButton = document.getElementById("session-recovery-dismiss");
+  let recoveryNoticeID = "", dismissedRecoveryNoticeID = "";
   let continueRequestID = null;
   try { continueRequestID = sessionStorage.getItem(`workspace-portal.continue.${slug}`); } catch (_) {}
   applyRecoveryStatus = (recovery, runtimeInteractive) => {
@@ -5409,7 +5411,12 @@
       recovering: "Restoring session access…", waiting: "Session restored. Saved work is waiting for you.",
       active: "Session is active.", failed: "Session recovery failed."};
     document.getElementById("session-recovery-message").textContent = recovery.error || labels[recovery.state] || "Checking session recovery…";
-    recoveryPanel.hidden = recovery.state === "active";
+    recoveryNoticeID = recovery.noticeId || "";
+    if (recovery.noticeDismissed) dismissedRecoveryNoticeID = recoveryNoticeID;
+    const dismissed = recovery.state === "waiting" && !recovery.error && recoveryNoticeID &&
+      (recovery.noticeDismissed || dismissedRecoveryNoticeID === recoveryNoticeID);
+    recoveryPanel.hidden = recovery.state === "active" || Boolean(dismissed);
+    if (dismissRecoveryButton) dismissRecoveryButton.hidden = recovery.state !== "waiting" || !recoveryNoticeID || Boolean(recovery.error);
     if (recovery.state === "active" && continueRequestID) {
       try { sessionStorage.removeItem(`workspace-portal.continue.${slug}`); } catch (_) {}
       continueRequestID = null;
@@ -5447,6 +5454,20 @@
   };
   resumeButton?.addEventListener("click", () => void recoveryAction("resume", resumeButton));
   continueButton?.addEventListener("click", () => void recoveryAction("continue", continueButton));
+  dismissRecoveryButton?.addEventListener("click", async () => {
+    const noticeID = recoveryNoticeID;
+    dismissRecoveryButton.disabled = true;
+    try {
+      const result = await request(apiPath(slug, "dismiss-recovery"), {
+        method: "POST", body: JSON.stringify({noticeId: noticeID, member: body.dataset.selectedMember || undefined}),
+      });
+      dismissedRecoveryNoticeID = result.noticeDismissed ? result.noticeId : "";
+      if (recoveryNoticeID === noticeID) applyRecoveryStatus(result, interactive);
+      void refreshSessionDetails();
+    } catch (error) {
+      document.getElementById("session-recovery-message").textContent = error.message;
+    } finally { dismissRecoveryButton.disabled = false; }
+  });
   restartConversationSync();
   void refreshSessionDetails();
 })();

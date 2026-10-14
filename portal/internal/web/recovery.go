@@ -18,9 +18,11 @@ import (
 )
 
 type recoveryStatus struct {
-	State string `json:"state"`
-	Error string `json:"error,omitempty"`
-	Retry bool   `json:"-"`
+	State           string `json:"state"`
+	Error           string `json:"error,omitempty"`
+	Retry           bool   `json:"-"`
+	NoticeID        string `json:"noticeId,omitempty"`
+	NoticeDismissed bool   `json:"noticeDismissed,omitempty"`
 }
 
 type recoveryController interface {
@@ -69,7 +71,7 @@ func (s *Server) recoveryStatus(summary *session.Summary) recoveryStatus {
 		return recoveryStatus{State: "stopped"}
 	}
 	if s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
-		return recoveryStatus{State: "waiting"}
+		return s.waitingRecoveryStatus(summary)
 	}
 	return recoveryStatus{State: "active"}
 }
@@ -265,8 +267,14 @@ func (s *Server) recoveryAPI(w http.ResponseWriter, r *http.Request, summary *se
 	}
 	var request struct {
 		RequestID string `json:"requestId"`
+		NoticeID  string `json:"noticeId"`
+		Member    string `json:"member,omitempty"`
 	}
 	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	if operation == "dismiss-recovery" {
+		s.dismissRecoveryNotice(w, r, summary, request.NoticeID, request.Member)
 		return
 	}
 	if operation == "continue" && !queueClientMessageIDPattern.MatchString(request.RequestID) {

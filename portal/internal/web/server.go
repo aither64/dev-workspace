@@ -258,6 +258,7 @@ type pageData struct {
 	SelectedThreadID  string
 	ConversationID    string
 	MemberNotice      string
+	Recovery          recoveryStatus
 	SourceFileAPI     string
 }
 
@@ -1205,6 +1206,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error = "Session lifecycle identity is unavailable: " + lifecycleIdentityErr.Error()
 	}
 	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, data.SelectedThreadID)
+	data.Recovery, _ = s.selectedRecoveryStatus(summary, data.SelectedMember)
 	data.PendingLifecycle, err = session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil {
 		data.Error = "Session lifecycle state is unsafe: " + err.Error()
@@ -1312,18 +1314,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
-	recovery := s.recoveryStatus(summary)
-	if address := r.URL.Query().Get("member"); address != "" && data.DirectTeam != nil && summary.Interactive {
-		for _, member := range data.DirectTeam.Members {
-			if member.Address == address && member.State == "ready" && member.RetireIntent == "" {
-				if s.recoveryHeld(summary.Slug, member.Thread) {
-					recovery.State = "waiting"
-				} else {
-					recovery.State = "active"
-				}
-			}
-		}
-	}
+	recovery, _ := s.selectedRecoveryStatus(summary, r.URL.Query().Get("member"))
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"currentTarget":    s.lifecycleSnapshot(summary.Slug),
 		"pendingLifecycle": pendingLifecycle,
@@ -1865,7 +1856,7 @@ func (s *Server) sessionAPIForSummary(
 		s.coordinationAPI(w, r, summary.Slug)
 		return
 	}
-	if len(parts) == 2 && (parts[1] == "resume" || parts[1] == "continue" || parts[1] == "recovery") {
+	if len(parts) == 2 && (parts[1] == "resume" || parts[1] == "continue" || parts[1] == "recovery" || parts[1] == "dismiss-recovery") {
 		s.recoveryAPI(w, r, summary, parts[1])
 		return
 	}

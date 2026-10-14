@@ -52,6 +52,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .notice { padding: .75rem; border-radius: 9px; background: #202733; overflow-wrap: anywhere; }
 .notice.error { color: #ffb5b5; border: 1px solid #713b46; }
 .notice.warning { color: var(--warning); border: 1px solid #66532e; }
+.recovery-notice { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; }
+.recovery-notice[hidden] { display: none; }
+#session-recovery-message { flex: 1; min-width: min(100%, 12rem); }
+#session-recovery-dismiss { margin-left: auto; }
 .full { grid-column: 1 / -1; }
 .checkbox { display: flex; gap: .6rem; align-items: center; }
 .checkbox input { width: auto; margin: 0; }

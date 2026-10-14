@@ -298,6 +298,17 @@ another browser. If there is queued work or an active goal, it activates that
 work. Otherwise it queues one visible continuation prompt with a stable ID.
 Cold Send uses the same native queue and preserves FIFO order.
 
+The restored-session notice has an X button. Dismissing it leaves saved queues
+and goals paused and sends no message to Codex. The server remembers dismissal
+across reloads, browser visits and portal-only restarts. A new runtime restoration
+shows a fresh notice. Sending a message or explicitly starting queued work still
+activates the addressed conversation. Recovery errors remain visible.
+
+Notice preferences use separate private thread records, bound to the retained
+session incarnation, terminal identity and App Server socket generation. They do
+not grant execution permission or change recovery file schemas. Older packages
+ignore these records.
+
 Private schema-1 recovery files live under
 `$DEV_WORKSPACES_STATE/session-recovery/<workspace-sha256>/<slug>.json`.
 They bind the canonical workspace, slug, root and socket, automatic restoration

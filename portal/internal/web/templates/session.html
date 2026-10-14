@@ -43,10 +43,11 @@
   </aside>
   <main class="page session-page">
     {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
-    <section id="session-recovery" class="notice full" role="status" aria-live="polite">
+    <section id="session-recovery" class="notice full recovery-notice" role="status" aria-live="polite"{{if or (eq .Recovery.State "active") (and (eq .Recovery.State "waiting") .Recovery.NoticeDismissed)}} hidden{{end}}>
       <span id="session-recovery-message">Checking session recovery…</span>
       <button id="session-resume" type="button" class="quiet" hidden>Resume session</button>
       <button id="session-continue" type="button" hidden>Continue task</button>
+      <button id="session-recovery-dismiss" type="button" class="quiet icon-button" title="Dismiss restored-session notice" aria-label="Dismiss restored-session notice" hidden><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
     </section>
     {{end}}
     <p id="session-details-warning" class="notice warning full" role="status" hidden></p>
