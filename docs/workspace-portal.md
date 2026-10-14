@@ -1218,3 +1218,11 @@ guest shutdown, forced reaping, runner cleanup, and command completion within
 that ceiling. Providers own their internal shutdown budgets and test them against
 the runtime contract. These fields are additive package metadata; they do not
 change persisted cluster state or its transition policy.
+
+## Sensitive sessions
+
+Choose **Sensitive session** when creating a session. The badge remains visible
+in the session list and session page. Forks and new sessions implementing a
+sensitive plan inherit the setting. Records remain local while portal access and
+Codex processing retain their existing behavior. See the
+[session guide](dev-sessions.md#sensitive-sessions) for storage and recovery.

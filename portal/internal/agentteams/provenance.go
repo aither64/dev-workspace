@@ -87,6 +87,12 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 	}
 	common := []string{"schema", "slug", "goal_sha256", "run_codex", "state"}
 	allowed := append([]string(nil), common...)
+	if marker, ok := raw["sensitive"]; ok {
+		if string(marker) != "true" {
+			return CreationJournal{}, errors.New("invalid creation sensitivity")
+		}
+		allowed = append(allowed, "sensitive")
+	}
 	if header.Schema == 2 {
 		allowed = append(allowed, "model", "effort", "agent_team_binding", "agent_team_binding_digest")
 	} else if header.Schema == 3 {

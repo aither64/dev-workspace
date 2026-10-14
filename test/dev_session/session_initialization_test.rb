@@ -4,86 +4,91 @@ require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
   def test_start_seeds_the_goal_and_returns_json_with_a_shared_thread
-    with_workspace do |workspace|
-      slug = '2026-06-06-demo'
-      out = StringIO.new
-      goal = File.join(workspace, 'goal.txt')
-      File.write(goal, "Implement a useful feature.\n")
-      tmux = ManagedTmux.new(slug, workspace:)
-      portal_command = [
-        RbConfig.ruby,
-        '-e',
-        "require 'json'; abort 'fresh creation selected discovery' if ARGV.include?('--recover-creating'); puts JSON.generate(threadId: 'thread-123')"
-      ]
-      session = DevSession::Tmux::Session.new(
-        id: '$created',
-        name: slug,
-        mark: '1',
-        slug:,
-        workspace:
-      )
-      runner_class = Class.new(DevSession::Runner) do
-        define_method(:create_tmux_session) do |
-          _slug, run_codex:, thread_id:, launch_codex:, identity_token:
-        |
-          raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
-          raise 'Codex launched before the initial request persisted' if launch_codex
-          raise 'missing journaled tmux identity' unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
+    [false, true].each do |sensitive|
+      with_workspace do |workspace|
+        sensitive_fixture(workspace, 'seed') if sensitive
+        slug = '2026-06-06-demo'
+        out = StringIO.new
+        goal = File.join(workspace, 'goal.txt')
+        File.write(goal, "Implement a useful feature.\n")
+        tmux = ManagedTmux.new(slug, workspace:)
+        portal_command = [
+          RbConfig.ruby,
+          '-e',
+          "require 'json'; abort 'fresh creation selected discovery' if ARGV.include?('--recover-creating'); puts JSON.generate(threadId: 'thread-123')"
+        ]
+        session = DevSession::Tmux::Session.new(
+          id: '$created',
+          name: slug,
+          mark: '1',
+          slug:,
+          workspace:
+        )
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_tmux_session) do |
+            _slug, run_codex:, thread_id:, launch_codex:, identity_token:
+          |
+            raise 'missing shared thread' unless run_codex && thread_id == 'thread-123'
+            raise 'Codex launched before the initial request persisted' if launch_codex
+            raise 'missing journaled tmux identity' unless identity_token&.match?(/\A[0-9a-f]{64}\z/)
 
-          session
+            session
+          end
+
+          define_method(:sync_slug) do |_slug, require_session:, session:|
+            raise 'missing created session' unless require_session && session
+
+            session
+          end
+
+          define_method(:revalidate_session!) do |expected|
+            expected
+          end
+
+          define_method(:reconcile_native_client!) do |_slug, expected, **_keywords|
+            expected
+          end
         end
+        runner = runner_class.new(
+          workspace:,
+          tmux: NullTmux.new,
+          out:,
+          err: StringIO.new,
+          today: TODAY,
+          env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') },
+          portal_command:,
+          codex_socket: '/run/test/codex.sock',
+          portal_url: 'https://workspace.example.test'
+        )
 
-        define_method(:sync_slug) do |_slug, require_session:, session:|
-          raise 'missing created session' unless require_session && session
+        runner.start(
+          slug,
+          as_is: true,
+          new: false,
+          attach: false,
+          run_codex: true,
+          goal_file: goal,
+          sensitive: sensitive,
+          json: true
+        )
 
-          session
-        end
-
-        define_method(:revalidate_session!) do |expected|
-          expected
-        end
-
-        define_method(:reconcile_native_client!) do |_slug, expected, **_keywords|
-          expected
-        end
+        assert_equal(sensitive, YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))['sensitive'] == true)
+        result = JSON.parse(out.string)
+        assert_equal(slug, result['slug'])
+        assert_equal('thread-123', result['threadId'])
+        assert_equal("https://workspace.example.test/#{slug}/", result['url'])
+        assert_includes(File.read(File.join(workspace, 'work', slug, 'plan.md')), 'Implement a useful feature.')
+        assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial request')
+        assert_equal(
+          {
+            'state' => 'ready',
+            'initial_goal_sent' => true,
+            'goal_sha256' => Digest::SHA256.hexdigest('Implement a useful feature.')
+          },
+          YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+              .fetch('creation')
+        )
       end
-      runner = runner_class.new(
-        workspace:,
-        tmux: NullTmux.new,
-        out:,
-        err: StringIO.new,
-        today: TODAY,
-        env: {},
-        portal_command:,
-        codex_socket: '/run/test/codex.sock',
-        portal_url: 'https://workspace.example.test'
-      )
-
-      runner.start(
-        slug,
-        as_is: true,
-        new: false,
-        attach: false,
-        run_codex: true,
-        goal_file: goal,
-        json: true
-      )
-
-      result = JSON.parse(out.string)
-      assert_equal(slug, result['slug'])
-      assert_equal('thread-123', result['threadId'])
-      assert_equal("https://workspace.example.test/#{slug}/", result['url'])
-      assert_includes(File.read(File.join(workspace, 'work', slug, 'plan.md')), 'Implement a useful feature.')
-      assert_includes(File.read(File.join(workspace, 'work', slug, 'state.md')), 'initial request')
-      assert_equal(
-        {
-          'state' => 'ready',
-          'initial_goal_sent' => true,
-          'goal_sha256' => Digest::SHA256.hexdigest('Implement a useful feature.')
-        },
-        YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
-            .fetch('creation')
-      )
     end
   end
 

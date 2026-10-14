@@ -116,6 +116,7 @@ func AvailableArtifacts(summary *Summary) []Artifact {
 }
 
 type Manifest struct {
+	Sensitive          bool `yaml:"sensitive,omitempty" json:"sensitive,omitempty"`
 	creationPresent    bool
 	scopeExplicit      bool
 	Schema             int          `yaml:"schema" json:"schema"`
@@ -513,7 +514,7 @@ func decodeManifest(data []byte, manifest *Manifest) error {
 		return err
 	}
 	fields, _ := strictMapping(document.Content[0], []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive",
 	}, []string{"schema", "slug"})
 	manifest.creationPresent = fields["creation"] != nil
 	manifest.scopeExplicit = fields["repositories"] != nil && fields["artifacts"] != nil
@@ -531,7 +532,7 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	fields, err := strictMapping(root, []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive",
 	}, []string{"schema", "slug"})
 	if err != nil {
 		return err
@@ -544,6 +545,14 @@ func validateManifestNode(root *yaml.Node) error {
 	}
 	if err := optionalString(fields, "archive_operation_id"); err != nil {
 		return err
+	}
+	if node := fields["sensitive"]; node != nil {
+		if err := scalarTag(node, "!!bool", "sensitive"); err != nil {
+			return err
+		}
+		if node.Value != "true" {
+			return errors.New("sensitive must be true when present")
+		}
 	}
 	if err := optionalString(fields, "forked_from"); err != nil {
 		return err

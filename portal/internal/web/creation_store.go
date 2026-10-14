@@ -25,6 +25,7 @@ import (
 // Old packages ignore these private files; the existing CLI journals retain
 // their original format and continue to own runtime initialization.
 type creationRequest struct {
+	Sensitive      bool   `json:"sensitive,omitempty"`
 	Kind           string `json:"kind"`
 	Slug           string `json:"slug"`
 	Goal           string `json:"goal,omitempty"`
@@ -74,6 +75,7 @@ type creationReceipt struct {
 }
 
 type creationStatus struct {
+	Sensitive      bool   `json:"sensitive,omitempty"`
 	InitialRequest string `json:"initialRequest,omitempty"`
 	StartedAt      string `json:"startedAt"`
 	UpdatedAt      string `json:"updatedAt"`
@@ -107,7 +109,7 @@ func (receipt creationReceipt) status() creationStatus {
 	if goal == "" && receipt.Request.Kind == "plan" && receipt.Request.PlanText != "" {
 		goal = planCreationGoal(receipt.Request.Source, receipt.Request.PlanText)
 	}
-	return creationStatus{InitialRequest: goal, CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: "/" + receipt.Request.Slug + "/", ReceiptID: receipt.ReceiptID,
+	return creationStatus{Sensitive: receipt.Request.Sensitive, InitialRequest: goal, CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: "/" + receipt.Request.Slug + "/", ReceiptID: receipt.ReceiptID,
 		Attempt: receipt.Attempt, State: receipt.State, Phase: receipt.Phase, Error: receipt.Error,
 		StartedAt: receipt.StartedAt, UpdatedAt: receipt.UpdatedAt, SourceURL: sourceURL}
 }
@@ -427,9 +429,12 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	if marker, ok := request["sensitive"]; ok && string(marker) != "true" {
+		return errors.New("sensitive must be true when present")
+	}
 	if schema == 1 {
 		requestAllowed := map[string]bool{}
-		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest"} {
+		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive"} {
 			requestAllowed[field] = true
 		}
 		for field := range request {
@@ -572,10 +577,10 @@ func validateManagedCreationRequestShape(request map[string]json.RawMessage) err
 	switch kind {
 	case "new":
 		required = []string{"kind", "slug", "goal", "team", "catalogDigest"}
-		optional = []string{"model", "effort"}
+		optional = []string{"model", "effort", "sensitive"}
 	case "plan":
 		required = []string{"kind", "slug", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "team", "catalogDigest"}
-		optional = []string{"planText", "model", "effort"}
+		optional = []string{"planText", "model", "effort", "sensitive"}
 	default:
 		return errors.New("schema-2 creation request has an invalid kind")
 	}

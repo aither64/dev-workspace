@@ -34,68 +34,72 @@ class DevSessionTest < Minitest::Test
   end
 
   def test_fork_creates_a_conversation_only_session
-    with_workspace do |workspace|
-      source_slug = '2026-06-05-source'
-      destination_slug = '2026-06-06-alternative'
-      setup_runner = runner_for(workspace)
-      setup_runner.ensure_tracking_files(source_slug)
-      source_manifest = setup_runner.send(:ensure_portal_manifest, source_slug)
-      source_manifest['codex'] = { 'thread_id' => 'thread-source' }
-      setup_runner.send(:write_portal_manifest, source_slug, source_manifest)
+    [false, true].each do |sensitive|
+      with_workspace do |workspace|
+        source_slug = '2026-06-05-source'
+        destination_slug = '2026-06-06-alternative'
+        setup_runner = sensitive ? sensitive_fixture(workspace, source_slug) : runner_for(workspace)
+        setup_runner.ensure_tracking_files(source_slug)
+        source_manifest = setup_runner.send(:ensure_portal_manifest, source_slug)
+        source_manifest['creation'] = { 'state' => 'ready', 'initial_goal_sent' => false } if sensitive
+        source_manifest['codex'] = { 'thread_id' => 'thread-source' }
+        setup_runner.send(:write_portal_manifest, source_slug, source_manifest)
 
-      log = File.join(workspace, 'portal.log')
-      portal = File.join(workspace, 'portal.rb')
-      File.write(portal, <<~RUBY)
-        require 'json'
-        File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
-        case ARGV[0, 2]
-        when ['thread', 'resolve-fork-settings']
-          puts JSON.generate(model: 'gpt-test', reasoningEffort: 'xhigh')
-        when ['thread', 'fork']
-          puts JSON.generate(threadId: 'thread-fork')
+        log = File.join(workspace, 'portal.log')
+        portal = File.join(workspace, 'portal.rb')
+        File.write(portal, <<~RUBY)
+          require 'json'
+          File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
+          case ARGV[0, 2]
+          when ['thread', 'resolve-fork-settings']
+            puts JSON.generate(model: 'gpt-test', reasoningEffort: 'xhigh')
+          when ['thread', 'fork']
+            puts JSON.generate(threadId: 'thread-fork')
+          end
+        RUBY
+        session = DevSession::Tmux::Session.new(
+          id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
+          workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
+        )
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            session.identity_token = kwargs.fetch(:identity_token)
+            session
+          end
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
         end
-      RUBY
-      session = DevSession::Tmux::Session.new(
-        id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
-        workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
-      )
-      runner_class = Class.new(DevSession::Runner) do
-        define_method(:create_tmux_session) do |*_args, **kwargs|
-          session.identity_token = kwargs.fetch(:identity_token)
-          session
-        end
-        define_method(:sync_slug) { |*_args, **_kwargs| session }
+        out = StringIO.new
+        runner = runner_class.new(
+          workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
+          out:, err: StringIO.new, today: TODAY, env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
+        )
+
+        runner.fork(
+          source_slug, 'alternative', as_is: false, json: true,
+          model: 'gpt-test', effort: 'xhigh'
+        )
+
+        result = JSON.parse(out.string)
+        assert_equal(destination_slug, result.fetch('slug'))
+        assert_equal(source_slug, result.fetch('forkedFrom'))
+        manifest = YAML.safe_load(
+          File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
+        )
+        assert_equal(sensitive, manifest['sensitive'] == true)
+        assert_equal(source_slug, manifest.fetch('forked_from'))
+        assert_equal('thread-fork', manifest.dig('codex', 'thread_id'))
+        assert_empty(manifest.fetch('repositories'))
+        assert_empty(manifest.fetch('artifacts'))
+        assert_empty(Dir.children(File.join(workspace, 'worktrees', destination_slug)))
+        commands = File.readlines(log, chomp: true)
+        preflight = commands.find { |line| line.start_with?('thread resolve-fork-settings ') }
+        assert_includes(preflight, '--thread-id thread-source')
+        command = commands.find { |line| line.start_with?('thread fork ') }
+        assert_includes(command, '--fresh')
+        assert_includes(command, '--thread-id thread-source')
+        assert_includes(command, '--model gpt-test')
+        assert_includes(command, '--effort xhigh')
       end
-      out = StringIO.new
-      runner = runner_class.new(
-        workspace:, tmux: NullTmux.new, portal_command: [RbConfig.ruby, portal],
-        out:, err: StringIO.new, today: TODAY, env: {}
-      )
-
-      runner.fork(
-        source_slug, 'alternative', as_is: false, json: true,
-        model: 'gpt-test', effort: 'xhigh'
-      )
-
-      result = JSON.parse(out.string)
-      assert_equal(destination_slug, result.fetch('slug'))
-      assert_equal(source_slug, result.fetch('forkedFrom'))
-      manifest = YAML.safe_load(
-        File.read(File.join(workspace, 'work', destination_slug, 'portal.yml'))
-      )
-      assert_equal(source_slug, manifest.fetch('forked_from'))
-      assert_equal('thread-fork', manifest.dig('codex', 'thread_id'))
-      assert_empty(manifest.fetch('repositories'))
-      assert_empty(manifest.fetch('artifacts'))
-      assert_empty(Dir.children(File.join(workspace, 'worktrees', destination_slug)))
-      commands = File.readlines(log, chomp: true)
-      preflight = commands.find { |line| line.start_with?('thread resolve-fork-settings ') }
-      assert_includes(preflight, '--thread-id thread-source')
-      command = commands.find { |line| line.start_with?('thread fork ') }
-      assert_includes(command, '--fresh')
-      assert_includes(command, '--thread-id thread-source')
-      assert_includes(command, '--model gpt-test')
-      assert_includes(command, '--effort xhigh')
     end
   end
 

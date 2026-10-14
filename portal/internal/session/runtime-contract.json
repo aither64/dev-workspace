@@ -1,4 +1,5 @@
 {
+  "sensitiveSessionsPolicy": 1,
   "developmentClusterStateSchema": 1,
   "developmentClusterTransitionPolicy": 3,
   "runtimeAuthorityIdentityPolicy": 1,

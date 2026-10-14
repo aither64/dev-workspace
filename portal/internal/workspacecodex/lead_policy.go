@@ -2,6 +2,7 @@ package workspacecodex
 
 import (
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"strings"
 
 	"github.com/aither64/codex-web/codex"
@@ -46,5 +47,5 @@ func LeadThreadPolicy(slug, workspace, roleInstructions string) codex.ThreadPoli
 			"keep resource waits interruptible and keep the turn open.\n\n%s",
 			slug, workspace, instructions)
 	}
-	return codex.ThreadPolicy{DeveloperInstructions: instructions}
+	return codex.ThreadPolicy{DeveloperInstructions: session.SensitiveInstructions(workspace, slug) + instructions}
 }

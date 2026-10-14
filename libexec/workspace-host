@@ -657,6 +657,7 @@ module DevWorkspaceHost
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
+      require_compatible_sensitive_sessions!(candidate)
       coordination_store.require_compatible!(candidate)
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
@@ -684,6 +685,7 @@ module DevWorkspaceHost
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
+      require_compatible_sensitive_sessions!(candidate)
       coordination_store.require_compatible!(candidate)
       require_coordination_profile_claim!(candidate)
       unless prepared.fetch('sourceIdentity') == coordination_source_identity(prepared.fetch('source'))
@@ -2172,6 +2174,10 @@ module DevWorkspaceHost
       if schema == 1 && journal['preserve_tracking'] == true
         allowed.concat(%w[preserve_tracking tracking_origin tracking_plan_sha256 tracking_state_sha256])
       end
+      if journal.key?('sensitive')
+        raise Error, 'invalid creation sensitivity' unless journal['sensitive'] == true
+        allowed << 'sensitive'
+      end
       allowed << 'tmux_identity' if state == 'creating'
       unless journal.keys.sort == allowed.sort && [true, false].include?(journal['run_codex']) &&
              (journal['goal_sha256'].nil? || journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(SHA256_HEX))
@@ -2406,6 +2412,8 @@ module DevWorkspaceHost
 							  plan = %w[source sourceThreadId sourceIdentity planTurnId planSha256]
 							  [common + plan, common + plan + %w[planText] + optional]
 							end
+    allowed << 'sensitive'
+    return false if request.key?('sensitive') && request['sensitive'] != true
     return false unless (request.keys - allowed).empty? && (required - request.keys).empty?
 	  return false unless request['slug'] == slug && valid_session_identity?(request['slug']) &&
 						  valid_portal_team_identifier?(request['team']) &&
@@ -2735,6 +2743,19 @@ module DevWorkspaceHost
       end
       missing = sockets.reject { |path| File.socket?(path) }
       raise Error, "Codex App Server sockets did not become ready: #{missing.join(', ')}"
+    end
+
+    def require_compatible_sensitive_sessions!(candidate)
+      root = File.join(@state, 'sensitive-sessions')
+      return if Dir[File.join(root, '*', '*.json')].empty?
+
+      path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      data = JSON.parse(File.binread(path, 64 * 1024 + 1))
+      return if data['sensitiveSessionsPolicy'] == 1
+
+      raise Error, 'candidate cannot preserve local sensitive sessions'
+    rescue Errno::ENOENT, JSON::ParserError
+      raise Error, 'candidate cannot preserve local sensitive sessions'
     end
 
     def read_portal_manifest(path)

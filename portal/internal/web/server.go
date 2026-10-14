@@ -107,6 +107,7 @@ type cachedRepositories struct {
 }
 
 type indexSessionStatus struct {
+	Sensitive           bool      `json:"sensitive,omitempty"`
 	ObservationIdentity string    `json:"observationIdentity"`
 	Slug                string    `json:"slug"`
 	UpdatedAt           time.Time `json:"updatedAt"`
@@ -905,7 +906,7 @@ func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
 		summaries, err = s.listSessions()
 	} else {
 		for _, status := range cached.statuses {
-			summaries = append(summaries, session.Summary{Manifest: session.Manifest{Slug: status.Slug,
+			summaries = append(summaries, session.Summary{Manifest: session.Manifest{Slug: status.Slug, Sensitive: status.Sensitive,
 				Repositories: make([]session.Repository, status.RepositoryCount)}, Archived: status.Archived, UpdatedAt: status.UpdatedAt, ObservationIdentity: status.ObservationIdentity})
 		}
 	}
@@ -1074,7 +1075,7 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 			}
 		}
 		result.statuses = append(result.statuses, indexSessionStatus{
-			Slug: summary.Slug, UpdatedAt: updated, Archived: summary.Archived, ObservationIdentity: summary.ObservationIdentity,
+			Slug: summary.Slug, Sensitive: summary.Sensitive, UpdatedAt: updated, Archived: summary.Archived, ObservationIdentity: summary.ObservationIdentity,
 			RepositoryCount: len(summary.Repositories),
 			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pendingKind,
 		})
@@ -1393,6 +1394,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.createPreparation(w, r)
 		return
 	}
+	if values, present := r.Form["sensitive"]; present && (len(values) != 1 || values[0] != "true") {
+		s.writeError(w, r, http.StatusBadRequest, "invalid session sensitivity")
+		return
+	}
 	name := strings.TrimSpace(r.FormValue("name"))
 	goal := strings.TrimSpace(r.FormValue("goal"))
 	model := strings.TrimSpace(r.FormValue("model"))
@@ -1417,7 +1422,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	_, teamSubmitted := r.Form["team"]
 	_, digestSubmitted := r.Form["catalogDigest"]
-	request := creationRequest{Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort}
+	request := creationRequest{Sensitive: r.FormValue("sensitive") == "true", Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort}
 	resolvedRequest, resolveErr := s.resolveManagedCreation(r.Context(), request, agentteams.CreationSelectionInput{
 		Team:            agentteams.StringPresence{Present: teamSubmitted, Value: team},
 		CatalogDigest:   agentteams.StringPresence{Present: digestSubmitted, Value: catalogDigest},
@@ -2319,6 +2324,7 @@ func planDigest(text string) string {
 }
 
 type implementPlanRequest struct {
+	Sensitive           bool    `json:"sensitive,omitempty"`
 	PlanContextVersion  int     `json:"planContextVersion"`
 	PlanText            string  `json:"planText"`
 	Model               *string `json:"model"`
@@ -2368,7 +2374,7 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 			return
 		}
 		request := creationRequest{
-			Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
+			Sensitive: body.Sensitive, Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
 			PlanSHA256: strings.TrimSpace(body.PlanSHA256), PlanText: body.PlanText,
 		}
 		if body.Model != nil {
@@ -3226,6 +3232,7 @@ func commandFailure(action, stdout, stderr string, err error) error {
 func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *session.Summary) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	var body struct {
+		Sensitive       bool   `json:"sensitive,omitempty"`
 		Name            string `json:"name"`
 		CreationDate    string `json:"creationDate"`
 		Model           string `json:"model"`
@@ -3257,7 +3264,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		return
 	}
 	receipt, err := s.acceptCreation(creationRequest{
-		Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
+		Sensitive: body.Sensitive, Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
 		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity,
 		Model: body.Model, Effort: body.ReasoningEffort,
 	})

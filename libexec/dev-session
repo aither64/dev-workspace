@@ -14,6 +14,7 @@ require 'tempfile'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-sensitive-sessions'
 require_relative 'workspace-coordination'
 require_relative 'workspace-provider-admission'
 require_relative 'workspace-auto-archive'
@@ -196,10 +197,10 @@ module DevSession
     Usage:
       dev-session start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
-        [--goal-file FILE] [--json] [--exclusive] [--team TEAM]
+        [--goal-file FILE] [--json] [--exclusive] [--team TEAM] [--sensitive]
         [--model MODEL] [--effort EFFORT]
       dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
-        [--model MODEL] [--effort EFFORT]
+        [--model MODEL] [--effort EFFORT] [--sensitive]
       dev-session attach <name-or-slug> [--as-is]
       dev-session resume <name-or-slug> [--as-is]
       dev-session sync <name-or-slug> [--as-is]
@@ -694,6 +695,7 @@ module DevSession
   end
 
   class Runner
+    include SensitiveSessions
     include WorkspaceAutoArchive::Runner
     include ArchiveCleanup::RunnerContext
     CleanupPlan = Struct.new(:session, :entries, :unexpected, keyword_init: true)
@@ -790,6 +792,7 @@ module DevSession
       run_codex:,
       goal_file: nil,
       goal_text: nil,
+      sensitive: nil,
       json: false,
       exclusive: false,
       model: nil,
@@ -909,6 +912,7 @@ module DevSession
 
         selected_session = with_slug_lock(slug) do
           guard_portal_preparation_reservation!(slug, receipt)
+          select_sensitivity!(slug, requested: sensitive)
           preparation_started = creation_progress_begin('prepare')
           select_tmux_for_slug!(slug)
           if lifecycle_operation == 'revive'
@@ -1347,7 +1351,7 @@ module DevSession
     end
 
     def fork(
-      source_input, destination_input, as_is:, json:, model: nil, effort: nil,
+      source_input, destination_input, as_is:, json:, model: nil, effort: nil, sensitive: nil,
       creation_receipt_id: nil, creation_evidence: nil,
       expected_source: nil, expected_source_thread: nil, expected_source_identity: nil
     )
@@ -1362,6 +1366,8 @@ module DevSession
       with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
+          source_choice = journal ? journal.fetch('source_slug') : lookup_slug(source_input, as_is: false)
+          select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_choice))
           prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:) if receipt
         end
       end
@@ -2695,6 +2701,7 @@ module DevSession
     end
 
     def ensure_tracking_files(slug, allow_uncommitted_revive: false)
+      ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
       if path_exists?(work_dir(slug))
         validate_work_directory!(slug)
         validate_tracking_files!(slug)
@@ -2880,6 +2887,7 @@ module DevSession
     end
 
     def archived_slug_known?(slug)
+      return true if sensitivity_record(slug)&.fetch('archived')
       return true if path_exists?(archive_dir(slug))
       return false unless path_exists?(File.join(workspace, '.git'))
 
@@ -3161,6 +3169,7 @@ module DevSession
         'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
         'run_codex' => run_codex
       }
+      expected['sensitive'] = true if sensitive_session?(slug)
       expected['model'] = model unless model.nil?
       expected['effort'] = effort unless effort.nil?
 	  if team_binding
@@ -3174,6 +3183,9 @@ module DevSession
         actual = read_private_json_object(
           path, 'creation journal', max_size: 64 * 1024, mode: 0o600
         )
+        unless (actual['sensitive'] == true) == sensitive_session?(slug)
+          raise Error, 'creation journal sensitivity changed'
+        end
         state = actual['state']
         if state == 'creating' && !actual.key?('tmux_identity')
           if cleanup_session(slug)
@@ -3344,6 +3356,7 @@ module DevSession
       ]
       creating = journal['state'] == 'creating'
       ready = journal['state'] == 'ready'
+      required << 'sensitive' if sensitive_session?(slug)
       expected_keys = creating ? required + ['tmux_identity'] : required
       binding = journal['agent_team_binding']
       binding_match = binding.is_a?(String) && AGENT_TEAM_BINDING_PATTERN.match(binding)
@@ -3387,6 +3400,7 @@ module DevSession
       required = %w[schema slug goal_sha256 run_codex state model effort direct_team]
       creating = journal['state'] == 'creating'
       ready = journal['state'] == 'ready'
+      required << 'sensitive' if sensitive_session?(slug)
       expected_keys = creating ? required + ['tmux_identity'] : required
       unless journal.keys.sort == expected_keys.sort && journal['slug'] == slug &&
              journal['run_codex'] == true && (creating || ready) &&
@@ -3435,6 +3449,7 @@ module DevSession
       return nil unless journal['schema'] == 3
 
       required = %w[schema slug goal_sha256 run_codex state model effort direct_team]
+      required << 'sensitive' if sensitive_session?(slug)
       unless journal.keys.sort == required.sort && journal['slug'] == slug &&
              journal['state'] == 'ready' && journal['run_codex'] == true &&
              journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(/\A[0-9a-f]{64}\z/) &&
@@ -3509,9 +3524,10 @@ module DevSession
       tracking = PRESERVED_JOURNAL_TRACKING_KEYS
       allowed = required + %w[
         model effort agent_team_binding agent_team_binding_digest
-        direct_team preserve_tracking tmux_identity
+        direct_team preserve_tracking tmux_identity sensitive
       ] + tracking
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
+      return false unless (journal['sensitive'] == true) == sensitive_session?(slug)
       return false unless [1, 2, 3].include?(journal['schema']) && journal['slug'] == slug &&
                           journal['state'] == 'ready' &&
                           [true, false].include?(journal['run_codex'])
@@ -3569,7 +3585,7 @@ module DevSession
         schema slug goal_sha256 run_codex state preserve_tracking
         tracking_origin tracking_plan_sha256 tracking_state_sha256
       ]
-      allowed = required + %w[model effort tmux_identity]
+      allowed = required + %w[model effort tmux_identity sensitive]
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
       return false unless journal['schema'] == 1 && journal['slug'] == slug &&
                           %w[creating ready].include?(journal['state']) &&
@@ -3611,6 +3627,7 @@ module DevSession
     end
 
     def committed_ordinary_tracking?(slug)
+      return !!ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
       %w[plan.md state.md portal.yml].all? do |name|
         path = File.join('work', slug, name)
         next false unless committed_path?('HEAD', path)
@@ -3879,6 +3896,9 @@ module DevSession
              current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'creation request is no longer current; start a new request'
       end
+      unless (current['request']['sensitive'] == true) == sensitive_session?(slug)
+        raise Error, 'creation sensitivity does not match the accepted request'
+      end
       if expected_schema == 2
 		validate_current_managed_portal_receipt!(current, receipt, slug, model:, effort:)
 		receipt['agent_team_catalog_digest'] = current.fetch('request').fetch('catalogDigest')
@@ -3927,7 +3947,7 @@ module DevSession
 	  allowed << 'planText' if request['kind'] == 'plan'
 	  # An explicit lead override remains in the accepted browser request as
 	  # provenance. Its resolved, immutable values live in directTeam.
-	  allowed.concat(%w[model effort])
+	  allowed.concat(%w[model effort sensitive])
       unless required.any? && request.keys.all? { |key| allowed.include?(key) } &&
              (required - request.keys).empty? && request['slug'] == slug &&
              request['team'] == direct_team['id'] && request['catalogDigest'] == direct_team['catalogDigest']
@@ -3972,7 +3992,7 @@ module DevSession
       end
 
       common = %w[catalogDigest kind slug team]
-      optional = %w[model effort]
+      optional = %w[model effort sensitive]
       kind = request['kind']
       kind_required = if kind == 'new'
                         common + ['goal']
@@ -4155,10 +4175,9 @@ module DevSession
       raise Error, "fork journal is not a file: #{path}" unless File.file?(path)
 
       journal = JSON.parse(File.read(path))
-      unless journal.is_a?(Hash) && journal.keys.sort == %w[
-        effort model requested_effort requested_model schema slug source_slug
-        source_thread_id state tmux_identity
-      ].sort &&
+      expected = %w[effort model requested_effort requested_model schema slug source_slug source_thread_id state tmux_identity]
+      expected << 'sensitive' if sensitive_session?(slug)
+      unless journal.is_a?(Hash) && journal.keys.sort == expected.sort &&
              journal['schema'] == 1 && journal['slug'] == slug &&
              valid_part?(journal['source_slug']) &&
              (source_slug.nil? || journal['source_slug'] == source_slug) &&
@@ -4207,6 +4226,7 @@ module DevSession
         'state' => 'creating',
         'tmux_identity' => SecureRandom.hex(32)
       }
+      journal['sensitive'] = true if sensitive_session?(slug)
       write_creation_journal(fork_journal_file(slug), journal, create: true)
       journal
     end
@@ -4334,7 +4354,7 @@ module DevSession
     end
 
     def new_threadless_portal_manifest(slug)
-      { 'schema' => 1, 'slug' => slug, 'repositories' => [], 'artifacts' => [] }
+      { 'schema' => 1, 'slug' => slug, **(sensitive_session?(slug) ? { 'sensitive' => true } : {}), 'repositories' => [], 'artifacts' => [] }
     end
 
     def ensure_portal_manifest(slug, creation_journal: nil, tracking_only: false)
@@ -4370,6 +4390,7 @@ module DevSession
       {
         'schema' => creation_journal ? 2 : 1,
         'slug' => slug,
+        **(sensitive_session?(slug) ? { 'sensitive' => true } : {}),
         'codex' => {},
         'creation' => if creation_journal
                         creation = {
@@ -4494,7 +4515,7 @@ module DevSession
       end
       validate_mapping_keys!(
         manifest,
-        %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id],
+        %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id sensitive],
         'portal manifest',
         path
       )
@@ -4504,6 +4525,12 @@ module DevSession
       if manifest.key?('forked_from') &&
          (!valid_part?(manifest['forked_from']) || manifest['forked_from'] == expected_slug)
         raise Error, "invalid portal fork source in #{path}"
+      end
+      if manifest.key?('sensitive') && manifest['sensitive'] != true
+        raise Error, 'sensitive must be true when present'
+      end
+      if (manifest['sensitive'] == true) != sensitive_session?(expected_slug)
+        raise Error, 'session sensitivity does not match private local metadata'
       end
       repositories = manifest.fetch('repositories', [])
       artifacts = manifest.fetch('artifacts', [])
@@ -6179,6 +6206,7 @@ module DevSession
         removal['git_tracked'] = false
         return
       end
+      ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
       relative = removal_tracking_path(slug, removal)
       tracked = committed_path?('HEAD', relative)
       removal['git_tracked'] = tracked
@@ -7358,6 +7386,7 @@ module DevSession
     end
 
     def validate_tracking_transition_commit!(slug, refresh: true)
+      return ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
       require_linear_workspace_master_for_tracking!(refresh:)
       paths = [File.join('work', slug), File.join('archive', slug)]
       _stdout, _stderr, status = @command_runner.capture(
@@ -7368,6 +7397,7 @@ module DevSession
     end
 
     def commit_tracking_transition!(slug, direction:, mode:)
+      return validate_sensitive_transition!(slug, direction:) if sensitive_session?(slug)
       require_linear_workspace_master_for_tracking!
       with_tracking_commit_lock do
         validate_tracking_transition_commit!(slug, refresh: false)
@@ -7427,6 +7457,7 @@ module DevSession
     end
 
     def require_clean_committed_tracking_transition!(slug, direction:)
+      return validate_sensitive_transition!(slug, direction:) if sensitive_session?(slug)
       source, destination = if direction == 'archive'
                               [File.join('work', slug), File.join('archive', slug)]
                             else
@@ -8090,7 +8121,7 @@ module DevSession
                  else
                    []
                  end
-      (slug_dirs('work') + slug_dirs('archive') + slug_dirs('worktrees') + sessions + removals).uniq.sort
+      (slug_dirs('work') + slug_dirs('archive') + slug_dirs('worktrees') + sensitive_slugs + sessions + removals).uniq.sort
     end
 
     def slug_dirs(name)
@@ -8325,6 +8356,7 @@ module DevSession
     end
 
     def validate_tracking_committed!(slug)
+      return ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
       plan_path = File.join('work', slug, 'plan.md')
       state_path = File.join('work', slug, 'state.md')
       missing = [plan_path, state_path].reject { |path| committed_path?('HEAD', path) }
@@ -8742,6 +8774,7 @@ module DevSession
         raise Error, "archive is missing tracking files: #{directory}"
       end
       validate_terminal_lifecycle_file!(state)
+      return validate_sensitive_transition!(slug, direction: 'archive') if sensitive_session?(slug)
 
       relative_paths = [File.join('work', slug), File.join('archive', slug)]
       status = git_capture([
@@ -9158,6 +9191,7 @@ module DevSession
       }
       parser = OptionParser.new do |parser_opts|
         parse_creation_receipt_options(parser_opts, opts)
+        parser_opts.on('--sensitive') { opts[:sensitive] = true }
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--new') { opts[:new] = true }
         parser_opts.on('--attach') { opts[:attach] = true }
@@ -9201,6 +9235,7 @@ module DevSession
       opts = { as_is: false, json: false, model: nil, effort: nil }
       parser = OptionParser.new do |parser_opts|
         parse_creation_receipt_options(parser_opts, opts)
+        parser_opts.on('--sensitive') { opts[:sensitive] = true }
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--json') { opts[:json] = true }
         parser_opts.on('--model MODEL') { |value| opts[:model] = value }

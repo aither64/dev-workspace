@@ -288,6 +288,13 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 }
 
 func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error) {
+	if request.Source != "" {
+		source, err := session.Find(s.config.Workspace, request.Source)
+		if err != nil {
+			return creationReceipt{}, err
+		}
+		request.Sensitive = request.Sensitive || source.Sensitive
+	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	return s.installCreationLocked(request, "", "", false)
@@ -458,6 +465,9 @@ func (s *Server) canonicalCreationConflict(receipt creationReceipt) string {
 		// A successful receipt-bound fork publishes evidence before removing
 		// its journal. Binding alone cannot resume an existing destination.
 		if _, err := os.Lstat(s.creationEvidencePath(receipt)); errors.Is(err, os.ErrNotExist) {
+			return creationConflictMessage
+		}
+		if summary.Sensitive != receipt.Request.Sensitive {
 			return creationConflictMessage
 		}
 		if summary.ForkedFrom != receipt.Request.Source || summary.Creation.GoalSHA256 != "" {
@@ -667,7 +677,7 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 	if err := unix.Lstat(filepath.Join(s.config.Workspace, summary.Root, summary.Slug), &stat); err != nil {
 		return err
 	}
-	if stat.Dev != proof.TrackingDevice || stat.Ino != proof.TrackingInode ||
+	if summary.Sensitive != receipt.Request.Sensitive || stat.Dev != proof.TrackingDevice || stat.Ino != proof.TrackingInode ||
 		summary.Codex.ThreadID != proof.ThreadID || summary.Creation.State != "ready" ||
 		(summary.Creation.GoalSHA256 != "" && !summary.Creation.InitialGoalSent) {
 		return errors.New("completed session identity changed")
@@ -997,6 +1007,9 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 			return err
 		}
 		args = []string{"start", request.Slug, "--as-is", "--exclusive", "--no-attach", "--goal-file", file.Name(), "--json"}
+	}
+	if request.Sensitive {
+		args = append(args, "--sensitive")
 	}
 	if receipt.Schema == 3 {
 		if receipt.DirectTeam == nil {

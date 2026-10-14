@@ -311,6 +311,8 @@ buildGoModule {
       "$out/libexec/workspace-portal/workspace-provider-admission.rb"
     ln -s ../workspace-profile-identity.rb \
       "$out/libexec/workspace-portal/workspace-profile-identity.rb"
+    install -Dm644 ${src}/libexec/workspace-sensitive-sessions.rb "$out/libexec/workspace-sensitive-sessions.rb"
+    ln -s ../workspace-sensitive-sessions.rb "$out/libexec/workspace-portal/workspace-sensitive-sessions.rb"
     install -Dm644 ${src}/libexec/workspace-auto-archive.rb \
       "$out/libexec/workspace-auto-archive.rb"
     ln -s ../workspace-auto-archive.rb \

@@ -19,6 +19,16 @@ const response = (value, code = 200) => ({ok: code >= 200 && code < 300, status:
 module.exports = async () => {
   let cases = 0;
   const test = async (name, fn) => { await fn(); cases++; };
+  await test("sensitive request retries keep the exact private choice", async () => {
+    const saved = storage(); const bodies = [];
+    const options = {storage: saved, fields: {...fields, sensitive: "true"}, randomUUID: () => id,
+      fetch: async (_url, request) => { if (request.method !== "POST") return response({}, 404); bodies.push(request.body); if (bodies.length === 1) throw new Error("lost response"); return response(status, 202); }};
+    await assert.rejects(helpers.createRequestDraft(options).submit([], true), /lost response/);
+    const recovered = helpers.createRequestDraft({...options, fields: {...fields, sensitive: ""}});
+    await recovered.submit([], true);
+    assert.equal(bodies.length, 2); assert.equal(bodies[0], bodies[1]);
+    assert.equal(new URLSearchParams(bodies[1]).get("sensitive"), "true");
+  });
   await test("blank and custom names freeze before nonblocking POST", async () => {
     for (const name of ["", "Custom_name"]) {
       const saved = storage(); let posted;

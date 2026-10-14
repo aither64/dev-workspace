@@ -3,6 +3,22 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_sensitive_sessions_require_a_capable_candidate
+    with_transition_host do |host, paths|
+      old = make_package(paths.fetch(:root), 'without-sensitive-support')
+      host.send(:require_compatible_sensitive_sessions!, old)
+      record = File.join(host.instance_variable_get(:@state), 'sensitive-sessions', 'workspace', 'session.json')
+      FileUtils.mkdir_p(File.dirname(record), mode: 0o700)
+      File.write(record, '{}')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_sensitive_sessions!, old) }
+      contract = File.join(old, 'share/workspace-portal/runtime-contract.json')
+      data = JSON.parse(File.read(contract))
+      data['sensitiveSessionsPolicy'] = 1
+      File.write(contract, JSON.generate(data))
+      host.send(:require_compatible_sensitive_sessions!, old)
+    end
+  end
+
   def test_recovery_state_blocks_a_predecessor_that_ignores_holds_and_receipts
     with_transition_host do |host, paths|
       state = host.instance_variable_get(:@state)

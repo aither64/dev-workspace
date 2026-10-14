@@ -38,6 +38,7 @@
       <button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"{{if or .PendingLifecycle (not .Session.Archived)}} hidden{{end}}><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>
       {{if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{end}}
       <button id="delete-session-open" type="button" class="danger" title="Delete session" aria-label="Delete session"><span class="rail-icon" aria-hidden="true">×</span><span class="rail-label">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</span></button>
+      {{if .Session.Sensitive}}<span class="badge">Sensitive</span>{{end}}
       <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .Session.Interactive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
     </div>
   </aside>
@@ -185,6 +186,7 @@
     <form id="fork-form" class="stack">
       <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Worktrees, files, and development clusters stay with this session.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>
       <div class="field-grid">
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
@@ -200,6 +202,7 @@
     <form id="plan-session-form" class="stack">
       <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
       {{if .AgentTeams.Managed}}
       <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">

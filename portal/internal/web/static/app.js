@@ -24,8 +24,8 @@
     deleteQueued: conversation?.deleteQueued,
     startQueue: conversation?.startQueue,
     settings: conversation?.settings,
-    fork: (name, creationDate, model, reasoningEffort) => request(apiPath(slug, "fork"), {
-      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort}),
+    fork: (name, creationDate, model, reasoningEffort, sensitive = false) => request(apiPath(slug, "fork"), {
+      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, ...(sensitive ? {sensitive: true} : {})}),
     }),
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
@@ -1055,9 +1055,10 @@
     Boolean(uploadReady) && !recoveryPending && !inFlight
   );
   const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
-  const creationCLICommand = ({name, team, model, effort}) => {
+  const creationCLICommand = ({name, team, model, effort, sensitive}) => {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(name || "") || !model || !effort) return "";
     const args = ["dev-session start", shellQuote(name)];
+    if (sensitive) args.push("--sensitive");
     if (team) args.push("--team", shellQuote(team));
     args.push("--model", shellQuote(model), "--effort", shellQuote(effort));
     return args.join(" ");
@@ -1741,6 +1742,8 @@
           clusters.title = item.clusterNotice || "";
           clusters.hidden = item.runningClusters === 0 && !item.clusterNotice;
         }
+        const sensitiveBadge = card.querySelector("[data-session-sensitive]");
+        if (sensitiveBadge) sensitiveBadge.hidden = !item.sensitive;
         const lifecycle = card.querySelector("[data-session-lifecycle]");
         if (lifecycle) {
           lifecycle.textContent = item.pendingLifecycle ? `${item.pendingLifecycle} pending` : "";
@@ -1846,7 +1849,7 @@
       const recoverButton = document.getElementById("new-session-recover");
       const separateRequest = document.getElementById("new-session-separate");
       const readFields = () => ({
-        name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
+        sensitive: form.elements.sensitive?.checked ? "true" : "", name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
         ...managedDraftPolicyForStorage(form, {
           model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
           team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
@@ -1898,7 +1901,7 @@
         const team = form.elements.team?.selectedOptions?.[0];
         const defaultPair = !form.elements.model.value && !form.elements.effort.value;
         const command = creationCLICommand({
-          name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
+          sensitive: Boolean(form.elements.sensitive?.checked), name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
           model: defaultPair ? team?.dataset.leadModel : form.elements.model.value,
           effort: defaultPair ? team?.dataset.leadEffort : form.elements.effort.value,
         });
@@ -2164,6 +2167,7 @@
       // An attempted request is independent of the current installed catalog.
       if (form.dataset.requestLocked === "true" || draft.body !== null) form.dataset.requestLocked = "true";
       else if (restoreManagedCatalogRecovery(form, draft)?.catalogChanged) return;
+      if (form.elements.sensitive) form.elements.sensitive.checked = draft.sensitive === "true";
       if (form.elements.catalogDigest) form.elements.catalogDigest.value = draft.catalogDigest;
       restoreDraftSelect(form.elements.team, draft.team, "Saved team");
       if (form.elements.team) updateTeamDescription(form.elements.team);
@@ -5113,6 +5117,7 @@
       });
       const result = await client.implementPlan({
         action: "new",
+        sensitive: Boolean(planSessionForm.elements.sensitive?.checked),
         ...planSessionSnapshot,
         name: planSessionForm.elements.name.value,
         creationDate: planSessionForm.elements.creationDate.value,
@@ -5302,6 +5307,7 @@
           forkForm.elements.creationDate.value,
           forkForm.elements.model.value,
           forkForm.elements.effort.value,
+          Boolean(forkForm.elements.sensitive?.checked),
         );
         progress.stop();
         location.assign(result.url);

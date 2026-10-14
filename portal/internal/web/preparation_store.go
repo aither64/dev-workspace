@@ -36,6 +36,7 @@ type preparationValue struct {
 }
 
 type preparationInput struct {
+	Sensitive   bool             `json:"sensitive,omitempty"`
 	RawPrompt   string           `json:"rawPrompt"`
 	Date        string           `json:"date"`
 	CustomName  string           `json:"customName"`

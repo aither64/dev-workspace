@@ -219,7 +219,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 
 func preparationCreationRequest(record sessionPreparation) creationRequest {
 	input := record.Snapshot.Input
-	request := creationRequest{Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal,
+	request := creationRequest{Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
 		Model: strings.TrimSpace(input.Model.Value), Effort: strings.TrimSpace(input.Effort.Value)}
 	if record.Snapshot.Preset != nil {
 		request.Team, request.CatalogDigest = record.Snapshot.Preset.ID, record.Snapshot.Preset.CatalogDigest
@@ -292,7 +292,7 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 			return "", input, errors.New("duplicate session request field")
 		}
 		switch key {
-		case "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort":
+		case "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort", "sensitive":
 		default:
 			return "", input, errors.New("unknown session request field")
 		}
@@ -302,7 +302,10 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 		return "", input, errors.New("invalid session request ID")
 	}
 	present := func(key string) preparationValue { _, ok := r.Form[key]; return preparationValue{ok, r.FormValue(key)} }
-	input = preparationInput{RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
+	if value := r.FormValue("sensitive"); value != "" && value != "true" {
+		return "", input, errors.New("invalid session sensitivity")
+	}
+	input = preparationInput{Sensitive: r.FormValue("sensitive") == "true", RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
 		UploadScope: r.FormValue("uploadScope"), Attachments: append([]string{}, r.Form["attachmentIds"]...),
 		Team: present("team"), Catalog: present("catalogDigest"), Model: present("model"), Effort: present("effort")}
 	return id, input, nil

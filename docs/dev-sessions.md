@@ -135,7 +135,7 @@ lifecycle: active
 ---
 ```
 
-Fill in a substantive plan and initial state and commit them in the workspace
+For ordinary sessions, fill in a substantive plan and initial state and commit them in the workspace
 repository before the first project-code commit or external mutation. Keep
 active tracking current in the working tree, but do not commit each plan,
 review, test/CI, deployment, or status update separately.
@@ -149,6 +149,50 @@ additional same-day checkpoint is reserved for a genuine ownership handoff or
 an explicit user request. A pause until a future working day can justify that
 day's consolidated checkpoint, but not a second one. Ordinary functional
 commits are not tracking-only checkpoints.
+
+## Sensitive sessions
+
+Choose sensitivity when creating a session:
+
+```sh
+dev-session start private-investigation --sensitive
+```
+
+The portal offers **Sensitive session** on the creation form. Sensitive sessions
+appear in the usual lists with a **Sensitive** badge. This choice stays fixed;
+existing ordinary sessions cannot be converted. Forks and sessions created from
+a sensitive plan inherit it. An ordinary source can create a sensitive destination.
+
+Plans, state, manifests and session artifacts keep their usual `work/<slug>/`
+and `archive/<slug>/` paths. Before writing them, the CLI records the choice in
+private user state and adds local exclusions to Git's `info/exclude`, including
+the session's worktree group and lifecycle/creation journals. No session
+name is added to the tracked `.gitignore`. Ordinary `git add -A` skips these
+records. A conflicting tracked/staged path or effective ignore rule stops creation;
+the command does not unstage or remove operator data. Deliberately force-adding
+ignored records bypasses this protection and is not supported.
+
+Maintain substantive plans, state, review evidence and handoffs locally. Keep
+session-specific notes under that same directory instead of tracked `notes/` or
+another session. Sensitive sessions have no initial, daily, archive or revive
+tracking commits. Their project repositories retain normal commits, publication,
+review and merge requirements. Portal access and Codex processing use the existing
+configuration; sensitivity does not introduce encryption or a new access policy.
+
+Archive and revive move local records without a Git commit and retain existing
+ownership, content checks, recovery snapshots and automatic archival rules.
+Private sensitivity metadata and local exclusions remain through runtime
+retirement. Archive tombstones remain local, so missing archived files do not
+make their slug reusable. Retain the workspace's private user state with local
+session backups. Git clones do not contain these records or their exclusions.
+
+Coordinated merges and deployments accept checksummed evidence from the excluded
+session directory. Approval, machine reservation and final integration proofs
+remain required. Archive and deletion do not release deployed ownership; revival
+preserves it. Package candidates must support sensitive sessions and the retained
+coordination contract. Finish pending lifecycle operations before updating; an
+older reader refuses sensitive metadata. Recover with a capable matching CLI and
+portal package rather than removing the marker or private state.
 
 ## Monitor long verification
 

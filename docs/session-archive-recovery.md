@@ -6,6 +6,10 @@ that work was integrated or discarded. Automatic archival keeps its completion
 policy and merge proofs. `--require-merged` selects that strict policy for a
 manual command; `--abandoned` retains the discard policy.
 
+Sensitive sessions follow these same ownership and recovery rules. Their tracking
+transition is verified locally without a Git history prerequisite or commit;
+sensitivity survives both moves. See [sensitive sessions](dev-sessions.md#sensitive-sessions).
+
 ## Explicit archival and local recovery
 
 Explicit archival stops the managed terminal client, pauses active goals,

@@ -32,10 +32,11 @@
       if (storage.getItem(key) !== null) throw storageError();
     } catch (_) { throw storageError(); }
   };
-  const fieldNames = ["name", "goal", "date", "model", "effort", "team", "catalogDigest"];
+  const fieldNames = ["name", "goal", "date", "model", "effort", "team", "catalogDigest", "sensitive"];
   const validFields = (value) => fieldNames.every((key) => typeof value[key] === "string") &&
-    /^\d{4}-\d{2}-\d{2}$/.test(value.date);
+    ["", "true"].includes(value.sensitive) && /^\d{4}-\d{2}-\d{2}$/.test(value.date);
   const normalizeDraft = (value) => {
+    if (value && value.sensitive === undefined) value = {...value, sensitive: ""};
     if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
@@ -48,7 +49,7 @@
       if (value.attachmentIds.length && !value.scope) return null;
       const fields = new URLSearchParams(value.body);
       const scalars = ["clientRequestId", "name", "goal", "creation_date", "model", "effort", "uploadScope"];
-      const optional = ["team", "catalogDigest"];
+      const optional = ["team", "catalogDigest", "sensitive"];
       if (scalars.some((key) => fields.getAll(key).length !== 1) ||
           optional.some((key) => fields.getAll(key).length > 1) ||
           [...fields.keys()].some((key) => ![...scalars, ...optional, "attachmentIds"].includes(key)) ||
@@ -67,7 +68,7 @@
     } catch (_) { throw storageError(); }
     let draft = normalizeDraft(saved);
     if (saved && !draft && (saved.schema !== undefined || !validFields({...saved,
-      model: saved.model || "", effort: saved.effort || "", team: saved.team || "", catalogDigest: saved.catalogDigest || ""}))) {
+      sensitive: saved.sensitive || "", model: saved.model || "", effort: saved.effort || "", team: saved.team || "", catalogDigest: saved.catalogDigest || ""}))) {
       throw new Error("The saved session request is unreadable. Keep this tab's storage for recovery; no request was sent.");
     }
     if (!draft) {
@@ -138,6 +139,7 @@
             const body = new URLSearchParams({clientRequestId: draft.requestId, name: draft.name, goal: draft.goal,
               creation_date: draft.date, model: draft.model, effort: draft.effort, uploadScope: draft.scope?.id || ""});
             if (includeTeam) { body.set("team", draft.team); body.set("catalogDigest", draft.catalogDigest); }
+            if (draft.sensitive === "true") body.set("sensitive", "true");
             for (const id of attachmentIds) body.append("attachmentIds", id);
             draft = {...draft, attachmentIds: [...attachmentIds], body: body.toString()};
             if (!normalizeDraft(draft)) throw new Error("The session request snapshot is invalid.");

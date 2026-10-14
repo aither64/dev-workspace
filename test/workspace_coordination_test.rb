@@ -86,6 +86,23 @@ class WorkspaceCoordinationTest < Minitest::Test
     Time.define_singleton_method(:now, original)
   end
 
+  def test_sensitive_owner_prepares_local_evidence_without_tracking_commit
+    first = owner('sensitive')
+    manifest_path = File.join(@workspace, 'work', 'sensitive', 'portal.yml')
+    manifest = YAML.safe_load(File.read(manifest_path))
+    manifest['sensitive'] = true
+    File.write(manifest_path, YAML.dump(manifest))
+    git('init', '--initial-branch=master', @workspace)
+    File.open(File.join(@workspace, '.git', 'info', 'exclude'), 'a') { |f| f.puts('/work/sensitive/') }
+    assert_equal first['id'], @engine.owner('sensitive')['id']
+    feature(first)
+    snapshot = @engine.prepare_merge(first, 'code', evidence(first))
+    assert_equal evidence(first), snapshot['evidence']
+    saved_path = File.join(@engine.store.root, 'sources', snapshot['id'].delete_prefix('sha256:'), 'snapshot.json')
+    assert_equal first['id'], JSON.parse(File.read(saved_path))['ownerId']
+    assert_equal '', git('-C', @workspace, 'ls-files', '--', 'work/sensitive')
+  end
+
   def test_prepared_hook_path_preserves_transport_and_restores_environment
     tools = File.join(@tmp, 'hook-tools')
     FileUtils.mkdir_p(tools)

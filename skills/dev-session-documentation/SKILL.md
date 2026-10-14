@@ -29,6 +29,12 @@ Register useful session artifacts with
 atomic writer instead of editing `portal.yml` by hand; it preserves session
 identity and repository scope while updating the artifact catalog.
 
+For a sensitive session, keep its plan, state, notes, review evidence and handoff
+artifacts under its excluded tracking directory. Maintain them without tracking
+commits. Do not promote session content into tracked notes, documentation or other
+sessions. Project-code commits keep their normal workflow; any publication of
+sensitive session content needs explicit user direction.
+
 ## Choose the smallest useful explanation
 
 Use judgment about the change rather than creating a fixed set of files:
