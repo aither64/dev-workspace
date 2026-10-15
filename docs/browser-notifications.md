@@ -43,7 +43,7 @@ appear on the lock screen. The browser vendor's push service handles encrypted
 delivery and can observe delivery metadata.
 
 Use **Send test notification** after enabling. The server waits ten seconds so
-you can close all portal tabs or switch windows before checking delivery. Open
+you can switch to another tab or app before checking delivery. Open
 these controls from **Browser notifications** in the workspace menu or from
 session Settings. The test result distinguishes arrival in this browser, whether
 the browser accepted or rejected the display request, and whether it retained a
@@ -53,11 +53,14 @@ confirm this test. The page checks for a result until ten seconds after the
 test's one-minute expiry and resumes the saved check after reopening. Missing
 or unavailable results remain unconfirmed.
 
-Existing subscribers may need a notification update before detailed test results
-are available. The page checks the installed worker and reports a waiting or
-unconfirmed update. Close all portal tabs and reopen when prompted. It never
-unregisters the worker or replaces a subscription automatically. Each explicit
-test gets a fresh notification entry; duplicate delivery of that test coalesces.
+New or refreshed notification controls check for an update to the installed
+worker. Updates activate automatically while other portal tabs stay open; no
+page is closed or reloaded, and unsent drafts stay intact. The page waits up to ten seconds for the updated worker to control it, then
+checks detailed Test support.
+An unsuccessful or unconfirmed update leaves those results limited; refresh the
+page to try again. Updating does not unregister the worker, replace a subscription
+or reset browser data. Each explicit test gets a fresh notification entry;
+duplicate delivery of that test coalesces.
 Only older test entries for the same browser registration are closed. Session
 notification tags and acknowledgement are unchanged.
 

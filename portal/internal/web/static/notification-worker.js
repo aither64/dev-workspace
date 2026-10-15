@@ -126,4 +126,5 @@ self.addEventListener("message", event => {
     notifications.forEach(notification => notification.close());
   })());
 });
+self.addEventListener("install", event => event.waitUntil(self.skipWaiting()));
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));

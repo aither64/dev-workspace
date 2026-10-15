@@ -75,6 +75,90 @@ async function checkControlSpacing(page) {
       bounds[i].x >= bounds[i - 1].x + bounds[i - 1].width + 8, "notification controls have space between them");
   }
 }
+async function checkWorkerUpgrade(browser, engine) {
+  const context = await browser.newContext({ignoreHTTPSErrors: true});
+  const trace = failureTrace(context);
+  let retained, controls;
+  const stage = async name => {
+    const response = await context.request.post(`${base}/fixture/worker-stage/${name}`, {headers: {Origin: base}});
+    assert.equal(response.status(), 200, "fixture stage selection succeeds");
+  };
+  try {
+    await stage("old");
+    retained = await context.newPage(); await retained.goto(`${base}/example/#codex`);
+    await retained.evaluate(async () => {
+      await navigator.serviceWorker.register("/notification-worker.js", {scope: "/", updateViaCache: "none"});
+      await navigator.serviceWorker.ready;
+    });
+    await retained.waitForFunction(() => navigator.serviceWorker.controller?.state === "activated");
+    await retained.locator('#message-form textarea[name="message"]').fill("Retain this unsent draft");
+    await retained.evaluate(() => {globalThis.fixtureRetainedSentinel = true;});
+    let navigations = 0;
+    retained.on("framenavigated", frame => {if (frame === retained.mainFrame()) navigations++;});
+    await stage("waiting");
+    await retained.evaluate(async () => (await navigator.serviceWorker.getRegistration("/")).update());
+    await retained.waitForFunction(async () => Boolean((await navigator.serviceWorker.getRegistration("/"))?.waiting));
+    const priorController = await retained.evaluateHandle(() => navigator.serviceWorker.controller);
+    // The already-waiting predecessor cannot handle a new activation message.
+    // Fetch the actual successor at the same URL with its own install handler.
+    await stage("current");
+    controls = await context.newPage(); await controls.goto(`${base}/browser-notifications`);
+    await expect(controls.locator("[data-notification-worker-status]")).toBeHidden({timeout: 12000});
+    await expect.poll(() => controls.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      return Boolean(registration?.active && !registration.waiting && !registration.installing &&
+        navigator.serviceWorker.controller === registration.active && registration.active.state === "activated");
+    })).toBe(true);
+    await expect(controls.locator("[data-notification-worker-status]")).toBeHidden();
+    assert.equal(await retained.evaluate(prior => navigator.serviceWorker.controller !== prior, priorController), true);
+    assert.equal(retained.isClosed(), false); assert.equal(navigations, 0);
+    assert.equal(await retained.evaluate(() => globalThis.fixtureRetainedSentinel), true);
+    await expect(retained.locator('#message-form textarea[name="message"]')).toHaveValue("Retain this unsent draft");
+    let controlsNavigations = 0;
+    controls.on("framenavigated", frame => {if (frame === controls.mainFrame()) controlsNavigations++;});
+    const capability = await controls.evaluate(() => new Promise(resolve => {
+      const channel = new MessageChannel(), controller = navigator.serviceWorker.controller;
+      const timer = setTimeout(() => {channel.port1.close(); resolve(false);}, 1500);
+      channel.port1.onmessage = event => {clearTimeout(timer); channel.port1.close(); resolve(event.data?.version === 1);};
+      controller.postMessage({type: "notification-test-capabilities"}, [channel.port2]);
+    }));
+    assert.equal(capability, true, "current document controller supports detailed Test outcomes");
+    if (engine !== chromium) {
+      console.log(`${engine.name()}: successor activated over old active/waiting workers; both tabs, draft and current-controller capability retained; no Playwright worker delivery claim`);
+      return;
+    }
+    const subscription = await (await context.request.get(`${base}/fixture/subscription`)).json();
+    await context.grantPermissions(["notifications"], {origin: base});
+    await controls.evaluate(sub => {
+      let subscribed = true;
+      const fake = {options: {}, toJSON: () => ({...sub, expirationTime: null}), unsubscribe: async () => {subscribed = false; return true;}};
+      PushManager.prototype.subscribe = async () => fake;
+      PushManager.prototype.getSubscription = async () => subscribed ? fake : null;
+    }, subscription);
+    const registerReply = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/register" && response.request().method() === "POST");
+    await controls.locator("[data-notification-enable]").click();
+    assert.equal((await registerReply).status(), 200);
+    await expect(controls.locator("[data-notification-test]")).toBeEnabled();
+    // Document controller equality already proved takeover. Select the worker
+    // carrying the actual successor's test-display implementation.
+    const successor = await Promise.any(context.serviceWorkers().map(async candidate => {
+      assert.equal(await candidate.evaluate(() => typeof displayTest), "function"); return candidate;
+    }));
+    await successor.evaluate(() => {self.registration.showNotification = async () => {};});
+    const queued = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/test" && response.request().method() === "POST");
+    await controls.locator("[data-notification-test]").click();
+    const descriptor = (await (await queued).json()).test;
+    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
+    await expect(controls.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
+    assert.equal(controlsNavigations, 0); assert.equal(retained.isClosed(), false); assert.equal(navigations, 0);
+    assert.equal(await retained.evaluate(() => globalThis.fixtureRetainedSentinel), true);
+    await expect(retained.locator('#message-form textarea[name="message"]')).toHaveValue("Retain this unsent draft");
+    await controls.locator("[data-notification-disable]").click();
+    await expect(controls.locator("[data-notification-status]")).toContainText("Disabled on this browser");
+    console.log(`${engine.name()}: successor activated over an old active and waiting worker with both tabs and draft retained; synthetic Test outcome correlated`);
+  } catch (error) {trace.record({event: "upgrade_fixture_failure", category: safeError(error)}); await trace.dump(controls || retained); throw error;}
+  finally {await stage("current"); await context.close();}
+}
 (async () => {
   for (const engine of [chromium, firefox]) {
     const browser = await engine.launch({headless: true, ...(engine === chromium ? {channel: "chromium", args: ["--ignore-certificate-errors"]} : {})});
@@ -117,7 +201,7 @@ async function checkControlSpacing(page) {
       await expect(page.locator("#session-attention-status")).toHaveCount(0);
       assert.equal(await page.evaluate(() => Notification.permission), "default", "page load did not ask for permission");
       assert.deepEqual(mutations, [], "opening or revealing controls never changes a subscription");
-      assert.equal(context.serviceWorkers().length, 0, "opening controls did not register a worker");
+      assert.equal(await page.evaluate(async () => Boolean(await navigator.serviceWorker.getRegistration("/"))), false, "opening controls did not register a worker");
       const workerAsset = await context.request.get(`${base}/notification-worker.js`);
       assert.equal(workerAsset.status(), 200);
       assert.equal(workerAsset.headers()["service-worker-allowed"], "/");
@@ -172,6 +256,7 @@ async function checkControlSpacing(page) {
       assert.deepEqual(errors, [], `${engine.name()} loaded real notification UI without script errors`);
       console.log(`${engine.name()}: real template, CSP, permission separation and worker route passed${engine === chromium ? "; registered worker received synthetic push with zero tabs" : ""}`);
       await context.close();
+      await checkWorkerUpgrade(browser, engine);
     } catch (error) {
       if (trace) {trace.record({event: "fixture_failure", category: safeError(error)}); await trace.dump(page);}
       throw error;

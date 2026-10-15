@@ -81,13 +81,13 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js?v=2" defer`, `href="/"`} {
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js?v=3" defer`, `href="/"`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("notification page lacks %s", required)
 		}
 	}
 	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) < 0 ||
-		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=2"`) {
+		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=3"`) {
 		t.Fatal("notification page must initialize the shared store before the client")
 	}
 }

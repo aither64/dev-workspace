@@ -31,11 +31,13 @@ function workerHarness() {
     fetch: async (url, options) => { calls.push({url, options}); return {ok: !inaccessible, status: inaccessible ? 401 : 200, json: async () => status}; },
     self: {location: {origin: 'https://workspace.example'}, registration: {
       showNotification: async (title, options) => notifications.push({title, ...options}), getNotifications: async () => [],
-    }, clients: {matchAll: async () => windows, openWindow: async url => calls.push({openWindow: url}), claim: async () => {}},
+    }, skipWaiting: async () => calls.push({skipWaiting: true}),
+    clients: {matchAll: async () => windows, openWindow: async url => calls.push({openWindow: url}), claim: async () => calls.push({claim: true})},
     addEventListener: (name, listener) => listeners[name] = listener},
   };
   vm.runInNewContext(source('notification-worker.js'), context);
   return {notifications, calls, records, context,
+    lifecycle: async name => {let pending; listeners[name]({waitUntil: promise => pending = promise}); await pending;},
     status: value => status = value, inaccessible: () => inaccessible = true,
     push: async payload => { let pending; listeners.push({data: {json: () => payload}, waitUntil: promise => pending = promise}); await pending; },
     click: async (route, boundIdentity) => { let pending; listeners.notificationclick({notification: {data: {route, identity: boundIdentity}, close() {}}, waitUntil: promise => pending = promise}); await pending; },
@@ -189,11 +191,16 @@ async function notificationHarness(state, storage = new Map()) {
     }};
   const registration = {pushManager: {getSubscription: async () => {if (state.subscriptionRead) return state.subscriptionRead(subscription); if (state.lookupFailure) throw Error('lookup unavailable'); return state.subscribed ? subscription : null;},
     subscribe: async () => {state.subscribed = true; return subscription;}}};
+  registration.active = {state: 'activated'};
+  registration.update = async () => {};
+  const service = lifecycleTarget({controller: registration.active, getRegistration: async () => registration,
+    register: async () => {state.onWorkerRegister?.(); return registration;}, ready: Promise.resolve(registration)});
+  const addListener = service.addEventListener;
+  service.addEventListener = (name, callback) => {addListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', addEventListener: (name, callback) => listeners[name] = callback,
     getElementById: () => ({querySelector: selector => controls[selector.match(/notification-(\w+)/)[1]]})},
     addEventListener: (name, callback) => listeners[name] = callback,
-    navigator: {serviceWorker: {addEventListener: (name, callback) => listeners[name] = callback,
-      getRegistration: async () => registration, register: async () => {state.onWorkerRegister?.(); return registration;}, ready: Promise.resolve(registration)}},
+    navigator: {serviceWorker: service},
     Notification: {permission: 'granted', requestPermission: async () => {state.permissionCalls = (state.permissionCalls || 0) + 1; return 'granted';}},
     PushManager: function() {}, isSecureContext: true, AbortController, setTimeout, clearTimeout, atob, Uint8Array, TextEncoder,
     crypto: require('node:crypto').webcrypto,
@@ -502,18 +509,28 @@ test('test storage failure still displays and fresh tests retire only older same
   assert.deepEqual(h.storage.versions, [1], 'no IndexedDB migration');
 });
 
+function lifecycleTarget(fields = {}) {
+  const handlers = new Map();
+  return {...fields, addEventListener(name, callback) {if (!handlers.has(name)) handlers.set(name, new Set()); handlers.get(name).add(callback);},
+    removeEventListener(name, callback) {handlers.get(name)?.delete(callback);},
+    dispatch(name, event) {[...handlers.get(name) || []].forEach(callback => callback(event));},
+    listenerCount() {return [...handlers.values()].reduce((sum, set) => sum + set.size, 0);}};
+}
 async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   const controls = Object.fromEntries(['status','enable','disable','test','test-status','provider-status','worker-status'].map(name => [name,
     {disabled: false, textContent: '', addEventListener(type, callback) {this[type] = callback;}}]));
   const listeners = {}, timers = new Map(), calls = [], saved = new Map([[browserKey, browserId]]);
   let now = Date.now(), nextTimer = 0;
-  const state = {descriptor: testDescriptor(now), registered: true, workerVersion: options.workerVersion ?? 1};
-  const registration = {update: async () => {state.updateChecks = (state.updateChecks || 0) + 1;}, active: {postMessage(_message, ports) {ports[0].reply({version: state.workerVersion});}},
-    pushManager: {getSubscription: async () => ({endpoint, unsubscribe: async () => true})}};
-  if (options.waitingWorker) registration.waiting = {};
+  const state = {descriptor: testDescriptor(now), registered: true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
+  const registration = lifecycleTarget({update: async () => {state.updateChecks = (state.updateChecks || 0) + 1; if (state.update) await state.update();},
+    active: lifecycleTarget({state: 'activated', postMessage(_message, ports) {state.probes = (state.probes || 0) + 1; if (!state.noReply) ports[0].reply({version: state.workerVersion});}}),
+    pushManager: {getSubscription: async () => ({endpoint, unsubscribe: async () => true})}});
+  if (options.waitingWorker) registration.waiting = lifecycleTarget({state: 'installed'});
+  const service = lifecycleTarget({getRegistration: async () => registration, controller: options.uncontrolled ? null : registration.active});
+  const addServiceListener = service.addEventListener;
+  service.addEventListener = (name, callback) => {addServiceListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', getElementById: () => ({querySelector: selector => controls[selector.slice(19, -1) || 'status']}),
-    addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: {getRegistration: async () => registration,
-      addEventListener: (name, callback) => listeners[name] = callback}}, addEventListener: (name, callback) => listeners[name] = callback,
+    addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: service}, addEventListener: (name, callback) => listeners[name] = callback,
     Date: class extends Date {static now() {return now;}}, Notification: {permission: 'granted'}, PushManager: function() {}, isSecureContext: true,
     workspaceAttentionStore: options.oldStore ? {} : storage.store, AbortController, Uint8Array, TextEncoder, crypto: require('node:crypto').webcrypto,
     MessageChannel: function() {this.port1 = {close() {}}; this.port2 = {reply: value => queueMicrotask(() => this.port1.onmessage({data: value}))};},
@@ -527,7 +544,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   vm.runInNewContext(source('browser-notifications.js'), context);
   const flush = async () => {for (let i = 0; i < 80; i++) await Promise.resolve();};
   await flush();
-  return {controls, storage, state, timers, calls, context, listeners, registration, async advance(ms) {now += ms;
+  return {controls, storage, state, timers, calls, context, listeners, registration, service, async advance(ms) {now += ms;
     const ready = [...timers].filter(([,timer]) => timer.at <= now); for (const [id,timer] of ready) {timers.delete(id); timer.callback(); await flush();}}, flush};
 }
 
@@ -585,7 +602,8 @@ test('UI preserves rejected/unavailable results, other-tab correlation and worke
   assert.match(h.controls['test-status'].textContent, /Another test replaced this check/); assert.equal(h.timers.size, 0);
   for (const options of [{workerVersion: 0}, {waitingWorker: true}]) {
     const old = await feedbackHarness(testStoreHarness(), options);
-    assert.match(old.controls['worker-status'].textContent, /Close portal tabs/);
+    if (options.waitingWorker) {assert.match(old.controls['worker-status'].textContent, /keep your tabs open/); await old.advance(10001);}
+    assert.match(old.controls['worker-status'].textContent, options.waitingWorker ? /could not be confirmed/ : /Detailed test results are unavailable/);
     assert.equal(old.calls.some(call => call.config.method === 'POST'), false, 'updates never mutate subscriptions');
   }
 });
@@ -842,4 +860,93 @@ test('browser fixture failure trace is bounded and excludes raw capability, ID, 
   await trace.dump({evaluate: async () => {throw {name: 'private-error-canary', message: 'exception-canary'};}});
   assert.ok(Buffer.byteLength(output[1], 'utf8') <= 8192);
   assert.ok(JSON.parse(output[1]).dropped > 0); assert.doesNotMatch(output[1], /canary|https:|registrationId/);
+});
+
+test('worker install skips waiting and activation claims documents without touching delivery or state', async () => {
+  const h = workerHarness();
+  await h.lifecycle('install'); await h.lifecycle('activate');
+  assert.deepEqual(h.calls, [{skipWaiting: true}, {claim: true}]);
+  assert.equal(h.notifications.length, 0); assert.equal(h.records.size, 0);
+});
+
+test('waiting predecessor is replaced and capability is checked only after this document gets the successor controller', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {waitingWorker: true});
+  assert.equal(h.state.updateChecks, 1, 'same root registration update fetches a successor');
+  assert.equal(h.state.probes || 0, 0, 'old active capability cannot certify a waiting update');
+  assert.match(h.controls['worker-status'].textContent, /keep your tabs open/);
+  let probes = 0;
+  const successor = lifecycleTarget({state: 'installing', postMessage(_message, ports) {probes++; ports[0].reply({version: 1});}});
+  h.registration.waiting = null; h.registration.installing = successor; h.registration.dispatch('updatefound');
+  successor.state = 'activated'; h.registration.installing = null; h.registration.active = successor; successor.dispatch('statechange');
+  await h.flush(); assert.equal(probes, 0, 'registration.active is insufficient while document controller is old');
+  h.service.controller = successor; h.service.dispatch('controllerchange'); await h.flush();
+  assert.equal(probes, 1); assert.equal(h.controls['worker-status'].textContent, '');
+  assert.equal(h.registration.listenerCount(), 0); assert.equal(successor.listenerCount(), 0); assert.equal(h.timers.size, 0);
+  assert.equal(h.calls.some(call => call.config.method === 'POST'), false, 'update makes no subscription or permission mutation');
+});
+
+test('worker transition deadlines and failures keep diagnostics limited and remove observers', async () => {
+  for (const options of [{waitingWorker: true}, {uncontrolled: true}, {update: () => new Promise(() => {})},
+    {update: async () => {throw Error('update failed');}}, {noReply: true}]) {
+    const h = await feedbackHarness(testStoreHarness(), options);
+    await h.advance(10001);
+    assert.match(h.controls['worker-status'].textContent, /could not be confirmed|Detailed test results are unavailable/);
+    assert.doesNotMatch(h.controls['worker-status'].textContent, /Close.*tabs/);
+    assert.equal(h.registration.listenerCount(), 0); assert.equal(h.registration.waiting?.listenerCount() || 0, 0);
+    assert.equal(h.registration.active.listenerCount(), 0); assert.equal(h.timers.size, 0);
+    assert.equal(h.state.updateChecks, 1, 'no repeated update loop');
+    assert.equal(h.calls.some(call => call.config.method === 'POST'), false);
+  }
+});
+
+test('stale worker readiness cannot overwrite a newer refresh, action or page retirement', async () => {
+  for (const invalidation of ['refresh', 'test', 'pagehide', 'revoke']) {
+    const h = await feedbackHarness(testStoreHarness(), {waitingWorker: true});
+    const predecessor = h.registration.waiting;
+    if (invalidation === 'refresh') h.service.dispatch('controllerchange');
+    else if (invalidation === 'test') await h.controls.test.click();
+    else if (invalidation === 'pagehide') h.listeners.pagehide();
+    else h.listeners.storage({key: browserKey, newValue: null});
+    await h.flush();
+    const status = h.controls['worker-status'].textContent;
+    h.registration.waiting = null; predecessor.state = 'redundant'; predecessor.dispatch('statechange'); await h.flush();
+    if (invalidation !== 'refresh') {
+      assert.equal(h.controls['worker-status'].textContent, status);
+      assert.equal(h.registration.listenerCount(), 0);
+    } else {
+      // The replacement observer may complete; the canceled observer's terminal
+      // state cannot publish a timeout over its confirmed controller result.
+      h.service.dispatch('controllerchange'); await h.flush();
+      assert.equal(h.controls['worker-status'].textContent, '');
+    }
+    h.listeners.pagehide(); await h.flush(); assert.equal(h.timers.size, 0);
+  }
+});
+
+test('a new refresh waits for the already-started successor fetch before trusting the old controller', async () => {
+  let release;
+  const h = await feedbackHarness(testStoreHarness(), {update: () => new Promise(resolve => {release = resolve;})});
+  h.service.dispatch('controllerchange'); await h.flush();
+  assert.equal(h.state.updateChecks, 1, 'refresh shares the one current document update check');
+  assert.equal(h.state.probes || 0, 0, 'old capable controller is not proof while successor fetch is outstanding');
+  release(); await h.flush();
+  assert.equal(h.state.probes, 1); assert.equal(h.controls['worker-status'].textContent, '');
+  assert.equal(h.timers.size, 0);
+});
+
+test('Test and Disable retire readiness progress without a lingering Updating status past its deadline', async () => {
+  for (const waitingWorker of [true, false]) for (const action of ['test', 'disable']) {
+    const h = await feedbackHarness(testStoreHarness(), {waitingWorker, noReply: !waitingWorker});
+    assert.match(h.controls['worker-status'].textContent, /^Updating browser notifications/);
+    await h.controls[action].click(); await h.flush();
+    assert.equal(h.controls['worker-status'].textContent,
+      'The notification update could not be confirmed. Refresh this page to try again. Test results may be limited.');
+    await h.advance(10001);
+    assert.doesNotMatch(h.controls['worker-status'].textContent, /Updating/);
+    assert.match(h.controls['worker-status'].textContent, /could not be confirmed/);
+    assert.equal(h.registration.listenerCount(), 0);
+    assert.equal(h.registration.waiting?.listenerCount() || 0, 0);
+    assert.equal(h.state.updateChecks, 1, 'action cancellation does not start an update loop');
+    h.listeners.pagehide(); await h.flush(); assert.equal(h.timers.size, 0);
+  }
 });

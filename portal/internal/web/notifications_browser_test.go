@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,7 +35,38 @@ func TestNotificationsBrowser(t *testing.T) {
 	}
 	event := attentionEvent{Version: 1, ID: strings.Repeat("b", 64), Identity: identity, Revision: 1, Slug: "example", Kind: "input", Member: "implementer0", Route: "/example/?member=implementer0#codex", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
 	handler := n.server.Handler()
+	var workerStage atomic.Int32
+	workerStage.Store(2)
 	fixture.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/fixture/worker-stage/") {
+			if r.Method != http.MethodPost || r.Header.Get("Origin") != n.server.config.BaseURL {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			switch r.URL.Path {
+			case "/fixture/worker-stage/old":
+				workerStage.Store(0)
+			case "/fixture/worker-stage/waiting":
+				workerStage.Store(1)
+			case "/fixture/worker-stage/current":
+				workerStage.Store(2)
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			n.server.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			return
+		}
+		if r.URL.Path == "/notification-worker.js" && workerStage.Load() < 2 {
+			// Fixture predecessors deliberately have neither skipWaiting nor an
+			// activation-message handler. Only the real successor can take over.
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("Service-Worker-Allowed", "/")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Write([]byte(`self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));` +
+				strings.Repeat("\n// predecessor", int(workerStage.Load())+1)))
+			return
+		}
 		if r.URL.Path == "/fixture/subscription" {
 			n.server.writeJSON(w, http.StatusOK, testPushSubscription(t))
 			return

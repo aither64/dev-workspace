@@ -46,9 +46,14 @@ The successful Test reply adds only an exact event descriptor: `id`, `identity`,
 `revision` and `expiresAt`. The client matches all four to the worker's bounded
 local outcome. Reopen the controls after a background test to resume its check.
 An old server or worker without these fields provides limited results, not proof
-of delivery. New assets check/update an existing worker registration; a waiting
-update requires closing portal tabs before reopening. No silent unregister,
-resubscribe or VAPID reset is part of this check.
+of delivery. New or refreshed controls update the existing root registration.
+The successor skips waiting during installation and claims clients on activation,
+so other tabs can stay open. The page confirms its own controller, rather than
+only the registration's active worker, within a bounded ten-second check. Failed
+updates remain unconfirmed and can be checked again by refreshing the page. No
+unregister, resubscribe, VAPID reset or document reload is part of activation.
+Existing loaded scripts in older tabs are not replaced; use new or refreshed
+controls for current notification behavior.
 
 ## Private state
 
