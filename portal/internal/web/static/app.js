@@ -331,7 +331,7 @@
   };
   const activityPresentation = (snapshot, elapsedSinceRead = 0) => {
     const elapsed = Math.max(0, elapsedSinceRead);
-    const stale = elapsed > 15_000;
+    const stale = Boolean(snapshot.stale) || elapsed > 15_000;
     const extension = stale ? 0 : elapsed;
     const state = snapshot.currentState || "unclassified";
     const working = Number(snapshot.workingMs || 0) + (state === "working" ? extension : 0);
@@ -372,6 +372,7 @@
   };
   const activityStatusPresentation = (snapshot, active, team = {}) => {
     const state = snapshot?.currentState;
+    if (snapshot?.stale) return {label: "Activity unavailable", detail: "Activity update unavailable."};
     const otherWork = team.present && (state === "waiting" || state === "idle" && !active) ?
       team.stale ? {label: "Team status unavailable", detail: "Team activity update unavailable."} :
         {label: team.label, detail: team.text} : null;
@@ -393,13 +394,13 @@
       detail: row.error || "Statistics unavailable"};
     if (!snapshot) return missing;
     const view = activityPresentation(snapshot);
-    const activity = ["removed", "stopped"].includes(row.state) ? missing.activity :
+    const activity = ["removed", "stopped"].includes(row.state) ? missing.activity : snapshot.stale ? "Activity unavailable" :
       view.state === "working" ? "Active" : view.state === "idle" ? "Idle" : view.state === "waiting" ?
         snapshot.waitReason === "sleep" ? "Sleeping" : snapshot.waitReason === "subagents" ? "Waiting for team" :
           snapshot.waitReason === "approval" ? "Awaiting approval" : snapshot.waitReason === "userInput" ? "Awaiting answer" : "Waiting" :
         snapshot.latestTurnStatus === "inProgress" ? "Turn in progress" : "Activity unavailable";
-    const partial = snapshot.countsComplete === false || snapshot.coverageComplete === false;
-    const detail = [view.state === "waiting" ? activityWaitLabel(snapshot) : "", partial ? "Partial statistics" : "",
+    const partial = snapshot.stale || snapshot.refreshing || snapshot.countsComplete === false || snapshot.coverageComplete === false;
+    const detail = [snapshot.stale ? "Activity update unavailable." : view.state === "waiting" ? activityWaitLabel(snapshot) : "", partial ? "Partial statistics" : "",
       snapshot.coverageReason || "", snapshot.countsComplete === false ? "Message or tool history is incomplete." : "",
       view.unclassified ? `${formatElapsed(view.unclassified)} unclassified` : ""].filter(Boolean).join(" · ");
     return {activity, sent: snapshot.sentMessages ?? "-", received: snapshot.receivedMessages ?? "-",
@@ -430,7 +431,7 @@
         `${row.address} ${state}`;
     });
     if (members.length > 3) compact.push(`+${members.length - 3}`);
-    const stale = members.some(row => !Number.isFinite(row.snapshot.observedAtMs) || row.snapshot.observedAtMs <= 0 ||
+    const stale = members.some(row => row.snapshot.stale || !Number.isFinite(row.snapshot.observedAtMs) || row.snapshot.observedAtMs <= 0 ||
       now - row.snapshot.observedAtMs > 15_000);
     return {members, stale, label: compact.join("; "), text: members.length ? `Other team members are working: ${labels.join(", ")}.` : ""};
   };
@@ -3486,7 +3487,7 @@
     const state = activitySnapshot?.currentState;
     const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
     const timing = timingClock.view(activityFreshnessBudget());
-    const waiting = interactive && activityAvailable && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
+    const waiting = interactive && activityAvailable && !activitySnapshot?.stale && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
       ((state === "idle" && !threadActive && !otherTeamWork().present) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
@@ -3519,7 +3520,7 @@
       return;
     }
     const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
-    const stale = interactive && timing.unavailable;
+    const stale = interactive && (timing.unavailable || activitySnapshot.stale);
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive) && !peerStatus;
     codexWork.classList.toggle("waiting", Boolean(waiting));

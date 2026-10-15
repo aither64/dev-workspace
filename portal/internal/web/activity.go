@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math/rand/v2"
 	"path/filepath"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ type activityMonitor struct {
 	readSlots chan struct{}
 	readMu    sync.Mutex
 	readGates map[string]*activityReadGate
+	failures  map[string]activityReadFailure
 	snapshots map[string]activityCachedSnapshot
 	clock     func() time.Time
 }
@@ -41,6 +43,12 @@ const activityReadConcurrency = 4
 type activityReadGate struct {
 	slot  chan struct{}
 	users int
+}
+
+type activityReadFailure struct {
+	count   int
+	retryAt time.Time
+	err     error
 }
 
 type activityCachedSnapshot struct {
@@ -66,8 +74,9 @@ func (s *Server) startActivityMonitor() {
 		s.config.Logger.Printf("open Codex activity recorder: %v", err)
 	}
 	observer := codex.NewWithOptions(s.config.CodexSocket, codex.ClientOptions{
-		ClientInfo:   codex.ClientInfo{Name: "dev-workspace-observer", Title: "Workspace activity", Version: "0.1.0"},
-		ObserverOnly: true, ActivityRecorder: recorder,
+		HistoryReader: s.config.HistoryReader,
+		ClientInfo:    codex.ClientInfo{Name: "dev-workspace-observer", Title: "Workspace activity", Version: "0.1.0"},
+		ObserverOnly:  true, ActivityRecorder: recorder,
 		AllowImplicitResume: func(thread string) bool {
 			return !s.config.RecoverSessions || s.recoveryStore().AllowsImplicitResume(s.config.CodexSocket, thread)
 		},
@@ -96,11 +105,23 @@ func (m *activityMonitor) now() time.Time {
 func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, force bool) (codex.ActivitySnapshot, error) {
 	m.readMu.Lock()
 	cached, found := m.snapshots[threadID]
+	if failure, failed := m.failures[threadID]; failed && m.now().Before(failure.retryAt) {
+		m.readMu.Unlock()
+		if found {
+			value := cached.value
+			value.Stale = true
+			return value, nil
+		}
+		return codex.ActivitySnapshot{}, failure.err
+	}
 	interval := 5 * time.Second
 	if cached.value.CurrentState == "idle" {
 		interval = 30 * time.Second
 	}
-	if found && !force && m.now().Sub(cached.at) < interval {
+	if cached.value.Refreshing {
+		interval = time.Second
+	}
+	if found && !cached.value.Stale && !force && m.now().Sub(cached.at) < interval {
 		m.readMu.Unlock()
 		return cached.value, nil
 	}
@@ -112,15 +133,32 @@ func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, for
 			m.snapshots = make(map[string]activityCachedSnapshot)
 		}
 		m.snapshots[threadID] = activityCachedSnapshot{value: snapshot, at: m.now()}
+		delete(m.failures, threadID)
 
 	} else {
-		delete(m.snapshots, threadID)
+		if m.failures == nil {
+			m.failures = make(map[string]activityReadFailure)
+		}
+		previous := m.failures[threadID]
+		previous.count = min(previous.count+1, 6)
+		delay := min(60*time.Second, time.Second*time.Duration(1<<previous.count))
+		delay = min(60*time.Second, time.Duration(float64(delay)*(0.8+0.4*rand.Float64())))
+		m.failures[threadID] = activityReadFailure{count: previous.count, retryAt: m.now().Add(delay), err: err}
+		if found {
+			cached.value.Stale = true
+			m.snapshots[threadID] = cached
+		}
 	}
 	m.readMu.Unlock()
 	if err == nil && m.server != nil && m.server.operationStore != nil {
 		if saveErr := m.server.saveThreadRecord("activity-final", threadID, snapshot); saveErr != nil {
 			m.server.config.Logger.Printf("save activity snapshot: %v", saveErr)
 		}
+	}
+	if err != nil && found {
+		value := cached.value
+		value.Stale = true
+		return value, nil
 	}
 	return snapshot, err
 }
@@ -220,6 +258,7 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 			delete(m.workers, slug)
 			m.readMu.Lock()
 			delete(m.snapshots, worker.threadID)
+			delete(m.failures, worker.threadID)
 			m.readMu.Unlock()
 		}
 	}
@@ -301,6 +340,9 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 			} else if err == nil {
 				idleWakeUsed = false
 				lastIdle = false
+			}
+			if err == nil && snapshot.Refreshing {
+				interval = time.Second
 			}
 			nextActivityRead = m.now().Add(interval)
 		}

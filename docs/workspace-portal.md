@@ -10,6 +10,28 @@ recovery contracts.
 
 ## Session attention and notifications
 
+The portal shares a validated session catalog between display, observation and
+recovery readers. It checks file identity and change metadata before reusing
+parsed records. Directory discovery is coalesced for one second; direct session
+lookups and resume permission still check current records. A reverse index finds
+the recovery owner of a watched thread, so reconnecting does not parse the entire
+workspace once for every conversation. Missing or ambiguous ownership denies
+resume. These process-local caches disappear when the portal stops.
+
+Activity and transcript history use a shared passive connection pool, separate
+from live subscriptions and interactive requests. Long conversations backfill
+statistics through small item pages. Statistics remain partial while that work
+continues; the transcript remains usable. Completed-turn totals and verified fork
+history are cached, while active items and appended records continue updating.
+No total conversation byte or turn ceiling applies. Individual messages retain
+the transport safeguard; an oversized item fails its own history request.
+
+After a failed activity read, the portal keeps the last good snapshot with its
+original observation time and marks it stale. Retries use exponential backoff
+from about two seconds to a maximum of one minute. Stale data cannot trigger a
+fresh notification. Successful reads replace it. This does not change persisted
+session, recovery or activity-checkpoint schemas, or the bundled Codex version.
+
 Session titles show unseen input (`?`), a finished response (`✓`) and persistent
 machine reservations (`R`, `R2`, …). Browser notifications use server observation
 and Web Push with every portal tab closed. The [feature guide](browser-notifications.md)

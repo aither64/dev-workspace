@@ -40,6 +40,10 @@ const sessionLifecycleDeveloperInstructions = "Completing work, preparing a hand
 	"session open."
 
 func newCodexClient(socket, workspace string, stateRoots ...string) *workspacecodex.Client {
+	return newCodexClientWithHistory(socket, workspace, nil, stateRoots...)
+}
+
+func newCodexClientWithHistory(socket, workspace string, history codex.HistoryReader, stateRoots ...string) *workspacecodex.Client {
 	stateRoot := os.Getenv("DEV_WORKSPACES_STATE")
 	if len(stateRoots) > 0 {
 		stateRoot = stateRoots[0]
@@ -52,6 +56,7 @@ func newCodexClient(socket, workspace string, stateRoots ...string) *workspaceco
 		ledgerPath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".json")
 	}
 	client := workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
+		HistoryReader: history,
 		ClientInfo: codex.ClientInfo{
 			Name: "dev-workspace", Title: "Development Workspace", Version: "0.1.0",
 		},
@@ -311,10 +316,13 @@ func serve(args []string) error {
 	if naming != nil {
 		namingSocket, namingCatalog = naming.socket, naming.catalog
 	}
-	codexClient := newCodexClient(options.codexSocket, options.workspace, options.userStateRoot)
+	history := codex.NewHistoryPool(options.codexSocket)
+	defer history.Close()
+	codexClient := newCodexClientWithHistory(options.codexSocket, options.workspace, history, options.userStateRoot)
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		ObserveActivity: true,
+		HistoryReader:   history,
 		CollectUploads:  true,
 		Workspace:       options.workspace, BaseURL: options.baseURL, DisplayLabel: options.displayLabel,
 		TrustedOrigins: options.trustedOrigins,

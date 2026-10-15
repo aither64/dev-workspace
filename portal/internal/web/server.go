@@ -64,6 +64,7 @@ type codexController interface {
 }
 
 type Config struct {
+	HistoryReader          codex.HistoryReader
 	RecoverSessions        bool
 	ObserveActivity        bool
 	CollectUploads         bool

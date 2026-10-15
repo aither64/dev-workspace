@@ -34,7 +34,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         if (reviewStyleHeld) await new Promise(resolve => { releaseReviewStyle = resolve; });
         await route.continue();
       });
-      let threadStatus = "idle", activityState = "idle", automaticWait = "", pending = [];
+      let threadStatus = "idle", activityState = "idle", automaticWait = "", pending = [], staleActivity = false;
       let workspaceArchiveReads = 0, indexReads = 0, indexProgressReads = 0, failWorkspaceArchive = false;
       await page.route("**/api/auto-archive", route => {
         workspaceArchiveReads++;
@@ -72,7 +72,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
           case "reconcile": return route.fulfill({json: {ok: true}});
           case "activity": return route.fulfill(failActivity ? {status: 503, json: {error: "Fixture timing failure"}} : {json: {
             currentState: activityState, waitReason: automaticWait || (activityState === "waiting" && pending.length ? "userInput" : ""), workingMs: 30000, waitingMs: 10000,
-            stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true,
+            stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true, stale: staleActivity,
           }});
           case "details": return route.fulfill({json: {repositoriesHTML: cards(repositoryVersion, workflowMode, workflowBodyVersion, workflowRunURL), artifactsHTML: "", repositoryCount: 2, artifactCount: 0, clusterCount: 0}});
           case "repository-histories": return route.fulfill({json: {repositories: ["project", "second"].map(repository => ({repository, pair, review: "frozen", snapshot: "history-" + repository, history: {commits: [], page: 0, hasMore: false}, summary: {commitCount: 0, stats: {files: 0, additions: 0, deletions: 0}}}))}});
@@ -249,6 +249,13 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.reload();
       await expect(waitingIndicator).toBeVisible();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex: Waiting for your answer");
+      staleActivity = true;
+      await page.reload();
+      await expect(waitingIndicator).toBeHidden();
+      await expect(codexTab).toHaveAttribute("aria-label", "Codex: Activity update unavailable.");
+      staleActivity = false;
+      await page.reload();
+      await expect(waitingIndicator).toBeVisible();
       await codexTab.click();
       await page.locator(".wizard-option").filter({hasText: "Continue"}).click();
       await page.getByRole("button", {name: "Submit answers"}).click();

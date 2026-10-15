@@ -336,6 +336,10 @@ assert.equal(teamWorkPresentation([teamMember("worker0", "unclassified", "", "in
 assert.equal(teamWorkPresentation([teamMember("implementer10", "working"), teamMember("implementer2", "working")]).label,
   "implementer2 working; implementer10 working");
 assert.equal(teamWorkPresentation(ongoingMembers).stale, false);
+const failedMember = teamMember("implementer0", "working");
+failedMember.snapshot.stale = true;
+assert.equal(teamWorkPresentation([failedMember]).stale, true, "a failed refresh is stale immediately");
+assert.equal(teamActivityPresentation(failedMember).activity, "Activity unavailable");
 const expiredMember = teamMember("implementer0", "working");
 expiredMember.snapshot.observedAtMs = Date.now() - 20000;
 assert.equal(teamWorkPresentation([expiredMember]).stale, true, "delivery must not renew expired observations");
@@ -345,6 +349,9 @@ assert.equal(waitingView.counts, "3 messages · 7 tool calls");
 assert.equal(activityPresentation({...timing,currentState:"working"},2000).working,"1m 02s");
 assert.equal(activityPresentation({...timing,currentState:"working"},16000).working,"1m 00s");
 assert.equal(activityPresentation(timing,16000).stale,true);
+assert.equal(activityPresentation({...timing,currentState:"working",stale:true},2000).working,"1m 00s");
+assert.equal(activityStatusPresentation({...timing,stale:true},true).label,"Activity unavailable");
+assert.equal(teamActivityPresentation({state:"ready",snapshot:{...timing,refreshing:true}}).partial,true);
 assert.equal(activityPresentation({messages:1,toolCalls:1},0).counts,"1 message · 1 tool call");
 
 assert.equal(automaticReasoningLabel(), "Automatic");

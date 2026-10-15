@@ -67,16 +67,25 @@ func TestActivityReadSharesSnapshotWithinStateBudget(t *testing.T) {
 	}
 	elapsed.Store(int64(40 * time.Second))
 	observer.fail = true
-	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err == nil {
-		t.Fatal("failed read returned the cached snapshot")
+	stale, err := monitor.ReadActivity(context.Background(), "thread-1")
+	if err != nil || !stale.Stale {
+		t.Fatalf("failed read did not retain explicit stale state: %#v %v", stale, err)
 	}
 	observer.fail = false
-	if _, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil {
-		t.Fatal(err)
+	if value, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil || !value.Stale {
+		t.Fatal("retry ignored backoff or lost stale snapshot")
+	}
+	if got := len(observer.read); got != 4 {
+		t.Fatalf("backoff issued another read: %d", got)
+	}
+	elapsed.Store(int64(44 * time.Second))
+	if value, err := monitor.ReadActivity(context.Background(), "thread-1"); err != nil || value.Stale {
+		t.Fatalf("recovery did not replace stale snapshot: %#v %v", value, err)
 	}
 	if got := len(observer.read); got != 5 {
-		t.Fatalf("failed read refreshed cache or blocked retry: %d", got)
+		t.Fatalf("retry reads: %d", got)
 	}
+
 }
 
 func (o *testActivityObserver) VerifyThread(_ context.Context, id, cwd string) error {

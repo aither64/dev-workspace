@@ -202,7 +202,7 @@ func (s *Server) observeAttention(summary session.Summary, now time.Time) attent
 		s.activity.readMu.Lock()
 		cached, found := s.activity.snapshots[thread]
 		s.activity.readMu.Unlock()
-		if !found || cached.value.ThreadID != thread || now.Sub(cached.at) > 40*time.Second ||
+		if !found || cached.value.Stale || cached.value.ThreadID != thread || now.Sub(cached.at) > 40*time.Second ||
 			cached.value.ObservedAtMS <= 0 || now.UnixMilli()-cached.value.ObservedAtMS > 40000 ||
 			(cached.value.CurrentState != "idle" && cached.value.CurrentState != "working" && cached.value.CurrentState != "waiting") {
 			o.Fresh = false
