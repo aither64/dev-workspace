@@ -59,12 +59,15 @@ unregister, resubscribe, VAPID reset or document reload is part of activation.
 Existing loaded scripts in older tabs are not replaced; use new or refreshed
 controls for current notification behavior.
 
-The workspace menu and full panel share the same Enable/Disable actions and
-browser-local sound choice. Loading or opening the controls does not request
-permission or change subscriptions. The worker may check for an update. Permission and
-subscription changes require an explicit action. Browser Disable leaves session
-mute preferences, title attention and reservation markers intact. Incomplete cleanup remains retryable
-from either surface.
+The **Notifications** checkbox in the workspace menu and the full-panel buttons
+use the same Enable/Disable actions. **Sound** and **Play sound** use the same
+browser-local choice. Loading the page or opening the menu does not request
+permission or change subscriptions. The worker may check for an update.
+Permission and subscription changes require an explicit action. Disabling
+notifications for this browser leaves per-session mute preferences, title
+attention and reservation markers intact. If cleanup is incomplete, use
+**Notification settings** to retry Disable. The menu shows a brief notice and a
+mixed checkbox.
 
 The browser-local **Play sound** setting uses the existing attention database.
 Checked leaves `silent` out of the display options; unchecked sets

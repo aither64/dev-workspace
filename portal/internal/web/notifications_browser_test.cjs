@@ -302,18 +302,23 @@ async function checkWorkerUpgrade(browser, engine) {
       await page.keyboard.press("Escape"); await expect(toggle).toBeFocused();
       await toggle.click();
       const menu = page.locator("#sidebar-menu");
-      await expect(menu.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      const menuDelivery = menu.locator("[data-notification-delivery]");
+      await expect(menuDelivery).toBeEnabled(); await expect(menuDelivery).not.toBeChecked();
+      assert.equal(await menuDelivery.evaluate(element => element.indeterminate), false, "menu confirms initial browser setup off");
+      await expect(menu.locator("[data-notification-menu-error]")).toBeHidden();
+      await expect(menu.locator("input[type=checkbox]")).toHaveCount(2);
+      await expect(menu.locator("button, [data-notification-status], [data-notification-worker-status], [data-notification-sound-status]")).toHaveCount(0);
       const menuSound = menu.locator("[data-notification-sound]");
       await expect(menuSound).toBeEnabled(); await expect(menuSound).toBeChecked();
       await menuSound.click();
       await expect.poll(() => page.evaluate(() => workspaceAttentionStore.readSound())).toBe(false);
       await expect(menuSound).toBeEnabled(); await expect(menuSound).not.toBeChecked();
       await page.setViewportSize({width: 375, height: 812});
-      for (const button of await menu.locator("button").all()) {
-        const bounds = await button.boundingBox();
+      for (const row of await menu.locator(".checkbox, .menu-notifications > a").all()) {
+        const bounds = await row.boundingBox();
         assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 375, "quick controls fit a narrow menu");
       }
-      await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
+      await page.getByRole("link", {name: "Notification settings", exact: true}).click();
       await page.waitForURL("**/browser-notifications");
       await expect(page.locator("#browser-notifications [data-notification-status]")).toHaveText("Disabled on this browser.");
       await expect(page.locator("#browser-notifications [data-notification-sound]")).not.toBeChecked();
@@ -326,7 +331,7 @@ async function checkWorkerUpgrade(browser, engine) {
       await page.getByRole("link", {name: "Back to workspace", exact: true}).click();
       await expect(page.locator("#browser-notifications")).toHaveCount(0);
       await toggle.click();
-      await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
+      await page.getByRole("link", {name: "Notification settings", exact: true}).click();
       await expect(page.locator("#browser-notifications [data-notification-status]")).toHaveText("Disabled on this browser.");
       await page.goto(`${base}/example/#codex`);
       await expect(page.locator("#browser-notifications")).toBeHidden();
@@ -387,10 +392,12 @@ async function checkWorkerUpgrade(browser, engine) {
         const registerReply = page.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/register" && response.request().method() === "POST");
         trace.record({event: "enable_click"});
         await toggle.click();
-        await menu.locator("[data-notification-enable]").click();
+        await expect(menuDelivery).toBeEnabled(); await expect(menuDelivery).not.toBeChecked();
+        await menuDelivery.click();
         const registerResponse = await registerReply;
         assert.ok(registerResponse.status() >= 200 && registerResponse.status() < 300, "register response must succeed");
         trace.record({event: "register_accepted"});
+        await expect(menuDelivery).toBeEnabled(); await expect(menuDelivery).toBeChecked();
         await page.keyboard.press("Escape");
         await expect(page.locator("#browser-notifications [data-notification-status]")).toContainText("Enabled on this browser");
         const worker = context.serviceWorkers()[0]; assert.ok(worker, "real root service worker registered through CSP");
@@ -420,7 +427,10 @@ async function checkWorkerUpgrade(browser, engine) {
         const reopened = await context.newPage(); await reopened.goto(`${base}/example/#settings`);
         await expect(reopened.locator("#browser-notifications [data-notification-disable]")).toBeEnabled();
         await reopened.getByRole("button", {name: "Workspace menu", exact: true}).click();
-        await reopened.locator("#sidebar-menu [data-notification-disable]").click();
+        const reopenedDelivery = reopened.locator("#sidebar-menu [data-notification-delivery]");
+        await expect(reopenedDelivery).toBeEnabled(); await expect(reopenedDelivery).toBeChecked();
+        await reopenedDelivery.click();
+        await expect(reopenedDelivery).toBeEnabled(); await expect(reopenedDelivery).not.toBeChecked();
         await expect(reopened.locator("#browser-notifications [data-notification-status]")).toContainText("Disabled on this browser");
       }
       assert.deepEqual(errors, [], `${engine.name()} loaded real notification UI without script errors`);

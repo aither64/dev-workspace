@@ -181,6 +181,7 @@ const endpoint = 'https://fcm.googleapis.com/private-endpoint?exact=value';
 const endpointDigest = require('node:crypto').createHash('sha256').update(endpoint).digest('hex');
 async function notificationHarness(state, storage = new Map()) {
   const controls = Object.fromEntries(['status', 'enable', 'disable', 'test'].map(name => [name, {disabled: false, addEventListener(type, callback) {this[type] = callback;}}]));
+  const menu = Object.fromEntries(['delivery', 'menu-error'].map(name => [name, {disabled: true, textContent: '', addEventListener(type, callback) {this[type] = callback;}}]));
   const calls = [], listeners = {};
   const subscription = {endpoint, options: state.keyMismatch ? {applicationServerKey: new Uint8Array([1]).buffer} : {},
     toJSON: () => ({endpoint, keys: {p256dh: 'public', auth: 'auth'}, expirationTime: null}),
@@ -200,7 +201,7 @@ async function notificationHarness(state, storage = new Map()) {
   const addListener = service.addEventListener;
   service.addEventListener = (name, callback) => {addListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', addEventListener: (name, callback) => listeners[name] = callback,
-    querySelectorAll: selector => [controls[selector.slice(19, -1)]].filter(Boolean), getElementById: () => null},
+    querySelectorAll: selector => [controls[selector.slice(19, -1)] || menu[selector.slice(19, -1)]].filter(Boolean), getElementById: () => null},
     addEventListener: (name, callback) => listeners[name] = callback,
     navigator: {serviceWorker: service},
     Notification: {permission: 'granted', requestPermission: async () => {state.permissionCalls = (state.permissionCalls || 0) + 1; return 'granted';}},
@@ -245,7 +246,7 @@ async function notificationHarness(state, storage = new Map()) {
   vm.runInNewContext(source('browser-notifications.js'), context);
   for (let i = 0; i < 30; i++) await Promise.resolve();
   const flush = async () => {for (let i = 0; i < 50; i++) await Promise.resolve();};
-  return {controls, calls, storage, listeners, context, registration, flush};
+  return {controls, menu, calls, storage, listeners, context, registration, flush};
 }
 
 test('lost registration reply, saved ID or changed key disable without registering again', async () => {
@@ -529,24 +530,24 @@ function lifecycleTarget(fields = {}) {
 async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   const controls = Object.fromEntries(['status','enable','disable','test','test-status','provider-status','worker-status','sound','sound-status'].map(name => [name,
     {disabled: false, textContent: '', addEventListener(type, callback) {this[type] = callback;}}]));
-  const menuControls = options.menu ? Object.fromEntries(Object.entries(controls).filter(([name]) => !['test', 'test-status', 'provider-status'].includes(name)).map(([name]) => [name,
-    {disabled: false, textContent: '', addEventListener(type, callback) {this[type] = callback;}}])) : {};
-  const listeners = {}, timers = new Map(), calls = [], saved = new Map([[browserKey, browserId]]);
+  const menuControls = options.menu ? Object.fromEntries(['delivery', 'sound', 'menu-error'].map(name => [name,
+    {disabled: true, textContent: '', addEventListener(type, callback) {this[type] = callback;}}])) : {};
+  const listeners = {}, timers = new Map(), calls = [], saved = new Map(options.off ? [] : [[browserKey, browserId]]);
   let now = Date.now(), nextTimer = 0;
-  const state = {descriptor: testDescriptor(now), registered: true, subscribed: true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
+  const state = {descriptor: testDescriptor(now), registered: !options.off, subscribed: !options.off, available: options.available ?? true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
   const subscription = {endpoint, options: {}, toJSON: () => ({endpoint, keys: {p256dh: 'public', auth: 'auth'}}), unsubscribe: async () => {state.subscribed = false; return true;}};
   const registration = lifecycleTarget({update: async () => {state.updateChecks = (state.updateChecks || 0) + 1; if (state.update) await state.update();},
     active: lifecycleTarget({state: 'activated', postMessage(_message, ports) {state.probes = (state.probes || 0) + 1; if (!state.noReply) ports[0].reply({version: state.workerVersion});}}),
     pushManager: {getSubscription: async () => state.subscribed ? subscription : null,
       subscribe: async () => {state.subscribes = (state.subscribes || 0) + 1; state.subscribed = true; return subscription;}}});
   if (options.waitingWorker) registration.waiting = lifecycleTarget({state: 'installed'});
-  const service = lifecycleTarget({getRegistration: async () => registration, controller: options.uncontrolled ? null : registration.active,
+  const service = lifecycleTarget({getRegistration: async () => options.initialLookup ? options.initialLookup(registration) : options.noRegistration ? null : registration, controller: options.uncontrolled ? null : registration.active,
     register: async () => {state.registrations = (state.registrations || 0) + 1; return registration;}, ready: Promise.resolve(registration)});
   const addServiceListener = service.addEventListener;
   service.addEventListener = (name, callback) => {addServiceListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', getElementById: () => ({querySelector: selector => controls[selector.slice(19, -1) || 'status']}),
     addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: service}, addEventListener: (name, callback) => listeners[name] = callback,
-    Date: class extends Date {static now() {return now;}}, Notification: {permission: 'granted', requestPermission: async () => {state.permissions = (state.permissions || 0) + 1; return 'granted';}, prototype: options.noSilent ? {} : {silent: false}}, PushManager: function() {}, isSecureContext: true,
+    Date: class extends Date {static now() {return now;}}, Notification: {permission: options.permission || 'granted', requestPermission: async () => {state.permissions = (state.permissions || 0) + 1; if (state.permissionReply) return state.permissionReply(); return 'granted';}, prototype: options.noSilent ? {} : {silent: false}}, PushManager: function() {}, isSecureContext: options.unsupported ? false : true,
     workspaceAttentionStore: options.oldStore ? {} : storage.store, AbortController, Uint8Array, TextEncoder, atob, crypto: require('node:crypto').webcrypto,
     MessageChannel: function() {this.port1 = {close() {}}; this.port2 = {reply: value => queueMicrotask(() => this.port1.onmessage({data: value}))};},
     setTimeout(callback, delay) {const id = ++nextTimer; timers.set(id, {callback, at: now + delay}); return id;}, clearTimeout: id => timers.delete(id),
@@ -555,7 +556,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
       if (url.endsWith('/test') && state.testReply) return state.testReply();
       if (url.endsWith('/disable')) state.registered = false;
       if (url.endsWith('/register')) {state.registered = true; return {ok: true, json: async () => ({registrationId: browserId})};}
-      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: true, registered: state.registered, publicKey: 'Ag', result: 'provider_accepted'}};},
+      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: state.available, registered: state.registered, publicKey: 'Ag', result: 'provider_accepted'}};},
   };
   context.document.querySelectorAll = selector => {
     const name = selector.slice(19, -1);
@@ -1132,7 +1133,7 @@ test('menu-only owner reads status on load/open without permission, subscription
   assert.equal(h.timers.size, 0, 'menu does not resume panel Test polling');
   storage.state.failed = true;
   h.listeners.menutoggle({newState: 'open'}); await h.flush();
-  assert.match(h.controls['sound-status'].textContent, /could not be read/);
+  assert.equal(h.controls['menu-error'].textContent, 'Could not read the sound setting.');
   assert.equal(h.controls.sound.disabled, true);
 });
 
@@ -1142,8 +1143,8 @@ test('menu and panel share committed sound, action locks, cleanup and saved pref
   assert.equal(menu.sound.checked, false); assert.equal(h.controls.sound.checked, false);
   h.storage.state.holdCommit = true;
   h.controls.sound.checked = true; const saving = h.controls.sound.change(); await h.flush();
-  assert.equal(menu.sound.disabled, true); assert.equal(menu.enable.disabled, true); assert.equal(h.controls.test.disabled, true);
-  const before = h.calls.length; await menu.disable.click(); assert.equal(h.calls.length, before, 'competing actions ignored during sound commit');
+  assert.equal(menu.sound.disabled, true); assert.equal(menu.delivery.disabled, true); assert.equal(h.controls.test.disabled, true);
+  const before = h.calls.length; menu.delivery.checked = false; await menu.delivery.change(); assert.equal(h.calls.length, before, 'competing actions ignored during sound commit');
   h.storage.state.completion(); await saving; h.storage.state.holdCommit = false;
   assert.equal(menu.sound.checked, true); assert.equal(h.controls.sound.checked, true);
   menu.sound.checked = false; await menu.sound.change();
@@ -1153,15 +1154,15 @@ test('menu and panel share committed sound, action locks, cleanup and saved pref
   h.context.fetch = async (...args) => args[0].endsWith('/disable') ? new Promise(resolve => {
     releases.push(async () => resolve(await fetch(...args))); if (releases.length === 2) started();
   }) : fetch(...args);
-  const disabling = menu.disable.click(); await startedDeleting;
+  menu.delivery.checked = false; const disabling = menu.delivery.change(); await startedDeleting;
   assert.equal(h.controls.enable.disabled, true); assert.equal(menu.sound.disabled, true);
-  await h.controls.disable.click(); await menu.enable.click();
+  await h.controls.disable.click(); menu.delivery.checked = true; await menu.delivery.change();
   await Promise.all(releases.map(release => release())); await disabling;
-  assert.equal(h.controls.status.textContent, menu.status.textContent); assert.match(menu.status.textContent, /^Disabled on this browser/);
+  assert.match(h.controls.status.textContent, /^Disabled on this browser/); assert.equal(menu.delivery.checked, false); assert.equal(menu.delivery.indeterminate, false);
   assert.equal(await h.storage.store.readSound(), false);
   h.context.fetch = fetch;
-  await menu.enable.click();
-  assert.equal(h.controls.status.textContent, menu.status.textContent); assert.match(menu.status.textContent, /^Enabled on this browser/);
+  menu.delivery.checked = true; await menu.delivery.change();
+  assert.match(h.controls.status.textContent, /^Enabled on this browser/); assert.equal(menu.delivery.checked, true);
   assert.equal(h.state.permissions, 1); assert.equal(h.state.registrations, 1); assert.equal(h.state.subscribes, 1);
   assert.equal(await h.storage.store.readSound(), false);
 });
@@ -1172,7 +1173,7 @@ test('cross-tab registration or cleanup revocation replaces every Enabled status
     const h = await feedbackHarness(testStoreHarness(), {menu: true});
     await h.controls.test.click(); await h.advance(2000);
     assert.equal(h.controls.status.textContent, 'Enabled on this browser.');
-    assert.equal(h.menuControls.status.textContent, h.controls.status.textContent);
+    assert.equal(h.menuControls.delivery.checked, true);
     let finish, reads = 0;
     h.context.fetch = () => {reads++; return new Promise((resolve, reject) => {finish = () => rejects ? reject(Error('retired read failed')) :
       resolve({ok: true, json: async () => ({available: true, registered: true})});});};
@@ -1180,22 +1181,22 @@ test('cross-tab registration or cleanup revocation replaces every Enabled status
     assert.equal(reads, 1, 'a status observation is pending before revocation');
     h.listeners.storage(invalidation); await h.flush();
     const expected = 'Browser setup is incomplete. Disable it or enable notifications again.';
-    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls.status.textContent, expected);
-    assert.equal(h.controls.test.disabled, true); assert.equal(h.menuControls.disable.disabled, false);
+    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.'); assert.equal(h.menuControls.delivery.indeterminate, true);
+    assert.equal(h.controls.test.disabled, true); assert.equal(h.controls.disable.disabled, false); assert.equal(h.menuControls.delivery.disabled, true);
     assert.equal(h.controls['test-status'].textContent, '');
     assert.equal(h.storage.records.get(h.state.descriptor.identity).testPending, undefined, 'revocation still cancels the exact saved check');
     h.listeners.menutoggle({newState: 'open'}); h.listeners.visibilitychange(); h.listeners.pageshow(); await h.flush();
     assert.equal(reads, 1, 'opening the menu cannot restart a retired observation');
     finish(); await h.flush(); await h.advance(20000);
-    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls.status.textContent, expected);
+    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.'); assert.equal(h.menuControls.delivery.indeterminate, true);
     assert.equal(reads, 1, 'late old completion cannot refresh, repair or resume');
   }
 });
 
 test('global delivery off and silent preference do not stop actual title attention, reservations or focused acknowledgement', async () => {
   const h = await feedbackHarness(testStoreHarness(), {menu: true, menuOnly: true});
-  h.controls.sound.checked = false; await h.controls.sound.change(); await h.controls.disable.click();
-  assert.match(h.controls.status.textContent, /^Disabled on this browser/);
+  h.controls.sound.checked = false; await h.controls.sound.change(); h.controls.delivery.checked = false; await h.controls.delivery.change();
+  assert.equal(h.controls.delivery.checked, false); assert.equal(h.controls.delivery.indeterminate, false);
   let current = event(), focus = false, refresh;
   const listeners = {}, acknowledgements = [];
   h.context.document.body = {dataset: {session: 'example', sessionObservation: identity, rootThreadId: 'thread-1'}};
@@ -1275,3 +1276,181 @@ test('rejected focus or a client closed after enumeration never retries by openi
     assert.equal(focused, 1); assert.equal(h.calls.length, 0);
   }
 });
+
+
+test('compact menu initializes without sinks and distinguishes confirmed on/off, blocked and mixed observations', async () => {
+  for (const [options, checked, mixed, disabled, message] of [
+    [{}, true, false, false, ''],
+    [{off: true, noRegistration: true}, false, false, false, ''],
+    [{off: true, noRegistration: true, permission: 'denied'}, false, false, true, 'Notifications are blocked.'],
+    [{off: true, noRegistration: true, available: false}, false, false, true, 'Notification delivery is unavailable.'],
+    [{unsupported: true}, false, true, true, 'Notifications are unavailable here.'],
+  ]) {
+    const h = await feedbackHarness(testStoreHarness(), {...options, menu: true, menuOnly: true});
+    assert.equal(h.controls.status, undefined); assert.equal(h.controls.enable, undefined); assert.equal(h.controls.disable, undefined);
+    assert.equal(h.controls.delivery.checked, checked); assert.equal(h.controls.delivery.indeterminate, mixed); assert.equal(h.controls.delivery.disabled, disabled);
+    assert.equal(h.controls['menu-error'].textContent, message); assert.equal(h.controls['menu-error'].hidden, !message);
+    assert.equal(h.calls.some(call => call.config.method), false); assert.equal(h.state.permissions || 0, 0);
+    if (options.off) assert.equal(h.controls.sound.disabled, false, 'Sound is independent of delivery');
+  }
+  let releaseInitial;
+  const initial = await feedbackHarness(testStoreHarness(), {menu: true, menuOnly: true,
+    initialLookup: registration => new Promise(resolve => {releaseInitial = () => resolve(registration);})});
+  assert.equal(initial.controls.delivery.indeterminate, true); assert.equal(initial.controls.delivery.disabled, true);
+  assert.equal(initial.controls['menu-error'].textContent, '', 'initial observation is not a failure');
+  releaseInitial(); await initial.flush(); assert.equal(initial.controls.delivery.checked, true);
+  const h = await feedbackHarness(testStoreHarness(), {menu: true, menuOnly: true});
+  h.context.fetch = async () => {throw Error('private status canary');};
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  assert.equal(h.controls.delivery.indeterminate, true); assert.equal(h.controls.delivery.disabled, true);
+  assert.equal(h.controls['menu-error'].textContent, 'Could not check notifications.');
+  assert.equal(h.controls['menu-error'].textContent.includes('canary'), false);
+});
+
+test('compact toggle restores confirmed values immediately during delayed Disable and Enable and blocks competing actions', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true}), toggle = h.menuControls.delivery;
+  const fetch = h.context.fetch, releases = []; let deleting;
+  const started = new Promise(resolve => {deleting = resolve;});
+  h.context.fetch = async (...args) => args[0].endsWith('/disable') ? new Promise(resolve => {
+    releases.push(async () => resolve(await fetch(...args))); if (releases.length === 2) deleting();
+  }) : fetch(...args);
+  toggle.checked = false; const disabling = toggle.change();
+  assert.equal(toggle.checked, true); assert.equal(toggle.disabled, true); assert.equal(toggle.indeterminate, false);
+  assert.equal(h.controls.enable.disabled, true); assert.equal(h.menuControls.sound.disabled, true);
+  toggle.checked = true; await toggle.change();
+  await started; await Promise.all(releases.map(release => release())); await disabling;
+  assert.equal(toggle.checked, false); assert.equal(toggle.disabled, false); assert.equal(toggle.indeterminate, false);
+  assert.equal(h.menuControls['menu-error'].textContent, '');
+  let permit;
+  h.context.fetch = async (...args) => args[0].endsWith('/register') ? new Promise(resolve => {permit = async () => resolve(await fetch(...args));}) : fetch(...args);
+  toggle.checked = true; const enabling = toggle.change(); await h.flush();
+  assert.equal(toggle.checked, false); assert.equal(toggle.disabled, true); assert.equal(h.controls.disable.disabled, true);
+  const count = h.state.permissions; await h.controls.enable.click(); assert.equal(h.state.permissions, count);
+  await permit(); await enabling;
+  assert.equal(toggle.checked, true); assert.equal(toggle.disabled, false); assert.equal(h.menuControls['menu-error'].textContent, '');
+});
+
+test('compact cleanup stays mixed for failed current-digest or old-ID removal and only full panel retry can confirm off', async () => {
+  for (const failSelector of ['registrationId', 'endpointDigest']) {
+    const replacementId = 'e'.repeat(64);
+    const state = {subscribed: true, registered: true, replacementId, failSelector,
+      serverRecords: new Map([[browserId, 'https://fcm.googleapis.com/old-endpoint'], [replacementId, endpoint]]), outbox: new Set([browserId, replacementId])};
+    const h = await notificationHarness(state, new Map([[browserKey, browserId]]));
+    h.menu.delivery.checked = false; await h.menu.delivery.change();
+    assert.equal(state.subscribed, false); assert.equal(state.serverRecords.size, 1); assert.equal(state.outbox.size, 1);
+    assert.equal(h.menu.delivery.indeterminate, true); assert.equal(h.menu.delivery.disabled, true);
+    assert.equal(h.menu['menu-error'].textContent, 'Notification setup needs attention.');
+    assert.equal(h.controls.disable.disabled, false, 'detailed recovery remains available');
+    state.failSelector = null; await h.controls.disable.click();
+    assert.equal(state.serverRecords.size, 0); assert.equal(state.outbox.size, 0);
+    assert.equal(h.menu.delivery.checked, false); assert.equal(h.menu.delivery.indeterminate, false);
+  }
+  const h = await notificationHarness({subscribed: true, registered: true, localFailure: true}, new Map([[browserKey, browserId]]));
+  h.menu.delivery.checked = false; await h.menu.delivery.change();
+  assert.equal(h.menu.delivery.indeterminate, true); assert.equal(h.menu.delivery.disabled, true);
+  assert.equal(h.controls.disable.disabled, false);
+});
+
+test('compact projection cannot enable from pending, contradictory, stale or retired observations', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true}), toggle = h.menuControls.delivery;
+  const fetch = h.context.fetch, pending = [];
+  h.context.fetch = () => new Promise((resolve, reject) => pending.push({resolve, reject}));
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  assert.equal(toggle.disabled, true, 'pending GET cannot authorize a stale action');
+  const permissions = h.state.permissions || 0; toggle.checked = false; await toggle.change();
+  assert.equal(toggle.checked, true); assert.equal(h.state.permissions || 0, permissions);
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  pending[1].resolve({ok: true, json: async () => ({available: true, registered: false})}); await h.flush();
+  assert.equal(toggle.indeterminate, true, 'local subscription plus absent server registration is incomplete');
+  assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.');
+  pending[0].resolve({ok: true, json: async () => ({available: true, registered: true})}); await h.flush();
+  assert.equal(toggle.indeterminate, true, 'old success cannot replace a newer contradictory observation');
+  h.context.fetch = fetch;
+  h.listeners.storage({key: browserKey, newValue: null}); await h.flush();
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  assert.equal(toggle.indeterminate, true); assert.equal(toggle.disabled, true);
+});
+
+test('compact notices use domain priority and clear only on that domain current success, without parsing detailed text', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true});
+  h.storage.state.failed = true; h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  assert.equal(h.menuControls['menu-error'].textContent, 'Could not read the sound setting.');
+  h.listeners.storage({key: browserKey, newValue: null}); await h.flush();
+  assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.');
+  h.storage.state.failed = false; h.menuControls.sound.checked = false; await h.menuControls.sound.change();
+  assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.', 'sound success cannot erase delivery uncertainty');
+  const clean = await feedbackHarness(testStoreHarness(), {menu: true});
+  clean.storage.state.commitFailure = true; clean.menuControls.sound.checked = false; await clean.menuControls.sound.change();
+  assert.equal(clean.menuControls['menu-error'].textContent, 'Could not save the sound setting.');
+  clean.controls.status.textContent = 'arbitrary backend/private status';
+  clean.listeners.controllerchange(); await clean.flush();
+  assert.equal(clean.menuControls['menu-error'].textContent, 'Could not save the sound setting.', 'delivery refresh alone cannot clear sound error');
+  clean.storage.state.commitFailure = false;
+  clean.listeners['session-section-change']({detail: 'settings'}); await clean.flush();
+  assert.equal(clean.menuControls['menu-error'].textContent, '');
+  const worker = await feedbackHarness(testStoreHarness(), {menu: true, waitingWorker: true});
+  assert.equal(worker.menuControls['menu-error'].textContent, '', 'in-progress activation is not an error');
+  await worker.advance(10001);
+  assert.equal(worker.menuControls['menu-error'].textContent, 'Notification update unconfirmed.');
+  const unsupported = await feedbackHarness(testStoreHarness(), {menu: true, noSilent: true});
+  assert.equal(unsupported.menuControls['menu-error'].textContent, 'Sound control is unavailable.');
+});
+
+test('late delivery action results cannot certify a retired compact checkbox or clear its error', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true, off: true}), toggle = h.menuControls.delivery;
+  const fetch = h.context.fetch; let release;
+  h.context.fetch = async (...args) => args[0].endsWith('/register') ? new Promise(resolve => {release = async () => resolve(await fetch(...args));}) : fetch(...args);
+  toggle.checked = true; const action = toggle.change(); await h.flush();
+  h.listeners.storage({key: browserKey, newValue: 'f'.repeat(64)}); await h.flush();
+  await release(); await action; await h.flush();
+  assert.equal(toggle.indeterminate, true); assert.equal(toggle.disabled, true);
+  assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.');
+});
+
+
+test('compact action errors stay finite and current retry success clears only its own failure', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true, off: true}), toggle = h.menuControls.delivery;
+  h.state.permissionReply = async () => {throw Error('private permission failure canary');};
+  toggle.checked = true; await toggle.change();
+  assert.equal(toggle.checked, false); assert.equal(toggle.indeterminate, false);
+  assert.equal(toggle.disabled, false, 'pre-native failure preserves confirmed off and permits retry');
+  assert.equal(h.menuControls['menu-error'].textContent, 'Could not update notifications.');
+  delete h.state.permissionReply;
+  const enable = h.controls.enable.click(); await enable;
+  assert.equal(toggle.checked, true); assert.equal(h.menuControls['menu-error'].textContent, '');
+  const blocked = await feedbackHarness(testStoreHarness(), {menu: true, off: true});
+  blocked.state.permissionReply = async () => 'denied';
+  blocked.menuControls.delivery.checked = true; await blocked.menuControls.delivery.change();
+  assert.equal(blocked.menuControls['menu-error'].textContent, 'Notifications are blocked.');
+  assert.equal(blocked.menuControls.delivery.checked, false);
+});
+
+for (const method of ['getSubscription', 'subscribe']) {
+  test(`compact Enable ${method} failure cannot certify off from an earlier absence read`, async () => {
+    const h = await feedbackHarness(testStoreHarness(), {menu: true, off: true}), toggle = h.menuControls.delivery;
+    assert.equal(toggle.checked, false); assert.equal(toggle.indeterminate, false); assert.equal(toggle.disabled, false);
+    let rejectNative, nativeCalls = 0;
+    h.registration.pushManager[method] = () => {
+      nativeCalls++;
+      return new Promise((_, reject) => {rejectNative = reject;});
+    };
+    toggle.checked = true; const action = toggle.change(); await h.flush();
+    assert.equal(nativeCalls, 1); assert.equal(typeof rejectNative, 'function');
+    assert.equal(toggle.checked, false, 'busy action keeps the previous confirmed value');
+    assert.equal(toggle.indeterminate, false); assert.equal(toggle.disabled, true);
+    rejectNative(Error('private native failure canary')); await action;
+    assert.equal(toggle.checked, false); assert.equal(toggle.indeterminate, true, 'failed native operation leaves absence unconfirmed');
+    assert.equal(toggle.disabled, true);
+    assert.equal(h.menuControls['menu-error'].textContent, 'Could not update notifications.');
+    assert.equal(h.menuControls['menu-error'].hidden, false);
+    assert.equal(h.calls.some(call => call.url.endsWith('/register') || call.url.endsWith('/disable')), false,
+      'no handle was returned and no server registration or cleanup was attempted');
+    assert.equal(h.state.subscribed, false);
+    assert.equal(h.controls.enable.disabled, false, 'the full panel retains explicit recovery');
+    h.state.permissionReply = async () => {throw Error('private permission failure after unknown native result');};
+    await h.controls.enable.click();
+    assert.equal(nativeCalls, 1, 'the second attempt failed before entering the native boundary');
+    assert.equal(toggle.indeterminate, true, 'a pre-native retry failure cannot revive the retired absence proof');
+    assert.equal(toggle.disabled, true); assert.equal(h.menuControls['menu-error'].textContent, 'Could not update notifications.');
+  });
+}

@@ -42,21 +42,24 @@ finished**. They contain no prompts, commands or excerpts. Session names may
 appear on the lock screen. The browser vendor's push service handles encrypted
 delivery and can observe delivery metadata.
 
-The workspace menu on index and session pages provides browser-wide delivery
-controls and **Play sound**. The same controls appear in session Settings; the
-**Browser notifications** link opens the full panel with Test and guidance.
+The workspace menu on index and session pages has **Notifications** and **Sound**
+checkboxes. **Notification settings** opens the full panel with detailed status,
+Test and recovery controls, also available in session Settings. The
+**Notifications** checkbox shows confirmed browser setup. A mixed, disabled
+checkbox means setup is uncertain; open **Notification settings** to check it.
 Opening the menu reads the current state without requesting permission or
-changing a subscription. Enable and Disable require an explicit click. Browser
-Disable applies across sessions in this browser, while title attention and
-reservation markers keep updating. Per-session notification settings remain
-unchanged and apply again after browser Enable. A provider-accepted message may
-still arrive after Disable.
+changing a subscription. Changing **Notifications** uses the same Enable or
+Disable action as the full panel. Disabling applies across sessions in this
+browser, while title attention and reservation markers keep updating. Per-session
+notification settings remain unchanged and apply again after browser Enable.
+A provider-accepted message may still arrive after Disable.
 
-**Play sound** applies to notifications from this portal in the current browser
+The **Sound** checkbox in the menu controls the same setting as **Play sound** in
+settings. It applies to notifications from this portal in the current browser
 profile, across sessions and tests. It defaults on when no choice has been
-saved. Turn it off for visual-only notifications. When checked, the
-browser uses its default sound behavior; it does not guarantee a sound. Browser
-and system notification settings still apply. The control reports when the browser lacks
+saved. Turn it off for visual-only notifications. When checked, the browser uses
+its default sound behavior; it does not guarantee a sound. Browser and system
+notification settings still apply. The control reports when the browser lacks
 native visual-only support or the worker update is unconfirmed.
 
 The choice is saved only after browser storage confirms the write. Reopening
@@ -70,7 +73,7 @@ already displayed notification, enable delivery or mute a session.
 
 Use **Send test notification** after enabling. The server waits ten seconds so
 you can switch to another tab or app before checking delivery. Open
-the full panel from **Browser notifications** in the workspace menu or use
+the full panel from **Notification settings** in the workspace menu or use
 session Settings. The test result distinguishes arrival in this browser, whether
 the browser accepted or rejected the display request, and whether it retained a
 matching notification record. None of these confirms appearance on your screen.

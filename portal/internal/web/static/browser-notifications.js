@@ -4,9 +4,29 @@
   const cleanupKey = `${key}.cleanup`;
   const elements = name => [...document.querySelectorAll(`[data-notification-${name}]`)];
   const statuses = elements("status"), enables = elements("enable"), disables = elements("disable"), tests = elements("test");
-  if (!statuses.length) return;
   const testStatus = elements("test-status"), providerStatus = elements("provider-status"), workerStatus = elements("worker-status");
   const soundControls = elements("sound"), soundStatus = elements("sound-status");
+  const deliveryControls = elements("delivery"), menuErrors = elements("menu-error");
+  if (!statuses.length && !deliveryControls.length && !soundControls.length) return;
+  let menuValue = null, menuReading = false, menuAvailable = null;
+  let deliveryError = null, soundError = null, workerError = false;
+  const menuMessages = {
+    setup: "Notification setup needs attention.", read: "Could not check notifications.",
+    blocked: "Notifications are blocked.", unsupported: "Notifications are unavailable here.",
+    unavailable: "Notification delivery is unavailable.", action: "Could not update notifications.",
+    soundRead: "Could not read the sound setting.", soundSave: "Could not save the sound setting.",
+    soundUnsupported: "Sound control is unavailable.", worker: "Notification update unconfirmed.",
+  };
+  const renderMenu = () => {
+    deliveryControls.forEach(control => {
+      control.checked = menuValue === true;
+      control.indeterminate = menuValue === null;
+      control.disabled = busy || soundBusy || menuReading || pageClosed || observationRetired || menuValue === null ||
+        !supported || Notification.permission === "denied" || menuAvailable === false;
+    });
+    const problem = deliveryError || (!silentSupported ? "soundUnsupported" : soundError) || (workerError ? "worker" : null);
+    setText(menuErrors, menuMessages[problem] || "");
+  };
   const setStatus = text => setText(statuses, text);
   const store = globalThis.workspaceAttentionStore;
   const silentSupported = Boolean(globalThis.Notification?.prototype && "silent" in Notification.prototype);
@@ -21,6 +41,7 @@
       "The sound setting could not be read. The browser will be asked to show notifications without sound." : !soundReady ?
       "The notification update is unconfirmed. This sound setting may not take effect yet." : "";
     setText(soundStatus, text);
+    renderMenu();
   };
   async function refreshSound() {
     if (!soundControls.length || soundBusy || pageClosed) return;
@@ -28,21 +49,21 @@
     let value;
     try { value = await store.readSound(); } catch (_) {}
     if (generation !== soundGeneration || pageClosed || soundBusy) return;
-    savedSound = value; soundFailed = false; renderSound();
+    savedSound = value; soundFailed = false; soundError = typeof value === "boolean" ? null : "soundRead"; renderSound();
   }
   soundControls.forEach(soundControl => soundControl.addEventListener("change", async () => {
     if (busy || soundBusy || pageClosed || !silentSupported) return;
     const generation = ++soundGeneration, selected = soundControl.checked;
-    soundBusy = true; buttons();
+    soundError = null; soundBusy = true; buttons();
     try {
       const value = await store.writeSound(selected);
-      if (generation === soundGeneration && !pageClosed) {savedSound = value; soundFailed = false;}
+      if (generation === soundGeneration && !pageClosed) {savedSound = value; soundFailed = false; soundError = null;}
     } catch (_) {
       // A timeout may leave an uncertain commit. Re-read rather than presenting
       // the attempted value as saved; the helper aborts overdue writes.
       let value;
       try {value = await store.readSound();} catch (_) {}
-      if (generation === soundGeneration && !pageClosed) {savedSound = value; soundFailed = true;}
+      if (generation === soundGeneration && !pageClosed) {savedSound = value; soundFailed = true; soundError = "soundSave";}
     } finally {
       soundBusy = false;
       if (!pageClosed) {
@@ -56,6 +77,7 @@
   const updateUnconfirmed = "The notification update could not be confirmed. Refresh this page to try again. Test results may be limited.";
   const invalidateRefresh = (action = false) => {
     refreshGeneration++;
+    if (action) menuReading = false;
     if (cancelReadiness) {
       soundReady = false; renderSound();
       cancelReadiness();
@@ -93,7 +115,7 @@
     const generation = refreshGeneration, deadline = Date.now() + 10000;
     const valid = () => current() && generation === refreshGeneration && !pageClosed && !observationRetired;
     if (!valid()) return;
-    soundReady = false; renderSound();
+    workerError = false; soundReady = false; renderSound();
     setText(workerStatus, "Updating browser notifications… You can keep your tabs open.");
     if (update && !workerUpdate) workerUpdate = Promise.resolve().then(() => registration.update());
     const activated = await new Promise(resolve => {
@@ -128,9 +150,10 @@
       inspect();
     });
     if (!valid()) return;
-    if (!activated) {setText(workerStatus, updateUnconfirmed); return;}
+    if (!activated) {workerError = true; renderMenu(); setText(workerStatus, updateUnconfirmed); return;}
     const controller = navigator.serviceWorker.controller;
     if (!globalThis.MessageChannel) {
+      workerError = true; renderMenu();
       setText(workerStatus, "Detailed test results are unavailable. Refresh this page to check for a notification update.");
       return;
     }
@@ -150,7 +173,7 @@
       catch (_) {finish(false);}
     });
     if (valid() && controller === navigator.serviceWorker.controller && controller === registration.active && !registration.waiting && !registration.installing) {
-      soundReady = supported; renderSound();
+      workerError = !supported; soundReady = supported; renderSound();
       setText(workerStatus, supported ? "" : "Detailed test results are unavailable. Refresh this page to check for a notification update.");
     }
   }
@@ -273,7 +296,8 @@
     invalidateRefresh();
     const generation = refreshGeneration, identity = registrationId;
     const current = () => generation === refreshGeneration && identity === registrationId && !busy && !pageClosed && !observationRetired;
-    if (!supported) { setStatus("This browser build does not support background Web Push. Use a browser with Push API support."); buttons(); return; }
+    menuReading = true; renderMenu();
+    if (!supported) { menuReading = false; menuValue = null; deliveryError = "unsupported"; setStatus("This browser build does not support background Web Push. Use a browser with Push API support."); buttons(); return; }
     let observedSubscription = localSubscription, observedKnown = localKnown;
     try {
       const local = await navigator.serviceWorker.getRegistration("/");
@@ -283,8 +307,13 @@
       const state = await api(`?registrationId=${encodeURIComponent(identity)}`);
       if (!current()) return;
       localSubscription = observedSubscription; localKnown = observedKnown;
-      setText(providerStatus, lastProvider(state.result) ? `Last push-service result; it may be from another notification: ${lastProvider(state.result)}` : "");
+      menuAvailable = state.available;
+      const off = !state.registered && localKnown && !localSubscription && !registrationId && !pendingCleanup;
       registered = Boolean(!pendingCleanup && state.registered && localSubscription && Notification.permission === "granted");
+      menuValue = registered && state.available ? true : off ? false : null;
+      deliveryError = pendingCleanup || (!off && !registered) ? "setup" : Notification.permission === "denied" ? "blocked" : !state.available ? "unavailable" : null;
+      menuReading = false;
+      setText(providerStatus, lastProvider(state.result) ? `Last push-service result; it may be from another notification: ${lastProvider(state.result)}` : "");
       setStatus(pendingCleanup ? cleanupStatus() : localSubscription && !registered ? incomplete : Notification.permission === "denied" ? "Notifications are blocked. Change this site's notification permission in your browser settings." :
         !state.available ? "Notification delivery is disabled on the server." : state.result === "expired" ? "The browser subscription expired. Enable notifications again." : registered ?
         "Enabled on this browser." : "Disabled on this browser.");
@@ -292,32 +321,42 @@
     } catch (error) {
       if (!current()) return;
       localSubscription = observedSubscription; localKnown = observedKnown;
-      registered = false; setStatus(pendingCleanup ? cleanupStatus() : localSubscription ? incomplete : error.message);
+      registered = false; menuValue = null; menuReading = false; deliveryError = pendingCleanup ? "setup" : "read"; setStatus(pendingCleanup ? cleanupStatus() : localSubscription ? incomplete : error.message);
     }
     if (current()) buttons();
   }
-  enables.forEach(control => control.addEventListener("click", async () => {
+  async function enableNotifications() {
     if (soundBusy || busy || !supported || Notification.permission === "denied") return;
     readCleanup();
-    if (pendingCleanup) { setStatus(cleanupStatus()); buttons(); return; }
+    if (pendingCleanup) { menuValue = null; deliveryError = "setup"; setStatus(cleanupStatus()); buttons(); return; }
+    deliveryError = null; menuReading = false;
     invalidateRefresh(true); observationRetired = false;
+    const generation = refreshGeneration, currentAction = () => generation === refreshGeneration && !pageClosed && !observationRetired;
     cancelTest();
     busy = true; buttons();
+    let menuAbsenceConfirmed = menuValue === false;
     try {
       const permission = await Notification.requestPermission();
+      if (currentAction() && permission !== "granted") deliveryError = permission === "denied" ? "blocked" : "action";
       if (permission !== "granted") throw new Error(permission === "denied" ? "Notifications are blocked. Change this site's notification permission in your browser settings." : "Notification permission was not granted.");
       const state = await api("");
-      if (!state.available) throw new Error("Notification delivery is disabled on the server.");
+      if (currentAction()) menuAvailable = state.available;
+      if (!state.available) {if (currentAction()) deliveryError = "unavailable"; throw new Error("Notification delivery is disabled on the server.");}
       const registration = await navigator.serviceWorker.register("/notification-worker.js", {scope: "/", updateViaCache: "none"});
       await navigator.serviceWorker.ready;
+      menuAbsenceConfirmed = false;
       let subscription = await registration.pushManager.getSubscription();
+      menuAbsenceConfirmed = !subscription;
       localSubscription = subscription;
       const applicationServerKey = Uint8Array.from(atob(state.publicKey.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
       if (subscription && subscription.options.applicationServerKey &&
           [...new Uint8Array(subscription.options.applicationServerKey)].join() !== [...applicationServerKey].join()) {
         throw new Error("The server's push key changed. Disable this browser subscription, then enable it again.");
       }
-      subscription ||= await registration.pushManager.subscribe({userVisibleOnly: true, applicationServerKey});
+      if (!subscription) {
+        menuAbsenceConfirmed = false;
+        subscription = await registration.pushManager.subscribe({userVisibleOnly: true, applicationServerKey});
+      }
       localSubscription = subscription;
       const value = subscription.toJSON();
       const saved = await api("/register", {subscription: {endpoint: value.endpoint, keys: value.keys}, expirationTime: value.expirationTime ?? null});
@@ -332,14 +371,23 @@
       localStorage.setItem(key, registrationId);
       if (localStorage.getItem(key) !== registrationId) throw new Error("Browser registration could not be saved. Try enabling notifications again.");
       if (replacement && !clearCleanup()) throw new Error();
+      if (currentAction()) {menuValue = true; deliveryError = null;}
       registered = true; setStatus("Enabled on this browser. Send a test notification to check delivery.");
       void workerReadiness(registration, true);
-    } catch (error) { registered = false; setStatus(pendingCleanup ? disablingIncomplete : localSubscription ? incomplete : `Registration failed: ${error.message}`); }
+    } catch (error) {
+      registered = false;
+      if (currentAction()) {
+        menuValue = menuAbsenceConfirmed && !localSubscription && !registrationId && !pendingCleanup ? false : null;
+        deliveryError = pendingCleanup || localSubscription || registrationId ? "setup" : deliveryError || "action";
+      }
+      setStatus(pendingCleanup ? disablingIncomplete : localSubscription ? incomplete : `Registration failed: ${error.message}`); }
     finally { busy = false; buttons(); }
-  }));
-  disables.forEach(control => control.addEventListener("click", async () => {
+  }
+  async function disableNotifications() {
     if (soundBusy || busy) return;
+    deliveryError = null; menuReading = false;
     invalidateRefresh(true);
+    const generation = refreshGeneration, currentAction = () => generation === refreshGeneration && !pageClosed && !observationRetired;
     cancelTest();
     busy = true; registered = false; buttons();
     let registration = null, subscription = localSubscription, selector = null, currentBound = false;
@@ -382,9 +430,21 @@
     } catch (_) {}
     if (serverAbsent && localKnown && !localSubscription && !registrationId) clearCleanup();
     const complete = serverAbsent && localKnown && !localSubscription && !pendingCleanup && !registrationId;
+    if (currentAction()) {menuValue = complete ? false : null; deliveryError = complete ? null : "setup";}
     setStatus(complete ? "Disabled on this browser. Site permission remains in your browser settings." :
       localKnown && !localSubscription && !serverAbsent ? serverPending : disablingIncomplete);
     busy = false; buttons();
+  }
+  enables.forEach(control => control.addEventListener("click", enableNotifications));
+  disables.forEach(control => control.addEventListener("click", disableNotifications));
+  deliveryControls.forEach(control => control.addEventListener("change", async () => {
+    const selected = control.checked, allowed = !control.disabled && !menuReading && !busy && !soundBusy && !pageClosed && !observationRetired;
+    // Native inputs toggle before change. Restore the last confirmed value
+    // synchronously; only the existing action's outcome can certify a new one.
+    buttons();
+    if (!allowed || menuValue === null || selected === menuValue) return;
+    if (selected) await enableNotifications();
+    else await disableNotifications();
   }));
   tests.forEach(control => control.addEventListener("click", async () => {
     if (soundBusy || busy || !registered) return;
@@ -430,7 +490,7 @@
   globalThis.addEventListener?.("storage", event => {
     if ((event.key === key && event.newValue !== registrationId) || (event.key === cleanupKey && event.newValue)) {
       invalidateRefresh(); observationRetired = true;
-      cancelTest(); registered = false; setStatus(incomplete); buttons();
+      cancelTest(); registered = false; menuValue = null; menuReading = false; deliveryError = "setup"; setStatus(incomplete); buttons();
     }
   });
   document.addEventListener?.("session-section-change", event => { if (event.detail === "settings") void refreshSound(); });

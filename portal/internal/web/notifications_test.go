@@ -76,23 +76,34 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 	if !strings.Contains(index.Body.String(), `name="browserNotificationsEnabled" type="checkbox" checked`) {
 		t.Fatal("new-session notification preference must remain available")
 	}
-	for _, required := range []string{"data-notification-enable", "data-notification-disable", "data-notification-sound", `aria-describedby="menu-notification-sound-hint menu-notification-sound-status"`, `src="/static/browser-notifications.js?v=4" defer`} {
-		if !strings.Contains(index.Body.String(), required) {
-			t.Fatalf("index menu lacks %s", required)
+	for _, required := range []string{"data-notification-delivery", "data-notification-sound", `aria-describedby="menu-notification-error"`, `data-notification-menu-error class="muted" role="status" hidden`, "> Notifications</label>", "> Sound</label>", `href="/browser-notifications">Notification settings</a>`} {
+		if !strings.Contains(menu, required) {
+			t.Fatalf("compact menu lacks %s", required)
 		}
+	}
+	if strings.Count(menu, `type="checkbox"`) != 2 {
+		t.Fatal("compact notification menu must have exactly two checkbox rows")
+	}
+	for _, removed := range []string{"data-notification-enable", "data-notification-disable", "data-notification-status", "data-notification-worker-status", "data-notification-sound-status", "<button", "Checking", "Page title", "Turn off", "Play sound"} {
+		if strings.Contains(menu, removed) {
+			t.Fatalf("compact menu contains detailed controls or help: %s", removed)
+		}
+	}
+	if strings.Count(index.Body.String(), `src="/static/browser-notifications.js?v=5" defer`) != 1 {
+		t.Fatal("index must initialize one notification owner")
 	}
 	page := httptest.NewRecorder()
 	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/browser-notifications", nil))
 	if page.Code != http.StatusOK {
 		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled`, `data-notification-sound-status role="status"`, `src="/static/browser-notifications.js?v=4" defer`, `href="/"`} {
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled`, `data-notification-sound-status role="status"`, `src="/static/browser-notifications.js?v=5" defer`, `href="/"`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("notification page lacks %s", required)
 		}
 	}
 	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) < 0 ||
-		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=4"`) {
+		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=5"`) {
 		t.Fatal("notification page must initialize the shared store before the client")
 	}
 }
