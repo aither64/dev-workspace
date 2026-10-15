@@ -456,42 +456,105 @@ module DevWorkspaceHost
       end
     end
 
+    def provider_failure_class(error)
+      name = error.class.name
+      %w[DevWorkspaceHost::Error RuntimeError ArgumentError TypeError KeyError
+         NoMethodError NameError IOError EOFError JSON::ParserError
+         Errno::ENOENT Errno::EACCES Errno::EPERM Errno::ESRCH Errno::ECHILD
+         Errno::EPIPE Errno::ECONNREFUSED Errno::ECONNRESET Errno::ETIMEDOUT
+         Errno::ENOSPC Errno::EIO Errno::EINVAL Errno::EEXIST Errno::ENOTDIR].include?(name) ? name : 'OtherError'
+    rescue Exception
+      'OtherError'
+    end
+
+    def provider_failure_diagnostic(operation, direction, diagnostic, error)
+      # Failure-only projection: never include messages or helper argv/output.
+      sources = {
+        __FILE__ => 'workspace-codex-providers.rb',
+        File.join(__dir__, 'workspace-host') => 'workspace-host',
+        File.join(__dir__, '.workspace-host-wrapped') => 'workspace-host'
+      }
+      frames = Array(error.backtrace_locations).filter_map do |frame|
+        label = sources[frame.absolute_path || frame.path]
+        {source: label, line: frame.lineno} if label && frame.lineno.between?(1, 1_000_000)
+      end.first(4)
+      id = operation['id']
+      stage = operation['stage']
+      elapsed = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - diagnostic.fetch(:started)) * 1000).to_i
+      errno = error.is_a?(SystemCallError) ? error.errno : nil
+      record = {
+        operation: id.is_a?(String) && id.bytesize == 36 && id.match?(PROVIDER_OPERATION_ID) ? id : 'unavailable',
+        direction: %w[forward recovery].include?(direction) ? direction : 'unavailable',
+        stage: %w[capturing quiescing daemon-stop shared-start].include?(stage) ? stage : 'unavailable',
+        step: diagnostic.fetch(:step), elapsedMs: elapsed.clamp(0, 86_400_000),
+        exception: provider_failure_class(error),
+        errno: errno.is_a?(Integer) && errno.between?(0, 65535) ? errno : 'unavailable',
+        frames:
+      }
+      record[:readiness] = diagnostic[:readiness] if diagnostic[:readiness]
+      line = "PROVIDER_FAILURE #{JSON.generate(record)}\n"
+      @err.write(line) if line.bytesize <= 2048
+    rescue Exception
+      # Formatting or a broken stderr must not affect compensation/state writes.
+      nil
+    end
+
     def provider_apply(entry, state, snapshot)
       operation = state.fetch('operation')
       unit = "workspace-codex@#{entry.fetch('name')}.service"
+      diagnostic = {step: 'capture', started: Process.clock_gettime(Process::CLOCK_MONOTONIC)}
       begin
         captured = provider_helper(entry, 'capture', snapshot:, target: operation.fetch('target'))
+        diagnostic[:step] = 'capture-write'
         atomic_private_file(snapshot, JSON.generate(captured))
+        diagnostic[:step] = 'quiescing-write'
         operation['stage'] = 'quiescing'
         provider_write_state(entry, state)
+        diagnostic[:step] = 'terminal-snapshot'
         atomic_private_file(snapshot + '.terminals', JSON.generate('schema' => 1, 'workspace' => entry.fetch('name'), 'root' => entry.fetch('root'), 'socket' => instance_runtime(entry).fetch(:codex), 'terminals' => []))
+        diagnostic[:step] = 'quiesce'
         quiesce_sessions([entry], provider_terminal_snapshot: snapshot + '.terminals')
+        diagnostic[:step] = 'inventory'
         final_inventory = provider_helper(entry, 'inventory')
         raise Error, 'workspace became active before native daemon stop' unless final_inventory.fetch('blockers').empty?
+        diagnostic[:step] = 'restart-safety'
         require_provider_restart_safe!(entry, final_inventory)
+        diagnostic[:step] = 'daemon-stop-write'
         operation['stage'] = 'daemon-stop'
         provider_write_state(entry, state)
+        diagnostic[:step] = 'daemon-stop'
         system! 'systemctl', '--user', 'stop', unit
+        diagnostic[:step] = 'private-start'
         provider_private_server(entry, operation.fetch('target')) do |socket|
+          diagnostic[:step] = 'private-resume'
           provider_helper(entry, 'resume', snapshot:, target: operation.fetch('target'), socket:)
         end
+        diagnostic[:step] = 'shared-selection-write'
         state['active'] = operation.fetch('target')
         operation['stage'] = 'shared-start'
         provider_write_state(entry, state)
+        diagnostic[:step] = 'shared-start'
         system! 'systemctl', '--user', 'start', unit
-        provider_wait_shared_server(entry)
+        diagnostic[:step] = 'shared-readiness'
+        provider_wait_shared_server(entry, diagnostic:)
+        diagnostic[:step] = 'verify'
         provider_helper(entry, 'verify', snapshot:, target: operation.fetch('target'))
+        diagnostic[:step] = 'applied-write'
         provider_finish(state, 'applied', 'Provider changed. Terminal restoration is pending; run dev-session sync if interrupted.')
         provider_write_state(entry, state)
         begin
+          diagnostic[:step] = 'terminal-restore'
           provider_restore_terminals(entry, snapshot)
           operation.delete('message')
+          diagnostic[:step] = 'terminal-restored-write'
           provider_write_state(entry, state)
         rescue StandardError
           operation['message'] = 'Provider changed. Some terminal clients need dev-session sync.'
+          diagnostic[:step] = 'terminal-notice-write'
           provider_write_state(entry, state)
         end
-      rescue StandardError
+      rescue StandardError => error
+        provider_failure_diagnostic(operation, 'forward', diagnostic, error)
         provider_finish(state, 'recovery-required', 'Provider switch needs recovery. Run workspace-host provider recover for this workspace.')
         provider_write_state(entry, state)
         provider_recover(entry)
@@ -524,23 +587,39 @@ module DevWorkspaceHost
       unless data.fetch('threads').all? { |thread| thread['original'] }
         raise Error, 'provider recovery settings snapshot is incomplete'
       end
+      diagnostic = {step: 'running-state', started: Process.clock_gettime(Process::CLOCK_MONOTONIC)}
       begin
         running = capture!('systemctl', '--user', 'show', unit, '--property=MainPID', '--value').strip.to_i.positive?
-        require_provider_restart_safe!(entry, provider_helper(entry, 'inventory')) if running
+        if running
+          diagnostic[:step] = 'inventory'
+          inventory = provider_helper(entry, 'inventory')
+          diagnostic[:step] = 'restart-safety'
+          require_provider_restart_safe!(entry, inventory)
+        end
+        diagnostic[:step] = 'daemon-stop'
         system! 'systemctl', '--user', 'stop', unit
+        diagnostic[:step] = 'previous-selection'
         old = operation.fetch('previousActive')
+        diagnostic[:step] = 'private-start'
         provider_private_server(entry, old) do |socket|
+          diagnostic[:step] = 'private-resume'
           provider_helper(entry, 'resume', snapshot:, socket:)
         end
+        diagnostic[:step] = 'shared-selection-write'
         state['active'] = old
         operation['stage'] = 'shared-start'
         provider_write_state(entry, state)
+        diagnostic[:step] = 'shared-start'
         system! 'systemctl', '--user', 'start', unit
-        provider_wait_shared_server(entry)
+        diagnostic[:step] = 'shared-readiness'
+        provider_wait_shared_server(entry, diagnostic:)
+        diagnostic[:step] = 'verify'
         provider_helper(entry, 'verify', snapshot:)
+        diagnostic[:step] = 'failed-write'
         provider_finish(state, 'failed', 'Original routing was restored. Terminal restoration is pending; run dev-session sync if interrupted.')
         provider_write_state(entry, state)
-      rescue StandardError
+      rescue StandardError => error
+        provider_failure_diagnostic(operation, 'recovery', diagnostic, error)
         provider_finish(state, 'recovery-required', 'Recovery could not be verified. Workspace writes remain blocked; retry provider recovery.')
         provider_write_state(entry, state)
         raise Error, 'provider recovery could not be verified'
@@ -555,18 +634,25 @@ module DevWorkspaceHost
       end
     end
 
-    def provider_wait_shared_server(entry)
+    def provider_wait_shared_server(entry, diagnostic: nil)
       unit = "workspace-codex@#{entry.fetch('name')}.service"
       socket = instance_runtime(entry).fetch(:codex)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+      readiness = {mainPID: 'unavailable', activeState: 'unavailable', executableMatch: 'unavailable', socketPresent: 'unavailable', healthError: 'unavailable'}
+      diagnostic[:readiness] = readiness if diagnostic
       loop do
         properties = capture!('systemctl', '--user', 'show', unit, '--property=MainPID,ActiveState').lines.to_h { |line| line.strip.split('=', 2) }
+        readiness.merge!(mainPID: 'unavailable', activeState: 'unavailable', executableMatch: 'unavailable', socketPresent: 'unavailable')
+        readiness[:mainPID] = properties['MainPID'].to_i if properties['MainPID'].to_s.match?(/\A[0-9]{1,10}\z/)
+        readiness[:activeState] = properties['ActiveState'] if %w[active activating inactive deactivating failed reloading maintenance refreshing].include?(properties['ActiveState'])
         raise Error, 'shared native App Server exited during startup' unless %w[active activating].include?(properties['ActiveState']) && properties['MainPID'].to_i.positive?
-        if provider_process_binary(properties.fetch('MainPID').to_i) == provider_native_binary && File.socket?(socket)
+        readiness[:executableMatch] = provider_process_binary(properties.fetch('MainPID').to_i) == provider_native_binary
+        if readiness[:executableMatch] && (readiness[:socketPresent] = File.socket?(socket))
           begin
             provider_helper(entry, 'health')
             return
-          rescue StandardError
+          rescue StandardError => error
+            readiness[:healthError] = provider_failure_class(error)
             # A socket pathname alone does not prove protocol readiness.
           end
         end

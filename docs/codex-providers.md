@@ -112,6 +112,17 @@ restoration fails or is interrupted, use `dev-session sync SLUG --as-is` after
 routing has reached a terminal phase. Do not erase state or restart an
 unsafe service to bypass a refusal.
 
+When a provider change or recovery fails, the worker writes a `PROVIDER_FAILURE`
+record to stderr. Read the records with
+`journalctl --user -u workspace-codex-provider@WORKSPACE.service`.
+Each record is at most 2 KiB and identifies the operation, direction, stage,
+step, elapsed time, exception category and a few source labels and line numbers.
+Readiness failures include only observations already made by that attempt;
+unavailable values are explicit. Records omit error messages, commands, helper
+output, filesystem paths, credentials and snapshots. Diagnostic failures do not
+change recovery. Step and source labels locate a failure boundary; a helper
+failure may still need further diagnosis.
+
 Packages consuming saved state must advertise provider schema 1 and transition
 policy 1. Applying and recovery exclude package changes. Waiting requests survive
 compatible updates. Cancel waiting requests before suspension or unregistration.

@@ -63,13 +63,68 @@ class CodexProviderTestHost < DevWorkspaceHost::Host
   def sleep(_seconds) = nil
 end
 
+class ProviderDiagnosticTestHost < CodexProviderTestHost
+  attr_accessor :faults, :real_readiness
+  attr_reader :written_states
+
+  def initialize(**arguments)
+    super
+    @faults, @written_states = {}, []
+  end
+
+  private
+
+  def fault(point)
+    error = @faults[point]&.shift
+    raise error if error
+  end
+
+  def provider_helper(entry, action, **)
+    @calls << ['helper', action]
+    fault(['helper', action])
+    return {'schema' => 1, 'workspace' => entry.fetch('root'), 'threads' => [], 'loaded' => [], 'blockers' => []} if %w[inventory capture].include?(action)
+    {'verified' => true}
+  end
+
+  def provider_private_server(_entry, provider)
+    @calls << ['private', provider]
+    fault(['private', provider])
+    yield '/private/synthetic-socket'
+  end
+
+  def quiesce_sessions(*, **) = @calls << ['quiesce']
+
+  def provider_wait_shared_server(entry, diagnostic: nil)
+    @calls << ['readiness']
+    @checking_readiness = true
+    super if @real_readiness
+  ensure
+    @checking_readiness = false
+  end
+
+  def provider_process_binary(pid)
+    fault(['identity']) if @checking_readiness
+    super
+  end
+
+  def capture!(*arguments)
+    fault(['readiness-properties']) if arguments.include?('--property=MainPID,ActiveState')
+    super
+  end
+
+  def provider_write_state(entry, state)
+    super
+    @written_states << [state.dig('operation', 'phase'), state.dig('operation', 'stage'), state['active']]
+  end
+end
+
 class WorkspaceHostTest
-  def with_provider_host
+  def with_provider_host(host_class: CodexProviderTestHost)
     Dir.mktmpdir('provider-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
       config = File.join(directory, 'config', 'registry.json')
       DevWorkspaceHost::Registry.new(config).register(name: 'example', root:, hostname: 'workspace.example.test', aliases: [], replace: false)
-      host = CodexProviderTestHost.new(env: host_environment(directory, config:), out: StringIO.new, err: StringIO.new)
+      host = host_class.new(env: host_environment(directory, config:), out: StringIO.new, err: StringIO.new)
       host.catalog = {'digest' => 'a' * 64, 'catalog' => {'schema' => 1, 'initialProvider' => 'openai', 'providers' => [
         {'id' => 'openai', 'label' => 'Subscription', 'kind' => 'subscription'},
         {'id' => 'pool', 'label' => 'Pool', 'kind' => 'codex-lb', 'baseURL' => 'http://127.0.0.1:2455/v1', 'tokenFile' => '/private/token'}
@@ -279,5 +334,267 @@ class WorkspaceHostTest
       inventory['blockers'] = ['active turn']
       assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
     end
+  end
+
+  def prepare_diagnostic_apply(host, entry)
+    id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    host.send(:provider_command, ['request', 'example', 'pool', id])
+    state = host.send(:provider_state, entry)
+    snapshot = File.join(host.send(:provider_directory, entry), "#{id}.snapshot.json")
+    host.send(:atomic_private_file, snapshot, JSON.generate('schema' => 1, 'threads' => []))
+    state['operation'].merge!('phase' => 'applying', 'stage' => 'capturing', 'snapshot' => snapshot, 'previousActive' => 'openai')
+    host.send(:provider_write_state, entry, state)
+    host.calls.clear
+    host.written_states.clear
+    [state, snapshot]
+  end
+
+  def provider_failure_records(host)
+    host.instance_variable_get(:@err).string.lines.map do |line|
+      assert_operator line.bytesize, :<=, 2048
+      assert line.start_with?('PROVIDER_FAILURE ')
+      refute_match(/SECRET_CANARY|private|https:|Bearer|argv|snapshot|rpc-payload/, line)
+      data = JSON.parse(line.delete_prefix('PROVIDER_FAILURE '))
+      assert_operator data.fetch('frames').length, :<=, 4
+      assert data.fetch('frames').all? { |frame| %w[workspace-host workspace-codex-providers.rb].include?(frame.fetch('source')) && frame.fetch('line').is_a?(Integer) }
+      data
+    end
+  end
+
+  def test_provider_failure_diagnostics_separate_forward_and_recovery_without_changing_order
+    outcomes = []
+    [:working, :broken_sink, :broken_formatter].each do |sink|
+      with_provider_host(host_class: ProviderDiagnosticTestHost) do |host, entry|
+        state, snapshot = prepare_diagnostic_apply(host, entry)
+        forward = Errno::EIO.new('SECRET_CANARY /private/token argv Bearer rpc-payload' * 4096)
+        recovery = Class.new(StandardError).new('SECRET_CANARY https://private/endpoint')
+        if sink == :broken_sink
+          broken = Object.new
+          broken.define_singleton_method(:write) { |_| raise IOError, 'SECRET_CANARY sink' }
+          host.instance_variable_set(:@err, broken)
+        elsif sink == :broken_formatter
+          [forward, recovery].each { |error| error.define_singleton_method(:backtrace_locations) { raise 'SECRET_CANARY formatter' } }
+        end
+        host.faults[['helper', 'verify']] = [forward, recovery]
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:provider_apply, entry, state, snapshot) }
+        assert_equal 'provider recovery could not be verified', error.message
+        saved = host.send(:provider_state, entry)
+        assert_equal 'recovery-required', saved.dig('operation', 'phase')
+        assert_equal 'openai', saved['active']
+        outcomes << [host.calls, host.written_states, saved.dig('operation', 'message')]
+        if sink == :working
+          records = provider_failure_records(host)
+          assert_equal %w[forward recovery], records.map { |record| record.fetch('direction') }
+          assert_equal %w[verify verify], records.map { |record| record.fetch('step') }
+          assert_equal ['Errno::EIO', 'OtherError'], records.map { |record| record.fetch('exception') }
+          assert_equal Errno::EIO::Errno, records.first.fetch('errno')
+          assert records.all? { |record| record.fetch('operation') == state.dig('operation', 'id') && record.fetch('stage') == 'shared-start' }
+          assert records.all? { |record| record.fetch('elapsedMs').is_a?(Integer) }
+          refute records.any? { |record| record.key?('readiness') }
+        elsif sink == :broken_formatter
+          assert_empty provider_failure_records(host)
+        end
+      end
+    end
+    assert_equal outcomes.first, outcomes[1]
+    assert_equal outcomes.first, outcomes[2]
+    calls, states = outcomes.first
+    assert_equal %w[stop start stop start], calls.select { |call| call.first == 'systemctl' && %w[stop start].include?(call[2]) }.map { |call| call[2] }
+    assert_equal ['capture', 'inventory', 'resume', 'verify', 'inventory', 'resume', 'verify'], calls.select { |call| call.first == 'helper' }.map(&:last)
+    assert_equal [
+      ['applying', 'quiescing', 'openai'], ['applying', 'daemon-stop', 'openai'],
+      ['applying', 'shared-start', 'pool'], ['recovery-required', 'shared-start', 'pool'],
+      ['recovery-required', 'shared-start', 'openai'], ['recovery-required', 'shared-start', 'openai']
+    ], states
+  end
+
+  def test_provider_failure_diagnostics_leave_success_and_compensation_state_compatible
+    with_provider_host(host_class: ProviderDiagnosticTestHost) do |host, entry|
+      state, snapshot = prepare_diagnostic_apply(host, entry)
+      host.send(:provider_apply, entry, state, snapshot)
+      assert_empty provider_failure_records(host)
+      assert_equal 'applied', host.send(:provider_state, entry).dig('operation', 'phase')
+      state, snapshot = prepare_diagnostic_apply(host, entry)
+      host.faults[['helper', 'verify']] = [RuntimeError.new('SECRET_CANARY')]
+      host.send(:provider_apply, entry, state, snapshot)
+      saved = host.send(:provider_state, entry)
+      assert_equal 'failed', saved.dig('operation', 'phase')
+      assert_equal 'openai', saved['active']
+      assert_equal ['forward'], provider_failure_records(host).map { |record| record['direction'] }
+      assert_equal %w[blockers catalogDigest createdAt id phase previousActive snapshot stage target updatedAt message].sort, saved.fetch('operation').keys.sort
+    end
+  end
+
+  def test_provider_failure_readiness_keeps_only_current_attempt_observations
+    cases = [
+      {fault: ['readiness-properties'], error: RuntimeError.new('SECRET_CANARY'), expected: {'mainPID' => 'unavailable', 'activeState' => 'unavailable', 'executableMatch' => 'unavailable', 'socketPresent' => 'unavailable', 'healthError' => 'unavailable'}},
+      {fault: ['identity'], error: Errno::ENOENT.new('SECRET_CANARY'), expected: {'mainPID' => 123, 'activeState' => 'active', 'executableMatch' => 'unavailable', 'socketPresent' => 'unavailable', 'healthError' => 'unavailable'}},
+      {fault: ['helper', 'health'], error: IOError.new('SECRET_CANARY'), expected: {'mainPID' => 123, 'activeState' => 'active', 'executableMatch' => true, 'socketPresent' => true, 'healthError' => 'IOError'}}
+    ]
+    cases.each do |test|
+      with_provider_host(host_class: ProviderDiagnosticTestHost) do |host, entry|
+        state, snapshot = prepare_diagnostic_apply(host, entry)
+        host.real_readiness = true
+        host.faults[test.fetch(:fault)] = [test.fetch(:error)]
+        host.service_states = ["MainPID=123\nActiveState=active\n"] * 2
+        # Existing deadline expires after the first failed health check, with no
+        # actual wait, service process or socket. Recovery gets its own context.
+        tick = 0
+        clock = ->(*) { tick += 1; tick == 3 ? 31.0 : 0.0 }
+        original_clock = Process.method(:clock_gettime)
+        original_socket = File.method(:socket?)
+        begin
+          Process.define_singleton_method(:clock_gettime, &clock)
+          File.define_singleton_method(:socket?) { |_| true }
+          host.send(:provider_apply, entry, state, snapshot)
+        ensure
+          Process.define_singleton_method(:clock_gettime, original_clock)
+          File.define_singleton_method(:socket?, original_socket)
+        end
+        records = provider_failure_records(host)
+        assert_equal 1, records.length
+        assert_equal 'shared-readiness', records.first.fetch('step')
+        assert_equal test.fetch(:expected), records.first.fetch('readiness')
+        assert records.first.fetch('frames').any? if test.fetch(:fault) == ['helper', 'health']
+        assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
+      end
+    end
+  end
+
+  def test_provider_failure_readiness_does_not_reuse_forward_values_in_recovery
+    with_provider_host(host_class: ProviderDiagnosticTestHost) do |host, entry|
+      state, snapshot = prepare_diagnostic_apply(host, entry)
+      host.real_readiness = true
+      host.service_states = ["MainPID=123\nActiveState=active\n"]
+      host.faults[['identity']] = [Errno::ENOENT.new('SECRET_CANARY')]
+      host.faults[['readiness-properties']] = [nil, RuntimeError.new('SECRET_CANARY')]
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_apply, entry, state, snapshot) }
+      forward, recovery = provider_failure_records(host)
+      assert_equal 123, forward.dig('readiness', 'mainPID')
+      assert_equal 'active', forward.dig('readiness', 'activeState')
+      assert_equal ['unavailable'], recovery.fetch('readiness').values.uniq
+      assert_equal %w[forward recovery], [forward, recovery].map { |record| record['direction'] }
+    end
+  end
+
+  def test_provider_failure_readiness_retains_last_observation_when_next_read_fails
+    with_provider_host(host_class: ProviderDiagnosticTestHost) do |host, entry|
+      state, snapshot = prepare_diagnostic_apply(host, entry)
+      host.real_readiness = true
+      host.service_states = ["MainPID=123\nActiveState=active\n"] * 2
+      host.faults[['helper', 'health']] = [IOError.new('SECRET_CANARY')]
+      host.faults[['readiness-properties']] = [nil, RuntimeError.new('SECRET_CANARY')]
+      original_socket = File.method(:socket?)
+      begin
+        File.define_singleton_method(:socket?) { |_| true }
+        host.send(:provider_apply, entry, state, snapshot)
+      ensure
+        File.define_singleton_method(:socket?, original_socket)
+      end
+      record = provider_failure_records(host).fetch(0)
+      assert_equal({'mainPID' => 123, 'activeState' => 'active', 'executableMatch' => true, 'socketPresent' => true, 'healthError' => 'IOError'}, record['readiness'])
+      assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
+    end
+  end
+
+  def test_provider_failure_projection_bounds_untrusted_error_metadata
+    with_provider_host do |host, _entry|
+      operation = {'id' => 'SECRET_CANARY' * 4096, 'stage' => 'SECRET_CANARY'}
+      diagnostic = {step: 'verify', started: Process.clock_gettime(Process::CLOCK_MONOTONIC)}
+      host.send(:provider_failure_diagnostic, operation, 'forward', diagnostic, Class.new(StandardError).new('SECRET_CANARY' * 4096))
+      record = provider_failure_records(host).fetch(0)
+      assert_equal 'unavailable', record['operation']
+      assert_equal 'unavailable', record['stage']
+      assert_equal 'OtherError', record['exception']
+      assert_equal 'unavailable', record['errno']
+    end
+  end
+
+  def test_recovery_vm_wait_returns_terminal_to_python_and_keeps_expected_recovery_phases
+    fixture = File.expand_path('../../nix/tests/session-recovery-boot.nix', __dir__)
+    script = <<~'PY'
+      import ast, contextlib, io, json, re, shlex, sys, textwrap
+      from pathlib import Path
+      source = Path(sys.argv[1]).read_text()
+      driver = source.split("  testScript = ''\n", 1)[1].rsplit("  '';", 1)[0]
+      driver = textwrap.dedent(re.sub(r"\$\{[^}]+\}", "/synthetic-store/path", driver))
+      tree = ast.parse(driver)
+      names = {'wait_provider_result', 'wait_phase', 'collect_provider_diagnostics'}
+      functions = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names], type_ignores=[])
+      class Machine:
+          def __init__(self):
+              self.phase = 'waiting'
+              self.calls = 0
+              self.collection = []
+              self.collection_timeouts = []
+              self.fail_collection = False
+          def wait_until_succeeds(self, command):
+              self.calls += 1
+              expression = shlex.split(shlex.split(command)[-1])[-1]
+              def safe_open(path):
+                  assert path == '/fixture/state.json'
+                  return io.StringIO(json.dumps({'operation': {'phase': self.phase, 'blockers': ['synthetic']}}))
+              output = io.StringIO()
+              with contextlib.redirect_stdout(output):
+                  exec(expression, {'open': safe_open})
+              return output.getvalue()
+          def execute(self, command, *, timeout):
+              assert timeout == 10
+              self.collection.append(command)
+              self.collection_timeouts.append(timeout)
+              if self.fail_collection:
+                  raise TimeoutError('SECRET_CANARY collection')
+              return 0, 'safe-fixture-evidence'
+      machine = Machine()
+      scope = dict(machine=machine, json=json, shlex=shlex, state_path='/fixture/state.json', user_prefix='', host='/synthetic-host', user=lambda command: '{}', diagnostic_start='123', worker='workspace-codex-provider@fixture.service', codex_unit='workspace-codex@fixture.service')
+      exec(compile(functions, 'selected-vm-functions', 'exec'), scope)
+      wait = scope['wait_phase']
+      for phase in ['applied', 'failed', 'recovery-required', 'canceled']:
+          machine.phase = phase
+          wait(phase)  # Expected phase is checked before terminal classification.
+      assert not machine.collection
+      for phase in ['failed', 'canceled']:
+          machine.phase = phase
+          machine.fail_collection = True
+          before = machine.calls
+          output = io.StringIO()
+          try:
+              with contextlib.redirect_stdout(output):
+                  wait('applied')
+              raise RuntimeError('unexpected terminal accepted')
+          except AssertionError as error:
+              assert str(error) == 'provider reached an unexpected terminal phase'
+          assert machine.calls == before + 1  # Terminal shell return was successful.
+          assert 'SECRET_CANARY' not in output.getvalue()
+      assert len(machine.collection) == 6
+      assert machine.collection_timeouts == [10] * 6
+      assert sum(machine.collection_timeouts[:3]) == 30
+      journal = machine.collection[0]
+      assert '--unit=workspace-codex-provider@fixture.service' in journal
+      assert '--unit=workspace-codex@fixture.service' in journal
+      assert 'tail -c 65536' in journal
+      # Nonterminal phases keep the existing retry path (simulated first attempt).
+      for phase in ['waiting', 'applying', 'recovery-required']:
+          machine.phase = phase
+          try:
+              with contextlib.redirect_stdout(io.StringIO()):
+                  wait('applied')
+              raise RuntimeError('intermediate incorrectly accepted')
+          except AssertionError as error:
+              assert str(error) != 'provider reached an unexpected terminal phase'
+      assert source.count('with subtest(') == 5
+      assert source.count('machine.reboot()') == 2
+      assert "wait_phase(\"recovery-required\")" in source
+      assert source.count('wait_phase("failed")') == 2
+      metadata = textwrap.dedent(source.split('metadata = pkgs.writeText "recovery-fixture-metadata.py" \'\'\n', 1)[1].split("  '';\nin", 1)[0])
+      compile(metadata, 'fixture-metadata', 'exec')
+      assert 'os.O_NOFOLLOW' in metadata and 'os.O_NONBLOCK' in metadata
+      assert 'info.st_uid != 1000' in metadata and 'op.get("snapshot") == BASE + snapshot_name' in metadata
+      assert 'threadCount' in metadata and 'terminalCount' in metadata
+      print('VM wait expected/unexpected/intermediate phases and bounded collection: PASS')
+    PY
+    stdout, stderr, status = Open3.capture3('python3', '-c', script, fixture)
+    assert status.success?, stderr
+    assert_includes stdout, 'PASS'
   end
 end

@@ -3,6 +3,89 @@
   self,
   devWorkspace,
 }:
+let
+  metadata = pkgs.writeText "recovery-fixture-metadata.py" ''
+    """Failure-only, read-only projection of this VM's fixed disposable fixture."""
+    import json
+    import os
+    import stat
+
+    BASE = "/home/developer/.local/state/dev-workspaces/providers/fixture/"
+    IDS = {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+    ROOT = "/home/developer/workspace"
+    SOCKET = "/run/user/1000/dev-workspaces/fixture/app-server.sock"
+    PHASES = {"waiting", "applying", "applied", "canceled", "failed", "recovery-required"}
+    STAGES = {"capturing", "quiescing", "daemon-stop", "shared-start"}
+    PROVIDERS = {"openai", "pool", "pooltwo"}
+
+
+    def private_json(name, maximum):
+        # Fixed basename only. Never follow a snapshot reference supplied by state.
+        fd = os.open(BASE + name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 1000 or info.st_mode & 0o077:
+                raise ValueError("private file")
+            if info.st_size > maximum:
+                raise ValueError("file bound")
+            data = stream.read(maximum + 1)
+            if len(data) > maximum:
+                raise ValueError("read bound")
+            return json.loads(data)
+
+
+    def enum(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "invalid-or-absent"
+
+
+    def main():
+        result = {"kind": "fixture-provider-metadata"}
+        try:
+            state = private_json("state.json", 1024 * 1024)
+            assert isinstance(state, dict) and state.get("schema") == 1
+            assert state.get("workspace") == "fixture" and state.get("root") == ROOT
+            assert state.get("socket") == SOCKET
+            op = state["operation"]
+            assert isinstance(op, dict) and op.get("id") in IDS
+            blockers = op.get("blockers")
+            result["operation"] = {
+                "phase": enum(op.get("phase"), PHASES),
+                "stage": enum(op.get("stage"), STAGES),
+                "active": enum(state.get("active"), PROVIDERS),
+                "target": enum(op.get("target"), PROVIDERS),
+                "previousActive": enum(op.get("previousActive"), PROVIDERS),
+                "blockerCount": len(blockers) if isinstance(blockers, list) else None,
+            }
+            snapshot_name = op["id"] + ".snapshot.json"
+            assert op.get("snapshot") == BASE + snapshot_name
+            try:
+                snapshot = private_json(snapshot_name, 16 * 1024 * 1024)
+                assert isinstance(snapshot, dict) and snapshot.get("schema") == 1
+                assert snapshot.get("workspace") == ROOT
+                threads, loaded = snapshot["threads"], snapshot["loaded"]
+                assert isinstance(threads, list) and len(threads) <= 4096
+                assert isinstance(loaded, list) and len(loaded) <= 4096
+                result["snapshot"] = {"status": "validated", "threadCount": len(threads), "loadedCount": len(loaded)}
+            except Exception:
+                result["snapshot"] = {"status": "unavailable-or-invalid"}
+            try:
+                terminals = private_json(snapshot_name + ".terminals", 1024 * 1024)
+                assert isinstance(terminals, dict) and terminals.get("schema") == 1
+                assert terminals.get("workspace") == "fixture" and terminals.get("root") == ROOT
+                assert terminals.get("socket") == SOCKET
+                assert isinstance(terminals["terminals"], list) and len(terminals["terminals"]) <= 4096
+                result["terminals"] = {"status": "validated", "terminalCount": len(terminals["terminals"])}
+            except Exception:
+                result["terminals"] = {"status": "unavailable-or-invalid"}
+        except Exception:
+            result["state"] = "unavailable-or-invalid"
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
+    if __name__ == "__main__":
+        main()
+  '';
+in
 pkgs.testers.runNixOSTest {
   name = "dev-workspace-session-recovery-boot";
   nodes.machine = {
@@ -53,7 +136,7 @@ pkgs.testers.runNixOSTest {
     };
     environment.systemPackages = [ pkgs.git ];
     # Register the user-profile closure in the VM's own Nix database.
-    virtualisation.additionalPaths = [ devWorkspace ];
+    virtualisation.additionalPaths = [ devWorkspace metadata ];
     system.stateVersion = "26.05";
   };
   testScript = ''
@@ -96,12 +179,43 @@ pkgs.testers.runNixOSTest {
     worker = "workspace-codex-provider@fixture.service"
     codex_unit = "workspace-codex@fixture.service"
 
-    def wait_phase(phase):
+    diagnostic_start = machine.succeed("date +%s").strip()
+    assert diagnostic_start.isdigit()
+
+    def collect_provider_diagnostics():
+        commands = [
+            "journalctl --user --no-pager --output=short-monotonic --since=@" + diagnostic_start
+            + " --unit=" + worker + " --unit=" + codex_unit + " | tail -c 65536",
+            "systemctl --user show " + worker + " " + codex_unit
+            + " --property=ActiveState,SubState,MainPID,Result,ExecMainStatus,NRestarts",
+            "${pkgs.python3}/bin/python3 ${metadata}",
+        ]
+        for command in commands:
+            try:
+                status, output = machine.execute(user_prefix + "sh -c " + shlex.quote(command), timeout=10)
+                print(output)
+                print("PROVIDER_DIAGNOSTIC_COLLECTION_STATUS=" + str(status))
+            except Exception:
+                print("PROVIDER_DIAGNOSTIC_COLLECTION_UNAVAILABLE")
+
+    def wait_provider_result(predicate):
+        # A terminal result returns to Python. A nonzero shell exit alone would
+        # keep wait_until_succeeds polling an already-failed operation for 900s.
         command = "${pkgs.python3}/bin/python3 -c " + shlex.quote(
             "import json; d=json.load(open(" + repr(state_path) + ")); o=d['operation']; "
-            "assert o['phase'] == " + repr(phase) + ", json.dumps({k:o.get(k) for k in ['phase','stage','blockers','message']})")
-        machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(command))
-        return json.loads(user(host + " provider status fixture"))
+            "expected=(" + predicate + "); terminal=o['phase'] in ['failed','canceled']; "
+            "assert expected or terminal; "
+            "print('PROVIDER_EXPECTED_RESULT' if expected else 'PROVIDER_UNEXPECTED_TERMINAL')")
+        try:
+            output = machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(command))
+            assert "PROVIDER_UNEXPECTED_TERMINAL" not in output, "provider reached an unexpected terminal phase"
+            return json.loads(user(host + " provider status fixture"))
+        except Exception:
+            collect_provider_diagnostics()
+            raise
+
+    def wait_phase(phase):
+        return wait_provider_result("o['phase'] == " + repr(phase))
 
     with subtest("foreign cgroup processes block the real worker until removed"):
         foreign_pid = machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(
@@ -109,9 +223,7 @@ pkgs.testers.runNixOSTest {
         group = user("systemctl --user show " + codex_unit + " -p ControlGroup --value").strip()
         machine.succeed("echo " + foreign_pid + " > " + shlex.quote("/sys/fs/cgroup" + group + "/cgroup.procs"))
         user(host + " provider request fixture pool aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-        blocked = "${pkgs.python3}/bin/python3 -c " + shlex.quote(
-            "import json; d=json.load(open(" + repr(state_path) + ")); assert d['operation']['phase']=='waiting' and d['operation']['blockers']")
-        machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(blocked))
+        wait_provider_result("o['phase']=='waiting' and o['blockers']")
         machine.succeed("kill " + foreign_pid)
         assert wait_phase("applied")["active"] == "pool"
         assert_services()
