@@ -719,6 +719,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.index(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/automatic-archival":
 		s.render(w, "automatic-archival", pageData{})
+	case r.Method == http.MethodGet && r.URL.Path == "/browser-notifications":
+		s.render(w, "browser-notifications-page", pageData{})
 	case r.Method == http.MethodGet && r.URL.Path == "/operations":
 		s.render(w, "operations", pageData{})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/upload-drafts":

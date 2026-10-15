@@ -54,6 +54,40 @@ func notificationRequest(n *notificationService, method, path, body string) *htt
 	return w
 }
 
+func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.DevSession = filepath.Join(t.TempDir(), "unavailable-dev-session")
+	index := httptest.NewRecorder()
+	server.Handler().ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
+	if index.Code != http.StatusOK {
+		t.Fatalf("index: %d: %s", index.Code, index.Body.String())
+	}
+	_, menu, ok := strings.Cut(index.Body.String(), `<nav id="sidebar-menu"`)
+	menu, _, _ = strings.Cut(menu, "</nav>")
+	if !ok || !strings.Contains(menu, `href="/browser-notifications"`) {
+		t.Fatal("browser notifications must be reachable through the workspace menu")
+	}
+	for _, removed := range []string{`id="browser-notifications"`, `src="/static/browser-notifications.js"`, "data-notification-enable"} {
+		if strings.Contains(index.Body.String(), removed) {
+			t.Fatalf("index still initializes browser controls: %s", removed)
+		}
+	}
+	if !strings.Contains(index.Body.String(), `name="browserNotificationsEnabled" type="checkbox" checked`) {
+		t.Fatal("new-session notification preference must remain available")
+	}
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/browser-notifications", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
+	}
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js" defer`, `href="/"`} {
+		if !strings.Contains(page.Body.String(), required) {
+			t.Fatalf("notification page lacks %s", required)
+		}
+	}
+}
+
 func TestNotificationsPersistenceFailureAndKeyRetention(t *testing.T) {
 	n := testNotifications(t)
 	store := n.store

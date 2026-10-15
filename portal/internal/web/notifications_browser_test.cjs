@@ -2,18 +2,55 @@
 const assert = require("node:assert/strict");
 const {chromium, firefox, expect} = require("@playwright/test");
 const base = process.argv[2];
+async function checkControlSpacing(page) {
+  const buttons = await page.locator("#browser-notifications button").all();
+  const bounds = await Promise.all(buttons.map(button => button.boundingBox()));
+  const viewport = page.viewportSize();
+  for (let i = 0; i < bounds.length; i++) {
+    assert.ok(bounds[i] && bounds[i].x >= 0 && bounds[i].x + bounds[i].width <= viewport.width, "notification control fits the viewport");
+    if (i) assert.ok(bounds[i].y >= bounds[i - 1].y + bounds[i - 1].height + 8 ||
+      bounds[i].x >= bounds[i - 1].x + bounds[i - 1].width + 8, "notification controls have space between them");
+  }
+}
 (async () => {
   for (const engine of [chromium, firefox]) {
     const browser = await engine.launch({headless: true, ...(engine === chromium ? {channel: "chromium", args: ["--ignore-certificate-errors"]} : {})});
     try {
       const context = await browser.newContext({ignoreHTTPSErrors: true});
       const page = await context.newPage();
-      const errors = []; page.on("pageerror", error => errors.push(error.message));
-      await page.goto(`${base}/example/#settings`);
+      const errors = [], mutations = []; page.on("pageerror", error => errors.push(error.message));
+      page.on("request", request => {if (request.method() === "POST" && new URL(request.url()).pathname.startsWith("/api/browser-notifications")) mutations.push(request.url());});
+      await page.goto(base);
+      await expect(page.locator("#browser-notifications")).toHaveCount(0);
+      const toggle = page.getByRole("button", {name: "Workspace menu", exact: true});
+      await toggle.focus(); await page.keyboard.press("Enter");
+      await expect(page.getByRole("link", {name: "Operations", exact: true})).toBeFocused();
+      await page.keyboard.press("Escape"); await expect(toggle).toBeFocused();
+      await toggle.click();
+      await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
+      await page.waitForURL("**/browser-notifications");
+      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await checkControlSpacing(page);
+      await page.setViewportSize({width: 375, height: 812});
+      await checkControlSpacing(page);
+      await page.getByRole("link", {name: "Back to workspace", exact: true}).click();
+      await expect(page.locator("#browser-notifications")).toHaveCount(0);
+      await toggle.click();
+      await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
+      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await page.goto(`${base}/example/#codex`);
+      await expect(page.locator("#browser-notifications")).toBeHidden();
+      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await page.locator("#session-tab-settings").click();
       await expect(page.locator("#browser-notifications")).toBeVisible();
+      await checkControlSpacing(page);
+      await page.setViewportSize({width: 1280, height: 720});
+      await checkControlSpacing(page);
       await expect(page.locator("#session-notifications-enabled")).toBeChecked();
       await expect(page.locator("#session-attention-status")).toContainText(/^(?!.*unavailable)/);
       assert.equal(await page.evaluate(() => Notification.permission), "default", "page load did not ask for permission");
+      assert.deepEqual(mutations, [], "opening or revealing controls never changes a subscription");
+      assert.equal(context.serviceWorkers().length, 0, "opening controls did not register a worker");
       const workerAsset = await context.request.get(`${base}/notification-worker.js`);
       assert.equal(workerAsset.status(), 200);
       assert.equal(workerAsset.headers()["service-worker-allowed"], "/");
