@@ -1,5 +1,5 @@
 "use strict";
-importScripts("/static/session-attention-store.js");
+importScripts("/static/session-attention-store.js?v=2");
 
 const reason = kind => ({input: "Your answer is needed", approval: "Approval needed", done: "Response finished", test: "Browser notification test"})[kind];
 const safeRoute = value => {
@@ -14,9 +14,54 @@ const valid = payload => payload && payload.version === 1 && /^[0-9a-f]{64}$/.te
   Number.isSafeInteger(payload.expiresAt) && payload.revision > 0 && typeof payload.slug === "string" && payload.slug.length <= 128 &&
   reason(payload.kind) && safeRoute(payload.route);
 
+async function notifyTestPages(identity) {
+  try {
+    const windows = await self.clients.matchAll({type: "window", includeUncontrolled: true});
+    windows.forEach(client => client.postMessage({type: "notification-test-update", identity}));
+  } catch (_) {}
+}
+async function boundedTestRead(promise, fallback) {
+  let timer;
+  try { return await Promise.race([promise, new Promise(resolve => { timer = setTimeout(() => resolve(fallback), 750); })]); }
+  catch (_) { return fallback; }
+  finally { clearTimeout(timer); }
+}
+async function displayTest(payload) {
+  const descriptor = workspaceAttentionStore.testDescriptor?.(payload);
+  const save = async outcome => {
+    if (!descriptor) return;
+    await boundedTestRead(Promise.resolve().then(() => workspaceAttentionStore.saveTest(descriptor, outcome)), null);
+    await boundedTestRead(notifyTestPages(payload.identity), null);
+  };
+  await save({received: true, display: "pending", browserRecord: "unavailable"});
+  const tag = `test-${payload.identity}-${payload.id}`;
+  try {
+    // Only older tests for this registration are retired. Session notifications
+    // and a newer explicit test remain untouched by a late/duplicate push.
+    const previous = await boundedTestRead(self.registration.getNotifications(), []);
+    previous.filter(item => item.data?.testIdentity === payload.identity && item.tag !== tag &&
+      Number.isSafeInteger(item.data.testRevision) && item.data.testRevision < payload.revision).slice(0, 32).forEach(item => item.close());
+  } catch (_) {}
+  try {
+    await self.registration.showNotification("Workspace", {body: reason("test"), tag, renotify: false,
+      data: {route: "/", testIdentity: payload.identity, testRevision: payload.revision}});
+  } catch (error) {
+    await save({received: true, display: "rejected", error: workspaceAttentionStore.testError?.(error) || "UnknownError", browserRecord: "unavailable"});
+    return;
+  }
+  let browserRecord = "unavailable";
+  const notifications = await boundedTestRead(self.registration.getNotifications({tag}), null);
+  if (notifications) browserRecord = notifications.some(item => item.tag === tag) ? "present" : "absent";
+  await save({received: true, display: "resolved", browserRecord});
+}
+
 async function display(payload) {
   if (!valid(payload)) {
     await self.registration.showNotification("Workspace update", {body: "Open the workspace to check its current status.", tag: "workspace-update", renotify: false, data: {route: "/"}});
+    return;
+  }
+  if (payload.kind === "test" && /^test-[0-9a-f]{64}$/.test(payload.identity)) {
+    await displayTest(payload);
     return;
   }
   let record, trusted = payload.kind === "test";
@@ -71,6 +116,10 @@ self.addEventListener("notificationclick", event => {
   })());
 });
 self.addEventListener("message", event => {
+  if (event.data?.type === "notification-test-capabilities") {
+    event.ports?.[0]?.postMessage({version: 1});
+    return;
+  }
   if (event.data?.type !== "session-attention-ack" || !/^[0-9a-f]{64}$/.test(event.data.identity)) return;
   event.waitUntil((async () => {
     const notifications = await self.registration.getNotifications({tag: `session-${event.data.identity}`});

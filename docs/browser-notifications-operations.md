@@ -34,8 +34,21 @@ fresh-status checks and clicks, and their own connection to the vendor push
 service. Verify the explicit Enable and Send test actions with the actual
 browser build. Check another active site, all portal tabs closed and the browser
 minimized or unfocused. Verify click navigation through normal authentication.
-Record provider acceptance, worker receipt, OS display and click results
-separately. Synthetic HTTP/worker tests do not prove macOS display.
+Record queue acceptance, the last provider result, exact test worker receipt,
+display API resolution or rejection, matching browser notification record,
+physical OS appearance and click results separately. The last provider result
+is registration-wide and may belong to another notification. A worker receipt
+saved before display cannot establish that the display API resolved. A resolved
+API or browser record still cannot establish physical appearance. Synthetic
+HTTP/worker tests and Linux displays do not prove macOS display.
+
+The successful Test reply adds only an exact event descriptor: `id`, `identity`,
+`revision` and `expiresAt`. The client matches all four to the worker's bounded
+local outcome. Reopen the controls after a background test to resume its check.
+An old server or worker without these fields provides limited results, not proof
+of delivery. New assets check/update an existing worker registration; a waiting
+update requires closing portal tabs before reopening. No silent unregister,
+resubscribe or VAPID reset is part of this check.
 
 ## Private state
 

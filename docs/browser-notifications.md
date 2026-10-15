@@ -43,9 +43,25 @@ appear on the lock screen. The browser vendor's push service handles encrypted
 delivery and can observe delivery metadata.
 
 Use **Send test notification** after enabling. The server waits ten seconds so
-you can close all portal tabs or switch windows before checking delivery. A
-provider-accepted result means the push service accepted the message; confirm
-that the browser and operating system displayed it. **Disable on this browser**
+you can close all portal tabs or switch windows before checking delivery. Open
+these controls from **Browser notifications** in the workspace menu or from
+session Settings. The test result distinguishes arrival in this browser, whether
+the browser accepted or rejected the display request, and whether it retained a
+matching notification record. None of these confirms appearance on your screen.
+The last push-service result may belong to another notification; it cannot
+confirm this test. The page checks for a result until ten seconds after the
+test's one-minute expiry and resumes the saved check after reopening. Missing
+or unavailable results remain unconfirmed.
+
+Existing subscribers may need a notification update before detailed test results
+are available. The page checks the installed worker and reports a waiting or
+unconfirmed update. Close all portal tabs and reopen when prompted. It never
+unregisters the worker or replaces a subscription automatically. Each explicit
+test gets a fresh notification entry; duplicate delivery of that test coalesces.
+Only older test entries for the same browser registration are closed. Session
+notification tags and acknowledgement are unchanged.
+
+**Disable on this browser**
 removes the server registration and unsubscribes locally. It leaves the browser's
 site permission unchanged. The two removals are independent: server failure does
 not prevent local unsubscribe. If server cleanup remains uncertain, the browser
@@ -97,7 +113,7 @@ up to six attempts within the original expiry. HTTP 404/410 retires the
 subscription. Permanent provider failures appear in browser Settings. Provider
 Topic and notification tag coalesce messages for the same session.
 
-The worker always displays a visible notification for a delivered push. A
+The worker attempts to display a visible notification for every delivered push. A
 bounded authenticated status read verifies its current meaning. Expired,
 resolved, muted, superseded, acknowledged or unverifiable delivery uses
 **Session update available**. A missing or inaccessible session uses
@@ -105,6 +121,14 @@ resolved, muted, superseded, acknowledged or unverifiable delivery uses
 revision replacing newer known state; duplicates replace the same notification
 with `renotify: false`. A worker crash can lose display. No exactly-once delivery
 guarantee is claimed.
+
+The browser's existing version-1 attention database keeps at most one pending
+test descriptor and the latest test outcome per test identity, with no
+database upgrade. These optional fields contain event IDs, revisions, expiry,
+fixed stage names and an allowlisted browser error category. They contain no
+endpoint, subscription key, provider response or notification payload. Older
+clients or workers leave the new result unknown. Local diagnostic storage
+failure does not prevent the worker from attempting display.
 
 Once accepted by a provider, a message cannot reliably be recalled. A mute or
 focus race can still produce a visible neutral notification. Clicking closes

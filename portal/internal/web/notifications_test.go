@@ -81,10 +81,14 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js" defer`, `href="/"`} {
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js?v=2" defer`, `href="/"`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("notification page lacks %s", required)
 		}
+	}
+	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) < 0 ||
+		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=2"`) {
+		t.Fatal("notification page must initialize the shared store before the client")
 	}
 }
 
@@ -265,6 +269,27 @@ func TestNotificationsRegistrationOriginAndDelayedTest(t *testing.T) {
 		t.Fatal(w.Body.String())
 	}
 	delivery := n.store.state.Outbox[notificationDeliveryKey(saved.RegistrationID, "test")]
+	var reply struct {
+		Test struct {
+			ID        string `json:"id"`
+			Identity  string `json:"identity"`
+			Revision  uint64 `json:"revision"`
+			ExpiresAt int64  `json:"expiresAt"`
+		} `json:"test"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.Test.ID != delivery.Event.ID || reply.Test.Identity != delivery.Event.Identity || reply.Test.Revision != delivery.Event.Revision || reply.Test.ExpiresAt != delivery.Event.ExpiresAt {
+		t.Fatal("test reply does not describe its exact queued event")
+	}
+	var fields map[string]json.RawMessage
+	json.Unmarshal(w.Body.Bytes(), &fields)
+	var descriptor map[string]json.RawMessage
+	json.Unmarshal(fields["test"], &descriptor)
+	if len(descriptor) != 4 || strings.Contains(w.Body.String(), sub.Endpoint) || strings.Contains(w.Body.String(), sub.Keys.Auth) || strings.Contains(w.Body.String(), sub.Keys.P256dh) {
+		t.Fatal("test reply exposes more than its bounded descriptor")
+	}
 	if delivery.NextAt < before.Add(10*time.Second).UnixMilli() || delivery.Event.ExpiresAt > before.Add(61*time.Second).UnixMilli() {
 		t.Fatal("test delay or expiry incorrect")
 	}

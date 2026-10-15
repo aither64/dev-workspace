@@ -373,6 +373,7 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var outputID string
+	var testDescriptor map[string]any
 	err := n.store.change(func(state *notificationState) error {
 		switch r.URL.Path {
 		case "/api/browser-notifications/register":
@@ -411,6 +412,7 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 				now := time.Now()
 				event := attentionEvent{Version: 1, ID: attentionDigest(browser.ID, now.String()), Identity: "test-" + browser.ID, Revision: uint64(now.UnixMilli()), Kind: "test", Route: "/", ExpiresAt: now.Add(time.Minute).UnixMilli()}
 				state.Outbox[notificationDeliveryKey(browser.ID, "test")] = notificationDelivery{Browser: browser.ID, Event: event, NextAt: now.Add(10 * time.Second).UnixMilli()}
+				testDescriptor = map[string]any{"id": event.ID, "identity": event.Identity, "revision": event.Revision, "expiresAt": event.ExpiresAt}
 			} else {
 				return errors.New("Browser notifications are disabled.")
 			}
@@ -423,7 +425,11 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "registrationId": outputID})
+	output := map[string]any{"ok": true, "registrationId": outputID}
+	if testDescriptor != nil {
+		output["test"] = testDescriptor
+	}
+	s.writeJSON(w, http.StatusOK, output)
 }
 
 func (s *Server) attentionAPI(w http.ResponseWriter, r *http.Request, slug string) {
