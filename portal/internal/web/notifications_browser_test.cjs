@@ -123,6 +123,85 @@ async function checkWorkerUpgrade(browser, engine) {
       controller.postMessage({type: "notification-test-capabilities"}, [channel.port2]);
     }));
     assert.equal(capability, true, "current document controller supports detailed Test outcomes");
+    // The real browser API and shared panel persist the choice without any
+    // registration, permission or subscription action. This is option plumbing,
+    // not evidence that the OS played or suppressed an audible sound.
+    assert.equal(await controls.evaluate(() => "silent" in Notification.prototype), true);
+    const sound = controls.locator("[data-notification-sound]");
+    await expect(sound).toBeEnabled(); await expect(sound).toBeChecked();
+    let registrationWrites = 0;
+    const trackRegistration = request => {
+      if (request.method() === "POST" && ["/api/browser-notifications/register", "/api/browser-notifications/disable"].includes(new URL(request.url()).pathname)) registrationWrites++;
+    };
+    context.on("request", trackRegistration);
+    const beforeNativeRead = await controls.evaluate(async () => {
+      globalThis.fixtureReadSoundSubscription = async registration => {
+        let subscription;
+        try {subscription = await registration.pushManager.getSubscription();}
+        catch (error) {
+          if (!(error instanceof DOMException) || !["AbortError", "InvalidStateError", "NotAllowedError", "NotSupportedError", "SecurityError", "UnknownError"].includes(error.name)) {
+            throw new Error("Native subscription read failed unexpectedly.");
+          }
+          return {read: "unavailable", category: error.name};
+        }
+        // Serialization is deliberately outside the native-read catch. Keep
+        // this identity solely in page memory, including actual readable null.
+        const identity = subscription === null ? null : JSON.stringify(subscription.toJSON());
+        if (subscription !== null && typeof identity !== "string") throw new Error("Native subscription identity could not be serialized.");
+        return {read: "readable", category: null, identity};
+      };
+      globalThis.fixtureSoundRegistration = await navigator.serviceWorker.getRegistration("/");
+      if (!fixtureSoundRegistration) throw new Error("Sound fixture requires an existing native registration.");
+      globalThis.fixtureSoundSubscription = await fixtureReadSoundSubscription(fixtureSoundRegistration);
+      return {read: fixtureSoundSubscription.read, category: fixtureSoundSubscription.category};
+    });
+    if (engine === chromium) assert.equal(beforeNativeRead.read, "readable", "Chromium native subscription is readable before sound save");
+    await sound.click();
+    await expect.poll(() => controls.evaluate(() => workspaceAttentionStore.readSound())).toBe(false);
+    await expect(sound).toBeEnabled(); await expect(sound).not.toBeChecked();
+    const afterNativeRead = await controls.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration("/");
+      if (!registration) throw new Error("Sound fixture lost its native registration.");
+      const after = await fixtureReadSoundSubscription(registration), before = fixtureSoundSubscription;
+      return {registrationSame: registration === fixtureSoundRegistration, read: after.read, category: after.category,
+        identitySame: before.read === "readable" && after.read === "readable" && before.identity === after.identity};
+    });
+    assert.equal(afterNativeRead.registrationSame, true, "sound preference retains the same native registration");
+    assert.equal(afterNativeRead.read, beforeNativeRead.read, "native subscription-read availability is unchanged after sound save");
+    assert.equal(afterNativeRead.category, beforeNativeRead.category, "native subscription-read category is unchanged after sound save");
+    if (afterNativeRead.read === "readable") assert.equal(afterNativeRead.identitySame, true, "sound preference retains readable native subscription identity");
+    else assert.equal(engine === firefox, true, "only Firefox may leave native subscription identity unverified");
+    // Two recognized unavailable reads verify category consistency, never
+    // subscription identity or absence. Only finite observations leave the page.
+    console.log(JSON.stringify({nativeSoundSubscription: {engine: engine.name(), read: afterNativeRead.read, category: afterNativeRead.category,
+      registrationSame: afterNativeRead.registrationSame, identityVerified: afterNativeRead.read === "readable" && afterNativeRead.identitySame}}));
+    await controls.reload();
+    await expect(controls.locator("[data-notification-sound]")).toBeEnabled();
+    await expect(controls.locator("[data-notification-sound]")).not.toBeChecked();
+    const sessionSound = retained.locator("#browser-notifications [data-notification-sound]");
+    assert.equal(navigations, 0, "retained page has no unexpected navigation before Settings setup");
+    const settingsTransition = retained.waitForEvent("framenavigated", {
+      predicate: frame => frame === retained.mainFrame() && frame.url() === `${base}/example/#settings`, timeout: 5000,
+    });
+    await Promise.all([settingsTransition, retained.locator("#session-tab-settings").click()]);
+    assert.equal(navigations, 1, "Settings setup causes exactly one retained main-frame transition");
+    assert.equal(await retained.evaluate(() => location.hash === "#settings" && document.getElementById("settings")?.classList.contains("active")), true,
+      "retained page is in Settings after the intended transition");
+    navigations = 0;
+    await expect(sessionSound).toBeEnabled(); await expect(sessionSound).not.toBeChecked();
+    await sessionSound.click();
+    await expect.poll(() => retained.evaluate(() => workspaceAttentionStore.readSound())).toBe(true);
+    await expect(sessionSound).toBeEnabled(); await expect(sessionSound).toBeChecked();
+    await expect(retained.locator("#sidebar-menu [data-notification-sound]")).toBeEnabled();
+    await expect(retained.locator("#sidebar-menu [data-notification-sound]")).toBeChecked();
+    await controls.reload();
+    await expect(controls.locator("[data-notification-sound]")).toBeEnabled();
+    await expect(controls.locator("[data-notification-sound]")).toBeChecked();
+    assert.equal(registrationWrites, 0, "sound controls perform no subscription mutation");
+    context.off("request", trackRegistration);
+    // Reloads above are explicit fixture actions. The application still never
+    // reloads either page to install the worker or change this preference.
+    controlsNavigations = 0;
     if (engine !== chromium) {
       console.log(`${engine.name()}: successor activated over old active/waiting workers; both tabs, draft and current-controller capability retained; no Playwright worker delivery claim`);
       return;
@@ -144,12 +223,34 @@ async function checkWorkerUpgrade(browser, engine) {
     const successor = await Promise.any(context.serviceWorkers().map(async candidate => {
       assert.equal(await candidate.evaluate(() => typeof displayTest), "function"); return candidate;
     }));
-    await successor.evaluate(() => {self.registration.showNotification = async () => {};});
+    await successor.evaluate(() => {
+      self.fixtureSoundDisplays = [];
+      self.registration.showNotification = async (_title, options) => self.fixtureSoundDisplays.push(options);
+    });
     const queued = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/test" && response.request().method() === "POST");
     await controls.locator("[data-notification-test]").click();
     const descriptor = (await (await queued).json()).test;
     await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
     await expect(controls.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
+    assert.equal(await successor.evaluate(() => Object.hasOwn(self.fixtureSoundDisplays[0], "silent")), false);
+    await expect(sound).toBeEnabled(); await expect(sound).toBeChecked();
+    await sound.click();
+    await expect.poll(() => controls.evaluate(() => workspaceAttentionStore.readSound())).toBe(false);
+    await expect(sound).toBeEnabled(); await expect(sound).not.toBeChecked();
+    const queuedSilent = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/test" && response.request().method() === "POST");
+    await controls.locator("[data-notification-test]").click();
+    const silentDescriptor = (await (await queuedSilent).json()).test;
+    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), silentDescriptor);
+    await expect(controls.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
+    assert.equal(await successor.evaluate(() => self.fixtureSoundDisplays.at(-1).silent), true);
+    const sessionPayload = await controls.evaluate(async () => {
+      const status = await (await fetch("/api/sessions/example/attention")).json();
+      return {version: 1, identity: status.identity, id: "b".repeat(64), revision: 1, slug: "example", kind: "input",
+        member: "implementer0", route: "/example/?member=implementer0#codex", expiresAt: Date.now() + 60000};
+    });
+    await successor.evaluate(payload => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify(payload)})), sessionPayload);
+    await expect.poll(() => successor.evaluate(() => self.fixtureSoundDisplays.length)).toBe(3);
+    assert.equal(await successor.evaluate(() => self.fixtureSoundDisplays.at(-1).silent), true);
     assert.equal(controlsNavigations, 0); assert.equal(retained.isClosed(), false); assert.equal(navigations, 0);
     assert.equal(await retained.evaluate(() => globalThis.fixtureRetainedSentinel), true);
     await expect(retained.locator('#message-form textarea[name="message"]')).toHaveValue("Retain this unsent draft");
@@ -178,9 +279,25 @@ async function checkWorkerUpgrade(browser, engine) {
       await expect(page.getByRole("link", {name: "Operations", exact: true})).toBeFocused();
       await page.keyboard.press("Escape"); await expect(toggle).toBeFocused();
       await toggle.click();
+      const menu = page.locator("#sidebar-menu");
+      await expect(menu.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      const menuSound = menu.locator("[data-notification-sound]");
+      await expect(menuSound).toBeEnabled(); await expect(menuSound).toBeChecked();
+      await menuSound.click();
+      await expect.poll(() => page.evaluate(() => workspaceAttentionStore.readSound())).toBe(false);
+      await expect(menuSound).toBeEnabled(); await expect(menuSound).not.toBeChecked();
+      await page.setViewportSize({width: 375, height: 812});
+      for (const button of await menu.locator("button").all()) {
+        const bounds = await button.boundingBox();
+        assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 375, "quick controls fit a narrow menu");
+      }
       await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
       await page.waitForURL("**/browser-notifications");
-      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await expect(page.locator("#browser-notifications [data-notification-status]")).toHaveText("Disabled on this browser.");
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).not.toBeChecked();
+      await page.reload();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeEnabled();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).not.toBeChecked();
       await checkControlSpacing(page);
       await page.setViewportSize({width: 375, height: 812});
       await checkControlSpacing(page);
@@ -188,12 +305,40 @@ async function checkWorkerUpgrade(browser, engine) {
       await expect(page.locator("#browser-notifications")).toHaveCount(0);
       await toggle.click();
       await page.getByRole("link", {name: "Browser notifications", exact: true}).click();
-      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await expect(page.locator("#browser-notifications [data-notification-status]")).toHaveText("Disabled on this browser.");
       await page.goto(`${base}/example/#codex`);
       await expect(page.locator("#browser-notifications")).toBeHidden();
-      await expect(page.locator("[data-notification-status]")).toHaveText("Disabled on this browser.");
+      await expect(page.locator("#browser-notifications [data-notification-status]")).toHaveText("Disabled on this browser.");
       await page.locator("#session-tab-settings").click();
       await expect(page.locator("#browser-notifications")).toBeVisible();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).not.toBeChecked();
+      await toggle.click();
+      await expect(menuSound).toBeEnabled(); await expect(menuSound).not.toBeChecked();
+      await menuSound.click();
+      await expect.poll(() => page.evaluate(() => workspaceAttentionStore.readSound())).toBe(true);
+      await expect(menuSound).toBeEnabled(); await expect(menuSound).toBeChecked();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeEnabled();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeChecked();
+      // Pointer-driven saving may move focus when the input is disabled. Check
+      // dismissal here, then keyboard restoration with known focus conditions.
+      await page.keyboard.press("Escape");
+      await expect.poll(() => menu.evaluate(element => element.matches(":popover-open"))).toBe(false);
+      await toggle.focus(); await page.keyboard.press("Enter");
+      await expect(page.getByRole("link", {name: "Operations", exact: true})).toBeFocused();
+      assert.equal(await menu.evaluate(element => element.matches(":popover-open") && element.contains(document.activeElement)), true,
+        "keyboard-open menu contains focus before Escape");
+      await page.keyboard.press("Escape");
+      await expect.poll(() => menu.evaluate(element => element.matches(":popover-open"))).toBe(false);
+      await expect(toggle).toBeFocused();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeEnabled();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeChecked();
+      await page.locator("#browser-notifications [data-notification-sound]").click();
+      await expect.poll(() => page.evaluate(() => workspaceAttentionStore.readSound())).toBe(false);
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).toBeEnabled();
+      await expect(page.locator("#browser-notifications [data-notification-sound]")).not.toBeChecked();
+      await toggle.click();
+      await expect(menuSound).toBeEnabled(); await expect(menuSound).not.toBeChecked();
+      await page.keyboard.press("Escape");
       await checkControlSpacing(page);
       await page.setViewportSize({width: 1280, height: 720});
       await checkControlSpacing(page);
@@ -219,20 +364,22 @@ async function checkWorkerUpgrade(browser, engine) {
         await page.evaluate(installSubscription, sub);
         const registerReply = page.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/register" && response.request().method() === "POST");
         trace.record({event: "enable_click"});
-        await page.locator("[data-notification-enable]").click();
+        await toggle.click();
+        await menu.locator("[data-notification-enable]").click();
         const registerResponse = await registerReply;
         assert.ok(registerResponse.status() >= 200 && registerResponse.status() < 300, "register response must succeed");
         trace.record({event: "register_accepted"});
-        await expect(page.locator("[data-notification-status]")).toContainText("Enabled on this browser");
+        await page.keyboard.press("Escape");
+        await expect(page.locator("#browser-notifications [data-notification-status]")).toContainText("Enabled on this browser");
         const worker = context.serviceWorkers()[0]; assert.ok(worker, "real root service worker registered through CSP");
         await worker.evaluate(() => {
           self.fixtureDisplays = [];
           self.registration.showNotification = async (title, options) => self.fixtureDisplays.push({title, ...options});
         });
         const queued = page.waitForResponse(response => response.url().endsWith("/api/browser-notifications/test") && response.request().method() === "POST");
-        await page.locator("[data-notification-test]").click();
+        await page.locator("#browser-notifications [data-notification-test]").click();
         const descriptor = (await (await queued).json()).test;
-        await expect(page.locator("[data-notification-status]")).toContainText("A test notification will be sent in 10 seconds.");
+        await expect(page.locator("#browser-notifications [data-notification-status]")).toContainText("A test notification will be sent in 10 seconds.");
         await page.close(); assert.equal(context.pages().length, 0);
         await worker.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
         await expect.poll(() => worker.evaluate(async descriptor => {
@@ -249,9 +396,10 @@ async function checkWorkerUpgrade(browser, engine) {
         await expect.poll(() => worker.evaluate(() => self.fixtureDisplays.length)).toBe(2);
         assert.equal((await worker.evaluate(() => self.fixtureDisplays[0])).renotify, false);
         const reopened = await context.newPage(); await reopened.goto(`${base}/example/#settings`);
-        await expect(reopened.locator("[data-notification-disable]")).toBeEnabled();
-        await reopened.locator("[data-notification-disable]").click();
-        await expect(reopened.locator("[data-notification-status]")).toContainText("Disabled on this browser");
+        await expect(reopened.locator("#browser-notifications [data-notification-disable]")).toBeEnabled();
+        await reopened.getByRole("button", {name: "Workspace menu", exact: true}).click();
+        await reopened.locator("#sidebar-menu [data-notification-disable]").click();
+        await expect(reopened.locator("#browser-notifications [data-notification-status]")).toContainText("Disabled on this browser");
       }
       assert.deepEqual(errors, [], `${engine.name()} loaded real notification UI without script errors`);
       console.log(`${engine.name()}: real template, CSP, permission separation and worker route passed${engine === chromium ? "; registered worker received synthetic push with zero tabs" : ""}`);

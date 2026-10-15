@@ -2,6 +2,7 @@
  * directory and root thread. IndexedDB and BroadcastChannel are origin scoped. */
 (() => {
   "use strict";
+  const soundIdentity = "browser-notification-sound";
   let opening;
   const open = () => opening ||= new Promise((resolve, reject) => {
     const request = indexedDB.open("workspace-session-attention", 1);
@@ -10,6 +11,7 @@
     request.onerror = () => { opening = null; reject(new Error("Attention storage is unavailable.")); };
   });
   const update = async (identity, change = value => value) => {
+    if (identity === soundIdentity) throw new Error("Reserved attention identity.");
     const db = await open();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sessions", "readwrite"), store = tx.objectStore("sessions");
@@ -22,7 +24,7 @@
         result.seen = [...new Set(result.seen || [])].slice(-32);
         store.put(result);
         const all = store.getAll();
-        all.onsuccess = () => all.result.sort((a,b) => b.at-a.at).slice(512).forEach(item => store.delete(item.identity));
+        all.onsuccess = () => all.result.filter(item => item.identity !== soundIdentity).sort((a,b) => b.at-a.at).slice(512).forEach(item => store.delete(item.identity));
       };
       tx.oncomplete = () => resolve(result);
       tx.onerror = tx.onabort = () => reject(new Error("Attention storage is unavailable."));
@@ -36,6 +38,47 @@
       request.onerror = () => reject(new Error("Attention storage is unavailable."));
     });
   };
+  // Preference reads and writes resolve only after commit. Bound the whole
+  // operation, including opening storage, and abort an overdue write if possible.
+  const sound = (write, playSound) => new Promise((resolve, reject) => {
+    let tx, finished = false, result;
+    const finish = (error) => {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      if (error) reject(new Error("Notification sound storage is unavailable."));
+      else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish(true);
+      try { tx?.abort(); } catch (_) {}
+    }, 750);
+    open().then(db => {
+      if (finished) return;
+      try {
+        tx = db.transaction("sessions", write ? "readwrite" : "readonly");
+        tx.oncomplete = () => finish(false);
+        tx.onerror = tx.onabort = () => finish(true);
+        const store = tx.objectStore("sessions");
+        if (write) {
+          // A retention rank, not a timestamp: already-open predecessor pages
+          // also sort this record ahead of ordinary Date.now() attention data.
+          store.put({identity: soundIdentity, playSound, at: Number.MAX_SAFE_INTEGER});
+          result = playSound;
+        } else {
+          const request = store.get(soundIdentity);
+          request.onerror = () => finish(true);
+          request.onsuccess = () => {
+            const value = request.result;
+            if (value === undefined) result = true;
+            else if (value && value.identity === soundIdentity && Object.keys(value).length === 3 && value.at === Number.MAX_SAFE_INTEGER && typeof value.playSound === "boolean") result = value.playSound;
+            else finish(true);
+          };
+        }
+      } catch (_) { finish(true); }
+    }, () => finish(true));
+  });
+  const readSound = () => sound(false);
+  const writeSound = playSound => typeof playSound === "boolean" ? sound(true, playSound) : Promise.reject(new Error("Invalid sound preference."));
   const testDescriptor = value => value && typeof value.id === "string" && /^[0-9a-f]{64}$/.test(value.id) &&
     typeof value.identity === "string" && /^test-[0-9a-f]{64}$/.test(value.identity) &&
     Number.isSafeInteger(value.revision) && value.revision > 0 && Number.isSafeInteger(value.expiresAt) && value.expiresAt > 0 ?
@@ -59,5 +102,5 @@
       return value;
     });
   };
-  globalThis.workspaceAttentionStore = {update, read, testDescriptor, testMatches, testError, saveTest};
+  globalThis.workspaceAttentionStore = {update, read, readSound, writeSound, testDescriptor, testMatches, testError, saveTest};
 })();

@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -93,6 +93,8 @@
   </main>
   </div>
   <template id="session-card-template">{{template "session-card"}}</template>
+  <script src="/static/session-attention-store.js?v=3" defer></script>
+  <script src="/static/browser-notifications.js?v=4" defer></script>
   <script src="/static/preparation.js?v=4" defer></script>
   <script src="/static/app.js?v=40" defer></script>
   <script src="/static/coordination.js?v=4" defer></script>
@@ -105,7 +107,16 @@
 <nav id="sidebar-menu" class="sidebar-menu" popover="auto" aria-label="Workspace navigation">
   <a href="/operations" autofocus>Operations</a>
   <a href="/automatic-archival">Automatic archival</a>
-  <a href="/browser-notifications">Browser notifications</a>
+  <section class="menu-notifications" aria-label="Browser notifications">
+    <p class="muted">These controls apply to all sessions in this browser. Page title markers stay on.</p>
+    <p data-notification-status role="status">Checking browser notifications…</p>
+    <p data-notification-worker-status class="muted" role="status" hidden></p>
+    <div class="notification-actions"><button type="button" data-notification-enable>Enable browser notifications</button><button type="button" class="quiet" data-notification-disable disabled>Disable on this browser</button></div>
+    <label class="checkbox"><input type="checkbox" data-notification-sound aria-describedby="menu-notification-sound-hint menu-notification-sound-status" disabled> Play sound</label>
+    <p id="menu-notification-sound-hint" class="muted">Turn off for visual-only notifications. Browser and system sound settings still apply.</p>
+    <p id="menu-notification-sound-status" data-notification-sound-status role="status">Checking sound preference…</p>
+    <a href="/browser-notifications">Browser notifications</a>
+  </section>
 </nav>
 {{end}}
 

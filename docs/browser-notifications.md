@@ -42,9 +42,35 @@ finished**. They contain no prompts, commands or excerpts. Session names may
 appear on the lock screen. The browser vendor's push service handles encrypted
 delivery and can observe delivery metadata.
 
+The workspace menu on index and session pages provides browser-wide delivery
+controls and **Play sound**. The same controls appear in session Settings; the
+**Browser notifications** link opens the full panel with Test and guidance.
+Opening the menu reads the current state without requesting permission or
+changing a subscription. Enable and Disable require an explicit click. Browser
+Disable applies across sessions in this browser, while title attention and
+reservation markers keep updating. Per-session notification settings remain
+unchanged and apply again after browser Enable. A provider-accepted message may
+still arrive after Disable.
+
+**Play sound** applies to notifications from this portal in the current browser
+profile, across sessions and tests. It defaults on when no choice has been
+saved. Turn it off for visual-only notifications. When checked, the
+browser uses its default sound behavior; it does not guarantee a sound. Browser
+and system notification settings still apply. The control reports when the browser lacks
+native visual-only support or the worker update is unconfirmed.
+
+The choice is saved only after browser storage confirms the write. Reopening
+these controls reads the last committed choice, including one saved in another
+tab. A failed save reports the failure and rechecks the stored choice. An
+unreadable or corrupt preference requests silent display while still attempting
+the notification. Disable and re-enable retain the choice; clearing this site's
+browser data resets it. Changing the setting affects the worker's next display
+attempt, including a push already queued by the provider. It cannot change an
+already displayed notification, enable delivery or mute a session.
+
 Use **Send test notification** after enabling. The server waits ten seconds so
 you can switch to another tab or app before checking delivery. Open
-these controls from **Browser notifications** in the workspace menu or from
+the full panel from **Browser notifications** in the workspace menu or use
 session Settings. The test result distinguishes arrival in this browser, whether
 the browser accepted or rejected the display request, and whether it retained a
 matching notification record. None of these confirms appearance on your screen.
@@ -131,7 +157,11 @@ database upgrade. These optional fields contain event IDs, revisions, expiry,
 fixed stage names and an allowlisted browser error category. They contain no
 endpoint, subscription key, provider response or notification payload. Older
 clients or workers leave the new result unknown. Local diagnostic storage
-failure does not prevent the worker from attempting display.
+failure does not prevent the worker from attempting display. The same database
+also holds one browser sound preference, separately from the 512 attention and
+test records. It uses the existing version-1 object store without a database
+upgrade or a server-side preference. A fixed retention rank, rather than a
+timestamp, protects this preference from pruning by already-open older pages.
 
 Once accepted by a provider, a message cannot reliably be recalled. A mute or
 focus race can still produce a visible neutral notification. Clicking closes

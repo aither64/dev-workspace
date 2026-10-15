@@ -55,6 +55,29 @@ unregister, resubscribe, VAPID reset or document reload is part of activation.
 Existing loaded scripts in older tabs are not replaced; use new or refreshed
 controls for current notification behavior.
 
+The workspace menu and full panel share the same Enable/Disable actions and
+browser-local sound choice. Loading or opening the controls does not request
+permission or change subscriptions. The worker may check for an update. Permission and
+subscription changes require an explicit action. Browser Disable leaves session
+mute preferences, title attention and reservation markers intact. Incomplete cleanup remains retryable
+from either surface.
+
+The browser-local **Play sound** setting uses the existing attention database.
+Checked leaves `silent` out of the display options; unchecked sets
+`silent: true` for Test, session and fallback notifications. Storage reads and
+writes are bounded and wait for transaction completion; unavailable or malformed
+state requests silent display. A rejected silent display is never retried with
+sound allowed. No subscription, provider payload or private server record is
+changed. Old loaded scripts do not implement this choice; use new or refreshed
+controls and confirm the worker update.
+
+Check native visual-only support and the saved choice in each browser profile.
+[Firefox 132 added `Notification.silent` support](https://developer.mozilla.org/en-US/docs/Mozilla/Firefox/Releases/132).
+Run one explicit Test with each choice and a background session event with
+visual-only selected. Record physical appearance and sound separately. Browser
+API support and recorded options do not prove OS sound behavior, and allowing
+sound cannot override browser or system settings.
+
 ## Private state
 
 `browser-notifications.json` lives beside `lifecycle-operations.json` in the

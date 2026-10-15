@@ -22,10 +22,12 @@ test('title priority and exact persistent reservation count', () => {
 
 function workerHarness() {
   const listeners = {}, notifications = [], windows = [], records = new Map(), calls = [];
+  let soundReads = 0;
+  const sound = {value: true, failed: false};
   let status = {fresh: true, enabled: true, identity, event: event(), revision: 1}, inaccessible = false;
   const context = {URL, AbortController, setTimeout, clearTimeout, Date,
-    importScripts: value => assert.equal(value, '/static/session-attention-store.js?v=2'),
-    workspaceAttentionStore: {update: async (key, change) => {
+    importScripts: value => assert.equal(value, '/static/session-attention-store.js?v=3'),
+    workspaceAttentionStore: {readSound: async () => {soundReads++; if (sound.failed) throw Error("sound read canary"); return sound.value;}, update: async (key, change) => {
       const record = change(records.get(key) || {identity: key, seen: [], revision: 0, event: null}); records.set(key, record); return record;
     }},
     fetch: async (url, options) => { calls.push({url, options}); return {ok: !inaccessible, status: inaccessible ? 401 : 200, json: async () => status}; },
@@ -36,7 +38,7 @@ function workerHarness() {
     addEventListener: (name, listener) => listeners[name] = listener},
   };
   vm.runInNewContext(source('notification-worker.js'), context);
-  return {notifications, calls, records, context,
+  return {notifications, calls, records, context, sound, soundReads: () => soundReads,
     lifecycle: async name => {let pending; listeners[name]({waitUntil: promise => pending = promise}); await pending;},
     status: value => status = value, inaccessible: () => inaccessible = true,
     push: async payload => { let pending; listeners.push({data: {json: () => payload}, waitUntil: promise => pending = promise}); await pending; },
@@ -90,8 +92,8 @@ test('browser permission is only requested after explicit enable click', async (
   const controls = Object.fromEntries(['status', 'enable', 'disable', 'test'].map(name => [name, {disabled: false, addEventListener(type, callback) { this[type] = callback; }}]));
   let prompts = 0;
   const storage = new Map();
-  const panel = {querySelector: selector => controls[selector.match(/notification-(\w+)/)[1]]};
-  const context = {document: {getElementById: () => panel}, navigator: {serviceWorker: {getRegistration: async () => null}},
+  const panel = {querySelector: selector => controls[selector.slice(19, -1)]};
+  const context = {document: {querySelectorAll: selector => [panel.querySelector(selector)].filter(Boolean), getElementById: () => null}, navigator: {serviceWorker: {getRegistration: async () => null}},
     Notification: {permission: 'default', requestPermission: async () => { prompts++; return 'denied'; }},
     isSecureContext: true, PushManager: function() {}, AbortController, setTimeout, clearTimeout,
     localStorage: {getItem: key => storage.get(key) || null},
@@ -198,7 +200,7 @@ async function notificationHarness(state, storage = new Map()) {
   const addListener = service.addEventListener;
   service.addEventListener = (name, callback) => {addListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', addEventListener: (name, callback) => listeners[name] = callback,
-    getElementById: () => ({querySelector: selector => controls[selector.match(/notification-(\w+)/)[1]]})},
+    querySelectorAll: selector => [controls[selector.slice(19, -1)]].filter(Boolean), getElementById: () => null},
     addEventListener: (name, callback) => listeners[name] = callback,
     navigator: {serviceWorker: service},
     Notification: {permission: 'granted', requestPermission: async () => {state.permissionCalls = (state.permissionCalls || 0) + 1; return 'granted';}},
@@ -417,24 +419,32 @@ function testStoreHarness() {
   const records = new Map(), state = {failed: false}, versions = [];
   const database = {transaction() {
     if (state.failed) throw Error('private storage canary');
-    const tx = {}; let pending = 0;
+    const before = structuredClone(records);
+    const tx = {abort() {state.aborts = (state.aborts || 0) + 1; records.clear(); before.forEach((v,k) => records.set(k,v)); tx.aborted = true; tx.onabort?.();}}; let pending = 0;
+    const complete = () => {
+      if (tx.aborted) return;
+      if (state.commitFailure) {tx.abort(); return;}
+      tx.oncomplete?.();
+    };
     const request = action => {
       const req = {}; pending++;
       queueMicrotask(() => {
+        if (tx.aborted) return;
+        if (state.readFailure) {req.onerror?.(); tx.abort(); return;}
         req.result = action(); req.onsuccess?.();
-        if (--pending === 0) queueMicrotask(() => tx.oncomplete?.());
+        if (--pending === 0) queueMicrotask(() => state.holdCommit ? state.completion = complete : complete());
       });
       return req;
     };
     tx.objectStore = () => ({get: key => request(() => structuredClone(records.get(key))),
-      put: value => records.set(value.identity, structuredClone(value)), getAll: () => request(() => [...records.values()].map(value => structuredClone(value))),
+      put: value => request(() => records.set(value.identity, structuredClone(value))), getAll: () => request(() => [...records.values()].map(value => structuredClone(value))),
       delete: key => records.delete(key)});
     return tx;
   }};
   const context = {indexedDB: {open(name, version) {
     assert.equal(name, 'workspace-session-attention'); versions.push(version);
     const req = {}; queueMicrotask(() => {req.result = database; req.onsuccess();}); return req;
-  }}, Date};
+  }}, Date, setTimeout, clearTimeout};
   vm.runInNewContext(source('session-attention-store.js'), context);
   return {store: context.workspaceAttentionStore, records, state, versions};
 }
@@ -517,34 +527,45 @@ function lifecycleTarget(fields = {}) {
     listenerCount() {return [...handlers.values()].reduce((sum, set) => sum + set.size, 0);}};
 }
 async function feedbackHarness(storage = testStoreHarness(), options = {}) {
-  const controls = Object.fromEntries(['status','enable','disable','test','test-status','provider-status','worker-status'].map(name => [name,
+  const controls = Object.fromEntries(['status','enable','disable','test','test-status','provider-status','worker-status','sound','sound-status'].map(name => [name,
     {disabled: false, textContent: '', addEventListener(type, callback) {this[type] = callback;}}]));
+  const menuControls = options.menu ? Object.fromEntries(Object.entries(controls).filter(([name]) => !['test', 'test-status', 'provider-status'].includes(name)).map(([name]) => [name,
+    {disabled: false, textContent: '', addEventListener(type, callback) {this[type] = callback;}}])) : {};
   const listeners = {}, timers = new Map(), calls = [], saved = new Map([[browserKey, browserId]]);
   let now = Date.now(), nextTimer = 0;
-  const state = {descriptor: testDescriptor(now), registered: true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
+  const state = {descriptor: testDescriptor(now), registered: true, subscribed: true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
+  const subscription = {endpoint, options: {}, toJSON: () => ({endpoint, keys: {p256dh: 'public', auth: 'auth'}}), unsubscribe: async () => {state.subscribed = false; return true;}};
   const registration = lifecycleTarget({update: async () => {state.updateChecks = (state.updateChecks || 0) + 1; if (state.update) await state.update();},
     active: lifecycleTarget({state: 'activated', postMessage(_message, ports) {state.probes = (state.probes || 0) + 1; if (!state.noReply) ports[0].reply({version: state.workerVersion});}}),
-    pushManager: {getSubscription: async () => ({endpoint, unsubscribe: async () => true})}});
+    pushManager: {getSubscription: async () => state.subscribed ? subscription : null,
+      subscribe: async () => {state.subscribes = (state.subscribes || 0) + 1; state.subscribed = true; return subscription;}}});
   if (options.waitingWorker) registration.waiting = lifecycleTarget({state: 'installed'});
-  const service = lifecycleTarget({getRegistration: async () => registration, controller: options.uncontrolled ? null : registration.active});
+  const service = lifecycleTarget({getRegistration: async () => registration, controller: options.uncontrolled ? null : registration.active,
+    register: async () => {state.registrations = (state.registrations || 0) + 1; return registration;}, ready: Promise.resolve(registration)});
   const addServiceListener = service.addEventListener;
   service.addEventListener = (name, callback) => {addServiceListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', getElementById: () => ({querySelector: selector => controls[selector.slice(19, -1) || 'status']}),
     addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: service}, addEventListener: (name, callback) => listeners[name] = callback,
-    Date: class extends Date {static now() {return now;}}, Notification: {permission: 'granted'}, PushManager: function() {}, isSecureContext: true,
-    workspaceAttentionStore: options.oldStore ? {} : storage.store, AbortController, Uint8Array, TextEncoder, crypto: require('node:crypto').webcrypto,
+    Date: class extends Date {static now() {return now;}}, Notification: {permission: 'granted', requestPermission: async () => {state.permissions = (state.permissions || 0) + 1; return 'granted';}, prototype: options.noSilent ? {} : {silent: false}}, PushManager: function() {}, isSecureContext: true,
+    workspaceAttentionStore: options.oldStore ? {} : storage.store, AbortController, Uint8Array, TextEncoder, atob, crypto: require('node:crypto').webcrypto,
     MessageChannel: function() {this.port1 = {close() {}}; this.port2 = {reply: value => queueMicrotask(() => this.port1.onmessage({data: value}))};},
     setTimeout(callback, delay) {const id = ++nextTimer; timers.set(id, {callback, at: now + delay}); return id;}, clearTimeout: id => timers.delete(id),
     localStorage: {getItem: key => saved.get(key) || null, setItem: (key,value) => saved.set(key,value), removeItem: key => saved.delete(key)},
     fetch: async (url, config = {}) => {calls.push({url, config});
       if (url.endsWith('/test') && state.testReply) return state.testReply();
-      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: true, registered: state.registered, result: 'provider_accepted'}};},
+      if (url.endsWith('/disable')) state.registered = false;
+      if (url.endsWith('/register')) {state.registered = true; return {ok: true, json: async () => ({registrationId: browserId})};}
+      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: true, registered: state.registered, publicKey: 'Ag', result: 'provider_accepted'}};},
   };
-  context.document.getElementById = () => ({querySelector: selector => controls[selector.replace('[data-notification-','').replace(']','')]});
+  context.document.querySelectorAll = selector => {
+    const name = selector.slice(19, -1);
+    return [options.menuOnly ? null : controls[name], menuControls[name]].filter(Boolean);
+  };
+  context.document.getElementById = name => name === 'sidebar-menu' ? {addEventListener: (_name, callback) => listeners.menutoggle = callback} : null;
   vm.runInNewContext(source('browser-notifications.js'), context);
   const flush = async () => {for (let i = 0; i < 80; i++) await Promise.resolve();};
   await flush();
-  return {controls, storage, state, timers, calls, context, listeners, registration, service, async advance(ms) {now += ms;
+  return {controls: options.menuOnly ? menuControls : controls, menuControls, storage, state, timers, calls, context, listeners, registration, service, async advance(ms) {now += ms;
     const ready = [...timers].filter(([,timer]) => timer.at <= now); for (const [id,timer] of ready) {timers.delete(id); timer.callback(); await flush();}}, flush};
 }
 
@@ -949,4 +970,253 @@ test('Test and Disable retire readiness progress without a lingering Updating st
     assert.equal(h.state.updateChecks, 1, 'action cancellation does not start an update loop');
     h.listeners.pagehide(); await h.flush(); assert.equal(h.timers.size, 0);
   }
+});
+
+
+const soundIdentity = 'browser-notification-sound';
+const flushStorage = async () => {for (let i = 0; i < 80; i++) await Promise.resolve();};
+test('sound singleton defaults only on absence, rejects corrupt data and survives attention pruning', async () => {
+  const h = testStoreHarness();
+  assert.equal(await h.store.readSound(), true);
+  for (const choice of [false, true]) {
+    assert.equal(await h.store.writeSound(choice), choice);
+    assert.equal(await h.store.readSound(), choice);
+    assert.deepEqual(h.records.get(soundIdentity), {identity: soundIdentity, playSound: choice, at: Number.MAX_SAFE_INTEGER});
+  }
+  for (const corrupt of [null, {identity: soundIdentity}, {identity: soundIdentity, playSound: 'true'},
+    {identity: soundIdentity, playSound: true, at: 0}, {identity: soundIdentity, playSound: true, at: Number.MAX_SAFE_INTEGER - 1},
+    {identity: soundIdentity, playSound: true, at: Number.MAX_SAFE_INTEGER, extra: false}]) {
+    h.records.set(soundIdentity, corrupt);
+    await assert.rejects(h.store.readSound());
+  }
+  await assert.rejects(h.store.writeSound('true'));
+  await assert.rejects(h.store.update(soundIdentity));
+  await h.store.writeSound(false);
+  for (let i = 0; i < 514; i++) await h.store.update(`attention-${i}`);
+  assert.equal(h.records.size, 513, 'preference is outside the 512 attention-record budget');
+  assert.equal(await h.store.readSound(), false);
+  // Exercise the exact deployed predecessor pruning algorithm, with valid
+  // attention keys preceding the reserved singleton in IndexedDB key order.
+  const old = testStoreHarness(); await old.store.writeSound(false);
+  for (let i = 0; i < 520; i++) old.records.set(i.toString(16).padStart(64, '0'), {identity: i.toString(16).padStart(64, '0'), at: Date.now() + i});
+  const all = [...old.records.values()].sort((a,b) => a.identity.localeCompare(b.identity));
+  assert.equal(all.at(-1).identity, soundIdentity);
+  all.sort((a,b) => b.at-a.at).slice(512).forEach(item => old.records.delete(item.identity));
+  assert.equal(old.records.size, 512); assert.equal(await old.store.readSound(), false);
+  assert.deepEqual(h.versions, [1]);
+});
+
+test('sound storage waits for commit and bounds read, open and aborted write failures', async () => {
+  const h = testStoreHarness(); await h.store.writeSound(true);
+  h.state.holdCommit = true;
+  let settled = false;
+  const write = h.store.writeSound(false).then(value => {settled = true; return value;});
+  await flushStorage(); assert.equal(settled, false);
+  h.state.completion(); assert.equal(await write, false);
+  const read = h.store.readSound().then(value => {settled = true; return value;}); settled = false;
+  await flushStorage(); assert.equal(settled, false, 'request success is not transaction success');
+  h.state.completion(); assert.equal(await read, false);
+  await assert.rejects(h.store.writeSound(true));
+  assert.equal(h.state.aborts, 1); assert.equal(h.records.get(soundIdentity).playSound, false);
+  await assert.rejects(h.store.readSound());
+  h.state.holdCommit = false; h.state.commitFailure = true;
+  await assert.rejects(h.store.writeSound(true));
+  h.state.commitFailure = false; assert.equal(await h.store.readSound(), false);
+  h.state.readFailure = true; await assert.rejects(h.store.readSound());
+  h.state.readFailure = false; h.state.failed = true; await assert.rejects(h.store.readSound());
+  const context = {setTimeout, clearTimeout, indexedDB: {open: () => ({})}};
+  vm.runInNewContext(source('session-attention-store.js'), context);
+  await assert.rejects(context.workspaceAttentionStore.readSound(), 'opening storage is bounded too');
+});
+
+test('one sound snapshot covers trusted, neutral, inaccessible and malformed push displays exactly', async () => {
+  for (const choice of [true, false, 'failed']) for (const branch of ['trusted', 'neutral', 'inaccessible', 'malformed']) {
+    const h = workerHarness(); h.sound.value = choice; h.sound.failed = choice === 'failed';
+    if (branch === 'neutral') h.status({fresh: false});
+    if (branch === 'inaccessible') h.inaccessible();
+    await h.push(branch === 'malformed' ? null : event());
+    assert.equal(h.notifications.length, 1); assert.equal(h.soundReads(), 1);
+    if (choice === true) assert.equal(Object.hasOwn(h.notifications[0], 'silent'), false, 'native defaults omit silent');
+    else assert.equal(h.notifications[0].silent, true);
+    assert.equal(h.notifications[0].renotify, false);
+  }
+});
+
+test('Test sound options persist without tabs; failed reads still display and rejected silent calls never retry audibly', async () => {
+  for (const choice of [true, false, 'failed', 'corrupt', 'stalled']) {
+    const h = displayHarness();
+    if (typeof choice === 'boolean') await h.storage.store.writeSound(choice);
+    else if (choice === 'corrupt') h.storage.records.set(soundIdentity, {identity: soundIdentity, playSound: 1});
+    else h.storage.store.readSound = () => choice === 'stalled' ? new Promise(() => {}) : Promise.reject(Error('private sound canary'));
+    await h.push(testDescriptor());
+    assert.equal(h.shown.length, 1);
+    assert.equal(Object.hasOwn(h.shown[0], 'silent'), choice !== true);
+    if (choice !== true) assert.equal(h.shown[0].silent, true);
+  }
+  const h = displayHarness(); await h.storage.store.writeSound(false); h.state.failure = {name: 'NotSupportedError'};
+  await h.push(testDescriptor());
+  assert.equal(h.shown.length, 1); assert.equal(h.shown[0].silent, true);
+  assert.equal(h.storage.records.get(testDescriptor().identity).testOutcome.display, 'rejected');
+});
+
+test('shared sound control persists across documents and Settings revisits without changing registration', async () => {
+  const storage = testStoreHarness(), first = await feedbackHarness(storage);
+  assert.equal(first.controls.sound.checked, true); assert.equal(first.controls.sound.disabled, false);
+  first.controls.sound.checked = false; await first.controls.sound.change();
+  assert.equal(await storage.store.readSound(), false);
+  const reopened = await feedbackHarness(storage);
+  assert.equal(reopened.controls.sound.checked, false);
+  reopened.controls.sound.checked = true; await reopened.controls.sound.change();
+  first.listeners['session-section-change']({detail: 'settings'}); await first.flush();
+  assert.equal(first.controls.sound.checked, true, 'revisit reads the last committed cross-document choice');
+  assert.equal(first.calls.some(call => call.config.method === 'POST'), false);
+  assert.equal(reopened.calls.some(call => call.config.method === 'POST'), false);
+  await first.controls.disable.click(); assert.equal(await storage.store.readSound(), true, 'Disable retains sound preference');
+  const unsupported = await feedbackHarness(storage, {noSilent: true});
+  assert.equal(unsupported.controls.sound.disabled, true);
+  assert.match(unsupported.controls['sound-status'].textContent, /does not support visual-only/);
+  const limited = await feedbackHarness(storage, {waitingWorker: true});
+  assert.match(limited.controls['sound-status'].textContent, /sound setting may not take effect/);
+});
+
+test('sound UI commits before presenting a selection, reconciles save failure and ignores stale reads', async () => {
+  const storage = testStoreHarness(), h = await feedbackHarness(storage);
+  storage.state.holdCommit = true;
+  h.controls.sound.checked = false; const saving = h.controls.sound.change(); await h.flush();
+  assert.equal(h.controls.sound.checked, true, 'attempt is not shown as committed');
+  assert.equal(h.controls.sound.disabled, true);
+  storage.state.completion(); await saving;
+  assert.equal(h.controls.sound.checked, false);
+  storage.state.holdCommit = false; storage.state.commitFailure = true;
+  h.controls.sound.checked = true; await h.controls.sound.change();
+  assert.equal(h.controls.sound.checked, false);
+  assert.match(h.controls['sound-status'].textContent, /could not be saved/);
+  storage.state.commitFailure = false;
+  const original = storage.store.readSound; let release;
+  storage.store.readSound = () => new Promise(resolve => {release = () => resolve(true);});
+  h.listeners['session-section-change']({detail: 'settings'}); await h.flush();
+  storage.store.readSound = original;
+  h.controls.sound.checked = false; await h.controls.sound.change(); release(); await h.flush();
+  assert.equal(h.controls.sound.checked, false, 'old read cannot overwrite a committed newer choice');
+  storage.state.failed = true;
+  h.listeners.pageshow(); await h.flush();
+  assert.equal(h.controls.sound.disabled, true);
+  assert.match(h.controls['sound-status'].textContent, /could not be read.*without sound/);
+});
+
+
+test('sound is sampled at the native attempt after a delayed status or Test receipt', async () => {
+  const session = workerHarness(); let releaseStatus;
+  session.context.fetch = () => new Promise(resolve => {releaseStatus = () => resolve({ok: true, status: 200, json: async () => ({fresh: true, enabled: true, identity, event: event(), revision: 1})});});
+  const work = session.push(event()); await flushStorage();
+  assert.equal(session.soundReads(), 0, 'status observation precedes preference snapshot');
+  session.sound.value = false; releaseStatus(); await work;
+  assert.equal(session.notifications[0].silent, true); assert.equal(session.soundReads(), 1);
+  const h = displayHarness(); await h.storage.store.writeSound(true);
+  const save = h.storage.store.saveTest; let releaseReceipt;
+  h.storage.store.saveTest = (descriptor, outcome) => outcome.display === 'pending' ? new Promise(resolve => {releaseReceipt = () => resolve(save(descriptor, outcome));}) : save(descriptor, outcome);
+  const push = h.push(testDescriptor()); await flushStorage();
+  await h.storage.store.writeSound(false); releaseReceipt(); await push;
+  assert.equal(h.shown.length, 1); assert.equal(h.shown[0].silent, true);
+});
+
+test('menu-only owner reads status on load/open without permission, subscription, Test or repair mutations', async () => {
+  const storage = testStoreHarness(); await storage.store.saveTest(testDescriptor());
+  const h = await feedbackHarness(storage, {menu: true, menuOnly: true});
+  assert.equal(h.controls.test, undefined, 'full panel and Test may be absent');
+  assert.equal(h.calls.every(call => !call.config.method), true);
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  h.listeners.visibilitychange(); await h.flush();
+  assert.equal(h.calls.every(call => !call.config.method), true);
+  assert.equal(h.state.permissions || 0, 0); assert.equal(h.state.registrations || 0, 0); assert.equal(h.state.subscribes || 0, 0);
+  assert.equal(h.timers.size, 0, 'menu does not resume panel Test polling');
+  storage.state.failed = true;
+  h.listeners.menutoggle({newState: 'open'}); await h.flush();
+  assert.match(h.controls['sound-status'].textContent, /could not be read/);
+  assert.equal(h.controls.sound.disabled, true);
+});
+
+test('menu and panel share committed sound, action locks, cleanup and saved preference across delivery off/on', {timeout: 2000}, async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true}), menu = h.menuControls;
+  menu.sound.checked = false; await menu.sound.change();
+  assert.equal(menu.sound.checked, false); assert.equal(h.controls.sound.checked, false);
+  h.storage.state.holdCommit = true;
+  h.controls.sound.checked = true; const saving = h.controls.sound.change(); await h.flush();
+  assert.equal(menu.sound.disabled, true); assert.equal(menu.enable.disabled, true); assert.equal(h.controls.test.disabled, true);
+  const before = h.calls.length; await menu.disable.click(); assert.equal(h.calls.length, before, 'competing actions ignored during sound commit');
+  h.storage.state.completion(); await saving; h.storage.state.holdCommit = false;
+  assert.equal(menu.sound.checked, true); assert.equal(h.controls.sound.checked, true);
+  menu.sound.checked = false; await menu.sound.change();
+  const releases = []; let started;
+  const startedDeleting = new Promise(resolve => {started = resolve;});
+  const fetch = h.context.fetch;
+  h.context.fetch = async (...args) => args[0].endsWith('/disable') ? new Promise(resolve => {
+    releases.push(async () => resolve(await fetch(...args))); if (releases.length === 2) started();
+  }) : fetch(...args);
+  const disabling = menu.disable.click(); await startedDeleting;
+  assert.equal(h.controls.enable.disabled, true); assert.equal(menu.sound.disabled, true);
+  await h.controls.disable.click(); await menu.enable.click();
+  await Promise.all(releases.map(release => release())); await disabling;
+  assert.equal(h.controls.status.textContent, menu.status.textContent); assert.match(menu.status.textContent, /^Disabled on this browser/);
+  assert.equal(await h.storage.store.readSound(), false);
+  h.context.fetch = fetch;
+  await menu.enable.click();
+  assert.equal(h.controls.status.textContent, menu.status.textContent); assert.match(menu.status.textContent, /^Enabled on this browser/);
+  assert.equal(h.state.permissions, 1); assert.equal(h.state.registrations, 1); assert.equal(h.state.subscribes, 1);
+  assert.equal(await h.storage.store.readSound(), false);
+});
+
+test('cross-tab registration or cleanup revocation replaces every Enabled status and retired menu reads stay fenced', async () => {
+  for (const invalidation of [{key: browserKey, newValue: null}, {key: browserKey, newValue: 'f'.repeat(64)},
+    {key: cleanupKey, newValue: JSON.stringify({endpointDigest})}]) for (const rejects of [false, true]) {
+    const h = await feedbackHarness(testStoreHarness(), {menu: true});
+    await h.controls.test.click(); await h.advance(2000);
+    assert.equal(h.controls.status.textContent, 'Enabled on this browser.');
+    assert.equal(h.menuControls.status.textContent, h.controls.status.textContent);
+    let finish, reads = 0;
+    h.context.fetch = () => {reads++; return new Promise((resolve, reject) => {finish = () => rejects ? reject(Error('retired read failed')) :
+      resolve({ok: true, json: async () => ({available: true, registered: true})});});};
+    h.listeners.controllerchange(); await h.flush();
+    assert.equal(reads, 1, 'a status observation is pending before revocation');
+    h.listeners.storage(invalidation); await h.flush();
+    const expected = 'Browser setup is incomplete. Disable it or enable notifications again.';
+    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls.status.textContent, expected);
+    assert.equal(h.controls.test.disabled, true); assert.equal(h.menuControls.disable.disabled, false);
+    assert.equal(h.controls['test-status'].textContent, '');
+    assert.equal(h.storage.records.get(h.state.descriptor.identity).testPending, undefined, 'revocation still cancels the exact saved check');
+    h.listeners.menutoggle({newState: 'open'}); h.listeners.visibilitychange(); h.listeners.pageshow(); await h.flush();
+    assert.equal(reads, 1, 'opening the menu cannot restart a retired observation');
+    finish(); await h.flush(); await h.advance(20000);
+    assert.equal(h.controls.status.textContent, expected); assert.equal(h.menuControls.status.textContent, expected);
+    assert.equal(reads, 1, 'late old completion cannot refresh, repair or resume');
+  }
+});
+
+test('global delivery off and silent preference do not stop actual title attention, reservations or focused acknowledgement', async () => {
+  const h = await feedbackHarness(testStoreHarness(), {menu: true, menuOnly: true});
+  h.controls.sound.checked = false; await h.controls.sound.change(); await h.controls.disable.click();
+  assert.match(h.controls.status.textContent, /^Disabled on this browser/);
+  let current = event(), focus = false, refresh;
+  const listeners = {}, acknowledgements = [];
+  h.context.document.body = {dataset: {session: 'example', sessionObservation: identity, rootThreadId: 'thread-1'}};
+  h.context.document.title = 'example · Workspace'; h.context.document.hasFocus = () => focus;
+  h.context.document.addEventListener = (name, callback) => listeners[name] = callback;
+  h.context.window = {addEventListener: (name, callback) => listeners[name] = callback};
+  h.context.navigator.serviceWorker.getRegistration = async () => ({active: {postMessage: message => acknowledgements.push(message)}});
+  h.context.setTimeout = (callback, delay) => {if (delay === 5000) refresh = callback; return 1;};
+  h.context.fetch = async (url, options = {}) => {
+    assert.equal(options.method, undefined, 'off browser never publishes presence or mutates session mute');
+    return {ok: true, json: async () => url.endsWith('/attention') ? {version: 1, identity, rootThread: 'thread-1', event: current, revision: current.revision, fresh: true, enabled: true} :
+      {reservationHolders: [{slug: 'example', observationIdentity: identity, machines: [{machine: 'one', state: 'recovery_hold'}, {machine: 'two', state: 'deployed_review'}]}]}};
+  };
+  vm.runInNewContext(source('session-attention.js'), h.context); await h.flush();
+  assert.equal(h.context.document.title, '? R2 example · Workspace');
+  current = {...event(2, 'done'), id: 'e'.repeat(64)}; refresh(); await h.flush();
+  assert.equal(h.context.document.title, '✓ R2 example · Workspace');
+  assert.equal(h.storage.records.get(identity).seen.length, 0);
+  focus = true; listeners.focus(); await h.flush();
+  assert.equal(h.context.document.title, 'R2 example · Workspace');
+  assert.equal(h.storage.records.get(identity).seen.includes(current.id), true);
+  assert.equal(acknowledgements[0].identity, identity);
+  assert.equal(await h.storage.store.readSound(), false);
 });

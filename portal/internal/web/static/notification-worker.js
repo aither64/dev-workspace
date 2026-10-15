@@ -1,5 +1,5 @@
 "use strict";
-importScripts("/static/session-attention-store.js?v=2");
+importScripts("/static/session-attention-store.js?v=3");
 
 const reason = kind => ({input: "Your answer is needed", approval: "Approval needed", done: "Response finished", test: "Browser notification test"})[kind];
 const safeRoute = value => {
@@ -26,6 +26,12 @@ async function boundedTestRead(promise, fallback) {
   catch (_) { return fallback; }
   finally { clearTimeout(timer); }
 }
+async function show(title, options) {
+  // Read at the display attempt, after status/receipt work, so a newly saved
+  // visual-only choice also applies to delivery already waiting in this worker.
+  const playSound = await boundedTestRead(Promise.resolve().then(() => workspaceAttentionStore.readSound()), false);
+  return self.registration.showNotification(title, {...options, ...(playSound === true ? {} : {silent: true})});
+}
 async function displayTest(payload) {
   const descriptor = workspaceAttentionStore.testDescriptor?.(payload);
   const save = async outcome => {
@@ -43,7 +49,7 @@ async function displayTest(payload) {
       Number.isSafeInteger(item.data.testRevision) && item.data.testRevision < payload.revision).slice(0, 32).forEach(item => item.close());
   } catch (_) {}
   try {
-    await self.registration.showNotification("Workspace", {body: reason("test"), tag, renotify: false,
+    await show("Workspace", {body: reason("test"), tag, renotify: false,
       data: {route: "/", testIdentity: payload.identity, testRevision: payload.revision}});
   } catch (error) {
     await save({received: true, display: "rejected", error: workspaceAttentionStore.testError?.(error) || "UnknownError", browserRecord: "unavailable"});
@@ -57,7 +63,7 @@ async function displayTest(payload) {
 
 async function display(payload) {
   if (!valid(payload)) {
-    await self.registration.showNotification("Workspace update", {body: "Open the workspace to check its current status.", tag: "workspace-update", renotify: false, data: {route: "/"}});
+    await show("Workspace update", {body: "Open the workspace to check its current status.", tag: "workspace-update", renotify: false, data: {route: "/"}});
     return;
   }
   if (payload.kind === "test" && /^test-[0-9a-f]{64}$/.test(payload.identity)) {
@@ -75,7 +81,7 @@ async function display(payload) {
       try {
         const response = await fetch(`/api/sessions/${encodeURIComponent(payload.slug)}/attention`, {credentials: "same-origin", cache: "no-store", signal: controller.signal});
         if (response.status === 404 || response.status === 403 || response.status === 401) {
-          await self.registration.showNotification("Workspace update", {body: "Open the workspace to check its current status.", tag: `session-${payload.identity}`, renotify: false, data: {route: "/"}});
+          await show("Workspace update", {body: "Open the workspace to check its current status.", tag: `session-${payload.identity}`, renotify: false, data: {route: "/"}});
           return;
         }
         const status = response.ok ? await response.json() : null;
@@ -84,10 +90,10 @@ async function display(payload) {
       } finally { clearTimeout(deadline); }
     }
   } catch (_) { trusted = false; }
-  // A delivered push always results in a visible notification. Duplicate,
+  // Attempt visible display for every delivered push. Duplicate,
   // reordered or unverifiable delivery replaces the same entry with neutral copy.
   const current = record?.event || payload;
-  await self.registration.showNotification(current.slug || "Workspace", {
+  await show(current.slug || "Workspace", {
     body: trusted ? `${current.member && current.member !== "lead" ? `${current.member}: ` : ""}${reason(current.kind)}` : "Session update available",
     tag: `session-${payload.identity}`, renotify: false,
     data: {route: safeRoute(current.route)?.pathname + (safeRoute(current.route)?.search || "") + (safeRoute(current.route)?.hash || ""), identity: payload.identity},

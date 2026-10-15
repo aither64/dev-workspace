@@ -68,26 +68,31 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 	if !ok || !strings.Contains(menu, `href="/browser-notifications"`) {
 		t.Fatal("browser notifications must be reachable through the workspace menu")
 	}
-	for _, removed := range []string{`id="browser-notifications"`, `src="/static/browser-notifications.js"`, "data-notification-enable"} {
+	for _, removed := range []string{`id="browser-notifications"`, "data-notification-test"} {
 		if strings.Contains(index.Body.String(), removed) {
-			t.Fatalf("index still initializes browser controls: %s", removed)
+			t.Fatalf("index contains full-panel controls: %s", removed)
 		}
 	}
 	if !strings.Contains(index.Body.String(), `name="browserNotificationsEnabled" type="checkbox" checked`) {
 		t.Fatal("new-session notification preference must remain available")
+	}
+	for _, required := range []string{"data-notification-enable", "data-notification-disable", "data-notification-sound", `aria-describedby="menu-notification-sound-hint menu-notification-sound-status"`, `src="/static/browser-notifications.js?v=4" defer`} {
+		if !strings.Contains(index.Body.String(), required) {
+			t.Fatalf("index menu lacks %s", required)
+		}
 	}
 	page := httptest.NewRecorder()
 	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/browser-notifications", nil))
 	if page.Code != http.StatusOK {
 		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `src="/static/browser-notifications.js?v=3" defer`, `href="/"`} {
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled`, `data-notification-sound-status role="status"`, `src="/static/browser-notifications.js?v=4" defer`, `href="/"`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("notification page lacks %s", required)
 		}
 	}
-	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) < 0 ||
-		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=2"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=3"`) {
+	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) < 0 ||
+		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=4"`) {
 		t.Fatal("notification page must initialize the shared store before the client")
 	}
 }

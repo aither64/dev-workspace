@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Browser notifications · {{.DisplayLabel}}</title>
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
   <header class="topbar">
@@ -15,8 +15,8 @@
   <main class="page">
     {{template "browser-notifications"}}
   </main>
-  <script src="/static/session-attention-store.js?v=2" defer></script>
-  <script src="/static/browser-notifications.js?v=3" defer></script>
+  <script src="/static/session-attention-store.js?v=3" defer></script>
+  <script src="/static/browser-notifications.js?v=4" defer></script>
 </body>
 </html>
 {{end}}
@@ -25,10 +25,14 @@
 <section id="browser-notifications" class="panel">
   <h3>Browser notifications</h3>
   <p>Notifications can appear while the browser is running with every portal tab closed. They show session names, which may appear on your lock screen. Delivery uses your browser vendor’s push service.</p>
+  <p class="muted">These controls apply to all sessions in this browser. Page title markers stay on.</p>
   <p data-notification-status role="status">Checking browser notifications…</p>
   <p data-notification-test-status role="status" hidden></p>
   <p data-notification-provider-status class="muted" hidden></p>
   <p data-notification-worker-status class="muted" role="status" hidden></p>
+  <label class="checkbox"><input type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled> Play sound</label>
+  <p id="notification-sound-hint" class="muted">Turn off for visual-only notifications. Browser and system sound settings still apply.</p>
+  <p id="notification-sound-status" data-notification-sound-status role="status">Checking sound preference…</p>
   <div class="notification-actions"><button type="button" data-notification-enable>Enable browser notifications</button><button type="button" data-notification-test disabled>Send test notification</button><button type="button" class="quiet" data-notification-disable disabled>Disable on this browser</button></div>
 </section>
 {{end}}
