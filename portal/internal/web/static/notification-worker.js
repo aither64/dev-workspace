@@ -113,11 +113,14 @@ self.addEventListener("notificationclick", event => {
     if (!route) return;
     if (route.pathname !== "/" && /^[0-9a-f]{64}$/.test(event.notification.data?.identity)) route.searchParams.set("attentionIdentity", event.notification.data.identity);
     const windows = await self.clients.matchAll({type: "window", includeUncontrolled: true});
-    const existing = windows.find(client => {
+    const matching = windows.filter(client => {
       const url = new URL(client.url);
-      return url.origin === route.origin && url.pathname === route.pathname;
+      return url.origin === route.origin && (url.pathname === route.pathname ||
+        (route.pathname !== "/" && url.pathname === route.pathname.slice(0, -1)));
     });
-    if (existing) { await existing.navigate(route.href); await existing.focus(); }
+    const member = route.searchParams.get("member") || "lead";
+    const existing = matching.find(client => (new URL(client.url).searchParams.get("member") || "lead") === member) || matching[0];
+    if (existing) await existing.focus();
     else await self.clients.openWindow(route.href);
   })());
 });

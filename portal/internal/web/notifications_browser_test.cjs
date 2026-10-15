@@ -251,6 +251,28 @@ async function checkWorkerUpgrade(browser, engine) {
     await successor.evaluate(payload => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify(payload)})), sessionPayload);
     await expect.poll(() => successor.evaluate(() => self.fixtureSoundDisplays.length)).toBe(3);
     assert.equal(await successor.evaluate(() => self.fixtureSoundDisplays.at(-1).silent), true);
+    // Invoke the actual click listener with a synthetic event. Native focus may
+    // reject without trusted user activation; only no-navigation/draft plumbing
+    // is asserted here, never physical Firefox/macOS selection.
+    const retainedURL = retained.url(), pageCount = context.pages().length;
+    await controls.bringToFront();
+    const click = await successor.evaluate(async payload => {
+      let work, closed = false;
+      const event = new Event("notificationclick");
+      Object.defineProperties(event, {
+        notification: {value: {data: {route: payload.route, identity: payload.identity}, close() {closed = true;}}},
+        waitUntil: {value: promise => {work = promise;}},
+      });
+      self.dispatchEvent(event);
+      let timer;
+      const completion = await Promise.race([Promise.resolve(work).then(() => "resolved", () => "rejected"),
+        new Promise(resolve => {timer = setTimeout(() => resolve("timeout"), 1500);})]);
+      clearTimeout(timer);
+      return {closed, dispatched: Boolean(work), completion};
+    }, sessionPayload);
+    assert.equal(click.closed, true); assert.equal(click.dispatched, true);
+    assert.ok(["resolved", "rejected"].includes(click.completion), "synthetic focus settles within its bound");
+    assert.equal(context.pages().length, pageCount); assert.equal(retained.url(), retainedURL);
     assert.equal(controlsNavigations, 0); assert.equal(retained.isClosed(), false); assert.equal(navigations, 0);
     assert.equal(await retained.evaluate(() => globalThis.fixtureRetainedSentinel), true);
     await expect(retained.locator('#message-form textarea[name="message"]')).toHaveValue("Retain this unsent draft");

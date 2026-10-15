@@ -38,7 +38,7 @@ function workerHarness() {
     addEventListener: (name, listener) => listeners[name] = listener},
   };
   vm.runInNewContext(source('notification-worker.js'), context);
-  return {notifications, calls, records, context, sound, soundReads: () => soundReads,
+  return {notifications, windows, calls, records, context, sound, soundReads: () => soundReads,
     lifecycle: async name => {let pending; listeners[name]({waitUntil: promise => pending = promise}); await pending;},
     status: value => status = value, inaccessible: () => inaccessible = true,
     push: async payload => { let pending; listeners.push({data: {json: () => payload}, waitUntil: promise => pending = promise}); await pending; },
@@ -1219,4 +1219,59 @@ test('global delivery off and silent preference do not stop actual title attenti
   assert.equal(h.storage.records.get(identity).seen.includes(current.id), true);
   assert.equal(acknowledgements[0].identity, identity);
   assert.equal(await h.storage.store.readSound(), false);
+});
+
+
+test('matching session click focuses once without navigating, opening, changing member or losing document state', async () => {
+  for (const path of ['/example', '/example/']) for (const view of ['?member=reviewer0#settings', '#repositories', '?member=implementer0#codex']) {
+    const h = workerHarness(); let release, focusCalls = 0, navigateCalls = 0, completed = false;
+    const client = {url: `https://workspace.example${path}${view}`, draft: 'unsent draft',
+      focus: () => {focusCalls++; return new Promise(resolve => {release = resolve;});},
+      navigate: async () => {navigateCalls++; throw Error('must never navigate a retained document');}};
+    h.windows.push(client);
+    const click = h.click('/example/?member=implementer0#codex', identity).then(() => {completed = true;});
+    await flushStorage();
+    assert.equal(focusCalls, 1); assert.equal(completed, false, 'click awaits the selected focus promise');
+    assert.equal(navigateCalls, 0); assert.equal(h.calls.some(call => call.openWindow), false);
+    release(client); await click;
+    assert.equal(client.url, `https://workspace.example${path}${view}`); assert.equal(client.draft, 'unsent draft');
+    assert.equal(h.calls.length, 0, 'focus adds no fetch, message, acknowledgement or open');
+  }
+});
+
+test('click prefers the existing target-member view, otherwise retains the matching session view', async () => {
+  for (const target of ['lead', 'implementer0']) {
+    const h = workerHarness(), focused = [];
+    const other = target === 'lead' ? 'implementer0' : 'lead';
+    for (const member of [other, target]) h.windows.push({url: `https://workspace.example/example/${member === 'lead' ? '' : `?member=${member}`}#settings`,
+      focus: async () => focused.push(member), navigate: () => assert.fail('navigation is forbidden')});
+    await h.click(`/example/${target === 'lead' ? '' : `?member=${target}`}#codex`, identity);
+    assert.deepEqual(focused, [target]); assert.equal(h.calls.length, 0);
+  }
+});
+
+test('click matching keeps origin, strict session path and home boundaries and canonical no-match navigation', async () => {
+  for (const path of ['https://foreign.example/example/', 'https://workspace.example/example-other/', 'https://workspace.example/example/child/',
+    'https://workspace.example/example//', 'https://workspace.example/exam%70le/', 'https://workspace.example/']) {
+    const h = workerHarness(); h.windows.push({url: path, focus: () => assert.fail('foreign/nonmatching view'), navigate: () => assert.fail('must not navigate')});
+    await h.click('/example/?member=implementer0#codex', identity);
+    assert.equal(h.calls.at(-1).openWindow, `https://workspace.example/example/?member=implementer0&attentionIdentity=${identity}#codex`);
+  }
+  const root = workerHarness(); root.windows.push({url: 'https://workspace.example/example/', focus: () => assert.fail('session is not home')});
+  await root.click('/'); assert.equal(root.calls.at(-1).openWindow, 'https://workspace.example/');
+  const home = workerHarness(); let focused = 0;
+  home.windows.push({url: 'https://workspace.example/?view=other#settings', focus: async () => focused++});
+  await home.click('/'); assert.equal(focused, 1); assert.equal(home.calls.length, 0);
+  const invalid = workerHarness();
+  for (const route of ['//foreign.example/example/', 'https://foreign.example/example/', '/example/child/', '/example//', '/example/?member=invalid#codex', '/example/#settings']) await invalid.click(route, identity);
+  assert.equal(invalid.calls.length, 0);
+});
+
+test('rejected focus or a client closed after enumeration never retries by opening a duplicate tab', async () => {
+  for (const name of ['InvalidAccessError', 'InvalidStateError']) {
+    const h = workerHarness(); let focused = 0;
+    h.windows.push({url: 'https://workspace.example/example/#settings', focus: async () => {focused++; throw {name};}, navigate: () => assert.fail('navigation forbidden')});
+    await assert.rejects(h.click('/example/#codex', identity), error => error.name === name);
+    assert.equal(focused, 1); assert.equal(h.calls.length, 0);
+  }
 });

@@ -164,10 +164,15 @@ upgrade or a server-side preference. A fixed retention rank, rather than a
 timestamp, protects this preference from pruning by already-open older pages.
 
 Once accepted by a provider, a message cannot reliably be recalled. A mute or
-focus race can still produce a visible neutral notification. Clicking closes
-the notification and focuses or opens its validated same-origin conversation
-route. Ordinary portal authentication remains required. The click itself does
-not acknowledge attention; the destination must become visible and focused.
+focus race can still produce a visible neutral notification. Clicking a session
+notification closes it and focuses an existing tab for the same portal and
+session, without reloading it, changing its member or section, or losing its
+unsent draft. If several tabs match,
+the worker prefers one already showing the target member. A missing final slash
+still matches the same session. If none matches, it opens the validated
+conversation route through ordinary portal authentication. A failed focus does
+not open a duplicate tab. The click itself does not acknowledge attention;
+normal visible, focused observation keeps its session identity checks.
 
 The worker caches no portal page or API response. The root worker route retains
 compatible version-1 payload handling across updates. Old clients ignore the

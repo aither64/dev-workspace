@@ -33,7 +33,11 @@ Browsers need trusted HTTPS access to the private portal for registration,
 fresh-status checks and clicks, and their own connection to the vendor push
 service. Verify the explicit Enable and Send test actions with the actual
 browser build. Check another active site, all portal tabs closed and the browser
-minimized or unfocused. Verify click navigation through normal authentication.
+minimized or unfocused. Verify that a click selects an existing session tab without reloading it,
+changing its member or section, or losing an unsent draft. With no matching tab,
+verify that it opens the intended conversation through normal authentication.
+A synthetic handler test cannot confirm which tab Firefox selects after a real
+macOS notification click.
 Record queue acceptance, the last provider result, exact test worker receipt,
 display API resolution or rejection, matching browser notification record,
 physical OS appearance and click results separately. The last provider result
