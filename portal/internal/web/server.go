@@ -157,6 +157,7 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	closeCatalog           func()
 	recoveryMu             sync.Mutex
 	recoveryOperations     map[string]recoveryStatus
 	recoveryJobs           map[string]bool
@@ -512,6 +513,7 @@ func New(config Config) (*Server, error) {
 	for slug, operation := range operations {
 		server.publishLifecycleSnapshot(slug, operation, time.Time{})
 	}
+	server.closeCatalog = session.StartCatalog(workspace)
 	server.displayRefreshWG.Add(1)
 	go server.runDisplayRefreshes()
 	server.startUploadCollector()
@@ -664,6 +666,9 @@ func (s *Server) Close() {
 		s.operationWG.Wait()
 		s.displayRefreshWG.Wait()
 		s.pausePreparationsOnClose()
+		if s.closeCatalog != nil {
+			s.closeCatalog()
+		}
 	})
 }
 

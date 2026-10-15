@@ -274,21 +274,24 @@ func (s RecoveryStore) AllowsImplicitResume(socket, thread string) bool {
 	if err != nil {
 		return false
 	}
-	summaries, err := List(s.Workspace)
-	if err != nil {
+	var candidates []string
+	if c := activeCatalog(s.Workspace); c != nil {
+		candidates, err = c.recoveryOwners(s, thread)
+	} else {
+		var owners map[string][]string
+		owners, err = s.readOwners()
+		candidates = owners[thread]
+	}
+	if err != nil || len(candidates) != 1 {
 		return false
 	}
-	for _, summary := range summaries {
-		if summary.Archived || RequireRetainedReady(&summary, socket) != nil {
-			continue
-		}
-		if owner, err := PendingLifecycle(s.Workspace, summary.Slug); err != nil || owner != "" {
-			continue
-		}
-		record, err := s.Load(summary.Slug)
-		if err == nil && record.ThreadID == summary.Codex.ThreadID && record.SocketPath == socket && record.Active(thread, epoch) {
-			return true
-		}
+	summary, err := Find(s.Workspace, candidates[0])
+	if err != nil || summary.Archived || RequireRetainedReady(summary, socket) != nil {
+		return false
 	}
-	return false
+	if owner, err := PendingLifecycle(s.Workspace, summary.Slug); err != nil || owner != "" {
+		return false
+	}
+	record, err := s.Load(summary.Slug)
+	return err == nil && record.ThreadID == summary.Codex.ThreadID && record.SocketPath == socket && record.Active(thread, epoch)
 }

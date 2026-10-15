@@ -283,6 +283,13 @@ func validRFC3339(value string) bool {
 }
 
 func List(workspace string) ([]Summary, error) {
+	if c := activeCatalog(workspace); c != nil {
+		return c.list()
+	}
+	return listUncached(workspace)
+}
+
+func listUncached(workspace string) ([]Summary, error) {
 	var summaries []Summary
 	var problems []error
 	seen := make(map[string]string)
@@ -380,6 +387,13 @@ func Find(workspace, slug string) (*Summary, error) {
 }
 
 func loadSummary(workspace, root, slug string, archived bool) (*Summary, error) {
+	if c := activeCatalog(workspace); c != nil {
+		return c.load(root, slug, archived)
+	}
+	return loadSummaryUncached(workspace, root, slug, archived)
+}
+
+func loadSummaryUncached(workspace, root, slug string, archived bool) (*Summary, error) {
 	relative := filepath.Join(root, slug, ManifestName)
 	file, err := openConfined(workspace, relative, unix.O_RDONLY, 0)
 	if err != nil {
