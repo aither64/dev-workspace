@@ -114,7 +114,7 @@ async function checkControlSpacing(page) {
       await page.setViewportSize({width: 1280, height: 720});
       await checkControlSpacing(page);
       await expect(page.locator("#session-notifications-enabled")).toBeChecked();
-      await expect(page.locator("#session-attention-status")).toContainText(/^(?!.*unavailable)/);
+      await expect(page.locator("#session-attention-status")).toHaveCount(0);
       assert.equal(await page.evaluate(() => Notification.permission), "default", "page load did not ask for permission");
       assert.deepEqual(mutations, [], "opening or revealing controls never changes a subscription");
       assert.equal(context.serviceWorkers().length, 0, "opening controls did not register a worker");
