@@ -142,13 +142,65 @@ attempt, so its owner can reduce it and refresh the job.
 Those recovery requests may use the reserve after normal admission fills, and
 have a 16 KiB request bound. Existing request IDs remain idempotent at capacity. New preparation/admission requires
 at least 1 GiB of free space. Capacity refusal preserves existing authority.
-This release retains source closures, artifacts, receipts and referenced roots;
-it bounds individual logs and admission, not lifetime disk usage. Automatic
-source/history pruning is deferred. Never delete an unresolved reservation or
-receipt to make room.
+Compact artifacts, snapshots, request receipts and history remain available.
+Disposable source/merge-target worktrees and their dedicated Nix roots are
+collected once their final required reference ends. Never delete unresolved
+reservations or receipts to make room. See [payload collection](#payload-collection).
 
 A claim without `request.json` predates any worker launch but still requires
 operator recovery; this release does not automatically redispatch it. Likewise,
 `finish` retains full integration proofs even when deployment was canceled before
 activation. Early release without integration is deferred; lifecycle abandonment
 or separately reviewed exceptional recovery remains required.
+
+
+## Payload collection
+
+Inspect the global per-user coordination store with:
+
+```sh
+workspace-host coordination gc --dry-run --json
+workspace-host coordination gc --apply --json
+```
+
+The default is a preview. `actions` identifies collectible worktrees and root
+links, `removed` records successful removals, and `preserved` explains holds or
+live references. `retry` means the ledger changed; rerun the same scan. Output
+contains paths and reasons, not environment dumps or credentials.
+
+The coordinator requests collection after ledger changes and every five minutes
+through `workspace-coordination-gc.service`. It keeps deletion out of scheduling.
+Collection preserves pending jobs, live worker locks/services, all unreleased
+reservation recovery, unfinished integration journals, pending notification
+artifacts and shared references. An operation succeeding does not retire a
+reservation still held for deployment review. Existing profile generations and
+their independent Nix roots continue to retain installed/rollback closures.
+
+A preparation not submitted within seven days expires. A new preparation renews
+its lease; status and collection previews do not. Older unused preparations and
+unsealed interrupted payloads receive a seven-day grace period at first applied
+collection. Submitted snapshots stop independently pinning payloads after their
+jobs/recovery obligations end. Fresh submission of an expired/consumed snapshot
+without a live job reference requires preparation; an exact completed request
+retry returns its saved receipt.
+
+A `.keep` file, local worktree changes, process references, busy Git resources or
+unknown layouts preserve a payload. Collection uses Git to remove registered
+worktrees; it does not delete user branches. Source payload deletion is final,
+but original repository refs and compact evidence remain available for a fresh
+preparation. Nix store paths are reclaimed only by ordinary Nix GC.
+
+`retention.json` is separate schema-1 bookkeeping for leases and interrupted
+worktree removal. Existing ledger, snapshot and artifact formats are unchanged.
+The profile transition guard excludes new preparations and package switches;
+legacy in-flight preparation commands also postpone collection. Deletion runs
+outside ledger transactions. A changed ledger stops the current sweep, and
+interrupted worktree removal resumes from its recorded exact path/common Git
+directory. Do not hand-edit the bookkeeping to bypass a preservation reason.
+
+Collection also takes each integration driver's existing lock without waiting.
+An active driver postpones the sweep; unfinished journals retain hook dependencies
+for their source heads between invocations. Integration scratch worktrees below
+`integrations/<UUID>/` and owner-keyed notification worker roots remain outside
+this collector. They are retained, including after completion; this command does
+not establish a disk bound for those two layouts.

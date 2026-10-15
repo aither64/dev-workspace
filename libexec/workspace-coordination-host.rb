@@ -152,21 +152,24 @@ module DevWorkspaceHost
     end
 
     def coordination_prepare(engine, owner, request)
-      case request.fetch('kind')
-      when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
-      when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
-      when 'profile_activate'
-        path, _common, _identity, registration = engine.repository(owner, 'workspace')
-        head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
-        source = engine.retain_commit(path, head)
-        artifact = prepare_profile(['--source', source])
-        artifact['coverage'] = engine.coverage(source, 'workspace', head)
-        artifact = engine.save_artifact(artifact)
-        engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
-        operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
-          'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
-        engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
-      else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        engine.current_generation!
+        case request.fetch('kind')
+        when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
+        when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
+        when 'profile_activate'
+          path, _common, _identity, registration = engine.repository(owner, 'workspace')
+          head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
+          source = engine.retain_commit(path, head)
+          artifact = prepare_profile(['--source', source])
+          artifact['coverage'] = engine.coverage(source, 'workspace', head)
+          artifact = engine.save_artifact(artifact)
+          engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
+          operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
+            'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
+          engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
+        else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
+        end
       end
     end
 
@@ -192,7 +195,48 @@ module DevWorkspaceHost
       end
     end
 
+    def coordination_collect_command(argv)
+      options = {apply: false, json: false}
+      OptionParser.new do |opts|
+        opts.on('--dry-run') { options[:apply] = false }
+        opts.on('--apply') { options[:apply] = true }
+        opts.on('--json') { options[:json] = true }
+      end.parse!(argv)
+      raise WorkspaceCoordination::Error, 'unexpected coordination gc arguments' unless argv.empty?
+      entry = registry.entries.first || raise(WorkspaceCoordination::Error, 'no registered workspace')
+      with_current_generation_lock do
+        result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply])
+        if options[:json]
+          @out.puts JSON.generate(result)
+        else
+          @out.puts "#{result['mode']}: #{result['actions'].length} collectible payloads/roots; #{result['removed'].length} removed"
+          result['actions'].each { |item| @out.puts "#{item['kind']}: #{item['path']}" }
+          @out.puts 'Ledger changed; the next sweep will revalidate remaining work.' if result['retry']
+        end
+      end
+    end
+
+    def dispatch_coordination_collection
+      revision = coordination_store.read['revision']
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return if @collection_revision == revision && now < (@collection_next_sweep || 0)
+      # Keep bulk deletion outside the scheduler loop. The selected executable
+      # rechecks its generation after obtaining the transition exclusion.
+      _out, _err, status, = WorkspaceCoordination::Command.run(
+        ['systemd-run', '--user', '--quiet', '--collect', '--unit=workspace-coordination-gc',
+         '--property=Type=oneshot', '--property=UMask=0077',
+         File.join(package_root, 'bin/workspace-host'), 'coordination', 'gc', '--apply'], env: @env.to_h)
+      if status.success?
+        @collection_revision = revision
+        @collection_next_sweep = now + 300
+      else
+        @collection_revision = revision
+        @collection_next_sweep = now + 5
+      end
+    end
+
     def coordination_host_command(argv)
+      return coordination_collect_command(argv.drop(1)) if argv.first == 'gc'
       if argv == ['guide']
         @out.puts "Selected package: #{File.realpath(package_root)}"
         @out.puts "Coordination catalog: #{coordination_catalog.digest} (#{File.join(package_root, 'share/dev-workspace/coordination.json')})"
@@ -395,6 +439,11 @@ module DevWorkspaceHost
             end
           rescue WorkspaceCoordination::Error, Error => e
             @err.puts "coordinator: #{e.message}"
+          end
+          begin
+            dispatch_coordination_collection
+          rescue WorkspaceCoordination::Error, Error => error
+            @err.puts "coordination collection: #{error.message}"
           end
           if IO.select([wake_socket], nil, nil, 5)
             wake_socket.recv_nonblock(64) while IO.select([wake_socket], nil, nil, 0)

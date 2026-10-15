@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-coordination'
+require_relative 'workspace-coordination-gc'
 require_relative 'workspace-integration-certification'
 
 module WorkspaceCoordination
@@ -384,6 +385,7 @@ module WorkspaceCoordination
       else
         WorkspaceCoordination.atomic(path, saved, limit: MAX_REQUEST)
       end
+      Retention.new(store).register(result.fetch('id'))
       result
     end
 

@@ -63,6 +63,8 @@ dev-session coordination cancel SESSION JOB --as-is --request FILE --json
 dev-session coordination reconcile SESSION JOB --as-is --json
 dev-session coordination finish SESSION RESERVATION --as-is --request FILE --json
 workspace-host coordination status --json
+workspace-host coordination gc --dry-run --json
+workspace-host coordination gc --apply --json
 ```
 
 JSON requests use `schema: 1` and a caller-generated lowercase UUID `requestId`.
@@ -77,6 +79,10 @@ the registered `repository` for a merge or catalog `target` for a machine. Profi
 preparation uses the session's registered workspace branch. Evidence lives under
 the owning session's active tracking directory. Preparation retains committed
 sources, artifacts and a content-addressed snapshot; it returns that snapshot.
+Unsubmitted preparations expire after seven days. Status reads do not renew
+them. Completed work releases disposable payloads immediately after its last
+required reference ends; compact receipts and history stay available. See
+[payload collection](coordination-operations.md#payload-collection).
 
 Approval records `kind` (`merge` or `deploy`), exact `scope`, `reviewedSnapshot`,
 and `source: {kind: "user_instruction", reference, quote}`. Merge scope entries

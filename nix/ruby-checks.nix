@@ -43,6 +43,7 @@ let
     auto_archive = 1;
     workspace_host = 1;
     coordination_admission = 1;
+    coordination_gc = 1;
     integration = 1;
     integration_certification = 1;
   };

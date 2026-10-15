@@ -1041,12 +1041,14 @@ module WorkspaceCoordination
         return store.transaction { |data| store.request(data, owner['id'], [action, job_id], request) { raise Error, 'request receipt disappeared' } }
       end
       preparation_capacity! unless %w[cancel].include?(action)
+      Retention.new(store).require_fresh!(request.dig('snapshot', 'id')) if %w[submit refresh].include?(action)
       prepared = snapshot(owner, request.fetch('snapshot'), request.fetch('kind')) if action == 'submit'
       if action == 'refresh'
         job = store.read['jobs'].fetch(job_id) { raise Error, 'unknown coordinated operation' }
         prepared = snapshot(owner, request.fetch('snapshot'), job.fetch('kind'))
       end
       if action == 'approve'
+        Retention.new(store).require_fresh!(request['reviewedSnapshot'])
         saved = prepared_snapshot!(owner, request['reviewedSnapshot'])
         raise Error.new('approval kind differs from its prepared operation', 4) unless (saved['kind'] == 'merge') == (request['kind'] == 'merge')
         snapshot(owner, saved.fetch('snapshot'), saved.fetch('kind'))
@@ -1164,6 +1166,7 @@ module WorkspaceCoordination
       preparation_capacity!
       prepared = jobs.map do |job|
         WorkspaceCoordination.keys!(job, %w[key kind dependsOn approvalId reservationId snapshot])
+        Retention.new(store).require_fresh!(job.dig('snapshot', 'id'))
         snapshot(owner, job.fetch('snapshot'), job.fetch('kind'))
       end
       contracts = prepared.map { |value| value[0].dig('operation', 'coverage') && coverage_contracts(owner, value[0].dig('operation', 'coverage')) }
