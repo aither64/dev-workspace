@@ -958,6 +958,11 @@ class DevSessionTest < Minitest::Test
       @delegate.with_timeout(seconds, &block)
     end
 
+    def stream(argv, **options, &block)
+      @callback.call(argv)
+      @delegate.stream(argv, **options, &block)
+    end
+
     def capture(argv, allow_failure: false, **options)
       @callback.call(argv)
       @delegate.capture(argv, allow_failure:, **options)

@@ -3,6 +3,147 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_git_archive_retains_checkout_when_saved_blobs_are_missing_or_corrupt
+    require 'zlib'
+    %w[missing corrupt].product(%w[before_capture before_removal]).each do |damage, timing|
+      with_archive_cleanup_fixture do |runner, _workspace, slug, common, checkout|
+        object = git_capture_success('git', '-C', checkout, 'rev-parse', 'HEAD:README.md').strip
+        path = File.join(common, 'objects', object[0, 2], object[2..])
+        damage_blob = lambda do
+          if damage == 'missing'
+            File.unlink(path)
+          else
+            File.chmod(0o600, path)
+            File.binwrite(path, Zlib::Deflate.deflate("blob 6\0wrong\n"))
+          end
+        end
+        assert_empty(git_capture_success('git', '-C', checkout, 'status', '--porcelain').strip)
+        if timing == 'before_capture'
+          damage_blob.call
+        else
+          runner.define_singleton_method(:archive_cleanup_recovery) do |*arguments|
+            recovery = super(*arguments)
+            unless recovery.instance_variable_defined?(:@fault_fixture_installed)
+              recovery.instance_variable_set(:@fault_fixture_installed, true)
+              calls = 0
+              recovery.define_singleton_method(:verify_checkout!) do |record|
+                calls += 1
+                damage_blob.call if calls == 2
+                super(record)
+              end
+            end
+            recovery
+          end
+        end
+        assert_raises(DevSession::Error, DevSession::CommandError) { runner.archive(slug, as_is: true, explicit: true) }
+        assert_equal("# Test\n", File.read(File.join(checkout, 'README.md')), "#{damage} #{timing} removed original bytes")
+      end
+    end
+  end
+
+  def test_git_archive_restore_repopulates_interrupted_checkout_without_filters
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      File.write(File.join(checkout, '.gitattributes'), "README.md filter=changed\n")
+      assert_git_success('git', '-C', checkout, 'add', '.gitattributes')
+      assert_git_success('git', '-C', checkout, 'commit', '-m', 'raw clean fixture')
+      before = git_capture_success('git', '-C', checkout, 'ls-files', '--stage')
+      runner.archive(slug, as_is: true, explicit: true)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+      record = recovery.records.first
+      saved, destination = recovery.send(:read_record, record)
+      assert_equal('git', saved.fetch('kind'))
+      recovery.send(:write_json, File.join(destination, 'restoring.json'), record.slice('path', 'common_dir', 'head', 'branch'))
+      assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '--no-checkout', checkout, record.fetch('branch'))
+      File.write(File.join(checkout, 'README.md'), 'partial wrong bytes')
+      assert_git_success('git', "--git-dir=#{common}", 'config', 'filter.changed.smudge', 'false')
+      recovery.restore!(record)
+      assert_equal("# Test\n", File.read(File.join(checkout, 'README.md')))
+      assert_equal("README.md filter=changed\n", File.read(File.join(checkout, '.gitattributes')))
+      assert_equal(before, git_capture_success('git', '-C', checkout, 'ls-files', '--stage'))
+    end
+  end
+
+  def test_git_clean_filtered_content_keeps_a_full_recovery_snapshot
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      clean = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('working', 'stored'))"].shelljoin
+      smudge = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('stored', 'working'))"].shelljoin
+      assert_git_success('git', '-C', checkout, 'config', 'filter.example.clean', clean)
+      assert_git_success('git', '-C', checkout, 'config', 'filter.example.smudge', smudge)
+      File.write(File.join(checkout, '.gitattributes'), "filtered filter=example\n")
+      File.write(File.join(checkout, 'filtered'), 'working contents')
+      assert_git_success('git', '-C', checkout, 'add', '.gitattributes', 'filtered')
+      assert_git_success('git', '-C', checkout, 'commit', '-m', 'filtered fixture')
+      assert_empty(git_capture_success('git', '-C', checkout, 'status', '--porcelain').strip)
+      runner.archive(slug, as_is: true, explicit: true)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+      saved, = recovery.send(:read_record, recovery.records.first)
+      assert_equal('files', saved.fetch('kind'))
+      assert_git_success('git', "--git-dir=#{common}", 'config', '--remove-section', 'filter.example')
+      runner.revive(slug, as_is: true)
+      assert_equal('working contents', File.read(File.join(checkout, 'filtered')))
+    end
+  end
+
+  def test_clean_archive_uses_git_recovery_and_preserves_permissions_and_empty_directories
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, _feature|
+      checkout = File.join(workspace, 'worktrees', slug, 'sample')
+      file = Dir.glob(File.join(checkout, '*')).find { |path| File.file?(path) }
+      File.chmod(0o640, file)
+      FileUtils.mkdir_p(File.join(checkout, 'empty'))
+      File.chmod(0o750, File.join(checkout, 'empty'))
+      runner.archive(slug, as_is: true, explicit: true)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      recovery = runner.send(:archive_cleanup_recovery, slug, manifest.fetch('archive_operation_id'))
+      record = recovery.records.find { |entry| entry.fetch('path') == 'sample' }
+      saved, destination = recovery.send(:read_record, record)
+      assert_equal('git', saved.fetch('kind'))
+      assert_empty(Dir.children(File.join(destination, 'files')))
+      assert_empty(git_capture_success('git', "--git-dir=#{common}", 'for-each-ref', '--format=%(refname)',
+                                      "refs/dev-session-archives/#{manifest.fetch('archive_operation_id')}/#{Digest::SHA256.hexdigest('sample')}/index").strip)
+      runner.revive(slug, as_is: true)
+      assert_equal(0o640, File.stat(file).mode & 0o777)
+      assert_equal(0o750, File.stat(File.join(checkout, 'empty')).mode & 0o777)
+    end
+  end
+
+  def test_tracking_digest_cache_detects_same_size_rewrite_with_restored_mtime
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      root = File.join(workspace, 'records')
+      FileUtils.mkdir_p(root)
+      path = File.join(root, 'record')
+      File.write(path, 'first')
+      before = File.stat(path)
+      digest = runner.send(:tracking_tree_sha256, root)
+      File.write(path, 'other')
+      File.utime(before.atime, before.mtime, path)
+      refute_equal(digest, runner.send(:tracking_tree_sha256, root))
+    end
+  end
+
+  def test_explicit_archive_retains_conflicted_index_and_working_contents
+    with_archive_cleanup_fixture do |runner, _workspace, slug, _common, checkout|
+      objects = %w[base ours theirs].map do |content|
+        stdout, stderr, status = Open3.capture3('git', '-C', checkout, 'hash-object', '-w', '--stdin', stdin_data: content)
+        assert(status.success?, stderr)
+        stdout.strip
+      end
+      entries = "0 #{'0' * 40}\tconflict\n" + objects.each_with_index.map do |object, index|
+        "100644 #{object} #{index + 1}\tconflict\n"
+      end.join
+      _out, err, status = Open3.capture3('git', '-C', checkout, 'update-index', '--index-info', stdin_data: entries)
+      assert(status.success?, err)
+      File.binwrite(File.join(checkout, 'conflict'), "working\x00resolution".b)
+      before = git_capture_success('git', '-C', checkout, 'ls-files', '--stage')
+      runner.archive(slug, as_is: true, explicit: true)
+      runner.revive(slug, as_is: true)
+      assert_equal(before, git_capture_success('git', '-C', checkout, 'ls-files', '--stage'))
+      assert_equal("working\x00resolution".b, File.binread(File.join(checkout, 'conflict')))
+    end
+  end
+
   def test_archive_private_records_under_restrictive_umask
     %w[active complete].each do |lifecycle|
       with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
@@ -797,6 +938,35 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_git_symlink_placeholders_use_full_copy_without_changing_external_permissions
+    with_archive_cleanup_fixture do |runner, workspace, slug, _common, checkout|
+      sentinel = File.join(workspace, 'outside-sentinel')
+      File.write(sentinel, 'external contents')
+      File.chmod(0o640, sentinel)
+      placeholder = File.join(checkout, 'link-placeholder')
+      File.symlink(sentinel, placeholder)
+      assert_git_success('git', '-C', checkout, 'add', 'link-placeholder')
+      assert_git_success('git', '-C', checkout, 'commit', '-m', 'tracked symlink fixture')
+      File.unlink(placeholder)
+      File.write(placeholder, sentinel)
+      assert_git_success('git', '-C', checkout, 'config', 'core.symlinks', 'false')
+      assert_empty(git_capture_success('git', '-C', checkout, 'status', '--porcelain').strip)
+      before = git_capture_success('git', '-C', checkout, 'ls-files', '--stage')
+      runner.archive(slug, as_is: true, explicit: true)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+      saved, = recovery.send(:read_record, recovery.records.first)
+      assert_equal('files', saved.fetch('kind'))
+      runner.revive(slug, as_is: true)
+      refute(File.symlink?(placeholder))
+      assert(File.file?(placeholder))
+      assert_equal(sentinel, File.read(placeholder))
+      assert_equal(before, git_capture_success('git', '-C', checkout, 'ls-files', '--stage'))
+      assert_equal(0o640, File.stat(sentinel).mode & 0o777)
+      assert_equal('external contents', File.read(sentinel))
+    end
+  end
+
   private
 
   def with_archive_cleanup_instance(cleanup)
@@ -816,6 +986,8 @@ class DevSessionTest < Minitest::Test
       commit_archive_fixture(workspace, slug, lifecycle:)
       configure_workspace_origin(workspace)
       common = File.join(workspace, 'repos', 'sample.git')
+      assert_git_success('git', "--git-dir=#{common}", 'config', 'user.name', 'Test User')
+      assert_git_success('git', "--git-dir=#{common}", 'config', 'user.email', 'test@example.invalid')
       feature = File.join(workspace, 'worktrees', slug, 'sample')
       yield runner, workspace, slug, common, feature
     end

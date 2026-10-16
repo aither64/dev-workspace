@@ -2571,6 +2571,7 @@ module DevWorkspaceHost
     # Once durable execution holds and submission receipts exist, a predecessor
     # that ignores them cannot safely restore sessions or reconcile retries.
     def require_compatible_session_recovery!(package)
+      require_compatible_archive_recovery!(package)
       state = %w[session-recovery submissions].flat_map do |name|
         Dir.glob(File.join(@state, name, '**', '*.json'))
       end
@@ -2583,6 +2584,21 @@ module DevWorkspaceHost
       raise Error, 'target workspace package cannot preserve session execution holds and durable submission receipts'
     rescue SystemCallError
       raise Error, 'target workspace package has no readable session recovery contract'
+    end
+
+    def require_compatible_archive_recovery!(package)
+      inventories = Dir.glob(File.join(@state, 'archived-worktrees', '*', '*', '*', 'inventory.json'))
+      git_recovery = inventories.any? do |path|
+        value = parse_strict_json_object(File.binread(path), 'archive recovery inventory', 8 * 1024 * 1024)
+        value['schema'] == 2
+      end
+      return unless git_recovery
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path), 'archive recovery contract', 64 * 1024)
+      unless contract['archiveRecoveryPolicy'] == 2
+        raise Error, 'target workspace package cannot preserve Git archive recovery'
+      end
     end
 
     def identity_bound_runtime_authorities(entries = registry.entries)

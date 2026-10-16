@@ -5,6 +5,7 @@
   "runtimeAuthorityIdentityPolicy": 1,
   "livePackageSwitchPolicy": 1,
   "sessionRecoveryPolicy": 1,
+  "archiveRecoveryPolicy": 2,
   "codexProviderStateSchema": 1,
   "codexProviderTransitionPolicy": 1,
   "agentTeamRegistration": {

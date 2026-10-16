@@ -22,7 +22,8 @@ module DevSession
       def archive_cleanup_recovery(slug, operation_id)
         workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
         root = File.join(@workspace_state_root, 'archived-worktrees', workspace_id, slug, operation_id)
-        ArchiveRecovery.new(root, worktrees_dir(slug), @command_runner)
+        @archive_recovery_instances ||= {}
+        @archive_recovery_instances[root] ||= ArchiveRecovery.new(root, worktrees_dir(slug), @command_runner)
       end
 
       def archive_cleanup_repository(project)
@@ -259,6 +260,7 @@ module DevSession
     def create(journal, inventory)
       if journal.fetch('mode') == 'archived'
         @runner.archive_cleanup_recovery(@slug, journal.fetch('operation_id')).capture!(inventory.fetch('worktrees'))
+        @recovery_audited = true
       end
       source = source_path
       inventory = inventory.merge('tracking_identity' => directory_identity(source),
@@ -328,9 +330,16 @@ module DevSession
         end
       end
       inventory.fetch('proofs').each { |proof| reprove!(proof, sidecar.fetch('mode')) }
-      if sidecar.fetch('mode') == 'archived'
+      if sidecar.fetch('mode') == 'archived' && !@recovery_audited
         recovery = @runner.archive_cleanup_recovery(@slug, sidecar.fetch('operation_id'))
-        inventory.fetch('worktrees').each { |record| recovery.verify_checkout!(record) unless record.fetch('removed') }
+        inventory.fetch('worktrees').each do |record|
+          if record.fetch('removed')
+            recovery.verify_saved!(record)
+          else
+            recovery.verify_checkout!(record)
+          end
+        end
+        @recovery_audited = true
       end
       tracking = exists?(source_path) ? source_path : archive_path
       unless directory_identity(tracking) == inventory.fetch('tracking_identity')
@@ -349,6 +358,7 @@ module DevSession
         revalidate!(sidecar, journal:)
         next if record.fetch('removed')
         if sidecar.fetch('mode') == 'archived'
+          @runner.archive_cleanup_recovery(@slug, sidecar.fetch('operation_id')).verify_checkout!(record)
           @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')), force: true)
         else
           @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))

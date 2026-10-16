@@ -35,7 +35,11 @@ repositories or the shared workspace repository. This includes nested containers
 and detached or locked checkouts. Explicit archival does not fetch, compare published heads,
 require merged work or require clean checkouts. It pins checkout heads and index
 objects under `refs/dev-session-archives/`, then saves working files and index and
-operation state in private `archived-worktrees/` storage. Staged, unstaged,
+operation state in private `archived-worktrees/` storage. A clean checkout with
+no untracked or ignored entries uses retained Git objects instead of a file copy;
+its saved permissions also preserve empty directories. Other checkouts use a full
+file snapshot. Git reconstruction requires raw file bytes to match retained blobs;
+filtered or converted content keeps a full snapshot. Staged, unstaged,
 untracked, ignored and binary contents survive. Captures are synced and checked
 against the source before forced Git removal. Branches are retained.
 
@@ -62,6 +66,11 @@ revival behavior and do not gain worktree snapshots.
 Once a restoration completion receipt exists, retry cannot replace the checkout
 again. It removes a leftover intent when the contents still match, and refuses
 if the operator has since changed them.
+
+Recovery inventory schema 2 distinguishes Git reconstruction from full copies.
+The reader retains schema 1 snapshots. Packages must publish matching
+`archiveRecoveryPolicy` support to manage these captures; package selection and
+activation refuse an incompatible target while retained recovery depends on it.
 
 ## Completion and abandoned cleanup
 
