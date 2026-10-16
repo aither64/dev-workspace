@@ -1,6 +1,12 @@
 # frozen_string_literal: true
 
 module WorkspaceCoordination
+  class AdmissionBusy < Error
+    def initialize(message)
+      super(message, 75)
+    end
+  end
+
   # Retry acquisition only. Callers must never replay a mutation after its
   # callback has started. The ledger mutex owns logical write serialization.
   module Admission
@@ -14,7 +20,7 @@ module WorkspaceCoordination
       until file.flock(mode | File::LOCK_NB)
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
         if elapsed >= timeout
-          raise Error.new(format('session lifecycle admission is busy after %.2fs; retry the same request', elapsed), 75)
+          raise AdmissionBusy, format('session lifecycle admission is busy after %.2fs; retry the same request', elapsed)
         end
         unless reported
           diagnostics&.puts 'waiting for session lifecycle admission; an exclusive lifecycle writer holds the guard'

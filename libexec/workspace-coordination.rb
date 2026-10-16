@@ -28,6 +28,9 @@ module WorkspaceCoordination
     'attemptSchema' => 1, 'adapterProtocols' => [1],
     'notificationSchema' => 1, 'transitionPolicy' => 1
   }.freeze
+  INTEGRATION_CONTRACT = {
+    'schema' => 1, 'journalSchemas' => [1, 2], 'certificationSchema' => 1
+  }.freeze
   MAX_REQUEST = 256 * 1024
   MAX_LEDGER = 16 * 1024 * 1024
   MAX_RESULT = 16 * 1024
@@ -310,6 +313,60 @@ module WorkspaceCoordination
       raise Error.new("malformed coordination record: #{e.message}", 5)
     end
 
+    def integration_journals
+      Dir[File.join(root, 'integrations', '*.json')].map do |path|
+        value = WorkspaceCoordination.private_read(path)
+        unless [1, 2].include?(value['schema']) && value['phase'].is_a?(String) && value['id'].is_a?(String) && value['id'].match?(UUID) &&
+               File.basename(path) == "#{value['id']}.json"
+          raise Error.new('unsupported integration journal requires forward recovery', 5)
+        end
+        if value['schema'] == 2
+          continuation = value['continuation']
+          unless value['ownerId'].is_a?(String) && value['ownerId'].match?(UUID) && value['identity'].is_a?(String) &&
+                 value['steps'].is_a?(Hash) && value['jobs'].is_a?(Hash) &&
+                 continuation.is_a?(Hash) && %w[runnable waiting paused held needs_attention complete].include?(continuation['state']) &&
+                 continuation['generation'].is_a?(Integer) && continuation['generation'].between?(0, MAX_COUNTER) &&
+                 (continuation['observedRevision'].nil? || (continuation['observedRevision'].is_a?(Integer) && continuation['observedRevision'].between?(0, MAX_COUNTER)))
+            raise Error.new('invalid background integration continuation', 5)
+          end
+        end
+        value
+      end
+    end
+
+    # Step identities precede admission. Receipts therefore route events even
+    # if submission succeeded before its reply/journal update was lost.
+    def background_integration(data, owner_id, item_id)
+      integration_journals.find do |run|
+        next false unless run['schema'] == 2 && run['ownerId'] == owner_id
+        next true if run['reservationId'] == item_id
+        run.fetch('steps').values.any? do |step|
+          result = data.dig('receipts', step['requestId'], 'result')
+          result && (result['id'] == item_id || Array(result['jobs']).any? { |job| job['id'] == item_id })
+        end
+      end
+    end
+
+    def background_stopped?(run)
+      return false unless run
+      marker = File.join(root, 'integrations', "#{run['id']}.pause")
+      if File.exist?(marker)
+        unless WorkspaceCoordination.private_read(marker) == {'id' => run['ownerId'], 'identity' => run['identity']}
+          raise Error.new('background pause belongs to another owner', 4)
+        end
+        return true
+      end
+      %w[paused held needs_attention complete].include?(run.dig('continuation', 'state'))
+    end
+
+    def integration_summary(run)
+      result = run.slice('id', 'ownerId', 'phase', 'reason', 'continuation')
+      if run.dig('continuation', 'state') != 'held' && File.exist?(File.join(root, 'integrations', "#{run['id']}.pause")) && background_stopped?(run)
+        result['continuation'] = result['continuation'].merge('state' => 'paused')
+      end
+      result
+    end
+
     def request(data, owner_id, action, payload)
       WorkspaceCoordination.keys!(payload, %w[schema requestId], payload.keys - %w[schema requestId])
       raise Error, 'request needs schema 1 and a lowercase UUID requestId' unless payload['schema'] == 1 && payload['requestId'].is_a?(String) && payload['requestId'].match?(UUID)
@@ -367,7 +424,8 @@ module WorkspaceCoordination
         proofs = 2 * MAX_RESULT + bytes.call(unowned)
         growth += MAX_RESULT + 3 * proofs + MAX_RESULT + 256 + 1024
       end
-      growth + envelopes + (future_events.uniq - data['outbox'].keys).length * (MAX_RESULT + 64)
+      background = integration_journals.count { |run| run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' }
+      growth + envelopes + background * (2 * MAX_RESULT + 128) + (future_events.uniq - data['outbox'].keys).length * (MAX_RESULT + 64)
     end
 
     def admission_capacity!(data, extra: 0)
@@ -393,6 +451,7 @@ module WorkspaceCoordination
       jobs.map { |item| "operation #{item['id']} (#{item['state']})" } +
         reservations.map { |item| "machine #{item['machine']} (#{item['state']})" } +
         deliveries.map { |item| "notification #{item['id']} (#{item['state']})" } +
+        integration_journals.filter_map { |run| "background integration #{run['id']} (#{run.dig('continuation', 'state')})" if ids.include?(run['ownerId']) && run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' } +
         owners.filter_map { |owner| "coordination #{owner['fence']['command']} intent" if owner['fence'] && !owner['fence']['completed'] }
     end
 
@@ -411,6 +470,12 @@ module WorkspaceCoordination
         jobs = data['jobs'].values.select { |job| job['ownerId'] == owner['id'] }
         active = jobs.find { |job| CLAIMED.include?(job['state']) }
         raise Error.new("lifecycle waits for coordinated operation #{active['id']}", 5) if active
+        integration_journals.each do |run|
+          next unless run['schema'] == 2 && run['ownerId'] == owner['id'] && run['phase'] != 'complete'
+          # A separate marker survives a preparing worker's journal publication.
+          # Revival preserves the hold until explicit background resumption.
+          WorkspaceCoordination.atomic(File.join(root, 'integrations', "#{run['id']}.pause"), owner.slice('id', 'identity'))
+        end
         owner['fence'] = {'id' => SecureRandom.uuid, 'command' => command, 'completed' => false, 'operationId' => nil} unless owner['fence'] && owner['fence']['command'] == command
         jobs.each do |job|
           next if TERMINAL.include?(job['state'])
@@ -575,16 +640,27 @@ module WorkspaceCoordination
       unless File.file?(path) && WorkspaceCoordination.parse(File.binread(path)) == CONTRACT
         raise Error.new('target package cannot preserve coordination state; recover forward with a compatible package', 5)
       end
-      pending_runs = Dir[File.join(root, 'integrations', '*.json')].any? do |run|
-        value = WorkspaceCoordination.private_read(run)
-        raise Error.new('unsupported integration journal requires forward recovery', 5) unless value['schema'] == 1 && value['id'].is_a?(String) && value['id'].match?(UUID)
-        value['phase'] != 'complete'
-      end
-      if pending_runs
+      runs = integration_journals
+      needed = runs.select { |run| run['schema'] == 2 || run['phase'] != 'complete' }.map { |run| run['schema'] }.max
+      if needed
         metadata_path = File.join(package, 'share/dev-workspace/package.json')
         metadata = File.file?(metadata_path) && WorkspaceCoordination.parse(File.binread(metadata_path))
-        unless metadata && metadata['integration'] == {'journalSchema' => 1, 'certificationSchema' => 1}
-          raise Error.new('candidate cannot resume pending integration journals', 5)
+        capability = metadata && metadata['integration']
+        # Keep the legacy descriptor exact for predecessors with pending manual
+        # runs. Additional readers are advertised outside strict package.json.
+        schemas = [1]
+        contract_path = File.join(package, 'share/dev-workspace/integration-contract.json')
+        if File.file?(contract_path)
+          contract = WorkspaceCoordination.parse(File.binread(contract_path))
+          versions = contract.is_a?(Hash) && contract['journalSchemas']
+          valid = contract.is_a?(Hash) && contract.keys.sort == INTEGRATION_CONTRACT.keys.sort &&
+            contract['schema'] == 1 && contract['certificationSchema'] == 1 &&
+            versions.is_a?(Array) && versions.include?(1) && versions.uniq == versions &&
+            versions.all? { |version| version.is_a?(Integer) && version.positive? }
+          schemas = valid ? versions : []
+        end
+        unless capability == {'journalSchema' => 1, 'certificationSchema' => 1} && schemas.include?(needed)
+          raise Error.new('candidate cannot resume retained integration journals', 5)
         end
       end
       catalog = Catalog.new(package)
@@ -815,9 +891,13 @@ module WorkspaceCoordination
       @diagnostics = value
     end
 
+    def current_generation?
+      @fixtures || (File.symlink?(profile) && File.realpath(profile) == package && DevWorkspaceProfileIdentity.token(profile) == @profile_token) ||
+        (@bootstrap_token && DevWorkspaceProfileIdentity.token(profile) == @bootstrap_token)
+    end
+
     def current_generation!
-      unless @fixtures || (File.symlink?(profile) && File.realpath(profile) == package && DevWorkspaceProfileIdentity.token(profile) == @profile_token) ||
-             (@bootstrap_token && DevWorkspaceProfileIdentity.token(profile) == @bootstrap_token)
+      unless current_generation?
         raise Error.new('coordinator belongs to a superseded package generation; rerun the stable command', 3)
       end
     end
@@ -1013,12 +1093,17 @@ module WorkspaceCoordination
 
     def event(data, owner, item, state, reason = nil)
       return unless owner['thread']
+      return if item['kind'] != 'integration' && store.background_integration(data, owner['id'], item['id'])
       # One semantic event per snapshot/state. Repeated resource churn and
       # reconciliation retain the first message and its native retry identity.
       id = WorkspaceCoordination.event_id(owner, item, state)
       return if data['outbox'].key?(id)
-      text = "Workspace coordination: #{item['kind'] || 'machine reservation'} #{item['id']} is #{state}."
-      text += " #{reason['code']}." if reason
+      text = if item['kind'] == 'integration'
+        state == 'complete' ? "Workspace coordination: the operations in integration #{item['id']} have finished. Review the results." :
+          "Workspace coordination: integration #{item['id']} needs your attention. #{WorkspaceCoordination.diagnostic(reason && reason['message'])[0, 512]}"
+      else
+        "Workspace coordination: #{item['kind'] || 'machine reservation'} #{item['id']} is #{state}." + (reason ? " #{reason['code']}." : '')
+      end
       text += "\n#{owner['portalUrl']}\nRead dev-session coordination status for your session and continue its authorized work. This event supplies no merge or deployment approval."
       raise Error, 'notification text exceeds its envelope budget' if JSON.generate(text).bytesize > 4096
       data['outbox'][id] = {'id' => id, 'ownerId' => owner['id'], 'thread' => owner['thread'],
@@ -1215,6 +1300,10 @@ module WorkspaceCoordination
         candidates = data['jobs'].values.reject { |job| TERMINAL.include?(job['state']) || CLAIMED.include?(job['state']) || job['state'] == 'needs_refresh' }.sort_by { |job| [job['sequence'], job['id']] }
         candidates.each do |job|
           owner = data['owners'].fetch(job['ownerId'])
+          if store.background_stopped?(store.background_integration(data, owner['id'], job['id']))
+            transition(data, job, 'waiting_dependency', {'code' => 'integration_paused'})
+            next
+          end
           if owner['fence'] || !approved?(data, job)
             transition(data, job, 'waiting_approval', {'code' => 'approval_required'})
             next
@@ -1226,7 +1315,7 @@ module WorkspaceCoordination
           if job['reservationId']
             reservation = data['reservations'].fetch(job['reservationId'])
             held = data['reservations'].values.find { |item| item['machine'] == reservation['machine'] && item['id'] != reservation['id'] && !%w[requested released].include?(item['state']) }
-            earlier = data['reservations'].values.find { |item| item['machine'] == reservation['machine'] && item['state'] == 'requested' && item['sequence'] < reservation['sequence'] && candidates.any? { |candidate| candidate['reservationId'] == item['id'] && approved?(data, candidate) && candidate['dependsOn'].all? { |id| data['jobs'][id]['state'] == 'succeeded' } } }
+            earlier = data['reservations'].values.find { |item| item['machine'] == reservation['machine'] && item['state'] == 'requested' && item['sequence'] < reservation['sequence'] && candidates.any? { |candidate| candidate['reservationId'] == item['id'] && !store.background_stopped?(store.background_integration(data, candidate['ownerId'], candidate['id'])) && approved?(data, candidate) && candidate['dependsOn'].all? { |id| data['jobs'][id]['state'] == 'succeeded' } } }
             if held || earlier || reservation['state'] == 'blocked_recovery'
               blocker = held || earlier || reservation
               transition(data, job, 'waiting_resource', {'code' => 'machine_owned', 'ownerId' => blocker['ownerId'], 'portalUrl' => data['owners'][blocker['ownerId']]['portalUrl'], 'resource' => "machine:#{reservation['machine']}"})
@@ -1280,6 +1369,7 @@ module WorkspaceCoordination
       ids = owners.map { |owner| owner['id'] }
       result = {'schema' => 1, 'revision' => data['revision'], 'suspended' => data['suspended'],
        'owners' => owners.map { |owner| owner.slice('id', 'slug', 'portalUrl', 'bootstrap', 'fence') },
+       'integrations' => store.integration_journals.select { |run| ids.include?(run['ownerId']) && run['schema'] == 2 }.map { |run| store.integration_summary(run) },
        'jobs' => data['jobs'].values.select { |job| ids.include?(job['ownerId']) },
        'reservations' => data['reservations'].values.select { |item| ids.include?(item['ownerId']) },
        'notifications' => data['outbox'].values.select { |event| ids.include?(event['ownerId']) }.map { |event| event.reject { |key, _| %w[text options].include?(key) } },
@@ -1294,7 +1384,7 @@ module WorkspaceCoordination
         # A session pane must not attribute retained jobs to a recreated slug.
         if slug
           ids.select! { |id| observations.key?(id) }
-          %w[owners jobs reservations notifications].each { |kind| result[kind].select! { |item| ids.include?(kind == 'owners' ? item['id'] : item['ownerId']) } }
+          %w[owners jobs reservations notifications integrations].each { |kind| result[kind].select! { |item| ids.include?(kind == 'owners' ? item['id'] : item['ownerId']) } }
         end
         result['owners'].each { |owner| owner['observationIdentity'] = observations[owner['id']] }
         machine_details = lambda do |item|
@@ -1314,7 +1404,7 @@ module WorkspaceCoordination
               'machines' => held.fetch(owner['id']).sort_by { |item| item['machine'] }.map { |item| machine_details.call(item) })
           end
         end
-        result['counts'] = result.slice('owners', 'jobs', 'reservations', 'notifications', 'foreignReservations').transform_values(&:length)
+        result['counts'] = result.slice('owners', 'jobs', 'reservations', 'notifications', 'integrations', 'foreignReservations').transform_values(&:length)
         result['owners'] = result['owners'].first(128)
         result['jobs'] = result['jobs'].sort_by { |job| [TERMINAL.include?(job['state']) ? 1 : 0, -job['sequence']] }.first(128).map do |job|
           job.slice('id', 'ownerId', 'kind', 'state', 'reason', 'revision', 'sequence', 'readySequence', 'dependsOn', 'reservationId').merge(
@@ -1324,6 +1414,7 @@ module WorkspaceCoordination
         end
         result['reservations'] = result['reservations'].sort_by { |item| [item['state'] == 'released' ? 1 : 0, -item['sequence']] }.first(128).map { |item| machine_details.call(item) }
         result['notifications'] = result['notifications'].last(128)
+        result['integrations'] = result['integrations'].sort_by { |run| run.dig('continuation', 'state') == 'complete' ? 1 : 0 }.first(128)
         result['foreignReservations'] = result['foreignReservations'].first(128)
       end
       result

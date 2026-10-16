@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-integration-certification'
+require_relative 'workspace-integration-background'
 require 'tempfile'
 
 module WorkspaceCoordination
@@ -27,6 +28,7 @@ module WorkspaceCoordination
   # A resumable composition of existing operations. It owns no Git integration,
   # reservation, activation or uncertain-effect recovery implementation.
   class Integration
+    include BackgroundIntegration
     TERMINAL_PHASES = %w[complete].freeze
     attr_reader :engine, :owner
 
@@ -42,7 +44,7 @@ module WorkspaceCoordination
 
     def read(id)
       value = WorkspaceCoordination.private_read(path(id))
-      unless value['schema'] == 1 && value['ownerId'] == owner['id'] && value['identity'] == owner['identity']
+      unless [1, 2].include?(value['schema']) && value['ownerId'] == owner['id'] && value['identity'] == owner['identity']
         raise Error.new('integration run belongs to another session incarnation', 4)
       end
       value
@@ -50,9 +52,10 @@ module WorkspaceCoordination
 
     def save(value)
       WorkspaceCoordination.atomic(path(value['id']), value)
+      engine.store.wake if value['schema'] == 2
     end
 
-    def start(request, wait: true)
+    def start(request, wait: true, background: false)
       request = WorkspaceCoordination.canonical(request)
       Array(request['repositories']).each do |item|
         item['recipe'] ||= data_refresh(item['repository'])
@@ -65,23 +68,33 @@ module WorkspaceCoordination
       engine.store.lock("integration-#{id}", nonblock: true) do
         if File.exist?(path(id))
           value = read(id)
+          raise Error.new('integration execution mode differs from the retained run', 3) unless (value['schema'] == 2) == background
           raise Error.new('integration requestId reused with changed input', 3) unless value['request'] == WorkspaceCoordination.canonical(request)
         else
           validate(request)
-          value = {'schema' => 1, 'id' => id, 'ownerId' => owner['id'], 'identity' => owner['identity'],
+          value = {'schema' => background ? 2 : 1, 'id' => id, 'ownerId' => owner['id'], 'identity' => owner['identity'],
             'phase' => 'prepare', 'request' => WorkspaceCoordination.canonical(request), 'steps' => {},
             'operations' => {}, 'jobs' => {}, 'replacements' => [], 'startedAt' => Time.now.utc.iso8601,
             'phaseSeconds' => {}, 'verificationSeconds' => 0, 'preparationSeconds' => 0,
             'queueSeconds' => 0, 'lastObservedAt' => Time.now.to_f}
-          @admission.call do
+          value['continuation'] = {'state' => 'runnable', 'generation' => 0, 'observedRevision' => nil} if background
+          admit do
             engine.current_generation!
             verify_tracking_binding
-            save(value)
+            engine.store.transaction do |data|
+              save(value)
+              begin
+                engine.store.admission_capacity!(data)
+              rescue Error
+                File.unlink(path(id))
+                raise
+              end
+            end
           end
         end
         true
       end || raise(Error.new('integration driver is already running', 75))
-      drive(id, wait:)
+      background ? status(id) : drive(id, wait:)
     end
 
     def data_refresh(repository)
@@ -120,8 +133,9 @@ module WorkspaceCoordination
 
     def status(id)
       value = read(id)
+      value['continuation'] = value['continuation'].merge('state' => 'paused') if value['schema'] == 2 && value.dig('continuation', 'state') != 'held' && paused?(id)
       current_jobs = engine.store.read['jobs']
-      value.slice('schema', 'id', 'phase', 'startedAt', 'finishedAt', 'phaseSeconds', 'queueSeconds', 'verificationSeconds', 'preparationSeconds', 'reason').merge(
+      value.slice('schema', 'id', 'phase', 'startedAt', 'finishedAt', 'phaseSeconds', 'queueSeconds', 'verificationSeconds', 'preparationSeconds', 'reason', 'continuation').merge(
         'administrationSeconds' => [value['phaseSeconds'].values.sum - value.fetch('verificationSeconds', 0) - value.fetch('preparationSeconds', 0), 0].max,
         'heads' => value['operations'].transform_values { |operation| operation.dig('snapshot', 'operation', 'featureHead') },
         'jobs' => value['jobs'].transform_values { |job_id| current_jobs[job_id]&.slice('id', 'kind', 'state', 'reason', 'revision') })
@@ -136,30 +150,31 @@ module WorkspaceCoordination
     end
 
     def resume(id)
-      path(id)
-      acquired = engine.store.lock("integration-#{id}", nonblock: true) do
-        value = read(id)
-        return status(id) if TERMINAL_PHASES.include?(value['phase'])
-        engine.current_generation!
-        phase = value['phase']
-        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        begin
-          value.delete('reason')
-          advance(value)
-        rescue Error => error
-          value['reason'] = {'code' => error.code, 'message' => error.message}
-          raise
-        ensure
-          value['phaseSeconds'][phase] = value['phaseSeconds'].fetch(phase, 0) + Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-          save(value)
-        end
-        status(id)
+      acquired = engine.store.lock("integration-#{id}", nonblock: true) { resume_locked(id) }
+      acquired || raise(Error.new('integration driver is already running', 75))
+    end
+
+    def resume_locked(id)
+      value = read(id)
+      return status(id) if TERMINAL_PHASES.include?(value['phase'])
+      engine.current_generation!
+      phase = value['phase']
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      begin
+        value.delete('reason')
+        advance(value)
+      rescue Error => error
+        value['reason'] = {'code' => error.code, 'message' => error.message}
+        raise
+      ensure
+        value['phaseSeconds'][phase] = value['phaseSeconds'].fetch(phase, 0) + Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        save(value)
       end
-      raise Error.new('integration driver is already running', 75) unless acquired
-      acquired
+      status(id)
     end
 
     def step(value, name)
+      background_guard! if @background_id
       entry = value['steps'][name] ||= {'requestId' => SecureRandom.uuid}
       save(value) # Persist identity before the caller can mutate anything.
       unless entry.key?('result')
@@ -176,7 +191,7 @@ module WorkspaceCoordination
         entry['payload'] ||= fields.merge('schema' => 1, 'requestId' => request_id)
         entry['jobId'] ||= job_id
         save(value)
-        @admission.call do
+        admit do
           engine.mutate(owner, action, entry['payload'], job_id: entry['jobId'])
         end
       end
@@ -214,7 +229,7 @@ module WorkspaceCoordination
             'approvalId' => operation['approvalId'], 'reservationId' => nil, 'snapshot' => operation['snapshot']}
         end
         submitted = step(value, 'submit-batch') do |request_id|
-          @admission.call { engine.submit_batch(owner, 'schema' => 1, 'requestId' => request_id, 'jobs' => jobs) }
+          admit { engine.submit_batch(owner, 'schema' => 1, 'requestId' => request_id, 'jobs' => jobs) }
         end
         submitted['jobs'].each { |job| value['jobs']["merge:#{job['key']}"] = job['id'] }
         value['phase'] = 'merging'
@@ -356,7 +371,7 @@ module WorkspaceCoordination
     def publish_refresh(value, item, path, registration, old_head, head, proof)
       retained = engine.retain_commit(path, old_head) { |source| engine.prepare_merge_hooks(source, item['repository'], old_head) }
       hooks = engine.prepare_merge_hooks(retained, item['repository'], old_head)
-      @admission.call do
+      admit do
         current = engine.owner(owner['slug'])
         raise Error.new('refresh owner changed', 4) unless current['id'] == owner['id'] && current['identity'] == owner['identity']
         engine.with_merge_hooks('hookArtifact' => hooks && hooks['id']) do
@@ -548,7 +563,7 @@ module WorkspaceCoordination
               'finalHeads' => final, 'replacements' => replacements(value, reservation, final) + completion.fetch('replacements', [])}
             save(value)
           end
-          @admission.call do
+          admit do
             engine.finish(owner, entry['reservationId'], entry['payload'])
           end
         end
@@ -556,6 +571,10 @@ module WorkspaceCoordination
       value['phase'] = 'finalizing'
       save(value)
       export(value)
+      if value['schema'] == 2
+        background_notice(value, 'complete')
+        return if engine.store.read['outbox'].values.any? { |event| event['ownerId'] == owner['id'] && event['state'] != 'delivered' }
+      end
       record_completion(value)
       value['phase'] = 'complete'
       value['finishedAt'] = Time.now.utc.iso8601
@@ -604,7 +623,7 @@ module WorkspaceCoordination
             end
           end
           receipt_path = File.join(record_directory(value), "equivalence-#{item['repository']}-#{coverage['revision'][0, 12]}.json")
-          @admission.call do
+          admit do
             verify_tracking_binding
             WorkspaceCoordination.atomic(receipt_path, receipt, limit: MAX_REQUEST)
           end
@@ -614,7 +633,7 @@ module WorkspaceCoordination
     end
 
     def export(value)
-      @admission.call do
+      admit do
         verify_tracking_binding
         directory = record_directory(value)
         FileUtils.mkdir_p(directory)
@@ -631,7 +650,7 @@ module WorkspaceCoordination
 
     def record_completion(value)
       return if value['steps'].dig('tracking-commit', 'result')
-      @admission.call do
+      admit do
         verify_tracking_binding
         root = File.join(engine.workspace, 'work', owner['slug'])
         state = File.read(File.join(root, 'state.md'))
@@ -645,7 +664,7 @@ module WorkspaceCoordination
           File.join('integration', value['id'], file), '--label', "Integration #{value['id']} #{file}",
           '--expected-owner', owner['id'], '--as-is')
       end
-      local_completion = @admission.call do
+      local_completion = admit do
         verify_tracking_binding
         manifest = YAML.safe_load(File.binread(File.join(engine.workspace, 'work', owner['slug'], 'portal.yml')), permitted_classes: [], aliases: false)
         if manifest['sensitive'] == true
@@ -662,7 +681,7 @@ module WorkspaceCoordination
         source = engine.retain_commit(engine.workspace, source_head)
         hooks = engine.prepare_merge_hooks(source, 'workspace', source_head)
         common = engine.capture('git', '-C', engine.workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
-        @admission.call do
+        admit do
           verify_tracking_binding
           File.open(File.join(common, 'dev-session-tracking.lock'), File::RDWR | File::CREAT, 0o600) do |lock|
             lock.flock(File::LOCK_EX)
@@ -691,7 +710,7 @@ module WorkspaceCoordination
       end
     rescue StandardError
       begin
-        @admission.call do
+        admit do
           verify_tracking_binding
           state_path = File.join(engine.workspace, 'work', owner['slug'], 'state.md')
           if File.file?(state_path)
@@ -715,7 +734,7 @@ module WorkspaceCoordination
       state_path = File.join(engine.workspace, 'work', owner['slug'], 'state.md')
       state = File.read(state_path)
       ledger = engine.store.read
-      settled = ledger['jobs'].values.none? { |job| job['ownerId'] == owner['id'] && !TERMINAL.include?(job['state']) } &&
+      settled = value['schema'] != 2 && ledger['jobs'].values.none? { |job| job['ownerId'] == owner['id'] && !TERMINAL.include?(job['state']) } &&
         ledger['reservations'].values.none? { |reservation| reservation['ownerId'] == owner['id'] && reservation['state'] != 'released' } &&
         ledger['outbox'].values.none? { |event| event['ownerId'] == owner['id'] && event['state'] != 'delivered' }
       File.write(state_path, state.sub(/\A---\nlifecycle: active\n---/, "---\nlifecycle: complete\n---")) if exact && settled

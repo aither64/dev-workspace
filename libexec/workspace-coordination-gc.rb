@@ -287,9 +287,7 @@ module WorkspaceCoordination
         closed = owner && owner['fence'] && owner['fence']['completed']
         mark(value) if !closed && @retention.live?(id, @ledger, @book)
       end
-      Dir[File.join(@store.root, 'integrations', '*.json')].each do |path|
-        value = WorkspaceCoordination.private_read(path)
-        raise Error, 'unknown integration journal; collection refused' unless value['schema'] == 1 && value['phase'].is_a?(String)
+      @store.integration_journals.each do |value|
         next if value['phase'] == 'complete'
         mark(value)
         # Existing journals bind source heads, but do not record hook artifact

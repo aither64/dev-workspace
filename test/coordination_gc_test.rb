@@ -159,10 +159,11 @@ class CoordinationGcTest < Minitest::Test
     cancel(person, job)
     directory = File.join(@engine.store.root, 'integrations')
     FileUtils.mkdir_p(directory)
-    path = File.join(directory, "#{SecureRandom.uuid}.json")
-    WorkspaceCoordination.atomic(path, {'schema' => 1, 'phase' => 'deploy', 'operation' => snapshot})
+    id = SecureRandom.uuid
+    path = File.join(directory, "#{id}.json")
+    WorkspaceCoordination.atomic(path, {'schema' => 1, 'id' => id, 'phase' => 'deploy', 'operation' => snapshot})
     assert_empty collect(apply: true)['removed']
-    WorkspaceCoordination.atomic(path, {'schema' => 1, 'phase' => 'complete', 'operation' => snapshot})
+    WorkspaceCoordination.atomic(path, {'schema' => 1, 'id' => id, 'phase' => 'complete', 'operation' => snapshot})
     assert_equal 2, collect(apply: true)['removed'].length
   end
 
@@ -186,7 +187,7 @@ class CoordinationGcTest < Minitest::Test
     cancel(person, submit(person, snapshot))
     id = SecureRandom.uuid
     journal = File.join(@engine.store.root, 'integrations', "#{id}.json")
-    WorkspaceCoordination.atomic(journal, {'schema' => 1, 'phase' => 'prepare',
+    WorkspaceCoordination.atomic(journal, {'schema' => 1, 'id' => id, 'phase' => 'prepare',
       'head' => snapshot.dig('operation', 'featureHead')})
     hook = @engine.save_artifact('kind' => 'merge_hooks', 'repository' => 'code',
       'featureHead' => snapshot.dig('operation', 'featureHead'), 'environment' => {})
@@ -203,7 +204,7 @@ class CoordinationGcTest < Minitest::Test
     collect(apply: true)
     assert File.directory?(source(snapshot))
     assert File.symlink?(root)
-    WorkspaceCoordination.atomic(journal, {'schema' => 1, 'phase' => 'complete'})
+    WorkspaceCoordination.atomic(journal, {'schema' => 1, 'id' => id, 'phase' => 'complete'})
     collect(apply: true)
     refute File.exist?(source(snapshot))
     refute File.symlink?(root)
@@ -270,6 +271,24 @@ class CoordinationGcTest < Minitest::Test
     @engine.retain_root(attempt, 'worker', @package)
     collect(apply: true)
     refute File.symlink?(File.join(@engine.store.root, 'roots', "#{attempt}-worker"))
+  end
+
+  def test_background_journal_retains_live_payloads_and_allows_collection_after_completion
+    person, snapshot = prepare('background-retention')
+    cancel(person, submit(person, snapshot))
+    id = SecureRandom.uuid
+    path = File.join(@engine.store.root, 'integrations', "#{id}.json")
+    value = {'schema' => 2, 'id' => id, 'ownerId' => person['id'], 'identity' => person['identity'],
+      'phase' => 'deploy', 'steps' => {}, 'jobs' => {}, 'operation' => snapshot,
+      'continuation' => {'state' => 'waiting', 'generation' => 0, 'observedRevision' => nil}}
+    WorkspaceCoordination.atomic(path, value)
+    assert_empty collect(apply: true)['removed']
+    assert File.directory?(source(snapshot))
+    value['phase'] = 'complete'
+    value['continuation']['state'] = 'complete'
+    WorkspaceCoordination.atomic(path, value)
+    assert_equal 2, collect(apply: true)['removed'].length
+    refute File.exist?(source(snapshot))
   end
 
 end

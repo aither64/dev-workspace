@@ -28,7 +28,7 @@ class CoordinationAdmissionTest < Minitest::Test
     with_lock do |path, writer|
       writer.flock(File::LOCK_EX)
       File.open(path, 'r+') do |reader|
-        error = assert_raises(WorkspaceCoordination::Error) do
+        error = assert_raises(WorkspaceCoordination::AdmissionBusy) do
           WorkspaceCoordination::Admission.acquire(reader, timeout: 0)
           flunk 'admission callback must not start'
         end

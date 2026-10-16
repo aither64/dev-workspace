@@ -14,7 +14,9 @@
     needs_refresh: "Needs preparation", reconciling: "Recovery required", succeeded: "Completed",
     failed: "Failed", canceled: "Canceled", requested: "Waiting for reservation", held: "Reserved for deployment",
     deployed_review: "Held for review", blocked_recovery: "Held for recovery",
-    closing: "Checking completion", released: "Released"};
+    closing: "Checking completion", released: "Released", runnable: "Continuing automatically",
+    waiting: "Waiting automatically", paused: "Paused",
+    needs_attention: "Agent action required", complete: "Completed"};
   const kinds = {merge: "Merge feature branch", machine_activate: "Deploy system configuration", profile_activate: "Update workspace application"};
   const node = (tag, text = "", className = "") => {
     const element = document.createElement(tag); element.textContent = text;
@@ -86,7 +88,7 @@
     const expanded = new Set([...panel.querySelectorAll("details[data-coordination-key][open]")].map(detail => detail.dataset.coordinationKey));
     const focused = document.activeElement?.closest?.("details[data-coordination-key]")?.dataset.coordinationKey;
     const content = document.createDocumentFragment();
-    const owners = new Map(), reservations = new Map(), held = new Map(), jobs = [], requests = [], alerts = [];
+    const owners = new Map(), reservations = new Map(), held = new Map(), jobs = [], integrations = [], requests = [], alerts = [];
     let limited = false;
     for (const workspace of payload.workspaces) {
       for (const owner of workspace.owners) {
@@ -111,6 +113,7 @@
         if (!["requested", "released"].includes(item.state) && !held.has(item.machine)) held.set(item.machine, {...item, id: item.machine, foreign: true});
       }
       jobs.push(...workspace.jobs.filter(own));
+      integrations.push(...(workspace.integrations || []).filter(own));
       const notices = workspace.notifications.filter(own).filter(event => event.state !== "delivered");
       if (notices.length) alerts.push(`${notices.length} agent ${notices.length === 1 ? "notification is" : "notifications are"} awaiting delivery or confirmation.`);
       if (workspace.counts && Object.entries(workspace.counts).some(([key, total]) => total > (workspace[key]?.length || 0))) limited = true;
@@ -133,6 +136,21 @@
       element.append(heading); content.append(element); return element;
     };
     for (const text of alerts) content.append(node("p", text, "notice warning"));
+    if (integrations.length) {
+      const runs = section("Background integrations", integrations.length);
+      for (const run of integrations) {
+        const row = node("article", "", "coordination-machine");
+        const heading = node("p"); heading.append(ownerLink(run), node("span", ": "), badge(run.continuation?.state === "held" ? "paused" : run.continuation?.state));
+        row.append(heading);
+        if (run.reason?.message) row.append(node("p", run.reason.message));
+        else row.append(node("p", run.continuation?.state === "complete"
+          ? "The requested operations have finished."
+          : ["paused", "held"].includes(run.continuation?.state)
+            ? "Continuation is paused. Operations already running may finish."
+            : "The worker continues approved operations while the session is idle."));
+        row.append(details(`integration:${run.id}`, run)); runs.append(row);
+      }
+    }
     const machineSection = section("Reserved machines", held.size);
     const grid = node("div", "", "coordination-machines"); machineSection.append(grid);
     for (const item of [...held.values()].sort((a, b) => shortName(a).localeCompare(shortName(b)))) {
@@ -170,7 +188,7 @@
         const row = node("tr"), operation = node("td");
         operation.append(node("strong", kinds[job.kind] || "Coordinated operation"), details(`job:${job.id}`, job));
         const owner = node("td"); owner.append(ownerLink(job));
-        const status = node("td"); status.append(badge(job.state));
+        const status = node("td"); status.append(badge(job.reason?.code === "integration_paused" ? "paused" : job.state));
         if (job.state === "needs_refresh") status.append(node("p", "The owning session needs to prepare an updated operation.", "muted"));
         if (job.reason?.portalUrl) {
           const blocker = node("p", "Waiting for "); blocker.append(link(job.reason.portalUrl + "#reservations", "another session")); status.append(blocker);

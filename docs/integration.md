@@ -1,7 +1,8 @@
 # Coordinated integration
 
 The integration driver prepares approved operations, admits their dependency
-graph together, monitors results and records completion. It uses the coordinator's
+graph together, monitors results and records completion. Background mode lets the owning
+session remain idle while approved operations continue. It uses the coordinator's
 ordinary merge and deployment workers. Physical resources remain free during
 preparation, review, builds and input regeneration.
 
@@ -15,6 +16,72 @@ dev-session coordination integration-resume SESSION RUN_UUID --as-is --json
 to advance once and return status. Interrupting the command leaves admitted jobs
 running and retains the journal; resume the same run. Status does not reconcile,
 create a session owner or change the ledger.
+
+## Background continuation
+
+For agent-driven work, submit the integration with `--background`:
+
+```sh
+dev-session coordination integrate SESSION --as-is --request integration.json --background --json
+dev-session coordination integration-status SESSION RUN_UUID --as-is --json
+dev-session coordination integration-pause SESSION RUN_UUID --as-is --json
+dev-session coordination integration-resume SESSION RUN_UUID --as-is --background --json
+```
+
+Acceptance returns the run ID before preparation begins. Record it in session
+state, continue any independent work, then end the turn. A systemd worker prepares
+and advances the approved operations without an attached CLI, browser or agent.
+The coordinator wakes on state changes; its five-second tick recovers missed
+signals and exited workers. Waiting runs do not consume model turns.
+
+The Operations page shows background runs, automatic waiting and reasons for
+intervention. Reservation grants and intermediate successes stay in that view.
+The retained session receives one native message when its operations finish or
+need agent action. Read authoritative status when it arrives. A message supplies
+no merge or deployment approval and preserves the retained model and policy.
+The lead reviews the result and updates initiative completion; background run
+completion alone does not close the initiative or release a review reservation.
+
+Pause takes effect before the next step or queued operation is admitted. Already
+claimed operations settle through their existing workers and recovery rules.
+A pause does not cancel effects, release a reservation or stop an in-flight
+build. Resume explicitly after reviewing the reason and fixing the relevant
+inputs. Conflicts, stale deployment artifacts, failed checks and uncertain effects
+stop automatic advancement. Only existing certified mechanical refreshes continue
+automatically; resumption cannot expand approval or replace reviewed evidence.
+
+Each background run has a schema-2 journal; manual runs retain schema 1. Step
+request IDs and coordinator receipts bind events to their run even if a submission
+reply is lost. Per-run locking prevents overlapping continuation. A preparing
+worker checks pause, suspension, lifecycle ownership and package generation before
+its next admitted mutation. Archive and deletion hold continuation; revival keeps
+that hold until explicit resumption. A profile switch transfers the exact run to
+the selected compatible generation. Operation ledgers, snapshots, adapter protocols
+and attempt envelopes retain schema 1.
+
+Run completion waits for prior delivery receipts, writes its result and emits its
+completion notice before final tracking publication. A delivery acknowledgment
+wakes finalization, so a pending notification cannot strand the run. Unknown native
+send outcomes retain the same message identity and require existing reconciliation.
+
+`--background` and `--no-wait` are mutually exclusive. Existing synchronous calls
+and manual `--no-wait` runs keep their behavior; `--no-wait` alone does not arrange
+background continuation. A manual run cannot change execution mode under the same
+request ID. Use `integration-resume --background` for a retained background run.
+
+### Upgrading from journal schema 1
+
+Packages read both journal formats. A profile upgrade can preserve pending manual
+runs: `package.json` keeps the exact schema-1 integration descriptor accepted by
+predecessor releases. The separate `share/dev-workspace/integration-contract.json`
+advertises `schema: 1`, `journalSchemas: [1, 2]` and `certificationSchema: 1`.
+Older package metadata readers ignore this file; current transition guards require
+it when schema-2 journals are retained. Missing or unsupported contracts refuse
+that selection. Upgrading preserves the pending manual run for its owner to resume.
+
+Retained schema-2 journals intentionally prevent selection of a package that only
+understands schema 1, including after run completion. Recover with a compatible
+generation; do not delete journals to enable a downgrade.
 
 ## Request and approval
 

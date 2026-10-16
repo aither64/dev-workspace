@@ -10,10 +10,16 @@ for exact owned operations; keep all recovery evidence and roots.
 
 Prepare and verify work independently. Request a machine only near the first
 prepared deployment. Submit approved work, then continue other useful work.
-When a resource is busy and nothing else remains, keep the turn waiting using an
-interruptible tool wait of at most 60 seconds. Reread status when the coordinator
-steers the conversation. Do not end a turn solely because another session owns a
-resource, ask the user to resume it, or redeploy around the reservation.
+Use the integration driver's `--background` mode when combining approved merges
+and deployments. Record the returned run ID and end the turn when no independent
+work remains. The worker continues and sends a native message for action or
+review. Read status when that message arrives. Individual submitted jobs also
+run independently and retain their existing state notifications.
+
+Do not keep a turn open to poll reservations or ask the user to restart it when
+another session owns a resource. Pause/resume and generation recovery are described
+in [background continuation](integration.md#background-continuation). A busy
+resource never authorizes a deployment around its reservation.
 
 On `needs_refresh`, refresh the branch or input baseline, resolve conflicts,
 repeat the required verification and review, record any preserved approval proof,

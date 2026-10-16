@@ -266,3 +266,20 @@ test('a delayed old reservation response cannot badge a replacement incarnation'
   await h.tick(); await h.respond(current);
   assert.equal(h.badge.hidden, false);
 });
+
+
+test('background runs show automatic waiting and action reasons without changing reservation counts', async () => {
+  const h = harness(true);
+  const p = payload([]);
+  p.workspaces[0].owners = [{id: 'owner', slug: 'holder', observationIdentity: 'incarnation-a', portalUrl: 'https://workspace.test/holder/'}];
+  p.workspaces[0].integrations = [{id: 'run-1', ownerId: 'owner', phase: 'merging', continuation: {state: 'waiting'}},
+    {id: 'run-2', ownerId: 'owner', phase: 'deploying', continuation: {state: 'needs_attention'}, reason: {message: 'Prepare an updated artifact.'}},
+    {id: 'run-3', ownerId: 'owner', phase: 'prepare', continuation: {state: 'paused'}}];
+  await h.respond(p);
+  assert.match(h.panel.textContent, /Background integrations/);
+  assert.match(h.panel.textContent, /Waiting automatically/);
+  assert.match(h.panel.textContent, /Agent action required/);
+  assert.match(h.panel.textContent, /Prepare an updated artifact/);
+  assert.match(h.panel.textContent, /Continuation is paused/);
+  assert.equal(h.badge.hidden, true);
+});

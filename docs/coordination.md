@@ -156,7 +156,8 @@ The separate extension catalog and session manifest formats remain unchanged.
 The pure Ruby `lib.coordinationCommandLibrary` is also used by packaged adapters
 for bounded protocol capture and diagnostics; it does not import the ledger.
 
-The Operations page is an authenticated, bounded, read-only view. It shows
+The Operations page is an authenticated, bounded, read-only view. It also shows
+background integration progress and intervention reasons. It shows
 machine ownership, blocked jobs and notification delivery separately. An idle
 owner still reserves its machine. The workspace menu links to `/operations`
 above Automatic archival. Reserved machines appear as cards with their owning
@@ -213,7 +214,8 @@ ownership, completion proofs or scheduler wake-up.
 
 Notifications use the existing Codex submission ledger, exact retained thread,
 model, effort and lead policy. Busy threads receive steering; idle threads receive
-a new turn. The coordinator preserves message IDs and reconciles lost replies.
+a new turn. Background integration runs report completion or agent action; their
+intermediate events remain in status without starting model turns. The coordinator preserves message IDs and reconciles lost replies.
 Each snapshot has one retained notification per reported state; repeated resource
 waits or reconciliation reuse that event. Native options and receipts live in
 immutable checksummed artifacts, so large retained instructions do not fill the

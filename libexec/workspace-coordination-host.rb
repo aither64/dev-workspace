@@ -73,7 +73,7 @@ module DevWorkspaceHost
       action = argv.shift
       slug = argv.shift
       raise WorkspaceCoordination::Error, 'coordination requires an exact session slug and --as-is' unless slug && slug.match?(WorkspaceCoordination::PART)
-      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume].include?(action)
+      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause].include?(action)
       options = {}
       OptionParser.new do |opts|
         opts.on('--as-is') { options[:as_is] = true }
@@ -83,8 +83,10 @@ module DevWorkspaceHost
         opts.on('--bootstrap-owner ID') { |value| options[:bootstrap_owner] = value }
         opts.on('--admission-timeout SECONDS', Float) { |value| options[:admission_timeout] = value }
         opts.on('--no-wait') { options[:no_wait] = true }
+        opts.on('--background') { options[:background] = true }
       end.parse!(argv)
       raise WorkspaceCoordination::Error, 'use coordination ACTION SLUG [ID] --as-is --request FILE' unless argv.empty? && options[:as_is]
+      raise WorkspaceCoordination::Error, '--background and --no-wait are mutually exclusive' if options[:background] && options[:no_wait]
       engine = coordination_engine(entry)
       @coordination_admission_timeout = options.fetch(:admission_timeout, 30)
       if options[:bootstrap_owner] && !%w[status reconcile cancel finish].include?(action)
@@ -96,7 +98,7 @@ module DevWorkspaceHost
         return
       end
       request = options[:request] && coordination_input(options[:request])
-      if %w[integrate integration-status integration-resume].include?(action)
+      if %w[integrate integration-status integration-resume integration-pause].include?(action)
         owner = nil
         resumable_finalization = action == 'integration-resume' && id && id.match?(WorkspaceCoordination::UUID) &&
           File.file?(File.join(engine.store.root, 'integrations', "#{id}.json")) &&
@@ -113,9 +115,16 @@ module DevWorkspaceHost
         driver = WorkspaceCoordination::Integration.new(engine, owner, admission:,
           prepare: ->(fields) { coordination_prepare(engine, owner, fields) }, diagnostics: @err)
         result = case action
-        when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait])
+        when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait], background: options[:background])
         when 'integration-status' then driver.status(id)
-        when 'integration-resume' then driver.drive(id, wait: !options[:no_wait])
+        when 'integration-pause' then driver.pause(id)
+        when 'integration-resume'
+          if options[:background]
+            driver.arm_background(id)
+          else
+            raise WorkspaceCoordination::Error, 'use --background to resume a background run' if driver.read(id)['schema'] == 2
+            driver.drive(id, wait: !options[:no_wait])
+          end
         end
         @out.puts JSON.generate(result)
         return
@@ -171,6 +180,8 @@ module DevWorkspaceHost
         else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
         end
       end
+    rescue DevWorkspaceHost::Error => error
+      raise WorkspaceCoordination::Error, WorkspaceCoordination.diagnostic(error.message)
     end
 
     def with_coordination_session_admission(entry, slug, timeout: @coordination_admission_timeout || 30)
@@ -375,6 +386,29 @@ module DevWorkspaceHost
       WorkspaceCoordination::Worker.new(argv[1]).reconcile
     end
 
+    def coordination_integration_command(argv)
+      raise WorkspaceCoordination::Error, 'coordination-integration requires --request PATH' unless argv.length == 2 && argv[0] == '--request'
+      request = WorkspaceCoordination.private_read(argv[1], limit: WorkspaceCoordination::MAX_REQUEST)
+      WorkspaceCoordination.keys!(request, %w[schema runId ownerId identity workspace entry package profile])
+      unless request['schema'] == 1 && request['package'] == File.realpath(package_root) && request['profile'] == @profile
+        raise WorkspaceCoordination::Error.new('integration worker generation differs', 3)
+      end
+      entry = registry.entries.find { |value| value['root'] == request['workspace'] && value['name'] == request.dig('entry', 'name') }
+      raise WorkspaceCoordination::Error.new('integration workspace changed', 4) unless entry
+      engine = coordination_engine(entry)
+      owner = nil
+      with_coordination_session_admission(entry, engine.store.read['owners'].fetch(request['ownerId'])['slug']) do
+        owner = engine.owner(engine.store.read['owners'].fetch(request['ownerId'])['slug'])
+        unless owner['id'] == request['ownerId'] && owner['identity'] == request['identity']
+          raise WorkspaceCoordination::Error.new('integration owner changed', 4)
+        end
+      end
+      driver = WorkspaceCoordination::Integration.new(engine, owner,
+        admission: ->(&block) { with_coordination_session_admission(entry, owner['slug'], &block) },
+        prepare: ->(fields) { coordination_prepare(engine, owner, fields) }, diagnostics: @err)
+      driver.run_background(request['runId'])
+    end
+
     def coordination_notifications_command(argv)
       raise WorkspaceCoordination::Error, 'coordination-notifications requires --request PATH' unless argv.length == 2 && argv[0] == '--request'
       request = WorkspaceCoordination.private_read(argv[1], limit: WorkspaceCoordination::MAX_REQUEST)
@@ -433,6 +467,7 @@ module DevWorkspaceHost
                 claimed = engine.claim(owner_id: owner['id'])
               end
               claimed.each { |job| engine.dispatch(job) }
+              engine.dispatch_integrations(owner)
               engine.dispatch_notifications(owner)
             rescue WorkspaceCoordination::Error => e
               @err.puts "coordinator owner #{owner['slug']}: #{e.message}"

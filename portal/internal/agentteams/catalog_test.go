@@ -249,6 +249,7 @@ func TestPackageMetadataSupportsOptionalIntegrationCapability(t *testing.T) {
 		}
 		for _, invalid := range []any{nil, map[string]int{"journalSchema": 1},
 			map[string]int{"journalSchema": 2, "certificationSchema": 1},
+			map[string]int{"journalSchema": 3, "certificationSchema": 1},
 			map[string]int{"journalSchema": 1, "certificationSchema": 1, "unexpected": 1}} {
 			metadata["integration"] = invalid
 			if err := os.WriteFile(path, marshalFixture(t, metadata), 0o644); err != nil {

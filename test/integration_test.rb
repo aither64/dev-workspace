@@ -359,4 +359,420 @@ class IntegrationTest < Minitest::Test
     assert_equal 5, error.code
     assert_includes error.message, 'integration journals'
   end
+
+  def test_pending_manual_run_accepts_legacy_and_dual_journal_packages
+    first = owner('manual-upgrade')
+    payload = integration_request(first)
+    driver(first).start(payload, wait: false)
+    shared = File.join(@package, 'share/dev-workspace')
+    WorkspaceCoordination.atomic(File.join(shared, 'coordination-contract.json'), WorkspaceCoordination::CONTRACT)
+    File.write(File.join(shared, 'coordination.json'), JSON.generate('schema' => 1, 'adapters' => {}, 'machines' => {}, 'repositories' => {}, 'profileMachine' => nil))
+    File.write(File.join(shared, 'package.json'), JSON.generate('integration' => {'journalSchema' => 1, 'certificationSchema' => 1}))
+    integration_path = File.join(@engine.store.root, 'integrations', "#{payload['requestId']}.json")
+    before = File.binread(integration_path)
+    @engine.store.require_compatible!(@package)
+    FileUtils.cp(File.expand_path('../nix/integration-contract.json', __dir__), File.join(shared, 'integration-contract.json'))
+    @engine.store.require_compatible!(@package)
+    assert_equal before, File.binread(integration_path)
+    assert_equal 1, JSON.parse(before).fetch('schema')
+    refute_equal 'complete', JSON.parse(before).fetch('phase')
+  end
+  def deliver_background_notifications(owner)
+    @engine.define_singleton_method(:notification_call) do |recipient, _event, action|
+      action == 'prepare' ? {'options' => {'model' => 'retained'}} : {'receipt' => {'threadId' => recipient['thread']}}
+    end
+    @engine.deliver_notifications(owner_id: owner['id'])
+  end
+
+  def test_background_admission_returns_before_preparation_and_reserves_lifecycle
+    first = owner('background-admission')
+    integration = driver(first)
+    payload = integration_request(first)
+    result = integration.start(payload, background: true)
+    assert_equal 2, result['schema']
+    assert_equal 'prepare', result['phase']
+    assert_equal 'runnable', result.dig('continuation', 'state')
+    assert_empty @engine.store.read['jobs']
+    assert @engine.store.session_blockers(@workspace, first['slug']).any? { |text| text.include?('background integration') }
+    assert_equal result, integration.start(payload, background: true)
+    assert_raises(WorkspaceCoordination::Error) { integration.start(payload, wait: false) }
+  end
+
+  def test_background_run_continues_without_an_agent_and_finalizes_after_delivery
+    first = owner('background-completion')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    # Claimed/running/completed intermediate steps do not wake the model.
+    claimed = @engine.claim(owner_id: first['id']).first
+    assert_empty @engine.store.read['outbox']
+    request_path = @engine.attempt_path(claimed['attempt'], 'request.json')
+    WorkspaceCoordination.atomic(request_path, @engine.worker_request(claimed, first))
+    WorkspaceCoordination::Worker.new(request_path, fixtures: true).run
+    @engine.reconcile_attempts
+    assert_empty @engine.store.read['outbox']
+    # A new process/driver resumes the original run and original job identities.
+    fresh = driver(first)
+    result = fresh.run_background(payload['requestId'])
+    assert_equal 'finalizing', result['phase']
+    assert_equal 1, @engine.store.read['outbox'].length
+    fresh.run_background(payload['requestId'])
+    assert_equal 1, @engine.store.read['outbox'].length
+    deliver_background_notifications(first)
+    assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal 1, @engine.store.read['jobs'].length
+    assert_equal 'complete', integration.read(payload['requestId']).dig('continuation', 'state')
+  end
+
+  def test_background_event_routing_survives_lost_submission_reply
+    first = owner('background-routing')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    value = integration.read(payload['requestId'])
+    value['jobs'] = {}
+    value['steps']['submit-batch'].delete('result')
+    integration.save(value)
+    @engine.claim(owner_id: first['id'])
+    assert_empty @engine.store.read['outbox']
+    assert_equal payload['requestId'], @engine.store.background_integration(@engine.store.read, first['id'], @engine.store.read['jobs'].keys.first)['id']
+  end
+
+  def test_background_replayed_submission_observes_completed_jobs_without_another_ledger_change
+    first = owner('background-submission-replay')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    claimed = @engine.claim(owner_id: first['id']).first
+    request_path = @engine.attempt_path(claimed['attempt'], 'request.json')
+    WorkspaceCoordination.atomic(request_path, @engine.worker_request(claimed, first))
+    WorkspaceCoordination::Worker.new(request_path, fixtures: true).run
+    @engine.reconcile_attempts
+
+    # The worker died after batch admission but before saving its reply/phase.
+    value = integration.read(payload['requestId'])
+    value['phase'] = 'submit'
+    value['jobs'] = {}
+    value['steps']['submit-batch'].delete('result')
+    value['continuation']['state'] = 'runnable'
+    integration.save(value)
+    revision = @engine.store.read['revision']
+    result = driver(first).run_background(payload['requestId'])
+    assert_equal revision, @engine.store.read['revision']
+    assert_equal 'merging', result['phase']
+    assert_equal 'runnable', result.dig('continuation', 'state')
+
+    calls = []
+    original_capture = @engine.method(:capture)
+    @engine.define_singleton_method(:capture) do |*argv, **options|
+      if argv.first == 'systemctl'
+        "inactive\n"
+      elsif argv.first == 'systemd-run'
+        calls << argv
+        ''
+      else
+        original_capture.call(*argv, **options)
+      end
+    end
+    @engine.dispatch_integrations(first)
+    assert_equal 1, calls.length
+    assert_equal 'finalizing', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal [claimed['id']], @engine.store.read['jobs'].keys
+    assert_equal 1, @engine.store.read['outbox'].length
+    deliver_background_notifications(first)
+    assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal 1, @engine.store.read['outbox'].length
+  end
+
+  def test_background_replayed_refresh_observes_completed_jobs_without_another_ledger_change
+    first = owner('background-refresh-replay')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    id = integration.read(payload['requestId'])['jobs']['merge:code']
+    @engine.store.transaction { |data| @engine.transition(data, data['jobs'].fetch(id), 'needs_refresh') }
+    original = @engine.method(:mutate)
+    lost = false
+    @engine.define_singleton_method(:mutate) do |*args, **keywords|
+      result = original.call(*args, **keywords)
+      if args[1] == 'refresh' && !lost
+        lost = true
+        raise 'fixture crash after committed refresh'
+      end
+      result
+    end
+    assert_raises(RuntimeError) { integration.run_background(payload['requestId']) }
+    assert integration.read(payload['requestId']).key?('pendingRefresh')
+    claimed = @engine.claim(owner_id: first['id']).first
+    request_path = @engine.attempt_path(claimed['attempt'], 'request.json')
+    WorkspaceCoordination.atomic(request_path, @engine.worker_request(claimed, first))
+    WorkspaceCoordination::Worker.new(request_path, fixtures: true).run
+    @engine.reconcile_attempts
+    revision = @engine.store.read['revision']
+    result = driver(first).run_background(payload['requestId'])
+    assert_equal revision, @engine.store.read['revision']
+    assert_equal 'merging', result['phase']
+    assert_equal 'runnable', result.dig('continuation', 'state')
+    refute integration.read(payload['requestId']).key?('pendingRefresh')
+    assert_equal 'finalizing', driver(first).run_background(payload['requestId'])['phase']
+    deliver_background_notifications(first)
+    assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal [id], @engine.store.read['jobs'].keys
+    assert_equal 1, @engine.store.read['jobs'][id]['history'].length
+    assert_equal 1, @engine.store.read['outbox'].length
+  end
+
+  def test_background_pause_prevents_admission_and_explicit_resume_reuses_the_run
+    first = owner('background-pause')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    assert_equal 'paused', integration.pause(payload['requestId']).dig('continuation', 'state')
+    assert_equal 'paused', integration.run_background(payload['requestId']).dig('continuation', 'state')
+    assert_empty @engine.store.read['jobs']
+    integration.arm_background(payload['requestId'])
+    integration.run_background(payload['requestId'])
+    assert_equal 1, @engine.store.read['jobs'].length
+    assert_equal 1, integration.read(payload['requestId']).dig('continuation', 'generation')
+  end
+
+  def test_background_error_is_actionable_once_and_crash_retry_does_not_repeat_work
+    first = owner('background-error')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    attempts = 0
+    integration.define_singleton_method(:advance) do |_value|
+      attempts += 1
+      raise WorkspaceCoordination::Error.new('changed deployment artifact needs preparation', 3)
+    end
+    result = integration.run_background(payload['requestId'])
+    assert_equal 'needs_attention', result.dig('continuation', 'state')
+    assert_equal 1, @engine.store.read['outbox'].length
+    integration.run_background(payload['requestId'])
+    assert_equal 1, attempts
+    assert_equal 1, @engine.store.read['outbox'].length
+    # The error-state publication can precede a lost notification transaction.
+    @engine.store.transaction { |data| data['outbox'].clear }
+    integration.run_background(payload['requestId'])
+    assert_equal 1, attempts
+    assert_equal 1, @engine.store.read['outbox'].length
+  end
+
+  def test_background_fencing_before_first_job_prevents_preparation
+    first = owner('background-fence')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    @engine.store.fence(@workspace, first['slug'], 'archive')
+    assert_equal 'held', integration.run_background(payload['requestId']).dig('continuation', 'state')
+    assert_empty @engine.store.read['jobs']
+    assert_empty @engine.store.read['outbox']
+  end
+
+  def test_background_failed_command_is_actionable_even_with_exit_code_75
+    first = owner('background-command-error')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    attempts = 0
+    integration.define_singleton_method(:advance) do |_value|
+      attempts += 1
+      engine.capture('sh', '-c', 'echo failed-check >&2; exit 1')
+    end
+    result = integration.run_background(payload['requestId'])
+    assert_equal 'needs_attention', result.dig('continuation', 'state')
+    assert_equal 75, result.dig('reason', 'code')
+    assert_includes result.dig('reason', 'message'), 'failed-check'
+    integration.run_background(payload['requestId'])
+    assert_equal 1, attempts
+    assert_equal 1, @engine.store.read['outbox'].length
+  end
+
+  def test_background_host_preparation_failure_is_actionable_once
+    first = owner('background-host-error')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    seed = File.join(@tmp, 'seed')
+    @engine.define_singleton_method(:repository) { |_owner, _name| [seed, nil, nil, {'branch' => 'master'}] }
+    @engine.define_singleton_method(:retain_commit) { |_path, _head| seed }
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.define_singleton_method(:with_current_generation_lock) { |**_options, &block| block.call }
+    attempts = 0
+    host.define_singleton_method(:prepare_profile) do |_argv|
+      attempts += 1
+      raise DevWorkspaceHost::Error, 'candidate profile validation failed'
+    end
+    engine = @engine
+    integration.define_singleton_method(:advance) do |_value|
+      host.coordination_prepare(engine, first, {'kind' => 'profile_activate'})
+    end
+    result = integration.run_background(payload['requestId'])
+    assert_equal 'needs_attention', result.dig('continuation', 'state')
+    assert_equal 'candidate profile validation failed', result.dig('reason', 'message')
+    integration.run_background(payload['requestId'])
+    assert_equal 1, attempts
+    assert_equal 1, @engine.store.read['outbox'].length
+  end
+
+  def test_background_lifecycle_admission_contention_waits_without_notifying
+    first = owner('background-admission-busy')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    lock_path = File.join(@tmp, 'lifecycle.lock')
+    File.open(lock_path, 'w+', 0o600) do |writer|
+      writer.flock(File::LOCK_EX)
+      integration.define_singleton_method(:advance) do |_value|
+        File.open(lock_path, 'r+') { |reader| WorkspaceCoordination::Admission.acquire(reader, timeout: 0) }
+      end
+      result = integration.run_background(payload['requestId'])
+      assert_equal 'waiting', result.dig('continuation', 'state')
+      assert_nil result.dig('continuation', 'observedRevision')
+      assert_empty @engine.store.read['outbox']
+    end
+  end
+
+  def test_background_waiting_is_not_redispatched_without_a_ledger_change
+    first = owner('background-dispatch')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    calls = []
+    @engine.define_singleton_method(:capture) { |*argv, **_options| calls << argv; argv.first == 'systemctl' ? "inactive\n" : '' }
+    @engine.dispatch_integrations(first)
+    # Submission changed the ledger after the worker's initial observation.
+    assert calls.any? { |call| call.first == 'systemd-run' && call.include?('coordination-integration') }
+    integration.run_background(payload['requestId'])
+    calls.clear
+    @engine.dispatch_integrations(first)
+    assert_empty calls
+    @engine.claim(owner_id: first['id'])
+    @engine.dispatch_integrations(first)
+    assert calls.any? { |call| call.first == 'systemd-run' }
+  end
+
+  def test_background_state_refuses_predecessor_even_after_completion
+    first = owner('background-capability')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    WorkspaceCoordination.atomic(File.join(@package, 'share/dev-workspace/coordination-contract.json'), WorkspaceCoordination::CONTRACT)
+    File.write(File.join(@package, 'share/dev-workspace/coordination.json'), JSON.generate('schema' => 1, 'adapters' => {}, 'machines' => {}, 'repositories' => {}, 'profileMachine' => nil))
+    metadata = File.join(@package, 'share/dev-workspace/package.json')
+    File.write(metadata, JSON.generate('integration' => {'journalSchema' => 1, 'certificationSchema' => 1}))
+    assert_raises(WorkspaceCoordination::Error) { @engine.store.require_compatible!(@package) }
+    contract = File.join(@package, 'share/dev-workspace/integration-contract.json')
+    FileUtils.cp(File.expand_path('../nix/integration-contract.json', __dir__), contract)
+    @engine.store.require_compatible!(@package)
+    File.write(contract, JSON.generate(WorkspaceCoordination::INTEGRATION_CONTRACT.merge('journalSchemas' => [1, 2, 3])))
+    @engine.store.require_compatible!(@package)
+    FileUtils.cp(File.expand_path('../nix/integration-contract.json', __dir__), contract)
+    value = integration.read(payload['requestId'])
+    value['phase'] = 'complete'
+    value['continuation']['state'] = 'complete'
+    integration.save(value)
+    @engine.store.require_compatible!(@package)
+    File.unlink(contract)
+    assert_raises(WorkspaceCoordination::Error) { @engine.store.require_compatible!(@package) }
+    [nil, {'schema' => 1, 'journalSchemas' => [1, 3], 'certificationSchema' => 1},
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('journalSchemas' => [1, 2, 2]),
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('journalSchemas' => [1, '2']),
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('journalSchemas' => [2]),
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('schema' => 2),
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('certificationSchema' => 2),
+      WorkspaceCoordination::INTEGRATION_CONTRACT.merge('unexpected' => true)].each do |invalid|
+      File.write(contract, JSON.generate(invalid))
+      error = assert_raises(WorkspaceCoordination::Error) { @engine.store.require_compatible!(@package) }
+      assert_includes error.message, 'integration journals'
+    end
+  end
+
+  def test_background_pause_also_prevents_claiming_already_submitted_jobs
+    first = owner('background-queued-pause')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    integration.pause(payload['requestId'])
+    assert_empty @engine.claim(owner_id: first['id'])
+    assert_equal 'paused', @engine.status(first['slug'])['integrations'].first.dig('continuation', 'state')
+    assert_equal 'integration_paused', @engine.store.read['jobs'].values.first.dig('reason', 'code')
+    integration.arm_background(payload['requestId'])
+    assert_equal 1, @engine.claim(owner_id: first['id']).length
+  end
+
+  def test_background_handover_does_not_turn_generation_change_into_agent_work
+    first = owner('background-generation')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    successor = File.join(@tmp, 'successor')
+    FileUtils.mkdir_p(successor)
+    File.unlink(@profile)
+    File.symlink(successor, @profile)
+    @engine.instance_variable_set(:@fixtures, false)
+    assert_equal 'runnable', integration.run_background(payload['requestId']).dig('continuation', 'state')
+    assert_empty @engine.store.read['outbox']
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_background_handover_checks_profile_token_when_package_is_unchanged
+    first = owner('background-token-generation')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    @engine.instance_variable_set(:@fixtures, false)
+    assert @engine.current_generation?
+    replacement = File.join(@tmp, 'replacement-profile')
+    File.symlink(@package, replacement)
+    File.rename(replacement, @profile)
+    assert_equal @engine.package, File.realpath(@profile)
+    refute @engine.current_generation?
+    assert_equal 'runnable', integration.run_background(payload['requestId']).dig('continuation', 'state')
+    assert_empty @engine.store.read['outbox']
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_background_pause_acknowledgment_serializes_with_claim_admission
+    first = owner('background-pause-race')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    checked, proceed, pause_started = Queue.new, Queue.new, Queue.new
+    original = @engine.store.method(:background_stopped?)
+    armed = true
+    @engine.store.define_singleton_method(:background_stopped?) do |run|
+      result = original.call(run)
+      if run && armed
+        armed = false
+        checked << true
+        proceed.pop
+      end
+      result
+    end
+    claimer = Thread.new { @engine.claim(owner_id: first['id']) }
+    checked.pop
+    pause_driver = WorkspaceCoordination::Integration.new(@engine, first,
+      admission: ->(&block) { pause_started << true; block.call }, prepare: ->(_fields) { raise 'pause cannot prepare' })
+    pauser = Thread.new { pause_driver.pause(payload['requestId']) }
+    pause_started.pop
+    # An admission already in progress must settle before pause is accepted.
+    assert_nil pauser.join(0.05)
+    proceed << true
+    assert_equal 1, claimer.value.length
+    assert_equal 'paused', pauser.value.dig('continuation', 'state')
+  ensure
+    proceed << true if proceed
+    claimer&.join
+    pauser&.join
+  end
+
 end
