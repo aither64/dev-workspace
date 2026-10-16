@@ -76,10 +76,10 @@ editing or recycling that ID.
 After an attempted submission fails, **Start a separate request** opens the
 current form in a new tab without an opener. The original request may still
 finish; this action does not cancel or replace it. The original tab retains its
-exact request, settings and file selection for recovery. **Copy saved text**
-copies its raw prompt. The new tab uses current settings, a new request ID and a
-fresh file scope. Copying text, reattaching files and submitting are deliberate
-steps; nothing transfers or submits automatically. A restored attempted draft
+exact request, settings and file selection for recovery. The copy icon beside
+the saved text copies its raw prompt. The new tab uses current settings, a new
+request ID and a fresh file scope. Copying text, reattaching files and submitting
+are deliberate steps; nothing transfers or submits automatically. A restored attempted draft
 retains its original recovery behavior, even in the new tab.
 
 Each draft owns a separate upload scope and stores its selection in the same

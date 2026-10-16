@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/style.css?v=18">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -76,7 +76,7 @@
           <button type="button" id="new-session-recover">Recover saved request</button>
           <div id="new-session-separate" hidden>
             <p>The original request may still finish. To start a separate request with current settings, copy your text and attach files again.</p>
-            <div><textarea data-saved-request-text readonly aria-label="Saved request text"></textarea><button type="button" data-copy>Copy saved text</button></div>
+            <div class="copy-row saved-request-copy"><textarea data-saved-request-text readonly aria-label="Saved request text"></textarea>{{template "copy-button" "saved text"}}</div>
             <a href="/" target="_blank" rel="noopener noreferrer">Start a separate request</a>
           </div>
         </div>

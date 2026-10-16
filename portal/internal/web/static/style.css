@@ -150,6 +150,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .copy-row { display: flex; gap: .5rem; margin: .35rem 0 .9rem; }
 .copy-row input { margin: 0; font-family: ui-monospace, monospace; }
 .copy-row button { flex: none; }
+.saved-request-copy.copy-row { display: grid; grid-template-columns: minmax(0, 1fr) 28px; align-items: start; }
+.saved-request-copy textarea { min-width: 0; margin: 0; }
 .repo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1rem; }
 #repositories .repo-grid { grid-template-columns: minmax(0, 1fr); }
 #repositories .repository-review-actions { display: flex; gap: .5rem; align-items: stretch; flex-wrap: wrap; margin: 1rem 0 .8rem; }
