@@ -7,6 +7,7 @@
   const refreshed = document.querySelector("[data-coordination-refreshed]");
   const sessionSlug = panel?.dataset.coordinationSession;
   const observation = panel?.dataset.coordinationObservation;
+  const reservationTab = document.querySelector('[data-session-tab="reservations"]');
   const terminal = new Set(["succeeded", "failed", "canceled"]);
   const labels = {waiting_approval: "Waiting for approval", waiting_dependency: "Waiting for an earlier operation",
     waiting_resource: "Queued", ready: "Ready to run", claimed: "Starting", running: "Running",
@@ -35,6 +36,30 @@
     return element;
   };
   let lastPayload = null, lastDisplay = null, unavailable = false, paused = true, active = null, timer = null;
+  let reservationCount = null;
+  const panelVisible = () => !sessionSlug || panel.closest(".tab-panel")?.classList.contains("active");
+
+  function countSessionReservations(payload) {
+    const machines = new Set();
+    for (const workspace of payload.workspaces) for (const holder of workspace.reservationHolders) {
+      if (!observation || holder.slug !== sessionSlug || holder.observationIdentity !== observation) continue;
+      if (!Array.isArray(holder.machines)) throw new Error("Reservation status is unavailable.");
+      for (const machine of holder.machines) {
+        if (!["requested", "released"].includes(machine.state)) machines.add(machine.machine);
+      }
+    }
+    return machines.size;
+  }
+
+  function renderReservationTab() {
+    if (!reservationTab) return;
+    const label = reservationCount === null ? "Reservations" : `Reservations (${reservationCount})`;
+    reservationTab.querySelector(".rail-label").textContent = label;
+    reservationTab.title = label + (unavailable ? reservationCount === null
+      ? ". Reservation status is unavailable."
+      : ". Reservation status is unavailable. Last known count is shown." : "");
+    reservationTab.setAttribute("aria-label", reservationTab.title);
+  }
 
   function renderBadges() {
     if (!lastPayload) return;
@@ -55,7 +80,7 @@
   }
 
   function renderOperations(payload) {
-    if (!panel) return;
+    if (!panel || !panelVisible()) return;
     const display = JSON.stringify(payload);
     if (display === lastDisplay) return;
     const expanded = new Set([...panel.querySelectorAll("details[data-coordination-key][open]")].map(detail => detail.dataset.coordinationKey));
@@ -163,11 +188,6 @@
     if (limited) content.append(node("p", "This is a limited view of operation history. The session command provides the complete records.", "notice"));
     panel.replaceChildren(content); lastDisplay = display;
     if (focused) [...panel.querySelectorAll("details[data-coordination-key]")].find(detail => detail.dataset.coordinationKey === focused)?.querySelector("summary")?.focus({preventScroll: true});
-    const tab = document.querySelector('[data-session-tab="reservations"]');
-    if (tab) {
-      const label = `Reservations (${held.size})`; tab.querySelector(".rail-label").textContent = label;
-      tab.title = label; tab.setAttribute("aria-label", label);
-    }
   }
 
   async function refresh() {
@@ -185,12 +205,14 @@
         !["owners", "jobs", "reservations", "foreignReservations", "notifications", "reservationHolders"].every(key => Array.isArray(workspace[key])))) {
         throw new Error("Reservation status is unavailable.");
       }
-      renderOperations(payload); lastPayload = payload; unavailable = false; renderBadges();
+      const count = sessionSlug ? countSessionReservations(payload) : null;
+      renderOperations(payload); lastPayload = payload; reservationCount = count; unavailable = false;
+      renderReservationTab(); renderBadges();
       if (warning) { warning.hidden = true; warning.textContent = ""; }
       if (refreshed) refreshed.textContent = `Last checked: ${new Date().toLocaleTimeString()}`;
     } catch (_) {
       if (active !== controller || paused) return;
-      unavailable = true; renderBadges();
+      unavailable = true; renderReservationTab(); renderBadges();
       if (warning) {
         warning.textContent = lastPayload ? "Operation status is unavailable. Last known status remains shown." : "Operation status is unavailable.";
         warning.hidden = false;
@@ -204,8 +226,8 @@
     paused = true; clearTimeout(timer); if (active) active.abort(); active = null;
   }
   function resume() {
-    const visible = !document.hidden && (!sessionSlug || panel.closest(".tab-panel")?.classList.contains("active"));
-    if (!visible) { pause(); return; }
+    if (document.hidden) { pause(); return; }
+    if (lastPayload) renderOperations(lastPayload);
     if (paused) { paused = false; clearTimeout(timer); refresh(); }
   }
   document.addEventListener("session-list-updated", renderBadges);

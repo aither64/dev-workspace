@@ -180,8 +180,13 @@ every held machine and its status. The session's Reservations tab, between
 Clusters and Artifacts, shows its held machines, pending requests and related
 operations. Links to `#reservations` open that tab. Session results are matched
 to the same observation identity as badges; a recreated session cannot inherit
-an earlier incarnation's history. The tab reads only while it and the document
-are visible. Read failures retain the last successful view with a warning.
+an earlier incarnation's history. The Reservations menu count refreshes on page
+load and every five seconds while the document is visible, whichever section is
+selected. It counts distinct held machines from the complete holder summary.
+The detailed panel renders the latest successful snapshot when opened. Read
+failures retain the last successful view and count; the menu tooltip and
+accessible label report unavailable status. Before the first successful read,
+the menu shows no count. A successful read can confirm zero reservations.
 
 ### Operation dates
 

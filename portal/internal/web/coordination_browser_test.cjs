@@ -53,7 +53,7 @@ function harness(operations = false, initiallyActive = true) {
     setTimeout: (action, delay) => { const id = ++nextTimer; timers.set(id, {action, delay}); return id; },
     clearTimeout: id => timers.delete(id),
   });
-  return {panel, warning, badge, unrelated, requests, addCard, cards, document,
+  return {panel, warning, badge, unrelated, requests, addCard, cards, document, tab, tabLabel,
     selectTab: (visible, event = 'click') => { tabPanel.className = visible ? 'tab-panel active' : 'tab-panel'; docListeners.get(event)?.(); },
     respond: async (payload, index = requests.length - 1) => { requests[index].resolve({ok: true, json: async () => payload}); await settle(); },
     fail: async () => { requests.at(-1).resolve({ok: false}); await settle(); },
@@ -149,41 +149,87 @@ test('multiple workspaces preserve full machine details and match same-slug badg
   assert.equal(h.badge.textContent, 'buildhost reserved');
 });
 
-test('session pane reads only its visible tab and fences both machines and history by incarnation', async () => {
-  const h = harness('session'), data = payload();
-  data.workspaces[0].owners = [{id: 'owner', slug: 'holder', observationIdentity: 'incarnation-a', portalUrl: 'https://workspace.test/holder/'}];
-  data.workspaces[0].jobs = [{id: 'completed', ownerId: 'owner', kind: 'machine_activate', state: 'succeeded'}];
-  assert.equal(h.requests[0].url, '/api/sessions/holder/coordination');
-  await h.respond(data.workspaces[0]);
-  assert.match(h.panel.textContent, /machine.*Held for review/);
-  assert.match(h.panel.textContent, /Deploy system configuration/);
-  h.selectTab(false); assert.equal(h.pollCount(), 0);
-  h.selectTab(true); assert.equal(h.requests.length, 2);
-  data.workspaces[0].owners[0].observationIdentity = 'incarnation-b';
-  data.workspaces[0].reservationHolders[0].observationIdentity = 'incarnation-b';
-  await h.respond(data.workspaces[0]);
-  assert.match(h.panel.textContent, /This session does not hold any machines/);
-  assert.match(h.panel.textContent, /No completed operations yet/);
-  assert.doesNotMatch(h.panel.textContent, /Deploy system configuration/);
-  h.selectTab(false); h.selectTab(true); const request = h.requests.at(-1);
-  h.selectTab(false); assert.equal(request.signal.aborted, true);
-  await h.respond(data.workspaces[0]); assert.equal(h.pollCount(), 0);
-});
-
-test('asynchronous initial fragment activation starts reservation reads without a click', async () => {
+test('session menu tracks reservations while another section is selected and renders cached details on opening', async () => {
   const h = harness('session', false);
-  assert.equal(h.requests.length, 0);
-  h.selectTab(true, 'session-section-change');
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].url, '/api/sessions/holder/coordination');
   await h.respond(payload().workspaces[0]);
-  assert.match(h.panel.textContent, /Held for review/);
-  h.selectTab(false, 'session-section-change');
-  assert.equal(h.pollCount(), 0);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.tab.title, 'Reservations (1)');
+  assert.equal(h.tab['aria-label'], h.tab.title);
+  assert.equal(h.panel.textContent, '', 'closed panel is not rendered');
+  await h.tick();
+  const data = payload([
+    {machine: 'fixture:one', state: 'held'}, {machine: 'fixture:two', state: 'blocked_recovery'},
+    {machine: 'fixture:two', state: 'blocked_recovery'}, {machine: 'fixture:pending', state: 'requested'},
+    {machine: 'fixture:released', state: 'released'},
+  ]).workspaces[0];
+  data.reservationHolders.push({slug: 'other', observationIdentity: 'incarnation-a', machines: [{machine: 'foreign', state: 'held'}]},
+    {slug: 'holder', observationIdentity: 'incarnation-b', machines: [{machine: 'old', state: 'held'}]});
+  data.counts = {reservations: 200};
+  await h.respond(data);
+  assert.equal(h.tabLabel.textContent, 'Reservations (2)', 'complete holder summary supplies the count');
+  assert.equal(h.panel.textContent, '');
   h.selectTab(true, 'session-section-change');
-  assert.equal(h.requests.length, 2);
+  assert.match(h.panel.textContent, /Held for recovery/);
+  assert.equal(h.requests.length, 2, 'opening renders cache without another request');
   h.selectTab(false, 'session-section-change');
-  assert.equal(h.requests[1].signal.aborted, true);
+  assert.equal(h.pollCount(), 1, 'leaving the panel keeps menu refreshes running');
+  await h.tick(); await h.respond(payload([]).workspaces[0]);
+  assert.equal(h.tabLabel.textContent, 'Reservations (0)');
+  h.selectTab(true, 'session-section-change');
+  assert.match(h.panel.textContent, /This session does not hold any machines/);
+});
+
+test('session menu retains successful counts through failed and malformed reads and clears warnings on recovery', async () => {
+  const h = harness('session', false);
+  await h.fail();
+  assert.equal(h.tabLabel.textContent, 'Reservations', 'initial failure does not claim zero');
+  assert.match(h.tab.title, /unavailable/);
+  await h.tick(); await h.respond(payload().workspaces[0]);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  await h.tick(); await h.fail();
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.match(h.tab.title, /unavailable.*Last known count/);
+  assert.equal(h.tab['aria-label'], h.tab.title);
+  const malformed = payload().workspaces[0]; malformed.reservationHolders[0].machines = null;
+  await h.tick(); await h.respond(malformed);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  await h.tick(); await h.respond(payload().workspaces[0]);
+  assert.equal(h.tab.title, 'Reservations (1)');
+  assert.equal(h.warning.hidden, true);
+});
+
+test('session pane and menu fence both machines and history by incarnation', async () => {
+  const h = harness('session'), data = payload().workspaces[0];
+  data.owners = [{id: 'owner', slug: 'holder', observationIdentity: 'incarnation-a', portalUrl: 'https://workspace.test/holder/'}];
+  data.jobs = [{id: 'completed', ownerId: 'owner', kind: 'machine_activate', state: 'succeeded'}];
+  await h.respond(data);
+  assert.match(h.panel.textContent, /machine.*Held for review/);
+  assert.match(h.panel.textContent, /Deploy system configuration/);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  data.owners[0].observationIdentity = 'incarnation-b';
+  data.reservationHolders[0].observationIdentity = 'incarnation-b';
+  await h.tick(); await h.respond(data);
+  assert.match(h.panel.textContent, /This session does not hold any machines/);
+  assert.match(h.panel.textContent, /No completed operations yet/);
+  assert.doesNotMatch(h.panel.textContent, /Deploy system configuration/);
+  assert.equal(h.tabLabel.textContent, 'Reservations (0)');
+});
+
+test('session menu aborts hidden and exited page reads and fences delayed responses', async () => {
+  const h = harness('session', false);
+  h.hide(); assert.equal(h.requests[0].signal.aborted, true);
+  assert.equal(h.pollCount(), 0);
+  h.show(); assert.equal(h.requests.length, 2);
+  await h.respond(payload().workspaces[0], 1);
+  await h.respond(payload([]).workspaces[0], 0);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  await h.tick(); h.leave();
+  assert.equal(h.requests.at(-1).signal.aborted, true);
+  await h.respond(payload([]).workspaces[0]);
+  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.pollCount(), 0);
 });
 
 test('dashboard refresh preserves expanded details and focused disclosure', async () => {
