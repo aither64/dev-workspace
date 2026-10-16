@@ -52,7 +52,7 @@ existing public interfaces. Missing required executables fail assembly.
 The manifest contains `layoutVersion = 1`, the input's `version`, the host Rust
 `target`, `variant = "codex"`, `entrypoint = "bin/codex"`,
 `resourcesDir = "codex-resources"` and `pathDir = "codex-path"`. This follows
-the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.160.0/scripts/codex_package/README.md).
+the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.163.0/scripts/codex_package/README.md).
 
 The runtime root retains resources supplied by the input. File and directory
 links are dereferenced during copying; no symlinks remain anywhere below
@@ -60,14 +60,20 @@ links are dereferenced during copying; no symlinks remain anywhere below
 bubblewrap are regular files at the paths above so the native daemon can copy
 the runtime root without links that escape its package.
 
-## Daemon copies and dependency retention
+## Daemon selection and dependency retention
 
-The native daemon can copy the runtime root into
-`$CODEX_HOME/packages/app-server-daemon/`. Those copied files still depend on
-the Nix store: their ELF interpreter, libraries and embedded store references
-remain intact. Nix scans the assembled output's references and retains those
-dependencies as its closure. Copying files into `CODEX_HOME` does not create a
-Nix GC root.
+The selected llm-agents package patches native daemon installation to use its
+original immutable Nix-store runtime in place. It disables upstream release
+updates for that selection and attempts to register a native daemon GC root.
+The assembled executable retains the original package's embedded store reference,
+so Nix retains that package and its dependencies as part of the assembly closure.
+The native daemon can therefore execute the original output rather than the
+materialized assembly. Check its actual executable independently.
+
+Retained daemons from older package generations can still use runtime copies
+under `$CODEX_HOME/packages/app-server-daemon/`. These copies retain their ELF
+interpreter, libraries and embedded store references. Copying files into
+`CODEX_HOME` does not create a Nix GC root.
 
 Workspace activation retains the selected assembled Codex output through
 `~/.local/state/dev-workspaces/codex/current` and
@@ -91,10 +97,9 @@ Here `workspace_package` is the selected workspace application output. For a
 system-only consumer, inspect its assembled Codex output directly.
 
 The package pin selects the workspace's explicit App Server and terminal pair.
-Upstream's native daemon release selection and updater have their own state;
-plain CLI startup can use a previously installed daemon release. Check that
-daemon's version separately from the public command's `--version`. Assembly
-does not make the daemon updater a permanently pinned Nix service.
+Retained native daemon state or an already-running daemon can still select a
+different executable. Check its version and store identity separately from the
+public command's `--version`; assembly alone does not establish what is running.
 
 ## Verification and recovery
 

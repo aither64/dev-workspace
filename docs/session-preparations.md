@@ -188,7 +188,7 @@ Native ephemeral mode omits resumable conversations but its diagnostic SQLite
 logger can retain plaintext copies of the naming input and thread/turn identities
 in `logs_2.sqlite` under the configured SQLite home. The portal keeps that existing
 local logger enabled. The naming input is limited to the first 8192 raw UTF-8
-bytes and excludes attachment names, paths and contents. Codex 0.160.0 prunes
+bytes and excludes attachment names, paths and contents. Codex 0.163.0 prunes
 rows older than ten days at startup; this is not a guaranteed erasure deadline.
 Accepted preparation requests and normal session history retain their existing
 persistence contracts. Portal operational logs contain outcome and duration,

@@ -38,7 +38,7 @@ import (
 // Explicit invocation requires the reviewed VM and frozen assembled package.
 // This fixture owns only disposable synthetic processes and state in that VM.
 // It never discovers an installed profile or registers a workspace.
-const managedSmokeCatalogHash = "1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b"
+const managedSmokeCatalogHash = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
 const managedSmokeOrigin = "https://managed-smoke.example.test"
 const managedSmokeCanaryPort = "39991"
 
@@ -176,7 +176,7 @@ func managedSmokeManifestFor(t *testing.T) managedSmokeManifest {
 	if err != nil || executable != manifest.FixtureBinary || !managedSmokeHex(manifest.FixtureSHA256, 32) || managedSmokeHash(t, executable) != manifest.FixtureSHA256 {
 		managedSmokeFail(t, "reviewed fixture binary mismatch")
 	}
-	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/kdq60x8qayhgkx6d3zbfdgw1i7dqp9q5-source" || !managedSmokeHex(manifest.NativeSHA256, 32) {
+	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/9is267xl3palxb615kk86qlli9nggkf9-source" || !managedSmokeHex(manifest.NativeSHA256, 32) {
 		managedSmokeFail(t, "candidate provenance missing")
 	}
 	for _, project := range []string{"runtime", "provider", "extension", "workspace"} {
@@ -487,10 +487,10 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	}
 	h.catalog, err = filepath.EvalSymlinks(filepath.Join(h.manifest.PackageRoot, "share/workspace-portal/codex-models.json"))
 	info, statErr := os.Stat(h.catalog)
-	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62843 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
+	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62680 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
 		managedSmokeFail(t, "fixed naming-only catalog mismatch")
 	}
-	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.160.0\n" {
+	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.163.0\n" {
 		managedSmokeFail(t, "native version mismatch")
 	}
 	h.ordinaryProvider, h.namingProvider = managedSmokeNewProvider(t, true), managedSmokeNewProvider(t, false)
@@ -908,7 +908,7 @@ func (h *managedSmokeHarness) startUnit(missingHome bool) *managedSmokeUnit {
 	}
 	args := []string{"--user", "--quiet", "--unit=" + unit.name, "--property=Type=simple", "--property=KillMode=mixed", "--property=TimeoutStopSec=150s", "--property=SendSIGKILL=yes", "--property=Restart=no", "--property=UMask=0077", "--", "/run/current-system/sw/bin/env", "-i"}
 	args = append(args, environment...)
-	args = append(args, filepath.Join(h.manifest.PackageRoot, "bin/workspace-portal"), "serve", "--unix-socket", unit.socket, "--workspace", filepath.Join(root, "workspace"), "--base-url", managedSmokeOrigin, "--dev-session", filepath.Join(root, "fail-dev-session"), "--authority-dir", filepath.Join(root, "authority"), "--user-state-root", filepath.Join(root, "state"), "--package-root", h.manifest.PackageRoot, "--workspace-name", "naming-smoke", "--registration-marker", filepath.Join(root, "runtime", "registration.json"), "--host-profile", filepath.Join(root, "profile"), "--transition-lock", filepath.Join(root, "transition.lock"), "--codex-socket", filepath.Join(root, "runtime", "ordinary.sock"), "--codex-version", "0.160.0", "--gh", filepath.Join(root, "fail-helper"), "--tmux", filepath.Join(root, "fail-helper"))
+	args = append(args, filepath.Join(h.manifest.PackageRoot, "bin/workspace-portal"), "serve", "--unix-socket", unit.socket, "--workspace", filepath.Join(root, "workspace"), "--base-url", managedSmokeOrigin, "--dev-session", filepath.Join(root, "fail-dev-session"), "--authority-dir", filepath.Join(root, "authority"), "--user-state-root", filepath.Join(root, "state"), "--package-root", h.manifest.PackageRoot, "--workspace-name", "naming-smoke", "--registration-marker", filepath.Join(root, "runtime", "registration.json"), "--host-profile", filepath.Join(root, "profile"), "--transition-lock", filepath.Join(root, "transition.lock"), "--codex-socket", filepath.Join(root, "runtime", "ordinary.sock"), "--codex-version", "0.163.0", "--gh", filepath.Join(root, "fail-helper"), "--tmux", filepath.Join(root, "fail-helper"))
 	managedSmokeCommand(h.t, 3*time.Second, "/run/current-system/sw/bin/systemd-run", args...)
 	managedSmokeAwait(h.t, 4*time.Second, "packaged portal readiness failed", func() bool {
 		status, _, err := h.http(unit.socket, "GET", "/healthz", nil)
@@ -1327,7 +1327,7 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 	child := h.probe(root)
 	ordinary := newCodexClient(filepath.Join(root, "runtime", "ordinary.sock"), filepath.Join(root, "workspace"))
 	defer ordinary.Close()
-	application, err := portalweb.New(portalweb.Config{ObserveActivity: true, CollectUploads: true, Workspace: filepath.Join(root, "workspace"), BaseURL: managedSmokeOrigin, DevSession: filepath.Join(root, "fail-dev-session"), HostProfile: filepath.Join(root, "profile"), GH: filepath.Join(root, "fail-helper"), Tmux: filepath.Join(root, "fail-helper"), AuthorityDir: filepath.Join(root, "authority"), TransitionLock: filepath.Join(root, "transition.lock"), UserStateRoot: filepath.Join(root, "state"), PackageRoot: h.manifest.PackageRoot, WorkspaceName: "naming-smoke", RegistrationMarker: filepath.Join(root, "runtime", "registration.json"), CodexSocket: filepath.Join(root, "runtime", "ordinary.sock"), CodexVersion: "0.160.0", NamingSocket: owner.socket, NamingModelCatalogFile: owner.catalog, Logger: log.New(io.Discard, "", 0), Codex: ordinary})
+	application, err := portalweb.New(portalweb.Config{ObserveActivity: true, CollectUploads: true, Workspace: filepath.Join(root, "workspace"), BaseURL: managedSmokeOrigin, DevSession: filepath.Join(root, "fail-dev-session"), HostProfile: filepath.Join(root, "profile"), GH: filepath.Join(root, "fail-helper"), Tmux: filepath.Join(root, "fail-helper"), AuthorityDir: filepath.Join(root, "authority"), TransitionLock: filepath.Join(root, "transition.lock"), UserStateRoot: filepath.Join(root, "state"), PackageRoot: h.manifest.PackageRoot, WorkspaceName: "naming-smoke", RegistrationMarker: filepath.Join(root, "runtime", "registration.json"), CodexSocket: filepath.Join(root, "runtime", "ordinary.sock"), CodexVersion: "0.163.0", NamingSocket: owner.socket, NamingModelCatalogFile: owner.catalog, Logger: log.New(io.Discard, "", 0), Codex: ordinary})
 	if err != nil {
 		managedSmokeFail(t, "owning HTTP constructor failed")
 	}

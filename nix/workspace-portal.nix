@@ -271,7 +271,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-eXQJQ9Nnig4USAztpqb1pkOPqpMa9ixa0j3o5hK66MY=";
+  vendorHash = "sha256-q/VR3ZgKqOjRCVpSjMSQcOS6/mUptbFyEqh6mp7Ht34=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}
@@ -478,8 +478,8 @@ buildGoModule {
     grep -Fq '# Coordination operations and recovery' "$TMPDIR/installed-coordination-guide"
     test -x "$out/bin/workspace-portal"
     cmp ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
-    test "$(sha256sum "$out/share/workspace-portal/codex-models.json" | cut -d' ' -f1)" = 1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b
-    test "$("$out/libexec/codex/libexec/codex/bin/codex" --version)" = "codex-cli 0.160.0"
+    test "$(sha256sum "$out/share/workspace-portal/codex-models.json" | cut -d' ' -f1)" = 049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1
+    test "$("$out/libexec/codex/libexec/codex/bin/codex" --version)" = "codex-cli 0.163.0"
     mkdir -p "$TMPDIR/agent-team-state" "$TMPDIR/agent-team-workspace"
     printf '{"schema":1}\n' | ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/bin/workspace-portal" agent-teams registration \
