@@ -82,6 +82,8 @@ let
   coreSkills = {
     dev-session-documentation = "${src}/skills/dev-session-documentation";
     dev-session-monitor = "${src}/skills/dev-session-monitor";
+    update-codex-web = "${codexWebSrc}/skills/update-codex-web";
+    update-dev-workspace-codex = "${src}/skills/update-dev-workspace-codex";
   };
   agentTeams = import ./agent-teams.nix {
     inherit

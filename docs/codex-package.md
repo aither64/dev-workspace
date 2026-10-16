@@ -1,5 +1,9 @@
 # Codex runtime package
 
+Use the [runtime update skill](../skills/update-dev-workspace-codex/SKILL.md)
+for a version upgrade. It delegates protocol and catalog maintenance to the
+selected codex-web source's update skill.
+
 `lib.mkCodexPackage { pkgs; codex; }` assembles a complete runtime package from
 an already selected upstream Codex output. It copies the native executables
 without rebuilding Rust, changing their ELF interpreter or RPATH, or stripping

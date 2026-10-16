@@ -91,7 +91,7 @@ assert rejectsUnsafeRouterSocket;
 assert rejectsUnsafeActivationAlias;
 pkgs.runCommand "dev-workspace-extension-catalog-validation" { nativeBuildInputs = [ pkgs.jq ]; } ''
   for package in ${corePackage} ${extendedPackage}; do
-    for name in dev-session-documentation dev-session-monitor; do
+    for name in dev-session-documentation dev-session-monitor update-codex-web update-dev-workspace-codex; do
       skill=$(jq -er --arg name "$name" '.skills[] | select(.name == $name) | .path' \
         "$package/share/dev-workspace/extensions.json")
       test -f "$skill/SKILL.md"
@@ -99,9 +99,9 @@ pkgs.runCommand "dev-workspace-extension-catalog-validation" { nativeBuildInputs
       test -f "$package/share/codex/skills/$name/agents/openai.yaml"
     done
   done
-  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor"]' \
+  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor", "update-codex-web", "update-dev-workspace-codex"]' \
     ${corePackage}/share/dev-workspace/extensions.json >/dev/null
-  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor", "example"]' \
+  jq -e '[.skills[].name] == ["dev-session-documentation", "dev-session-monitor", "example", "update-codex-web", "update-dev-workspace-codex"]' \
     ${extendedPackage}/share/dev-workspace/extensions.json >/dev/null
   test -f ${extendedPackage}/share/codex/skills/example/SKILL.md
   touch "$out"

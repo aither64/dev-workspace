@@ -48,6 +48,10 @@ being developed, their users, containers or virtual machines.
 
 ## Compatibility
 
+For a packaged Codex upgrade, read
+[the runtime update skill](skills/update-dev-workspace-codex/SKILL.md). It routes
+protocol and catalog work to codex-web's own skill.
+
 This application manages persistent state and destructive session operations.
 Changes must consider old and new package generations, rollback, operation
 journals, workspace manifests, runtime authorities, Codex submission ledgers,
