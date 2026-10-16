@@ -228,6 +228,11 @@ func validateLifecycleOperation(operation lifecycleOperation) error {
 			return fmt.Errorf("invalid operation %s", label)
 		}
 	}
+	if operation.FinishedAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, operation.FinishedAt); err != nil {
+			return errors.New("invalid operation finishedAt")
+		}
+	}
 	if len(operation.Error) > maxLifecycleOperationErrorBytes || !utf8.ValidString(operation.Error) {
 		return errors.New("invalid operation error")
 	}
@@ -383,6 +388,24 @@ func (s *Server) captureLifecycleOperation(slug string) (lifecycleOperation, boo
 func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOperation, exists bool,
 	progress *session.LifecycleProgress, progressErr error, now time.Time,
 ) (lifecycleOperation, bool, error) {
+	if exists && operation.Kind == "archive" && operation.State != "complete" && s.supervisedArchives() {
+		worker, err := s.archiveWorker(s.operationContext, operation)
+		if err != nil {
+			return operation, true, err
+		}
+		if worker != nil {
+			operation.State = worker.State
+			operation.Error = worker.Error
+			if worker.State == "running" {
+				operation.FinishedAt = ""
+			} else {
+				operation.FinishedAt = worker.FinishedAt
+				if operation.FinishedAt == "" {
+					operation.FinishedAt = now.Format(time.RFC3339Nano)
+				}
+			}
+		}
+	}
 	if progressErr != nil {
 		if !exists {
 			return lifecycleOperation{}, false, progressErr

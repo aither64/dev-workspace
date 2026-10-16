@@ -11,10 +11,11 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
-	lifecycleOperationStoreSchema   = 1
+	lifecycleOperationStoreSchema   = 2
 	maxLifecycleOperationStoreBytes = 256 * 1024
 	maxLifecycleOperationRecords    = 512
 )
@@ -114,7 +115,7 @@ func (store *lifecycleOperationStore) loadWithDirectoryRepair(repair bool) (map[
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, errors.New("lifecycle operation state contains trailing data")
 	}
-	if payload.Schema != lifecycleOperationStoreSchema || payload.Workspace != store.workspace {
+	if (payload.Schema != 1 && payload.Schema != lifecycleOperationStoreSchema) || payload.Workspace != store.workspace {
 		return nil, errors.New("lifecycle operation state has the wrong workspace identity")
 	}
 	// Absence retains predecessor receipts. Explicit null/zero is not a
@@ -250,6 +251,7 @@ func (store *lifecycleOperationStore) canPersistTerminalOutcomes(
 		candidates[key] = operation
 	}
 	started.State = "failed"
+	started.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	started.Error = strings.Repeat("x", maxLifecycleOperationErrorBytes)
 	candidates[slug] = started
 	_, err := store.encode(candidates)

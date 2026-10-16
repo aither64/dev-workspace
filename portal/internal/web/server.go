@@ -127,20 +127,23 @@ type cachedIndexStatus struct {
 }
 
 type lifecycleOperation struct {
-	Slug                  string                    `json:"slug,omitempty"`
-	Kind                  string                    `json:"kind,omitempty"`
-	State                 string                    `json:"state"`
-	Phase                 string                    `json:"phase,omitempty"`
-	StartedAt             string                    `json:"startedAt,omitempty"`
-	UpdatedAt             string                    `json:"updatedAt,omitempty"`
-	Error                 string                    `json:"error,omitempty"`
-	Redirect              string                    `json:"redirect,omitempty"`
-	ReceiptID             string                    `json:"receiptId,omitempty"`
-	TargetIdentityVersion int                       `json:"targetIdentityVersion,omitempty"`
-	Attempt               int                       `json:"attempt,omitempty"`
-	CurrentTarget         *lifecycleTargetSnapshot  `json:"currentTarget,omitempty"`
-	ErrorCode             string                    `json:"code,omitempty"`
-	Options               lifecycleOperationOptions `json:"options,omitempty"`
+	Slug                  string                      `json:"slug,omitempty"`
+	Kind                  string                      `json:"kind,omitempty"`
+	State                 string                      `json:"state"`
+	Phase                 string                      `json:"phase,omitempty"`
+	StartedAt             string                      `json:"startedAt,omitempty"`
+	UpdatedAt             string                      `json:"updatedAt,omitempty"`
+	FinishedAt            string                      `json:"finishedAt,omitempty"`
+	TrackingSync          *session.TrackingSyncStatus `json:"trackingSync,omitempty"`
+	Progress              *session.ArchiveProgress    `json:"progress,omitempty"`
+	Error                 string                      `json:"error,omitempty"`
+	Redirect              string                      `json:"redirect,omitempty"`
+	ReceiptID             string                      `json:"receiptId,omitempty"`
+	TargetIdentityVersion int                         `json:"targetIdentityVersion,omitempty"`
+	Attempt               int                         `json:"attempt,omitempty"`
+	CurrentTarget         *lifecycleTargetSnapshot    `json:"currentTarget,omitempty"`
+	ErrorCode             string                      `json:"code,omitempty"`
+	Options               lifecycleOperationOptions   `json:"options,omitempty"`
 }
 
 type lifecycleOperationOptions struct {
@@ -2938,6 +2941,7 @@ func (s *Server) startLifecycleOperation(
 		finished := time.Now().UTC().Format(time.RFC3339Nano)
 		completed := started
 		completed.UpdatedAt = finished
+		completed.FinishedAt = finished
 		if err == nil {
 			completed.State = "complete"
 			completed.Phase = "complete"
@@ -2996,6 +3000,9 @@ func (s *Server) startLifecycleOperation(
 func (s *Server) runLifecycleOperation(
 	parent context.Context, slug, kind string, args []string, options lifecycleOperationOptions,
 ) error {
+	if kind == "archive" && s.supervisedArchives() {
+		return s.executeLifecycleOperation(parent, 0, slug, kind, args, options)
+	}
 	return s.executeLifecycleOperation(parent, 12*time.Minute, slug, kind, args, options)
 }
 
@@ -3003,7 +3010,11 @@ func (s *Server) executeLifecycleOperation(
 	parent context.Context, timeout time.Duration, slug, kind string, args []string,
 	options lifecycleOperationOptions,
 ) error {
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	ctx, cancel := context.WithCancel(parent)
+	if timeout > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	}
 	defer cancel()
 	transition, unlockTransition, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
@@ -3042,6 +3053,9 @@ func (s *Server) executeLifecycleOperation(
 			return targetErr
 		}
 	}
+	if kind == "archive" && s.supervisedArchives() {
+		return s.runSupervisedArchive(ctx, slug, args)
+	}
 	stdout, stderr, err := s.runDevSessionWithTransition(ctx, timeout, transition, args...)
 	if err != nil {
 		return commandFailure(kind+" session", stdout, stderr, err)
@@ -3063,6 +3077,10 @@ func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
 	if !exists {
 		snapshot.operation = lifecycleOperation{State: "idle"}
 	}
+	if status, err := session.ReadTrackingSync(s.config.Workspace, s.config.UserStateRoot, slug); err == nil {
+		snapshot.operation.TrackingSync = status
+	}
+	snapshot.operation.Progress = session.ReadArchiveProgress(s.config.Workspace, s.config.UserStateRoot, slug, snapshot.operation.Options.JournalID)
 	s.writeJSON(w, http.StatusOK, struct {
 		lifecycleOperation
 		StatusCheckedAt time.Time `json:"statusCheckedAt"`
@@ -3235,6 +3253,9 @@ func (s *Server) dismissLifecycleOperation(w http.ResponseWriter, r *http.Reques
 }
 
 func commandFailure(action, stdout, stderr string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: %w", action, err)
+	}
 	message := strings.TrimSpace(stderr)
 	if message == "" {
 		message = strings.TrimSpace(stdout)

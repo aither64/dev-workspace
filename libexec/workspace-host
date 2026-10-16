@@ -447,6 +447,9 @@ module DevWorkspaceHost
       when 'run-auto-archive'
         entry = instance_argument(argv, 'run-auto-archive')
         dispatch(['--workspace', entry.fetch('name'), 'auto-archive', 'scan', '--json'], 'dev-session')
+      when 'run-tracking-sync'
+        entry = instance_argument(argv, 'run-tracking-sync')
+        dispatch(['--workspace', entry.fetch('name'), 'tracking-sync', '--json'], 'dev-session')
       when '-h', '--help', nil
         extension_catalog
         @out.puts usage
@@ -1146,6 +1149,11 @@ module DevWorkspaceHost
 
       timers = entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.timer" }
       workers = entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.service" }
+      tracking_template = File.join(@home, '.config/systemd/user/workspace-tracking-sync@.timer')
+      if File.exist?(tracking_template) || File.symlink?(tracking_template)
+        timers.concat(entries.map { |entry| "workspace-tracking-sync@#{entry.fetch('name')}.timer" })
+        workers.concat(entries.map { |entry| "workspace-tracking-sync@#{entry.fetch('name')}.service" })
+      end
       system! 'systemctl', '--user', 'disable', '--now', *timers
       system! 'systemctl', '--user', 'stop', *workers
       @auto_archive_stopped = true
@@ -1163,14 +1171,20 @@ module DevWorkspaceHost
       @auto_archive_stopped = false
       system! 'systemctl', '--user', 'enable', '--now',
               *entries.map { |entry| "workspace-auto-archive@#{entry.fetch('name')}.timer" }
+      if File.file?(File.join(package, 'share/systemd/user/workspace-tracking-sync@.timer'))
+        system! 'systemctl', '--user', 'enable', '--now',
+                *entries.map { |entry| "workspace-tracking-sync@#{entry.fetch('name')}.timer" }
+      end
     end
 
     def remove_auto_archive_links
-      %w[timer service].each do |suffix|
-        remove_exact_link(
-          File.join(@home, ".config/systemd/user/workspace-auto-archive@.#{suffix}"),
-          File.join(@profile, "share/systemd/user/workspace-auto-archive@.#{suffix}")
-        )
+      %w[auto-archive tracking-sync].each do |family|
+        %w[timer service].each do |suffix|
+          remove_exact_link(
+            File.join(@home, ".config/systemd/user/workspace-#{family}@.#{suffix}"),
+            File.join(@profile, "share/systemd/user/workspace-#{family}@.#{suffix}")
+          )
+        end
       end
     end
 
@@ -1299,6 +1313,7 @@ module DevWorkspaceHost
       environment = @env.to_h.merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
         'DEV_WORKSPACE_CODEX_HOME' => codex_home,
+        'DEV_WORKSPACE_DEFER_TRACKING' => '1',
         'DEV_WORKSPACES_STATE' => @state
       )
       [environment, private_command, arguments]
@@ -2587,17 +2602,23 @@ module DevWorkspaceHost
     end
 
     def require_compatible_archive_recovery!(package)
+      tracking = Dir.glob(File.join(@state, 'tracking-sync', '*', '*.json'))
       inventories = Dir.glob(File.join(@state, 'archived-worktrees', '*', '*', '*', 'inventory.json'))
       git_recovery = inventories.any? do |path|
         value = parse_strict_json_object(File.binread(path), 'archive recovery inventory', 8 * 1024 * 1024)
         value['schema'] == 2
       end
-      return unless git_recovery
+      execution = Dir.glob(File.join(@state, 'portal', '*', 'lifecycle-operations.json')).any? do |path|
+        parse_strict_json_object(File.binread(path), 'portal lifecycle receipts', 256 * 1024)['schema'] == 2
+      end
+      return if tracking.empty? && !git_recovery && !execution
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'archive recovery contract', 64 * 1024)
-      unless contract['archiveRecoveryPolicy'] == 2
-        raise Error, 'target workspace package cannot preserve Git archive recovery'
+      unless (!git_recovery || contract['archiveRecoveryPolicy'] == 2) &&
+             (tracking.empty? || contract['trackingSyncPolicy'] == 1) &&
+             (!execution || contract['archiveExecutionPolicy'] == 1)
+        raise Error, 'target workspace package cannot preserve local archive recovery and pending tracking'
       end
     end
 

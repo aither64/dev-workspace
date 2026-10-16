@@ -373,6 +373,10 @@ buildGoModule {
       "$out/libexec/workspace-archive-recovery.rb"
     ln -s ../workspace-archive-recovery.rb \
       "$out/libexec/workspace-portal/workspace-archive-recovery.rb"
+    install -Dm644 ${src}/libexec/workspace-tracking-sync.rb \
+      "$out/libexec/workspace-tracking-sync.rb"
+    ln -s ../workspace-tracking-sync.rb \
+      "$out/libexec/workspace-portal/workspace-tracking-sync.rb"
     install -Dm644 ${codexWebSrc}/test/codex_protocol_contract.py \
       "$out/share/workspace-portal/codex_web_protocol_contract.py"
     install -Dm644 ${src}/test/selected_protocol_contract.py \

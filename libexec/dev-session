@@ -20,6 +20,7 @@ require_relative 'workspace-provider-admission'
 require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
 require_relative 'workspace-archive-recovery'
+require_relative 'workspace-tracking-sync'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -209,6 +210,7 @@ module DevSession
       dev-session recover-stale <name-or-slug> [--as-is]
       dev-session archive <name-or-slug> [--as-is] [--abandoned]
       dev-session auto-archive scan [--dry-run] [--json]
+      dev-session tracking-sync [--status] [--slug SLUG] [--force] [--json]
       dev-session auto-archive enable|disable [--json]
       dev-session auto-archive hold|release|status <name-or-slug> [--as-is] [--json]
       dev-session delete <name-or-slug> [--as-is] [--force]
@@ -366,14 +368,29 @@ module DevSession
       @timeout = previous
     end
 
+    def with_deadline(deadline)
+      previous = @deadline
+      @deadline = deadline
+      yield
+    ensure
+      @deadline = previous
+    end
+
+    def timed_command(argv)
+      command = argv.map(&:to_s)
+      seconds = [@timeout, @deadline && @deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)].compact.min
+      raise Error, 'command deadline exceeded' if seconds && seconds <= 0
+
+      seconds ? ['timeout', '--signal=TERM', '--kill-after=5s', "#{seconds}s", *command] : command
+    end
+
     def initialize(out:, err:)
       @out = out
       @err = err
     end
 
     def capture(argv, allow_failure: false, env: nil, pass_fds: [], input: nil)
-      command = argv.map(&:to_s)
-      command = ['timeout', '--signal=TERM', '--kill-after=5s', "#{@timeout}s", *command] if @timeout
+      command = timed_command(argv)
       descriptor_options = pass_fds.to_h do |file|
         descriptor = file.fileno
         [descriptor, descriptor]
@@ -397,9 +414,7 @@ module DevSession
 
     # Stream large Git objects without retaining their contents in memory.
     def stream(argv, input:)
-      command = argv.map(&:to_s)
-      command = ['timeout', '--signal=TERM', '--kill-after=5s', "#{@timeout}s", *command] if @timeout
-      Open3.popen3(*command) do |stdin, stdout, stderr, process|
+      Open3.popen3(*timed_command(argv)) do |stdin, stdout, stderr, process|
         writer = Thread.new do
           begin
             stdin.write(input)
@@ -741,6 +756,7 @@ module DevSession
   end
 
   class Runner
+    include TrackingSync
     include SensitiveSessions
     include WorkspaceAutoArchive::Runner
     include ArchiveCleanup::RunnerContext
@@ -1930,6 +1946,7 @@ module DevSession
           if sidecar && sidecar.fetch('mode') != mode
             raise Error, "resuming archival of #{slug} requires mode #{sidecar.fetch('mode')}"
           end
+          @archive_progress_operation_id = operation_id || journal&.fetch('operation_id')
           if sidecar && !journal && sidecar.fetch('completed')
             cleanup.discard_completed!(sidecar)
             @out.puts "archived session: #{slug}"
@@ -1975,7 +1992,7 @@ module DevSession
             unless File.stat(source).dev == archive_device
               raise Error, 'work and archive directories must be on the same filesystem'
             end
-            validate_tracking_transition_commit!(slug)
+            validate_tracking_transition_commit!(slug, local_only: defer_tracking?)
             sync_team_lifecycle!(slug, 'require-idle') if automatic
             automatic&.call(prepared)
             if prepared
@@ -2055,7 +2072,11 @@ module DevSession
             cleanup.revalidate!(sidecar, journal:) if sidecar
             verify_archived_tracking_tree!(slug, journal)
             verify_archived_proven_heads!(slug, journal) if mode == 'complete'
-            commit_tracking_transition!(slug, direction: 'archive', mode:)
+            if local_tracking_journal?(journal)
+              save_tracking_transition!(slug, journal, direction: 'archive')
+            else
+              commit_tracking_transition!(slug, direction: 'archive', mode:)
+            end
             advance_archive!(slug, journal, 'tracking_committed')
           end
           verify_committed_archive_tracking!(slug, journal)
@@ -2093,6 +2114,7 @@ module DevSession
       end
     ensure
       @explicit_archive_operation_id = nil
+      @archive_progress_operation_id = nil
     end
 
     def with_verified_committed_archive(slug, expected_journal)
@@ -2154,14 +2176,18 @@ module DevSession
           with_slug_lock(slug) do
             current = load_revive_journal(slug, operation_id:)
             verify_revived_tracking_tree!(slug, current)
-            commit_tracking_transition!(slug, direction: 'revive', mode: current.fetch('lifecycle'))
+            if local_tracking_journal?(current)
+              save_tracking_transition!(slug, current, direction: 'revive')
+            else
+              commit_tracking_transition!(slug, direction: 'revive', mode: current.fetch('lifecycle'))
+            end
             verify_revived_tracking_tree!(slug, current)
             advance_revive!(slug, current, 'tracking_committed')
             current
           end
         end
       end
-      if journal['schema'] == 4 && revive_phase_before?(journal, 'runtime_started')
+      if journal['archive_operation_id'] && revive_phase_before?(journal, 'runtime_started')
         with_creation_lock(slug) do
           with_slug_lock(slug) do
             recovery = archive_cleanup_recovery(slug, journal.fetch('archive_operation_id'))
@@ -2193,7 +2219,7 @@ module DevSession
         journal = with_creation_lock(slug) do
           with_slug_lock(slug) do
             current = load_revive_journal(slug, operation_id:)
-            if current.fetch('phase') == 'tracking_committed'
+            if %w[tracking_committed tracking_saved].include?(current.fetch('phase'))
               current = prepare_revive_runtime_start!(slug, operation_id:)
             end
             advance_revive!(slug, current, 'runtime_started')
@@ -5378,7 +5404,11 @@ module DevSession
     end
 
     def verify_committed_archive_tracking!(slug, journal)
-      require_clean_committed_tracking_transition!(slug, direction: 'archive')
+      if local_tracking_journal?(journal)
+        verify_saved_tracking_transition!(slug, journal, direction: 'archive')
+      else
+        require_clean_committed_tracking_transition!(slug, direction: 'archive')
+      end
       verify_archived_tracking_tree!(slug, journal)
       verify_archived_proven_heads!(slug, journal) if journal.fetch('mode') == 'complete'
     end
@@ -6344,7 +6374,11 @@ module DevSession
       unless branch == 'master'
         raise Error, 'workspace checkout must be on master while changing session tracking'
       end
-      @command_runner.run(['git', '-C', workspace, 'fetch', 'origin', 'master']) if refresh
+      if refresh
+        @command_runner.with_timeout(30) do
+          @command_runner.run(['git', '-C', workspace, 'fetch', 'origin', 'master'])
+        end
+      end
       _stdout, _stderr, status = @command_runner.capture(
         ['git', '-C', workspace, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'],
         allow_failure: true
@@ -6374,6 +6408,7 @@ module DevSession
       removal['state'] = 'removed'
       removal['removed_at'] = Time.now.utc.iso8601(6)
       write_removal_metadata!(removal.fetch('recovery'), removal)
+      discard_tracking_sync!(slug)
       coordination_store.lifecycle_completed(workspace, slug, 'delete', operation_id: removal.fetch('operation_id'))
       path = lifecycle_journal_file(slug, 'delete')
       File.unlink(path) if path_exists?(path)
@@ -6929,7 +6964,7 @@ module DevSession
       ]
       unless journal.keys.sort == keys.sort &&
              ((journal['schema'] == 2 && %w[complete abandoned].include?(journal['mode'])) ||
-               (journal['schema'] == 3 && journal['mode'] == 'archived')) && ARCHIVE_PHASES.include?(journal['phase']) &&
+               (journal['schema'] == 3 && journal['mode'] == 'archived') || journal['schema'] == 4) && archive_phases(journal).include?(journal['phase']) &&
              journal['operation_id'].is_a?(String) &&
              journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
              %w[complete abandoned archived].include?(journal['mode']) &&
@@ -6961,7 +6996,7 @@ module DevSession
         slug, plan, mode, inventory ? inventory.fetch('registered_heads') : proven_heads, finalized_at
       )
       journal = {
-        'schema' => mode == 'archived' ? 3 : 2,
+        'schema' => defer_tracking? ? 4 : (mode == 'archived' ? 3 : 2),
         'slug' => slug,
         'workspace' => workspace,
         'operation_id' => operation_id || SecureRandom.hex(32),
@@ -6983,12 +7018,20 @@ module DevSession
     end
 
     def archive_phase_before?(journal, phase)
-      ARCHIVE_PHASES.index(journal.fetch('phase')) < ARCHIVE_PHASES.index(phase)
+      phases = archive_phases(journal)
+      phase = 'tracking_saved' if local_tracking_journal?(journal) && phase == 'tracking_committed'
+      phases.index(journal.fetch('phase')) < phases.index(phase)
+    end
+
+    def archive_phases(journal)
+      local_tracking_journal?(journal) ? ARCHIVE_PHASES.map { |phase| phase == 'tracking_committed' ? 'tracking_saved' : phase } : ARCHIVE_PHASES
     end
 
     def advance_archive!(slug, journal, phase)
-      current = ARCHIVE_PHASES.index(journal.fetch('phase'))
-      target = ARCHIVE_PHASES.index(phase)
+      phases = archive_phases(journal)
+      phase = 'tracking_saved' if local_tracking_journal?(journal) && phase == 'tracking_committed'
+      current = phases.index(journal.fetch('phase'))
+      target = phases.index(phase)
       raise Error, "invalid archive phase transition to #{phase}" unless target == current + 1
 
       journal['phase'] = phase
@@ -7007,7 +7050,7 @@ module DevSession
           lifecycle_journal_file(slug, 'archive'), journal, command: 'archive', create: false
         )
       end
-      if committed_path?('HEAD', File.join('archive', slug)) &&
+      if !local_tracking_journal?(journal) && committed_path?('HEAD', File.join('archive', slug)) &&
          !committed_path?('HEAD', File.join('work', slug)) &&
          archive_phase_before?(journal, 'tracking_committed')
         require_clean_committed_tracking_transition!(slug, direction: 'archive')
@@ -7096,7 +7139,7 @@ module DevSession
         plan_sha256 state_sha256 target_state_sha256 portal_sha256
         target_portal_sha256
       ]
-      keys << 'archive_operation_id' if journal['schema'] == 4
+      keys << 'archive_operation_id' if journal['lifecycle'] == 'archived'
       digests = %w[
         target_tracking_sha256 plan_sha256 state_sha256 target_state_sha256
         target_portal_sha256
@@ -7104,7 +7147,8 @@ module DevSession
       unless journal.keys.sort == keys.sort &&
              ((journal['schema'] == 3 && %w[complete abandoned].include?(journal['lifecycle'])) ||
                (journal['schema'] == 4 && journal['lifecycle'] == 'archived' &&
-                journal['archive_operation_id']&.match?(/\A[0-9a-f]{64}\z/))) && REVIVE_PHASES.include?(journal['phase']) &&
+                journal['archive_operation_id']&.match?(/\A[0-9a-f]{64}\z/)) ||
+               (journal['schema'] == 5 && (journal['lifecycle'] != 'archived' || journal['archive_operation_id']&.match?(/\A[0-9a-f]{64}\z/)))) && revive_phases(journal).include?(journal['phase']) &&
              journal['operation_id'].is_a?(String) &&
              journal['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
              %w[complete abandoned archived].include?(journal['lifecycle']) &&
@@ -7145,7 +7189,7 @@ module DevSession
       end
       raise Error, "live tmux session already exists: #{slug}" if @tmux.session(slug)
       raise Error, "session authority still exists: #{slug}" if @selected_authority
-      validate_tracking_transition_commit!(slug)
+      validate_tracking_transition_commit!(slug, local_only: defer_tracking?)
       source = archive_dir(slug)
       state = read_bounded_file(File.join(source, 'state.md'), 'state.md')
       target_state = revived_state_content(state)
@@ -7175,7 +7219,7 @@ module DevSession
                       end
       archived_manifest = portal && YAML.safe_load(portal)
       journal = {
-        'schema' => lifecycle == 'archived' ? 4 : 3,
+        'schema' => defer_tracking? ? 5 : (lifecycle == 'archived' ? 4 : 3),
         'slug' => slug,
         'workspace' => workspace,
         'operation_id' => operation_id || SecureRandom.hex(32),
@@ -7208,12 +7252,19 @@ module DevSession
     end
 
     def revive_phase_before?(journal, phase)
-      REVIVE_PHASES.index(journal.fetch('phase')) < REVIVE_PHASES.index(phase)
+      phase = 'tracking_saved' if local_tracking_journal?(journal) && phase == 'tracking_committed'
+      revive_phases(journal).index(journal.fetch('phase')) < revive_phases(journal).index(phase)
+    end
+
+    def revive_phases(journal)
+      local_tracking_journal?(journal) ? REVIVE_PHASES.map { |phase| phase == 'tracking_committed' ? 'tracking_saved' : phase } : REVIVE_PHASES
     end
 
     def advance_revive!(slug, journal, phase)
-      current = REVIVE_PHASES.index(journal.fetch('phase'))
-      target = REVIVE_PHASES.index(phase)
+      phases = revive_phases(journal)
+      phase = 'tracking_saved' if local_tracking_journal?(journal) && phase == 'tracking_committed'
+      current = phases.index(journal.fetch('phase'))
+      target = phases.index(phase)
       raise Error, "invalid revive phase transition to #{phase}" unless target == current + 1
 
       journal['phase'] = phase
@@ -7230,7 +7281,7 @@ module DevSession
     end
 
     def recover_revive_phase!(slug, journal)
-      if journal.fetch('phase') == 'tracking_restored' &&
+      if !local_tracking_journal?(journal) && journal.fetch('phase') == 'tracking_restored' &&
          committed_path?('HEAD', File.join('work', slug)) &&
          !committed_path?('HEAD', File.join('archive', slug)) &&
          revive_phase_before?(journal, 'tracking_committed')
@@ -7241,13 +7292,17 @@ module DevSession
           lifecycle_journal_file(slug, 'revive'), journal, command: 'revive', create: false
         )
       end
-      if journal.fetch('phase') == 'tracking_committed'
+      if %w[tracking_committed tracking_saved].include?(journal.fetch('phase'))
         verify_committed_revive_tracking!(slug, journal)
       end
     end
 
     def verify_committed_revive_tracking!(slug, journal)
-      require_clean_committed_tracking_transition!(slug, direction: 'revive')
+      if local_tracking_journal?(journal)
+        verify_saved_tracking_transition!(slug, journal, direction: 'revive')
+      else
+        require_clean_committed_tracking_transition!(slug, direction: 'revive')
+      end
       verify_revived_tracking_tree!(slug, journal)
       return if journal.fetch('legacy_without_portal')
 
@@ -7262,7 +7317,7 @@ module DevSession
       raise Error, "revive journal is missing for #{slug}" unless journal
 
       case journal.fetch('phase')
-      when 'tracking_committed'
+      when 'tracking_committed', 'tracking_saved'
         verify_committed_revive_tracking!(slug, journal)
         advance_revive!(slug, journal, 'runtime_starting')
       when 'runtime_starting'
@@ -7430,7 +7485,7 @@ module DevSession
                 else
                   raise Error, "unsupported lifecycle journal writer: #{command}"
                 end
-      allowed << 'archive_operation_id' if command == 'revive' && journal['schema'] == 4
+      allowed << 'archive_operation_id' if command == 'revive' && journal['lifecycle'] == 'archived'
       unless journal.keys.sort == allowed.sort
         raise Error, "invalid lifecycle journal fields: #{path}"
       end
@@ -7480,9 +7535,15 @@ module DevSession
       atomic_replace(path, replacement)
     end
 
-    def validate_tracking_transition_commit!(slug, refresh: true)
+    def validate_tracking_transition_commit!(slug, refresh: true, local_only: false)
       return ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
-      require_linear_workspace_master_for_tracking!(refresh:)
+      if local_only
+        unless git_capture(['git', '-C', workspace, 'symbolic-ref', '--short', 'HEAD']).strip == 'master'
+          raise Error, 'workspace checkout must be on master while changing session tracking'
+        end
+      else
+        require_linear_workspace_master_for_tracking!(refresh:)
+      end
       paths = [File.join('work', slug), File.join('archive', slug)]
       _stdout, _stderr, status = @command_runner.capture(
         ['git', '-C', workspace, 'diff', '--cached', '--quiet', '--', *paths],
@@ -7503,6 +7564,9 @@ module DevSession
                               end
         absolute_destination = File.join(workspace, destination)
         raise Error, "tracking transition destination is missing: #{destination}" unless File.directory?(absolute_destination)
+        paths = [source, destination].select do |path|
+          path_exists?(File.join(workspace, path)) || committed_path?('HEAD', path)
+        end
 
         status = git_capture([
           'git', '-C', workspace, 'status', '--porcelain=v1', '--', source, destination
@@ -7534,14 +7598,19 @@ module DevSession
           intent_added = true
           @command_runner.run([
             'git', '-C', workspace, 'commit', '--only', '-F', message.path,
-            '--', source, destination
+            '--', *paths
           ])
         rescue StandardError
           if intent_added
-            @command_runner.capture(
-              ['git', '-C', workspace, 'reset', '--quiet', 'HEAD', '--', source, destination],
-              allow_failure: true
-            )
+            # A retry deadline must not prevent ordinary owned-index cleanup.
+            @command_runner.with_deadline(nil) do
+              @command_runner.with_timeout(10) do
+                @command_runner.capture(
+                  ['git', '-C', workspace, 'reset', '--quiet', 'HEAD', '--', *paths],
+                  allow_failure: true
+                )
+              end
+            end
           end
           raise
         ensure
@@ -7595,7 +7664,19 @@ module DevSession
           raise Error, "#{description} must be a uid #{Process.euid} mode-0600 file: #{path}"
         end
         locked = file.flock(mode | File::LOCK_NB)
-        locked = file.flock(mode) if !locked && wait
+        if !locked && wait
+          if @tracking_sync_deadline
+            until locked
+              remaining = @tracking_sync_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+              raise Error, 'tracking synchronization lock deadline exceeded' if remaining <= 0
+
+              sleep([remaining, 0.05].min)
+              locked = file.flock(mode | File::LOCK_NB)
+            end
+          else
+            locked = file.flock(mode)
+          end
+        end
         unless locked
           raise Error, busy_message || "cannot lock #{description}: #{path}"
         end
@@ -8452,6 +8533,7 @@ module DevSession
 
     def validate_tracking_committed!(slug)
       return ensure_sensitive_exclusions!(slug) if sensitive_session?(slug)
+      return if tracking_sync_receipt(slug)&.fetch('direction') == 'revive'
       plan_path = File.join('work', slug, 'plan.md')
       state_path = File.join('work', slug, 'state.md')
       missing = [plan_path, state_path].reject { |path| committed_path?('HEAD', path) }
@@ -8870,6 +8952,7 @@ module DevSession
       end
       validate_terminal_lifecycle_file!(state)
       return validate_sensitive_transition!(slug, direction: 'archive') if sensitive_session?(slug)
+      return if locally_archived_tracking?(slug)
 
       relative_paths = [File.join('work', slug), File.join('archive', slug)]
       status = git_capture([
@@ -8996,10 +9079,12 @@ module DevSession
       raise Error, USAGE unless command
 
       @provider_read_only = %w[current list url validate quiesce].include?(command) ||
+                            (command == 'tracking-sync' && @argv.include?('--status')) ||
                             (command == 'team' && @argv.first == 'list')
 
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
         read_only = %w[current list url validate].include?(command) ||
+                    (command == 'tracking-sync' && @argv.include?('--status')) ||
                     (command == 'team' && @argv.first == 'list')
         with_transition_lock(File::LOCK_SH, read_only:) do
           validate_host_generation!
@@ -9051,6 +9136,16 @@ module DevSession
         run_archive
       when 'auto-archive'
         run_auto_archive
+      when 'tracking-sync'
+        options = { force: false, slug: nil, status: false }
+        OptionParser.new do |parser|
+          parser.on('--force') { options[:force] = true }
+          parser.on('--status') { options[:status] = true }
+          parser.on('--slug SLUG') { |value| options[:slug] = value }
+          parser.on('--json') { }
+        end.parse!(@argv)
+        value = options[:status] ? runner.tracking_sync_status(options[:slug]) : runner.tracking_sync(options[:slug], force: options[:force])
+        @out.puts JSON.generate(value)
       when 'delete'
         run_delete
       when 'revive'
@@ -9435,11 +9530,11 @@ module DevSession
 
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       if opts.fetch(:portal_authorized)
-        validate_portal_authorization!
         operation_id = opts.fetch(:portal_operation_id)
         unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
           raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
         end
+        validate_portal_authorization!(archive_slug: slug, archive_operation_id: operation_id)
       else
         if opts.fetch(:portal_operation_id)
           raise Error, '--portal-operation-id requires --portal-authorized'
@@ -9637,7 +9732,7 @@ module DevSession
       slug
     end
 
-    def validate_portal_authorization!
+    def validate_portal_authorization!(archive_slug: nil, archive_operation_id: nil)
       unless @require_runtime && @authority_dir && @portal_command
         raise Error, 'portal lifecycle authorization requires the deployed workspace runtime'
       end
@@ -9649,7 +9744,10 @@ module DevSession
       service = "workspace-portal@#{workspace_name}.service"
       authorized = cgroups.lines.any? do |line|
         path = line.split(':', 3).last.to_s.strip
-        path.split('/').include?(service)
+        path.split('/').any? do |unit|
+          unit == service || (archive_slug && unit.match?(/\Aworkspace-archive-[0-9a-f]{64}-[0-9]+\.service\z/) &&
+            runner.authorized_archive_worker?(archive_slug, archive_operation_id, unit))
+        end
       end
       return if authorized
 

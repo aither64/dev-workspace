@@ -64,25 +64,93 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_git_clean_filtered_content_keeps_a_full_recovery_snapshot
-    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
-      clean = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('working', 'stored'))"].shelljoin
-      smudge = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('stored', 'working'))"].shelljoin
-      assert_git_success('git', '-C', checkout, 'config', 'filter.example.clean', clean)
-      assert_git_success('git', '-C', checkout, 'config', 'filter.example.smudge', smudge)
-      File.write(File.join(checkout, '.gitattributes'), "filtered filter=example\n")
-      File.write(File.join(checkout, 'filtered'), 'working contents')
-      assert_git_success('git', '-C', checkout, 'add', '.gitattributes', 'filtered')
-      assert_git_success('git', '-C', checkout, 'commit', '-m', 'filtered fixture')
-      assert_empty(git_capture_success('git', '-C', checkout, 'status', '--porcelain').strip)
+  def test_tracking_sync_hanging_hook_releases_lifecycle_locks_and_preserves_shared_index
+    with_archive_cleanup_fixture do |runner, workspace, slug, _common, _checkout|
+      runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
       runner.archive(slug, as_is: true, explicit: true)
-      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
-      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
-      saved, = recovery.send(:read_record, recovery.records.first)
-      assert_equal('files', saved.fetch('kind'))
-      assert_git_success('git', "--git-dir=#{common}", 'config', '--remove-section', 'filter.example')
+      File.write(File.join(workspace, 'unrelated'), 'staged outside session')
+      assert_git_success('git', '-C', workspace, 'add', 'unrelated')
+      staged = git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary', '--', 'unrelated')
+      started = File.join(workspace, '.git', 'hook-started')
+      hook = File.join(workspace, '.git', 'hooks', 'pre-commit')
+      File.write(hook, "#!/bin/sh\n: > #{started.shellescape}\nwhile :; do sleep 1; done\n")
+      File.chmod(0o700, hook)
+      runner.define_singleton_method(:tracking_sync_attempt_seconds) { 5 }
+      sync = Thread.new { runner.tracking_sync(slug, force: true) }
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      until File.file?(started)
+        if !sync.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          flunk "tracking hook did not start: #{runner.tracking_sync_receipt(slug).inspect}; alive=#{sync.alive?}"
+        end
+        sleep 0.02
+      end
+      reviver = archive_runner_for(workspace, env: {'DEV_WORKSPACE_DEFER_TRACKING' => '1'})
+      assert_raises(DevSession::Error) { reviver.revive(slug, as_is: true) }
+      assert(sync.join(10), 'tracking hook retained lifecycle locks')
+      assert_equal('pending', runner.tracking_sync_receipt(slug).fetch('state'))
+      File.unlink(hook)
+      reviver.revive(slug, as_is: true)
+      assert_equal('revive', reviver.tracking_sync_receipt(slug).fetch('direction'))
+      reviver.tracking_sync(slug, force: true)
+      assert_equal('synced', reviver.tracking_sync_receipt(slug).fetch('state'))
+      assert_equal(staged, git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary', '--', 'unrelated'))
+    ensure
+      File.unlink(hook) if hook && File.file?(hook)
+      sync&.join(10)
+    end
+  end
+
+  def test_supervised_archive_authorization_requires_the_exact_portal_receipt
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-06-06-worker'
+      operation = 'a' * 64
+      receipt_id = 'b' * 64
+      unit = "workspace-archive-#{receipt_id}-1.service"
+      identity = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      path = File.join(runner.instance_variable_get(:@workspace_state_root), 'portal', identity, 'lifecycle-operations.json')
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      File.write(path, JSON.generate('schema' => 2, 'workspace' => workspace, 'operations' => [{
+        'slug' => slug, 'kind' => 'archive', 'state' => 'running', 'receiptId' => receipt_id,
+        'attempt' => 1, 'options' => { 'journalId' => operation }
+      }]))
+      File.chmod(0o600, path)
+      assert(runner.authorized_archive_worker?(slug, operation, unit))
+      refute(runner.authorized_archive_worker?(slug, 'c' * 64, unit))
+      refute(runner.authorized_archive_worker?(slug, operation, unit.sub('-1.service', '-2.service')))
+      refute(runner.authorized_archive_worker?('other-session', operation, unit))
+    end
+  end
+
+  def test_local_archive_and_revive_coalesce_pending_tracking_without_fetching
+    with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
+      runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
+      head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip
+      runner.define_singleton_method(:require_linear_workspace_master_for_tracking!) do |**|
+        raise DevSession::Error, 'remote unavailable'
+      end
+
+      runner.archive(slug, as_is: true, explicit: true)
+      receipt = runner.tracking_sync_receipt(slug)
+      assert_equal('pending', receipt.fetch('state'))
+      assert_equal('archive', receipt.fetch('direction'))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip)
+      runner.tracking_sync(slug, force: true)
+      assert_includes(runner.tracking_sync_receipt(slug).fetch('error'), 'remote unavailable')
+
       runner.revive(slug, as_is: true)
-      assert_equal('working contents', File.read(File.join(checkout, 'filtered')))
+      receipt = runner.tracking_sync_receipt(slug)
+      assert_equal('pending', receipt.fetch('state'))
+      assert_equal('revive', receipt.fetch('direction'))
+      assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip)
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+
+      runner.singleton_class.remove_method(:require_linear_workspace_master_for_tracking!)
+      runner.tracking_sync(slug, force: true)
+      assert_equal('synced', runner.tracking_sync_receipt(slug).fetch('state'))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      assert_git_success('git', '-C', workspace, 'diff', '--quiet', 'HEAD', '--', File.join('work', slug))
     end
   end
 
@@ -141,6 +209,28 @@ class DevSessionTest < Minitest::Test
       runner.revive(slug, as_is: true)
       assert_equal(before, git_capture_success('git', '-C', checkout, 'ls-files', '--stage'))
       assert_equal("working\x00resolution".b, File.binread(File.join(checkout, 'conflict')))
+    end
+  end
+
+  def test_git_clean_filtered_content_keeps_a_full_recovery_snapshot
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      clean = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('working', 'stored'))"].shelljoin
+      smudge = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('stored', 'working'))"].shelljoin
+      assert_git_success('git', '-C', checkout, 'config', 'filter.example.clean', clean)
+      assert_git_success('git', '-C', checkout, 'config', 'filter.example.smudge', smudge)
+      File.write(File.join(checkout, '.gitattributes'), "filtered filter=example\n")
+      File.write(File.join(checkout, 'filtered'), 'working contents')
+      assert_git_success('git', '-C', checkout, 'add', '.gitattributes', 'filtered')
+      assert_git_success('git', '-C', checkout, 'commit', '-m', 'filtered fixture')
+      assert_empty(git_capture_success('git', '-C', checkout, 'status', '--porcelain').strip)
+      runner.archive(slug, as_is: true, explicit: true)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
+      saved, = recovery.send(:read_record, recovery.records.first)
+      assert_equal('files', saved.fetch('kind'))
+      assert_git_success('git', "--git-dir=#{common}", 'config', '--remove-section', 'filter.example')
+      runner.revive(slug, as_is: true)
+      assert_equal('working contents', File.read(File.join(checkout, 'filtered')))
     end
   end
 

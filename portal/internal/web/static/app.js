@@ -527,11 +527,15 @@
   const lifecyclePresentation = (operation = {}, pendingKind = "", elapsedMilliseconds = 0) => {
     const kind = operation.kind || pendingKind;
     const label = lifecycleKindLabel(kind);
+    if (operation.trackingSync?.state === "pending" && ["complete", "idle"].includes(operation.state)) {
+      return {detail: operation.trackingSync.error || "Tracking changes will be saved automatically.",
+        retry: false, title: "Tracking sync pending", tone: "pending"};
+    }
     if (operation.state === "running") {
       return {
-        detail: `Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
+        detail: `${operation.progress?.path ? operation.progress.path + " · " : ""}Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
         retry: false,
-        title: `${label}: ${lifecyclePhaseLabel(operation.phase)}`,
+        title: `${label}: ${operation.progress?.stage || lifecyclePhaseLabel(operation.phase)}`,
         tone: "running",
       };
     }
@@ -553,7 +557,7 @@
     }
     if (operation.state === "complete") {
       return {
-        detail: operation.updatedAt ? `Finished ${activityAge(operation.updatedAt)}` : "Finished",
+        detail: (operation.finishedAt || operation.updatedAt) ? `Finished ${activityAge(operation.finishedAt || operation.updatedAt)}` : "Finished",
         retry: false,
         title: `${label} complete`,
         tone: "complete",
@@ -911,7 +915,7 @@
           .find(line => line && !line.startsWith("command failed with exit")) || state.last_attempt_error;
         const step = {prepared: "Stopping session activity", quiesced: "Releasing development clusters",
           clusters_released: "Archiving session records", tracking_archived: "Committing archive records",
-          tracking_committed: "Closing conversations", thread_retired: "Stopping session runtime",
+          tracking_committed: "Closing conversations", tracking_saved: "Closing conversations", thread_retired: "Stopping session runtime",
           runtime_retired: "Finishing archive", archived: "Finishing archive"}[state.journal?.phase];
         blockers.push(step ? `${step}: ${reason.slice(0, 400)}` : reason.slice(0, 400));
       }

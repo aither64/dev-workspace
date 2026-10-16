@@ -23,7 +23,7 @@ catch children spawned during shutdown, then retires children before parents.
 Threadless sessions still require proof that no conversations or retained team
 contradict their recorded ownership.
 
-A threadless session can retain its verified shell until tracking is committed.
+A threadless session can retain its verified shell until tracking is saved.
 The capture journal exists before the full conversation absence check, so fresh
 CLI attempts and browser attempts use the same accepted operation proof. A failed
 check leaves the journal retryable and worktrees intact. Archive can finish its
@@ -39,9 +39,11 @@ operation state in private `archived-worktrees/` storage. A clean checkout with
 no untracked or ignored entries uses retained Git objects instead of a file copy;
 its saved permissions also preserve empty directories. Other checkouts use a full
 file snapshot. Git reconstruction requires raw file bytes to match retained blobs;
-filtered or converted content keeps a full snapshot. Staged, unstaged,
+file types must also match the Git tree. Filtered or converted content and regular
+files representing Git symlinks keep a full snapshot. Staged, unstaged,
 untracked, ignored and binary contents survive. Captures are synced and checked
-against the source before forced Git removal. Branches are retained.
+against the source before forced Git removal. Git recovery checks every retained
+tree and file object, including its raw object hash, before removal. Branches are retained.
 
 Wrong repository ownership, symlinked checkout paths, conflicting operation
 identities and changed recovery contents still refuse destructive cleanup.
@@ -49,13 +51,18 @@ Stop external editors and builds before archival: session locks cannot stop an
 unmanaged writer. A failed filesystem copy or removal leaves the operation
 retryable with its recovery contents retained.
 
-Explicit archival uses a schema-3 archive journal, schema-2 cleanup sidecar and
-schema-3 finalized manifest. The manifest's `archive_operation_id` selects private
+Installed workspaces write schema-4 archive journals and schema-3 cleanup
+sidecars. Their `tracking_saved` phase proves a durable local tracking transition;
+Git synchronization runs separately. Schema-2/3 archive journals keep their
+commit prerequisite. Recovery inventories accept full-copy schema 1 and schema 2,
+whose records distinguish Git reconstruction from full copies. Finalized
+manifests remain schema 3. The manifest's `archive_operation_id` selects private
 recovery without exposing local storage paths. A registration with no available
 local head stays recorded without an invented final SHA. Existing schema-2
 complete/abandoned journals keep their saved policy on retry.
 
-Revival uses a schema-4 journal for these archives. Before starting the retained
+Installed workspaces write schema-5 revival journals with the same local tracking
+milestone. Older schema-3/4 journals retain synchronous bookkeeping. Before starting the retained
 conversation, it recreates each saved checkout and restores its files and Git
 index. An unchanged retained branch is attached again; an advanced or missing
 branch produces a detached checkout at the saved head without resetting a shared
@@ -66,11 +73,9 @@ revival behavior and do not gain worktree snapshots.
 Once a restoration completion receipt exists, retry cannot replace the checkout
 again. It removes a leftover intent when the contents still match, and refuses
 if the operator has since changed them.
-
-Recovery inventory schema 2 distinguishes Git reconstruction from full copies.
-The reader retains schema 1 snapshots. Packages must publish matching
-`archiveRecoveryPolicy` support to manage these captures; package selection and
-activation refuse an incompatible target while retained recovery depends on it.
+An incomplete Git restore reconstructs raw file bytes on retry before applying
+saved permissions and index state. Checkout filters and line-ending settings do
+not change those saved bytes.
 
 ## Completion and abandoned cleanup
 
@@ -115,8 +120,32 @@ Git commands, editors or native clients.
 
 Ordinary archive, delete, revive and hold commands retain a shared package
 transition lock and their existing session locks. Different sessions can proceed
-while package switches and recovery retain the exclusive transition lock. The
-operation deadline includes waiting for generation and session locks.
+while package switches and recovery retain the exclusive transition lock.
+For operations with a deadline, lock waits count toward that deadline.
+Managed browser archives run in independent `workspace-archive-RECEIPT-ATTEMPT`
+user services. The unit identity must match the retained portal authorization.
+Portal restart reconciles the unit instead of starting another worker. Private
+progress records are presentation only; the lifecycle journal remains authority.
+Portal receipt schema 2 stores finish time separately from journal progress and
+continues to read schema 1.
+
+Local tracking receipts live under private `tracking-sync/` state. An archive
+receipt binds its operation and exact tracking digest before runtime retirement.
+The per-workspace retry timer commits only owned paths under the existing shared
+tracking lock. Each attempt has a 60-second deadline covering lock waits, fetches
+and hooks; fetches also retain their 30-second limit. Timed-out commands receive
+a five-second termination grace. Owned-index cleanup has a separate ten-second
+command timeout. Hooks are not bypassed. Failed attempts retain their error and
+backoff and release lifecycle locks. Revival coalesces the receipt under the
+session lock; deletion removes it after its own transition finishes. Sensitive
+sessions do not enqueue Git tracking.
+
+New capture and receipt formats require the matching `archiveRecoveryPolicy`,
+`trackingSyncPolicy` and `archiveExecutionPolicy` runtime capabilities. Package
+selection and activation refuse a target that cannot read retained state. Keep
+recovery and receipts when recovering forward; do not remove them to select an
+older package.
+
 Tracking commits cooperate through `dev-session-tracking.lock` in the shared
 Git common directory. Fetches occur before that short lock; each waiter then
 rechecks master, cached origin ancestry, current HEAD and owned staged paths.

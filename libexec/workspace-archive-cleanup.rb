@@ -23,7 +23,10 @@ module DevSession
         workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
         root = File.join(@workspace_state_root, 'archived-worktrees', workspace_id, slug, operation_id)
         @archive_recovery_instances ||= {}
-        @archive_recovery_instances[root] ||= ArchiveRecovery.new(root, worktrees_dir(slug), @command_runner)
+        @archive_recovery_instances[root] ||= ArchiveRecovery.new(
+          root, worktrees_dir(slug), @command_runner,
+          progress: ->(stage, path) { archive_progress!(slug, stage, path) }
+        )
       end
 
       def archive_cleanup_repository(project)
@@ -266,7 +269,7 @@ module DevSession
       inventory = inventory.merge('tracking_identity' => directory_identity(source),
                                   'source_sha256' => @runner.archive_cleanup_source_digest(@slug))
       sidecar = journal.slice(*BINDING_KEYS).merge(
-        'schema' => journal.fetch('mode') == 'archived' ? 2 : 1, 'sealed' => true, 'inventory' => inventory,
+        'schema' => journal.fetch('schema') >= 4 ? 3 : (journal.fetch('mode') == 'archived' ? 2 : 1), 'sealed' => true, 'inventory' => inventory,
         'inventory_sha256' => inventory_digest(inventory), 'completed' => false
       )
       @runner.archive_cleanup_prepare_storage!
@@ -298,7 +301,7 @@ module DevSession
         raise Error, "prepared archive cleanup inventory changed: #{@slug}"
       end
       sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => sidecar.fetch('mode') == 'archived' ? 3 : 2, 'phase' => 'prepared',
+        'schema' => sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2), 'phase' => 'prepared',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? inventory.fetch('registered_heads') : {}
       )
     end
@@ -359,6 +362,7 @@ module DevSession
         next if record.fetch('removed')
         if sidecar.fetch('mode') == 'archived'
           @runner.archive_cleanup_recovery(@slug, sidecar.fetch('operation_id')).verify_checkout!(record)
+          @runner.archive_progress!(@slug, 'removing checkout', record.fetch('path'))
           @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')), force: true)
         else
           @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
@@ -395,7 +399,7 @@ module DevSession
       raise Error, "archive cleanup is not completed: #{@slug}" unless sidecar.fetch('completed')
 
       journal = sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => sidecar.fetch('mode') == 'archived' ? 3 : 2, 'phase' => 'archived',
+        'schema' => sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2), 'phase' => 'archived',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
       )
       revalidate!(sidecar, journal:)
@@ -799,10 +803,10 @@ module DevSession
 
     def validate!(sidecar)
       inventory = sidecar['inventory'] if sidecar.is_a?(Hash)
-      valid = keys?(sidecar, KEYS) && [1, 2].include?(sidecar['schema']) && sidecar['sealed'] == true &&
+      valid = keys?(sidecar, KEYS) && [1, 2, 3].include?(sidecar['schema']) && sidecar['sealed'] == true &&
         sidecar['workspace'] == @workspace && sidecar['slug'] == @slug &&
         sidecar['operation_id'].is_a?(String) && sidecar['operation_id'].match?(DIGEST) &&
-        (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode'])) &&
+        (sidecar['schema'] == 3 ? %w[complete abandoned archived].include?(sidecar['mode']) : (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode']))) &&
         timestamp?(sidecar['finalized_at']) &&
         sidecar['target_tracking_sha256'].is_a?(String) && sidecar['target_tracking_sha256'].match?(DIGEST) &&
         (sidecar['retained_thread_id'].nil? || sidecar['retained_thread_id'].is_a?(String) && sidecar['retained_thread_id'].match?(/\A[0-9A-Za-z-]+\z/)) &&

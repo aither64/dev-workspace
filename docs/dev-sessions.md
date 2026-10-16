@@ -701,9 +701,31 @@ Git branches. Unmerged, unpublished, detached and dirty work do not prevent
 explicit closure. Snapshot capture and verified ownership protect local recovery.
 
 Plan and state need an earlier tracking commit. Stop external editors and builds
-that can still write into a worktree. The command commits only the tracking
-transition and preserves unrelated workspace changes. Missing registered refs
+that can still write into a worktree. In an installed workspace, archival finishes
+locally and queues its tracking commit. The retry service preserves unrelated
+workspace changes and runs ordinary Git hooks. Missing registered refs
 stay recorded without a fabricated final head.
+
+The portal shows **Tracking sync pending** when Git bookkeeping needs another
+attempt. A network failure, a failing hook or an advanced workspace master does
+not reopen the session. Inspect the saved result without changing it:
+
+```sh
+dev-session tracking-sync --status --slug FULL-SLUG --json
+```
+
+The workspace retries pending commits every minute, with backoff after errors.
+To retry immediately, use `dev-session tracking-sync --slug FULL-SLUG --force`.
+If you revive before the archive commit succeeds, the pending job saves the
+latest tracking state. Revival can proceed while the remote is unavailable.
+
+Browser archival runs in a separate systemd user service and continues when the
+portal restarts or the browser disconnects. Its progress identifies the checkout
+being captured, verified or removed. Local file work has no total wall-clock
+deadline; external calls keep their own timeouts.
+
+Source-only executors without an installed tracking worker keep synchronous Git
+bookkeeping. Existing operation journals retain their saved policy on retry.
 
 Automatic archival keeps its merge, publication, cleanliness and idle checks.
 `dev-session archive api-token-rotation --require-merged` explicitly requests the

@@ -67,7 +67,8 @@ class DevSessionTest < Minitest::Test
         path = runner.send(:lifecycle_journal_file, slug, command)
         FileUtils.mkdir_p(File.dirname(path))
         File.write(path, 'retained recovery journal')
-        journal = {'operation_id' => command[0] * 64, 'phase' => {'archive' => 'archived', 'delete' => 'removed', 'revive' => 'revived'}[command], 'recovery' => workspace}
+        journal = {'schema' => {'archive' => 3, 'delete' => 1, 'revive' => 4}.fetch(command),
+          'operation_id' => command[0] * 64, 'phase' => {'archive' => 'archived', 'delete' => 'removed', 'revive' => 'revived'}[command], 'recovery' => workspace}
         calls = []
         failing = Object.new
         failing.define_singleton_method(:lifecycle_completed) { |*args, **kwargs| calls << [args, kwargs]; raise WorkspaceCoordination::Error, 'injected coordination write failure' }
@@ -956,6 +957,10 @@ class DevSessionTest < Minitest::Test
 
     def with_timeout(seconds, &block)
       @delegate.with_timeout(seconds, &block)
+    end
+
+    def with_deadline(deadline, &block)
+      @delegate.with_deadline(deadline, &block)
     end
 
     def stream(argv, **options, &block)

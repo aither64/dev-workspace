@@ -5,6 +5,6 @@ After=workspace-codex@%i.service
 [Service]
 Type=oneshot
 ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-auto-archive %i
-TimeoutStartSec=45min
+TimeoutStartSec=infinity
 TimeoutStopSec=10s
 KillMode=control-group

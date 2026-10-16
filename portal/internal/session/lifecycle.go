@@ -75,7 +75,7 @@ func PendingLifecycles(workspace string) (map[string]LifecycleProgress, error) {
 var lifecyclePhases = map[string]map[string]struct{}{
 	"archive": phaseSet(
 		"prepared", "quiesced", "clusters_released", "tracking_archived",
-		"tracking_committed", "thread_retired", "runtime_retired", "archived",
+		"tracking_committed", "tracking_saved", "thread_retired", "runtime_retired", "archived",
 	),
 	"delete": phaseSet(
 		"prepared", "validated", "thread_retiring", "thread_retired",
@@ -83,7 +83,7 @@ var lifecyclePhases = map[string]map[string]struct{}{
 		"tracking_preserved", "tracking_committed", "removed",
 	),
 	"revive": phaseSet(
-		"prepared", "tracking_restored", "tracking_committed", "runtime_starting",
+		"prepared", "tracking_restored", "tracking_committed", "tracking_saved", "runtime_starting",
 		"runtime_started", "revived",
 	),
 }

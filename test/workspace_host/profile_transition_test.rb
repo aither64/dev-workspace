@@ -3,6 +3,34 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_archive_recovery_and_tracking_receipts_require_capable_packages
+    with_transition_host do |host, paths|
+      package = make_package(paths.fetch(:root), 'archive-contract')
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path))
+      %w[archiveRecoveryPolicy trackingSyncPolicy archiveExecutionPolicy].each { |key| contract.delete(key) }
+      File.write(path, JSON.generate(contract))
+      host.send(:require_compatible_archive_recovery!, package)
+      state = host.instance_variable_get(:@state)
+      {
+        ['archived-worktrees', 'workspace', 'session', 'operation', 'inventory.json'] => { 'schema' => 2 },
+        ['tracking-sync', 'workspace', 'session.json'] => {},
+        ['portal', 'workspace', 'lifecycle-operations.json'] => { 'schema' => 2 }
+      }.each do |parts, value|
+        record = File.join(state, *parts)
+        FileUtils.mkdir_p(File.dirname(record))
+        File.write(record, JSON.generate(value))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_archive_recovery!, package) }
+        File.unlink(record)
+      end
+      contract.merge!('archiveRecoveryPolicy' => 2, 'trackingSyncPolicy' => 1, 'archiveExecutionPolicy' => 1)
+      File.write(path, JSON.generate(contract))
+      record = File.join(state, 'tracking-sync', 'workspace', 'session.json')
+      File.write(record, '{}')
+      host.send(:require_compatible_archive_recovery!, package)
+    end
+  end
+
   def test_sensitive_sessions_require_a_capable_candidate
     with_transition_host do |host, paths|
       old = make_package(paths.fetch(:root), 'without-sensitive-support')
