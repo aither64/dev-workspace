@@ -30,6 +30,71 @@ func preparationTestID(number int) string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012d", number)
 }
 
+func TestSessionPreparationBrowserNotificationPreference(t *testing.T) {
+	for _, value := range []string{"true", "false", ""} {
+		t.Run("preference="+value, func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			extra := url.Values{}
+			if value != "" {
+				extra.Set("browserNotificationsEnabled", value)
+			}
+			id := preparationTestID(1)
+			response := postPreparation(t, server, id, "New session request", "", extra)
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("admission=%d %s", response.Code, response.Body.String())
+			}
+			server.operationMu.Lock()
+			stored := server.preparations[id]
+			server.operationMu.Unlock()
+			preference := stored.Snapshot.Input.BrowserNotificationsEnabled
+			if value == "" {
+				if preference != nil {
+					t.Fatal("omitted preference must remain absent")
+				}
+			} else if preference == nil || *preference != (value == "true") {
+				t.Fatalf("saved preference=%v, want %s", preference, value)
+			}
+			if replay := postPreparation(t, server, id, "New session request", "", extra); replay.Code != http.StatusAccepted {
+				t.Fatalf("replay=%d %s", replay.Code, replay.Body.String())
+			}
+			changedPreference := "true"
+			if value == "true" {
+				changedPreference = "false"
+			}
+			extra.Set("browserNotificationsEnabled", changedPreference)
+			if changed := postPreparation(t, server, id, "New session request", "", extra); changed.Code != http.StatusConflict {
+				t.Fatalf("changed preference=%d %s", changed.Code, changed.Body.String())
+			}
+		})
+	}
+}
+
+func TestSessionPreparationRejectsInvalidNotificationFields(t *testing.T) {
+	for _, test := range []struct {
+		name, message string
+		fields        url.Values
+	}{
+		{"empty", "invalid browser notification preference", url.Values{"browserNotificationsEnabled": {""}}},
+		{"checkbox default", "invalid browser notification preference", url.Values{"browserNotificationsEnabled": {"on"}}},
+		{"duplicate", "duplicate session request field", url.Values{"browserNotificationsEnabled": {"true", "false"}}},
+		{"unknown field", "unknown session request field", url.Values{"browserNotifications": {"true"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			response := postPreparation(t, server, preparationTestID(1), "New session request", "", test.fields)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), test.message) {
+				t.Fatalf("rejection=%d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func postPreparation(t *testing.T, server *Server, id, prompt, name string, extra url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	values := url.Values{"clientRequestId": {id}, "goal": {prompt}, "creation_date": {"2026-10-03"}, "name": {name}}

@@ -301,7 +301,7 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 			return "", input, errors.New("duplicate session request field")
 		}
 		switch key {
-		case "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort", "sensitive":
+		case "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort", "sensitive", "browserNotificationsEnabled":
 		default:
 			return "", input, errors.New("unknown session request field")
 		}
