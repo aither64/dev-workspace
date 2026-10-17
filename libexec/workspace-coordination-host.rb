@@ -69,11 +69,23 @@ module DevWorkspaceHost
       WorkspaceCoordination.parse(payload)
     end
 
+    def coordination_actor_thread
+      values = %w[CODEX_THREAD_ID CODEX_SESSION_ID].filter_map { |key| @env[key] unless @env[key].to_s.empty? }.uniq
+      raise WorkspaceCoordination::Error.new('caller Codex conversation identities disagree', 4) if values.length > 1
+      values.first
+    end
+
+    def verify_background_recipient!(owner, explicit: false)
+      actor = coordination_actor_thread
+      return if explicit || actor && actor == owner['thread']
+      raise WorkspaceCoordination::Error.new('background recipient is not this conversation; use --foreground for supervised continuation or explicitly --to-session-lead', 4)
+    end
+
     def coordination_session_command(entry, argv)
       action = argv.shift
       slug = argv.shift
       raise WorkspaceCoordination::Error, 'coordination requires an exact session slug and --as-is' unless slug && slug.match?(WorkspaceCoordination::PART)
-      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause integration-cancel].include?(action)
+      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause integration-ack integration-cancel].include?(action)
       options = {}
       OptionParser.new do |opts|
         opts.on('--as-is') { options[:as_is] = true }
@@ -84,9 +96,13 @@ module DevWorkspaceHost
         opts.on('--admission-timeout SECONDS', Float) { |value| options[:admission_timeout] = value }
         opts.on('--no-wait') { options[:no_wait] = true }
         opts.on('--background') { options[:background] = true }
+        opts.on('--foreground') { options[:foreground] = true }
+        opts.on('--to-session-lead') { options[:to_session_lead] = true }
       end.parse!(argv)
       raise WorkspaceCoordination::Error, 'use coordination ACTION SLUG [ID] --as-is --request FILE' unless argv.empty? && options[:as_is]
       raise WorkspaceCoordination::Error, '--background and --no-wait are mutually exclusive' if options[:background] && options[:no_wait]
+      raise WorkspaceCoordination::Error, '--foreground requires an attached caller' if options[:foreground] && (options[:background] || options[:no_wait])
+      raise WorkspaceCoordination::Error, '--to-session-lead requires --background' if options[:to_session_lead] && !options[:background]
       engine = coordination_engine(entry)
       @coordination_admission_timeout = options.fetch(:admission_timeout, 30)
       if options[:bootstrap_owner] && !%w[status reconcile cancel finish].include?(action)
@@ -98,12 +114,12 @@ module DevWorkspaceHost
         return
       end
       request = options[:request] && coordination_input(options[:request])
-      if %w[integrate integration-status integration-resume integration-pause integration-cancel].include?(action)
+      if %w[integrate integration-status integration-resume integration-pause integration-ack integration-cancel].include?(action)
         owner = nil
         resumable_finalization = action == 'integration-resume' && id && id.match?(WorkspaceCoordination::UUID) &&
           File.file?(File.join(engine.store.root, 'integrations', "#{id}.json")) &&
           %w[finalizing complete].include?(WorkspaceCoordination.private_read(File.join(engine.store.root, 'integrations', "#{id}.json"))['phase'])
-        if action == 'integration-status' || resumable_finalization
+        if %w[integration-status integration-ack].include?(action) || resumable_finalization
           raise WorkspaceCoordination::Error, 'invalid integration run ID' unless id && id.match?(WorkspaceCoordination::UUID)
           journal = WorkspaceCoordination.private_read(File.join(engine.store.root, 'integrations', "#{id}.json"))
           owner = engine.store.read['owners'].fetch(journal['ownerId'])
@@ -114,17 +130,24 @@ module DevWorkspaceHost
         admission = ->(&block) { with_coordination_session_admission(entry, slug, &block) }
         driver = WorkspaceCoordination::Integration.new(engine, owner, admission:,
           prepare: ->(fields) { coordination_prepare(engine, owner, fields) }, diagnostics: @err)
+        verify_background_recipient!(owner, explicit: options[:to_session_lead]) if options[:background]
         result = case action
         when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait], background: options[:background])
         when 'integration-status' then driver.status(id)
         when 'integration-pause' then driver.pause(id)
+        when 'integration-ack'
+          driver.acknowledge(id, request || raise(WorkspaceCoordination::Error, 'acknowledgement requires a request'), recipient: coordination_actor_thread)
         when 'integration-cancel' then driver.cancel_unsubmitted(id)
         when 'integration-resume'
           if options[:background]
             driver.arm_background(id)
           else
-            raise WorkspaceCoordination::Error, 'use --background to resume a background run' if driver.read(id)['schema'] == 2
-            driver.drive(id, wait: !options[:no_wait])
+            if driver.read(id)['schema'] == 2
+              raise WorkspaceCoordination::Error, 'use --background or --foreground to resume a background run' unless options[:foreground]
+              driver.supervise(id)
+            else
+              driver.drive(id, wait: !options[:no_wait])
+            end
           end
         end
         @out.puts JSON.generate(result)
@@ -496,7 +519,10 @@ module DevWorkspaceHost
         claimed.each { |job| engine.dispatch(job) }
         engine.dispatch_integrations(owner)
       end
-      with_coordination_session_admission(entry, owner['slug'], timeout: 0) { engine.notification_owner(owner) }
+      with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
+        engine.notification_owner(owner)
+        engine.remind_integrations(owner)
+      end
       engine.dispatch_notifications(owner)
     end
 

@@ -933,4 +933,155 @@ class IntegrationTest < Minitest::Test
     assert_raises(WorkspaceCoordination::Error) { integration.cancel_unsubmitted(payload['requestId']) }
   end
 
+  def coordination_host(actor)
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.instance_variable_set(:@env, actor ? {'CODEX_THREAD_ID' => actor} : {})
+    host.instance_variable_set(:@out, StringIO.new)
+    host.instance_variable_set(:@err, StringIO.new)
+    engine = @engine
+    host.define_singleton_method(:coordination_engine) { |_entry| engine }
+    host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
+    host
+  end
+
+  def test_background_cli_refuses_another_or_unknown_conversation_before_creating_a_run
+    first = owner('recipient')
+    payload = integration_request(first)
+    path = File.join(@tmp, 'integration-request.json')
+    File.write(path, JSON.generate(payload))
+    [nil, SecureRandom.uuid].each do |actor|
+      error = assert_raises(WorkspaceCoordination::Error) do
+        coordination_host(actor).coordination_session_command(@entry,
+          ['integrate', first['slug'], '--as-is', '--request', path, '--background'])
+      end
+      assert_equal 4, error.code
+      assert_match(/recipient/, error.message)
+      refute File.exist?(driver(first).path(payload['requestId']))
+    end
+    coordination_host(first['thread']).coordination_session_command(@entry,
+      ['integrate', first['slug'], '--as-is', '--request', path, '--background'])
+    assert_equal 'runnable', driver(first).read(payload['requestId']).dig('continuation', 'state')
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_background_cli_explicitly_hands_to_the_managed_lead_and_rejects_conflicting_identity
+    first = owner('explicit-recipient')
+    host = coordination_host(SecureRandom.uuid)
+    assert_nil host.verify_background_recipient!(first, explicit: true)
+    host.instance_variable_set(:@env, {'CODEX_THREAD_ID' => first['thread'], 'CODEX_SESSION_ID' => SecureRandom.uuid})
+    assert_raises(WorkspaceCoordination::Error) { host.verify_background_recipient!(first, explicit: true) }
+  end
+
+  def test_attention_requires_pickup_after_delivery_and_scheduler_reminds_without_replaying_work
+    first = owner('pickup')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.instance_variable_set(:@prepare, ->(*) { raise WorkspaceCoordination::Error.new('fixture preparation stopped', 3) })
+    start = Time.now
+    with_time(start) do
+      integration.start(payload, background: true)
+      result = integration.run_background(payload['requestId'])
+      assert_equal 'needs_attention', result.dig('continuation', 'state')
+      assert_equal 'pending', result.dig('handoff', 'state')
+    end
+    sends = []
+    @engine.define_singleton_method(:notification_call) do |owner, event, action|
+      next {'options' => {'model' => 'retained-model'}} if action == 'prepare'
+      sends << notification_payload(owner, event, action)
+      {'receipt' => {'turnId' => "turn-#{sends.length}"}}
+    end
+    with_time(start) { @engine.deliver_notifications(owner_id: first['id']) }
+    assert_equal 1, sends.length
+    event_id = integration.read(payload['requestId']).dig('handoff', 'eventId')
+    assert_equal 'delivered', @engine.store.read['outbox'][event_id]['state']
+    assert_equal 'pending', driver(first).status(payload['requestId']).dig('handoff', 'state')
+    @engine.define_singleton_method(:dispatch_notifications) { |owner| deliver_notifications(owner_id: owner['id']) }
+    with_time(start + 61) { coordination_host(first['thread']).coordinate_owner(@entry, @engine, first) }
+    assert_equal 2, sends.length
+    refute_equal sends[0]['messageId'], sends[1]['messageId']
+    assert_equal sends[0]['options'], sends[1]['options']
+    assert_equal sends[0]['text'], sends[1]['text']
+    assert_equal 1, @engine.store.read['outbox'].length
+    assert_empty @engine.store.read['jobs']
+
+    handoff = integration.read(payload['requestId'])['handoff']
+    ack = request('eventId' => handoff['eventId'], 'generation' => handoff['generation'])
+    assert_raises(WorkspaceCoordination::Error) { integration.acknowledge(payload['requestId'], ack, recipient: SecureRandom.uuid) }
+    assert_raises(WorkspaceCoordination::Error) { integration.acknowledge(payload['requestId'], ack.merge('generation' => 1), recipient: first['thread']) }
+    with_time(start + 62) do
+      ack_path = File.join(@tmp, 'ack.json')
+      File.write(ack_path, JSON.generate(ack))
+      host = coordination_host(first['thread'])
+      host.coordination_session_command(@entry.merge('root' => @workspace),
+        ['integration-ack', first['slug'], payload['requestId'], '--as-is', '--request', ack_path])
+      receipt = JSON.parse(host.instance_variable_get(:@out).string)
+      assert_equal 'acknowledged', receipt['state']
+      assert_equal receipt, integration.acknowledge(payload['requestId'], ack, recipient: first['thread'])
+    end
+    with_time(start + 200) { coordination_host(first['thread']).coordinate_owner(@entry, @engine, first) }
+    assert_equal 2, sends.length
+    # A restarted agent that never follows up cannot suppress attention forever.
+    with_time(start + 400) { coordination_host(first['thread']).coordinate_owner(@entry, @engine, first) }
+    assert_equal 3, sends.length
+    assert_equal 'pending', integration.read(payload['requestId']).dig('handoff', 'state')
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_supervised_continuation_keeps_jobs_eligible_and_reports_failure_to_the_attached_caller
+    first = owner('supervised')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    original = integration.method(:resume_locked)
+    integration.define_singleton_method(:resume_locked) do |id|
+      result = original.call(id)
+      if result['phase'] == 'merging'
+        job = engine.claim(owner_id: first['id']).first
+        raise 'supervised jobs were not eligible' unless job
+        file = engine.attempt_path(job['attempt'], 'request.json')
+        WorkspaceCoordination.atomic(file, engine.worker_request(job, first))
+        WorkspaceCoordination::Worker.new(file, fixtures: true).run
+        engine.reconcile_attempts
+      end
+      result
+    end
+    result = integration.supervise(payload['requestId'])
+    assert_equal 'complete', result['phase']
+    assert_equal 'complete', result.dig('continuation', 'state')
+    assert_equal 1, @engine.store.read['jobs'].length
+    assert_empty @engine.store.read['outbox']
+    # Resume interruption between phase completion and continuation completion.
+    value = integration.read(payload['requestId'])
+    value['continuation']['state'] = 'runnable'
+    integration.save(value)
+    jobs = @engine.store.read['jobs']
+    result = driver(first).supervise(payload['requestId'])
+    assert_equal 'complete', result.dig('continuation', 'state')
+    assert_equal jobs, @engine.store.read['jobs']
+  end
+
+  def test_supervision_failure_stays_attached_and_only_explicit_background_resume_releases_it
+    first = owner('supervision-failure')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    integration.instance_variable_set(:@prepare, ->(*) { raise WorkspaceCoordination::Error.new('fixture preparation failure', 3) })
+    error = assert_raises(WorkspaceCoordination::Error) { integration.supervise(payload['requestId']) }
+    assert_equal 3, error.code
+    assert_equal 'paused', integration.read(payload['requestId']).dig('continuation', 'state')
+    assert_equal 'supervised', integration.read(payload['requestId']).dig('handoff', 'state')
+    launches = []
+    @engine.define_singleton_method(:capture) do |*argv, **_options|
+      next "inactive\n" if argv.first == 'systemctl'
+      launches << argv if argv.first == 'systemd-run'
+      ''
+    end
+    @engine.dispatch_integrations(first)
+    assert_empty launches
+    integration.arm_background(payload['requestId'])
+    @engine.dispatch_integrations(first)
+    assert_equal 1, launches.length
+    assert_empty @engine.store.read['jobs']
+  end
+
 end

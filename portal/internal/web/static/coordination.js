@@ -149,6 +149,9 @@
           : ["paused", "held"].includes(run.continuation?.state)
             ? "Continuation is paused. Operations already running may finish."
             : "The worker continues approved operations while the session is idle."));
+        if (run.handoff?.state === "pending") row.append(node("p", "Waiting for an agent to respond. Sending a message does not confirm a response.", "notice warning"));
+        else if (run.handoff?.state === "acknowledged") row.append(node("p", "An agent acknowledged this action. A reminder follows if its acknowledgement expires."));
+        else if (run.handoff?.state === "supervised") row.append(node("p", "Continuation is supervised from an external conversation."));
         row.append(details(`integration:${run.id}`, run)); runs.append(row);
       }
     }

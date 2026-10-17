@@ -5,7 +5,7 @@ module WorkspaceCoordination
   module BackgroundIntegration
     def admit(&block)
       @admission.call do
-        background_guard! if @background_id
+        background_guard! if @background_id || @supervised_id
         block.call
       end
     end
@@ -30,7 +30,8 @@ module WorkspaceCoordination
       retained = current['owners'].fetch(owner['id'])
       raise Error.new('background owner is fenced by lifecycle recovery', 75) if retained['fence']
       raise Error.new('background scheduling is suspended', 75) if current['suspended']
-      raise Error.new('background integration is paused', 75) if paused?(@background_id)
+      id = @background_id || @supervised_id
+      raise Error.new('background integration is paused', 75) if id && paused?(id)
       verify_tracking_binding
     end
 
@@ -63,6 +64,7 @@ module WorkspaceCoordination
           generation = value['continuation']['generation']
           raise Error.new('background continuation counter exhausted', 5) if generation >= MAX_COUNTER
           value['continuation'] = {'state' => 'runnable', 'generation' => generation + 1, 'observedRevision' => nil}
+          value['handoff']['state'] = 'pending' if value['handoff']
           value.delete('reason')
           save(value)
         end
@@ -72,8 +74,10 @@ module WorkspaceCoordination
     end
 
     def background_notice(value, state)
+      return if @supervised_id
       @admission.call do
         background_guard!
+        retain_handoff(value, state)
         engine.store.transaction do |data|
           item = {'id' => value['id'], 'kind' => 'integration', 'snapshot' => {'id' => value['continuation']['generation'].to_s}}
           engine.event(data, owner, item, state, value['reason'])
@@ -172,6 +176,8 @@ module WorkspaceCoordination
       store.integration_journals.each do |run|
         next unless run['schema'] == 2 && run['ownerId'] == owner['id'] && run['identity'] == owner['identity']
         next if File.exist?(File.join(store.root, 'integrations', "#{run['id']}.pause")) && store.background_stopped?(run)
+        next if run.dig('handoff', 'state') == 'supervised'
+        next unless store.lock("integration-#{run['id']}", nonblock: true) { true }
         state = run.dig('continuation', 'state')
         next if %w[paused held complete].include?(state)
         if state == 'needs_attention'

@@ -228,6 +228,13 @@ an uncertain submission cannot prevent later attempts from making progress.
 This policy applies only to coordinator status notifications. Commands and user
 requests retain their existing replay protection.
 
+Actionable integration notices also track agent pickup separately from native
+delivery. A matching managed recipient acknowledges the event and generation;
+its five-minute lease prevents an unattended acknowledgement from suppressing
+future reminders. Bounded reminders reuse the logical event and existing retry
+transport. See [agent pickup](integration.md#agent-pickup). External conversations
+must remain supervised or deliberately hand responsibility to the managed lead.
+
 Pending notifications remain visible and retry independently after operation
 completion. Delivery accepts the exact retained owner in active or complete
 tracking, without registering a new owner or admitting new coordinated work.
