@@ -1057,8 +1057,8 @@
   const effortSelectionForModelRefresh = (managedOverride, selectedEffort, currentEffort) => (
     managedOverride ? selectedEffort : currentEffort
   );
-  const creationSubmitEligible = ({uploadReady = true, recoveryPending = false, inFlight = false} = {}) => (
-    Boolean(uploadReady) && !recoveryPending && !inFlight
+  const creationSubmitEligible = ({uploadReady = true, selectionReady = true, recoveryPending = false, inFlight = false} = {}) => (
+    Boolean(uploadReady) && Boolean(selectionReady) && !recoveryPending && !inFlight
   );
   const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
   const creationCLICommand = ({name, team, model, effort, sensitive}) => {
@@ -1838,6 +1838,9 @@
     managedFormSubmissionState.set(form, state);
     const eligible = creationSubmitEligible({
       uploadReady: state.uploadReady,
+      // The installed catalog is authoritative for teams. Exact lead model
+      // overrides remain usable when live model discovery is unavailable.
+      selectionReady: form.elements.team?.selectedOptions?.[0]?.dataset.savedDraftValue !== "true",
       recoveryPending: managedFormRecoveryPending(form),
       inFlight: state.inFlight || form.dataset.requestLocked === "true" || state.storageReady === false,
     });
@@ -1864,6 +1867,13 @@
       });
       const showFailure = (error) => {
         progress.hidden = false; progress.textContent = error.message;
+        if (error.catalogRejected) {
+          // The exact rejected attempt is saved as an editable draft. Reload
+          // current policy before the existing explicit catalog confirmation.
+          indexNavigationPending = true;
+          window.location.reload();
+          return;
+        }
         if (savedRequest && savedRequest.draft.body !== null) {
           recovery.hidden = false;
           recovery.querySelector("[data-request-identity]").textContent = `Saved request: ${savedRequest.draft.requestId}`;
@@ -2153,7 +2163,13 @@
     }
     recovery.requiresAcknowledgement = recovery.catalogChanged && !recovery.acknowledged;
     if (recovery.requiresAcknowledgement && !recovery.reset) {
-      resetManagedDraftPolicy(form);
+      if (draft.catalogRejected) {
+        restoreDraftSelect(form.elements.team, draft.team, "Saved team is unavailable");
+        updateTeamDescription(form.elements.team);
+        restoreDraftSelect(form.elements.model, draft.model, "Saved model");
+        populateEfforts(form.elements.model, form.elements.effort, draft.effort);
+        restoreDraftSelect(form.elements.effort, draft.effort, "Saved reasoning effort");
+      } else resetManagedDraftPolicy(form);
       recovery.reset = true;
     }
     updateManagedCatalogRecoveryUI(form, recovery);
@@ -2172,10 +2188,10 @@
   const restoreManagedCreationDraft = (form, draft) => {
     if (!form || !draft) return;
     if (form.id === "new-session-form") {
+      if (form.elements.sensitive) form.elements.sensitive.checked = draft.sensitive === "true";
       // An attempted request is independent of the current installed catalog.
       if (form.dataset.requestLocked === "true" || draft.body !== null) form.dataset.requestLocked = "true";
       else if (restoreManagedCatalogRecovery(form, draft)?.catalogChanged) return;
-      if (form.elements.sensitive) form.elements.sensitive.checked = draft.sensitive === "true";
       if (form.elements.catalogDigest) form.elements.catalogDigest.value = draft.catalogDigest;
       restoreDraftSelect(form.elements.team, draft.team, "Saved team");
       if (form.elements.team) updateTeamDescription(form.elements.team);

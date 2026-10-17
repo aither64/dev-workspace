@@ -139,7 +139,8 @@ const baseURL = process.argv[2];
       draft.model = ""; draft.effort = "";
       draft.body = new URLSearchParams({clientRequestId: draft.requestId, name: draft.name,
         goal: draft.goal, creation_date: draft.date, team: draft.team, catalogDigest: draft.catalogDigest,
-        model: "", effort: "", uploadScope: draft.scope?.id || ""}).toString();
+        model: "", effort: "", uploadScope: draft.scope?.id || "",
+        ...(draft.sensitive === "true" ? {sensitive: "true"} : {})}).toString();
       sessionStorage.setItem(key, JSON.stringify(draft));
       return draft.body;
     }, draftKey);
@@ -147,6 +148,84 @@ const baseURL = process.argv[2];
     await expect.poll(() => retryBody).toBe(frozenBody);
     await expect(team).toBeDisabled();
     assert.equal(await page.evaluate(key => JSON.parse(sessionStorage.getItem(key)).body, draftKey), frozenBody);
+    // A retained, rejected stale-catalog attempt becomes editable only after
+    // the exact POST rejection, then preserves choices for explicit review.
+    const catalogBodies = [];
+    await page.route("**/sessions", route => {
+      const body = route.request().postData(); catalogBodies.push(body);
+      const fields = new URLSearchParams(body);
+      if (catalogBodies.length === 1) return route.fulfill({status:409,json:{code:"preparation_catalog_stale",
+        requestId:fields.get("clientRequestId"),catalogDigest:fields.get("catalogDigest"),error:"Catalog changed"}});
+      return route.fulfill({status:503,json:{error:"Fixture keeps fresh request recoverable"}});
+    });
+    await page.evaluate(key => {
+      const draft=JSON.parse(sessionStorage.getItem(key));
+      Object.assign(draft,{name:"retained-choice",goal:" literal saved request ",team:"solo",model:"model-lead",effort:"xhigh",
+        catalogDigest:"b".repeat(64),sensitive:"true",browserNotificationsEnabled:false});
+      draft.body=new URLSearchParams({clientRequestId:draft.requestId,name:draft.name,goal:draft.goal,creation_date:draft.date,
+        team:draft.team,catalogDigest:draft.catalogDigest,model:draft.model,effort:draft.effort,sensitive:"true",
+        browserNotificationsEnabled:"false",uploadScope:draft.scope?.id || ""}).toString();
+      sessionStorage.setItem(key,JSON.stringify(draft));
+    },draftKey);
+    await page.reload({waitUntil:"domcontentloaded"});
+    await expect.poll(()=>catalogBodies.length).toBe(1);
+    await expect(form.locator("[data-team-catalog-changed]")).toBeVisible();
+    await expect(team).toBeEnabled();await expect(team).toHaveValue("solo");
+    await pair("model-lead","xhigh");await expect(sensitive).toBeChecked();
+    await expect(form.locator("[name=browserNotificationsEnabled]")).not.toBeChecked();
+    await expect(form.locator("[name=goal]")).toHaveValue(" literal saved request ");
+    await expect(form.locator("[name=name]")).toHaveValue("retained-choice");
+    const rejected=await page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)),draftKey);
+    assert.equal(rejected.body,null);assert.equal(rejected.catalogDigest,"b".repeat(64));
+    await expect(form.locator("[type=submit]")).toBeDisabled();
+    await form.locator("[data-team-catalog-acknowledge]").check();
+    await form.locator("[type=submit]").click();
+    await expect.poll(()=>catalogBodies.length).toBe(2);
+    const retried=new URLSearchParams(catalogBodies[1]);
+    assert.notEqual(retried.get("catalogDigest"),"b".repeat(64));
+    assert.equal(retried.get("clientRequestId"),rejected.requestId);
+    assert.equal(retried.get("team"),"solo");assert.equal(retried.get("model"),"model-lead");
+    assert.equal(retried.get("effort"),"xhigh");assert.equal(retried.get("goal"),rejected.goal);
+    // A removed saved team/model stays visible, but confirming new policy
+    // cannot freeze invalid choices. The user must choose a supported team.
+    catalogBodies.length=0;
+    await page.evaluate(key=>{
+      const draft=JSON.parse(sessionStorage.getItem(key));
+      const fields=new URLSearchParams(draft.body);
+      draft.catalogDigest="b".repeat(64);draft.team="removed-team";draft.model="removed-model";
+      fields.set("catalogDigest",draft.catalogDigest);fields.set("team",draft.team);fields.set("model",draft.model);
+      draft.body=fields.toString();sessionStorage.setItem(key,JSON.stringify(draft));
+    },draftKey);
+    await page.reload({waitUntil:"domcontentloaded"});
+    await expect.poll(()=>catalogBodies.length).toBe(1);
+    await expect(form.locator("[data-team-catalog-changed]")).toBeVisible();
+    await expect(team).toHaveValue("removed-team");await expect(model).toHaveValue("removed-model");
+    await form.locator("[data-team-catalog-acknowledge]").check();
+    await expect(form.locator("[type=submit]")).toBeDisabled();
+    assert.equal(catalogBodies.length,1);
+    assert.equal(await page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)).body,draftKey),null);
+    await team.selectOption("solo");await pair("model-solo","high");
+    await expect(form.locator("[type=submit]")).toBeEnabled();
+    await form.locator("[type=submit]").click();
+    await expect.poll(()=>catalogBodies.length).toBe(2);
+    assert.equal(new URLSearchParams(catalogBodies[1]).get("team"),"solo");
+    // Missing live discovery does not invalidate an exact saved override.
+    catalogBodies.length=0;failModels=true;
+    await page.evaluate(key=>{
+      const draft=JSON.parse(sessionStorage.getItem(key));const fields=new URLSearchParams(draft.body);
+      draft.catalogDigest="b".repeat(64);draft.team="solo";draft.model="exact-custom-model";draft.effort="xhigh";
+      fields.set("catalogDigest",draft.catalogDigest);fields.set("team",draft.team);fields.set("model",draft.model);fields.set("effort",draft.effort);
+      draft.body=fields.toString();sessionStorage.setItem(key,JSON.stringify(draft));
+    },draftKey);
+    await page.reload({waitUntil:"domcontentloaded"});
+    await expect.poll(()=>catalogBodies.length).toBe(1);
+    await expect(form.locator("[data-team-catalog-changed]")).toBeVisible();
+    await pair("exact-custom-model","xhigh");await expect(team).toHaveValue("solo");
+    await form.locator("[data-team-catalog-acknowledge]").check();
+    await expect(form.locator("[type=submit]")).toBeEnabled();await form.locator("[type=submit]").click();
+    await expect.poll(()=>catalogBodies.length).toBe(2);
+    assert.equal(new URLSearchParams(catalogBodies[1]).get("model"),"exact-custom-model");
+    assert.equal(new URLSearchParams(catalogBodies[1]).get("effort"),"xhigh");
     for (const width of [1280, 375]) {
       await page.setViewportSize({width, height: 900});
       for (const item of sessions) {

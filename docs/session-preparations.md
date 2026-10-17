@@ -66,7 +66,8 @@ The browser verifies a random version-4 request ID in the tab's sessionStorage
 before sending. Its version-2 tab draft retains text, date, settings, upload
 scope and the exact serialized submission body, including field presence and
 ordered attachment IDs. The first attempt saves that body before POST. A lost
-response, HTTP failure or reload keeps the inputs and uploads locked. Recover
+response, HTTP failure without a confirmed pre-acceptance rejection, or reload
+keeps the inputs and uploads locked. Recover
 saved request checks status first; a missing operation permits only identical
 resubmission of the saved body. A 503 with the exact saved `requestId` and
 `code: "preparation_persistence_unconfirmed"` also permits identical recovery
@@ -362,3 +363,17 @@ isolated reader from the immediately preceding source revision: an unfinished
 snapshot containing more than 10 files must fail, while its normally compacted
 terminal mapping must remain readable. Do not switch the installed runtime to
 an older package for this test.
+
+### Catalog changes before acceptance
+
+When the portal rejects an exact request because its starting-team catalog is
+stale, it confirms that rejection before saving a preparation receipt or claiming
+files. The browser keeps the request ID, text, settings and upload selection,
+then reloads the current catalog. Review and confirm the team policy before
+submitting again. Saved choices remain selected; an unavailable team requires
+an explicit replacement. Exact lead model and effort overrides remain usable
+when live model discovery is unavailable.
+
+A lost response, a status lookup returning 404, an ordinary conflict or an
+unconfirmed save does not prove rejection. Those cases keep the frozen request
+and recover its exact bytes and identity, even after the installed catalog changes.

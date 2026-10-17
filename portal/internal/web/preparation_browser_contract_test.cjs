@@ -29,6 +29,51 @@ module.exports = async () => {
     assert.equal(bodies.length, 2); assert.equal(bodies[0], bodies[1]);
     assert.equal(new URLSearchParams(bodies[1]).get("sensitive"), "true");
   });
+  await test("exact catalog rejection restores editable text/settings/uploads across reload", async () => {
+    const saved = storage(), initial = {...fields, name:"retained-name", model:"exact-model", effort:"xhigh", sensitive:"true", browserNotificationsEnabled:false};
+    const rejection = {code:"preparation_catalog_stale",requestId:id,catalogDigest:fields.catalogDigest,error:"Catalog changed"};
+    let firstBody;
+    const first = helpers.createRequestDraft({storage:saved,fields:initial,randomUUID:()=>id,fetch:async (_,options)=>{
+      firstBody=options.body;return response(rejection,409);
+    }});
+    first.bindScope(scope);saved.setItem(`workspace-portal.upload-draft.${scope.id}`,"retained-file-selection");
+    await assert.rejects(first.submit([attachment],true),error=>error.catalogRejected===true);
+    assert.equal(first.draft.body,null);assert(first.draft.catalogRejected);
+    for (const [key,value] of Object.entries(initial)) assert.equal(first.draft[key],value,key);
+    assert.deepEqual(first.draft.scope,scope);assert.equal(first.draft.requestId,id);
+    const next = helpers.createRequestDraft({storage:saved,fields:{...fields,catalogDigest:"b".repeat(64)},randomUUID:()=>assert.fail("new ID"),fetch:async (_,options)=>{
+      const body=new URLSearchParams(options.body);assert.equal(body.get("catalogDigest"),"b".repeat(64));
+      assert.equal(body.get("goal"),initial.goal);assert.equal(body.get("model"),initial.model);
+      assert.deepEqual(body.getAll("attachmentIds"),[attachment]);return response(status,202);
+    }});
+    // The existing form confirmation updates only the reviewed catalog identity.
+    next.update({catalogDigest:"b".repeat(64)});await next.submit([attachment],true);
+    assert.equal(saved.getItem(`workspace-portal.upload-draft.${scope.id}`),"retained-file-selection");
+    assert.notEqual(next.draft.body,firstBody);assert.equal(next.draft.requestId,id);
+  });
+  await test("an old frozen rejection unlocks only after GET 404 and exact POST rejection", async () => {
+    const saved=storage();let body;
+    const first=helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>id,fetch:async (_,options)=>{body=options.body;throw Error("lost");}});
+    await assert.rejects(first.submit([],true));const calls=[];
+    const next=helpers.createRequestDraft({storage:saved,fields:{...fields,catalogDigest:"b".repeat(64)},fetch:async (url,options)=>{
+      calls.push(url);if(url!=="/sessions")return response({},404);
+      assert.equal(options.body,body);return response({code:"preparation_catalog_stale",requestId:id,catalogDigest:fields.catalogDigest},409);
+    }});
+    await assert.rejects(next.submit(),error=>error.catalogRejected===true);
+    assert.deepEqual(calls,[`/api/session-creations/${id}`,"/sessions"]);assert.equal(next.draft.body,null);
+  });
+  await test("generic or mismatched catalog errors never unlock an uncertain request", async () => {
+    for(const rejection of [{error:"catalog digest is stale; reload the form"},{code:"preparation_catalog_stale",requestId:otherID,catalogDigest:fields.catalogDigest},
+      {code:"preparation_catalog_stale",requestId:id,catalogDigest:"b".repeat(64)}]) {
+      const request=helpers.createRequestDraft({storage:storage(),fields,randomUUID:()=>id,fetch:async()=>response(rejection,409)});
+      await assert.rejects(request.submit([],true));assert.notEqual(request.draft.body,null);assert(!request.draft.catalogRejected);
+    }
+    const saved=storage();const request=helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>id,fetch:async()=>{
+      saved.setItem=()=>{};return response({code:"preparation_catalog_stale",requestId:id,catalogDigest:fields.catalogDigest},409);
+    }});
+    await assert.rejects(request.submit([],true),/storage/);assert.notEqual(request.draft.body,null);
+    assert.notEqual(JSON.parse(saved.getItem(helpers.draftKey)).body,null);
+  });
   await test("blank and custom names freeze before nonblocking POST", async () => {
     for (const name of ["", "Custom_name"]) {
       const saved = storage(); let posted;

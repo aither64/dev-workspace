@@ -1,6 +1,7 @@
 // New session's tab-local request record. Plan and fork drafts use their
 // existing stores. Once a POST might have reached the server, only this exact
 // serialized body may be sent again, including after a status lookup says 404.
+// An exact pre-acceptance catalog rejection is the sole unlock exception.
 (() => {
   "use strict";
   const draftKey = "workspace-portal.creation-draft";
@@ -40,6 +41,7 @@
     if (value && value.browserNotificationsEnabled === undefined) value = {...value, browserNotificationsEnabled: true};
     if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
+        (value.catalogRejected !== undefined && typeof value.catalogRejected !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
         !Array.isArray(value.attachmentIds) || value.attachmentIds.length > 50 ||
         value.attachmentIds.some((id) => typeof id !== "string" || !uuid.test(id)) ||
@@ -96,8 +98,20 @@
     const persist = () => verifyWrite(storage, draftKey, JSON.stringify(draft));
     try { persist(); } catch (error) { error.requestId = draft.requestId; throw error; }
     let busy = null;
-    const receive = async (response, decoded) => {
+    const receive = async (response, decoded, allowCatalogRejection = false) => {
       const status = decoded ?? await response.json().catch(() => ({}));
+      if (allowCatalogRejection && response.status === 409 && !draft.accepted && draft.body !== null &&
+          status.code === "preparation_catalog_stale" && status.requestId === draft.requestId &&
+          status.catalogDigest === draft.catalogDigest) {
+        const next = {...draft, body: null, attachmentIds: [], catalogRejected: true};
+        // Retain the locked in-memory request if storage cannot confirm this
+        // rejection. Upload scope and its selected-file store are untouched.
+        verifyWrite(storage, draftKey, JSON.stringify(next));
+        draft = next;
+        const error = new Error(status.error || "The starting team catalog changed. Reload the form to review your selection.");
+        error.catalogRejected = true;
+        throw error;
+      }
       if (!response.ok) throw new Error(status.error || `Unable to confirm session request (${response.status}).`);
       if (!acceptedStatus(status, draft.requestId, draft.accepted?.receiptId)) {
         throw new Error("Unable to confirm the saved session request identity. Retry recovery.");
@@ -119,7 +133,7 @@
       return receive(await fetchRequest("/sessions", {
         method: "POST", credentials: "same-origin",
         headers: {Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded"}, body: draft.body,
-      }));
+      }), undefined, true);
     };
     return {
       get draft() { return JSON.parse(JSON.stringify(draft)); },
@@ -150,7 +164,7 @@
             return receive(await fetchRequest("/sessions", {
               method: "POST", credentials: "same-origin",
               headers: {Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded"}, body: draft.body,
-            }));
+            }), undefined, true);
           }
           return recover();
         })().finally(() => { busy = null; });

@@ -548,6 +548,67 @@ func TestSessionPreparationFiftyFilesRecoveryAndCompaction(t *testing.T) {
 	}
 }
 
+func TestSessionPreparationCatalogRejectionIsBeforeAcceptance(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) { <-ctx.Done(); return "", ctx.Err() }
+	server.installedTeams = &agentteams.Installed{Managed: true, Catalog: &agentteams.Catalog{
+		CatalogDigest: strings.Repeat("b", 64), Teams: map[string]agentteams.Team{"solo": {Description: "A lead", TeamDigest: strings.Repeat("c", 64),
+			Roles: map[string]agentteams.Role{"team_lead": {Model: "model-1", Effort: "high", Purpose: "lead", Instructions: "Lead instructions."}}}}}}
+	scope, file := preparationReadyFile(t, server)
+	catalogPath := filepath.Join(server.uploadStore.Directory, "catalog.json")
+	before, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := preparationTestID(222)
+	extra := url.Values{"team": {"removed-team"}, "catalogDigest": {strings.Repeat("a", 64)}, "model": {"model-1"}, "effort": {"high"},
+		"sensitive": {"true"}, "browserNotificationsEnabled": {"false"}, "uploadScope": {scope.ID}, "attachmentIds": {file.ID}}
+	rejected := postPreparation(t, server, id, " literal request ", "", extra)
+	var proof map[string]string
+	if err := json.Unmarshal(rejected.Body.Bytes(), &proof); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Code != 409 || proof["code"] != "preparation_catalog_stale" || proof["requestId"] != id || proof["catalogDigest"] != strings.Repeat("a", 64) {
+		t.Fatalf("rejection=%d %s", rejected.Code, rejected.Body.String())
+	}
+	if _, exists := server.preparations[id]; exists {
+		t.Fatal("rejected request was accepted")
+	}
+	if _, err := os.Lstat(server.preparationPath(id, false)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected receipt exists: %v", err)
+	}
+	after, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("rejected request changed upload selection or ownership")
+	}
+	extra.Set("catalogDigest", strings.Repeat("b", 64))
+	extra.Set("team", "solo")
+	accepted := postPreparation(t, server, id, " literal request ", "", extra)
+	if accepted.Code != 202 {
+		t.Fatalf("fresh catalog=%d %s", accepted.Code, accepted.Body.String())
+	}
+	server.installedTeams = nil // Previously accepted request remains exact across catalog changes.
+	replay := postPreparation(t, server, id, " literal request ", "", extra)
+	if replay.Code != 202 {
+		t.Fatalf("accepted replay=%d %s", replay.Code, replay.Body.String())
+	}
+	var first, second preparationStatus
+	json.Unmarshal(accepted.Body.Bytes(), &first)
+	json.Unmarshal(replay.Body.Bytes(), &second)
+	if first.ReceiptID != second.ReceiptID {
+		t.Fatal("replay allocated another receipt")
+	}
+	extra.Set("catalogDigest", strings.Repeat("a", 64))
+	conflict := postPreparation(t, server, id, " literal request ", "", extra)
+	if strings.Contains(conflict.Body.String(), "preparation_catalog_stale") {
+		t.Fatal("accepted identity conflict supplied rejection proof")
+	}
+}
+
 func TestSessionPreparationAdmissionReplaysBeforeCatalogAndNaming(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

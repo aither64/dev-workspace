@@ -57,6 +57,8 @@ type preparationStatusSnapshot struct {
 	exists bool
 }
 
+var errPreparationCatalogStale = errors.New("The starting team catalog changed. Reload the form to review your selection.")
+
 func (s *Server) writePreparationError(w http.ResponseWriter, r *http.Request, id string, status int, err error) {
 	if errors.Is(err, errPreparationPersistenceUnconfirmed) || errors.Is(err, uploads.ErrPersistenceUnconfirmed) {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
@@ -266,12 +268,12 @@ func (s *Server) freezePreparationPreset(input preparationInput) (*teamruntime.P
 		s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
 		return nil, errors.New("invalid starting team selection")
 	}
+	if input.Catalog.Value != s.installedTeams.Catalog.CatalogDigest {
+		return nil, errPreparationCatalogStale
+	}
 	preset, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, strings.TrimSpace(input.Team.Value))
 	if err != nil {
 		return nil, err
-	}
-	if input.Catalog.Value != preset.CatalogDigest {
-		return nil, errors.New("catalog digest is stale; reload the form")
 	}
 	model, effort := strings.TrimSpace(input.Model.Value), strings.TrimSpace(input.Effort.Value)
 	if model != "" || effort != "" {
@@ -343,6 +345,7 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	defer s.uploadCreationMu.Unlock()
 	s.operationMu.Lock()
 	record, exists := s.preparations[id]
+	catalogRejected := false
 	digest := inputPreparationDigest(input)
 	if exists {
 		if record.InputDigest != digest {
@@ -373,6 +376,7 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 		var preset *teamruntime.Preset
 		if err == nil {
 			preset, err = s.freezePreparationPreset(input)
+			catalogRejected = errors.Is(err, errPreparationCatalogStale)
 		}
 		if err == nil {
 			var raw [32]byte
@@ -401,6 +405,13 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	}
 	s.operationMu.Unlock()
 	if err != nil {
+		if catalogRejected {
+			// Only this branch proves rejection before any receipt or upload
+			// claim. Existing and uncertain requests keep exact-byte recovery.
+			s.writeJSON(w, http.StatusConflict, map[string]string{"requestId": id,
+				"code": "preparation_catalog_stale", "catalogDigest": input.Catalog.Value, "error": err.Error()})
+			return
+		}
 		s.writePreparationError(w, r, id, http.StatusConflict, err)
 		return
 	}
