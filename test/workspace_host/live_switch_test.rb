@@ -321,3 +321,25 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 end
+
+class WorkspaceHostTest < Minitest::Test
+  def test_candidate_upgrade_entry_refuses_stale_generation_and_foreign_ownership
+    with_ready_coordination_session do |host, entry, slug, _path, _journal, _manifest, engine|
+      owner = host.send(:with_coordination_session_admission, entry, slug) { engine.owner(slug) }
+      host.define_singleton_method(:coordination_engine) { |_entry, **_options| engine }
+      foreign_candidate = make_package(File.dirname(host.candidate), 'reporting-candidate')
+      host.executing_package = foreign_candidate
+      prepared = false
+      host.define_singleton_method(:prepare_profile) { |*| prepared = true; raise 'should refuse before preparation' }
+      common = ['coordination', 'candidate-prepare', slug, '--as-is', '--source', entry['root'],
+        '--owner', owner['id'], '--reservation', SecureRandom.uuid, '--request', '/unused-request']
+      token = host.send(:profile_link_token)
+      assert_equal 3, host.run('workspace-host', common + ['--expected-profile-token', 'stale-token'])
+      assert_equal 4, host.run('workspace-host', common + ['--expected-profile-token', token])
+      refute prepared
+      assert_equal token, host.send(:profile_link_token)
+      assert_empty engine.store.read['jobs']
+      assert_equal owner['id'], engine.store.read['owners'].values.first['id']
+    end
+  end
+end

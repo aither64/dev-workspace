@@ -662,14 +662,8 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	bound := client.options[0].ThreadPolicy
 	if client.starts[0].Policy.Sandbox != "workspace-write" || client.starts[0].Policy.MCPServer != nil ||
 		bound.Sandbox != client.starts[0].Policy.Sandbox || bound.DeveloperInstructions != client.starts[0].Policy.DeveloperInstructions ||
-		bound.MCPServer == nil || bound.MCPServer.Tool != "report_to_lead" {
+		bound.MCPServer != nil {
 		t.Fatalf("member report policy = starts %#v, assignment %#v", client.starts, client.options)
-	}
-	if got, want := bound.MCPServer.Args, []string{
-		"team-mcp", "--user-state-root", store.stateRoot, "--host-profile", filepath.Join(store.stateRoot, "profile"), "--workspace", workspace,
-		"--session-slug", "one", "--root-thread-id", "root-one", "--member-address", "implementer0", "--member-thread-id", "thread-1",
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("member report helper args = %#v, want %#v", got, want)
 	}
 	if len(client.sends) != 1 || !strings.Contains(client.sends[0], "report_to_lead") ||
 		!strings.Contains(client.sends[0], "new message_id for each message") || strings.Contains(client.sends[0], "dev-session team assign") {
@@ -779,7 +773,7 @@ func TestUpdateAccessRetainsThreadAndRebindsNextTurn(t *testing.T) {
 	}
 }
 
-func TestMemberReportBindingChangesWithExactThreadIdentity(t *testing.T) {
+func TestMemberPolicyDoesNotInsertLateMCPOnWarmThreads(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	store, err := NewStore(t.TempDir(), workspace)
 	if err != nil {
@@ -788,21 +782,17 @@ func TestMemberReportBindingChangesWithExactThreadIdentity(t *testing.T) {
 	service := Service{Store: store, Workspace: workspace}
 	member := Member{Role: "reviewer", Behavior: "reviewer", Access: "read_only", Address: "reviewer0", Thread: "member-one"}
 	first, err := service.memberTurnPolicy("one", "root-one", member)
-	if err != nil || first.MCPServer == nil {
-		t.Fatalf("first report binding = %#v, %v", first, err)
+	if err != nil || first.MCPServer != nil || first.Sandbox != "read-only" {
+		t.Fatalf("warm policy %#v %v", first, err)
 	}
 	member.Thread = "member-two"
 	second, err := service.memberTurnPolicy("one", "root-one", member)
-	if err != nil || second.MCPServer == nil || first.MCPServer.Name == second.MCPServer.Name {
-		t.Fatalf("thread replacement reused report binding: first %#v, second %#v, %v", first.MCPServer, second.MCPServer, err)
-	}
-	if !filepath.IsAbs(first.MCPServer.Command) || filepath.Clean(first.MCPServer.Command) != first.MCPServer.Command ||
-		first.MCPServer.Tool != "report_to_lead" {
-		t.Fatalf("invalid helper launch: %#v", first.MCPServer)
+	if err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatalf("replacement changed saved policy %#v %v", second, err)
 	}
 	member.Thread = ""
 	if _, err := service.memberTurnPolicy("one", "root-one", member); err == nil {
-		t.Fatal("member report helper accepted an unbound thread")
+		t.Fatal("accepted missing identity")
 	}
 }
 
@@ -2504,8 +2494,7 @@ func TestCatalogPresetRetryReusesPersistedThreadAndDoesNotAppend(t *testing.T) {
 	}
 	if len(client.resumes) != 1 || client.resumes[0].Policy.Sandbox != client.starts[0].Policy.Sandbox ||
 		client.resumes[0].Policy.DeveloperInstructions != client.starts[0].Policy.DeveloperInstructions ||
-		client.starts[0].Policy.MCPServer != nil || client.resumes[0].Policy.MCPServer == nil ||
-		client.resumes[0].Policy.MCPServer.Args[len(client.resumes[0].Policy.MCPServer.Args)-1] != "thread-1" {
+		client.starts[0].Policy.MCPServer != nil || client.resumes[0].Policy.MCPServer != nil {
 		t.Fatalf("retry did not restore retained policy: starts %#v, resumes %#v", client.starts, client.resumes)
 	}
 	service.Catalog = &agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 3), Teams: map[string]agentteams.Team{
@@ -2830,8 +2819,8 @@ func TestForkUsesDestinationMemberAddressInEachThreadEnvironment(t *testing.T) {
 	if _, err := service.Assign(context.Background(), "target", "root-target", "lead", "architect0", "Review the design", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.options) != 1 || client.options[0].ThreadPolicy.MCPServer == nil ||
-		client.options[0].ThreadPolicy.MCPServer.Args[len(client.options[0].ThreadPolicy.MCPServer.Args)-1] != "thread-3" {
+	if len(client.options) != 1 || client.options[0].ThreadPolicy.MCPServer != nil ||
+		client.options[0].ThreadPolicy.DeveloperInstructions != client.forkSettings[0].Policy.DeveloperInstructions {
 		t.Fatalf("forked member assignment did not bind its destination thread: %#v", client.options)
 	}
 }

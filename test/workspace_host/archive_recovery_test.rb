@@ -397,7 +397,7 @@ class WorkspaceHostTest < Minitest::Test
       host.executing_package = paths.fetch(:candidate)
       assert_equal(0, recover_archive(host, paths))
       host.executing_package = nil
-      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
       assert_equal(paths.fetch(:candidate), File.realpath(host.instance_variable_get(:@profile)))
     end
   end
@@ -441,6 +441,16 @@ class WorkspaceHostTest < Minitest::Test
       host.candidate = candidate
       host.executing_package = candidate
       host.extend(RecoveryBehavior)
+      host.define_singleton_method(:registration_plan_for) do |entry, package: package_root|
+        plan = super(entry, package:)
+        if send(:reporting_startup_contract?, package)
+          values = {'command' => File.join(package, 'bin/workspace-portal'),
+            'args' => ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile],
+            'required' => true, 'enabled_tools' => ['report_to_lead'], 'tools.report_to_lead.approval_mode' => 'approve'}
+          plan.argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+        end
+        plan
+      end
       host.events.clear
       entry = host.send(:registry).find('example-workspace')
       slug = '2026-09-29-recover-example'

@@ -65,6 +65,17 @@ slug has no claim to the previous owner's resources. An exceptional release or
 transfer needs a separate reviewed operation with exact user direction and live
 evidence; there is no force-release command.
 
+## First reporting-startup upgrade
+
+A predecessor whose host accepts only `agents.*` launch overrides cannot decode
+the reporting startup plan. The reviewed candidate's narrowly scoped
+`coordination candidate-prepare` and `candidate-reconcile` entries keep the
+selected generation's ledger authority, actual managed owner, held machine
+reservation and original attempt. They do not create bootstrap owners or grant
+approval. Follow [team reporting upgrade and recovery](team-reporting-upgrade.md)
+for exact source/profile-token proofs, ordinary submission and exited-attempt
+recovery. Normal selected-generation reconciliation applies after selection.
+
 ## Reviewed rebase lineage
 
 For each deployed nonancestor head, `finish.replacements` contains:

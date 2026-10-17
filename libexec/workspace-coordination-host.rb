@@ -56,9 +56,9 @@ module DevWorkspaceHost
       raise Error, 'candidate Codex compatibility check failed' unless status.success? && !overflow
     end
 
-    def coordination_engine(entry)
+    def coordination_engine(entry, package: package_root)
       runtime = instance_runtime(entry)
-      WorkspaceCoordination::Engine.new(state: @state, package: package_root, profile: @profile,
+      WorkspaceCoordination::Engine.new(state: @state, package:, profile: @profile,
         workspace: entry.fetch('root'), entry: entry.merge('socket' => runtime.fetch(:codex),
           'authority' => runtime.fetch(:authority), 'portalUrl' => "https://#{entry.fetch('hostname')}"),
         env: @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'), 'DEV_WORKSPACE_CODEX_HOME' => codex_home))
@@ -208,8 +208,18 @@ module DevWorkspaceHost
       raise WorkspaceCoordination::Error, WorkspaceCoordination.diagnostic(error.message)
     end
 
-    def with_coordination_session_admission(entry, slug, timeout: @coordination_admission_timeout || 30)
-      with_current_generation_lock(mode: File::LOCK_SH) do
+    def with_coordination_session_admission(entry, slug, timeout: @coordination_admission_timeout || 30, candidate_token: nil)
+      admission = lambda do |&block|
+        if candidate_token
+          with_candidate_generation_lock(mode: File::LOCK_SH) do
+            raise WorkspaceCoordination::Error.new('candidate predecessor changed', 3) unless profile_link_token == candidate_token
+            block.call
+          end
+        else
+          with_current_generation_lock(mode: File::LOCK_SH, &block)
+        end
+      end
+      admission.call do
         runtime = instance_runtime(entry)
         FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
         path = File.join(runtime.fetch(:authority), "#{slug}.lock")
@@ -270,7 +280,100 @@ module DevWorkspaceHost
       end
     end
 
+    # Managed first-upgrade entry for a predecessor that cannot decode a new
+    # registration plan. Ledger authority stays with the selected generation;
+    # only exact candidate preparation/recovery uses the newer host reader.
+    def coordination_candidate_command(argv)
+      action = argv.shift
+      slug = argv.shift
+      options = {}
+      OptionParser.new do |opts|
+        opts.on('--as-is') { options[:as_is] = true }
+        opts.on('--json') { options[:json] = true }
+        %w[source expected-profile-token owner reservation request job workspace].each do |name|
+          opts.on("--#{name} VALUE") { |value| options[name.tr('-', '_').to_sym] = value }
+        end
+      end.parse!(argv)
+      required = %i[source expected_profile_token owner reservation]
+      unless argv.empty? && options[:as_is] && WorkspaceCoordination::PART.match?(slug.to_s) && required.all? { |key| options[key] }
+        raise WorkspaceCoordination::Error, 'candidate operation requires exact session, source, predecessor token, owner and reservation'
+      end
+      unless %w[candidate-prepare candidate-reconcile].include?(action) &&
+             (action == 'candidate-prepare' ? options[:request] && !options[:job] : options[:job] && !options[:request])
+        raise WorkspaceCoordination::Error, 'candidate preparation requires request; recovery requires original job'
+      end
+      entry = registry.select(cwd: Dir.pwd, environment_name: options[:workspace] || @env['DEV_WORKSPACE_NAME'])
+      token = options.fetch(:expected_profile_token)
+      selected = nil
+      with_candidate_generation_lock(mode: File::LOCK_SH) do
+        raise WorkspaceCoordination::Error.new('candidate predecessor changed', 3) unless profile_link_token == token
+        selected = File.realpath(@profile)
+      end
+      engine = coordination_engine(entry, package: selected)
+      @coordination_catalog = engine.catalog
+      owner = engine.store.read['owners'][options[:owner]]
+      reservation = engine.store.read['reservations'][options[:reservation]]
+      unless owner && !owner['bootstrap'] && owner['slug'] == slug && owner['workspace'] == entry['root'] &&
+             coordination_actor_thread == owner['thread'] && reservation && reservation['ownerId'] == owner['id'] &&
+             %w[held deployed_review blocked_recovery].include?(reservation['state'])
+        raise WorkspaceCoordination::Error.new('candidate requires the actual managed owner and held reservation', 4)
+      end
+      with_coordination_session_admission(entry, slug, candidate_token: token) do
+        raise WorkspaceCoordination::Error.new('candidate owner changed', 4) unless engine.owner(slug)['id'] == owner['id']
+      end
+      source = File.realpath(options.fetch(:source))
+      path, _common, _identity, registration = engine.repository(owner, 'workspace')
+      head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
+      unless coordination_source_identity(source)['head'] == head && capture!('git', '-C', source, 'status', '--porcelain').empty?
+        raise WorkspaceCoordination::Error.new('candidate source is not the exact clean registered workspace head', 3)
+      end
+      prepared = prepare_profile(['--source', source, '--from-candidate'], from_candidate: true)
+      unless prepared['candidatePackage'] == File.realpath(package_root) && prepared['profileToken'] == token
+        raise WorkspaceCoordination::Error.new('candidate source or predecessor identity changed', 3)
+      end
+      with_coordination_session_admission(entry, slug, candidate_token: token) do
+        engine.current_generation!
+        if action == 'candidate-prepare'
+          request = coordination_input(options.fetch(:request))
+          WorkspaceCoordination.keys!(request, %w[schema requestId kind evidence])
+          raise WorkspaceCoordination::Error, 'candidate prepares only profile activation' unless request['kind'] == 'profile_activate'
+          retained = engine.retain_commit(path, head)
+          # Artifact provenance uses the retained exact source, not a mutable
+          # caller checkout. Its complete identity must equal the built source.
+          raise WorkspaceCoordination::Error.new('candidate retained source differs', 3) unless coordination_source_identity(retained) == prepared['sourceIdentity']
+          prepared['source'] = retained
+          prepared['coverage'] = engine.coverage(retained, 'workspace', head)
+          artifact = engine.save_artifact(prepared)
+          engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
+          operation = {'preparedArtifact' => artifact['id'], 'candidatePackage' => artifact['candidatePackage'],
+            'expectedProfileToken' => token, 'coverage' => artifact['coverage']}
+          @out.puts JSON.generate(engine.prepare_snapshot(owner, 'profile_activate', operation, request['evidence']))
+        else
+          job = engine.store.read['jobs'][options[:job]]
+          unless job && job['ownerId'] == owner['id'] && job['reservationId'] == reservation['id'] &&
+                 job['kind'] == 'profile_activate' && job.dig('snapshot', 'operation', 'candidatePackage') == prepared['candidatePackage']
+            raise WorkspaceCoordination::Error.new('candidate recovery differs from original owned profile job', 4)
+          end
+          artifact = engine.artifact!(job.dig('snapshot', 'operation', 'preparedArtifact'))
+          unless artifact.slice(*WorkspaceCoordination::Engine::PROFILE_IDENTITY.reject { |key| key == 'coverage' }) == prepared.slice(*WorkspaceCoordination::Engine::PROFILE_IDENTITY.reject { |key| key == 'coverage' })
+            raise WorkspaceCoordination::Error.new('candidate recovery differs from retained preparation', 3)
+          end
+          @candidate_recovery = [engine, owner, job['id']]
+        end
+      end
+      if @candidate_recovery
+        # The engine owns the original worker lock and proves service exit.
+        # Activation takes its ordinary exclusive generation/claim locks.
+        @out.puts JSON.generate(engine.reconcile_job(owner, options[:job], candidate_host: File.join(package_root, 'bin/workspace-host')))
+      end
+    ensure
+      @candidate_recovery = nil
+    end
+
     def coordination_host_command(argv)
+      if %w[candidate-prepare candidate-reconcile].include?(argv.first)
+        return coordination_candidate_command(argv)
+      end
       return coordination_collect_command(argv.drop(1)) if argv.first == 'gc'
       if argv == ['guide']
         @out.puts "Selected package: #{File.realpath(package_root)}"
@@ -324,10 +427,19 @@ module DevWorkspaceHost
       end
       data = coordination_store.read
       job = data['jobs'].values.find { |value| value['attempt'] == attempt }
+      reservation = job && data['reservations'][job['reservationId']]
+      # An uncertain original attempt retains its claim while reconciliation
+      # completes the exact prepared candidate. It must not need a new job or
+      # a reservation-state rewrite to recover forward.
+      recovering = job && job['state'] == 'reconciling' && reservation &&
+        reservation['state'] == 'blocked_recovery' && reservation['history'].any? do |record|
+          record['attempt'] == attempt && record['kind'] == 'profile_activate' &&
+            record['artifact'] == job.dig('snapshot', 'operation', 'preparedArtifact') && record['outcome'] == 'unknown'
+        end
       unless job && job['kind'] == 'profile_activate' && WorkspaceCoordination::CLAIMED.include?(job['state']) &&
              job.dig('snapshot', 'operation', 'candidatePackage') == candidate &&
-             data['reservations'][job['reservationId']]&.fetch('ownerId') == job['ownerId'] &&
-             %w[held deployed_review].include?(data['reservations'][job['reservationId']]&.fetch('state'))
+             reservation&.fetch('ownerId') == job['ownerId'] &&
+             (%w[held deployed_review].include?(reservation&.fetch('state')) || recovering)
         raise WorkspaceCoordination::Error.new('profile attempt has no exact admitted machine claim', 4)
       end
     end

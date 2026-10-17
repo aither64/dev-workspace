@@ -278,6 +278,14 @@ module DevWorkspaceHost
       marker = load_registration_marker(entry)
       commands << File.join(marker.fetch('launch').fetch('package_root'), 'bin/workspace-portal') if marker.is_a?(Hash)
       return false unless commands.include?(executable)
+      if marker.is_a?(Hash)
+        launch = marker.fetch('launch')
+        invocation = reporting_server_invocation(entry, package: launch.fetch('package_root'))
+        # Daemon-start servers have no legacy per-thread MCP policy. Their
+        # exact validated launch marker proves this owned host helper instead.
+        return true if executable == invocation.first && arguments == invocation &&
+          valid_reporting_registration_argv?(launch.fetch('argv'), entry, launch.fetch('package_root'))
+      end
       inventory.fetch('threads').any? do |thread|
         server = thread.dig('settings', 'policy', 'mcpServer')
         thread['memberAddress'] && server && arguments == [executable, *server.fetch('Args')]

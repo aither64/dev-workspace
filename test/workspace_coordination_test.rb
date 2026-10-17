@@ -1250,3 +1250,64 @@ class WorkspaceCoordinationTest < Minitest::Test
     assert File.directory?(File.join(@engine.store.root, 'sources', before))
   end
 end
+
+class WorkspaceCoordinationTest < Minitest::Test
+  def test_candidate_profile_recovery_retains_original_attempt_and_claim
+    configure_machine
+    first = owner('managed-candidate')
+    candidate = File.join(@tmp, 'new-candidate')
+    FileUtils.mkdir_p(File.join(candidate, 'bin'))
+    artifact = @engine.save_artifact('kind' => 'profile', 'candidatePackage' => candidate,
+      'profileToken' => DevWorkspaceProfileIdentity.token(@profile), 'coverage' => [])
+    snapshot = @engine.prepare_snapshot(first, 'profile_activate', {
+      'preparedArtifact' => artifact['id'], 'candidatePackage' => candidate,
+      'expectedProfileToken' => artifact['profileToken'], 'coverage' => []}, evidence(first))
+    auth = approval(first, snapshot, kind: 'deploy', scope: [{'machine' => 'fixture:machine', 'actions' => ['profile_activate'], 'reboot' => false}])
+    reservation = @engine.mutate(first, 'reserve', request('target' => 'alias', 'mode' => 'deploy_first', 'approvalId' => auth, 'integrationObligations' => []))
+    submitted = @engine.mutate(first, 'submit', request('kind' => 'profile_activate', 'dependsOn' => [], 'approvalId' => auth, 'reservationId' => reservation['id'], 'snapshot' => snapshot))
+    job = @engine.claim(owner_id: first['id']).first
+    worker = WorkspaceCoordination::Worker.new(write_attempt(job), fixtures: true)
+    worker.phase('profile_intent')
+    worker.result('unknown', nil, 'predecessor refused new registration argv before selection')
+    @engine.reconcile_attempts
+    assert_equal 'reconciling', @engine.store.read['jobs'][submitted['id']]['state']
+    assert_equal 'blocked_recovery', @engine.store.read['reservations'][reservation['id']]['state']
+    # Exercise the actual child activation claim guard, rather than mocking
+    # the entire candidate invocation and missing the recovery reservation.
+    host = DevWorkspaceHost::Host.allocate
+    engine = @engine
+    host.define_singleton_method(:coordination_store) { engine.store }
+    host.define_singleton_method(:coordination_catalog) { engine.catalog }
+    host.instance_variable_set(:@coordination_attempt, job['attempt'])
+    host.send(:require_coordination_profile_claim!, candidate)
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, '/wrong-candidate') }
+    @engine.store.transaction { |data| data['reservations'][reservation['id']]['history'][0]['artifact'] = 'sha256:' + ('f' * 64) }
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, candidate) }
+    @engine.store.transaction { |data| data['reservations'][reservation['id']]['history'][0]['artifact'] = artifact['id'] }
+    # A wrong candidate cannot recover an uncertain original intent.
+    assert_raises(WorkspaceCoordination::Error) { @engine.reconcile_job(first, job['id'], candidate_host: '/wrong/workspace-host') }
+    calls = []
+    original_capture = @engine.method(:capture)
+    profile = @profile
+    @engine.define_singleton_method(:capture) do |*argv, **options|
+      if argv.first == File.join(candidate, 'bin/workspace-host')
+        host.send(:require_coordination_profile_claim!, candidate)
+        calls << argv
+        File.unlink(profile)
+        File.symlink(candidate, profile)
+        ''
+      else
+        original_capture.call(*argv, **options)
+      end
+    end
+    result = @engine.reconcile_job(first, job['id'], candidate_host: File.join(candidate, 'bin/workspace-host'))
+    assert_equal 'succeeded', result['state']
+    assert_equal [[File.join(candidate, 'bin/workspace-host'), 'activate-prepared', '--artifact', artifact['id'], '--attempt', job['attempt']]], calls
+    data = @engine.store.read
+    assert_equal job['attempt'], data['jobs'][job['id']]['attempt']
+    assert_equal first['id'], data['reservations'][reservation['id']]['ownerId']
+    assert_equal 'deployed_review', data['reservations'][reservation['id']]['state']
+    assert_equal 1, data['reservations'][reservation['id']]['history'].length
+    assert_equal 'unknown', data['reservations'][reservation['id']]['history'][0]['dispositions'][0]['outcome']
+  end
+end

@@ -462,6 +462,7 @@ func teamCommand(args []string) error {
 	address := flags.String("address", "", "team member address")
 	access := flags.String("access", "", "retained member access")
 	from := flags.String("from", "lead", "sender address")
+	expectedMemberThread := flags.String("expected-member-thread-id", "", "native report caller thread")
 	to := flags.String("to", "", "recipient address")
 	message := flags.String("message", "", "assignment message")
 	messageID := flags.String("message-id", "", "stable assignment retry ID")
@@ -541,7 +542,7 @@ func teamCommand(args []string) error {
 		"DEV_SESSION_SLUG": *slug, "DEV_SESSION_WORKSPACE": *workspace, "DEV_SESSION_WORK_DIR": *cwd,
 		"DEV_SESSION_REQUIRE_RUNTIME": "1", "DEV_SESSION_CODEX_SOCKET": *socket,
 	}
-	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, Client: client, Workspace: *workspace, HostProfile: *hostProfile, Catalog: teamCatalog,
+	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, ExpectedReporterThread: *expectedMemberThread, Client: client, Workspace: *workspace, HostProfile: *hostProfile, Catalog: teamCatalog,
 		ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
 			models, err := client.ListModels(ctx)
 			if err != nil {
@@ -1035,6 +1036,7 @@ func agentTeamsCommandIO(args []string, input io.Reader, output io.Writer) error
 	packageRoot := flags.String("package-root", "", "absolute installed or candidate package root")
 	stateRoot := flags.String("state-root", "", "absolute private user-state root")
 	workspace := flags.String("workspace", "", "absolute canonical workspace root")
+	hostProfile := flags.String("host-profile", "", "stable selected host profile")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1052,6 +1054,13 @@ func agentTeamsCommandIO(args []string, input io.Reader, output io.Writer) error
 		return err
 	}
 	plan, err := agentteams.BuildRegistrationPlan(*packageRoot)
+	if err != nil {
+		return err
+	}
+	if *hostProfile == "" {
+		*hostProfile = filepath.Join(*stateRoot, "profile")
+	}
+	plan, err = plan.WithWorkspaceReporting(*packageRoot, *stateRoot, *workspace, *hostProfile)
 	if err != nil {
 		return err
 	}

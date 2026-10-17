@@ -67,6 +67,7 @@ class TeamMcpBindingTest < DevSessionTest
       argv, input = capture.calls.fetch(0)
       assert_equal('Private report text', input)
       assert_equal('/dev/stdin', argv.fetch(argv.index('--input-file') + 1))
+      assert_equal('actual-member-thread', argv.fetch(argv.index('--expected-member-thread-id') + 1))
       assert_equal(File.join(workspace, '.xdg-state', 'dev-workspaces', 'profile'),
                    argv.fetch(argv.index('--host-profile') + 1))
       refute_includes(argv.join(' '), 'Private report text')
@@ -104,7 +105,8 @@ class TeamMcpBindingTest < DevSessionTest
       'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'),
       DevSession::ENV_SLUG => slug,
       DevSession::ENV_MEMBER_ADDRESS => 'reviewer0',
-      DevSession::ENV_EXPECTED_ROOT_THREAD_ID => expected_root
+      DevSession::ENV_EXPECTED_ROOT_THREAD_ID => expected_root,
+      DevSession::ENV_EXPECTED_MEMBER_THREAD_ID => 'actual-member-thread'
     })
   end
 

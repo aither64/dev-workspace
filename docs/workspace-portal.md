@@ -413,7 +413,8 @@ Packages publishing `livePackageSwitchPolicy = 1` can switch while threads are
 active when the candidate resolves to the same native Codex executable, launch
 policy, complete arguments and native child-thread capacity as every running
 workspace's launch marker. Catalog defaults, portal code, session tools and
-package paths do not themselves require a Codex restart. The host refreshes
+package paths do not themselves require a Codex restart unless they change the
+complete reporting-server launch argv. The host refreshes
 registration inventory and restarts the portal and router; Codex, tmux and
 managed terminal clients keep running. Browser clients reconnect to the portal.
 
@@ -984,19 +985,37 @@ inspect the member transcript to determine whether the assignment arrived.
 Send a new assignment with a new ID only after confirming it did not; if the
 outcome remains uncertain, stop and investigate before resending.
 
-The report tool is bound to the workspace, session, lead thread, member address,
-and exact member thread. A new or forked thread receives the tool after its ID
-is known. Before each assignment, App Server resumes the member thread with
-that binding, including for members created by an earlier package. No roster
-format change is needed. The helper checks the current roster identity before
-sending. A missing or mismatched binding fails without sending to `lead`.
-The helper exposes only `report_to_lead`. It passes the report through stdin to
-the configured user profile's session command, which checks that the lead thread still belongs
-to this session under the session lock. Neither command puts the report text in
-its process arguments. Use a fresh message ID for each report, and reuse that
-ID only when retrying delivery of the same report. The helper retains the stable
-profile path across package switches, including custom profiles, and checks the
-roster again for each call.
+The shared workspace daemon installs one package-owned `team_reporting` MCP
+server at startup. Materialized warm threads do not accept a newly inserted MCP
+server through `thread/resume`, so member turns no longer depend on late
+per-thread insertion. A changed startup argv requires ordinary idle daemon
+reconciliation even when the native executable is unchanged. Unrelated MCP
+servers remain configured. New members, resumed histories and forks receive the
+startup server without changing their saved model, effort, access or instructions.
+
+Only `message` and stable `message_id` are tool arguments. The helper routes by
+native `_meta.threadId`, which the pinned native server supplies for model calls
+and replaces on direct tool calls. It resolves exactly one current ready,
+non-retiring member in this registered workspace's validated rosters. Unknown,
+ambiguous, removed, archived or malformed identities refuse delivery. Root
+conversations can see the shared tool but cannot report as a member. No session
+or sender can be selected through tool input.
+
+Delivery executes on the host through the configured stable user profile's
+`bin/dev-session`, with report text on stdin. The helper carries the expected
+member thread and lead identity. The session lock verifies the current lead;
+the team operation lock revalidates the exact current caller before delivery.
+The member sandbox never runs the host locking command. Successful calls return
+the bounded native submission receipt. Use a fresh message ID for each report,
+and reuse that exact ID, text and options after uncertain delivery. The retained
+submission ledger deduplicates retries. Tool errors never echo report text or
+child stderr. Completed turns are not automatically forwarded.
+
+Fully bound legacy `team-mcp` process flags and queued per-thread MCP policies
+remain supported for recovery. They dispatch through the stable profile and
+revalidate their original identities too. No roster migration or native upgrade
+is required. See [reporting upgrade and recovery](team-reporting-upgrade.md) for
+the first daemon-start cutover, busy deferral and managed candidate recovery.
 
 A fork requires all source members to have finished creation, preserves the
 source member snapshot, and refuses an interrupted retry if that roster

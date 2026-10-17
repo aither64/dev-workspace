@@ -29,7 +29,7 @@ func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string
 		t.Fatal(err)
 	}
 	devSession := filepath.Join(packageBin, "dev-session")
-	if err := os.WriteFile(devSession, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := os.WriteFile(devSession, []byte("#!/bin/sh\nprintf '{\"clientUserMessageId\":\"%s\",\"turnId\":\"fixture-turn\"}\n' \"${11}\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	hostProfile := filepath.Join(root, "custom-profile")
@@ -260,7 +260,7 @@ func TestTeamMCPChildOutputNeverEntersProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	responses := teamMCPResponses(t, output.String())
-	if len(responses) != 1 || teamMCPResult(t, responses[0])["isError"] != false ||
+	if len(responses) != 1 || teamMCPResult(t, responses[0])["isError"] != true ||
 		strings.Contains(output.String(), "host stdout") || strings.Contains(diagnostics.String(), "host stderr") {
 		t.Fatalf("host output escaped into MCP streams: %q, %q", output.String(), diagnostics.String())
 	}
@@ -275,7 +275,7 @@ func TestRetainedTeamMCPDispatchesThroughCustomProfileAfterSwitch(t *testing.T) 
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		body := "#!/bin/sh\nprintf '%s:%s\\n' '" + generation + "' \"${11}\" >> \"$TEAM_MCP_TRACE\"\ncat >/dev/null\n"
+		body := "#!/bin/sh\nprintf '%s:%s\\n' '" + generation + "' \"${11}\" >> \"$TEAM_MCP_TRACE\"\ncat >/dev/null\nprintf '{\"clientUserMessageId\":\"%s\",\"turnId\":\"fixture-turn\"}\n' \"${11}\"\n"
 		if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -314,5 +314,42 @@ func TestRetainedTeamMCPDispatchesThroughCustomProfileAfterSwitch(t *testing.T) 
 	data, err := os.ReadFile(trace)
 	if err != nil || string(data) != "first:"+id+"\nsecond:"+id+"\n" {
 		t.Fatalf("selected dispatchers and retry identity = %q, %v", data, err)
+	}
+}
+
+func TestWorkspaceTeamMCPRoutesOnlyNativeCaller(t *testing.T) {
+	binding, deps, args := teamMCPFixture(t)
+	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte("schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"plan.md": "fixture\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(binding.workDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args = args[:6] // state, workspace and custom profile only; no per-thread flags.
+	var calls []teamMCPInvocation
+	deps.run = func(_ context.Context, call teamMCPInvocation) error {
+		calls = append(calls, call)
+		_, err := call.receipt.WriteString(`{"clientUserMessageId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","turnId":"native-turn"}`)
+		return err
+	}
+	for _, meta := range []json.RawMessage{nil, []byte(`null`), []byte(`{"threadId":null}`), []byte(`{"threadId":5}`), []byte(`{"threadId":"unknown"}`), []byte(`{"threadId":"member-thread","threadId":"member-thread"}`), []byte(`{"threadId":"member-thread"}`)} {
+		params := map[string]any{"name": "report_to_lead", "arguments": map[string]string{"message": "report", "message_id": strings.Repeat("b", 32)}}
+		if meta != nil {
+			params["_meta"] = meta
+		}
+		var output, diagnostics bytes.Buffer
+		if err := teamMCPCommand(args, strings.NewReader(teamMCPRequestLine(t, 1, "tools/call", params)), &output, &diagnostics, deps); err != nil {
+			t.Fatal(err)
+		}
+		success := string(meta) == `{"threadId":"member-thread"}`
+		result := teamMCPResult(t, teamMCPResponses(t, output.String())[0])
+		if result["isError"] == success {
+			t.Fatalf("metadata %s result %#v", meta, result)
+		}
+	}
+	if len(calls) != 1 || calls[0].workDir != binding.workDir || !strings.Contains(strings.Join(calls[0].environment, "\n"), "DEV_SESSION_EXPECTED_MEMBER_THREAD_ID=member-thread") {
+		t.Fatalf("native dispatch %#v", calls)
 	}
 }

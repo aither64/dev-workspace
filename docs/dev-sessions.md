@@ -358,6 +358,16 @@ complete them with their originating generation before switching packages.
 
 ## Team members
 
+Members explicitly return results and blocking questions through `report_to_lead`.
+The workspace daemon installs that host-side tool at startup and routes native
+caller metadata to the member's own current lead. Use one stable message ID per
+report and keep it unchanged for delivery retries. The tool returns a native
+submission receipt; the lead still checks actual work completion separately.
+Do not invoke the host locking CLI inside a member sandbox or change access to
+work around a missing tool. See the [portal reporting contract](workspace-portal.md#installed-team-policy)
+and [upgrade/recovery guide](team-reporting-upgrade.md).
+
+
 `dev-session attach` continues to attach the root `lead` conversation in tmux.
 Team members are independent persistent Codex threads and do not create extra
 tmux panes. Choose an installed team when starting a session, or manage members

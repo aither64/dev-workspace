@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
@@ -31,8 +32,8 @@ var teamMCPThreadIDPattern = regexp.MustCompile(`^[0-9A-Za-z-]{1,128}$`)
 var teamMCPAddressPattern = regexp.MustCompile(`^[a-z][a-z0-9]{0,31}[0-9]+$`)
 var teamMCPMessageIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 
-// teamMCPBinding is fixed by App Server's per-thread MCP launch. Tool input
-// cannot choose another session or sender.
+// A workspace launch routes native caller metadata. Fully bound legacy launches
+// remain supported for retained queued policies; tool arguments never pick identity.
 type teamMCPBinding struct {
 	stateRoot, workspace, slug, rootThreadID, address, memberThreadID string
 	devSession, hostProfile, workDir                                  string
@@ -43,6 +44,7 @@ type teamMCPInvocation struct {
 	command, workDir  string
 	args, environment []string
 	message           string
+	receipt           *bytes.Buffer
 }
 
 type teamMCPDependencies struct {
@@ -58,8 +60,14 @@ func (dependencies teamMCPDependencies) withDefaults() teamMCPDependencies {
 			command.Stdin = strings.NewReader(invocation.message)
 			// The CLI writes a roster receipt. Neither it nor its errors belong
 			// on stdout, which is reserved for MCP JSON-RPC frames.
-			command.Stdout, command.Stderr = io.Discard, io.Discard
-			return command.Run()
+			command.Stdout, command.Stderr = teamMCPReceiptWriter{invocation.receipt}, io.Discard
+			if err := command.Run(); err != nil {
+				return err
+			}
+			if invocation.receipt == nil || invocation.receipt.Len() == 0 {
+				return errors.New("missing host delivery receipt")
+			}
+			return nil
 		}
 	}
 	return dependencies
@@ -80,10 +88,13 @@ func teamMCPCommand(args []string, input io.Reader, output, diagnostics io.Write
 		return err
 	}
 	if flags.NArg() != 0 || !canonicalAbsolutePath(*stateRoot) || !canonicalAbsolutePath(*workspace) ||
-		!canonicalAbsolutePath(*hostProfile) ||
-		!session.ValidSlug(*slug) || !teamMCPThreadIDPattern.MatchString(*rootThreadID) ||
-		!teamMCPThreadIDPattern.MatchString(*memberThreadID) || !teamMCPAddressPattern.MatchString(*address) {
+		!canonicalAbsolutePath(*hostProfile) {
 		return errors.New("team-mcp requires a canonical state root, host profile, workspace, session, lead thread, member address, and member thread")
+	}
+	legacy := *slug != "" || *rootThreadID != "" || *memberThreadID != "" || *address != ""
+	if legacy && (!session.ValidSlug(*slug) || !teamMCPThreadIDPattern.MatchString(*rootThreadID) ||
+		!teamMCPThreadIDPattern.MatchString(*memberThreadID) || !teamMCPAddressPattern.MatchString(*address)) {
+		return errors.New("team-mcp legacy binding requires every exact session, lead and member identity")
 	}
 	resolvedWorkspace, err := filepath.EvalSymlinks(*workspace)
 	if err != nil || resolvedWorkspace != *workspace {
@@ -118,7 +129,7 @@ func (binding teamMCPBinding) ready() error {
 		if member.Address != binding.address {
 			continue
 		}
-		if member.State != "ready" || member.Thread != binding.memberThreadID || member.RemovedAt != nil {
+		if member.State != "ready" || member.Thread != binding.memberThreadID || member.RemovedAt != nil || member.RetireIntent != "" {
 			return errors.New("bound member is no longer ready on its original thread")
 		}
 		return nil
@@ -147,6 +158,7 @@ func (binding teamMCPBinding) invocation(message, messageID string) teamMCPInvoc
 		"DEV_SESSION_WORK_DIR="+binding.workDir,
 		"DEV_SESSION_MEMBER_ADDRESS="+binding.address,
 		"DEV_SESSION_EXPECTED_ROOT_THREAD_ID="+binding.rootThreadID,
+		"DEV_SESSION_EXPECTED_MEMBER_THREAD_ID="+binding.memberThreadID,
 	)
 	return teamMCPInvocation{command: binding.devSession, workDir: binding.workDir,
 		args: args, environment: environment, message: message}
@@ -283,16 +295,88 @@ func (binding teamMCPBinding) call(ctx context.Context, raw json.RawMessage, dia
 		!teamMCPMessageIDPattern.MatchString(*arguments.MessageID) {
 		return teamMCPToolResult("Provide a nonempty message of at most 20,000 bytes and a stable lowercase UUID or 32-character hex message_id.", true)
 	}
+	if binding.slug == "" {
+		threadID, err := teamMCPNativeThread(params.Meta)
+		if err != nil {
+			return teamMCPToolResult("A valid native caller thread is required.", true)
+		}
+		reporter, err := binding.store.ResolveReporter(threadID)
+		if err != nil {
+			fmt.Fprintln(diagnostics, "team-mcp: native caller is not a current unique ready member")
+			return teamMCPToolResult("This caller is not an active team member in this workspace.", true)
+		}
+		binding.slug, binding.rootThreadID = reporter.Slug, reporter.RootThreadID
+		binding.address, binding.memberThreadID = reporter.Member.Address, threadID
+		binding.workDir = filepath.Join(binding.workspace, "work", binding.slug)
+	} else if len(params.Meta) != 0 {
+		// A legacy process may omit metadata, but cannot contradict it.
+		threadID, err := teamMCPNativeThread(params.Meta)
+		if err != nil || threadID != binding.memberThreadID {
+			return teamMCPToolResult("The native caller does not match this legacy report binding.", true)
+		}
+	}
 	if err := binding.ready(); err != nil {
 		fmt.Fprintln(diagnostics, "team-mcp: bound member is not ready")
 		return teamMCPToolResult("This team member is no longer active in this session.", true)
 	}
 	bounded, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	if err := run(bounded, binding.invocation(*arguments.Message, *arguments.MessageID)); err != nil {
+	invocation := binding.invocation(*arguments.Message, *arguments.MessageID)
+	invocation.receipt = new(bytes.Buffer)
+	if err := run(bounded, invocation); err != nil {
 		// Never print child stderr: the report may appear in a downstream error.
 		fmt.Fprintf(diagnostics, "team-mcp: report delivery failed (%T)\n", err)
 		return teamMCPToolResult("The report could not be confirmed. Retry with the same message_id.", true)
 	}
+	if invocation.receipt.Len() > 0 {
+		var receipt codex.SendReceipt
+		if teamMCPDecode(invocation.receipt.Bytes(), &receipt) != nil || receipt.ClientUserMessageID != *arguments.MessageID {
+			return teamMCPToolResult("Report receipt could not be confirmed. Retry with the same message_id.", true)
+		}
+		return teamMCPToolResult("Report sent to lead. Receipt: "+strings.TrimSpace(invocation.receipt.String()), false)
+	}
 	return teamMCPToolResult("Report sent to lead.", false)
+}
+
+// The child receipt is bounded independently of JSON-RPC output. Child stderr
+// is never copied into a response, since downstream errors can include text.
+type teamMCPReceiptWriter struct{ buffer *bytes.Buffer }
+
+func (w teamMCPReceiptWriter) Write(p []byte) (int, error) {
+	if w.buffer == nil || w.buffer.Len()+len(p) > teamMCPMaxLineBytes/2 {
+		return 0, errors.New("report receipt exceeds bound")
+	}
+	return w.buffer.Write(p)
+}
+
+func teamMCPNativeThread(raw json.RawMessage) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return "", errors.New("native metadata must be an object")
+	}
+	seen := map[string]bool{}
+	var threadID string
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] {
+			return "", errors.New("invalid or duplicate native metadata")
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", err
+		}
+		if key == "threadId" && json.Unmarshal(value, &threadID) != nil {
+			return "", errors.New("native thread ID must be a string")
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return "", err
+	}
+	if decoder.Decode(new(any)) != io.EOF || !teamMCPThreadIDPattern.MatchString(threadID) {
+		return "", errors.New("missing or invalid native caller thread")
+	}
+	return threadID, nil
 }

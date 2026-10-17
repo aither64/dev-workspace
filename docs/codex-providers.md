@@ -62,8 +62,10 @@ Application holds the package-transition lock, repeats ownership and idle checks
 and probes authentication and retained models without inference. It records
 private settings and terminal identities, quiesces managed terminal clients,
 and validates both forward and recovery settings before stopping the proven native
-daemon. Direct native code-mode and retained team MCP helpers are accepted only
-with exact executable, parent and member-argument proof after all threads are idle.
+daemon. After all threads are idle, direct native code-mode children and retained
+per-thread team MCP helpers require exact executable, parent and argument proof.
+Daemon-start reporting helpers require the same process proof and the validated
+launch marker's exact package, state root, workspace and stable host profile.
 Other processes and helper descendants, including VM runners, block the switch.
 Portal and tmux services remain running.
 

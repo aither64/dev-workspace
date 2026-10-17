@@ -1510,6 +1510,7 @@ module DevWorkspaceHost
         File.join(package, 'bin/workspace-portal'), 'agent-teams', 'registration',
         '--package-root', package, '--state-root', @state, '--workspace', entry.fetch('root')
       ]
+      command.concat(['--host-profile', @profile]) if reporting_startup_contract?(package)
       raise Error, "workspace package has no registration helper: #{command.first}" unless File.executable?(command.first)
 
       stdin, stdout, stderr, waiter = Open3.popen3(*command)
@@ -1565,28 +1566,67 @@ module DevWorkspaceHost
       policy = object.fetch('policy')
       capacity = object.fetch('required_native_child_threads')
       states = object.fetch('states')
-      validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:)
+      validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:, package:)
       RegistrationPlan.new(
         package_root: package, argv:, digest:, policy:, required_native_child_threads: capacity, states:
       )
     end
 
-    def validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:)
+    def validate_registration_values!(argv:, digest:, policy:, capacity:, states:, entry:, package: nil)
       unless digest.is_a?(String) && digest.match?(SHA256_HEX) &&
              policy == AGENT_TEAM_REGISTRATION.fetch('policy') &&
              capacity.is_a?(Integer) && capacity.between?(0, 64)
         raise Error, 'agent team registration helper returned invalid semantic metadata'
       end
-      unless argv.is_a?(Array) && argv.length.even? && argv.each_slice(2).all? do |flag, value|
+      unless argv.is_a?(Array) && argv.length.even? &&
+             (valid_reporting_registration_argv?(argv, entry, package) || argv.each_slice(2).all? do |flag, value|
                flag == '-c' && valid_registration_argv_value?(value)
-             end && argv.sum { |value| value.bytesize + 1 } <= REGISTRATION_ARGV_MAX_BYTES
+             end) && argv.sum { |value| value.bytesize + 1 } <= REGISTRATION_ARGV_MAX_BYTES
         raise Error, 'agent team registration helper returned an invalid argv'
+      end
+      if package && reporting_startup_contract?(package) && !valid_reporting_registration_argv?(argv, entry, package)
+        raise Error, 'reporting registration must contain exactly the owned MCP startup argv'
       end
       validate_registration_inventory!(states, entry)
     end
 
+    def reporting_startup_contract?(package)
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      return false unless File.file?(path)
+
+      payload = File.binread(path, 64 * 1024 + 1)
+      return false if payload.bytesize > 64 * 1024
+
+      JSON.parse(payload)['workspaceReportingPolicy'] == 1
+    rescue JSON::ParserError
+      false
+    end
+
     def valid_registration_argv_value?(value)
       value.is_a?(String) && !value.empty? && !value.include?("\0") && value.start_with?('agents.')
+    end
+
+    def reporting_server_invocation(entry, package:)
+      [File.join(package, 'bin/workspace-portal'), 'team-mcp', '--user-state-root', @state,
+       '--workspace', entry.fetch('root'), '--host-profile', @profile]
+    end
+
+    def valid_reporting_registration_argv?(argv, entry, package)
+      return false unless canonical_absolute_path?(package) && argv.length == 10
+
+      invocation = reporting_server_invocation(entry, package:)
+      expected = [
+        ['command', invocation.first], ['args', invocation.drop(1)],
+        ['required', true], ['enabled_tools', ['report_to_lead']],
+        ['tools.report_to_lead.approval_mode', 'approve']
+      ]
+      argv.each_slice(2).zip(expected).all? do |(flag, value), (key, wanted)|
+        name, json = value.is_a?(String) ? value.split('=', 2) : []
+        flag == '-c' && name == "mcp_servers.team_reporting.#{key}" &&
+          json && JSON.parse(json) == wanted
+      end
+    rescue JSON::ParserError
+      false
     end
 
     def validate_registration_inventory!(states, entry)
@@ -1685,7 +1725,7 @@ module DevWorkspaceHost
       end
       validate_registration_values!(
         argv: plan.argv, digest: plan.digest, policy: plan.policy,
-        capacity: plan.required_native_child_threads, states: plan.states, entry:
+        capacity: plan.required_native_child_threads, states: plan.states, entry:, package: plan.package_root
       )
       ensure_private_instance_runtime!(entry)
       path = registration_marker_path(entry)
@@ -1752,7 +1792,7 @@ module DevWorkspaceHost
       ] && canonical_absolute_path?(launch['codex_path']) && canonical_absolute_path?(launch['package_root'])
       validate_registration_values!(
         argv: launch['argv'], digest: launch['digest'], policy: launch['policy'],
-        capacity: launch['required_native_child_threads'], states: [], entry:
+        capacity: launch['required_native_child_threads'], states: [], entry:, package: launch['package_root']
       )
       marker
     rescue Error
@@ -2061,7 +2101,7 @@ module DevWorkspaceHost
         socket = File.join(directory, 'app-server.sock')
         command = [codex, *plan.argv, 'app-server', '--listen', "unix://#{socket}"]
         unless command.index('app-server') == plan.argv.length + 1 &&
-               plan.argv.each_slice(2).all? { |flag, value| flag == '-c' && valid_registration_argv_value?(value) }
+               plan.argv.each_slice(2).all? { |flag, value| flag == '-c' && value.is_a?(String) && !value.include?("\0") }
           raise Error, 'agent team registration argv cannot be placed before Codex app-server'
         end
         pid = Process.spawn(*command, pgroup: true, out: File::NULL, err: File::NULL)
@@ -2927,9 +2967,9 @@ module DevWorkspaceHost
     # generation cannot parse. Bind its explicit entry to the exact source
     # build, then run the ordinary switch preflight and activation under the
     # same transition lock. No other command can enter from a candidate.
-    def with_candidate_generation_lock
+    def with_candidate_generation_lock(mode: File::LOCK_EX)
       observed_profile = profile_link_token
-      with_transition_lock do
+      with_transition_lock(mode) do
         unless observed_profile && profile_link_token == observed_profile &&
                File.symlink?(@profile) &&
                File.executable?(File.join(File.realpath(@profile), 'bin/workspace-host'))

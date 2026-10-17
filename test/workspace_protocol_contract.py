@@ -29,6 +29,12 @@ def validate(schema_directory):
             "multiAgentMode": "explicitRequestOnly", "collaborationMode": {
                 "mode": "default", "settings": {"model": "retained",
                     "reasoning_effort": "low", "developer_instructions": None}}}})
+    Draft7Validator(request_schema).validate({"id": 4, "method": "mcpServerStatus/list",
+        "params": {"threadId": "thread-1", "serverName": "team_reporting"}})
+    Draft7Validator(request_schema).validate({"id": 5, "method": "mcpServer/tool/call",
+        "params": {"threadId": "thread-1", "server": "team_reporting", "tool": "report_to_lead",
+            "arguments": {"message": "fixture report", "message_id": "a" * 32},
+            "_meta": {"threadId": "native-overwrites-this-value"}}})
     resume = json.loads((schema_directory / "v2/ThreadResumeResponse.json").read_text())
     for field in ("modelProvider", "model", "cwd", "approvalPolicy", "approvalsReviewer", "sandbox"):
         if field not in resume.get("required", []):

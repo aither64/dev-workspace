@@ -31,6 +31,8 @@ The [coordination guide](docs/coordination.md) covers queued merges, persistent
 machine review reservations and [operations/recovery](docs/coordination-operations.md).
 The [integration guide](docs/integration.md) covers resumable operation batches,
 mechanical refresh certificates and cached verification.
+The [team reporting upgrade guide](docs/team-reporting-upgrade.md) covers daemon-start
+MCP reporting, retained-member acceptance and first-upgrade recovery.
 
 ## Nix interfaces
 

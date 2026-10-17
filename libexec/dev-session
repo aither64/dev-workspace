@@ -98,6 +98,7 @@ module DevSession
   ENV_TMUX_IDENTITY = 'DEV_SESSION_TMUX_IDENTITY'
   ENV_MEMBER_ADDRESS = 'DEV_SESSION_MEMBER_ADDRESS'
   ENV_EXPECTED_ROOT_THREAD_ID = 'DEV_SESSION_EXPECTED_ROOT_THREAD_ID'
+  ENV_EXPECTED_MEMBER_THREAD_ID = 'DEV_SESSION_EXPECTED_MEMBER_THREAD_ID'
 
   TMUX_METADATA = RUNTIME_CONTRACT.fetch('tmuxMetadata').freeze
   TMUX_AUTHORITY_FORMAT = TMUX_METADATA.fetch('authorityFormat').freeze
@@ -1866,6 +1867,12 @@ module DevSession
         next if action == 'assign' && name == :message
         next if value.nil? || value.empty?
         command.concat(["--#{name.to_s.tr('_', '-')}", value])
+      end
+	  if @env.key?(ENV_EXPECTED_MEMBER_THREAD_ID)
+        unless action == 'assign' && from == @env[ENV_MEMBER_ADDRESS] && to == 'lead' && @env.key?(ENV_EXPECTED_ROOT_THREAD_ID)
+          raise Error, 'report identity requires an exact member-to-lead assignment'
+        end
+        command.concat(['--expected-member-thread-id', @env.fetch(ENV_EXPECTED_MEMBER_THREAD_ID)])
       end
 	  command.concat(['--input-file', '/dev/stdin']) if action == 'assign'
 	  command.concat(['--source-session-slug', source_slug]) if source_slug && !source_slug.empty?

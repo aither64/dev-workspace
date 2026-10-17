@@ -81,3 +81,32 @@ func TestRegistrationPlanSupportsUnmanagedPackage(t *testing.T) {
 		t.Fatalf("unmanaged package invented native registration: %#v", plan)
 	}
 }
+
+func TestWorkspaceReportingRegistrationKeepsOnlyOwnedStartupOverrides(t *testing.T) {
+	root := "/nix/store/00000000000000000000000000000000-dev-workspace"
+	base, err := buildRegistrationPlan(root, func(string) (Installed, error) { return Installed{packageRoot: root}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := base.WithWorkspaceReporting(root, "/state", "/work tree", "/custom/profile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Argv) != 10 || plan.Digest == base.Digest {
+		t.Fatalf("reporting launch %#v", plan)
+	}
+	for i := 0; i < len(plan.Argv); i += 2 {
+		if plan.Argv[i] != "-c" || !strings.HasPrefix(plan.Argv[i+1], "mcp_servers.team_reporting.") {
+			t.Fatalf("unowned override %#v", plan.Argv)
+		}
+	}
+	other, err := base.WithWorkspaceReporting(root, "/state", "/work tree", "/different/profile")
+	if err != nil || other.Digest == plan.Digest {
+		t.Fatal("custom profile missing from semantic launch")
+	}
+	for _, path := range []string{"relative", "/unclean/../path", "/bad\x00path"} {
+		if _, err := base.WithWorkspaceReporting(root, path, "/workspace", "/profile"); err == nil {
+			t.Fatalf("accepted %q", path)
+		}
+	}
+}

@@ -815,3 +815,62 @@ class WorkspaceHostTest < Minitest::Test
     }
   end
 end
+
+class WorkspaceHostTest < Minitest::Test
+  def test_reporting_startup_argv_is_exact_and_requires_same_binary_idle_restart
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory, argv: [])
+      codex = File.realpath(host.send(:active_codex))
+      old_plan = host.send(:registration_plan_for, entry, package:)
+      host.send(:write_registration_marker, entry, codex, old_plan)
+      profile = host.instance_variable_get(:@profile)
+      state = host.instance_variable_get(:@state)
+      values = [
+        ['command', File.join(package, 'bin/workspace-portal')],
+        ['args', ['team-mcp', '--user-state-root', state, '--workspace', entry.fetch('root'), '--host-profile', profile]],
+        ['required', true], ['enabled_tools', ['report_to_lead']], ['tools.report_to_lead.approval_mode', 'approve']
+      ]
+      argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+      contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      data = JSON.parse(File.read(contract))
+      data['workspaceReportingPolicy'] = 1
+      File.write(contract, JSON.generate(data))
+      host.responses = { entry.fetch('name') => registration_response(digest: 'b' * 64, argv:) }
+      plan = host.send(:registration_plan_for, entry, package:)
+      assert_equal(argv, plan.argv)
+      assert(host.send(:registration_restart_required?, [[entry, plan]], codex))
+      [[], argv + ['-c', 'mcp_servers.unrelated.command="bad"'],
+       argv.map { |v| v.sub('team_reporting.command', 'foreign.command') },
+       argv.map { |v| v.sub('report_to_lead', 'another_tool') },
+       argv.map { |v| v.sub(profile, '/foreign/profile') },
+       argv + argv].each do |bad|
+        host.responses = { entry.fetch('name') => registration_response(argv: bad) }
+        assert_raises(DevWorkspaceHost::Error) { host.send(:registration_plan_for, entry, package:) }
+      end
+    end
+  end
+end
+
+class WorkspaceHostTest < Minitest::Test
+  def test_reporting_registration_helper_receives_custom_stable_profile
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory, argv: [])
+      profile = File.join(directory, 'custom-profile')
+      host.instance_variable_set(:@profile, profile)
+      contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      data = JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => 1)
+      File.write(contract, JSON.generate(data))
+      trace = File.join(directory, 'helper-arguments')
+      helper = File.join(package, 'bin/workspace-portal')
+      response = JSON.generate(registration_response(argv: []))
+      File.write(helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > #{trace.shellescape}\ncat >/dev/null\nprintf '%s' #{response.shellescape}\n")
+      File.chmod(0o700, helper)
+      DevWorkspaceHost::Host.instance_method(:run_registration_helper).bind_call(host, package, entry)
+      argv = File.readlines(trace, chomp: true)
+      assert_equal profile, argv.fetch(argv.index('--host-profile') + 1)
+      assert_equal entry['root'], argv.fetch(argv.index('--workspace') + 1)
+      assert_equal package, argv.fetch(argv.index('--package-root') + 1)
+      assert_equal 'registration', argv[1]
+    end
+  end
+end

@@ -336,6 +336,61 @@ class WorkspaceHostTest
     end
   end
 
+  def test_daemon_reporting_helpers_require_exact_validated_launch_and_idle_parent
+    with_provider_host do |host, entry|
+      directory = File.dirname(host.instance_variable_get(:@state))
+      package = make_package(directory, 'reporting-launch')
+      contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => 1)))
+      host.define_singleton_method(:package_root) { package }
+      host.instance_variable_set(:@profile, File.join(directory, 'custom-profile'))
+      host.define_singleton_method(:load_registration_marker) do |selected|
+        DevWorkspaceHost::Host.instance_method(:load_registration_marker).bind_call(self, selected)
+      end
+      command = File.join(package, 'bin/workspace-portal')
+      args = ['team-mcp', '--user-state-root', host.instance_variable_get(:@state), '--workspace', entry.fetch('root'),
+        '--host-profile', host.instance_variable_get(:@profile)]
+      values = {'command' => command, 'args' => args, 'required' => true, 'enabled_tools' => ['report_to_lead'],
+        'tools.report_to_lead.approval_mode' => 'approve'}
+      argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+      plan = DevWorkspaceHost::RegistrationPlan.new(package_root: package, argv: argv, digest: 'a' * 64,
+        policy: 1, required_native_child_threads: 0, states: [])
+      host.send(:write_registration_marker, entry, '/proved/native/codex', plan)
+      host.processes = [123, 456]
+      host.children = {456 => {binary: command, parent: 123, arguments: [command, *args]}}
+      inventory = {'blockers' => [], 'threads' => []}
+      host.send(:require_provider_restart_safe!, entry, inventory)
+      # Exact old launch remains owned while a compatible selected package is
+      # completing forward recovery; the marker retains its original command.
+      replacement = make_package(directory, 'new-selected')
+      host.define_singleton_method(:package_root) { replacement }
+      host.send(:require_provider_restart_safe!, entry, inventory)
+      host.define_singleton_method(:package_root) { package }
+      [2, 4, 6].each do |position|
+        changed = args.dup; changed[position] = '/foreign'
+        host.children[456][:arguments] = [command, *changed]
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      end
+      host.children[456][:arguments] = [command, *args, '--unexpected']
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      host.children[456][:arguments] = [command, *args]
+      host.children[456][:parent] = 999
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      host.children[456][:parent] = 123
+      inventory['blockers'] = ['active member']
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      inventory['blockers'] = []
+      marker_path = host.send(:registration_marker_path, entry)
+      original = File.binread(marker_path)
+      File.write(marker_path, '{}')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      File.write(marker_path, original)
+      host.children[456][:binary] = '/foreign/workspace-portal'
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_provider_restart_safe!, entry, inventory) }
+      refute host.calls.any? { |call| call.include?('stop') }
+    end
+  end
+
   def prepare_diagnostic_apply(host, entry)
     id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     host.send(:provider_command, ['request', 'example', 'pool', id])

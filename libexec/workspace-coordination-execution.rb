@@ -60,7 +60,7 @@ module WorkspaceCoordination
       store.read['jobs'].fetch(reply['id'])
     end
 
-    def reconcile_job(owner, id)
+    def reconcile_job(owner, id, candidate_host: nil)
       job = store.read['jobs'].fetch(id) { raise Error, 'unknown coordinated operation' }
       raise Error.new('operation belongs to another owner', 4) unless job['ownerId'] == owner['id']
       return reply(job, owner) unless CLAIMED.include?(job['state'])
@@ -92,6 +92,14 @@ module WorkspaceCoordination
             'expectedLive' => operation.fetch('expectedLive'), 'attemptId' => job['attempt'], 'requestDigest' => request['digest'], 'attemptDirectory' => directory})
           outcome, observed, error = response.values_at('outcome', 'observed', 'error')
           outcome, error = 'not_applied', 'worker ended before machine mutation intent' if phase && phase['phase'] == 'admitted'
+        elsif candidate_host && job['kind'] == 'profile_activate' &&
+              candidate_host == File.join(operation.fetch('candidatePackage'), 'bin/workspace-host') &&
+              DevWorkspaceProfileIdentity.token(profile) == operation.fetch('expectedProfileToken') &&
+              phase && phase['phase'] == 'profile_intent'
+          # Explicit first-upgrade recovery uses the exact prepared candidate
+          # under the original exited attempt, never another activation job.
+          capture(candidate_host, 'activate-prepared', '--artifact', operation.fetch('preparedArtifact'), '--attempt', job['attempt'])
+          outcome, observed = 'applied', {'package' => File.realpath(profile), 'profileToken' => DevWorkspaceProfileIdentity.token(profile)}
         elsif File.realpath(profile) == operation.fetch('candidatePackage')
           # Selection alone is not successful activation. Re-enter the exact
           # admitted candidate to finish its forward activation and checks.

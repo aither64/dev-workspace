@@ -679,6 +679,10 @@ func (store *Store) LockOperation(ctx context.Context, slug string) (func(), err
 }
 
 func (store *Store) Load(slug, rootThreadID string) (*Roster, error) {
+	return store.load(slug, rootThreadID, false)
+}
+
+func (store *Store) load(slug, rootThreadID string, discover bool) (*Roster, error) {
 	if !session.ValidSlug(slug) {
 		return nil, errors.New("invalid session slug")
 	}
@@ -697,6 +701,12 @@ func (store *Store) Load(slug, rootThreadID string) (*Roster, error) {
 	var roster Roster
 	if err := json.Unmarshal(data, &roster); err != nil {
 		return nil, fmt.Errorf("decode team roster: %w", err)
+	}
+	if discover {
+		rootThreadID = roster.RootThreadID
+		if rootThreadID == "" {
+			return nil, errors.New("team roster has no lead")
+		}
 	}
 	if err := roster.Validate(store.workspace, slug, rootThreadID); err != nil {
 		return nil, err
@@ -822,13 +832,14 @@ type Client interface {
 }
 
 type Service struct {
-	Progress         creationprogress.Observer
-	Store            *Store
-	Client           Client
-	Workspace        string
-	HostProfile      string
-	Catalog          *agentteams.Catalog
-	ValidateSettings func(context.Context, codex.ThreadSettings) error
+	Progress               creationprogress.Observer
+	Store                  *Store
+	Client                 Client
+	Workspace              string
+	HostProfile            string
+	ExpectedReporterThread string
+	Catalog                *agentteams.Catalog
+	ValidateSettings       func(context.Context, codex.ThreadSettings) error
 }
 
 type MemberSettingsError struct{ Err error }
@@ -836,49 +847,14 @@ type MemberSettingsError struct{ Err error }
 func (failure *MemberSettingsError) Error() string { return failure.Err.Error() }
 func (failure *MemberSettingsError) Unwrap() error { return failure.Err }
 
-// memberTurnPolicy binds the report tool to the exact roster identity on each
-// resume before a member turn. A thread ID is unavailable during thread/start
-// and thread/fork; neither operation can expose this helper before the roster
-// has durably recorded that ID.
+// Reporting is installed once at daemon startup. A warm materialized native
+// thread ignores a newly inserted per-thread MCP server on resume. Keep saved
+// sandbox/instructions here; legacy queued policies remain readable unchanged.
 func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member) (codex.ThreadPolicy, error) {
 	if service.Store == nil || member.Thread == "" || !session.ValidSlug(slug) || rootThreadID == "" || member.Address == "" {
-		return codex.ThreadPolicy{}, errors.New("member report tool has incomplete roster identity")
+		return codex.ThreadPolicy{}, errors.New("member policy has incomplete roster identity")
 	}
-	policy, err := memberPolicy(service.Store.workspace, slug, member)
-	if err != nil {
-		return codex.ThreadPolicy{}, err
-	}
-	command, err := os.Executable()
-	if err != nil {
-		return codex.ThreadPolicy{}, fmt.Errorf("locate member report helper: %w", err)
-	}
-	command, err = filepath.EvalSymlinks(command)
-	if err != nil {
-		return codex.ThreadPolicy{}, fmt.Errorf("locate canonical member report helper: %w", err)
-	}
-	if !filepath.IsAbs(command) || filepath.Clean(command) != command {
-		return codex.ThreadPolicy{}, errors.New("member report helper path is not canonical and absolute")
-	}
-	identity := strings.Join([]string{service.Store.workspace, slug, rootThreadID, member.Address, member.Thread}, "\x00")
-	hostProfile := service.HostProfile
-	if hostProfile == "" {
-		hostProfile = filepath.Join(service.Store.stateRoot, "profile")
-	}
-	if !filepath.IsAbs(hostProfile) || filepath.Clean(hostProfile) != hostProfile {
-		return codex.ThreadPolicy{}, errors.New("member report host profile must be an absolute clean path")
-	}
-	digest := sha256.Sum256([]byte(identity))
-	policy.MCPServer = &codex.ThreadMCPServer{
-		Name: "team_" + hex.EncodeToString(digest[:16]), Tool: "report_to_lead", Command: command,
-		Args: []string{
-			"team-mcp", "--user-state-root", service.Store.stateRoot,
-			"--host-profile", hostProfile,
-			"--workspace", service.Store.workspace, "--session-slug", slug,
-			"--root-thread-id", rootThreadID, "--member-address", member.Address,
-			"--member-thread-id", member.Thread,
-		},
-	}
-	return policy, nil
+	return memberPolicy(service.Store.workspace, slug, member)
 }
 
 // MemberTurnPolicy is the same package-owned policy used by team assignments.
@@ -2218,10 +2194,19 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	if err != nil {
 		return codex.SendReceipt{}, err
 	}
+	if service.ExpectedReporterThread != "" {
+		if from == "lead" || to != "lead" {
+			return codex.SendReceipt{}, errors.New("report identity requires a member-to-lead assignment")
+		}
+		reporter, err := service.Store.ResolveReporter(service.ExpectedReporterThread)
+		if err != nil || reporter.Slug != slug || reporter.RootThreadID != rootThreadID || reporter.Member.Address != from {
+			return codex.SendReceipt{}, errors.New("report caller or lead changed before delivery")
+		}
+	}
 	if from != "lead" {
 		found := false
 		for _, member := range roster.Members {
-			if member.Address == from && member.State == "ready" {
+			if member.Address == from && member.State == "ready" && member.RemovedAt == nil && member.RetireIntent == "" {
 				found = true
 				break
 			}
