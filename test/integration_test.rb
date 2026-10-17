@@ -866,4 +866,44 @@ class IntegrationTest < Minitest::Test
     pauser&.join
   end
 
+  def test_all_repository_preflight_catches_unpublished_default_before_creating_a_run
+    first = owner('preflight')
+    payload = integration_request(first)
+    git('-C', @bare, 'update-ref', 'refs/heads/master', payload['repositories'][0]['head'])
+    integration = driver(first)
+    error = assert_raises(WorkspaceCoordination::Error) { integration.start(payload, background: true) }
+    assert_match(/code: local refs\/heads\/master has unpublished/, error.message)
+    refute File.exist?(integration.path(payload['requestId']))
+    assert_empty @engine.store.read['jobs']
+    assert_empty @engine.store.read['approvals']
+  end
+
+  def test_unprepared_retry_recertifies_tracking_refresh_instead_of_trusting_cached_head
+    first = owner('cached-preparation')
+    integration = driver(first)
+    payload = integration_request(first)
+    checkout = File.join(@workspace, 'worktrees', first['slug'], 'code')
+    FileUtils.mkdir_p(File.dirname(checkout))
+    git('-C', @bare, 'worktree', 'move', File.join(@tmp, first['slug']), checkout)
+    original_prepare = integration.instance_variable_get(:@prepare)
+    integration.instance_variable_set(:@prepare, ->(*) { raise WorkspaceCoordination::Error.new('fixture preparation stopped', 3) })
+    integration.start(payload, background: true)
+    integration.run_background(payload['requestId'])
+    old = integration.read(payload['requestId']).dig('operations', 'code', 'expectedHead')
+    refute integration.read(payload['requestId']).dig('operations', 'code', 'snapshot')
+    seed = File.join(@tmp, 'seed')
+    FileUtils.mkdir_p(File.join(seed, 'work', 'another'))
+    File.write(File.join(seed, 'work', 'another', 'state.md'), 'tracking-only advancement')
+    git('-C', seed, 'add', 'work/another/state.md')
+    git('-C', seed, 'commit', '-m', 'fixture tracking-only advancement')
+    git('-C', seed, 'push', 'origin', 'master')
+    integration.instance_variable_set(:@prepare, original_prepare)
+    integration.arm_background(payload['requestId'])
+    result = integration.run_background(payload['requestId'])
+    assert_equal 'merging', result['phase']
+    refute_equal old, integration.read(payload['requestId']).dig('operations', 'code', 'expectedHead')
+    assert_equal 'reconstructed_patch', integration.read(payload['requestId']).dig('operations', 'code', 'proof', 'relation')
+    assert_equal 1, @engine.store.read['jobs'].length
+  end
+
 end

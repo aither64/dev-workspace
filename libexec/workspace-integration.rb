@@ -72,6 +72,7 @@ module WorkspaceCoordination
           raise Error.new('integration requestId reused with changed input', 3) unless value['request'] == WorkspaceCoordination.canonical(request)
         else
           validate(request)
+          preflight(request)
           value = {'schema' => background ? 2 : 1, 'id' => id, 'ownerId' => owner['id'], 'identity' => owner['identity'],
             'phase' => 'prepare', 'request' => WorkspaceCoordination.canonical(request), 'steps' => {},
             'operations' => {}, 'jobs' => {}, 'replacements' => [], 'startedAt' => Time.now.utc.iso8601,
@@ -99,6 +100,23 @@ module WorkspaceCoordination
 
     def data_refresh(repository)
       @catalog.data.fetch('refreshes', {})[repository]
+    end
+
+    def preflight(request)
+      request.fetch('repositories').each do |item|
+        name = item.fetch('repository')
+        repository, _, _, = engine.repository(owner, name)
+        engine.capture('git', '-C', repository, 'fetch', 'origin', item.fetch('target'))
+        remote = engine.remote_head(repository, item.fetch('target'))
+        local, _, status, = Command.run(['git', '-C', repository, 'rev-parse', '--verify', item.fetch('target')])
+        if status.success? && !engine.ancestor?(repository, local.strip, remote)
+          raise Error.new("#{name}: local #{item['target']} has unpublished commits; reconcile tracking publication before integration", 3)
+        end
+        worktree = File.join(engine.workspace, 'worktrees', owner['slug'], name)
+        if File.directory?(worktree) && !engine.capture('git', '-C', worktree, 'status', '--porcelain').empty?
+          raise Error.new("#{name}: owned feature worktree has uncommitted changes", 3)
+        end
+      end
     end
 
     def validate(request)
@@ -205,7 +223,7 @@ module WorkspaceCoordination
           name = item['repository']
           operation = value['operations'][name] ||= {}
           unless operation['snapshot']
-            operation['expectedHead'] ||= refresh(value, item)
+            operation['expectedHead'] = refresh(value, item)
             save(value)
             verify_head(value, name)
             verify_checks(value, name)
