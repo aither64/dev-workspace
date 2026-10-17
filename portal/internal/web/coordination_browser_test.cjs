@@ -274,7 +274,7 @@ test('background runs show automatic waiting and action reasons without changing
   p.workspaces[0].owners = [{id: 'owner', slug: 'holder', observationIdentity: 'incarnation-a', portalUrl: 'https://workspace.test/holder/'}];
   p.workspaces[0].integrations = [{id: 'run-1', ownerId: 'owner', phase: 'merging', continuation: {state: 'waiting'}},
     {id: 'run-2', ownerId: 'owner', phase: 'deploying', continuation: {state: 'needs_attention'}, reason: {message: 'Prepare an updated artifact.'}},
-    {id: 'run-3', ownerId: 'owner', phase: 'prepare', continuation: {state: 'paused'}},
+    {id: 'run-3', ownerId: 'owner', phase: 'prepare', continuation: {state: 'paused'}, handoff: {state: 'pending'}},
     {id: 'run-4', ownerId: 'owner', phase: 'complete', outcome: 'canceled', continuation: {state: 'complete'}}];
   await h.respond(p);
   assert.match(h.panel.textContent, /Background integrations/);
@@ -282,6 +282,7 @@ test('background runs show automatic waiting and action reasons without changing
   assert.match(h.panel.textContent, /Agent action required/);
   assert.match(h.panel.textContent, /Prepare an updated artifact/);
   assert.match(h.panel.textContent, /Continuation is paused/);
+  assert.match(h.panel.textContent, /Waiting for an agent to respond/);
   assert.match(h.panel.textContent, /Canceled before any operation was submitted/);
   assert.equal(h.badge.hidden, true);
 });

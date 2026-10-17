@@ -28,6 +28,31 @@ dev-session coordination integration-pause SESSION RUN_UUID --as-is --json
 dev-session coordination integration-resume SESSION RUN_UUID --as-is --background --json
 ```
 
+Before accepting a new run, the driver checks every repository for unpublished
+local default commits and dirty owned worktrees. A failure names the repository
+and leaves no new journal or operation. Successful admission returns a run ID in
+`prepare`; merges have started only after merge jobs appear in status.
+
+Background mode requires `CODEX_THREAD_ID`/`CODEX_SESSION_ID` to agree with the
+session's retained lead. Conflicting identities refuse. An unknown or external
+conversation cannot rely on that lead's App Server to wake it. Use ordinary
+foreground integration, or explicitly add `--to-session-lead` to hand responsibility
+to the managed lead. This does not rebind the session or change saved policies.
+
+For an existing background run, an external conversation can stay attached:
+
+```sh
+dev-session coordination integration-resume SESSION RUN_UUID --as-is --foreground --json
+```
+
+This command supervises the same run under its driver lock. Operation claims
+remain separate, so workers can execute submitted jobs. Background continuation
+stays disabled while supervision owns the run. Failure returns to the caller; ordinary errors pause continuation. After a
+package-generation change, resume the same run through the selected command.
+The supervised marker prevents implicit background takeover. Explicit resume
+selects foreground supervision or a verified managed recipient. Keep the caller observed through the development
+monitoring procedure. A detached external conversation has no automatic wake-up.
+
 Acceptance returns the run ID before preparation begins. Record it in session
 state, continue any independent work, then end the turn. A systemd worker prepares
 and advances the approved operations without an attached CLI, browser or agent.
@@ -41,6 +66,27 @@ need agent action. Read authoritative status when it arrives. A message supplies
 no merge or deployment approval and preserves the retained model and policy.
 The lead reviews the result and updates initiative completion; background run
 completion alone does not close the initiative or release a review reservation.
+
+### Agent pickup
+
+An attention or review notice has a `handoff` record in integration status.
+`pending` means no agent has acknowledged responsibility. Native delivery receipts
+alone do not change it. The matching managed lead acknowledges the exact event:
+
+```sh
+dev-session coordination integration-ack SESSION RUN_UUID --as-is --request ack.json --json
+```
+
+The schema-1 request contains a fresh UUID `requestId`, the status record's
+`eventId`, and its integer `generation`. The caller's Codex identity must match
+the retained recipient. A stale generation or another conversation refuses.
+An exact request retry returns the original receipt. Acknowledgement lasts five
+minutes; renew with a fresh request while handling the action. After an unclaimed
+or expired acknowledgement, the coordinator retries the same logical event with
+a new native delivery attempt. Reminders back off to at most one per fifteen
+minutes. They may produce duplicates and never replay operations. The Operations
+page distinguishes delivery from agent response. Pickup does not gate operation
+completion, tracking publication or machine release.
 
 Preparation with no submitted operations can be canceled explicitly:
 
@@ -217,3 +263,13 @@ nix develop --command ruby test/run_ruby_suite.rb \
 The flake exports individual `ruby-*` checks; the package exposes `rubyChecks`.
 The development shell provides build/test tools without building verification
 outputs merely to prepare hook dependencies.
+
+Optional bounded handoff metadata extends schema-2 journals without changing
+operation, ledger or native request formats. Schema-2 predecessors can read it
+but do not enforce recipient verification or agent acknowledgement. A rollback
+therefore loses those handoff guarantees while preserving operation authority.
+They also ignore the supervised marker and can resume a runnable continuation
+without its attached caller. Pause or settle supervised runs before rollback
+when that supervision boundary must be preserved.
+Retained schema-2 journals still require a compatible reader. Canceled runs retain
+their explicit outcome; older displays may label their terminal phase completed.

@@ -11,9 +11,16 @@ for exact owned operations; keep all recovery evidence and roots.
 Prepare and verify work independently. Request a machine only near the first
 prepared deployment. Submit approved work, then continue other useful work.
 Use the integration driver's `--background` mode when combining approved merges
-and deployments. Record the returned run ID and end the turn when no independent
-work remains. The worker continues and sends a native message for action or
-review. Read status when that message arrives. Individual submitted jobs also
+and deployments. Background handoff verifies the caller's managed Codex identity and runs a cheap
+Git preflight. Record the returned run ID and distinguish preparation from
+submitted merge jobs. End the turn when no independent
+work remains and the recipient is verified. The worker continues and sends a native message for action or
+review. Read status when that message arrives and acknowledge its exact handoff event
+and generation before handling the action. Renew the five-minute acknowledgement
+while work continues. A delivered native message alone does not establish pickup.
+For an external conversation, use `integration-resume --foreground` under an
+attached observer, or explicitly select `--background --to-session-lead` to hand
+responsibility to the retained managed lead. Individual submitted jobs also
 run independently and retain their existing state notifications.
 
 Do not keep a turn open to poll reservations or ask the user to restart it when

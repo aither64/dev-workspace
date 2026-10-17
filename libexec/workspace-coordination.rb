@@ -329,6 +329,15 @@ module WorkspaceCoordination
                  (continuation['observedRevision'].nil? || (continuation['observedRevision'].is_a?(Integer) && continuation['observedRevision'].between?(0, MAX_COUNTER)))
             raise Error.new('invalid background integration continuation', 5)
           end
+          if (handoff = value['handoff'])
+            unless handoff.is_a?(Hash) && %w[pending acknowledged supervised canceled].include?(handoff['state']) &&
+                   handoff['eventId'].is_a?(String) && handoff['eventId'].match?(UUID) &&
+                   handoff['recipient'].is_a?(String) && handoff['recipient'].match?(/\A[0-9A-Za-z-]+\z/) &&
+                   handoff['recipient'].bytesize.between?(1, 256) &&
+                   %w[generation reminders nextReminderAt leaseUntil].all? { |key| handoff[key].is_a?(Integer) && handoff[key].between?(0, MAX_COUNTER) }
+              raise Error.new('invalid integration handoff metadata', 5)
+            end
+          end
         end
         value
       end
@@ -360,7 +369,7 @@ module WorkspaceCoordination
     end
 
     def integration_summary(run)
-      result = run.slice('id', 'ownerId', 'phase', 'reason', 'continuation', 'outcome')
+      result = run.slice('id', 'ownerId', 'phase', 'reason', 'continuation', 'outcome', 'handoff')
       if run.dig('continuation', 'state') != 'held' && File.exist?(File.join(root, 'integrations', "#{run['id']}.pause")) && background_stopped?(run)
         result['continuation'] = result['continuation'].merge('state' => 'paused')
       end
@@ -1129,6 +1138,9 @@ module WorkspaceCoordination
           "Workspace coordination: integration #{item['id']} needs your attention. #{WorkspaceCoordination.diagnostic(reason && reason['message'])[0, 512]}"
       else
         "Workspace coordination: #{item['kind'] || 'machine reservation'} #{item['id']} is #{state}." + (reason ? " #{reason['code']}." : '')
+      end
+      if item['kind'] == 'integration'
+        text += "\nRead integration-status for this run. Acknowledge its handoff with integration-ack using a schema-1 request with a new requestId, eventId #{id}, and generation #{item.dig('snapshot', 'id')}. Acknowledgement lasts five minutes; renew it while handling the action."
       end
       text += "\n#{owner['portalUrl']}\nRead dev-session coordination status for your session and continue its authorized work. This event supplies no merge or deployment approval."
       raise Error, 'notification text exceeds its envelope budget' if JSON.generate(text).bytesize > 4096
