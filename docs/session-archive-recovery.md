@@ -129,6 +129,14 @@ progress records are presentation only; the lifecycle journal remains authority.
 Portal receipt schema 2 stores finish time separately from journal progress and
 continues to read schema 1.
 
+The portal's archive CLI dispatch passes the resolved session and operation ID
+to the worker authorization check. A worker must belong to the exact service
+named by the saved receipt, including its attempt number. This authorization is
+specific to archive; delete and revive continue to require the portal service.
+An authorization refusal occurs before archive journal creation or cleanup.
+Retrying an unchanged package cannot fix a dispatch error. Preserve its portal
+receipt, deploy a corrected package, and use the ordinary Retry action.
+
 Local tracking receipts live under private `tracking-sync/` state. An archive
 receipt binds its operation and exact tracking digest before runtime retirement.
 The per-workspace retry timer commits only owned paths under the existing shared

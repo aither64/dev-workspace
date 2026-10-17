@@ -9546,7 +9546,7 @@ module DevSession
         unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
           raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
         end
-        validate_portal_authorization!(archive_slug: slug, archive_operation_id: operation_id)
+        validate_portal_authorization!
       else
         if opts.fetch(:portal_operation_id)
           raise Error, '--portal-operation-id requires --portal-authorized'
@@ -9661,11 +9661,11 @@ module DevSession
       require_arity!(1, @argv, 'archive')
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
       if opts.fetch(:portal_authorized)
-        validate_portal_authorization!
         operation_id = opts.fetch(:portal_operation_id)
         unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
           raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'
         end
+        validate_portal_authorization!(archive_slug: slug, archive_operation_id: operation_id)
       else
         if opts.fetch(:portal_operation_id)
           raise Error, '--portal-operation-id requires --portal-authorized'

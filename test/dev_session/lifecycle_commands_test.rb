@@ -1337,6 +1337,73 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_only_archive_dispatch_accepts_its_receipt_bound_worker
+    Dir.mktmpdir('dev-session-archive-worker') do |directory|
+      cgroup = File.join(directory, 'cgroup')
+      unit = "workspace-archive-#{'a' * 64}-1.service"
+      File.write(cgroup, "0::/user.slice/app.slice/#{unit}\n")
+      %w[archive delete revive].each do |command|
+        [true, false].each do |receipt_matches|
+          calls = []
+          runner = Object.new
+          runner.define_singleton_method(:resolve_slug) { |slug, as_is:| slug }
+          runner.define_singleton_method(:authorized_archive_worker?) do |*identity|
+            calls << [:authorize, *identity]
+            receipt_matches
+          end
+          runner.define_singleton_method(command) { |*args, **opts| calls << [:execute, args, opts] }
+          errors = StringIO.new
+          cli = DevSession::CLI.new(
+            ['--require-runtime', '--authority-dir', '/run/user/1000/dev-workspaces/example/authority',
+             '--portal-command', '/package/workspace-portal', '--', command, 'example',
+             '--as-is', '--portal-authorized', '--portal-operation-id', 'b' * 64],
+            input: StringIO.new, out: StringIO.new, err: errors, cgroup_file: cgroup, env: {}
+          )
+          cli.define_singleton_method(:runner) { runner }
+          accepted = command == 'archive' && receipt_matches
+          assert_equal(accepted ? 0 : 1, cli.run, "#{command}: #{errors.string}")
+          assert_equal(command == 'archive' ? [[:authorize, 'example', 'b' * 64, unit]] : [],
+                       calls.select { |entry| entry.first == :authorize })
+          assert_equal(accepted ? 1 : 0, calls.count { |entry| entry.first == :execute })
+          assert_includes(errors.string, 'not available to this process') unless accepted
+        end
+      end
+    end
+  end
+
+  def test_archive_worker_authorization_requires_the_exact_saved_receipt
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      path = File.join(runner.instance_variable_get(:@workspace_state_root), 'portal', workspace_id,
+                       'lifecycle-operations.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      receipt = { 'slug' => 'example', 'kind' => 'archive', 'state' => 'running',
+                  'receiptId' => 'a' * 64, 'attempt' => 1,
+                  'options' => { 'journalId' => 'b' * 64 } }
+      unit = "workspace-archive-#{'a' * 64}-1.service"
+      write = lambda do |record, owner = workspace|
+        File.write(path, JSON.generate('schema' => 2, 'workspace' => owner, 'operations' => [record]))
+        File.chmod(0o600, path)
+      end
+      %w[running paused failed].each do |state|
+        write.call(receipt.merge('state' => state))
+        assert(runner.authorized_archive_worker?('example', 'b' * 64, unit))
+      end
+      write.call(receipt)
+      refute(runner.authorized_archive_worker?('other', 'b' * 64, unit))
+      refute(runner.authorized_archive_worker?('example', 'c' * 64, unit))
+      refute(runner.authorized_archive_worker?('example', 'b' * 64, unit.sub('-1.', '-2.')))
+      refute(runner.authorized_archive_worker?('example', 'b' * 64, unit.sub('a' * 64, 'c' * 64)))
+      [{ 'state' => 'complete' }, { 'kind' => 'delete' }].each do |change|
+        write.call(receipt.merge(change))
+        refute(runner.authorized_archive_worker?('example', 'b' * 64, unit))
+      end
+      write.call(receipt, workspace + '-other')
+      refute(runner.authorized_archive_worker?('example', 'b' * 64, unit))
+    end
+  end
+
   def test_cli_accepts_an_exactly_maximum_size_interactive_request
     captured = nil
     fake_runner = Object.new
