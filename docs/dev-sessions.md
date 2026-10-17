@@ -394,14 +394,23 @@ automatic specialists. A Lead and reviewer lead also owns design and application
 edits and uses its retained reviewer for independent final review.
 A Lead-designed lead owns the design brief and assigns
 application work to an implementer; a Full-team lead assigns nontrivial design
-to its design-purpose member and application work to its implementation-purpose
-member. The design owner writes the design and verification brief before
+to its design-purpose member and complete execution packages to its implementation-purpose
+members. The design owner writes the design and verification brief before
 substantive implementation. Implementers accept either an architect-owned or
 lead-owned brief; bounded small edits can use a direct lead brief.
 
 For each new substantive team work item, the lead checks the current roster,
 uses ready members with saved settings and suitable access, then integrates
-their reports. It handles short or dependent coordination steps itself. Adding,
+their reports. The lead keeps brief scoping, acceptance inspection, session tracking,
+approval-bound coordination and user communication, including required
+context-dependent writing. Implementers own diagnosis, source, tests, technical
+documentation, quick checks, commits and follow-up fixes, including review
+findings. Dependent implementation stays delegated. The lead tracks owners,
+acceptance criteria, dependencies and checks, assigns independent packages to
+available implementers, and serializes overlapping edits and Git operations.
+It waits for reports without duplicating specialist investigation. If the live
+roster has no implementer, the lead implements; busy or inaccessible members
+require resolving the condition rather than taking their work. Adding,
 replacing or reconfiguring members requires explicit user direction. Manual
 team controls remain available, and user-directed team changes apply without
 restarting the lead. Selecting a team creates no automatic work assignments.

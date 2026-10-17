@@ -27,3 +27,15 @@ func TestLeadPolicyBindsSessionWithoutReplacingFrozenRoleInstructions(t *testing
 		t.Fatal("legacy policy unexpectedly has a session binding")
 	}
 }
+
+func TestFallbackLeadDelegatesExecutionAndDistinguishesMissingMembers(t *testing.T) {
+	text := LeadThreadPolicy("", "", "").DeveloperInstructions
+	for _, expected := range []string{"complete execution packages", "dependent implementation", "acceptance criteria", "short coordination steps", "no implementation member, implement yourself", "busy, unready or inaccessible"} {
+		if !strings.Contains(text, expected) {
+			t.Errorf("missing %q", expected)
+		}
+	}
+	if strings.Contains(text, "Keep short or dependent steps yourself") {
+		t.Fatal("broad execution exception remains")
+	}
+}
