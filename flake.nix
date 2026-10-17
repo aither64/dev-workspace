@@ -112,6 +112,9 @@
         session-recovery-boot = import ./nix/tests/session-recovery-boot.nix {
           inherit pkgs self devWorkspace;
         };
+        session-archive-lifecycle = import ./nix/tests/session-archive-lifecycle.nix {
+          inherit pkgs self devWorkspace;
+        };
         host-package-contract = import ./nix/tests/host-package-contract.nix {
           inherit devWorkspace hostPaths pkgs;
         };

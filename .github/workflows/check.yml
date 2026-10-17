@@ -24,9 +24,24 @@ jobs:
         run: |
           check_names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
           mapfile -t checks < <(
-            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot") | ".#checks.x86_64-linux." + .' <<< "$check_names"
+            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot" and . != "session-archive-lifecycle") | ".#checks.x86_64-linux." + .' <<< "$check_names"
           )
           nix build --no-link --print-build-logs "${checks[@]}"
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Enable VM acceleration
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+      - uses: cachix/install-nix-action@v31.11.2
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+      - name: Packaged browser archive, recovery and revival
+        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-archive-lifecycle
   host:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest

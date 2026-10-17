@@ -412,3 +412,12 @@ idempotency, nginx authentication, renewal, recovery and rollback. Dispatch
 feature-branch VM tests after mandatory review. The VM job requires KVM
 acceleration. Review cold-run timings when changing these checks; the target for
 a normal dependency update is under 20 minutes.
+
+The separate `session-archive-lifecycle` VM check runs on every push and pull
+request. It uses the shipped browser, portal, systemd worker, CLI and native App
+Server to archive and revive disposable sessions without model turns. It checks
+dirty-file/index restoration, portal restart, worker interruption, recovery after
+checkout removal and deferred tracking synchronization. Run it after independent
+review and require it before deployment. Component tests with fake commands do
+not establish that the packaged archive workflow works. Verify a disposable
+archive/revive against the selected package after deployment as well.
