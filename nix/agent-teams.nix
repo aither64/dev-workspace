@@ -192,18 +192,45 @@ let
         && (builtins.getAttr team.routing.low_risk_review_role team.roles).fresh_context
       )
     );
+  validInitialMemberCounts =
+    team:
+    let
+      counts = team.initial_member_counts or { };
+      memberRoles = builtins.filter (name: name != "team_lead") (builtins.attrNames team.roles);
+      total = builtins.foldl' (sum: name: sum + (counts.${name} or 1)) 0 memberRoles;
+      addresses = lib.concatMap (
+        name:
+        map (index: "${if name == "designer" then "architect" else name}${toString index}") (
+          lib.range 0 ((counts.${name} or 1) - 1)
+        )
+      ) memberRoles;
+    in
+    builtins.isAttrs counts
+    && builtins.all (
+      name:
+      name != "team_lead"
+      && builtins.hasAttr name team.roles
+      && isPositiveInt counts.${name}
+      && counts.${name} <= 63
+    ) (builtins.attrNames counts)
+    && total <= 63
+    && isUnique addresses
+    && (counts == { } || total <= team.max_open_agents);
   validTeam =
     team: capacity: workPolicy:
-    hasExactFields [
-      "description"
-      "design_owner"
-      "lifecycle"
-      "max_open_agents"
-      "mode"
-      "roles"
-      "routing"
-      "service_policy"
-    ] team
+    hasExactFields (lib.sort builtins.lessThan (
+      [
+        "description"
+        "design_owner"
+        "lifecycle"
+        "max_open_agents"
+        "mode"
+        "roles"
+        "routing"
+        "service_policy"
+      ]
+      ++ lib.optional (team ? initial_member_counts) "initial_member_counts"
+    )) team
     && isNonemptyString team.description
     && builtins.elem team.mode [
       "solo"
@@ -219,6 +246,7 @@ let
     && !(team.roles ? designer && team.roles ? architect)
     && builtins.all isRoleName (builtins.attrNames team.roles)
     && builtins.all validRole (builtins.attrValues team.roles)
+    && validInitialMemberCounts team
     && builtins.all (
       name:
       let
@@ -280,7 +308,10 @@ let
       "utilities"
       "work_policy"
     ] teamConfig
-    && teamConfig.schema_version == 4
+    && builtins.elem teamConfig.schema_version [
+      4
+      5
+    ]
     && hasExactFields [ "required_native_child_threads" ] teamConfig.capacity
     && isPositiveInt teamConfig.capacity.required_native_child_threads
     && hasExactFields [ "design" "implementation" ] teamConfig.work_policy
@@ -289,9 +320,11 @@ let
     && builtins.isAttrs teamConfig.teams
     && teamConfig.teams != { }
     && builtins.all isIdentifier (builtins.attrNames teamConfig.teams)
-    && builtins.all (team: validTeam team teamConfig.capacity teamConfig.work_policy) (
-      builtins.attrValues teamConfig.teams
-    )
+    && builtins.all (
+      team:
+      validTeam team teamConfig.capacity teamConfig.work_policy
+      && (teamConfig.schema_version != 4 || !(team ? initial_member_counts))
+    ) (builtins.attrValues teamConfig.teams)
     && isIdentifier teamConfig.default_team
     && builtins.hasAttr teamConfig.default_team teamConfig.teams
     && (

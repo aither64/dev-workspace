@@ -3,6 +3,59 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_creation_journal_writer_rejects_oversize_before_publication
+    with_workspace do |workspace|
+      runner = DevSession::Runner.new(workspace:, out: StringIO.new, err: StringIO.new)
+      preset = direct_team_preset
+      preset['leadInstructions'] = 'Coordinate.'
+      preset['members'] = 16.times.map do |index|
+        {'role' => 'implementer', 'address' => "implementer#{index}",
+         'model' => 'model-1', 'reasoningEffort' => 'high',
+         'behavior' => 'implementer', 'purpose' => 'implementation',
+         'access' => 'workspace_write', 'instructions' => 'x' * 4096}
+      end
+      preset['roles'] = ['lead'] + preset['members'].map { |m| m['address'] }
+      journal = {'schema' => 3, 'slug' => 'example', 'goal_sha256' => 'c' * 64,
+                 'run_codex' => true, 'state' => 'creating', 'tmux_identity' => 'd' * 64,
+                 'model' => preset['leadModel'], 'effort' => preset['leadEffort'], 'direct_team' => preset}
+      path = File.join(workspace, 'example.creation.json')
+      assert(runner.send(:valid_direct_team_preset?, preset))
+      assert_raises(DevSession::Error) { runner.send(:write_creation_journal, path, journal, create: true) }
+      refute(File.exist?(path))
+      assert_empty(Dir.glob("#{path}.*.tmp"))
+      # Trim only instruction bytes to hit the inclusive persisted-file boundary.
+      excess = JSON.generate(journal).bytesize + 1 - 64 * 1024
+      preset['members'].each do |member|
+        amount = [excess, member['instructions'].bytesize - 1].min
+        member['instructions'] = member['instructions'][0, member['instructions'].bytesize - amount]
+        excess -= amount
+        break if excess.zero?
+      end
+      runner.send(:write_creation_journal, path, journal, create: true)
+      assert_equal(64 * 1024, File.size(path))
+      assert_equal(journal, runner.send(:read_private_json_object, path, 'creation journal', max_size: 64 * 1024, mode: 0o600))
+      # A newline that takes the record over the limit must preserve the old file.
+      preset['members'][0]['instructions'] += 'x'
+      assert_raises(DevSession::Error) { runner.send(:write_creation_journal, path, journal, create: false) }
+      assert_equal(64 * 1024, File.size(path))
+    end
+  end
+
+  def test_repeated_direct_member_addresses_are_contiguous
+    with_workspace do |workspace|
+      runner = DevSession::Runner.new(workspace:, out: StringIO.new, err: StringIO.new)
+      preset = direct_team_preset
+      second = preset['members'].last.merge('address' => 'implementer1')
+      preset['members'] << second
+      preset['roles'] << 'implementer1'
+      assert(runner.send(:valid_direct_team_preset?, preset))
+      %w[implementer0 implementer2 implementer01].each do |address|
+        second['address'] = preset['roles'][-1] = address
+        refute(runner.send(:valid_direct_team_preset?, preset), address)
+      end
+    end
+  end
+
   def test_direct_creation_browser_notification_preference_is_optional_boolean
     with_workspace do |workspace|
       runner = DevSession::Runner.new(workspace:, out: StringIO.new, err: StringIO.new)

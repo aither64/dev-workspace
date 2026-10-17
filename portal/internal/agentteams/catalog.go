@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	CatalogSchemaVersion        = 4
+	CatalogSchemaVersion        = 5
 	PackageMetadataSchema       = 1
 	maxCatalogBytes             = 4 * 1024 * 1024
 	maxPackageMetadataBytes     = 1024 * 1024
@@ -98,16 +98,29 @@ type Routing struct {
 	LowRiskReviewRole       *string `json:"low_risk_review_role,omitempty"`
 }
 
+// InitialMemberCount defaults each non-lead role to one member.
+func (team Team) InitialMemberCount(role string) int {
+	if count, ok := team.InitialMemberCounts[role]; ok {
+		return count
+	}
+	return 1
+}
+
+func supportedCatalogSchema(version int) bool {
+	return version == 4 || version == CatalogSchemaVersion
+}
+
 type Team struct {
-	Description   string          `json:"description"`
-	DesignOwner   string          `json:"design_owner"`
-	Lifecycle     Lifecycle       `json:"lifecycle"`
-	MaxOpenAgents int             `json:"max_open_agents"`
-	Mode          string          `json:"mode"`
-	Roles         map[string]Role `json:"roles"`
-	Routing       Routing         `json:"routing"`
-	ServicePolicy string          `json:"service_policy"`
-	TeamDigest    string          `json:"team_digest"`
+	InitialMemberCounts map[string]int  `json:"initial_member_counts,omitempty"`
+	Description         string          `json:"description"`
+	DesignOwner         string          `json:"design_owner"`
+	Lifecycle           Lifecycle       `json:"lifecycle"`
+	MaxOpenAgents       int             `json:"max_open_agents"`
+	Mode                string          `json:"mode"`
+	Roles               map[string]Role `json:"roles"`
+	Routing             Routing         `json:"routing"`
+	ServicePolicy       string          `json:"service_policy"`
+	TeamDigest          string          `json:"team_digest"`
 }
 
 type VerificationWatcher struct {
@@ -296,7 +309,7 @@ func LoadPinned(packageRoot string, pin CatalogPin) (Catalog, error) {
 
 func (pin CatalogPin) Validate() error {
 	if !nixStoreRoot(pin.PackagePath) || pin.CatalogPath != defaultCatalogRelativePath || !isDigest(pin.CatalogDigest) ||
-		pin.SchemaVersion != CatalogSchemaVersion || pin.MetadataSchema != PackageMetadataSchema ||
+		!supportedCatalogSchema(pin.SchemaVersion) || pin.MetadataSchema != PackageMetadataSchema ||
 		pin.Capacity.RequiredNativeChildThreads < 1 || pin.Capacity.RequiredNativeChildThreads > 64 || !validGenerator(pin.Generator) || !validAdapter(pin.NativeAdapter) {
 		return errors.New("invalid catalog pin")
 	}
@@ -369,7 +382,7 @@ func (metadata AgentTeamsMetadata) Validate() error {
 		return nil
 	}
 	if metadata.MetadataSchema != 1 || metadata.Catalog.Path != defaultCatalogRelativePath ||
-		metadata.Catalog.SchemaVersion != CatalogSchemaVersion || !isDigest(metadata.Catalog.Digest) ||
+		!supportedCatalogSchema(metadata.Catalog.SchemaVersion) || !isDigest(metadata.Catalog.Digest) ||
 		metadata.Capacity.RequiredNativeChildThreads < 1 || metadata.Capacity.RequiredNativeChildThreads > 64 || metadata.NativeCapacity.ConfigKey != "agents.max_concurrent_threads_per_session" ||
 		metadata.NativeCapacity.RequiredValue != metadata.Capacity.RequiredNativeChildThreads ||
 		!validGenerator(metadata.Generator) || !validAdapter(metadata.NativeAdapter) {
@@ -379,7 +392,7 @@ func (metadata AgentTeamsMetadata) Validate() error {
 }
 
 func (catalog Catalog) Validate() error {
-	if catalog.SchemaVersion != CatalogSchemaVersion || !identifier(catalog.DefaultTeam) ||
+	if !supportedCatalogSchema(catalog.SchemaVersion) || !identifier(catalog.DefaultTeam) ||
 		catalog.Capacity.RequiredNativeChildThreads < 1 || catalog.Capacity.RequiredNativeChildThreads > 64 || !isDigest(catalog.CatalogDigest) ||
 		len(catalog.Teams) == 0 || !validWorkPolicy(catalog.WorkPolicy.Design) ||
 		!validWorkPolicy(catalog.WorkPolicy.Implementation) || !validAdapter(catalog.NativeAgentConfigs.Adapter) {
@@ -395,7 +408,7 @@ func (catalog Catalog) Validate() error {
 		}
 	}
 	for name, team := range catalog.Teams {
-		if !identifier(name) || !validTeam(name, team, catalog.Capacity, catalog.WorkPolicy) {
+		if !identifier(name) || (catalog.SchemaVersion == 4 && team.InitialMemberCounts != nil) || !validTeam(name, team, catalog.Capacity, catalog.WorkPolicy) {
 			return fmt.Errorf("invalid catalog team %q", name)
 		}
 	}
@@ -493,6 +506,38 @@ func validTeam(name string, team Team, capacity Capacity, policies WorkPolicies)
 			return false
 		}
 	}
+	for role, count := range team.InitialMemberCounts {
+		if _, ok := team.Roles[role]; !ok || role == "team_lead" || count < 1 || count > 63 {
+			return false
+		}
+	}
+	members := 0
+	for role := range team.Roles {
+		if role != "team_lead" {
+			members += team.InitialMemberCount(role)
+		}
+	}
+	if members > 63 || (len(team.InitialMemberCounts) > 0 && members > team.MaxOpenAgents) {
+		return false
+	}
+	addresses := make(map[string]bool, members)
+	for role := range team.Roles {
+		if role == "team_lead" {
+			continue
+		}
+		addressRole := role
+		if role == "designer" {
+			addressRole = "architect"
+		}
+		for index := 0; index < team.InitialMemberCount(role); index++ {
+			address := fmt.Sprintf("%s%d", addressRole, index)
+			if addresses[address] {
+				return false
+			}
+			addresses[address] = true
+		}
+	}
+
 	owner, ok := team.Roles[team.DesignOwner]
 	if !ok || (team.DesignOwner == "team_lead" && owner.Purpose != "lead") ||
 		(team.DesignOwner != "team_lead" && owner.Purpose != "design") {
@@ -848,8 +893,24 @@ func validateCatalogShape(data []byte) error {
 	if err := json.Unmarshal(root["teams"], &teams); err != nil || len(teams) == 0 {
 		return errors.New("catalog teams must be a nonempty object")
 	}
+	var schema int
+	if err := json.Unmarshal(root["schema_version"], &schema); err != nil {
+		return err
+	}
 	for _, rawTeam := range teams {
-		team, err := strictObject(rawTeam, "description", "design_owner", "lifecycle", "max_open_agents", "mode", "roles", "routing", "service_policy", "team_digest")
+		fields := []string{"description", "design_owner", "lifecycle", "max_open_agents", "mode", "roles", "routing", "service_policy", "team_digest"}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(rawTeam, &object); err != nil {
+			return err
+		}
+		if counts, present := object["initial_member_counts"]; present && schema == CatalogSchemaVersion {
+			fields = append(fields, "initial_member_counts")
+			var values map[string]int
+			if err := json.Unmarshal(counts, &values); err != nil || values == nil {
+				return errors.New("initial member counts must be an object of integers")
+			}
+		}
+		team, err := strictObject(rawTeam, fields...)
 		if err != nil {
 			return err
 		}

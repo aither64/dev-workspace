@@ -136,6 +136,9 @@ func (s *Server) resolveManagedCreation(_ context.Context, request creationReque
 	if err := validDirectTeamPreset(preset); err != nil {
 		return creationRequest{}, fmt.Errorf("resolve direct team preset: %w", err)
 	}
+	if err := preset.ValidateCreationSize(); err != nil {
+		return creationRequest{}, err
+	}
 	request.Team, request.CatalogDigest = preset.ID, preset.CatalogDigest
 	request.directTeam = &preset
 	return request, nil
@@ -159,13 +162,15 @@ func validDirectTeamPreset(preset teamruntime.Preset) error {
 	addresses := make(map[string]struct{}, len(preset.Members))
 	expectedRoles := make([]string, 0, len(preset.Members)+1)
 	expectedRoles = append(expectedRoles, "lead")
+	indices := make(map[string]int)
 	for _, member := range preset.Members {
 		if !validDirectMemberRole(member.Role) || member.Role == "lead" ||
-			member.Address != member.Role+"0" || member.Model == "" || member.Effort == "" ||
+			member.Address != fmt.Sprintf("%s%d", member.Role, indices[member.Role]) || member.Model == "" || member.Effort == "" ||
 			!validDirectMemberPolicy(member.Role, member.Behavior, member.Access, member.Purpose, member.Instructions, withInstructions) ||
 			validateCreationSettingValue(member.Model) != nil || validateCreationSettingValue(member.Effort) != nil {
 			return errors.New("direct team preset has an invalid member")
 		}
+		indices[member.Role]++
 		if _, duplicate := addresses[member.Address]; duplicate {
 			return errors.New("direct team preset has duplicate member addresses")
 		}

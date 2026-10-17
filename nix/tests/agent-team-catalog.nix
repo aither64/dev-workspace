@@ -174,6 +174,28 @@ let
       development_clone = validTeamConfig.teams.development;
     };
   };
+  repeatedTeamConfig = validTeamConfig // {
+    schema_version = 5;
+    teams = validTeamConfig.teams // {
+      development = validTeamConfig.teams.development // {
+        initial_member_counts.implementer = 2;
+      };
+    };
+  };
+  withCounts =
+    counts:
+    repeatedTeamConfig
+    // {
+      teams = repeatedTeamConfig.teams // {
+        development = repeatedTeamConfig.teams.development // {
+          initial_member_counts = counts;
+        };
+      };
+    };
+  repeatedPackage = mkPackage {
+    inherit pkgs;
+    teamConfig = repeatedTeamConfig;
+  };
   configuredPackage = mkPackage {
     inherit pkgs;
     teamConfig = validTeamConfig;
@@ -231,6 +253,49 @@ let
   unmanagedPackage = mkPackage { inherit pkgs; };
 in
 assert (evaluate leadReviewedConfig).success;
+assert (evaluate repeatedTeamConfig).success;
+assert
+  !((evaluate (withCounts {
+    implementer = 0;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    implementer = -1;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    implementer = 1.5;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    implementer = "2";
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    implementer = 64;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    implementer = 3;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    team_lead = 2;
+  })).success
+  );
+assert
+  !((evaluate (withCounts {
+    unknown = 2;
+  })).success
+  );
+assert !((evaluate (withCounts null)).success);
+assert !((evaluate (repeatedTeamConfig // { schema_version = 4; })).success);
 assert !((evaluate invalidLeadReviewedReviewer).success);
 assert !((evaluate invalidLeadReviewedImplementer).success);
 assert !((evaluate invalidLeadReviewedLead).success);
@@ -245,7 +310,9 @@ pkgs.runCommand "dev-workspace-agent-team-catalog" {
     pkgs.jq
   ];
 } ''
-  catalog=${configuredPackage}/share/dev-workspace/agent-teams.json
+  jq -e '.schema_version == 5 and .teams.development.initial_member_counts.implementer == 2' \
+      ${repeatedPackage}/share/dev-workspace/agent-teams.json >/dev/null
+    catalog=${configuredPackage}/share/dev-workspace/agent-teams.json
   metadata=${configuredPackage}/share/dev-workspace/package.json
   renamed_catalog=${renamedPackage}/share/dev-workspace/agent-teams.json
   jq -e '.teams.development.roles | keys == ["reviewer", "team_lead"]' \

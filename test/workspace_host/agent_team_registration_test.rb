@@ -171,6 +171,37 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_direct_creation_journal_at_existing_size_limit_remains_readable
+    Dir.mktmpdir do |directory|
+      _root, _entry, environment = registration_workspace(directory)
+      host = DevWorkspaceHost::Host.new(env: environment, out: StringIO.new, err: StringIO.new)
+      preset = {'id' => 'delegated', 'name' => 'Full team', 'description' => 'Expanded',
+                'catalogDigest' => 'a' * 64, 'teamDigest' => 'b' * 64,
+                'leadModel' => 'model-1', 'leadEffort' => 'high', 'leadInstructions' => 'Coordinate.'}
+      preset['members'] = 16.times.map do |index|
+        {'role' => 'implementer', 'address' => "implementer#{index}",
+         'model' => 'model-1', 'reasoningEffort' => 'high', 'behavior' => 'implementer',
+         'purpose' => 'implementation', 'access' => 'workspace_write', 'instructions' => 'x' * 4096}
+      end
+      preset['roles'] = ['lead'] + preset['members'].map { |m| m['address'] }
+      journal = {'schema' => 3, 'slug' => 'example', 'goal_sha256' => 'c' * 64,
+                 'run_codex' => true, 'state' => 'creating', 'tmux_identity' => 'd' * 64,
+                 'model' => 'model-1', 'effort' => 'high', 'direct_team' => preset}
+      excess = JSON.generate(journal).bytesize + 1 - 64 * 1024
+      preset['members'].each do |member|
+        amount = [excess, member['instructions'].bytesize - 1].min
+        member['instructions'] = member['instructions'][0, member['instructions'].bytesize - amount]
+        excess -= amount
+        break if excess.zero?
+      end
+      path = File.join(directory, 'example.creation.json')
+      File.write(path, JSON.generate(journal) + "\n")
+      File.chmod(0o600, path)
+      assert_equal(64 * 1024, File.size(path))
+      assert_equal(journal, host.send(:read_private_creation_journal!, path, 'example'))
+    end
+  end
+
   def test_direct_team_receipt_keeps_member_behavior_and_access
     Dir.mktmpdir('workspace-direct-team-receipt-test') do |directory|
       _root, _entry, environment = registration_workspace(directory)
@@ -202,6 +233,15 @@ class WorkspaceHostTest < Minitest::Test
       preset['members'].first['purpose'] = 'implementation'
       refute(host.send(:valid_direct_portal_preset?, preset))
       preset['members'].first['purpose'] = 'design'
+      second = preset['members'].first.merge('address' => 'architect1')
+      preset['members'] << second
+      preset['roles'] << 'architect1'
+      assert(host.send(:valid_direct_portal_preset?, preset))
+      %w[architect0 architect2 architect01].each do |address|
+        second['address'] = preset['roles'][-1] = address
+        refute(host.send(:valid_direct_portal_preset?, preset), address)
+      end
+      second['address'] = preset['roles'][-1] = 'architect1'
 
       path = File.join(directory, 'example.creation.json')
       File.write(path, JSON.generate(

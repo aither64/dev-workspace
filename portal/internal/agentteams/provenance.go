@@ -14,7 +14,8 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
-const maxCreationJournalBytes = 64 * 1024
+// MaxCreationJournalBytes is the existing shared CLI and recovery file bound.
+const MaxCreationJournalBytes = 64 * 1024
 
 func ownedByCurrentUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -49,7 +50,7 @@ func ReadCreationJournal(workspace, slug string) (CreationJournal, bool, error) 
 	if err != nil {
 		return CreationJournal{}, false, fmt.Errorf("inspect creation journal: %w", err)
 	}
-	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm() != 0o600 || info.Size() < 1 || info.Size() > maxCreationJournalBytes {
+	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm() != 0o600 || info.Size() < 1 || info.Size() > MaxCreationJournalBytes {
 		return CreationJournal{}, false, errors.New("creation journal is not a private bounded regular file")
 	}
 	data, err := os.ReadFile(path)
@@ -67,7 +68,7 @@ func ReadCreationJournal(workspace, slug string) (CreationJournal, bool, error) 
 // cross-state fields. It is shared by lifecycle classification and portal
 // receipt recovery so a managed journal cannot gain two interpretations.
 func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
-	if len(data) == 0 || len(data) > maxCreationJournalBytes {
+	if len(data) == 0 || len(data) > MaxCreationJournalBytes {
 		return CreationJournal{}, errors.New("creation journal exceeds bounds")
 	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
@@ -201,6 +202,7 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 	if withInstructions != (len(raw) == 10) {
 		return errors.New("invalid direct team instruction fields")
 	}
+	indices := make(map[string]int)
 	for _, key := range []string{"id", "name", "description", "roles", "catalogDigest", "teamDigest", "leadModel", "leadEffort", "members"} {
 		if _, ok := raw[key]; !ok {
 			return errors.New("incomplete direct team object")
@@ -264,13 +266,14 @@ func validateDirectCreationTeam(data json.RawMessage, model, effort string) erro
 				return errors.New("incomplete direct team member object")
 			}
 		}
-		if !directCreationRole(member.Role) || member.Role == "lead" || member.Address != member.Role+"0" ||
+		if !directCreationRole(member.Role) || member.Role == "lead" || member.Address != fmt.Sprintf("%s%d", member.Role, indices[member.Role]) ||
 			!directCreationScalar(member.Model, session.MaxAgentTeamPersistedScalarBytes) ||
 			!directCreationScalar(member.ReasoningEffort, session.MaxAgentTeamPersistedScalarBytes) ||
 			!validDirectCreationPolicy(member.Role, member.Behavior, member.Access, member.Purpose, member.Instructions, withInstructions) ||
 			team.Roles[index+1] != member.Address || seen[member.Address] {
 			return errors.New("invalid direct team member")
 		}
+		indices[member.Role]++
 		seen[member.Address] = true
 	}
 	return nil
