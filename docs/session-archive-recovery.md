@@ -126,6 +126,9 @@ Managed browser archives run in independent `workspace-archive-RECEIPT-ATTEMPT`
 user services. The unit identity must match the retained portal authorization.
 Portal restart reconciles the unit instead of starting another worker. Private
 progress records are presentation only; the lifecycle journal remains authority.
+An inactive unit with a queued start job is still running from the portal's
+perspective. An inactive unit without that job is terminal, including a worker
+cancelled before its executable started.
 Portal receipt schema 2 stores finish time separately from journal progress and
 continues to read schema 1.
 

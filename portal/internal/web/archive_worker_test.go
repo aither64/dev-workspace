@@ -10,6 +10,46 @@ import (
 	"time"
 )
 
+func TestArchiveWorkerQueuedStartIsNotTerminal(t *testing.T) {
+	directory := t.TempDir()
+	statusPath := filepath.Join(directory, "status")
+	for name, script := range map[string]string{
+		"systemctl":  "#!/bin/sh\ncat \"$ARCHIVE_TEST_STATUS\"\n",
+		"journalctl": "#!/bin/sh\nexit 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ARCHIVE_TEST_STATUS", statusPath)
+	server := &Server{config: Config{Workspace: directory, WorkspaceName: "example", HostProfile: directory, PackageRoot: directory}, operationContext: context.Background()}
+	operation := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", ReceiptID: strings.Repeat("a", 64), Attempt: 2}
+	for _, step := range []struct {
+		name, properties, want string
+	}{
+		{"queued", "ActiveState=inactive\nSubState=dead\nJob=123\nExecMainCode=0\nExecMainStatus=0\n", "running"},
+		{"starting", "ActiveState=activating\nSubState=start-pre\nJob=123\n", "running"},
+		{"executing", "ActiveState=active\nSubState=running\nJob=\n", "running"},
+		{"completed", "ActiveState=active\nSubState=exited\nJob=\nExecMainCode=1\nExecMainStatus=0\n", "complete"},
+		{"cancelled before exec", "ActiveState=inactive\nSubState=dead\nJob=\nExecMainCode=0\nExecMainStatus=0\n", "failed"},
+		{"pre-exec failed", "ActiveState=failed\nSubState=failed\nJob=\nExecMainCode=0\nExecMainStatus=0\n", "failed"},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			if err := os.WriteFile(statusPath, []byte("LoadState=loaded\n"+step.properties), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reconciled, exists, err := server.proposeLifecycleOperation("example", operation, true, nil, nil, time.Now())
+			if err != nil || !exists || reconciled.State != step.want {
+				t.Fatalf("reconcile %s: %#v, exists %v, error %v", step.name, reconciled, exists, err)
+			}
+			if step.want == "running" && reconciled.FinishedAt != "" {
+				t.Fatalf("uncompleted worker has finish time: %#v", reconciled)
+			}
+		})
+	}
+}
+
 func TestArchiveWorkerContinuesAcrossPortalCancellation(t *testing.T) {
 	directory := t.TempDir()
 	statusPath := filepath.Join(directory, "status")

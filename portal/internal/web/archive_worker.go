@@ -34,7 +34,7 @@ func (s *Server) archiveWorker(ctx context.Context, operation lifecycleOperation
 	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	output, err := processgroup.CombinedOutput(readCtx, exec.Command("systemctl", "--user", "--timestamp=unix", "show", archiveUnit(operation),
-		"--property=LoadState,ActiveState,SubState,ExecMainCode,ExecMainStatus,ExecMainExitTimestamp"))
+		"--property=LoadState,ActiveState,SubState,Job,ExecMainCode,ExecMainStatus,ExecMainExitTimestamp"))
 	if err != nil {
 		return nil, fmt.Errorf("read archive worker: %w", err)
 	}
@@ -48,6 +48,11 @@ func (s *Server) archiveWorker(ctx context.Context, operation lifecycleOperation
 	if values["LoadState"] == "not-found" || values["LoadState"] == "" {
 		return nil, nil
 	}
+	// A transient unit can be loaded but still waiting for its start job.
+	// Without the job check, receipt reconciliation can fail it before ExecStart.
+	if values["ActiveState"] == "inactive" && values["SubState"] == "dead" && values["Job"] != "" && values["Job"] != "0" {
+		return &archiveWorkerStatus{State: "running"}, nil
+	}
 	if values["ActiveState"] == "activating" || values["SubState"] == "running" || values["SubState"] == "start" {
 		return &archiveWorkerStatus{State: "running"}, nil
 	}
@@ -55,7 +60,7 @@ func (s *Server) archiveWorker(ctx context.Context, operation lifecycleOperation
 		return &archiveWorkerStatus{State: "complete", FinishedAt: archiveFinishTime(values["ExecMainExitTimestamp"])}, nil
 	}
 	logs, _ := processgroup.CombinedOutput(readCtx, exec.Command("journalctl", "--user", "--unit="+archiveUnit(operation), "--no-pager", "--output=cat", "--lines=24"))
-	cause := fmt.Sprintf("archive worker ended (code %s, status %s)", values["ExecMainCode"], values["ExecMainStatus"])
+	cause := fmt.Sprintf("archive worker ended (state %s/%s, code %s, status %s)", values["ActiveState"], values["SubState"], values["ExecMainCode"], values["ExecMainStatus"])
 	return &archiveWorkerStatus{State: "failed", Error: boundedLifecycleError(cause + "\n" + string(logs)), FinishedAt: archiveFinishTime(values["ExecMainExitTimestamp"])}, nil
 }
 
