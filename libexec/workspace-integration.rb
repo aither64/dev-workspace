@@ -155,6 +155,7 @@ module WorkspaceCoordination
       current_jobs = engine.store.read['jobs']
       value.slice('schema', 'id', 'phase', 'startedAt', 'finishedAt', 'phaseSeconds', 'queueSeconds', 'verificationSeconds', 'preparationSeconds', 'reason', 'continuation').merge(
         'administrationSeconds' => [value['phaseSeconds'].values.sum - value.fetch('verificationSeconds', 0) - value.fetch('preparationSeconds', 0), 0].max,
+        'outcome' => value['outcome'],
         'heads' => value['operations'].transform_values { |operation| operation.dig('snapshot', 'operation', 'featureHead') },
         'jobs' => value['jobs'].transform_values { |job_id| current_jobs[job_id]&.slice('id', 'kind', 'state', 'reason', 'revision') })
     end

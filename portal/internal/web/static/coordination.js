@@ -140,9 +140,10 @@
       const runs = section("Background integrations", integrations.length);
       for (const run of integrations) {
         const row = node("article", "", "coordination-machine");
-        const heading = node("p"); heading.append(ownerLink(run), node("span", ": "), badge(run.continuation?.state === "held" ? "paused" : run.continuation?.state));
+        const heading = node("p"); heading.append(ownerLink(run), node("span", ": "), badge(run.outcome === "canceled" ? "canceled" : run.continuation?.state === "held" ? "paused" : run.continuation?.state));
         row.append(heading);
-        if (run.reason?.message) row.append(node("p", run.reason.message));
+        if (run.outcome === "canceled") row.append(node("p", "Canceled before any operation was submitted."));
+        else if (run.reason?.message) row.append(node("p", run.reason.message));
         else row.append(node("p", run.continuation?.state === "complete"
           ? "The requested operations have finished."
           : ["paused", "held"].includes(run.continuation?.state)

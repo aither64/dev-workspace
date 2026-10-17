@@ -42,6 +42,19 @@ no merge or deployment approval and preserves the retained model and policy.
 The lead reviews the result and updates initiative completion; background run
 completion alone does not close the initiative or release a review reservation.
 
+Preparation with no submitted operations can be canceled explicitly:
+
+```sh
+dev-session coordination integration-cancel SESSION RUN_UUID --as-is --json
+```
+
+Cancellation holds the run and session locks, requires `prepare`, and refuses
+any submitted job, submission step or deployment completion. It retains the
+original request, preparation steps and receipts, records `outcome: canceled`,
+and ends continuation without releasing reservations or claiming integration.
+Use it when a reviewed replacement changes scope before any operation started.
+Submitted or uncertain effects retain their existing recovery interface.
+
 Pause takes effect before the next step or queued operation is admitted. Already
 claimed operations settle through their existing workers and recovery rules.
 A pause does not cancel effects, release a reservation or stop an in-flight

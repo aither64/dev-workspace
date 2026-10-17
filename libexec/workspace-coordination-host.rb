@@ -73,7 +73,7 @@ module DevWorkspaceHost
       action = argv.shift
       slug = argv.shift
       raise WorkspaceCoordination::Error, 'coordination requires an exact session slug and --as-is' unless slug && slug.match?(WorkspaceCoordination::PART)
-      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause].include?(action)
+      id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause integration-cancel].include?(action)
       options = {}
       OptionParser.new do |opts|
         opts.on('--as-is') { options[:as_is] = true }
@@ -98,7 +98,7 @@ module DevWorkspaceHost
         return
       end
       request = options[:request] && coordination_input(options[:request])
-      if %w[integrate integration-status integration-resume integration-pause].include?(action)
+      if %w[integrate integration-status integration-resume integration-pause integration-cancel].include?(action)
         owner = nil
         resumable_finalization = action == 'integration-resume' && id && id.match?(WorkspaceCoordination::UUID) &&
           File.file?(File.join(engine.store.root, 'integrations', "#{id}.json")) &&
@@ -118,6 +118,7 @@ module DevWorkspaceHost
         when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait], background: options[:background])
         when 'integration-status' then driver.status(id)
         when 'integration-pause' then driver.pause(id)
+        when 'integration-cancel' then driver.cancel_unsubmitted(id)
         when 'integration-resume'
           if options[:background]
             driver.arm_background(id)

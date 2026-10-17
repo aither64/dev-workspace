@@ -906,4 +906,31 @@ class IntegrationTest < Minitest::Test
     assert_equal 1, @engine.store.read['jobs'].length
   end
 
+  def test_cancel_unsubmitted_preserves_evidence_and_refuses_any_submission_boundary
+    first = owner('cancel-unsubmitted')
+    integration = driver(first)
+    payload = integration_request(first)
+    integration.start(payload, background: true)
+    original = integration.read(payload['requestId'])
+    result = integration.cancel_unsubmitted(payload['requestId'])
+    assert_equal 'canceled', result['outcome']
+    assert_equal 'complete', result.dig('continuation', 'state')
+    assert_equal original['request'], integration.read(payload['requestId'])['request']
+    assert_empty @engine.store.read['jobs']
+    assert_equal result, integration.cancel_unsubmitted(payload['requestId'])
+
+    value = original
+    value['steps']['submit-batch'] = {'requestId' => SecureRandom.uuid}
+    integration.save(value)
+    assert_raises(WorkspaceCoordination::Error) { integration.cancel_unsubmitted(payload['requestId']) }
+    value['steps'].delete('submit-batch')
+    value['jobs']['system'] = SecureRandom.uuid
+    integration.save(value)
+    assert_raises(WorkspaceCoordination::Error) { integration.cancel_unsubmitted(payload['requestId']) }
+    value['jobs'].clear
+    value['deploymentComplete'] = true
+    integration.save(value)
+    assert_raises(WorkspaceCoordination::Error) { integration.cancel_unsubmitted(payload['requestId']) }
+  end
+
 end

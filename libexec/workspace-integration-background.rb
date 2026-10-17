@@ -81,6 +81,30 @@ module WorkspaceCoordination
       end
     end
 
+    def cancel_unsubmitted(id)
+      result = engine.store.lock("integration-#{id}", nonblock: true) do
+        value = read(id)
+        return status(id) if value['outcome'] == 'canceled'
+        unless value['schema'] == 2 && value['phase'] == 'prepare' && value.fetch('jobs').empty? &&
+               !value.fetch('steps').key?('submit-batch') && !value['deploymentComplete']
+          raise Error.new('only preparation with no submitted operations can be canceled', 5)
+        end
+        @admission.call do
+          engine.current_generation!
+          current = engine.owner(owner['slug'])
+          raise Error.new('integration owner changed', 4) unless current['id'] == owner['id']
+          verify_tracking_binding
+          value['outcome'], value['phase'] = 'canceled', 'complete'
+          value['finishedAt'] = Time.now.utc.iso8601
+          value['continuation']['state'] = 'complete'
+          value['handoff']['state'] = 'canceled' if value['handoff']
+          save(value)
+        end
+        status(id)
+      end
+      result || raise(Error.new('integration driver is already running', 75))
+    end
+
     def run_background(id)
       result = engine.store.lock("integration-#{id}", nonblock: true) { run_background_locked(id) }
       result || raise(Error.new('integration driver is already running', 75))

@@ -360,7 +360,7 @@ module WorkspaceCoordination
     end
 
     def integration_summary(run)
-      result = run.slice('id', 'ownerId', 'phase', 'reason', 'continuation')
+      result = run.slice('id', 'ownerId', 'phase', 'reason', 'continuation', 'outcome')
       if run.dig('continuation', 'state') != 'held' && File.exist?(File.join(root, 'integrations', "#{run['id']}.pause")) && background_stopped?(run)
         result['continuation'] = result['continuation'].merge('state' => 'paused')
       end
