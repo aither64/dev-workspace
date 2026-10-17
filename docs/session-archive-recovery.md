@@ -139,6 +139,9 @@ specific to archive; delete and revive continue to require the portal service.
 An authorization refusal occurs before archive journal creation or cleanup.
 Retrying an unchanged package cannot fix a dispatch error. Preserve its portal
 receipt, deploy a corrected package, and use the ordinary Retry action.
+A completed receipt may retain evidence that its journal previously existed.
+That historical evidence does not block a new confirmation once fresh inspection
+finds no pending journal. Failed or paused receipts still require recovery.
 
 Local tracking receipts live under private `tracking-sync/` state. An archive
 receipt binds its operation and exact tracking digest before runtime retirement.

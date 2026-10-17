@@ -169,6 +169,65 @@ func TestIndexLifecycleOperationsAreIndependentOfSessionCards(t *testing.T) {
 	}
 }
 
+func TestNewLifecycleAfterCompletedRecoveredArchive(t *testing.T) {
+	for _, testCase := range []struct {
+		state   string
+		pending bool
+		want    int
+	}{
+		{"complete", false, http.StatusAccepted},
+		{"failed", false, http.StatusConflict},
+		{"paused", false, http.StatusConflict},
+		{"complete", true, http.StatusConflict},
+	} {
+		t.Run(fmt.Sprintf("%s/pending=%t", testCase.state, testCase.pending), func(t *testing.T) {
+			server := newTestServer(t)
+			directory := filepath.Join(server.config.Workspace, "archive", "example")
+			if err := os.MkdirAll(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte("schema: 1\nslug: example\nrepositories: []\nfinalized_at: \"2026-09-09T10:06:13Z\"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, "archived")
+			helper := filepath.Join(t.TempDir(), "dev-session")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
+			journalID := strings.Repeat("a", 64)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			server.operationMu.Lock()
+			err := server.replaceLifecycleOperationLocked("example", lifecycleOperation{
+				Slug: "example", Kind: "archive", State: testCase.state, Phase: "complete", Redirect: "/",
+				StartedAt: now, UpdatedAt: now, ReceiptID: strings.Repeat("b", 64), Attempt: 2, TargetIdentityVersion: 2,
+				Options: lifecycleOperationOptions{Mode: "archived", JournalID: journalID, JournalExpected: true,
+					TargetID: strings.Repeat("c", 64), TargetLocation: "work"},
+			})
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if testCase.pending {
+				root := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+				if err := os.MkdirAll(root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				journal := fmt.Sprintf(`{"schema":2,"slug":"example","workspace":%q,"phase":"clusters_released","mode":"complete","operation_id":%q}`, server.config.Workspace, journalID)
+				if err := os.WriteFile(filepath.Join(root, "example.archive.json"), []byte(journal), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := httptest.NewRecorder()
+			server.startLifecycleOperation(response, "example", "revive", "/example/", []string{"revive", "example"},
+				lifecycleOperationOptions{TargetID: deletionTargetForTest(t, server, "example"), JournalID: strings.Repeat("d", 64)}, "")
+			if response.Code != testCase.want {
+				t.Fatalf("new revive after recovered archive: %d %s, want %d", response.Code, response.Body.String(), testCase.want)
+			}
+		})
+	}
+}
+
 func TestLifecycleOperationReconcilesExternalSuccess(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string

@@ -2849,7 +2849,7 @@ func (s *Server) startLifecycleOperation(
 			if len(supersedeReceiptIDs) != 0 {
 				supersede = supersedeReceiptIDs[0]
 			}
-			if progress != nil || (exists && operation.Options.JournalExpected) {
+			if progress != nil || (exists && operation.State != "complete" && operation.Options.JournalExpected) {
 				proofErr = errors.New("An accepted lifecycle journal cannot be replaced. Retry that operation.")
 			} else if supersede != "" {
 				if !exists || operation.ReceiptID != supersede || operation.State != "failed" {
