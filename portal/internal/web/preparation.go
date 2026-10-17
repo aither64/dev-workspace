@@ -283,6 +283,9 @@ func (s *Server) freezePreparationPreset(input preparationInput) (*teamruntime.P
 	if err := validDirectTeamPreset(preset); err != nil {
 		return nil, err
 	}
+	if err := preset.ValidateCreationSize(); err != nil {
+		return nil, err
+	}
 	encoded, err := json.Marshal(preset)
 	if err != nil {
 		return nil, err

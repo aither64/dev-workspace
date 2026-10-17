@@ -3037,3 +3037,160 @@ func TestArchiveExplicitAllPreservesPromptsAndRetainedMemberWithoutRecreation(t 
 		t.Fatal("retry recreated archived member")
 	}
 }
+
+func TestRepeatedImplementerPresetRetryForkAndAdd(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{nameFailure: true}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	catalog := agentteams.Catalog{CatalogDigest: fmt.Sprintf("%064x", 1), Teams: map[string]agentteams.Team{
+		"delegated": {Description: "Two implementers", InitialMemberCounts: map[string]int{"implementer": 2},
+			TeamDigest: fmt.Sprintf("%064x", 2), Roles: map[string]agentteams.Role{
+				"team_lead":   {Model: "lead-model", Effort: "high", Purpose: "lead", Instructions: "Coordinate."},
+				"implementer": {Model: "implementation-model", Effort: "xhigh", Behavior: "implementer", Purpose: "implementation", Instructions: "Own the package.", Access: "workspace_write"},
+			}},
+	}}
+	preset, err := FindCatalogPreset(catalog, "delegated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.MemberCount() != 3 || preset.RoleSummary() != "1 lead, 2 implementers" || preset.Members[1].Address != "implementer1" {
+		t.Fatalf("projection: %#v", preset)
+	}
+	cwd := filepath.Join(workspace, "work", "source")
+	if _, err := service.ApplyPresetSpec(context.Background(), "source", "root-source", cwd, nil, preset); err == nil {
+		t.Fatal("expected interrupted creation")
+	}
+	partial, err := store.Load("source", "root-source")
+	if err != nil || len(partial.Members) != 2 || partial.Members[1].Index != 1 {
+		t.Fatalf("partial: %#v, %v", partial, err)
+	}
+	ready, err := service.ApplyPresetSpec(context.Background(), "source", "root-source", cwd, nil, preset)
+	if err != nil || client.next != 2 {
+		t.Fatalf("retry: %#v, starts %d, %v", ready, client.next, err)
+	}
+	if ready, err = service.ApplyPresetSpec(context.Background(), "source", "root-source", cwd, nil, preset); err != nil || client.next != 2 {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	fork, err := service.Fork(context.Background(), ready, "target", "root-target", filepath.Join(workspace, "work", "target"), nil)
+	if err != nil || len(fork.Members) != 2 || fork.Members[1].Address != "implementer1" || fork.Members[1].Index != 1 || fork.Members[1].Instructions != preset.Members[1].Instructions {
+		t.Fatalf("fork: %#v, %v", fork, err)
+	}
+	service.Catalog = &catalog
+	member, err := service.Add(context.Background(), "source", "root-source", cwd, nil, "implementer", "model-1", "xhigh")
+	if err != nil || member.Address != "implementer2" || member.Index != 2 {
+		t.Fatalf("add: %#v, %v", member, err)
+	}
+}
+
+func TestPreviousUnmanagedFullPresetRetryKeepsAcceptedMembers(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace}
+	// The complete reservation made by schema-4-era ApplyPreset("full").
+	_, err = store.Update(context.Background(), "source", "root-source", true, func(roster *Roster) error {
+		for _, role := range []string{"architect", "implementer", "reviewer"} {
+			policy, err := catalogRole(nil, "", role, false)
+			if err != nil {
+				return err
+			}
+			roster.Members = append(roster.Members, Member{Address: role + "0", Role: role, Index: 0,
+				Model: "model-1", Effort: "high", Behavior: policy.Behavior, Purpose: policy.Purpose,
+				Instructions: policy.Instructions, Access: policy.Access, State: "creating", AddedAt: time.Now().UTC()})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, err := service.ApplyPreset(context.Background(), "source", "root-source",
+		filepath.Join(workspace, "work", "source"), nil, "full", "model-1", "high")
+	if err != nil {
+		t.Fatalf("retry of preceding full preset failed: %v", err)
+	}
+	if len(members) != 3 {
+		t.Fatalf("retry changed saved member count: %d", len(members))
+	}
+}
+
+func TestFreshPresetSizeIncludesEscapingAndJournalEnvelope(t *testing.T) {
+	preset := Preset{ID: "delegated", Name: "Full team", Description: "Expanded team", CatalogDigest: strings.Repeat("a", 64), TeamDigest: strings.Repeat("b", 64), LeadModel: "model-1", LeadEffort: "high", LeadInstructions: "Coordinate.", Roles: []string{"lead"}}
+	for i := 0; i < 16; i++ {
+		address := fmt.Sprintf("implementer%d", i)
+		preset.Roles = append(preset.Roles, address)
+		preset.Members = append(preset.Members, MemberSpec{Role: "implementer", Address: address, Model: "model-1", Effort: "high", Behavior: "implementer", Purpose: "implementation", Instructions: strings.Repeat("x", 4096), Access: "workspace_write"})
+	}
+	if err := preset.ValidateCreationSize(); err == nil {
+		t.Fatal("accepted oversized expanded journal")
+	}
+	preset.Members = preset.Members[:14]
+	preset.Roles = preset.Roles[:15]
+	if err := preset.ValidateCreationSize(); err != nil {
+		t.Fatalf("fitting team: %v", err)
+	}
+	for i := range preset.Members {
+		preset.Members[i].Instructions = strings.Repeat("\"", 4096)
+	}
+	if err := preset.ValidateCreationSize(); err == nil {
+		t.Fatal("ignored JSON escaping expansion")
+	}
+	// Use a short actual slug to prove a permitted selection remains readable.
+	for i := range preset.Members {
+		preset.Members[i].Instructions = strings.Repeat("x", 4096)
+	}
+	journal := map[string]any{"schema": 3, "slug": "example", "goal_sha256": strings.Repeat("c", 64), "run_codex": true, "state": "creating", "tmux_identity": strings.Repeat("d", 64), "model": preset.LeadModel, "effort": preset.LeadEffort, "direct_team": preset}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentteams.DecodeCreationJournal(append(data, '\n'), "example"); err != nil {
+		t.Fatalf("permitted journal unreadable: %v", err)
+	}
+}
+
+func TestPersistedExpandedJournalAtExactBoundRemainsReadable(t *testing.T) {
+	preset := Preset{ID: "delegated", Name: "Full team", Description: "Expanded", CatalogDigest: strings.Repeat("a", 64), TeamDigest: strings.Repeat("b", 64), LeadModel: "model-1", LeadEffort: "high", LeadInstructions: "Coordinate.", Roles: []string{"lead"}}
+	for i := 0; i < 16; i++ {
+		address := fmt.Sprintf("implementer%d", i)
+		preset.Roles = append(preset.Roles, address)
+		preset.Members = append(preset.Members, MemberSpec{Role: "implementer", Address: address, Model: "model-1", Effort: "high", Behavior: "implementer", Purpose: "implementation", Instructions: strings.Repeat("x", 4096), Access: "workspace_write"})
+	}
+	journal := map[string]any{"schema": 3, "slug": "example", "goal_sha256": strings.Repeat("c", 64), "run_codex": true, "state": "creating", "tmux_identity": strings.Repeat("d", 64), "model": preset.LeadModel, "effort": preset.LeadEffort, "direct_team": preset}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	excess := len(data) + 1 - agentteams.MaxCreationJournalBytes
+	if excess <= 0 {
+		t.Fatal("fixture no longer exceeds the persisted bound")
+	}
+	for i := range preset.Members {
+		amount := min(excess, len(preset.Members[i].Instructions)-1)
+		preset.Members[i].Instructions = preset.Members[i].Instructions[:len(preset.Members[i].Instructions)-amount]
+		excess -= amount
+		if excess == 0 {
+			break
+		}
+	}
+	data, err = json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if len(data) != agentteams.MaxCreationJournalBytes {
+		t.Fatalf("boundary fixture size %d", len(data))
+	}
+	if _, err := agentteams.DecodeCreationJournal(data, "example"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentteams.DecodeCreationJournal(append(data, ' '), "example"); err == nil {
+		t.Fatal("accepted an oversized persisted file")
+	}
+}

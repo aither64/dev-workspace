@@ -211,6 +211,9 @@ func teamPresetCommand(args []string) error {
 		}
 		preset.LeadModel, preset.LeadEffort = settings.Model, settings.ReasoningEffort
 	}
+	if err := preset.ValidateCreationSize(); err != nil {
+		return err
+	}
 	return json.NewEncoder(os.Stdout).Encode(preset)
 }
 

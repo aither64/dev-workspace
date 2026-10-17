@@ -71,3 +71,24 @@ func TestDirectCreationSnapshotRejectsMixedAndInvalidPromptFields(t *testing.T) 
 		})
 	}
 }
+
+func TestDirectCreationRepeatedRolesRequireContiguousAddresses(t *testing.T) {
+	for _, address := range []string{"scribe1", "scribe0", "scribe2", "scribe01", "scribe-1"} {
+		team := directCreationSnapshot(true)
+		original := team["members"].([]any)[0].(map[string]any)
+		second := make(map[string]any)
+		for k, v := range original {
+			second[k] = v
+		}
+		second["address"] = address
+		team["members"] = []any{original, second}
+		team["roles"] = []string{"lead", "scribe0", address}
+		data, err := json.Marshal(team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateDirectCreationTeam(data, "model-1", "high"); (err == nil) != (address == "scribe1") {
+			t.Fatalf("%s: %v", address, err)
+		}
+	}
+}

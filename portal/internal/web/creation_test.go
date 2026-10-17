@@ -136,6 +136,20 @@ func TestDirectTeamPresetAcceptsFrozenCustomRoleInstructions(t *testing.T) {
 	if err := validDirectTeamPreset(preset); err != nil {
 		t.Fatal(err)
 	}
+	member := preset.Members[0]
+	member.Address = "scribe1"
+	preset.Members = append(preset.Members, member)
+	preset.Roles = append(preset.Roles, "scribe1")
+	if err := validDirectTeamPreset(preset); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"scribe0", "scribe2", "scribe01"} {
+		preset.Members[1].Address, preset.Roles[2] = bad, bad
+		if err := validDirectTeamPreset(preset); err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+	preset.Members[1].Address, preset.Roles[2] = "scribe1", "scribe1"
 	data, err := json.Marshal(preset)
 	if err != nil {
 		t.Fatal(err)
@@ -1942,5 +1956,35 @@ func TestCreationJSONAcceptanceIncludesDurableRequest(t *testing.T) {
 	var saved creationReceipt
 	if err := readCreationJSON(server.creationPath(status.Slug), &saved); err != nil || saved.ReceiptID != status.ReceiptID {
 		t.Fatalf("not durably accepted: %v", err)
+	}
+}
+
+func TestOversizedStartingTeamRejectedBeforeCreation(t *testing.T) {
+	server := newTestServer(t)
+	catalog := agentteams.Catalog{CatalogDigest: strings.Repeat("a", 64), Teams: map[string]agentteams.Team{
+		"delegated": {Description: "Expanded", TeamDigest: strings.Repeat("b", 64), InitialMemberCounts: map[string]int{"implementer": 16}, Roles: map[string]agentteams.Role{
+			"team_lead":   {Model: "model-1", Effort: "high", Purpose: "lead", Instructions: "Coordinate."},
+			"implementer": {Model: "model-1", Effort: "high", Behavior: "implementer", Purpose: "implementation", Instructions: strings.Repeat("x", 4096), Access: "workspace_write"},
+		}},
+	}}
+	server.installedTeams = &agentteams.Installed{Managed: true, Catalog: &catalog}
+	_, err := server.resolveManagedCreation(context.Background(), creationRequest{Kind: "new", Slug: "example", Goal: "Work"}, agentteams.CreationSelectionInput{
+		Team: agentteams.StringPresence{Present: true, Value: "delegated"}, CatalogDigest: agentteams.StringPresence{Present: true, Value: catalog.CatalogDigest},
+	})
+	if err == nil {
+		t.Fatal("accepted an unreadable expanded snapshot")
+	}
+	if len(server.creations) != 0 {
+		t.Fatal("published a partial creation")
+	}
+	if _, err := os.Stat(filepath.Join(server.config.Workspace, "work", "example")); !os.IsNotExist(err) {
+		t.Fatalf("created session tracking: %v", err)
+	}
+	entries, err := os.ReadDir(server.creationDirectory())
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("persisted creation artifacts: %v", entries)
 	}
 }

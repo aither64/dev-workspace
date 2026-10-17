@@ -3575,12 +3575,13 @@ module DevSession
                           preset['roles'].uniq.length == preset['roles'].length
 
       addresses = {}
+      indices = Hash.new(0)
       preset['members'].all? do |member|
         member_keys = %w[access address behavior model reasoningEffort role]
         member_keys += %w[purpose instructions] if with_instructions
         next false unless member.is_a?(Hash) && member.keys.sort == member_keys.sort &&
                           member['role'].is_a?(String) && member['role'].match?(/\A[a-z][a-z0-9]{0,31}\z/) && member['role'] != 'lead' &&
-                          member['address'] == "#{member['role']}0" &&
+                          member['address'] == "#{member['role']}#{indices[member['role']]}" &&
                           valid_agent_team_persisted_scalar?(member['model']) &&
                           valid_agent_team_persisted_scalar?(member['reasoningEffort'])
         if with_instructions
@@ -3599,6 +3600,7 @@ module DevSession
                               'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
                             [member['behavior'], member['access']]
         end
+        indices[member['role']] += 1
         addresses[member['address']] = true
       end && addresses.length == preset['members'].length &&
         preset['roles'] == ['lead'] + preset['members'].map { |member| member['address'] }
@@ -3797,11 +3799,14 @@ module DevSession
     end
 
     def write_creation_journal(path, journal, create:)
+      encoded = JSON.generate(journal) + "\n"
+      if encoded.bytesize > 64 * 1024
+        raise Error, 'creation journal exceeds 64 KiB'
+      end
       temporary = "#{path}.#{$$}.tmp"
       begin
         File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
-          file.write(JSON.generate(journal))
-          file.write("\n")
+          file.write(encoded)
           file.flush
           file.fsync
         end

@@ -162,6 +162,27 @@ func (preset Preset) RoleSummary() string {
 	return strings.Join(parts, ", ")
 }
 
+// ValidateCreationSize checks a fresh selection before any receipt or root is
+// created. Reserve the largest filesystem component for the eventual CLI slug
+// and include the creating journal envelope, JSON escaping and trailing newline.
+// Retained selections keep their original validation and byte limits.
+func (preset Preset) ValidateCreationSize() error {
+	journal := map[string]any{
+		"schema": 3, "slug": strings.Repeat("s", 255),
+		"goal_sha256": strings.Repeat("0", 64), "run_codex": true,
+		"state": "creating", "model": preset.LeadModel, "effort": preset.LeadEffort,
+		"direct_team": preset, "tmux_identity": strings.Repeat("0", 64), "sensitive": true,
+	}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		return err
+	}
+	if len(data)+1 > agentteams.MaxCreationJournalBytes {
+		return errors.New("starting team exceeds the 64 KiB creation journal limit")
+	}
+	return nil
+}
+
 type MemberSpec struct {
 	Role         string `json:"role"`
 	Address      string `json:"address"`
@@ -404,6 +425,7 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 		}
 		sort.Strings(roleNames)
 		addresses := make(map[string]bool, len(roleNames))
+		memberAddresses := make(map[string]bool)
 		for _, roleName := range roleNames {
 			role := team.Roles[roleName]
 			addressRole := roleName
@@ -421,10 +443,21 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 			if err := validateCatalogInstructions(&catalog, id, roleName, role); err != nil {
 				return nil, err
 			}
-			preset.Members = append(preset.Members, MemberSpec{Role: addressRole,
-				Address: addressRole + "0", Model: role.Model, Effort: role.Effort,
-				Behavior: role.Behavior, Purpose: role.Purpose, Instructions: role.Instructions, Access: role.Access})
-			preset.Roles = append(preset.Roles, addressRole+"0")
+			count := team.InitialMemberCount(roleName)
+			if count < 1 || count > 63 || len(preset.Members)+count > 63 {
+				return nil, fmt.Errorf("team %s has invalid initial member count", id)
+			}
+			for index := 0; index < count; index++ {
+				address := fmt.Sprintf("%s%d", addressRole, index)
+				if memberAddresses[address] {
+					return nil, fmt.Errorf("team %s has duplicate member address %s", id, address)
+				}
+				memberAddresses[address] = true
+				preset.Members = append(preset.Members, MemberSpec{Role: addressRole,
+					Address: address, Model: role.Model, Effort: role.Effort,
+					Behavior: role.Behavior, Purpose: role.Purpose, Instructions: role.Instructions, Access: role.Access})
+				preset.Roles = append(preset.Roles, address)
+			}
 		}
 		presets = append(presets, preset)
 	}
@@ -438,6 +471,9 @@ func FindCatalogPreset(catalog agentteams.Catalog, id string) (Preset, error) {
 	}
 	for _, preset := range presets {
 		if preset.ID == id {
+			if err := preset.ValidateCreationSize(); err != nil {
+				return Preset{}, err
+			}
 			return preset, nil
 		}
 	}
@@ -1013,14 +1049,16 @@ func (service Service) ApplyPreset(ctx context.Context, slug, rootThreadID, cwd 
 // silently appends a changed preset to a team that the user has edited.
 func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, cwd string, environment map[string]string, preset Preset) (*Roster, error) {
 	if service.Store == nil || service.Client == nil || preset.ID == "" || preset.CatalogDigest == "" ||
-		preset.TeamDigest == "" || preset.LeadModel == "" || preset.LeadEffort == "" {
+		preset.TeamDigest == "" || preset.LeadModel == "" || preset.LeadEffort == "" || len(preset.Members) > 63 {
 		return nil, errors.New("team preset is incomplete")
 	}
+	indices := make(map[string]uint64)
 	for _, member := range preset.Members {
 		if !rolePattern.MatchString(member.Role) || member.Role == "lead" ||
-			member.Address != member.Role+"0" || member.Model == "" || member.Effort == "" {
+			member.Address != fmt.Sprintf("%s%d", member.Role, indices[member.Role]) || member.Model == "" || member.Effort == "" {
 			return nil, errors.New("team preset contains an invalid member")
 		}
+		indices[member.Role]++
 		if err := validateMemberPolicy(member.Role, member.Behavior, member.Purpose, member.Instructions, member.Access); err != nil {
 			return nil, fmt.Errorf("team preset member %s: %w", member.Address, err)
 		}
@@ -1035,12 +1073,14 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 				roster.LeadModel, roster.LeadEffort = preset.LeadModel, preset.LeadEffort
 				roster.LeadInstructions = preset.LeadInstructions
 				now := time.Now().UTC()
+				indices := make(map[string]uint64)
 				for _, member := range preset.Members {
 					roster.Members = append(roster.Members, Member{Address: member.Address, Role: member.Role,
-						Index: 0, Model: member.Model, Effort: member.Effort,
+						Index: indices[member.Role], Model: member.Model, Effort: member.Effort,
 						Behavior: member.Behavior, Purpose: member.Purpose, Instructions: member.Instructions,
 						Access: member.Access, PolicyCatalogDigest: preset.CatalogDigest,
 						State: "creating", AddedAt: now})
+					indices[member.Role]++
 				}
 				return nil
 			}
@@ -1052,7 +1092,7 @@ func (service Service) ApplyPresetSpec(ctx context.Context, slug, rootThreadID, 
 			}
 			for index, spec := range preset.Members {
 				member := roster.Members[index]
-				if member.Address != spec.Address || member.Role != spec.Role || member.Model != spec.Model ||
+				if member.Address != spec.Address || member.Role != spec.Role || fmt.Sprintf("%s%d", member.Role, member.Index) != spec.Address || member.Model != spec.Model ||
 					member.Effort != spec.Effort || member.Behavior != spec.Behavior ||
 					member.Purpose != spec.Purpose || member.Instructions != spec.Instructions || member.Access != spec.Access ||
 					(member.State != "creating" && member.State != "ready") {

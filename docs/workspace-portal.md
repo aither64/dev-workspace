@@ -771,7 +771,7 @@ reviewer (`lead_reviewed`). Their role
 lists and exact lead model and reasoning effort appear on the new-session
 screen. Solo has only the lead, which investigates, designs and edits
 application code without automatic specialists. Full team has `lead`,
-`architect0`, `implementer0`, and `reviewer0`, with architect-owned design and
+`architect0`, `implementer0`, `implementer1`, and `reviewer0`, with architect-owned design and
 delegated application implementation. Lead-designed has `lead`, `implementer0`
 and `reviewer0`; the lead writes the substantive design brief and delegates
 application implementation. Catalog prompts own these mode-specific policies.
@@ -840,7 +840,7 @@ unavailable` instead of asserting ongoing work. Returning to the page requests
 a fresh observation. This read does not activate held or stopped threads.
 
 The new-session form labels presets by size and role counts, such as
-`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer`. It also shows
+`Full team (5): 1 lead, 1 architect, 2 implementers, 1 reviewer`. It also shows
 a copyable `dev-session start` command that tracks the selected name, team,
 model, and reasoning effort. From an interactive terminal, that command asks
 for the initial request; portal uploads are not transferred to the CLI.
@@ -891,7 +891,27 @@ development team needs a design owner and an independent reviewer. It can use
 an implementation-purpose member, or a lead that owns design and satisfies
 the implementation policy when no implementer is present. An existing
 implementer must satisfy its policy; the lead cannot substitute for an invalid
-implementer. Role names can differ from the built-in names. The package records
+implementer. Role names can differ from the built-in names. Catalog schema 5 supports an optional team-level
+`initial_member_counts` object, for example `{ implementer = 2; }` in Nix.
+Omitted non-lead roles have one initial member. Counts must be positive integers
+for existing non-lead roles; the expanded team has at most 63 specialists and
+count-bearing teams must fit `max_open_agents`. Members receive consecutive
+addresses within their role, such as `implementer0` and `implementer1`. Schema-4
+catalogs remain readable and keep their original interpretation and digests.
+The new runtime accepts preceding creation snapshots. Older packages reject
+repeated-role creation snapshots; recovery requires a compatible newer package.
+Existing roster and receipt field layouts remain unchanged. Fresh selections
+must fit the existing 64 KiB creating-journal contract, including JSON escaping,
+the journal envelope and newline. Acceptance reserves the maximum filesystem
+component length for the destination slug and checks lead overrides too. The CLI
+writer rejects an oversized complete record before publishing it. Retained
+snapshots keep their original validation.
+
+The unmanaged compatibility preset `full` retains one implementer so interrupted
+reservations from older packages can retry their exact lineup. Installed catalogs
+own the configurable Full-team composition.
+
+The package records
 its catalog digest, and the host launch marker records the launch catalog through
 the registration-plan digest. Catalog identity alone does not require a restart.
 No native child-agent capacity or per-role startup

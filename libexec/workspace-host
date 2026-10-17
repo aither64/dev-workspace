@@ -2389,13 +2389,14 @@ module DevWorkspaceHost
 		preset['roles'].is_a?(Array) && preset['members'].is_a?(Array) &&
 		preset['roles'].length <= 64 && preset['members'].length <= 64
 	  addresses = []
+	  indices = Hash.new(0)
 	  return false unless preset['members'].all? do |member|
 		next false unless member.is_a?(Hash)
 		member_keys = %w[access address behavior model reasoningEffort role]
 		member_keys += %w[purpose instructions] if with_instructions
 		next false unless member.keys.sort == member_keys.sort &&
 		  member['role'].is_a?(String) && member['role'].match?(/\A[a-z][a-z0-9]{0,31}\z/) && member['role'] != 'lead' &&
-		  member['address'] == "#{member['role']}0" &&
+		  member['address'] == "#{member['role']}#{indices[member['role']]}" &&
 		  bounded_portal_setting?(member['model']) && bounded_portal_setting?(member['reasoningEffort'])
 		if with_instructions
 		  purpose = { 'designer' => 'design', 'implementer' => 'implementation',
@@ -2413,6 +2414,7 @@ module DevWorkspaceHost
 		                      'reviewer' => ['reviewer', 'read_only'] }[member['role']] ==
 		                    [member['behavior'], member['access']]
 		end
+		indices[member['role']] += 1
 		addresses << member['address']
 	  end
 	  addresses.uniq.length == addresses.length && preset['roles'] == ['lead'] + addresses

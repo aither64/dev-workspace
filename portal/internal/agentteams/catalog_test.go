@@ -467,3 +467,85 @@ func TestManagedCapacityIsBoundedInEveryPersistedContract(t *testing.T) {
 		t.Fatal("managed package metadata accepted native child capacity above 64")
 	}
 }
+
+func TestInitialMemberCountsValidation(t *testing.T) {
+	fixture := catalogFixture(t)
+	base := fixture.Teams["solo"]
+	base.Mode, base.MaxOpenAgents = "development", 4
+	base.Routing = Routing{DesignSimpleEffort: ptrString("high"), ImplementerSimpleEffort: ptrString("high")}
+	base.Roles["reviewer"] = Role{Model: "review-model", Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}
+	for _, test := range []struct {
+		name   string
+		counts map[string]int
+		valid  bool
+	}{
+		{"default", nil, true}, {"two", map[string]int{"reviewer": 2}, true},
+		{"zero", map[string]int{"reviewer": 0}, false}, {"negative", map[string]int{"reviewer": -1}, false},
+		{"unknown", map[string]int{"missing": 2}, false}, {"lead", map[string]int{"team_lead": 2}, false},
+		{"over slots", map[string]int{"reviewer": 5}, false}, {"too large", map[string]int{"reviewer": 64}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			team := base
+			team.InitialMemberCounts = test.counts
+			if got := validTeam("development", team, Capacity{RequiredNativeChildThreads: 4}, fixture.WorkPolicy); got != test.valid {
+				t.Fatalf("valid = %t", got)
+			}
+		})
+	}
+}
+
+func TestInitialCountsRejectOverlappingNumberedRoleNames(t *testing.T) {
+	fixture := catalogFixture(t)
+	team := fixture.Teams["solo"]
+	team.Mode, team.MaxOpenAgents = "development", 12
+	team.Routing = Routing{DesignSimpleEffort: ptrString("high"), ImplementerSimpleEffort: ptrString("high")}
+	reviewer := Role{Model: "review-model", Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}
+	team.Roles["reviewer"], team.Roles["reviewer1"] = reviewer, reviewer
+	team.InitialMemberCounts = map[string]int{"reviewer": 11}
+	if validTeam("development", team, Capacity{RequiredNativeChildThreads: 12}, fixture.WorkPolicy) {
+		t.Fatal("reviewer10 collides with reviewer1 index zero")
+	}
+}
+
+func TestCatalogCountsShapeAndPreviousSchema(t *testing.T) {
+	for _, schema := range []int{4, 5} {
+		for _, value := range []string{"absent", "{}", "null", "[]", `{"reviewer":1.5}`, `{"reviewer":"2"}`} {
+			t.Run(fmt.Sprintf("%d/%s", schema, value), func(t *testing.T) {
+				var raw map[string]any
+				data := marshalFixture(t, catalogFixture(t))
+				if err := json.Unmarshal(data, &raw); err != nil {
+					t.Fatal(err)
+				}
+				raw["schema_version"] = schema
+				team := raw["teams"].(map[string]any)["solo"].(map[string]any)
+				if value != "absent" {
+					team["initial_member_counts"] = json.RawMessage(value)
+				}
+				valid := value == "absent" || (schema == 5 && value == "{}")
+				if err := validateCatalogShape(marshalFixture(t, raw)); (err == nil) != valid {
+					t.Fatalf("shape: %v", err)
+				}
+			})
+		}
+	}
+	// Reconstruct preceding schema-4 identities without adding defaults to its JSON.
+	catalog := catalogFixture(t)
+	catalog.SchemaVersion = 4
+	catalog.Teams["solo"] = withFixtureTeamDigest(t, catalog.Teams["solo"], marshalFixture(t, catalog), "solo")
+	digest, err := catalogDigest(marshalFixture(t, catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.CatalogDigest = digest
+	for i := range catalog.NativeAgentConfigs.Roles {
+		role := &catalog.NativeAgentConfigs.Roles[i]
+		role.Name = expectedRoleName(digest, *role)
+	}
+	for i := range catalog.NativeAgentConfigs.Utilities {
+		utility := &catalog.NativeAgentConfigs.Utilities[i]
+		utility.Name = expectedUtilityName(digest, *utility)
+	}
+	if _, err := decodeCatalog(marshalFixture(t, catalog)); err != nil {
+		t.Fatalf("schema 4: %v", err)
+	}
+}
