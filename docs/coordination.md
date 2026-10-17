@@ -212,17 +212,21 @@ affects dates only. A crash after ledger publication can leave an event without
 a date. Timing failure never rolls back successful work or affects scheduling,
 ownership, completion proofs or scheduler wake-up.
 
-Notifications use the existing Codex submission ledger, exact retained thread,
-model, effort and lead policy. Busy threads receive steering; idle threads receive
-a new turn. Background integration runs report completion or agent action; their
-intermediate events remain in status without starting model turns. The coordinator preserves message IDs and reconciles lost replies.
-Each snapshot has one retained notification per reported state; repeated resource
-waits or reconciliation reuse that event. Native options and receipts live in
-immutable checksummed artifacts, so large retained instructions do not fill the
-operation ledger. Retries verify and load the original options.
-A crash after recording submission but before the native RPC can leave delivery
-ambiguous. That event remains visible and retries only reconciliation; it never
-creates another message ID or conversation to escape the ambiguity.
+Notifications are informational status messages sent to the retained Codex
+conversation. They use its saved model, effort and lead policy. Busy threads
+receive steering; idle threads receive a new turn. Background runs report
+completion or agent action; intermediate states remain visible without starting
+model turns. Each operation state has one
+retained logical event. Native options and receipts live in immutable checksummed
+artifacts; retries load the original options and preserve the event text/context.
+
+Delivery is at least once: after a failed attempt, the next retry derives a new
+native message ID from the event and its persisted failure count. Repeating the
+same attempt still reconciles its exact ID. A lost reply or a crash before the
+failure counter is saved can therefore produce a duplicate status message, but
+an uncertain submission cannot prevent later attempts from making progress.
+This policy applies only to coordinator status notifications. Commands and user
+requests retain their existing replay protection.
 
 Selected-package registration reconciles services under the transition lock and
 refuses a pending package transition or held machine review reservation before

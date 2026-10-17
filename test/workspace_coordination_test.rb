@@ -851,13 +851,13 @@ class WorkspaceCoordinationTest < Minitest::Test
     assert_equal 'succeeded', @engine.reconcile_job(first, a['id'])['state']
   end
 
-  def test_notification_retry_keeps_exact_native_identity_and_saved_options
+  def test_notification_retry_keeps_event_and_options_with_a_new_native_delivery_identity
     first = owner('first')
     submit_merge(first)
     @engine.claim
     calls = []
-    @engine.define_singleton_method(:notification_call) do |_owner, event, action|
-      calls << [action, Marshal.load(Marshal.dump(event))]
+    @engine.define_singleton_method(:notification_call) do |recipient, event, action|
+      calls << [action, Marshal.load(Marshal.dump(event)), notification_payload(recipient, event, action)]
       return {'options' => {'model' => 'saved-model', 'reasoningEffort' => 'xhigh'}} if action == 'prepare'
       raise WorkspaceCoordination::Error, 'lost native reply' if calls.count { |call| call.first == 'send' } == 1
       {'receipt' => {'threadId' => event['thread'], 'turnId' => 'observed-native-turn'}}
@@ -868,9 +868,15 @@ class WorkspaceCoordinationTest < Minitest::Test
     assert_equal 'retry', event['state']
     @engine.store.transaction { |ledger| ledger['outbox'][event['id']]['retryAt'] = 0 }
     @engine.deliver_notifications
-    sends = calls.select { |call| call.first == 'send' }.map(&:last)
+    sends = calls.select { |call| call.first == 'send' }.map { |call| call[1] }
     assert_equal 2, sends.length
     assert_equal sends.first.slice('messageId', 'text', 'thread', 'actionContext', 'options', 'payloadDigest'), sends.last.slice('messageId', 'text', 'thread', 'actionContext', 'options', 'payloadDigest')
+    payloads = calls.select { |call| call.first == 'send' }.map(&:last)
+    assert_equal event['messageId'], payloads.first['messageId']
+    refute_equal payloads.first['messageId'], payloads.last['messageId']
+    assert_match WorkspaceCoordination::UUID, payloads.last['messageId']
+    assert_equal payloads.last, @engine.notification_payload(first, sends.last, 'send')
+    assert_equal payloads.first.reject { |key, _| key == 'messageId' }, payloads.last.reject { |key, _| key == 'messageId' }
     assert_equal 'delivered', @engine.store.read['outbox'][event['id']]['state']
     assert_equal 1, calls.count { |call| call.first == 'prepare' }
   end

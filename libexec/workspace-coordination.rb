@@ -804,9 +804,15 @@ module WorkspaceCoordination
         WorkspaceCoordination.keys!(options, %w[id kind options])
         raise Error.new('notification options artifact has wrong kind', 5) unless options['kind'] == 'notification_options' && options['options'].is_a?(Hash)
       end
+      # Status messages tolerate duplicate delivery. Retain the logical event,
+      # but do not retry an uncertain native submission forever with the same ID.
+      message_id = event && event['messageId']
+      if event && action == 'send' && event.fetch('attempts', 0).positive?
+        message_id = WorkspaceCoordination.event_id(owner, event, "notification-delivery:#{event.fetch('attempts')}")
+      end
       payload = {'schema' => 1, 'action' => action, 'workspace' => owner.fetch('workspace'), 'slug' => owner.fetch('slug'),
         'socket' => owner.fetch('socket'), 'thread' => owner.fetch('thread'), 'stateRoot' => File.dirname(store.root),
-        'text' => event && event['text'], 'messageId' => event && event['messageId'],
+        'text' => event && event['text'], 'messageId' => message_id,
         'actionContext' => event && event['actionContext'], 'options' => options && options['options']}
       raise Error, 'notification request exceeds its protocol bound' if JSON.generate(payload).bytesize + 1 > MAX_REQUEST
       payload
