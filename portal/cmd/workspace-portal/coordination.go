@@ -16,7 +16,8 @@ import (
 )
 
 // Private transport only. Ruby owns outbox persistence and admission locks.
-// It saves options before sending, and always retries the same native identity.
+// It saves options before sending and supplies one native identity per delivery
+// attempt. This helper reconciles that exact identity before submission.
 func coordinationNotify(args []string) error {
 	if len(args) != 2 || args[0] != "--request" {
 		return errors.New("coordination-notify requires --request FILE")

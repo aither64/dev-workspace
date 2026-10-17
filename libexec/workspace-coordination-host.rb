@@ -423,7 +423,7 @@ module DevWorkspaceHost
       engine.store.lock("notifications-#{request['ownerId']}", nonblock: true) do
         owner = engine.store.read['owners'].fetch(request['ownerId'])
         with_coordination_session_admission(entry, owner['slug']) do
-          current = engine.owner(owner['slug'])
+          current = engine.notification_owner(owner)
           unless current['id'] == request['ownerId'] && current['identity'] == request['identity']
             raise WorkspaceCoordination::Error.new('notification owner changed', 4)
           end
@@ -449,26 +449,7 @@ module DevWorkspaceHost
             engine.reconcile_attempts
             engine.store.read['owners'].values.select { |owner| owner['workspace'] == entry['root'] && !owner['fence'] }.each do |owner|
               next if owner['bootstrap']
-              claimed = []
-              with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
-                current = engine.owner(owner['slug'])
-                raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
-              end
-              engine.store.read['jobs'].values.select { |job| job['ownerId'] == owner['id'] && WorkspaceCoordination::CLAIMED.include?(job['state']) }.each do |job|
-                begin
-                  engine.dispatch_reconciliation(job)
-                rescue WorkspaceCoordination::Error => e
-                  raise unless [5, 75].include?(e.code)
-                end
-              end
-              with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
-                current = engine.owner(owner['slug'])
-                raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
-                claimed = engine.claim(owner_id: owner['id'])
-              end
-              claimed.each { |job| engine.dispatch(job) }
-              engine.dispatch_integrations(owner)
-              engine.dispatch_notifications(owner)
+              coordinate_owner(entry, engine, owner)
             rescue WorkspaceCoordination::Error => e
               @err.puts "coordinator owner #{owner['slug']}: #{e.message}"
             end
@@ -488,6 +469,34 @@ module DevWorkspaceHost
         wake_socket&.close
         File.unlink(wake_path) if wake_path && File.exist?(wake_path)
       end
+    end
+
+    def coordinate_owner(entry, engine, owner)
+      jobs = engine.store.read['jobs'].values.select { |job| job['ownerId'] == owner['id'] && !WorkspaceCoordination::TERMINAL.include?(job['state']) }
+      background = engine.store.integration_journals.any? { |run| run['ownerId'] == owner['id'] && run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' }
+      unless jobs.empty? && !background
+        with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
+          current = engine.owner(owner['slug'])
+          raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
+        end
+        jobs.select { |job| WorkspaceCoordination::CLAIMED.include?(job['state']) }.each do |job|
+          begin
+            engine.dispatch_reconciliation(job)
+          rescue WorkspaceCoordination::Error => error
+            raise unless [5, 75].include?(error.code)
+          end
+        end
+        claimed = []
+        with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
+          current = engine.owner(owner['slug'])
+          raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
+          claimed = engine.claim(owner_id: owner['id'])
+        end
+        claimed.each { |job| engine.dispatch(job) }
+        engine.dispatch_integrations(owner)
+      end
+      with_coordination_session_admission(entry, owner['slug'], timeout: 0) { engine.notification_owner(owner) }
+      engine.dispatch_notifications(owner)
     end
 
     def coordination_bootstrap(argv)

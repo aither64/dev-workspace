@@ -547,8 +547,6 @@ module WorkspaceCoordination
 
     def complete(value)
       completion = value['request']['completion']
-      waiting = engine.store.read['outbox'].values.any? { |event| event['ownerId'] == owner['id'] && event['state'] != 'delivered' }
-      return if waiting
       if completion
         final = value['request']['repositories'].map do |item|
           item.slice('repository', 'target').merge('head' => value['operations'][item['repository']].dig('snapshot', 'operation', 'featureHead'))
@@ -573,7 +571,6 @@ module WorkspaceCoordination
       export(value)
       if value['schema'] == 2
         background_notice(value, 'complete')
-        return if engine.store.read['outbox'].values.any? { |event| event['ownerId'] == owner['id'] && event['state'] != 'delivered' }
       end
       record_completion(value)
       value['phase'] = 'complete'
@@ -735,8 +732,7 @@ module WorkspaceCoordination
       state = File.read(state_path)
       ledger = engine.store.read
       settled = value['schema'] != 2 && ledger['jobs'].values.none? { |job| job['ownerId'] == owner['id'] && !TERMINAL.include?(job['state']) } &&
-        ledger['reservations'].values.none? { |reservation| reservation['ownerId'] == owner['id'] && reservation['state'] != 'released' } &&
-        ledger['outbox'].values.none? { |event| event['ownerId'] == owner['id'] && event['state'] != 'delivered' }
+        ledger['reservations'].values.none? { |reservation| reservation['ownerId'] == owner['id'] && reservation['state'] != 'released' }
       File.write(state_path, state.sub(/\A---\nlifecycle: active\n---/, "---\nlifecycle: complete\n---")) if exact && settled
     end
 

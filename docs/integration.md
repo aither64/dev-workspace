@@ -59,10 +59,10 @@ that hold until explicit resumption. A profile switch transfers the exact run to
 the selected compatible generation. Operation ledgers, snapshots, adapter protocols
 and attempt envelopes retain schema 1.
 
-Run completion waits for prior delivery receipts, writes its result and emits its
-completion notice before final tracking publication. A delivery acknowledgment
-wakes finalization, so a pending notification cannot strand the run. Unknown native
-send outcomes retain the same message identity and require existing reconciliation.
+Run completion writes its result and emits its completion notice before final
+tracking publication. Informational delivery does not gate completion or release.
+Pending notices remain visible and retry independently; a failed attempt uses a
+new native message identity and can produce a duplicate.
 
 `--background` and `--no-wait` are mutually exclusive. Existing synchronous calls
 and manual `--no-wait` runs keep their behavior; `--no-wait` alone does not arrange
@@ -150,7 +150,8 @@ requests immediate admission. Timeout returns exit 75 without entering the
 mutation callback. Waiting is cancelable and uses a monotonic clock.
 
 Notifications run separately from scheduling, under a shared generation/lifecycle
-guard. They retain native options and message IDs and reconcile ambiguous sends.
+guard. They retain event identity and native options. After a recorded delivery
+failure, the next attempt uses a new native message ID and can deliver a duplicate.
 Slow delivery does not hold exclusive session admission or block unrelated claims.
 
 Private versioned journals retain every request identity and payload before
@@ -172,7 +173,9 @@ time and active administration time. Detailed timings live in the private journa
 The session's compact integration summary and result record operation completion;
 the driver's final status also covers tracking publication. Records use the normal
 artifact writer and owned-path tracking commit, preserving unrelated shared files
-and index entries. Feature refs and sessions remain retained.
+and index entries. Informational notification delivery does not gate integration
+completion or machine release; pending events remain visible and retry through
+the coordinator independently. Feature refs and sessions remain retained.
 Each run writes its summary, result and equivalence receipts beneath
 `work/SESSION/integration/RUN_UUID/`. These short writes require session admission
 and the original tracking incarnation, including when resuming finalization.

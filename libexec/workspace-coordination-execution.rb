@@ -662,7 +662,7 @@ module WorkspaceCoordination
         raise Error.new('reservation changed during final proof', 3) unless current == reservation
         pending = ledger['jobs'].values.any? { |job| job['ownerId'] == owner['id'] && !TERMINAL.include?(job['state']) }
         raise Error.new('owner still has pending coordinated operations', 5) if pending
-        raise Error.new('owner still has unresolved notifications or lifecycle recovery', 5) if ledger['owners'][owner['id']]['fence'] || ledger['outbox'].values.any? { |item| item['ownerId'] == owner['id'] && item['state'] != 'delivered' }
+        raise Error.new('owner still has unresolved lifecycle recovery', 5) if ledger['owners'][owner['id']]['fence']
         store.request(ledger, owner['id'], ['finish', id], request) do
           current['state'] = 'released'
           current['revision'] += 1

@@ -909,11 +909,38 @@ module WorkspaceCoordination
     end
 
     def owner(slug, bootstrap: false)
+      value = verified_owner_tracking(slug, bootstrap:)
+      store.transaction do |data|
+        existing = data['owners'].values.find { |item| item['identity'] == value['identity'] }
+        next existing if existing
+        data['owners'][value['id']] = value
+        store.admission_capacity!(data)
+        value
+      end
+    end
+
+    # Delivery may finish after tracking completion, but cannot register a new
+    # owner or admit ordinary operations for a completed session.
+    def notification_owner(owner)
+      current_generation!
+      data = store.read
+      raise Error.new('coordination is suspended', 4) if data['suspended']
+      verified = verified_owner_tracking(owner.fetch('slug'), completed: true)
+      retained = data['owners'][owner.fetch('id')]
+      unless retained && !retained['fence'] && !retained['bootstrap'] && retained['identity'] == verified['identity'] &&
+             retained.slice('workspace', 'workspaceName', 'slug', 'thread', 'socket') == verified.slice('workspace', 'workspaceName', 'slug', 'thread', 'socket')
+        raise Error.new('notification owner changed or has lifecycle recovery', 4)
+      end
+      retained
+    end
+
+    def verified_owner_tracking(slug, bootstrap: false, completed: false)
       raise Error, 'invalid session slug' unless slug.match?(PART)
       root = File.join(workspace, 'work', slug)
       stat = File.lstat(root)
       raise Error.new('session tracking is not an ordinary directory', 4) unless stat.directory?
-      raise Error.new('coordination requires active session lifecycle', 4) unless File.binread(File.join(root, 'state.md'), MAX_REQUEST).match?(/\A---\s*\nlifecycle: active\s*\n---/)
+      lifecycle = completed ? /\A---\s*\nlifecycle: (?:active|complete)\s*\n---/ : /\A---\s*\nlifecycle: active\s*\n---/
+      raise Error.new('coordination requires an eligible session lifecycle', 4) unless File.binread(File.join(root, 'state.md'), MAX_REQUEST).match?(lifecycle)
       manifest = YAML.safe_load(File.binread(File.join(root, 'portal.yml'), 8 * 1024 * 1024 + 1), permitted_classes: [], aliases: false)
       unless manifest.is_a?(Hash) && manifest['slug'] == slug && manifest['repositories'].is_a?(Array) &&
              (!manifest['creation'] || manifest['creation']['state'] == 'ready')
@@ -928,17 +955,10 @@ module WorkspaceCoordination
         notification_call(value = {'workspace' => workspace, 'slug' => slug, 'socket' => entry.fetch('socket'), 'thread' => thread}, nil, 'verify')
       end
       identity = WorkspaceCoordination.digest([workspace, entry.fetch('name'), slug, stat.dev, stat.ino, thread, WorkspaceCoordination.creation_identity(manifest)])
-      value = {'id' => SecureRandom.uuid, 'identity' => identity, 'workspace' => workspace,
+      {'id' => SecureRandom.uuid, 'identity' => identity, 'workspace' => workspace,
                'workspaceName' => entry.fetch('name'), 'slug' => slug, 'thread' => thread,
                'socket' => entry.fetch('socket'), 'portalUrl' => "#{entry.fetch('portalUrl')}/#{slug}/",
                'bootstrap' => bootstrap, 'fence' => nil}
-      store.transaction do |data|
-        existing = data['owners'].values.find { |item| item['identity'] == identity }
-        next existing if existing
-        data['owners'][value['id']] = value
-        store.admission_capacity!(data)
-        value
-      end
     rescue Errno::ENOENT, Psych::Exception => e
       raise Error.new("coordination owner cannot be verified: #{e.message}", 4)
     end
@@ -1101,7 +1121,7 @@ module WorkspaceCoordination
       return unless owner['thread']
       return if item['kind'] != 'integration' && store.background_integration(data, owner['id'], item['id'])
       # One semantic event per snapshot/state. Repeated resource churn and
-      # reconciliation retain the first message and its native retry identity.
+      # reconciliation retain the first logical event identity.
       id = WorkspaceCoordination.event_id(owner, item, state)
       return if data['outbox'].key?(id)
       text = if item['kind'] == 'integration'

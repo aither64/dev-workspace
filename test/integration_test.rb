@@ -83,12 +83,11 @@ class IntegrationTest < Minitest::Test
     WorkspaceCoordination.atomic(request_path, @engine.worker_request(job, first))
     WorkspaceCoordination::Worker.new(request_path, fixtures: true).run
     @engine.reconcile_attempts
-    @engine.define_singleton_method(:notification_call) do |recipient, _event, action|
-      action == 'prepare' ? {'options' => {'model' => 'retained'}} : {'receipt' => {'threadId' => recipient['thread']}}
-    end
-    @engine.deliver_notifications(owner_id: first['id'])
+    pending = @engine.store.read['outbox']
+    refute_empty pending
     finished = integration.resume(payload['requestId'])
     assert_equal 'complete', finished['phase']
+    assert_equal pending, @engine.store.read['outbox']
     assert_equal 1, @engine.store.read['jobs'].length
     assert File.file?(File.join(@workspace, 'work', first['slug'], 'integration', payload['requestId'], 'result.json'))
   end
@@ -322,6 +321,55 @@ class IntegrationTest < Minitest::Test
     assert_equal %w[summary.md result.json].map { |file| File.join('integration', payload['requestId'], file) }, artifacts
   end
 
+  def test_tracking_completion_does_not_wait_for_informational_delivery
+    first = owner('notification-pending')
+    payload = integration_request(first)
+    integration = driver(first)
+    integration.start(payload, wait: false)
+    @engine.claim(owner_id: first['id'])
+    journal = integration.read(payload['requestId'])
+    @engine.store.transaction do |data|
+      data['jobs'].each_value { |job| job['state'] = 'succeeded' }
+    end
+    pending = @engine.store.read['outbox']
+    refute_empty pending
+    root = File.join(@workspace, 'work', first['slug'])
+    manifest = YAML.safe_load(File.read(File.join(root, 'portal.yml')))
+    integration.update_tracking_lifecycle(journal, manifest)
+    assert_match /\Alifecycle: complete\n/, File.read(File.join(root, 'state.md')).delete_prefix("---\n")
+    assert_equal pending, @engine.store.read['outbox']
+    assert_raises(WorkspaceCoordination::Error) { @engine.owner(first['slug']) }
+
+    # Exercise the scheduler's per-owner path and its launched worker command,
+    # with only process creation and the native notification transport stubbed.
+    entry = @entry.merge('root' => @workspace)
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    engine, package, profile = @engine, @package, @profile
+    admissions = []
+    host.instance_variable_set(:@profile, profile)
+    host.define_singleton_method(:registry) { Struct.new(:entries).new([entry]) }
+    host.define_singleton_method(:package_root) { package }
+    host.define_singleton_method(:coordination_engine) { |_entry| engine }
+    host.define_singleton_method(:with_coordination_session_admission) do |_entry, slug, **_options, &block|
+      admissions << slug
+      block.call
+    end
+    @engine.define_singleton_method(:capture) do |*argv, **_options|
+      next "inactive\n" if argv.first == 'systemctl'
+      host.coordination_notifications_command(['--request', argv.last]) if argv.first == 'systemd-run'
+      ''
+    end
+    @engine.define_singleton_method(:notification_call) do |recipient, _event, action|
+      action == 'prepare' ? {'options' => {'model' => 'retained'}} : {'receipt' => {'threadId' => recipient['thread']}}
+    end
+    before_owners = @engine.store.read['owners']
+    host.coordinate_owner(entry, @engine, first)
+    assert_equal [first['slug'], first['slug']], admissions
+    assert_equal before_owners, @engine.store.read['owners']
+    assert @engine.store.read['outbox'].values.all? { |event| event['state'] == 'delivered' }
+    assert_raises(WorkspaceCoordination::Error) { @engine.owner(first['slug']) }
+  end
+
   def test_read_only_status_never_creates_dates_or_changes_ledger
     first = owner('read-status')
     payload = integration_request(first)
@@ -398,7 +446,25 @@ class IntegrationTest < Minitest::Test
     assert_raises(WorkspaceCoordination::Error) { integration.start(payload, wait: false) }
   end
 
-  def test_background_run_continues_without_an_agent_and_finalizes_after_delivery
+  def test_scheduler_dispatches_background_preparation_without_pending_jobs
+    first = owner('background-scheduler')
+    payload = integration_request(first)
+    driver(first).start(payload, background: true)
+    assert_empty @engine.store.read['jobs']
+    launches = []
+    @engine.define_singleton_method(:capture) do |*argv, **_options|
+      next "inactive\n" if argv.first == 'systemctl'
+      launches << argv if argv.first == 'systemd-run'
+      ''
+    end
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
+    host.coordinate_owner(@entry, @engine, first)
+    assert_equal 1, launches.length
+    assert_includes launches.first, 'coordination-integration'
+  end
+
+  def test_background_run_continues_without_an_agent_and_finishes_before_delivery
     first = owner('background-completion')
     integration = driver(first)
     payload = integration_request(first)
@@ -415,14 +481,39 @@ class IntegrationTest < Minitest::Test
     # A new process/driver resumes the original run and original job identities.
     fresh = driver(first)
     result = fresh.run_background(payload['requestId'])
-    assert_equal 'finalizing', result['phase']
+    assert_equal 'complete', result['phase']
     assert_equal 1, @engine.store.read['outbox'].length
+    assert @engine.store.read['outbox'].values.all? { |event| event['state'] == 'pending' }
     fresh.run_background(payload['requestId'])
     assert_equal 1, @engine.store.read['outbox'].length
     deliver_background_notifications(first)
     assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
     assert_equal 1, @engine.store.read['jobs'].length
     assert_equal 'complete', integration.read(payload['requestId']).dig('continuation', 'state')
+    # Interruption after phase publication but before continuation publication
+    # must still launch recovery without repeating any completed operation.
+    interrupted = integration.read(payload['requestId'])
+    interrupted['continuation']['state'] = 'runnable'
+    integration.save(interrupted)
+    jobs_before = @engine.store.read['jobs']
+    launches = []
+    engine = @engine
+    @engine.define_singleton_method(:capture) do |*argv, **_options|
+      next "inactive\n" if argv.first == 'systemctl'
+      if argv.first == 'systemd-run'
+        launches << argv
+        WorkspaceCoordination::Integration.new(engine, first, admission: ->(&block) { block.call },
+          prepare: ->(*) { raise 'completed operations must not prepare again' }, diagnostics: StringIO.new).run_background(payload['requestId'])
+      end
+      ''
+    end
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
+    host.coordinate_owner(@entry, @engine, first)
+    assert_equal 1, launches.length
+    assert_includes launches.first, 'coordination-integration'
+    assert_equal 'complete', integration.read(payload['requestId']).dig('continuation', 'state')
+    assert_equal jobs_before, @engine.store.read['jobs']
   end
 
   def test_background_event_routing_survives_lost_submission_reply
@@ -479,7 +570,7 @@ class IntegrationTest < Minitest::Test
     end
     @engine.dispatch_integrations(first)
     assert_equal 1, calls.length
-    assert_equal 'finalizing', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
     assert_equal [claimed['id']], @engine.store.read['jobs'].keys
     assert_equal 1, @engine.store.read['outbox'].length
     deliver_background_notifications(first)
@@ -518,7 +609,7 @@ class IntegrationTest < Minitest::Test
     assert_equal 'merging', result['phase']
     assert_equal 'runnable', result.dig('continuation', 'state')
     refute integration.read(payload['requestId']).key?('pendingRefresh')
-    assert_equal 'finalizing', driver(first).run_background(payload['requestId'])['phase']
+    assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
     deliver_background_notifications(first)
     assert_equal 'complete', driver(first).run_background(payload['requestId'])['phase']
     assert_equal [id], @engine.store.read['jobs'].keys

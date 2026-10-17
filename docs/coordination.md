@@ -36,7 +36,7 @@ It also covers workspace profile selection on that machine. Other sessions can
 build and merge while their deployment waits.
 
 Normal release requires every exact final owned feature head to be integrated,
-all deployed input revisions to be integrated, settled operations and deliveries,
+all deployed input revisions to be integrated, settled operations,
 unchanged live identities, and an explicit declaration that deployment and review
 work is finished. Integration alone does not release a machine. Deployment or
 review does not supply merge approval.
@@ -227,6 +227,17 @@ failure counter is saved can therefore produce a duplicate status message, but
 an uncertain submission cannot prevent later attempts from making progress.
 This policy applies only to coordinator status notifications. Commands and user
 requests retain their existing replay protection.
+
+Pending notifications remain visible and retry independently after operation
+completion. Delivery accepts the exact retained owner in active or complete
+tracking, without registering a new owner or admitting new coordinated work.
+It still checks native identity, selected generation, suspension and lifecycle
+fences. They do not prevent machine release, integration completion or
+completed tracking. Exact integration proofs, settled jobs, unchanged live
+identities, lifecycle fences and explicit deployment/review acceptance still
+gate release. Lifecycle archive and suspension checks retain their existing
+notification guards. The ledger and native request schemas are unchanged; older
+packages can read this state but restore stricter delivery and completion behavior.
 
 Selected-package registration reconciles services under the transition lock and
 refuses a pending package transition or held machine review reservation before

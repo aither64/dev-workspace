@@ -282,6 +282,30 @@ class WorkspaceCoordinationTest < Minitest::Test
     assert @engine.store.read['outbox'].values.select { |event| event['ownerId'] == first['id'] }.all? { |event| event['state'] == 'pending' }
   end
 
+  def test_retained_notification_admission_preserves_completion_and_lifecycle_guards
+    first = owner('completed-notification')
+    state_path = File.join(@workspace, 'work', first['slug'], 'state.md')
+    File.write(state_path, "---\nlifecycle: complete\n---\n")
+    before = @engine.store.read
+    assert_equal first, @engine.notification_owner(first)
+    assert_equal before, @engine.store.read
+    assert_raises(WorkspaceCoordination::Error) { @engine.owner(first['slug']) }
+    assert_raises(WorkspaceCoordination::Error) { @engine.notification_owner(first.merge('id' => SecureRandom.uuid)) }
+    @engine.store.transaction { |data| data['suspended'] = true }
+    assert_raises(WorkspaceCoordination::Error) { @engine.notification_owner(first) }
+    @engine.store.transaction do |data|
+      data['suspended'] = false
+      data['owners'][first['id']]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => false, 'operationId' => nil}
+    end
+    assert_raises(WorkspaceCoordination::Error) { @engine.notification_owner(first) }
+    @engine.store.transaction { |data| data['owners'][first['id']]['fence'] = nil }
+    File.write(state_path, "---\nlifecycle: abandoned\n---\n")
+    assert_raises(WorkspaceCoordination::Error) { @engine.notification_owner(first) }
+    File.rename(File.dirname(state_path), File.join(@tmp, 'previous-tracking'))
+    owner(first['slug'])
+    assert_raises(WorkspaceCoordination::Error) { @engine.notification_owner(first) }
+  end
+
   def test_machine_revalidates_remote_configuration_before_any_activation
     configure_machine
     first = owner('deployer')
@@ -1017,7 +1041,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     assert_operator JSON.generate(WorkspaceCoordination.diagnostic("\n" * 4096)).bytesize, :<=, 4096
   end
 
-  def test_machine_release_requires_review_completion_exact_integration_and_delivery
+  def test_machine_release_requires_review_and_exact_integration_without_waiting_for_notifications
     check_machine_release(:receipts)
   end
 
@@ -1047,10 +1071,18 @@ class WorkspaceCoordinationTest < Minitest::Test
     payload['deploymentWorkFinished'] = true
     assert_raises(WorkspaceCoordination::Error) { @engine.finish(first, reservation['id'], payload) }
     git('-C', checkout, 'push', 'origin', 'HEAD:master')
+    @engine.store.transaction do |data|
+      data['outbox'].each_value { |event| event['state'] = 'retry'; event['attempts'] = 1; event['error'] = 'lost native reply' }
+    end
+    pending_events = @engine.store.read['outbox'].values
+    refute_empty pending_events
+    assert pending_events.all? { |event| event['state'] != 'delivered' }
+    @engine.store.transaction { |data| data['owners'][first['id']]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => false, 'operationId' => nil} }
     assert_raises(WorkspaceCoordination::Error) { @engine.finish(first, reservation['id'], payload) }
-    @engine.store.transaction { |data| data['outbox'].each_value { |event| event['state'] = 'delivered' } }
+    @engine.store.transaction { |data| data['owners'][first['id']]['fence'] = nil }
     fill_admission(capacity)
     assert_equal 'released', @engine.finish(first, reservation['id'], payload)['state']
+    pending_events.each { |event| assert_equal event, @engine.store.read['outbox'][event['id']] }
     assert_equal 'released', @engine.finish(first, reservation['id'], payload)['state']
     fresh = payload.merge('requestId' => SecureRandom.uuid, 'expectedRevision' => @engine.store.read['reservations'][reservation['id']]['revision'])
     assert_raises(WorkspaceCoordination::Error) { @engine.finish(first, reservation['id'], fresh) }

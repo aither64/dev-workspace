@@ -74,9 +74,14 @@ class WorkspaceHostTest < Minitest::Test
       engine.define_singleton_method(:claim) { |owner_id:| claimed << owner_id; [] }
       engine.define_singleton_method(:dispatch_notifications) { |_owner| throw :scheduler_tick_completed }
       catch(:scheduler_tick_completed) { host.send(:run_coordinator, []) }
-      assert_equal [admitted['id']], claimed
+      assert_empty claimed # An idle owner has no ordinary work to claim.
       assert_equal before, File.binread(path)
       refute_match(/coordinator.*creation/, host.instance_variable_get(:@err).string)
+      File.write(File.join(entry['root'], 'work', slug, 'state.md'), "---\nlifecycle: complete\n---\n")
+      catch(:scheduler_tick_completed) { host.send(:run_coordinator, []) }
+      assert_empty claimed
+      assert_equal before, File.binread(path)
+      assert_raises(WorkspaceCoordination::Error) { engine.owner(slug) }
     end
   end
 
