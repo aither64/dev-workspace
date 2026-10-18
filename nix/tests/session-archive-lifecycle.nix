@@ -159,8 +159,16 @@ pkgs.testers.runNixOSTest {
             machine.wait_until_succeeds(user_prefix + "systemctl --user show " + worker + " -p SubState --value | grep start-pre")
             user("systemctl --user restart workspace-portal@fixture")
             machine.wait_until_succeeds(user_prefix + "test -S /run/user/1000/dev-workspaces/fixture/portal.sock")
-            assert operation(slug)["receiptId"] == accepted["receiptId"]
-            assert operation(slug)["state"] == "running"
+            # Restored receipts start paused until the background reconciler
+            # proves the still-running supervised worker. Socket readiness
+            # alone does not prove that reconciliation has finished.
+            command = "curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
+            command += "http://localhost/api/sessions/" + slug + "/operation"
+            command += " | ${pkgs.python3}/bin/python3 -c " + shlex.quote(
+                "import sys,json; d=json.load(sys.stdin); "
+                "assert d.get('receiptId') == " + repr(accepted["receiptId"]) +
+                " and d.get('state') == 'running', d; print(json.dumps(d))")
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(command), timeout=60)
             user("systemctl --user kill --signal=SIGKILL --kill-whom=all " + worker)
             wait_operation(slug, "failed")
             user("rm " + dropin + "/barrier.conf && systemctl --user daemon-reload")
