@@ -19,6 +19,43 @@ const response = (value, code = 200) => ({ok: code >= 200 && code < 300, status:
 module.exports = async () => {
   let cases = 0;
   const test = async (name, fn) => { await fn(); cases++; };
+  await test("provider edits survive draft restoration, frozen submission and recovery", async () => {
+    const saved=storage(), bodies=[];
+    const options={storage:saved,fields:{...fields,provider:""},randomUUID:()=>id,
+      fetch:async (_,request)=>{if(request.method!=="POST")return response({},404);bodies.push(request.body);if(bodies.length===1)throw new Error("lost reply");return response(status,202);}};
+    const draft=helpers.createRequestDraft(options);
+    draft.update({provider:"pool"});
+    assert.equal(draft.draft.provider,"pool");
+    const restored=helpers.createRequestDraft({...options,fields:{...fields,provider:"openai"},randomUUID:()=>assert.fail("changed identity")});
+    assert.equal(restored.draft.provider,"pool");
+    await assert.rejects(restored.submit([],true),/lost reply/);
+    assert.equal(new URLSearchParams(bodies[0]).get("provider"),"pool");
+    const locked=helpers.createRequestDraft({...options,fields:{...fields,provider:"openai"},randomUUID:()=>assert.fail("changed identity")});
+    await locked.submit([],true);
+    assert.equal(locked.draft.provider,"pool");assert.equal(bodies[0],bodies[1]);
+    const inherited=helpers.createRequestDraft({...options,storage:storage()});
+    inherited.update({provider:"openai"});inherited.update({provider:""});
+    assert.equal(inherited.draft.provider,"");
+    assert.equal(helpers.normalizeDraft({...inherited.draft,schema:2,provider:undefined}).provider,"");
+    assert.equal(helpers.normalizeDraft({...inherited.draft,provider:"../foreign"}),null);
+  });
+  await test("provider-aware envelopes upgrade old drafts without changing frozen bytes", async () => {
+    const saved=storage();
+    const draft=helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>id,fetch:async()=>{throw Error("lost");}});
+    assert.equal(draft.draft.schema,3);
+    const legacy={...draft.draft,schema:2}; delete legacy.provider;
+    saved.setItem(helpers.draftKey,JSON.stringify(legacy));
+    const restored=helpers.createRequestDraft({storage:saved,fields,randomUUID:()=>assert.fail("new identity"),fetch:async()=>{throw Error("lost");}});
+    assert.equal(restored.draft.schema,3); assert.equal(restored.draft.provider,"");
+    await assert.rejects(restored.submit([],true),/lost/);
+    const frozen={...restored.draft,schema:2}; delete frozen.provider;
+    saved.setItem(helpers.draftKey,JSON.stringify(frozen));
+    const recovered=helpers.createRequestDraft({storage:saved,fields,fetch:async()=>assert.fail("network during restore")});
+    assert.equal(recovered.draft.schema,3); assert.equal(recovered.draft.body,frozen.body);
+    assert.equal(recovered.draft.requestId,frozen.requestId);
+    assert.equal(helpers.normalizeDraft({...draft.draft,schema:3,provider:undefined}),null);
+    assert.equal(helpers.normalizeDraft({...draft.draft,schema:4}),null);
+  });
   await test("sensitive request retries keep the exact private choice", async () => {
     const saved = storage(); const bodies = [];
     const options = {storage: saved, fields: {...fields, sensitive: "true"}, randomUUID: () => id,

@@ -33,13 +33,14 @@
       if (storage.getItem(key) !== null) throw storageError();
     } catch (_) { throw storageError(); }
   };
-  const fieldNames = ["name", "goal", "date", "model", "effort", "team", "catalogDigest", "sensitive"];
+  const fieldNames = ["name", "goal", "date", "model", "effort", "team", "catalogDigest", "sensitive", "provider"];
   const validFields = (value) => fieldNames.every((key) => typeof value[key] === "string") &&
-    ["", "true"].includes(value.sensitive) && /^\d{4}-\d{2}-\d{2}$/.test(value.date);
+    ["", "true"].includes(value.sensitive) && (value.provider === "" || /^[a-z0-9][a-z0-9_-]{0,62}$/.test(value.provider)) && /^\d{4}-\d{2}-\d{2}$/.test(value.date);
   const normalizeDraft = (value) => {
+    if (value?.schema === 2 && value.provider === undefined) value = {...value, provider: ""};
     if (value && value.sensitive === undefined) value = {...value, sensitive: ""};
     if (value && value.browserNotificationsEnabled === undefined) value = {...value, browserNotificationsEnabled: true};
-    if (!value || value.schema !== 2 || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
+    if (!value || ![2, 3].includes(value.schema) || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
         (value.catalogRejected !== undefined && typeof value.catalogRejected !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
@@ -52,7 +53,7 @@
       if (value.attachmentIds.length && !value.scope) return null;
       const fields = new URLSearchParams(value.body);
       const scalars = ["clientRequestId", "name", "goal", "creation_date", "model", "effort", "uploadScope"];
-      const optional = ["team", "catalogDigest", "sensitive", "browserNotificationsEnabled"];
+      const optional = ["team", "catalogDigest", "sensitive", "browserNotificationsEnabled", "provider"];
       if (scalars.some((key) => fields.getAll(key).length !== 1) ||
           optional.some((key) => fields.getAll(key).length > 1) ||
           [...fields.keys()].some((key) => ![...scalars, ...optional, "attachmentIds"].includes(key)) ||
@@ -62,7 +63,9 @@
           fieldNames.some((key) => (fields.get(key === "date" ? "creation_date" : key) || "") !== value[key]) ||
           JSON.stringify(fields.getAll("attachmentIds")) !== JSON.stringify(value.attachmentIds)) return null;
     } else if (value.accepted || value.attachmentIds.length) return null;
-    return value;
+    // Older readers must reject provider-aware editable records too. Upgrade
+    // only the envelope; retain attempted request IDs and body bytes.
+    return {...value, schema: 3};
   };
   const createRequestDraft = ({storage, fields, legacyStorage, randomUUID = () => globalThis.crypto.randomUUID(), fetch: fetchRequest}) => {
     let saved;
@@ -72,7 +75,7 @@
     } catch (_) { throw storageError(); }
     let draft = normalizeDraft(saved);
     if (saved && !draft && (saved.schema !== undefined || !validFields({...saved,
-      sensitive: saved.sensitive || "", model: saved.model || "", effort: saved.effort || "", team: saved.team || "", catalogDigest: saved.catalogDigest || ""}))) {
+      provider: saved.provider || "", sensitive: saved.sensitive || "", model: saved.model || "", effort: saved.effort || "", team: saved.team || "", catalogDigest: saved.catalogDigest || ""}))) {
       throw new Error("The saved session request is unreadable. Keep this tab's storage for recovery; no request was sent.");
     }
     if (!draft) {
@@ -91,7 +94,7 @@
         } catch (_) { /* Unreadable legacy storage cannot block this tab's draft. */ }
       }
       const original = saved ? {...fields, ...saved} : fields;
-      draft = {schema: 2, requestId: randomUUID(), ...Object.fromEntries(fieldNames.map((key) => [key, original[key] || ""])),
+      draft = {schema: 3, requestId: randomUUID(), ...Object.fromEntries(fieldNames.map((key) => [key, original[key] || ""])),
         browserNotificationsEnabled: original.browserNotificationsEnabled !== false, scope: null, attachmentIds: [], body: null, accepted: null, migratedUploads};
       if (!normalizeDraft(draft)) throw new Error("Unable to allocate a valid session request identity.");
     }
@@ -156,6 +159,7 @@
               creation_date: draft.date, model: draft.model, effort: draft.effort, uploadScope: draft.scope?.id || ""});
             body.set("browserNotificationsEnabled", String(draft.browserNotificationsEnabled));
             if (includeTeam) { body.set("team", draft.team); body.set("catalogDigest", draft.catalogDigest); }
+            if (draft.provider) body.set("provider", draft.provider);
             if (draft.sensitive === "true") body.set("sensitive", "true");
             for (const id of attachmentIds) body.append("attachmentIds", id);
             draft = {...draft, attachmentIds: [...attachmentIds], body: body.toString()};

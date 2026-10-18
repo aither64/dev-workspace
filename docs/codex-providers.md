@@ -32,8 +32,14 @@ Omitting the option inherits the workspace default. The CLI creation journal
 retains the original selection before provider binding, so an interrupted retry
 cannot change it by omitting or replacing the flag. An explicit selection binds
 to the accepted creation incarnation, then to its exact root thread. Creation
-retries retain that selection. Reusing a deleted session name cannot inherit
+retries retain that selection. Browser drafts keep the provider through model
+refresh and reload; an accepted request keeps its exact submitted provider. Reusing a deleted session name cannot inherit
 the previous session's override. Retained members use their session's provider.
+
+Browser creation drafts use schema 3. The current portal reads older schema-2
+requests and preserves their submitted bytes. Older portals refuse schema-3
+drafts before submission, including editable drafts. After a rollback, keep the
+tab's storage and restore a compatible portal to continue the saved request.
 
 Explicit forks retain provider intent in a schema-2 fork journal; inherited
 forks keep schema 1. Both use the existing provider-state format. A package must

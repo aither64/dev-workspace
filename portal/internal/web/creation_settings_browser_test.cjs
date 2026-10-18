@@ -11,7 +11,9 @@ const baseURL = process.argv[2];
     const errors = [];
     let releaseModels, failModels = false, holdModels = true, modelReads = 0;
     page.on("pageerror", error => errors.push(error.message));
-    await page.route("**/api/models", async route => {
+    await page.route("**/api/codex-providers*", route => route.fulfill({json: {default:"openai",active:"openai",providers:[
+      {id:"openai",label:"Subscription",kind:"subscription"},{id:"pool",label:"Pool",kind:"codex-lb"}]}}));
+    await page.route("**/api/models*", async route => {
       modelReads++;
       if (holdModels) await new Promise(resolve => { releaseModels = resolve; });
       if (failModels) return route.fulfill({status: 503, json: {error: "Models unavailable"}});
@@ -20,6 +22,7 @@ const baseURL = process.argv[2];
           supportedReasoningEfforts: [{reasoningEffort: "high"}, {reasoningEffort: "xhigh"}]},
         {model: "model-solo", displayName: "Solo model", isDefault: true, defaultReasoningEffort: "medium",
           supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "high"}]},
+        ...(new URL(route.request().url()).searchParams.get("provider")==="pool" ? [{model:"pool-marker",displayName:"Pool marker",defaultReasoningEffort:"high",supportedReasoningEfforts:[{reasoningEffort:"high"}]}] : []),
       ]});
     });
     await page.route("**/api/upload-drafts", route => route.fulfill({status: 503, json: {error: "Fixture has no files"}}));
@@ -49,7 +52,7 @@ const baseURL = process.argv[2];
         const box = input.getBoundingClientRect(), text = range.getBoundingClientRect();
         return {width: box.width, centerDelta: Math.abs(box.y + box.height / 2 - text.y - text.height / 2),
           afterTeam: Boolean(document.querySelector("[name=team]").compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING),
-          beforeOptions: label.nextElementSibling?.tagName === "DETAILS"};
+          beforeOptions: Boolean(label.nextElementSibling?.querySelector("[name=browserNotificationsEnabled]")) && label.nextElementSibling?.nextElementSibling?.tagName === "DETAILS"};
       });
       assert.ok(geometry.width < 24 && geometry.centerDelta < 2, JSON.stringify(geometry));
       assert.ok(geometry.afterTeam && geometry.beforeOptions, JSON.stringify(geometry));
@@ -84,6 +87,27 @@ const baseURL = process.argv[2];
     holdModels = false; releaseModels();
     await expect(model.locator("option")).toHaveCount(2);
     await pair("model-solo", "high");
+    // The actual provider store must retain edits when async model loading and
+    // draft restoration run, including across reload and equal-default pins.
+    const provider=form.locator("[name=provider]");
+    await expect(provider.locator("option[value='']")).toHaveText("Workspace default (Subscription)");
+    await provider.selectOption("pool");
+    await expect(model.locator("option[value=pool-marker]")).toHaveCount(1);
+    await expect(provider).toHaveValue("pool");
+    await expect.poll(()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)).provider,draftKey)).toBe("pool");
+    await page.evaluate(()=>document.dispatchEvent(new CustomEvent("workspace-provider-changed")));
+    await expect(model.locator("option[value=pool-marker]")).toHaveCount(1);
+    await expect(provider).toHaveValue("pool");
+    await page.reload({waitUntil:"domcontentloaded"});
+    await form.locator("summary").click();
+    await expect(provider).toHaveValue("pool");
+    await expect(model.locator("option[value=pool-marker]")).toHaveCount(1);
+    await provider.selectOption("openai");
+    await expect.poll(()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)).provider,draftKey)).toBe("openai");
+    await expect(model.locator("option[value=pool-marker]")).toHaveCount(0);
+    await expect(provider).toHaveValue("openai");
+    await provider.selectOption("");
+    await expect.poll(()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)).provider,draftKey)).toBe("");
     await model.selectOption("model-lead");
     await pair("model-lead", "high");
     await effort.selectOption("xhigh");
@@ -161,10 +185,10 @@ const baseURL = process.argv[2];
     await page.evaluate(key => {
       const draft=JSON.parse(sessionStorage.getItem(key));
       Object.assign(draft,{name:"retained-choice",goal:" literal saved request ",team:"solo",model:"model-lead",effort:"xhigh",
-        catalogDigest:"b".repeat(64),sensitive:"true",browserNotificationsEnabled:false});
+        catalogDigest:"b".repeat(64),sensitive:"true",browserNotificationsEnabled:false,provider:"pool"});
       draft.body=new URLSearchParams({clientRequestId:draft.requestId,name:draft.name,goal:draft.goal,creation_date:draft.date,
         team:draft.team,catalogDigest:draft.catalogDigest,model:draft.model,effort:draft.effort,sensitive:"true",
-        browserNotificationsEnabled:"false",uploadScope:draft.scope?.id || ""}).toString();
+        browserNotificationsEnabled:"false",provider:draft.provider,uploadScope:draft.scope?.id || ""}).toString();
       sessionStorage.setItem(key,JSON.stringify(draft));
     },draftKey);
     await page.reload({waitUntil:"domcontentloaded"});
@@ -184,6 +208,8 @@ const baseURL = process.argv[2];
     const retried=new URLSearchParams(catalogBodies[1]);
     assert.notEqual(retried.get("catalogDigest"),"b".repeat(64));
     assert.equal(retried.get("clientRequestId"),rejected.requestId);
+    assert.equal(retried.get("provider"),"pool");
+    await expect(provider).toHaveValue("pool");
     assert.equal(retried.get("team"),"solo");assert.equal(retried.get("model"),"model-lead");
     assert.equal(retried.get("effort"),"xhigh");assert.equal(retried.get("goal"),rejected.goal);
     // A removed saved team/model stays visible, but confirming new policy
