@@ -407,6 +407,12 @@ test catalog through `DEV_WORKSPACES_CODEX_PROVIDERS`. Otherwise their disposabl
 unregistered workspaces read the host's provider catalog. Package checks run in
 the isolated Nix build environment.
 
+The ordinary Go/Node check `TestSessionPreparationShippedBrowserHTTP` sends the
+shipped preparation serializer's requests through the real `/sessions` handler,
+including durable acceptance and replay. The optional Playwright creation test
+also submits real forms to that handler. Mocked POST responses test browser
+error handling; they do not establish that the server accepts a request.
+
 CI runs package and focused checks on every push and pull request. On `master`
 and manual dispatch, it also runs a small NixOS VM test for activation,
 idempotency, nginx authentication, renewal, recovery and rollback. Dispatch

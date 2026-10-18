@@ -261,6 +261,32 @@ const baseURL = process.argv[2];
         assert.equal(await page.locator("#settings [name=sensitive]").count(), 0);
       }
     }
+    // These pages have no /sessions route interception: submit the real form
+    // through the production parser, validation and durable admission handler.
+    for (const value of ["", "pool", "openai"]) {
+      const actual=await browser.newPage({ignoreHTTPSErrors:true});
+      actual.on("pageerror",error=>errors.push(error.message));
+      await actual.route("**/api/models*",route=>route.fulfill({json:[{model:"model-solo",displayName:"Solo model",
+        defaultReasoningEffort:"high",supportedReasoningEfforts:[{reasoningEffort:"high"}]}]}));
+      await actual.goto(baseURL,{waitUntil:"domcontentloaded"});
+      const realForm=actual.locator("#new-session-form");
+      await realForm.locator("[name=team]").selectOption("solo");
+      const realProvider=realForm.locator("[name=provider]");
+      await expect(realProvider.locator("option[value=pool]")).toHaveCount(1);
+      await realProvider.selectOption(value);
+      await realForm.locator("[name=goal]").fill(`Unmocked provider admission: ${value || "inherited"}`);
+      await expect(realForm.locator("[type=submit]")).toBeEnabled();
+      const submitted=actual.waitForResponse(response=>new URL(response.url()).pathname==="/sessions" && response.request().method()==="POST");
+      await realForm.locator("[type=submit]").click();
+      const response=await submitted;
+      assert.equal(response.status(),202,await response.text());
+      const status=await response.json();
+      assert.equal(new URLSearchParams(response.request().postData()).get("provider"),value || null);
+      await expect(actual).toHaveURL(`${baseURL}/creations/${status.requestId}/`);
+      await actual.reload({waitUntil:"domcontentloaded"});
+      await expect(actual.locator("body")).not.toContainText("unknown session request field");
+      await actual.close();
+    }
     assert.deepEqual(errors, []);
     console.log("Concrete creation settings, drafts and recovery passed");
   } finally {

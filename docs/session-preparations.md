@@ -10,7 +10,7 @@ existing behavior. Forks, plan sessions and CLI name syntax are unchanged.
 
 The frozen input contains the original UTF-8 prompt, ordered attachment IDs,
 upload scope, date, normalized custom name, submitted team/model values and
-their presence, and an exact resolved team preset. Presets include member and
+their presence, provider selection, and an exact resolved team preset. Presets include member and
 lead settings and instructions. For managed selections, admission validates
 local structure and policy; the initialization worker checks live model/effort
 availability. It never replaces unavailable captured settings with defaults.
@@ -63,9 +63,13 @@ recovery with already saved exact overrides. Initialization checks captured
 settings against live availability without choosing another model or effort.
 
 The browser verifies a random version-4 request ID in the tab's sessionStorage
-before sending. Its version-2 tab draft retains text, date, settings, upload
+before sending. Its version-3 tab draft retains text, date, settings, provider, upload
 scope and the exact serialized submission body, including field presence and
-ordered attachment IDs. The first attempt saves that body before POST. A lost
+ordered attachment IDs. Schema-2 drafts remain readable without changing their
+request ID or submitted body. Older portals reject schema-3 drafts before sending;
+preserve tab storage and use a compatible portal to recover them. See
+[provider selection](codex-providers.md) for inherited and explicit choices.
+The first attempt saves that body before POST. A lost
 response, HTTP failure without a confirmed pre-acceptance rejection, or reload
 keeps the inputs and uploads locked. Recover
 saved request checks status first; a missing operation permits only identical
@@ -309,7 +313,7 @@ before the directory move remains recoverable. Receipt eviction or later
 session deletion never allows the same request ID to initialize again.
 
 The default preparation bound is 50 ordered attachments, matching the upload
-store's prompt limit and the browser's version-2 draft validation. Existing
+store's prompt limit and the browser's draft validation. Existing
 records and drafts remain readable without a schema change. Refresh browser
 assets to recover requests with more than 10 files; a new browser still respects
 the file limit advertised by an older backend.
