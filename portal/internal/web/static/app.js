@@ -223,6 +223,19 @@
   const messageReceiptLabel = (entry) => entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
       "Outcome unknown.";
+  const createIndexSnapshotNotice = (notice) => {
+    let loading = false;
+    return (payload) => {
+      if (payload.loading === true) {
+        if (!loading) notice.begin();
+        loading = true;
+      } else {
+        loading = false;
+        if (payload.warning) notice.failure(new Error(payload.warning));
+        else notice.success();
+      }
+    };
+  };
   const captureTranscriptDisclosureState = (container) => {
     const states = new Map();
     for (const element of container.querySelectorAll("[data-transcript-entry-key]")) {
@@ -1106,6 +1119,7 @@
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
       markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
       createTranscriptAcknowledgementScheduler,
+      createIndexSnapshotNotice,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript, transcriptFollowOnScroll,
       renderCollaborationModes,
@@ -1559,15 +1573,17 @@
   let indexRefreshRunning = false, indexProgressRunning = false, indexHasRunningOperations = false;
   let indexFullNextAt = 0, indexProgressNextAt = 0;
   const indexReads = createReadScope();
-  let indexSnapshotWarning = "", indexFailure = null, progressFailure = null;
+  let indexFailure = null, progressFailure = null;
   const renderIndexWarning = () => {
     const warning = document.getElementById("index-status-warning");
     if (!warning) return;
-    warning.textContent = indexFailure?.warning ? `Live session status is temporarily unavailable: ${indexFailure.error.message}` :
-      progressFailure?.warning ? `Operation status is temporarily unavailable: ${progressFailure.error.message}` : indexSnapshotWarning;
+    warning.textContent = indexFailure?.warning ? indexFailure.error.message :
+      progressFailure?.warning ? `Operation status is temporarily unavailable: ${progressFailure.error.message}` :
+        indexFailure?.loading ? "Session status is loading." : "";
     warning.hidden = !warning.textContent;
   };
   const indexNotice = conversationAssets.createRefreshNotice({render: state => {indexFailure = state; renderIndexWarning();}});
+  const updateIndexSnapshotNotice = createIndexSnapshotNotice(indexNotice);
   const progressNotice = conversationAssets.createRefreshNotice({render: state => {progressFailure = state; renderIndexWarning();}});
   const renderIndexOperations = (operations) => {
     const panel = document.getElementById("operations");
@@ -1721,14 +1737,13 @@
     indexRefreshTimer = null;
     indexRefreshRunning = true;
     const read = indexReads.begin();
-    const warning = document.getElementById("index-status-warning");
     let nextRefresh = refreshPolicy.indexMs;
     try {
       const payload = await request("/api/index-status", {signal: read.signal});
       if (indexNavigationPending || !read.isCurrent()) return;
       indexHasRunningOperations = renderIndexOperations(payload.operations);
       scheduleIndexProgress();
-      if (warning) { warning.textContent = payload.warning || ""; warning.hidden = !warning.textContent; }
+      updateIndexSnapshotNotice(payload);
       const statuses = indexStatusOrder(payload.sessions);
       if (!indexStatusFreshForPage(body.dataset.indexGeneratedAt, payload.generatedAt)) {
         return;
@@ -1802,9 +1817,7 @@
           .filter(Boolean);
         ordered.forEach((card) => grid.append(card));
       }
-      indexSnapshotWarning = payload.warning || "";
       document.dispatchEvent(new Event("session-list-updated"));
-      indexNotice.success();
       if (sidebar) sidebar.scrollTop = previousSidebarTop;
     } catch (error) {
       nextRefresh = refreshPolicy.indexRetryMs;

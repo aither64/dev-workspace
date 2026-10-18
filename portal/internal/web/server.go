@@ -973,7 +973,8 @@ func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
 	result := cloneIndexStatus(s.indexStatusCache)
 	s.indexStatusMu.Unlock()
 	operations, _ := s.lifecycleOperations()
-	if result.created.IsZero() && result.warning == "" {
+	loading := result.created.IsZero() && result.warning == ""
+	if loading {
 		result.warning = "Session status is loading."
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -981,6 +982,7 @@ func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
 		"sessions": result.statuses, "generatedAt": result.created,
 		"operations": operations, "warning": result.warning,
 		"authoritative": result.authoritative,
+		"loading":       loading,
 	})
 }
 

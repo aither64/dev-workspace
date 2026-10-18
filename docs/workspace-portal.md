@@ -308,6 +308,10 @@ failures appear after 30 continuous visible seconds; returning to a hidden tab
 or restoring a page starts a fresh grace period. Access errors and failures of
 user actions appear immediately.
 
+Index snapshot warnings use the same grace period as failed HTTP refreshes,
+including when the server successfully returns its last known state. Repeated
+warnings do not restart the grace period. A healthy snapshot clears the warning.
+
 An unconfirmed send keeps its message in the composer and shows an outcome
 receipt. **Retry original** retries the receipt's saved text and attachments
 with its original attempt ID, independently of the composer draft. A changed
@@ -562,6 +566,8 @@ pause both polls. A cold cache reports loading; it does not certify an empty
 session inventory. `GET /api/index-status?progress=1` reads only these snapshots.
 Ordinary index-status requests ask the single background task to refresh when
 due, with a six-second pass deadline. Session operation GETs also stay cache-only.
+Index-status responses include `loading: true` for a cold cache without a
+recorded refresh failure, so browsers can distinguish loading from a warning.
 
 Session details include `pendingLifecycle` from a fresh validated journal check.
 An empty string confirms no pending journal; inspection errors fail the read.
