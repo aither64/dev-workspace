@@ -236,6 +236,41 @@
       }
     };
   };
+  // One notice owns the current thread's metadata-loading episode. Exact
+  // observations stay with entry identities even when a later page lacks them.
+  const createTranscriptTimestampPresentation = ({format, keyFor, createNotice, onChange}) => {
+    let threadID = "", pending = false, showFallback = false;
+    const exact = new Map();
+    const notice = createNotice({render: (state) => {
+      if (showFallback === Boolean(state.warning)) return;
+      showFallback = Boolean(state.warning);
+      onChange?.();
+    }});
+    return {
+      observe(payload) {
+        if (threadID !== payload.threadId) {
+          threadID = payload.threadId;
+          exact.clear();
+          notice.success();
+        }
+        pending = payload.metadataPending === true;
+        (payload.entries || []).forEach((entry, index, entries) => {
+          if (entry.timestampApproximate === true || !format(entry).dateTime) return;
+          const key = keyFor(entry, index, entries);
+          exact.set(key, entry.timestamp);
+        });
+        if (pending) notice.failure(new Error("Message times are still loading."));
+        else notice.success();
+      },
+      present(entry, index, entries) {
+        const timestamp = exact.get(keyFor(entry, index, entries));
+        if (timestamp) return format({...entry, timestamp, timestampApproximate: false});
+        if (pending && !showFallback) return {text: "", title: "", dateTime: "", dateKey: "", dateLabel: ""};
+        return format(entry);
+      },
+      destroy() { notice.destroy(); exact.clear(); },
+    };
+  };
   const captureTranscriptDisclosureState = (container) => {
     const states = new Map();
     for (const element of container.querySelectorAll("[data-transcript-entry-key]")) {
@@ -1119,7 +1154,7 @@
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
       markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
       createTranscriptAcknowledgementScheduler,
-      createIndexSnapshotNotice,
+      createIndexSnapshotNotice, createTranscriptTimestampPresentation,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript, transcriptFollowOnScroll,
       renderCollaborationModes,
@@ -4137,6 +4172,15 @@
     }
   };
 
+  const transcriptNodeEntries = new WeakMap();
+  const transcriptContent = ({timestamp, timestampApproximate, ...content}) => JSON.stringify(content);
+  const updateTranscriptTimestamp = (time, timestamp) => {
+    if (time.textContent !== timestamp.text) time.textContent = timestamp.text;
+    if (timestamp.dateTime) {
+      if (time.dateTime !== timestamp.dateTime) time.dateTime = timestamp.dateTime;
+    } else time.removeAttribute("datetime");
+    if (time.title !== timestamp.title) time.title = timestamp.title;
+  };
   const appendMessage = (entry, index, entries, disclosureStates) => {
     const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
     const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
@@ -4175,16 +4219,15 @@
     if (entry.attachments?.length) element.append(conversationAssets.renderAttachments(entry.attachments, {onRemove: async (file) => {
       await request(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
     }}));
-    const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+    const timestamp = transcriptTimestamps.present(entry, index, entries);
     const time = document.createElement("time");
     time.className = "message-time";
-    time.textContent = timestamp.text;
-    if (timestamp.dateTime) time.dateTime = timestamp.dateTime;
-    time.title = timestamp.title;
+    updateTranscriptTimestamp(time, timestamp);
     const footer = document.createElement("div");
     footer.className = "message-footer";
     footer.append(conversationAssets.createTranscriptCopyButton(entry), time);
     element.append(footer);
+    transcriptNodeEntries.set(element, entry);
     return element;
   };
 
@@ -4194,7 +4237,7 @@
     let dateKey = "";
     entries.forEach((entry, index) => {
       if (transcriptEntryVisible(entry, transcriptFilter)) {
-        const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+        const timestamp = transcriptTimestamps.present(entry, index, entries);
         if (timestamp.dateKey && timestamp.dateKey !== dateKey) {
           dateKey = timestamp.dateKey;
           const separator = document.createElement("div");
@@ -4233,7 +4276,7 @@
     for (let index = 0; index < rows.length; index += 1) {
       const {key, entry} = rows[index];
       if (!transcriptEntryVisible(entry, transcriptFilter)) continue;
-      const timestamp = conversationAssets.formatTranscriptTimestamp(entry);
+      const timestamp = transcriptTimestamps.present(entry, index, entries);
       if (timestamp.dateKey && timestamp.dateKey !== lastDate) {
         lastDate = timestamp.dateKey;
         const dateKey = `${timestamp.dateKey}:${dateOccurrence++}`;
@@ -4247,11 +4290,14 @@
         desired.push(separator);
       }
       let node = oldNodes.get(key);
-      if (!node || changed.has(key)) {
+      if (!node || changed.has(key) && transcriptContent(transcriptNodeEntries.get(node)) !== transcriptContent(entry)) {
         const disclosures = new Map();
         const disclosure = node?.querySelector("details");
         if (disclosure) disclosures.set(key, disclosure.open);
         node = appendMessage(entry, index, entries, disclosures);
+      } else {
+        updateTranscriptTimestamp(node.querySelector(".message-footer .message-time"), timestamp);
+        transcriptNodeEntries.set(node, entry);
       }
       desired.push(node);
     }
@@ -4283,6 +4329,21 @@
     if (!view) return;
     Object.assign(view, captureTranscriptViewState(transcript), {follow: view.follow, initialized: true});
   };
+
+  const transcriptTimestamps = createTranscriptTimestampPresentation({
+    format: conversationAssets.formatTranscriptTimestamp,
+    keyFor: conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey,
+    createNotice: conversationAssets.createRefreshNotice,
+    onChange: () => queueMicrotask(() => {
+      if (!transcriptInitialized) return;
+      const view = transcriptViews.get(transcriptFilter);
+      const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({
+        entry, key: legacyTranscriptEntryKey(entry, index, entries),
+      }));
+      patchTranscriptEntries(rows, new Set(), {follow: view.follow});
+    }),
+  });
+  addEventListener("pagehide", (event) => { if (!event.persisted) transcriptTimestamps.destroy(); });
 
   document.querySelectorAll("[data-transcript-filter]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -4348,6 +4409,7 @@
     }
     currentThreadId = payload.threadId;
     loadMessageReceipts();
+    transcriptTimestamps.observe(payload);
     const view = transcriptViews.get(transcriptFilter);
     const follow = !transcriptInitialized || (kind === "newest" && view.follow);
     const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(payload) :

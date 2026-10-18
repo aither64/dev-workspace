@@ -182,6 +182,7 @@ if (!conversationModulePath) throw new Error("browser contract test requires the
 (async () => {
 await require("./preparation_browser_contract_test.cjs")();
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
+require("./refresh_presentation_contract_test.cjs")(conversationAssets);
 assert.equal(hasTranscriptPagingHelpers(conversationAssets), true);
 assert.equal(hasTranscriptPagingHelpers({
   ...conversationAssets, createTranscriptHistory: undefined,

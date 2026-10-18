@@ -312,6 +312,16 @@ Index snapshot warnings use the same grace period as failed HTTP refreshes,
 including when the server successfully returns its last known state. Repeated
 warnings do not restart the grace period. A healthy snapshot clears the warning.
 
+Message times come from recorded item timing when available. While metadata
+loads, the portal keeps an exact time already observed for that entry. For a
+new entry without an exact time, it leaves the time blank until enrichment
+finishes or the shared 30-second visible grace period expires. A fallback based
+on turn timing has a `~` prefix; its tooltip identifies it as approximate.
+Exact times replace estimates as soon as they become available. Time and date
+grouping use the same observation. Returning to a hidden page starts a fresh
+grace period. Older servers without the metadata-loading signal display
+available estimates immediately.
+
 An unconfirmed send keeps its message in the composer and shows an outcome
 receipt. **Retry original** retries the receipt's saved text and attachments
 with its original attempt ID, independently of the composer draft. A changed
