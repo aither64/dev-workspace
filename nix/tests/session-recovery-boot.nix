@@ -11,7 +11,8 @@ let
     import stat
 
     BASE = "/home/developer/.local/state/dev-workspaces/providers/fixture/"
-    IDS = {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+    IDS = {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+           "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}
     ROOT = "/home/developer/workspace"
     SOCKET = "/run/user/1000/dev-workspaces/fixture/app-server.sock"
     PHASES = {"waiting", "applying", "applied", "canceled", "failed", "recovery-required"}
@@ -42,7 +43,7 @@ let
         result = {"kind": "fixture-provider-metadata"}
         try:
             state = private_json("state.json", 1024 * 1024)
-            assert isinstance(state, dict) and state.get("schema") == 1
+            assert isinstance(state, dict) and state.get("schema") in (1, 2)
             assert state.get("workspace") == "fixture" and state.get("root") == ROOT
             assert state.get("socket") == SOCKET
             op = state["operation"]
@@ -56,6 +57,10 @@ let
                 "previousActive": enum(op.get("previousActive"), PROVIDERS),
                 "blockerCount": len(blockers) if isinstance(blockers, list) else None,
             }
+            if op.get("strategy") == "scoped-v1":
+                result["operation"]["strategy"] = "scoped-v1"
+                print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+                return
             snapshot_name = op["id"] + ".snapshot.json"
             assert op.get("snapshot") == BASE + snapshot_name
             try:
@@ -136,12 +141,16 @@ pkgs.testers.runNixOSTest {
     };
     environment.systemPackages = [ pkgs.git ];
     # Register the user-profile closure in the VM's own Nix database.
-    virtualisation.additionalPaths = [ devWorkspace metadata ];
+    virtualisation.additionalPaths = [
+      devWorkspace
+      metadata
+    ];
     system.stateVersion = "26.05";
   };
   testScript = ''
     import json
     import shlex
+    import time
 
     machine.start(allow_reboot=True)
     machine.wait_for_unit("user@1000.service")
@@ -185,8 +194,10 @@ pkgs.testers.runNixOSTest {
     def collect_provider_diagnostics():
         commands = [
             "journalctl --user --no-pager --output=short-monotonic --since=@" + diagnostic_start
-            + " --unit=" + worker + " --unit=" + codex_unit + " | tail -c 65536",
+            + " --unit=" + worker + " --unit=" + codex_unit
+            + " --unit=workspace-codex-reconcile.service --unit=workspace-coordination-gc.service | tail -c 65536",
             "systemctl --user show " + worker + " " + codex_unit
+            + " workspace-codex-reconcile.service workspace-coordination-gc.service"
             + " --property=ActiveState,SubState,MainPID,Result,ExecMainStatus,NRestarts",
             "${pkgs.python3}/bin/python3 ${metadata}",
         ]
@@ -203,7 +214,7 @@ pkgs.testers.runNixOSTest {
         # keep wait_until_succeeds polling an already-failed operation for 900s.
         command = "${pkgs.python3}/bin/python3 -c " + shlex.quote(
             "import json; d=json.load(open(" + repr(state_path) + ")); o=d['operation']; "
-            "expected=(" + predicate + "); terminal=o['phase'] in ['failed','canceled']; "
+            "expected=(" + predicate + "); terminal=o['phase'] in ['applied','failed','canceled']; "
             "assert expected or terminal; "
             "print('PROVIDER_EXPECTED_RESULT' if expected else 'PROVIDER_UNEXPECTED_TERMINAL')")
         try:
@@ -217,12 +228,34 @@ pkgs.testers.runNixOSTest {
     def wait_phase(phase):
         return wait_provider_result("o['phase'] == " + repr(phase))
 
-    with subtest("foreign cgroup processes block the real worker until removed"):
+    def legacy_provider_request(target, identity):
+        # Only retained schema-1 requests use the daemon-restart engine. New
+        # public requests intentionally select scoped-v1, even in an empty workspace.
+        user("systemctl --user stop " + worker)
+        catalog = json.loads(user(package + "/bin/workspace-portal codex-provider catalog "
+                                  "--catalog /etc/dev-workspaces/codex-providers.json"))
+        seed = (
+            "import datetime,json,os; p=" + repr(state_path) + "; "
+            "os.makedirs(os.path.dirname(p),mode=0o700,exist_ok=True); "
+            "d=json.load(open(p)) if os.path.exists(p) else "
+            + repr({"schema": 1, "workspace": "fixture", "root": "/home/developer/workspace",
+                    "socket": "/run/user/1000/dev-workspaces/fixture/app-server.sock", "active": "openai"})
+            + "; assert d['schema']==1; "
+            "now=datetime.datetime.now(datetime.timezone.utc).isoformat(); "
+            "d['operation']=" + repr({"id": identity, "target": target,
+                                      "catalogDigest": catalog["digest"], "phase": "waiting", "blockers": []})
+            + "; d['operation'].update(createdAt=now,updatedAt=now); "
+            "os.umask(0o077); open(p,'w').write(json.dumps(d))"
+        )
+        user("${pkgs.python3}/bin/python3 -c " + shlex.quote(seed))
+        user("systemctl --user enable --now " + worker)
+
+    with subtest("retained legacy requests wait for foreign cgroup processes"):
         foreign_pid = machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(
             "import subprocess; p=subprocess.Popen(['sleep','300'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); print(p.pid)")).strip()
         group = user("systemctl --user show " + codex_unit + " -p ControlGroup --value").strip()
         machine.succeed("echo " + foreign_pid + " > " + shlex.quote("/sys/fs/cgroup" + group + "/cgroup.procs"))
-        user(host + " provider request fixture pool aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        legacy_provider_request("pool", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         wait_provider_result("o['phase']=='waiting' and o['blockers']")
         machine.succeed("kill " + foreign_pid)
         assert wait_phase("applied")["active"] == "pool"
@@ -233,7 +266,7 @@ pkgs.testers.runNixOSTest {
         user("mkdir -p " + shlex.quote(dropin.rsplit("/", 1)[0]))
         user("printf '[Service]\\nExecStart=\\nExecStart=${pkgs.coreutils}/bin/false\\n' > " + shlex.quote(dropin))
         user("systemctl --user daemon-reload")
-        user(host + " provider request fixture pooltwo bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        legacy_provider_request("pooltwo", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         wait_phase("recovery-required")
         user("rm " + shlex.quote(dropin))
         user("systemctl --user daemon-reload")
@@ -257,5 +290,36 @@ pkgs.testers.runNixOSTest {
         assert machine.succeed("cat /proc/sys/kernel/random/boot_id").strip() != before
         assert machine.succeed("loginctl show-user developer -p Linger --value").strip() == "yes"
         assert_services()
+
+    with subtest("new scoped requests preserve the daemon and foreign processes"):
+        try:
+            # A ready socket can precede completion of boot package reconciliation.
+            # Join that ordinary oneshot before taking the PID baseline or adding activity.
+            machine.succeed(user_prefix + "systemctl --user start workspace-codex-reconcile.service", timeout=300)
+            assert_services()
+            daemon_pid = user("systemctl --user show " + codex_unit + " -p MainPID --value").strip()
+            foreign_pid = machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(
+                "import subprocess; p=subprocess.Popen(['sleep','300'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); print(p.pid)")).strip()
+            group = user("systemctl --user show " + codex_unit + " -p ControlGroup --value").strip()
+            machine.succeed("echo " + foreign_pid + " > " + shlex.quote("/sys/fs/cgroup" + group + "/cgroup.procs"))
+            # Retry only a concurrent package-admission refusal, retaining the
+            # exact request UUID. Every other failure ends this assertion.
+            request = host + " provider request fixture pooltwo cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            deadline = time.monotonic() + 60
+            while True:
+                status, output = machine.execute(user_prefix + "sh -c " + shlex.quote(request + " 2>&1"), timeout=30)
+                if status == 0:
+                    break
+                assert output.strip() == "error: workspace package transition is in progress; retry shortly", output
+                assert time.monotonic() < deadline, "package admission did not settle"
+                time.sleep(1)
+            assert wait_phase("applied")["active"] == "pooltwo"
+            assert user("systemctl --user show " + codex_unit + " -p MainPID --value").strip() == daemon_pid
+            machine.succeed("kill -0 " + foreign_pid)
+            machine.succeed("kill " + foreign_pid)
+            assert_services()
+        except Exception:
+            collect_provider_diagnostics()
+            raise
   '';
 }

@@ -609,21 +609,21 @@ class WorkspaceHostTest
           machine.phase = phase
           wait(phase)  # Expected phase is checked before terminal classification.
       assert not machine.collection
-      for phase in ['failed', 'canceled']:
+      for phase, expected in [('failed', 'applied'), ('canceled', 'applied'), ('applied', 'waiting')]:
           machine.phase = phase
           machine.fail_collection = True
           before = machine.calls
           output = io.StringIO()
           try:
               with contextlib.redirect_stdout(output):
-                  wait('applied')
+                  wait(expected)
               raise RuntimeError('unexpected terminal accepted')
           except AssertionError as error:
               assert str(error) == 'provider reached an unexpected terminal phase'
           assert machine.calls == before + 1  # Terminal shell return was successful.
           assert 'SECRET_CANARY' not in output.getvalue()
-      assert len(machine.collection) == 6
-      assert machine.collection_timeouts == [10] * 6
+      assert len(machine.collection) == 9
+      assert machine.collection_timeouts == [10] * 9
       assert sum(machine.collection_timeouts[:3]) == 30
       journal = machine.collection[0]
       assert '--unit=workspace-codex-provider@fixture.service' in journal
@@ -638,7 +638,7 @@ class WorkspaceHostTest
               raise RuntimeError('intermediate incorrectly accepted')
           except AssertionError as error:
               assert str(error) != 'provider reached an unexpected terminal phase'
-      assert source.count('with subtest(') == 5
+      assert source.count('with subtest(') == 6
       assert source.count('machine.reboot()') == 2
       assert "wait_phase(\"recovery-required\")" in source
       assert source.count('wait_phase("failed")') == 2
