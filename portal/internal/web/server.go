@@ -751,6 +751,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.providerMutation(w, r, true)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/recover":
 		s.providerMutation(w, r, false)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/dismiss":
+		s.providerMutation(w, r, false)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-limits/reset":
 		s.consumeCodexReset(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":

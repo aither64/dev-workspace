@@ -105,22 +105,24 @@ func (c Catalog) Find(id string) (Provider, error) {
 }
 
 type Operation struct {
-	ID             string            `json:"id"`
-	Target         string            `json:"target"`
-	CatalogDigest  string            `json:"catalogDigest"`
-	Phase          string            `json:"phase"`
-	Blockers       []string          `json:"blockers"`
-	CreatedAt      string            `json:"createdAt"`
-	UpdatedAt      string            `json:"updatedAt"`
-	Snapshot       string            `json:"snapshot,omitempty"`
-	Message        string            `json:"message,omitempty"`
-	Stage          string            `json:"stage,omitempty"`
-	PreviousActive string            `json:"previousActive,omitempty"`
-	Strategy       string            `json:"strategy,omitempty"`
-	Session        string            `json:"session,omitempty"`
-	Sessions       []string          `json:"sessions,omitempty"`
-	Inherit        bool              `json:"inherit,omitempty"`
-	Roots          map[string]string `json:"roots,omitempty"`
+	ID              string            `json:"id"`
+	Target          string            `json:"target"`
+	CatalogDigest   string            `json:"catalogDigest"`
+	Phase           string            `json:"phase"`
+	Blockers        []string          `json:"blockers"`
+	CreatedAt       string            `json:"createdAt"`
+	UpdatedAt       string            `json:"updatedAt"`
+	Snapshot        string            `json:"snapshot,omitempty"`
+	Message         string            `json:"message,omitempty"`
+	Stage           string            `json:"stage,omitempty"`
+	PreviousActive  string            `json:"previousActive,omitempty"`
+	Strategy        string            `json:"strategy,omitempty"`
+	Session         string            `json:"session,omitempty"`
+	Sessions        []string          `json:"sessions,omitempty"`
+	Inherit         bool              `json:"inherit,omitempty"`
+	CancelRequested bool              `json:"-"`
+	Dismissed       bool              `json:"-"`
+	Roots           map[string]string `json:"roots,omitempty"`
 }
 
 func (o *Operation) Reserved() bool {
@@ -260,7 +262,39 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 			}
 		}
 	}
+	if o := state.Operation; o != nil {
+		control, err := ReadOperationControl(filepath.Dir(path), o.ID)
+		if err != nil {
+			return State{}, err
+		}
+		o.CancelRequested, o.Dismissed = control.CancelRequested, control.Dismissed
+	}
 	return state, nil
+}
+
+type OperationControl struct {
+	Operation       string `json:"operation"`
+	CancelRequested bool   `json:"cancelRequested,omitempty"`
+	Dismissed       bool   `json:"dismissed,omitempty"`
+}
+
+// Separate UI/control metadata preserves rollback to strict schema-2 readers.
+func ReadOperationControl(directory, id string) (OperationControl, error) {
+	var control OperationControl
+	if !operationID.MatchString(id) {
+		return control, errors.New("invalid provider control operation")
+	}
+	data, err := readBounded(filepath.Join(directory, id+".control.json"), 4096, true)
+	if errors.Is(err, os.ErrNotExist) {
+		return control, nil
+	}
+	if err != nil {
+		return control, err
+	}
+	if decode(data, &control) != nil || control.Operation != id {
+		return control, errors.New("invalid provider control identity")
+	}
+	return control, nil
 }
 
 func decode(data []byte, result any) error {

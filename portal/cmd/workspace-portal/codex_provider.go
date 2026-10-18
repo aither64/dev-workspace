@@ -142,6 +142,11 @@ func codexProviderCommand(args []string) error {
 			Operation string `json:"operation"`
 		}
 		_ = json.Unmarshal(data, &scope)
+		if queueOperationID(scope.Operation) {
+			var stop context.CancelFunc
+			ctx, stop = providerPreparationContext(ctx, *snapshot, scope.Operation)
+			defer stop()
+		}
 		report := func(reason, thread string) {
 			if queueOperationID(scope.Operation) {
 				_ = providerAtomicJSON(*snapshot+".progress", scopedProviderProgress{Operation: scope.Operation, Stage: "checking-provider", Thread: thread, Total: len(inventory.Threads), UpdatedAt: time.Now().UTC().Format(time.RFC3339), Reason: reason})

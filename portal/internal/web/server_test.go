@@ -4391,6 +4391,8 @@ func newTestServer(t *testing.T) *Server {
 
 func newTestServerWithTrustedOrigins(t *testing.T, trustedOrigins []string) *Server {
 	t.Helper()
+	// The host may have a real provider catalog; fixtures opt in explicitly.
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", filepath.Join(t.TempDir(), "absent-catalog.json"))
 	workspace := t.TempDir()
 	authorityDir := filepath.Join(t.TempDir(), "authority")
 	if err := os.Mkdir(authorityDir, 0o700); err != nil {

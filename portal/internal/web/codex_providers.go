@@ -26,19 +26,24 @@ type providerView struct {
 }
 
 type publicProviderOperation struct {
-	ID        string   `json:"id"`
-	Target    string   `json:"target"`
-	Phase     string   `json:"phase"`
-	Blockers  []string `json:"blockers"`
-	Message   string   `json:"message,omitempty"`
-	Session   string   `json:"session,omitempty"`
-	Stage     string   `json:"stage,omitempty"`
-	Thread    string   `json:"thread,omitempty"`
-	Completed int      `json:"completed"`
-	Total     int      `json:"total"`
-	CreatedAt string   `json:"createdAt,omitempty"`
-	UpdatedAt string   `json:"updatedAt,omitempty"`
-	Reason    string   `json:"reason,omitempty"`
+	ID              string   `json:"id"`
+	Target          string   `json:"target"`
+	Phase           string   `json:"phase"`
+	Blockers        []string `json:"blockers"`
+	Message         string   `json:"message,omitempty"`
+	Session         string   `json:"session,omitempty"`
+	Stage           string   `json:"stage,omitempty"`
+	Thread          string   `json:"thread,omitempty"`
+	ThreadLabel     string   `json:"threadLabel,omitempty"`
+	CanCancel       bool     `json:"canCancel"`
+	CancelRequested bool     `json:"cancelRequested,omitempty"`
+	Dismissed       bool     `json:"dismissed,omitempty"`
+	FinishedAt      string   `json:"finishedAt,omitempty"`
+	Completed       int      `json:"completed"`
+	Total           int      `json:"total"`
+	CreatedAt       string   `json:"createdAt,omitempty"`
+	UpdatedAt       string   `json:"updatedAt,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
 }
 
 func (s *Server) providerState() (codexproviders.Catalog, codexproviders.State, error) {
@@ -74,21 +79,28 @@ func (s *Server) providerSessionView(slug string) (providerView, error) {
 	}
 	if o := state.Operation; o != nil {
 		view.Operation = &publicProviderOperation{ID: o.ID, Target: o.Target, Phase: o.Phase, Blockers: o.Blockers, Message: o.Message, Session: o.Session, Stage: o.Stage, CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt}
+		view.Operation.CancelRequested, view.Operation.Dismissed = o.CancelRequested, o.Dismissed
+		view.Operation.CanCancel = !o.CancelRequested && (o.Phase == "waiting" || o.Strategy == "scoped-v1" && o.Phase == "applying" && (o.Stage == "quiescing" || o.Stage == "preparing"))
+		if o.Phase == "applied" || o.Phase == "failed" || o.Phase == "canceled" {
+			view.Operation.FinishedAt = o.UpdatedAt
+		}
 		if o.Strategy == "scoped-v1" {
 			path := filepath.Join(s.config.UserStateRoot, "providers", s.config.WorkspaceName, o.ID+".snapshot.json.progress")
 			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0600 && info.Size() <= 64*1024 {
 				data, err := os.ReadFile(path)
 				var progress struct {
-					Operation string `json:"operation"`
-					Stage     string `json:"stage"`
-					Thread    string `json:"thread"`
-					Completed int    `json:"completed"`
-					Total     int    `json:"total"`
-					UpdatedAt string `json:"updatedAt"`
-					Reason    string `json:"reason"`
+					Operation   string `json:"operation"`
+					Stage       string `json:"stage"`
+					Thread      string `json:"thread"`
+					ThreadLabel string `json:"threadLabel"`
+					Completed   int    `json:"completed"`
+					Total       int    `json:"total"`
+					UpdatedAt   string `json:"updatedAt"`
+					Reason      string `json:"reason"`
 				}
 				if err == nil && json.Unmarshal(data, &progress) == nil && progress.Operation == o.ID {
 					view.Operation.Stage, view.Operation.Thread = progress.Stage, progress.Thread
+					view.Operation.ThreadLabel = progress.ThreadLabel
 					view.Operation.Completed, view.Operation.Total = progress.Completed, progress.Total
 					view.Operation.UpdatedAt, view.Operation.Reason = progress.UpdatedAt, progress.Reason
 				}
@@ -114,6 +126,7 @@ func (s *Server) codexProviders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) providerMutation(w http.ResponseWriter, r *http.Request, cancel bool) {
 	recover := strings.HasSuffix(r.URL.Path, "/recover")
+	dismiss := strings.HasSuffix(r.URL.Path, "/dismiss")
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var body struct {
 		ProviderID     string `json:"providerId"`
@@ -142,10 +155,13 @@ func (s *Server) providerMutation(w http.ResponseWriter, r *http.Request, cancel
 	}
 	action := "request"
 	arguments := []string{body.ProviderID, body.IdempotencyKey}
-	if cancel || recover {
+	if cancel || recover || dismiss {
 		action = "cancel"
 		if recover {
 			action = "recover"
+		}
+		if dismiss {
+			action = "dismiss"
 		}
 		arguments = []string{body.OperationID}
 		if !queueClientMessageIDPattern.MatchString(body.OperationID) {
@@ -156,11 +172,11 @@ func (s *Server) providerMutation(w http.ResponseWriter, r *http.Request, cancel
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid provider request"})
 		return
 	}
-	if !cancel && !recover && body.Session != "" {
+	if !cancel && !recover && !dismiss && body.Session != "" {
 		arguments = append(arguments, "--session", body.Session)
 	}
 	if body.Inherit {
-		if cancel || recover || body.Session == "" {
+		if cancel || recover || dismiss || body.Session == "" {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Select a session to use the workspace default"})
 			return
 		}
@@ -180,6 +196,9 @@ func (s *Server) providerMutation(w http.ResponseWriter, r *http.Request, cancel
 		}
 		if strings.Contains(diagnostic.String(), "another provider request is pending") {
 			message = "A provider switch is already running. Its progress is shown below."
+		}
+		if strings.Contains(diagnostic.String(), "provider preparation has ended") {
+			message = "Preparation has ended. Check the switch result or use its recovery action."
 		}
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": message})
 		return

@@ -40,13 +40,14 @@ type scopedProviderSnapshot struct {
 }
 
 type scopedProviderProgress struct {
-	Operation string `json:"operation"`
-	Stage     string `json:"stage"`
-	Thread    string `json:"thread,omitempty"`
-	Completed int    `json:"completed"`
-	Total     int    `json:"total"`
-	UpdatedAt string `json:"updatedAt"`
-	Reason    string `json:"reason,omitempty"`
+	Operation   string `json:"operation"`
+	Stage       string `json:"stage"`
+	Thread      string `json:"thread,omitempty"`
+	ThreadLabel string `json:"threadLabel,omitempty"`
+	Completed   int    `json:"completed"`
+	Total       int    `json:"total"`
+	UpdatedAt   string `json:"updatedAt"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type scopedProviderFailure struct {
@@ -95,6 +96,11 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 	if !canonicalAbsolutePath(authority) || !canonicalAbsolutePath(path) || !queueOperationID(operation) {
 		return errors.New("scoped provider helper requires exact private identities")
 	}
+	if action == "scoped-prepare" {
+		var stop context.CancelFunc
+		ctx, stop = providerPreparationContext(ctx, path, operation)
+		defer stop()
+	}
 	slugs := []string{}
 	if scopes != "" {
 		slugs = strings.Split(scopes, ",")
@@ -112,8 +118,10 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		return errors.New("scoped provider roots are absent or inconsistent")
 	}
 	progress := scopedProviderProgress{Operation: operation, Stage: strings.TrimPrefix(action, "scoped-")}
+	labels := map[string]string{}
 	writeProgress := func(stage, thread string, completed, total int) error {
 		progress.Stage, progress.Thread, progress.Completed, progress.Total = stage, thread, completed, total
+		progress.ThreadLabel = labels[thread]
 		progress.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		return providerAtomicJSON(path+".progress", progress)
 	}
@@ -178,6 +186,7 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		snapshot := scopedProviderSnapshot{providerInventory: inventory, Operation: operation, Target: target, Sessions: slugs, Intents: map[string]*scopedThreadIntent{}}
 		for index := range snapshot.Threads {
 			thread := &snapshot.Threads[index]
+			labels[thread.ID] = providerThreadLabel(*thread)
 			if err := writeProgress("capturing-settings", thread.ID, index, len(snapshot.Threads)); err != nil {
 				return err
 			}
@@ -211,6 +220,7 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		return errors.New("scoped provider snapshot identity changed")
 	}
 	for _, thread := range snapshot.Threads {
+		labels[thread.ID] = providerThreadLabel(thread)
 		if !scope[thread.Slug] || thread.Cwd != filepath.Join(workspace, "work", thread.Slug) || snapshot.Intents[thread.ID] == nil {
 			return errors.New("scoped provider thread has a foreign session")
 		}
@@ -378,6 +388,13 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": 1, "verified": true})
+}
+
+func providerThreadLabel(thread providerThread) string {
+	if thread.MemberAddress != "" {
+		return thread.MemberAddress
+	}
+	return "Lead"
 }
 
 func queueOperationID(value string) bool {

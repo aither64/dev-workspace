@@ -160,3 +160,51 @@ func TestCreationProviderSurvivesPreparationAndReceiptRestart(t *testing.T) {
 		t.Fatal("provider is absent from accepted creation identity")
 	}
 }
+
+func TestProviderTerminalTimingAndControlProjection(t *testing.T) {
+	s := newTestServer(t)
+	providerTestCatalog(t, s, "http://127.0.0.1:1")
+	path, _ := codexproviders.StatePath(s.config.UserStateRoot, s.config.WorkspaceName)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	o := &codexproviders.Operation{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Target: "pool", CatalogDigest: strings.Repeat("a", 64), Phase: "failed", Strategy: "scoped-v1", Stage: "preparing", CreatedAt: "2026-10-18T17:16:58Z", UpdatedAt: "2026-10-18T17:17:04Z"}
+	state := codexproviders.State{Schema: 2, Workspace: s.config.WorkspaceName, Root: s.config.Workspace, Socket: s.config.CodexSocket, Active: "pool", Operation: o}
+	save := func() {
+		data, _ := json.Marshal(state)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save()
+	progress := `{"operation":"` + o.ID + `","stage":"capturing-settings","threadLabel":"architect0","updatedAt":"2026-10-18T17:17:02Z","reason":"cold_permissions_unsupported"}`
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), o.ID+".snapshot.json.progress"), []byte(progress), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.providerView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Operation.FinishedAt != o.UpdatedAt || view.Operation.CanCancel || view.Operation.ThreadLabel != "architect0" {
+		t.Fatalf("wrong terminal view: %#v", view.Operation)
+	}
+	o.Phase = "applying"
+	save()
+	view, err = s.providerView()
+	if err != nil || !view.Operation.CanCancel {
+		t.Fatalf("preparation cancellation: %#v %v", view.Operation, err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), o.ID+".control.json"), []byte(`{"operation":"`+o.ID+`","cancelRequested":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view, err = s.providerView()
+	if err != nil || view.Operation.CanCancel || !view.Operation.CancelRequested {
+		t.Fatalf("pending cancellation: %#v %v", view.Operation, err)
+	}
+	o.Stage = "switching"
+	save()
+	view, err = s.providerView()
+	if err != nil || view.Operation.CanCancel {
+		t.Fatalf("cancel fence: %#v %v", view.Operation, err)
+	}
+}

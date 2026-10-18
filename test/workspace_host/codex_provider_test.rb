@@ -148,10 +148,10 @@ class WorkspaceHostTest
     end
   end
 
-  def test_provider_cancel_loses_after_applying_is_durable
+  def test_legacy_provider_cancel_loses_after_applying_is_durable
     with_provider_host do |host, entry|
       identity = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', identity])
+      host.send(:legacy_provider_command, ['request', 'example', 'pool', identity])
       host.send(:provider_locked, entry) do
         state = host.send(:provider_state, entry)
         state['operation']['phase'] = 'applying'

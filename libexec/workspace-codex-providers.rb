@@ -157,11 +157,32 @@ module DevWorkspaceHost
         end
         validate_scoped_provider_operation!(data) if operation['strategy']
       end
+      if (operation = data['operation'])
+        control_path = File.join(provider_directory(entry), "#{operation.fetch('id')}.control.json")
+        if File.exist?(control_path)
+          control = JSON.parse(read_private_json_file!(control_path, 'provider control', maximum: 4096))
+          unless control.is_a?(Hash) && (control.keys - %w[operation cancelRequested dismissed]).empty? &&
+                 control['operation'] == operation['id'] &&
+                 %w[cancelRequested dismissed].all? { |key| !control.key?(key) || [true, false].include?(control[key]) }
+            raise Error, 'invalid provider control identity'
+          end
+          operation.merge!(control.slice('cancelRequested', 'dismissed'))
+        end
+      end
       data
     end
 
     def provider_write_state(entry, state)
-      data = JSON.generate(state) + "\n"
+      persisted = state.dup
+      if (operation = state['operation'])
+        control = operation.slice('cancelRequested', 'dismissed')
+        unless control.empty?
+          control['operation'] = operation.fetch('id')
+          atomic_private_file(File.join(provider_directory(entry), "#{operation.fetch('id')}.control.json"), JSON.generate(control))
+        end
+        persisted['operation'] = operation.reject { |key, _| %w[cancelRequested dismissed].include?(key) }
+      end
+      data = JSON.generate(persisted) + "\n"
       raise Error, 'workspace provider state exceeds bounds' if data.bytesize > 1024 * 1024
       atomic_private_file(provider_state_path(entry), data)
     end

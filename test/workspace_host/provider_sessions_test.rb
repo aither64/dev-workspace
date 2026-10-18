@@ -189,3 +189,110 @@ class WorkspaceHostTest
     end
   end
 end
+
+class CancelPreparationProviderHost < ScopedProviderTestHost
+  attr_accessor :cancel_at, :restore_failure
+  attr_reader :restoration_state, :late_cancel_error
+
+  private
+
+  def provider_scoped_helper(entry, action, snapshot, operation)
+    provider_control(entry, 'cancel', [operation.fetch('id')]) if @cancel_at == action
+    super
+  end
+
+  def provider_helper(entry, action, **options)
+    provider_control(entry, 'cancel', [provider_state(entry).dig('operation', 'id')]) if @cancel_at == 'preflight' && action == 'preflight'
+    super
+  end
+
+  def provider_scoped_begin_switch!(entry, state)
+    provider_control(entry, 'cancel', [state.dig('operation', 'id')]) if @cancel_at == 'before-fence'
+    super
+    if @cancel_at == 'after-fence'
+      begin
+        provider_control(entry, 'cancel', [state.dig('operation', 'id')])
+      rescue DevWorkspaceHost::Error => error
+        @late_cancel_error = error.message
+      end
+    end
+  end
+
+  def provider_restore_terminals(entry, *)
+    @restoration_state = provider_state(entry).fetch('operation').dup
+    raise 'synthetic terminal failure' if @restore_failure
+  end
+end
+
+class WorkspaceHostTest
+  def test_cancel_preparation_preserves_reservation_until_terminals_are_restored
+    %w[scoped-prepare preflight before-fence].each do |stage|
+      with_scoped_provider_host(host_class: CancelPreparationProviderHost) do |host, entry|
+        provider_session_fixture(host, entry, 'one', 'root-one')
+        id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        host.cancel_at = stage
+        host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+        catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+        state = host.send(:provider_state, entry)
+        assert_equal 'canceled', state.dig('operation', 'phase'), stage
+        assert_equal 'openai', state['active']
+        assert_nil state.dig('sessions', 'one')
+        assert_equal 'applying', host.restoration_state['phase']
+        assert host.restoration_state['cancelRequested']
+        refute host.calls.any? { |call| call[0] == 'scoped-helper' && call[1] == 'scoped-switch' }
+      end
+    end
+  end
+
+  def test_late_cancel_cannot_race_past_the_switching_fence
+    with_scoped_provider_host(host_class: CancelPreparationProviderHost) do |host, entry|
+      provider_session_fixture(host, entry, 'one', 'root-one')
+      host.cancel_at = 'after-fence'
+      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+      assert_match(/preparation has ended/, host.late_cancel_error)
+      assert_equal 'applied', host.send(:provider_state, entry).dig('operation', 'phase')
+    end
+  end
+
+  def test_cancel_intent_survives_stale_writes_and_worker_restart
+    with_scoped_provider_host(host_class: CancelPreparationProviderHost) do |host, entry|
+      provider_session_fixture(host, entry, 'one', 'root-one')
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+      stale = host.send(:provider_state, entry)
+      stale['operation']['phase'], stale['operation']['stage'] = 'applying', 'preparing'
+      host.send(:provider_write_state, entry, stale)
+      host.send(:provider_command, ['cancel', 'example', id])
+      host.send(:provider_scoped_write_state, entry, stale)
+      assert host.send(:provider_state, entry).dig('operation', 'cancelRequested')
+      host.restore_failure = true
+      catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+      result = host.send(:provider_state, entry)
+      assert_equal 'canceled', result.dig('operation', 'phase')
+      assert_match(/terminal clients need dev-session sync/, result.dig('operation', 'message'))
+      refute host.calls.any? { |call| call[0] == 'scoped-helper' }
+    end
+  end
+
+  def test_dismiss_preserves_failure_identity_timestamp_and_routing
+    with_scoped_provider_host do |host, entry|
+      provider_session_fixture(host, entry, 'one', 'root-one')
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+      host.scoped_failure = 'scoped-prepare'
+      catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+      before = host.send(:provider_state, entry)
+      host.send(:provider_command, ['dismiss', 'example', id])
+      after = host.send(:provider_state, entry)
+      assert after.dig('operation', 'dismissed')
+      persisted = JSON.parse(File.read(host.send(:provider_state_path, entry)))
+      refute persisted.fetch('operation').key?('dismissed')
+      refute persisted.fetch('operation').key?('cancelRequested')
+      assert_equal before['operation'], after['operation'].reject { |key, _| key == 'dismissed' }
+      assert_equal 'openai', after['active']
+      assert_equal before.dig('operation', 'updatedAt'), host.send(:provider_operation_view, entry, after['operation'])['finishedAt']
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_command, ['dismiss', 'example', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']) }
+    end
+  end
+end

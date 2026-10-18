@@ -6,6 +6,60 @@ module DevWorkspaceHost
   module CodexProviderHost
     private
 
+    class ProviderCanceled < StandardError; end
+
+    def provider_scoped_cancelable?(operation)
+      operation['phase'] == 'waiting' ||
+        operation['strategy'] == 'scoped-v1' && operation['phase'] == 'applying' && %w[quiescing preparing].include?(operation['stage'])
+    end
+
+    def provider_control(entry, action, argv)
+      raise Error, 'provider control requires the exact operation UUID' unless argv.length == 1 && argv.first.match?(PROVIDER_OPERATION_ID)
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        provider_locked(entry) do
+          state = provider_state(entry)
+          operation = state['operation']
+          raise Error, 'provider operation identity changed' unless operation && operation['id'] == argv.first
+          if action == 'dismiss'
+            raise Error, 'an unfinished provider switch cannot be dismissed' unless %w[failed canceled applied].include?(operation['phase'])
+            operation['dismissed'] = true
+          elsif operation['phase'] == 'waiting'
+            provider_finish(state, 'canceled', 'Provider switch canceled.')
+          elsif operation['phase'] == 'canceled'
+            # An exact cancellation retry is idempotent.
+          elsif operation['strategy'] == 'scoped-v1' && provider_scoped_cancelable?(operation)
+            operation['cancelRequested'] = true
+          else
+            raise Error, 'provider preparation has ended; inspect its result or recovery action'
+          end
+          provider_write_state(entry, state)
+        end
+      end
+      @out.puts JSON.generate(provider_public_status(entry))
+    end
+
+    def provider_scoped_check_cancel!(entry, operation)
+      current = provider_locked(entry) { provider_state(entry).fetch('operation') }
+      raise Error, 'scoped provider operation identity changed' unless current['id'] == operation['id']
+      raise ProviderCanceled if current['cancelRequested'] || current['phase'] == 'canceled'
+    end
+
+    # This short transaction is the cancellation cutoff. It precedes the first
+    # native close and shares the request mutex with cancellation admission.
+    def provider_scoped_begin_switch!(entry, state)
+      provider_locked(entry) do
+        current = provider_state(entry)
+        operation = current.fetch('operation')
+        raise Error, 'scoped provider operation identity changed' unless operation['id'] == state.dig('operation', 'id')
+        raise ProviderCanceled if operation['cancelRequested']
+        raise Error, 'provider preparation state changed' unless operation['phase'] == 'applying' && operation['stage'] == 'preparing'
+        state.fetch('operation')['stage'] = 'switching'
+        current['operation'] = state.fetch('operation')
+        provider_write_state(entry, current)
+        state.replace(current)
+      end
+    end
+
     def provider_thread_identity?(value)
       value.is_a?(String) && !value.empty? && value.bytesize <= 512 && !value.match?(/[\x00-\x20\x7f]/)
     end
@@ -17,6 +71,7 @@ module DevWorkspaceHost
              %w[accepted waiting-creation waiting-package quiescing preparing switching resuming restoring-terminals].include?(operation['stage']) &&
              operation['target'].is_a?(String) && operation['target'].match?(PROVIDER_ID) &&
              operation['catalogDigest'].is_a?(String) && operation['catalogDigest'].match?(SHA256_HEX) &&
+             %w[cancelRequested dismissed].all? { |key| !operation.key?(key) || [true, false].include?(operation[key]) } &&
              sessions.is_a?(Array) && sessions.length <= 4096 && sessions.uniq == sessions &&
              sessions.all? { |slug| slug.is_a?(String) && slug.match?(PROVIDER_ID) } &&
              roots.is_a?(Hash) && roots.keys.sort == sessions.sort && roots.values.all? { |root| provider_thread_identity?(root) } &&
@@ -29,11 +84,12 @@ module DevWorkspaceHost
 
     def provider_command(argv)
       action, name = argv.first(2)
-      return legacy_provider_command(argv) unless %w[request native-args bind-creation bind-root recover models].include?(action)
+      return legacy_provider_command(argv) unless %w[request native-args bind-creation bind-root recover models cancel dismiss].include?(action)
 
       argv = argv.drop(2)
       entry = registry.find(name.to_s)
       raise Error, 'provider operation requires a registered workspace' unless entry
+      return provider_control(entry, action, argv) if %w[cancel dismiss].include?(action)
       if action == 'models'
         raise Error, 'provider models requires a catalog provider ID' unless argv.length == 1
         target = argv.first
@@ -197,12 +253,14 @@ module DevWorkspaceHost
     end
 
     def provider_operation_view(entry, operation)
-      view = operation.slice('id', 'target', 'phase', 'blockers', 'message', 'stage', 'session', 'sessions', 'createdAt', 'updatedAt')
+      view = operation.slice('id', 'target', 'phase', 'blockers', 'message', 'stage', 'session', 'sessions', 'createdAt', 'updatedAt', 'cancelRequested', 'dismissed')
+      view['canCancel'] = provider_scoped_cancelable?(operation) && !operation['cancelRequested']
+      view['finishedAt'] = operation['updatedAt'] if %w[applied failed canceled].include?(operation['phase'])
       if operation['strategy'] == 'scoped-v1'
         path = File.join(provider_directory(entry), "#{operation.fetch('id')}.snapshot.json.progress")
         if File.file?(path)
           progress = JSON.parse(read_private_json_file!(path, 'provider progress', maximum: 64 * 1024))
-          view.merge!(progress.slice('stage', 'thread', 'completed', 'total', 'updatedAt', 'reason')) if progress['operation'] == operation['id']
+          view.merge!(progress.slice('stage', 'thread', 'threadLabel', 'completed', 'total', 'updatedAt', 'reason')) if progress['operation'] == operation['id']
         end
       end
       view
@@ -233,6 +291,7 @@ module DevWorkspaceHost
         current = provider_state(entry)
         raise Error, 'scoped provider operation identity changed' unless current.dig('operation', 'id') == state.dig('operation', 'id')
         return false if expected_phase && current.dig('operation', 'phase') != expected_phase
+        state.fetch('operation')['cancelRequested'] = true if current.dig('operation', 'cancelRequested')
         current['operation'] = state.fetch('operation')
         if selection
           if state.dig('operation', 'session')
@@ -327,18 +386,22 @@ module DevWorkspaceHost
             end
           end
           terminal_path = snapshot + '.terminals'
+          provider_scoped_check_cancel!(entry, operation) if %w[quiescing preparing].include?(operation['stage'])
           if operation['stage'] == 'quiescing'
             unless File.exist?(terminal_path)
               atomic_private_file(terminal_path, JSON.generate('schema' => 1, 'workspace' => entry.fetch('name'), 'root' => entry.fetch('root'), 'socket' => instance_runtime(entry).fetch(:codex), 'terminals' => []))
             end
             quiesce_sessions([entry], provider_terminal_snapshot: terminal_path, provider_slugs: operation.fetch('sessions')) do |slug, index, total|
+              provider_scoped_check_cancel!(entry, operation)
               provider_scoped_progress(operation, snapshot, 'quiescing', thread: slug, completed: index, total:)
             end
             operation['stage'] = 'preparing'
             provider_scoped_write_state(entry, state)
           end
           if operation['stage'] == 'preparing'
+            provider_scoped_check_cancel!(entry, operation)
             prepared = provider_scoped_helper(entry, 'scoped-prepare', snapshot, operation)
+            provider_scoped_check_cancel!(entry, operation)
             prepared.fetch('threads').each { |thread| thread['environment'] = provider_thread_environment(entry, thread.fetch('slug'), thread['memberAddress']) }
             atomic_private_file(snapshot, JSON.generate(prepared))
             provider_scoped_progress(operation, snapshot, 'starting-provider-check')
@@ -347,8 +410,7 @@ module DevWorkspaceHost
             provider_private_server(entry, operation.fetch('target')) do |socket|
               provider_helper(entry, 'preflight', snapshot:, target: operation.fetch('target'), socket:)
             end
-            operation['stage'] = 'switching'
-            provider_scoped_write_state(entry, state)
+            provider_scoped_begin_switch!(entry, state)
           end
           if %w[switching resuming].include?(operation['stage'])
             provider_scoped_helper(entry, 'scoped-switch', snapshot, operation)
@@ -381,6 +443,24 @@ module DevWorkspaceHost
           provider_finish(state, 'applied')
           provider_scoped_write_state(entry, state)
         rescue StandardError => error
+          canceled = error.is_a?(ProviderCanceled)
+          if %w[quiescing preparing].include?(operation['stage']) && !canceled
+            current = provider_locked(entry) { provider_state(entry).fetch('operation') }
+            canceled = current['id'] == operation['id'] && current['cancelRequested']
+          end
+          if canceled
+            message = 'Provider switch canceled.'
+            provider_scoped_progress(operation, snapshot, 'restoring-terminals')
+            begin
+              provider_restore_terminals(entry, snapshot)
+            rescue StandardError
+              message += ' Some terminal clients need dev-session sync.'
+            end
+            provider_finish(state, 'canceled', message)
+            provider_scoped_progress(operation, snapshot, 'canceled')
+            provider_scoped_write_state(entry, state)
+            return
+          end
           diagnostic = {started: Process.clock_gettime(Process::CLOCK_MONOTONIC), step: 'scoped-transition'}
           provider_failure_diagnostic(operation, 'forward', diagnostic, error)
           # No silent compensation. The journal retains exact native progress
