@@ -54,6 +54,7 @@
         <details><summary>Options</summary>
         <div class="stack">
         <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
+        <label data-creation-provider-label hidden>Provider<select name="provider" data-creation-provider><option value="">Workspace default</option></select></label>
         <p class="muted">Leave the name blank to generate a dated session name from your request.</p>
         {{if .AgentTeams.Managed}}
         <div class="field-grid"><label>Lead model<select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label>Lead reasoning effort<select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
@@ -96,7 +97,7 @@
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/preparation.js?v=4" defer></script>
-  <script src="/static/app.js?v=40" defer></script>
+  <script src="/static/app.js?v=41" defer></script>
   <script src="/static/coordination.js?v=6" defer></script>
 </body>
 </html>
@@ -129,12 +130,19 @@
 <dialog id="codex-limits-dialog" aria-labelledby="codex-limits-title">
   <div class="section-heading"><h2 id="codex-limits-title">Codex limits</h2><button type="button" class="quiet" data-limits-close>Close</button></div>
   <div data-provider-controls hidden>
+    <label for="codex-provider-scope">Apply provider to</label>
+    <select id="codex-provider-scope" data-provider-scope>
+      <option value="session">This session</option>
+      <option value="workspace">Workspace default</option>
+    </select>
     <label for="codex-provider-preview">Preview provider limits</label>
     <select id="codex-provider-preview" data-provider-select></select>
     <p data-provider-active class="muted"></p>
-    <p>Switching changes the provider for every thread in this workspace. It waits until all threads are idle.</p>
+    <p>The switch pauses affected threads and resumes their work automatically. Temporary subagents may stop and need their tasks assigned again. Sessions with their own provider keep it when the workspace default changes.</p>
     <button type="button" data-provider-switch>Switch to this provider</button>
+    <button type="button" data-provider-inherit hidden>Use workspace default</button>
     <button type="button" data-provider-cancel hidden>Cancel waiting switch</button>
+    <button type="button" data-provider-recover hidden>Retry provider switch</button>
     <p data-provider-status role="status"></p>
   </div>
   <div data-account-limits></div><p data-reset-status role="status"></p>

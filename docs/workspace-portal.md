@@ -5,8 +5,8 @@ both a browser and tmux. One installed package generation supplies the portal,
 Codex CLI, session helper, user units and any configured extensions.
 
 The [Codex provider guide](codex-providers.md) describes the limits popup's
-provider preview and workspace-wide switch, including operator catalog and
-recovery contracts.
+provider previews, session selections and workspace defaults, including automatic
+pause/resume, operator catalog and recovery contracts.
 
 ## Session attention and notifications
 

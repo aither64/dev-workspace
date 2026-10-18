@@ -76,6 +76,12 @@ When the workspace portal is available, `--model` and `--effort` select the
 initial Codex settings. The browser offers the same choices from the App Server
 model catalog.
 
+Use `--provider ID` to select a provider for a new session, or choose it in the
+browser's **Options** or plan creation dialog. The selection applies to the root and team members and
+survives creation retries. Omit it to inherit the workspace default. Existing
+sessions switch providers through the limits dialog; see
+[provider switching](codex-providers.md) for automatic pause/resume and recovery.
+
 The first window is named `dev` and contains three panes:
 
 - left: login shell with cwd set to the workspace repository root; the helper

@@ -973,7 +973,7 @@
         pending = read; options.onStart?.();
         read.promise = (async () => {
           try {
-            const value = await request("/api/codex-limits", {signal: read.abort.signal});
+            const value = await request(options.url || "/api/codex-limits", {signal: read.abort.signal});
             if (read.generation !== generation || read.abort.signal.aborted) return;
             if (options.acceptSnapshot && !options.acceptSnapshot(value)) {
               snapshot = null; render(null, false); options.onMismatch?.();
@@ -1017,6 +1017,7 @@
       name: value.name, date: value.date,
       model: typeof value.model === "string" ? value.model : "",
       effort: typeof value.effort === "string" ? value.effort : "",
+      ...(typeof value.provider === "string" && value.provider ? {provider:value.provider} : {}),
       team: typeof value.team === "string" ? value.team : "",
       catalogDigest: typeof value.catalogDigest === "string" ? value.catalogDigest : "",
       ...(value.browserNotificationsEnabled === undefined ? {} : {browserNotificationsEnabled: value.browserNotificationsEnabled !== false}),
@@ -1051,7 +1052,7 @@
       team: draft.team, catalogDigest: draft.catalogDigest,
       model: draft.model, reasoningEffort: draft.effort,
     } : {
-      model: snapshot.model, reasoningEffort: snapshot.reasoningEffort,
+      model: draft.model ?? snapshot.model, reasoningEffort: draft.effort ?? snapshot.reasoningEffort,
     }
   );
   const effortSelectionForModelRefresh = (managedOverride, selectedEffort, currentEffort) => (
@@ -1061,11 +1062,12 @@
     Boolean(uploadReady) && Boolean(selectionReady) && !recoveryPending && !inFlight
   );
   const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
-  const creationCLICommand = ({name, team, model, effort, sensitive}) => {
+  const creationCLICommand = ({name, team, model, effort, sensitive, provider}) => {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(name || "") || !model || !effort) return "";
     const args = ["dev-session start", shellQuote(name)];
     if (sensitive) args.push("--sensitive");
     if (team) args.push("--team", shellQuote(team));
+    if (provider) args.push("--provider",shellQuote(provider));
     args.push("--model", shellQuote(model), "--effort", shellQuote(effort));
     return args.join(" ");
   };
@@ -1428,11 +1430,21 @@
     limits = createCodexLimitsReader(request, (snapshot, failed, error) => {
       if (failed) notice.failure(error);
       else { limitsSnapshot = snapshot; notice.success(); }
-    }, {freshnessMs: refreshPolicy.limitsMs, deadlineMs: refreshPolicy.limitsDeadlineMs,
+    }, {url:slug ? `/api/codex-limits?session=${encodeURIComponent(slug)}` : "/api/codex-limits", freshnessMs: refreshPolicy.limitsMs, deadlineMs: refreshPolicy.limitsDeadlineMs,
       retryInitialMs: refreshPolicy.retryInitialMs, retryMaxMs: refreshPolicy.retryMaxMs,
       isVisible: () => !document.hidden, onStart: () => notice.begin(),
       acceptSnapshot: snapshot => !observedActiveProvider || snapshot?.provider?.id === observedActiveProvider,
-      onMismatch: () => {void providers?.refresh();}});
+      onMismatch: () => {
+        // The dialog may preview another scope. Refresh the page's identity
+        // independently so an inherited default change cannot reject limits
+        // forever while the dialog stays on Workspace default.
+        void request(`/api/codex-providers${slug ? `?session=${encodeURIComponent(slug)}` : ""}`).then(catalog => {
+          observedActiveProvider = catalog.active;
+          limits.invalidate({clearSnapshot:true});
+          document.dispatchEvent(new CustomEvent("workspace-provider-changed"));
+          void limits.refresh(true);
+        }).catch(() => {});
+      }});
     const {createResetCreditAction} = await import("/static/reset-credits.js?v=1");
     let resetStorage = null;
     try { resetStorage = localStorage; } catch (_) {}
@@ -1449,11 +1461,17 @@
     resetAction = createResetCreditAction({request, store, withLock,
       confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
       refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
-    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=2");
+    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=3");
     const providerControls = dialog.querySelector("[data-provider-controls]");
     const providerSelect = dialog.querySelector("[data-provider-select]");
+    const providerScope = dialog.querySelector("[data-provider-scope]");
+    providerScope.value = slug ? "session" : "workspace";
+    providerScope.querySelector('[value="session"]').disabled = !slug;
+    const selectedProviderSession = () => providerScope.value === "session" ? slug : "";
     const switchProvider = dialog.querySelector("[data-provider-switch]");
     const cancelProvider = dialog.querySelector("[data-provider-cancel]");
+    const inheritProvider = dialog.querySelector("[data-provider-inherit]");
+    const recoverProvider = dialog.querySelector("[data-provider-recover]");
     const providerStatus = dialog.querySelector("[data-provider-status]");
     let providerFeedbackOperationId = "";
     const renderProviderStatus = preview => {
@@ -1461,7 +1479,7 @@
     };
     const clearProviderFeedback = () => {providerFeedbackOperationId = ""; renderProviderStatus(providers.state());};
     dialog.addEventListener("close", clearProviderFeedback);
-    providers = createProviderPreview({request, onChange: preview => {
+    providers = createProviderPreview({request, session:selectedProviderSession(), onChange: preview => {
       const catalog = preview.catalog;
       if (!catalog) return;
       providerControls.hidden = false;
@@ -1470,36 +1488,47 @@
       }
       providerSelect.value = preview.selected;
       const active = catalog.providers.find(provider => provider.id === catalog.active);
-      dialog.querySelector("[data-provider-active]").textContent = `Active provider: ${active.label}`;
+      dialog.querySelector("[data-provider-active]").textContent = `${catalog.session ? "Session provider" : "Workspace default"}: ${active.label}${catalog.session && catalog.inherited ? " (inherited)" : ""}`;
       const pending = ["waiting", "applying", "recovery-required"].includes(catalog.operation?.phase);
-      switchProvider.disabled = providerBusy || pending || !preview.selected || preview.selected === catalog.active;
+      switchProvider.disabled = providerBusy || pending || !preview.selected || preview.selected === catalog.active && (!catalog.session || !catalog.inherited);
+      inheritProvider.hidden = !catalog.session || catalog.inherited;
+      inheritProvider.disabled = providerBusy || pending;
+      recoverProvider.hidden = catalog.operation?.phase !== "recovery-required";
+      recoverProvider.disabled = providerBusy;
       cancelProvider.hidden = catalog.operation?.phase !== "waiting";
       cancelProvider.disabled = providerBusy;
       renderProviderStatus(preview);
       if (providerAttempt && (catalog.operation?.id === providerAttempt.id || catalog.active === providerAttempt.target)) providerAttempt = null;
-      const activeChanged = observedActiveProvider && observedActiveProvider !== catalog.active;
-      observedActiveProvider = catalog.active;
-      if (activeChanged || (limitsSnapshot?.provider && limitsSnapshot.provider.id !== catalog.active)) {
-        limits.invalidate({clearSnapshot:true}); void limits.refresh(true);
+      if ((catalog.session || "") === (slug || "")) {
+        const activeChanged = observedActiveProvider && observedActiveProvider !== catalog.active;
+        observedActiveProvider = catalog.active;
+        if (activeChanged || (limitsSnapshot?.provider && limitsSnapshot.provider.id !== catalog.active)) {
+          limits.invalidate({clearSnapshot:true}); void limits.refresh(true);
+          document.dispatchEvent(new CustomEvent("workspace-provider-changed"));
+        }
       }
       renderAccountDetails();
     }});
     providerSelect.addEventListener("change", () => {clearProviderFeedback(); providers.select(providerSelect.value);});
-    const providerMutation = async cancel => {
+    providerScope.addEventListener("change", () => {providerAttempt = null; clearProviderFeedback(); void providers.setSession(selectedProviderSession());});
+    const providerMutation = async (cancel, inherit = false, recover = false) => {
       if (providerBusy) return;
       const preview = providers.state();
-      if (!cancel && (!providerAttempt || providerAttempt.target !== preview.selected)) providerAttempt = {id: crypto.randomUUID(), target: preview.selected};
-      providerFeedbackOperationId = cancel ? preview.catalog.operation.id : providerAttempt.id;
+      const target = inherit ? preview.catalog.default : preview.selected;
+      if (!cancel && !recover && (!providerAttempt || providerAttempt.target !== target || providerAttempt.inherit !== inherit)) providerAttempt = {id: crypto.randomUUID(), target, inherit};
+      providerFeedbackOperationId = cancel || recover ? preview.catalog.operation.id : providerAttempt.id;
       providerBusy = true; switchProvider.disabled = true; cancelProvider.disabled = true;
       try {
-        await request(`/api/codex-providers/${cancel ? "cancel" : "switch"}`, {method:"POST", body:JSON.stringify(cancel ? {operationId:preview.catalog.operation.id} : {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id})});
+        await request(`/api/codex-providers/${recover ? "recover" : cancel ? "cancel" : "switch"}`, {method:"POST", body:JSON.stringify(cancel || recover ? {operationId:preview.catalog.operation.id,session:selectedProviderSession()} : {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id,session:selectedProviderSession(),...(inherit ? {inherit:true} : {})})});
       } catch (error) {providerStatus.textContent = error.message;}
       finally {providerBusy = false; await providers.refresh();}
     };
     switchProvider.addEventListener("click", () => {void providerMutation(false);});
     cancelProvider.addEventListener("click", () => {void providerMutation(true);});
+    inheritProvider.addEventListener("click", () => {void providerMutation(false,true);});
+    recoverProvider.addEventListener("click", () => {void providerMutation(false,false,true);});
     void providers.refresh();
-    const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !limitsLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 5000);
+    const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !limitsLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 1000);
     globalThis.addEventListener("pagehide", event => {if (!event.persisted) {globalThis.clearInterval(providerPoll); providers.stop();}});
     globalThis.addEventListener("storage", event => {
       if (event.key === resetStorageKey || event.key === null) resetAction.reload();
@@ -1848,6 +1877,19 @@
     return eligible;
   };
   let initializeNewSession = () => {};
+  for (const form of document.querySelectorAll("#new-session-form, #plan-session-form")) {
+    if (form?.elements.provider) {
+      void request("/api/codex-providers").then(catalog => {
+        const selected = form.elements.provider.value;
+        for (const provider of catalog.providers) {
+          const option = document.createElement("option"); option.value = provider.id; option.textContent = provider.label;
+          form.elements.provider.append(option);
+        }
+        form.elements.provider.value = selected;
+        form.querySelector("[data-creation-provider-label]").hidden = false;
+      }).catch(() => {});
+    }
+  }
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
     initializeNewSession = () => {
@@ -1860,6 +1902,7 @@
       const readFields = () => ({
         sensitive: form.elements.sensitive?.checked ? "true" : "", name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
         browserNotificationsEnabled: form.elements.browserNotificationsEnabled?.checked !== false,
+        provider:form.elements.provider?.value || "",
         ...managedDraftPolicyForStorage(form, {
           model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
           team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
@@ -1919,6 +1962,7 @@
         const defaultPair = !form.elements.model.value && !form.elements.effort.value;
         const command = creationCLICommand({
           sensitive: Boolean(form.elements.sensitive?.checked), name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
+          provider:form.elements.provider?.value || "",
           model: defaultPair ? team?.dataset.leadModel : form.elements.model.value,
           effort: defaultPair ? team?.dataset.leadEffort : form.elements.effort.value,
         });
@@ -2029,6 +2073,9 @@
     if (document.hidden) pauseIndexReads(); else void refreshIndexStatus();
   }
   let models = [];
+  const modelCatalogs = new Map(), selectModelCatalogs = new WeakMap(), selectModelURLs = new WeakMap();
+  document.addEventListener("workspace-provider-changed", () => {models = []; modelCatalogs.clear(); void loadModels();});
+  document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {modelCatalogs.clear(); void loadModels(select.closest("form"));}));
   let collaborationModes = [];
   let currentModel = "";
   let currentEffort = "";
@@ -2061,7 +2108,7 @@
     const modelSelect = form?.elements.model;
     const effortSelect = form?.elements.effort;
     if (!selected || !modelSelect || !effortSelect) return;
-    if (form.id === "new-session-form") {
+    if (["new-session-form", "plan-session-form"].includes(form.id)) {
       if (form.dataset.requestLocked === "true") return;
       selectCreationSetting(modelSelect, selected.dataset.leadModel || "");
       populateEfforts(modelSelect, effortSelect, selected.dataset.leadEffort || "");
@@ -2186,6 +2233,13 @@
   };
 
   const restoreManagedCreationDraft = (form, draft) => {
+    if (form?.elements.provider && draft) {
+      const provider = draft.provider || "";
+      const providerChanged = form.elements.provider.value !== provider;
+      restoreDraftSelect(form.elements.provider,provider,"Saved provider is unavailable");
+      if (providerChanged) void loadModels(form);
+      form.querySelector("[data-creation-provider-label]").hidden = false;
+    }
     if (!form || !draft) return;
     if (form.id === "new-session-form") {
       if (form.elements.sensitive) form.elements.sensitive.checked = draft.sensitive === "true";
@@ -2232,9 +2286,9 @@
 
   const populateEfforts = (modelSelect, effortSelect, selected = "") => {
     if (!effortSelect) return;
-    const newSession = modelSelect.closest("form")?.id === "new-session-form";
+    const newSession = ["new-session-form", "plan-session-form"].includes(modelSelect.closest("form")?.id);
     if (newSession && modelSelect.closest("form").dataset.requestLocked === "true") return;
-    const model = models.find((candidate) => candidate.model === modelSelect.value);
+    const model = (selectModelCatalogs.get(modelSelect) || models).find((candidate) => candidate.model === modelSelect.value);
     const existingSettings = modelSelect.dataset.existingSettings === "true";
     effortSelect.replaceChildren();
     if (!newSession && !existingSettings && !effortSelect.required) {
@@ -2277,7 +2331,7 @@
         if (Array.from(modelSelect.options).some((option) => option.value === team.dataset.leadModel)) {
           modelSelect.value = team.dataset.leadModel;
         } else modelSelect.selectedIndex = -1;
-      } else if (!team && !retainedValue && !modelSelect.closest("[data-direct-team-form]") &&
+      } else if (modelSelect.closest("form")?.id !== "plan-session-form" && !team && !retainedValue && !modelSelect.closest("[data-direct-team-form]") &&
                  currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
         modelSelect.value = currentModel;
       }
@@ -2285,7 +2339,7 @@
       // of the source conversation. Preserve both its explicit value and its
       // intentional empty default across background settings refreshes.
       populateEfforts(modelSelect, effortSelect, team && effortSelect.dataset.userEdited !== "true" ?
-        team.dataset.leadEffort : effortSelectionForModelRefresh(false, effortSelect.value, currentEffort));
+        team.dataset.leadEffort : effortSelectionForModelRefresh(modelSelect.closest("form")?.id === "plan-session-form", effortSelect.value, currentEffort));
       if (modelSelect.dataset.existingSettings === "true") {
         modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
       }
@@ -2306,53 +2360,56 @@
   };
 
   const loadModels = async (root = document) => {
-    const modelSelects = Array.from(root.querySelectorAll("[data-model-select]"));
-    const effortSelects = Array.from(root.querySelectorAll("[data-effort-select]"));
-    try {
-      if (!models.length) models = await request("/api/models");
-      for (const modelSelect of modelSelects) {
-        if (modelSelect.closest("form")?.dataset.requestLocked === "true") continue;
-        const newSession = modelSelect.closest("form")?.id === "new-session-form";
-        const savedModel = modelSelect.value;
-        const allowDefault = !modelSelect.required;
-        modelSelect.replaceChildren();
-        if (allowDefault) {
-          const fallback = document.createElement("option");
-          fallback.value = "";
-          fallback.textContent = "Configured default";
-          modelSelect.append(fallback);
-        }
-        for (const model of models) {
-          const option = document.createElement("option");
-          option.value = model.model;
-          option.textContent = newSession ? model.model : model.displayName;
-          option.title = model.description || "";
-          modelSelect.append(option);
-        }
-        if (newSession && savedModel) {
-          selectCreationSetting(modelSelect, savedModel);
-        } else if (!currentModel && modelSelect.required) {
-          const defaultModel = models.find((model) => model.isDefault);
-          if (defaultModel) modelSelect.value = defaultModel.model;
-        }
-      }
-      applyCurrentSettings(root, true);
-      applyMemberDefaults();
-      restoreManagedCreationDrafts();
-    } catch (_error) {
-      for (const modelSelect of modelSelects) {
-        if (modelSelect.closest("form")?.id === "new-session-form") continue;
-        modelSelect.replaceChildren();
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "Model catalog unavailable";
-        modelSelect.append(option);
-        modelSelect.disabled = true;
-      }
-      for (const effortSelect of effortSelects) {
-        if (effortSelect.closest("form")?.id !== "new-session-form") effortSelect.disabled = true;
-      }
+    const groups = new Map();
+    for (const select of root.querySelectorAll("[data-model-select]")) {
+      const form = select.closest("form");
+      const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
+      const destination = creation || form?.id === "fork-form";
+      const provider = creation ? form.elements.provider?.value || "" : "";
+      const url = `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
+      if (!groups.has(url)) groups.set(url, []);
+      groups.get(url).push({select, creation, destination});
+      selectModelURLs.set(select, url);
     }
+    await Promise.all(Array.from(groups, async ([url, entries]) => {
+      try {
+        if (!modelCatalogs.has(url)) modelCatalogs.set(url, request(url).catch(error => {modelCatalogs.delete(url); throw error;}));
+        const available = await modelCatalogs.get(url);
+        for (const {select, creation, destination} of entries) {
+          if (selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true") continue;
+          selectModelCatalogs.set(select, available);
+          if (!destination) models = available;
+          const saved = select.value;
+          select.replaceChildren();
+          if (!select.required) {
+            const option = document.createElement("option"); option.value = ""; option.textContent = "Configured default"; select.append(option);
+          }
+          for (const model of available) {
+            const option = document.createElement("option"); option.value = model.model;
+            option.textContent = creation ? model.model : model.displayName; option.title = model.description || ""; select.append(option);
+          }
+          const team = creation ? select.closest("form")?.elements.team?.selectedOptions?.[0] : null;
+          if (team && select.dataset.userEdited !== "true") selectCreationSetting(select, team.dataset.leadModel || "");
+          else if (creation && saved) selectCreationSetting(select, saved);
+          else if ((destination || !currentModel) && select.required) {
+            const fallback = available.find(model => model.isDefault);
+            if (fallback) select.value = fallback.model;
+          }
+          select.disabled = false;
+          populateEfforts(select, pairedEffortSelect(select), team && select.dataset.userEdited !== "true" ? team.dataset.leadEffort || "" : "");
+        }
+      } catch (_) {
+        for (const {select, creation} of entries) {
+          if (selectModelURLs.get(select) !== url || creation) continue;
+          select.replaceChildren();
+          const option = document.createElement("option"); option.value = ""; option.textContent = "Model catalog unavailable"; select.append(option);
+          select.disabled = true; const effort = pairedEffortSelect(select); if (effort) effort.disabled = true;
+        }
+      }
+    }));
+    applyCurrentSettings(root, true);
+    applyMemberDefaults();
+    restoreManagedCreationDrafts();
   };
 
   const bindModelSelects = (root = document) => {
@@ -5087,6 +5144,7 @@
       name: planSessionForm.elements.name.value,
       browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
       date: planSessionForm.elements.creationDate.value,
+      provider: planSessionForm.elements.provider?.value || "",
       ...policy,
     }, "plan");
     if (draft) {
@@ -5143,6 +5201,7 @@
       });
       const result = await client.implementPlan({
         action: "new",
+        provider: planSessionForm.elements.provider?.value || "",
         sensitive: Boolean(planSessionForm.elements.sensitive?.checked),
         browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
         ...planSessionSnapshot,

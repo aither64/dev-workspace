@@ -42,10 +42,23 @@ test("preview coalesces reads and retains a stale snapshot on failure", async ()
   assert.equal(preview.state().failed,true);assert.equal(preview.state().snapshot.provider.id,"openai");
 });
 
+test("session scope changes ignore an outstanding catalog for the old scope", async () => {
+  const {createProviderPreview}=await import(moduleURL);
+  let release;
+  const preview=createProviderPreview({session:"one",onChange:()=>{},request:async url=>{
+    if(url==="/api/codex-providers?session=one") return new Promise(resolve=>{release=resolve;});
+    if(url==="/api/codex-providers?session=two") return {...catalog,session:"two",active:"pool"};
+    return {provider:{id:new URL(url,"http://fixture").searchParams.get("provider")},windows:[]};
+  }});
+  const old=preview.refresh();await tick();await preview.setSession("two");
+  release({...catalog,session:"one"});await old;
+  assert.equal(preview.state().catalog.session,"two");assert.equal(preview.state().selected,"pool");
+});
+
 test("operation status distinguishes waiting, applying and recovery", async () => {
   const {providerOperationText} = await import(moduleURL);
-  assert.match(providerOperationText({phase:"waiting",target:"pool",blockers:["Active goal."]},catalog.providers),/when all workspace threads are idle.*Active goal/);
-  assert.match(providerOperationText({phase:"applying",target:"pool"},catalog.providers),/Switching workspace threads/);
+  assert.match(providerOperationText({phase:"waiting",target:"pool",blockers:["Session creation."]},catalog.providers),/switching to Pool.*Session creation/);
+  assert.match(providerOperationText({phase:"applying",target:"pool",session:"one",stage:"closing",completed:1,total:2},catalog.providers),/Session one.*Closing threads \(1\/2\)/);
   assert.equal(providerOperationText({phase:"recovery-required",target:"pool",message:"Recover this workspace."},catalog.providers),"Recover this workspace.");
   assert.equal(providerOperationText({phase:"failed",target:"pool",message:"Target unavailable."},catalog.providers),"Target unavailable.");
   assert.equal(providerOperationText({phase:"applied",target:"pool",message:"Some terminal clients need dev-session sync."},catalog.providers),"Some terminal clients need dev-session sync.");
@@ -65,19 +78,19 @@ async function popup(backend) {
   const helpers = await import(moduleURL);
   const control = () => {
     const listeners = new Map();
-    return {options:[],value:"",textContent:"",hidden:false,disabled:false,
+    return {options:[],value:"",textContent:"",hidden:false,disabled:false,querySelector(){return {disabled:false};},
       addEventListener(type,fn) {listeners.set(type,fn);},
       emit(type) {listeners.get(type)?.();},
       replaceChildren(...options) {this.options=options;}};
   };
-  const controls = new Map(["controls","select","switch","cancel","status","active"].map(name => [name,control()]));
+  const controls = new Map(["controls","select","scope","switch","inherit","cancel","recover","status","active"].map(name => [name,control()]));
   const dialog = control(); dialog.open=true;
   dialog.querySelector = selector => controls.get(selector.match(/\[data-provider-(.*)\]/)[1]);
   dialog.close = () => {dialog.open=false;dialog.emit("close");};
   let poll;
-  const context = {dialog,...helpers,providers:null,providerBusy:false,providerAttempt:null,observedActiveProvider:"",
+  const context = {dialog,...helpers,slug:"",providers:null,providerBusy:false,providerAttempt:null,observedActiveProvider:"",
     limitsSnapshot:null,limitsLeaving:false,limits:{invalidate(){},refresh:async()=>{}},renderAccountDetails(){},
-    crypto:{randomUUID},document:{hidden:false,createElement:control},
+    crypto:{randomUUID},document:{hidden:false,createElement:control,dispatchEvent(){}},CustomEvent:class {},
     setInterval:fn => {poll=fn;return 1;},clearInterval(){},addEventListener(){},
     request:async (url,options) => {
       if (url === "/api/codex-providers") return {...catalog,operation:backend.operation ? {...backend.operation} : null};
@@ -108,7 +121,7 @@ test("historical and other-tab cancellations stay hidden on load and polling", a
   assert.equal(first.status.textContent,"");
   await first.poll();assert.equal(first.status.textContent,"");
   backend.operation={id:"other-tab",target:"pool",phase:"waiting"};
-  await first.refresh();assert.match(first.status.textContent,/Waiting to switch/);
+  await first.refresh();assert.match(first.status.textContent,/switching to/);
   const second=await popup(backend);
   second.cancel.emit("click");await tick();
   assert.equal(second.status.textContent,"Provider switch canceled.");
@@ -122,7 +135,7 @@ test("accepted switch retains local feedback until close or preview change", asy
   const ui=await popup(backend);
   await ui.selectProvider("pool");
   ui.switch.emit("click");await tick();
-  assert.match(ui.status.textContent,/Waiting to switch/);
+  assert.match(ui.status.textContent,/switching to/);
   backend.operation={...backend.operation,phase:"canceled"};
   await ui.poll();assert.equal(ui.status.textContent,"Provider switch canceled.");
   ui.dialog.close();assert.equal(ui.status.textContent,"");
@@ -145,4 +158,86 @@ test("closing a popup during cancellation prevents late feedback", async () => {
   ui.dialog.open=true;
   await ui.poll();assert.equal(ui.status.textContent,"");
   assert.equal(backend.operation.phase,"canceled");
+});
+
+test("sidebar follows its session after a default switch while the dialog previews workspace scope", async () => {
+  const {createCodexLimitsReader} = require("./static/app.js");
+  const calls = [], events = [];
+  const context = {createCodexLimitsReader,slug:"page-session",observedActiveProvider:"openai",
+    limits:null,limitsSnapshot:null,notice:{failure(){},success(){},begin(){}},
+    refreshPolicy:{limitsMs:0,limitsDeadlineMs:1000,retryInitialMs:0},
+    document:{hidden:false,dispatchEvent:event=>events.push(event.type)},CustomEvent:class {constructor(type){this.type=type;}},
+    // The preview is deliberately a different scope and must not supply the
+    // page-session identity when its effective provider changes.
+    providers:{refresh:()=>{throw new Error("workspace preview was used for the page session");}},
+    request:async url=>{calls.push(url);return url.includes("codex-providers") ? {active:"pool",session:"page-session"} : {provider:{id:"pool"},windows:[]};}};
+  const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const start=source.indexOf("    limits = createCodexLimitsReader(request,");
+  const end=source.indexOf('    const {createResetCreditAction}',start);
+  assert(start>=0 && end>start);
+  const api=vm.runInNewContext(source.slice(start,end)+'\n({refresh:()=>limits.refresh(true)})',context);
+  await api.refresh();await tick();
+  assert.equal(context.observedActiveProvider,"pool");
+  assert.equal(context.limitsSnapshot.provider.id,"pool");
+  assert(calls.includes("/api/codex-providers?session=page-session"));
+  assert(calls.filter(url=>url.includes("codex-limits")).every(url=>url==="/api/codex-limits?session=page-session"));
+  assert(events.includes("workspace-provider-changed"));
+});
+
+test("plan and fork creation load destination catalogs independently of the source session", async () => {
+  const makeSelect = form => ({value:"",required:true,dataset:{},options:[],closest:()=>form,
+    replaceChildren(){this.options=[];this.value="";},append(option){this.options.push(option);if(!this.value)this.value=option.value;}});
+  const plan={id:"plan-session-form",dataset:{},elements:{provider:{value:"openai"}}};
+  const source={id:"conversation",dataset:{},elements:{}};
+  const fork={id:"fork-form",dataset:{},elements:{}};
+  const planModel=makeSelect(plan),sourceModel=makeSelect(source),forkModel=makeSelect(fork),calls=[];
+  const context={slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+    document:{querySelectorAll:()=>[sourceModel,planModel,forkModel],createElement:()=>({})},
+    request:async url=>{calls.push(url);return [{model:url.includes("provider=openai")?"daybreak":url.includes("session=source")?"source-model":"default-model",displayName:"Fixture",isDefault:true}];},
+    selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){}};
+  const text=readFileSync(__dirname+"/static/app.js","utf8");
+  const start=text.indexOf("  const loadModels = async "),end=text.indexOf("\n  const bindModelSelects",start);
+  assert(start>=0&&end>start);
+  const api=vm.runInNewContext(text.slice(start,end)+'\n({loadModels})',context);
+  await api.loadModels();
+  assert.equal(planModel.options[0].value,"daybreak");
+  assert.equal(sourceModel.options[0].value,"source-model");
+  assert.equal(forkModel.options[0].value,"default-model");
+  assert.equal(context.models[0].model,"source-model");
+  assert(calls.includes("/api/models?provider=openai"));
+  plan.elements.provider.value="";
+  planModel.value="";
+  await api.loadModels({querySelectorAll:()=>[planModel]});
+  assert.equal(planModel.options[0].value,"default-model");
+  assert.equal(sourceModel.options[0].value,"source-model");
+});
+
+
+test("restoring a plan provider reloads its catalog and discards the outstanding default", async () => {
+  const model={value:"",required:true,dataset:{},options:[],replaceChildren(){this.options=[];this.value="";},append(option){this.options.push(option);if(!this.value)this.value=option.value;}};
+  const label={hidden:true};
+  const form={id:"plan-session-form",dataset:{},elements:{provider:{value:""},model},querySelectorAll:()=>[model],querySelector:()=>label};
+  model.closest=()=>form;
+  let releaseDefault;
+  const calls=[];
+  const context={slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+    document:{querySelectorAll:()=>[model],createElement:()=>({})},
+    request:url=>{calls.push(url);return url==="/api/models"?new Promise(resolve=>{releaseDefault=resolve;}):Promise.resolve([{model:"daybreak",isDefault:true}]);},
+    selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){},
+    restoreDraftSelect:(select,value)=>{if(select)select.value=value;},restoreManagedCatalogRecovery:()=>null};
+  const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const start=source.indexOf("  const loadModels = async "),end=source.indexOf("\n  const bindModelSelects",start);
+  const restoreStart=source.indexOf("  const restoreManagedCreationDraft = "),restoreEnd=source.indexOf("\n  const restoreManagedCreationDrafts = ",restoreStart);
+  const api=vm.runInNewContext(source.slice(start,end)+source.slice(restoreStart,restoreEnd)+'\n({loadModels,restoreManagedCreationDraft})',context);
+  const old=api.loadModels(form);
+  api.restoreManagedCreationDraft(form,{provider:"openai",model:"daybreak",effort:"high"});
+  await tick();
+  assert.equal(form.elements.provider.value,"openai");assert.equal(label.hidden,false);
+  assert(calls.includes("/api/models?provider=openai"));
+  assert.equal(model.options[0].value,"daybreak");
+  releaseDefault([{model:"default-only",isDefault:true}]);await old;
+  assert.equal(model.options[0].value,"daybreak");
+  // An inherited draft must also replace the last explicit choice.
+  api.restoreManagedCreationDraft(form,{model:"default-only",effort:"high"});await tick();
+  assert.equal(form.elements.provider.value,"");assert.equal(model.options[0].value,"default-only");
 });

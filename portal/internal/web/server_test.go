@@ -1802,7 +1802,7 @@ func TestBrowserClientShipsMessageAndLifecycleInteractions(t *testing.T) {
 		"shouldSubmitMessage(event)", "event.shiftKey", "event.isComposing", "form.requestSubmit()",
 		"await beforeRequestInputAction(snoozeAutoResolution)",
 		"entry.html", "archive-session", "revive-session", "artifactPreview", "controlCluster", "fork-dialog",
-		"data-cluster-service-tab", "data-reveal-secret", "index-status", "modelSelect.required",
+		"data-cluster-service-tab", "data-reveal-secret", "index-status",
 		"const signature = JSON.stringify([entries,", "client.operation().then(async (operation)",
 		"dialog.showModal()", `lifecycleKind === "revive" && (needsOptions || lastLifecycleOperation.code === "target_changed")`,
 		`openLifecycleConfirmation("delete")`, "confirmationForLifecycle",

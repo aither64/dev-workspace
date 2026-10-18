@@ -26,7 +26,8 @@ automatic archival.
 The [archive recovery guide](docs/session-archive-recovery.md) owns retry and
 compatibility removal procedures.
 The [Codex provider guide](docs/codex-providers.md) covers limits previews,
-workspace-wide selection, catalog configuration and interrupted-switch recovery.
+session selection, automatic pause/resume, workspace defaults, catalog
+configuration and interrupted-switch recovery.
 The [coordination guide](docs/coordination.md) covers queued merges, persistent
 machine review reservations and [operations/recovery](docs/coordination-operations.md).
 The [integration guide](docs/integration.md) covers resumable operation batches,

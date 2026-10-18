@@ -31,6 +31,8 @@ assert.equal(creationCLICommand({name:"feature", team:"delegated", model:"gpt-6-
 assert.equal(creationCLICommand({name:"feature", model:"gpt-6-sol", effort:"high"}),
   "dev-session start 'feature' --model 'gpt-6-sol' --effort 'high'");
 assert.equal(creationCLICommand({name:"", model:"gpt-6-sol", effort:"high"}), "");
+assert.equal(creationCLICommand({name:"feature",provider:"openai",model:"gpt-6-sol",effort:"high"}),
+  "dev-session start 'feature' --provider 'openai' --model 'gpt-6-sol' --effort 'high'");
 
 const archivalDiagnostic = 'command failed with exit 1: /nix/store/example/bin/workspace-portal thread require-idle\nworkspace-portal: Codex thread thread-1 is not idle (latest turn turn-1 has status "inProgress")';
 const archivalState = {enabled: true, hold: false, tier: "merged", checked_at: "2026-09-14T18:01:59Z",
@@ -767,7 +769,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   planSessionCreationSettings(false, {model: "source-model", reasoningEffort: "high"}, planDraft),
-  {model: "source-model", reasoningEffort: "high"},
+  {model: "model-lead", reasoningEffort: ""},
 );
 assert.equal(effortSelectionForModelRefresh(true, "", "high"), "");
 assert.equal(effortSelectionForModelRefresh(true, "xhigh", "high"), "xhigh");

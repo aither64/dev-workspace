@@ -1,16 +1,118 @@
 # Codex providers
 
-The limits sidebar shows the provider selected for the registered workspace.
-Open its info dialog and choose a provider to preview that provider's limits.
-Changing the select box only reads limits. **Switch to this provider** submits
-a separate request for every retained root and team thread in the workspace.
-Other registered workspaces keep their own selection.
+Each session can use its own provider or inherit the workspace default. Open
+the limits dialog, choose **This session** or **Workspace default**, preview a
+provider, then choose **Switch to this provider**. Changing the preview only
+reads limits. **Use workspace default** removes a session's explicit selection.
+Changing the default applies to inherited sessions; explicit selections stay put.
 
-Subscription previews use the authenticated native account's limits. Reset
-credits are available only when that subscription is active. Load balancer
-previews separate API-key and upstream aggregate quotas, account pool remaining
-percentages, and reported request, token and cost totals. Missing metrics are
-unavailable; they do not mean unlimited capacity.
+The switch pauses affected threads and resumes their interrupted work. Idle
+threads stay idle. It preserves thread IDs, queued input, active goals, model,
+reasoning effort, permissions and team settings. Other sessions keep working.
+The shared native daemon, portal, tmux and development clusters keep running.
+The lead and every retained team member switch, including idle members.
+Temporary subagents stop when their parent is closed. Their saved history remains,
+but interrupted delegated tasks may need to be assigned again. New subagents
+inherit their parent's selected provider. Switching uses the selected upstream
+Codex binary without an additional provider-switching patch or rebuild.
+
+Select a provider in the new-session form's **Options** or the plan creation
+dialog, or use:
+
+```sh
+dev-session start my-task --provider openai
+```
+
+Omitting the option inherits the workspace default. The CLI creation journal
+retains the original selection before provider binding, so an interrupted retry
+cannot change it by omitting or replacing the flag. An explicit selection binds
+to the accepted creation incarnation, then to its exact root thread. Creation
+retries retain that selection. Reusing a deleted session name cannot inherit
+the previous session's override. Retained members use their session's provider.
+
+The sidebar shows limits for the current session's provider. The dialog can
+preview either provider independently. Subscription previews use the native
+account's limits. Load balancer previews separate API-key and upstream aggregate
+quotas, account pool remaining percentages, and reported request, token and cost
+totals. Missing metrics are unavailable, rather than unlimited capacity.
+Quota metrics do not gate a switch. Model preflight checks the target catalog.
+
+## Progress and recovery
+
+Requests belong to `workspace-codex-provider@WORKSPACE.service` and survive
+closing the browser. Status appears before native inventory and provider checks.
+It identifies the affected scope, current step, thread, completed count and
+elapsed time. Specific reasons distinguish session locks, unfinished lifecycle
+operations, unavailable authentication/models and unsupported saved permissions.
+
+Native checks use metadata without loading transcript pages. The worker locks
+only affected session runtimes and shares the package-generation lock. A session
+switch does not wait for unrelated turns, goals, queued input, stale submission
+receipts, utility threads or VM processes. A workspace-default change waits for
+inherited session creation to finish before freezing its scope. Package updates
+and accepted lifecycle operations retain their normal ownership rules. A shared
+creation-admission lock prevents an inherited creator from entering between the
+default switch's root inventory and its durable applying fence.
+
+**Cancel waiting switch** cancels the exact request before application begins.
+Once application starts, its journal owns recovery. A failure before any native
+close leaves routing unchanged. A later failure shows **recovery-required** for
+the affected scope. **Retry provider switch** continues the accepted target;
+it does not silently switch other sessions back to an earlier provider.
+
+```sh
+workspace-host provider status WORKSPACE
+workspace-host provider request WORKSPACE PROVIDER UUID --session SLUG
+workspace-host provider request WORKSPACE PROVIDER UUID
+workspace-host provider recover WORKSPACE UUID
+```
+
+Use a fresh operation UUID for a new request and retain it when retrying the
+same request. Omit `--session` to change the workspace default. To return a
+session to inheritance, request the current default provider with
+`--session SLUG --inherit`. Status and receipts distinguish those intentions.
+
+Terminal clients restore automatically. A terminal restoration failure leaves
+the selected provider in place and reports that `dev-session sync SLUG --as-is`
+is needed. The portal separately rejoins its event and activity subscriptions.
+That durable notification survives another provider request or portal restart.
+Do not erase provider state or snapshots to clear a recovery refusal.
+
+## Native transition
+
+Codex cannot change the provider of an already loaded thread. Unsubscribing has
+a 30-minute inactivity grace period, so the worker uses native archive/unarchive
+to close and reopen the selected histories on the same daemon. This temporary
+native close does not archive the development session, tracking or worktrees.
+
+Before closing, it validates ownership and captures effective settings. Native
+closure stops execution while retaining queue entries and delivery identities.
+Goal status remains native-owned: cold resume restores the current persisted
+state. The worker never replays goal activation, which could restart a goal
+that completed during preparation or after a lost reply. Native archive closes the selected root and its temporary subagents. Only retained
+leads and members enter provider preflight, reopening and verification. The
+worker does not wait for temporary agents or try to migrate their provider.
+Cold resumes explicitly retain provider, model, effort, sandbox, approval
+policy, runtime roots and saved team instructions. Member environments retain
+their member address. Effective native responses prove routing.
+
+The worker restores only work interrupted by the close. Continuation messages
+have durable client identities and ask Codex to inspect tool results before
+retrying actions. It never answers an approval or question; an interrupted
+request can be asked again after continuation. Unsupported named permission
+profiles or cold filesystem settings refuse before closing retained threads.
+Persisted collaboration settings and disabled plugins retain their values.
+
+Native model discovery uses the daemon's configured provider. Model-only private
+servers supply cached catalogs for the selected session or creation provider,
+without loading threads or restarting the shared daemon. Conversation pickers
+and model validation use the same provider catalog, including CLI root creation,
+team presets and team changes. Creation dialogs resolve the destination catalog
+independently of the source session.
+
+Native v2 children remain controlled by their parent. Their interruption does
+not prevent a provider switch. They are not resumed by the switch worker and
+are not included in the retained-team completion condition.
 
 ## Operator catalog
 
@@ -33,108 +135,56 @@ services.dev-workspaces = {
 ```
 
 The token must be a private regular file readable by the workspace user.
-Neither the portal nor the catalog contains its contents. Metrics use bearer
+The catalog and portal never contain its contents. Metrics use bearer
 authentication against `/v1/usage`; model preflight uses `/v1/models`.
 Redirects are refused. Native inference uses Responses and a token-file auth
 helper. Browser requests cannot supply endpoints or executable paths.
 
 `codexInitialProvider` applies only before saved workspace selection exists.
-Removing a catalog with saved state fails closed. Configure the initial provider
-to match current routing before enabling the feature on existing threads.
-Global Codex config, authentication and subscription backups remain untouched.
-No catalog and no saved state preserve the previous runtime behavior.
+Removing a catalog with saved state fails closed. Match the initial provider to
+existing routing before enabling the feature. Global Codex configuration,
+authentication and subscription backups stay intact. No catalog and no saved
+state preserve ordinary runtime behavior.
 
-## Waiting and application
+## State and package compatibility
 
-A durable request belongs to `workspace-codex-provider@WORKSPACE.service`.
-Closing the popup or browser does not cancel it. While **waiting**, ordinary
-work continues. The popup reports active turns, unresolved submissions, pending
-questions, queues, goals, unfinished lifecycle operations or unowned threads.
-**Cancel waiting switch** cancels that exact request. Cancellation is refused
-after **applying** starts.
+Private provider state lives below
+`$XDG_STATE_HOME/dev-workspaces/providers/WORKSPACE/`, bound to the registered
+workspace root and socket. Schema 2 adds exact-root session selections and
+scoped operations. Receipts bind UUID, provider, scope and inheritance intent.
+Their retention is bounded to 2,048 UUIDs and state to 1 MiB. Private per-operation
+snapshots journal close, reopen, verification and continuation boundaries.
 
-Cancellation confirmation appears only in the popup where you requested a switch
-or canceled a waiting switch. Closing the popup or changing its preview selection
-clears that confirmation. Waiting, applying, failure and recovery status remain
-visible across tabs and page reloads.
+Schema-1 state remains readable. An unfinished schema-1 operation keeps its
+original workspace-wide engine and compensation rules, including its daemon
+restart. Finish or cancel that operation before requesting a scoped switch.
+Snapshots are never reinterpreted as another strategy.
 
-Application holds the package-transition lock, repeats ownership and idle checks,
-and probes authentication and retained models without inference. It records
-private settings and terminal identities, quiesces managed terminal clients,
-and validates both forward and recovery settings before stopping the proven native
-daemon. After all threads are idle, direct native code-mode children and retained
-per-thread team MCP helpers require exact executable, parent and argument proof.
-Daemon-start reporting helpers require the same process proof and the validated
-launch marker's exact package, state root, workspace and stable host profile.
-Other processes and helper descendants, including VM runners, block the switch.
-Portal and tmux services remain running.
+Packages retain `codexProviderStateSchema: 1` and
+`codexProviderTransitionPolicy: 1` for admission by an installed legacy runtime.
+Packages managing schema 2 must additionally advertise
+`codexProviderScopedStateSchema: 2` and
+`codexProviderScopedTransitionPolicy: 1`. Once schema 2 exists, package selection
+refuses candidates lacking those capabilities. Recover software with a corrected
+compatible package; workspace package selection remains forward-only.
 
-The selected native package cold-resumes retained IDs with explicit provider,
-model, effort, sandbox, approval policy, runtime roots and saved team policy.
-Effective resume responses prove routing; historical provider metadata alone
-is insufficient. Isolated writers exit before shared daemon startup.
-Shared startup waits for the exact native service and protocol readiness, even
-when the loaded inventory was empty. Originally loaded threads and terminal
-clients are restored. Member environments retain their member address. Unsupported
-settings, including custom named permission profiles, refuse the transition;
-implicit built-in profiles use their verified effective sandbox policy.
+Creation preparations and receipts with provider selections or destination model
+settings require the scoped capabilities too, even before provider state is
+written. The host checks both before package activation so an older portal cannot
+start against fields its strict reader does not support. Completed CLI creation
+journals retain their validated provider selection during host inspection.
 
-Cold capture reads both turn contexts and idle settings snapshots in native
-chronological order. Approval policy, reviewer and profile changes after the
-last turn take precedence. Nondefault service tiers remain explicit; native
-`null` and `default` tier values mean the same default scheduling policy.
-Compiled unrestricted and ordinary read-only snapshots are supported without
-a preceding turn. Other compiled filesystem snapshots require an identical
-preceding turn policy; unsupported changes refuse before loading the thread.
-
-## State and recovery
-
-Private schema-1 state lives below
-`$XDG_STATE_HOME/dev-workspaces/providers/WORKSPACE/`, bound to the workspace
-root and socket. Atomic state includes active selection, operation UUID,
-target catalog digest, phase, snapshot reference and UUID receipts in one write.
-Receipts prevent canceled retries becoming new requests; retention is bounded to
-2,048 distinct UUIDs and the whole state to 1 MiB. The enabled worker stays available
-between requests so requests accepted during completion cannot miss it. A changed catalog fails a
-waiting request; select the provider again.
-
-Before daemon stop, failure leaves original routing running. Later failure
-compensates each thread through native resumes to its original provider and
-settings. Recovery preserves history; it never overwrites native databases or
-rollout files. Unverified recovery leaves **recovery-required** and blocks writes.
-
-```sh
-workspace-host provider status WORKSPACE
-workspace-host provider recover WORKSPACE
-```
-
-Recovery starts the same worker without interrupting an existing worker.
-A durable notice marks terminal restoration as pending until it succeeds. If
-restoration fails or is interrupted, use `dev-session sync SLUG --as-is` after
-routing has reached a terminal phase. Do not erase state or restart an
-unsafe service to bypass a refusal.
-
-When a provider change or recovery fails, the worker writes a `PROVIDER_FAILURE`
-record to stderr. Read the records with
-`journalctl --user -u workspace-codex-provider@WORKSPACE.service`.
-Each record is at most 2 KiB and identifies the operation, direction, stage,
-step, elapsed time, exception category and a few source labels and line numbers.
-Readiness failures include only observations already made by that attempt;
-unavailable values are explicit. Records omit error messages, commands, helper
-output, filesystem paths, credentials and snapshots. Diagnostic failures do not
-change recovery. Step and source labels locate a failure boundary; a helper
-failure may still need further diagnosis.
-
-Packages consuming saved state must advertise provider schema 1 and transition
-policy 1. Applying and recovery exclude package changes. Waiting requests survive
-compatible updates. Cancel waiting requests before suspension or unregistration.
+The worker emits bounded `PROVIDER_FAILURE` diagnostics to its systemd journal.
+They identify operation, direction, stage, step and exception category without
+credentials, native transcripts, helper output or private settings. Public
+progress reports stable reason codes rather than raw exception text.
 
 ## Deployment
 
-Deploy the matching host module and catalog, then select the matching application
-through the workspace user profile. Keep the native Codex version unchanged.
-Check package-transition restart safety separately: application rollout can
-restart services that provider switching leaves running. Verify both previews
-and an idle switch in each direction. Returning to the subscription uses the
-selector. Package updates remain forward-only; recover software by selecting
-a corrected compatible package.
+Deploy the matching host catalog/module and select the application through the
+workspace user profile. Keep the native Codex version unchanged. Application
+deployment can restart services even though provider switching does not.
+Verify a disposable busy session, its queued input and continuation, an unrelated
+working session, creation selection, model catalogs and interrupted recovery.
+Use both provider directions. Keep live production sessions out of development
+transition tests.
