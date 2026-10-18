@@ -56,4 +56,38 @@ func TestSelectedProviderModelsDoNotUseTheSharedDaemonCatalog(t *testing.T) {
 	if _, err := ResolveNewThreadSettings(models, codex.ThreadSettings{Model: "target-only-daybreak", ReasoningEffort: "high"}); err != nil {
 		t.Fatal(err)
 	}
+	// A fork selects its destination provider before the new root exists.
+	state.Sessions["selected"] = codexproviders.Selection{Provider: "openai", CreationID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	data, _ = json.Marshal(state)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	locks := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(locks, 0700); err != nil {
+		t.Fatal(err)
+	}
+	forkJournal := filepath.Join(locks, "selected.fork.json")
+	journal := []byte(`{"schema":2,"slug":"selected","state":"creating","provider":"openai","tmux_identity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+	if err := os.WriteFile(forkJournal, journal, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ModelsForDirectory(context.Background(), cwd, profile, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locks, "selected.creation.json"), journal, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ModelsForDirectory(context.Background(), cwd, profile, ""); err == nil {
+		t.Fatal("ambiguous creation and fork journals accepted")
+	}
+	if err := os.Remove(filepath.Join(locks, "selected.creation.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(forkJournal, []byte(`{"schema":2,"slug":"selected","state":"creating","provider":"pool","tmux_identity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ModelsForDirectory(context.Background(), cwd, profile, ""); err == nil {
+		t.Fatal("changed fork provider accepted")
+	}
+
 }

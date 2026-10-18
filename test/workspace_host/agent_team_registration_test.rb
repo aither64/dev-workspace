@@ -3,6 +3,37 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_fork_provider_receipts_require_capable_packages_before_journaling_and_after_completion
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-10-18-provider-fork'
+      receipt = legacy_portal_creation_receipt(workspace, slug, 'c' * 64)
+      request = receipt.fetch('request')
+      request.delete('goal')
+      request.merge!('kind' => 'fork', 'provider' => 'openai', 'source' => '2026-10-18-source',
+        'sourceThreadId' => 'source-thread', 'sourceIdentity' => 'a' * 64)
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      path = File.join(creations, "#{slug}.json")
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge('codexProviderScopedStateSchema' => 2,
+        'codexProviderScopedTransitionPolicy' => 1, 'codexProviderForkCreationPolicy' => 1)
+      %w[running ready].each do |state|
+        receipt['state'] = state
+        File.write(path, JSON.generate(receipt))
+        File.chmod(0o600, path)
+        refute File.exist?(host.send(:provider_state_path, entry))
+        File.write(contract_path, JSON.generate(contract.reject { |key, _| key == 'codexProviderForkCreationPolicy' }))
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+        assert_includes error.message, 'fork provider receipts'
+        File.write(contract_path, JSON.generate(contract))
+        host.send(:require_compatible_provider_state!, package)
+      end
+    end
+  end
+
   def test_provider_plan_receipts_survive_managed_and_direct_host_inspection
     Dir.mktmpdir do |directory|
       _package, entry, host = registration_host(directory)

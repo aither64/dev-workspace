@@ -708,6 +708,7 @@ func threadCommand(args []string) error {
 	leadInstructions := flags.String("lead-instructions", "", "frozen lead role instructions")
 	requireRuntime := flags.Bool("require-runtime", false, "require complete deployed runtime provenance")
 	fresh := flags.Bool("fresh", false, "direct fork for a locked first invocation")
+	provider := flags.String("provider", "", "explicit destination provider for fork settings")
 	recoverCreating := flags.Bool("recover-creating", false, "reconcile a creating thread by working directory")
 	recoverArchived := flags.Bool("recover-archived", false, "restore the exact thread retained by revived tracking")
 	startUnmaterialized := flags.Bool("start-unmaterialized", false, "allow the first turn on a proven fresh thread")
@@ -761,7 +762,7 @@ func threadCommand(args []string) error {
 		}
 		settings, err := client.ResolveForkSettings(ctx, *threadID, codex.ThreadSettings{
 			Model: *model, ReasoningEffort: *effort,
-		}, filepath.Dir(filepath.Dir(*portalCommand)))
+		}, filepath.Dir(filepath.Dir(*portalCommand)), *provider)
 		if err != nil {
 			return err
 		}

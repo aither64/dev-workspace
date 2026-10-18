@@ -217,7 +217,8 @@ module DevWorkspaceHost
     end
 
     def require_compatible_provider_state!(package)
-      scoped_creations = registry.entries.any? { |entry| portal_creations_require_scoped_provider?(entry) }
+      creation_policy = registry.entries.map { |entry| portal_creation_provider_policy(entry) }.max || 0
+      scoped_creations = creation_policy.positive?
       return unless scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) }
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       data = JSON.parse(File.binread(path, 64 * 1024 + 1))
@@ -227,6 +228,9 @@ module DevWorkspaceHost
                   else
                     data['codexProviderStateSchema'] == 1 && data['codexProviderTransitionPolicy'] == 1
                   end
+      if creation_policy == 2 && data['codexProviderForkCreationPolicy'] != 1
+        raise Error, 'target workspace package cannot load retained fork provider receipts'
+      end
       unless supported
         raise Error, 'target workspace package cannot load retained Codex provider state'
       end

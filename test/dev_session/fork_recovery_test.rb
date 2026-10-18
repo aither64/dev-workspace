@@ -3,6 +3,45 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_fork_provider_intent_survives_interruption_and_cannot_be_replaced
+    with_workspace do |workspace|
+      source, destination = '2026-06-05-source', '2026-06-06-provider-fork'
+      setup = runner_for(workspace)
+      setup.ensure_tracking_files(source)
+      manifest = setup.send(:ensure_portal_manifest, source)
+      manifest['codex'] = { 'thread_id' => 'thread-source' }
+      setup.send(:write_portal_manifest, source, manifest)
+      selections = []
+      runner_class = Class.new(DevSession::Runner) do
+        define_method(:resolve_portal_fork_settings) do |_, **options|
+          selections << ['catalog', options[:provider]]
+          ['model-1', 'high']
+        end
+        define_method(:prepare_provider_selection!) do |_, journal, provider|
+          selections << ['binding', journal['provider'], provider, journal['schema']]
+        end
+        define_method(:create_portal_fork) { |*_, **_| raise DevSession::Error, 'synthetic interruption' }
+      end
+      runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new, today: TODAY, env: {})
+      2.times do |index|
+        error = assert_raises(DevSession::Error) do
+          options = index.zero? ? {provider: 'openai'} : {}
+          runner.fork(source, destination, as_is: true, json: true, **options)
+        end
+        assert_equal 'synthetic interruption', error.message
+      end
+      journal = runner.send(:load_fork_journal, destination)
+      assert_equal 2, journal['schema']
+      assert_equal 'openai', journal['provider']
+      assert_includes selections, ['catalog', 'openai']
+      assert_equal 2, selections.count(['binding', 'openai', 'openai', 2])
+      error = assert_raises(DevSession::Error) do
+        runner.fork(source, destination, as_is: true, json: true, provider: 'pool')
+      end
+      assert_includes error.message, 'options do not match'
+    end
+  end
+
   def test_portal_fork_rechecks_current_receipt_after_source_validation
     with_workspace do |workspace|
       source_slug = '2026-06-05-source'

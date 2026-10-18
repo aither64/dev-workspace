@@ -202,7 +202,7 @@ module DevSession
         [--goal-file FILE] [--json] [--exclusive] [--team TEAM] [--sensitive]
         [--model MODEL] [--effort EFFORT] [--provider PROVIDER]
       dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
-        [--model MODEL] [--effort EFFORT] [--sensitive]
+        [--model MODEL] [--effort EFFORT] [--provider PROVIDER] [--sensitive]
       dev-session attach <name-or-slug> [--as-is]
       dev-session resume <name-or-slug> [--as-is]
       dev-session sync <name-or-slug> [--as-is]
@@ -1424,10 +1424,13 @@ module DevSession
     end
 
     def fork(
-      source_input, destination_input, as_is:, json:, model: nil, effort: nil, sensitive: nil,
+      source_input, destination_input, as_is:, json:, model: nil, effort: nil, provider: nil, sensitive: nil,
       creation_receipt_id: nil, creation_evidence: nil,
       expected_source: nil, expected_source_thread: nil, expected_source_identity: nil
     )
+      if provider && !provider.match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/)
+        raise Error, 'invalid fork provider selection'
+      end
       receipt = creation_receipt_options(
         creation_receipt_id, creation_evidence,
         expected_source:, expected_source_thread:, expected_source_identity:
@@ -1435,20 +1438,22 @@ module DevSession
       preparation_started = creation_progress_begin('prepare')
       destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
       journal = load_fork_journal(destination_slug)
+      require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:) if journal
+      provider = journal['provider'] if journal
       verify_creation_source!(receipt) if receipt && receipt['source'] && journal.nil?
       with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
           source_choice = journal ? journal.fetch('source_slug') : lookup_slug(source_input, as_is: false)
           select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_choice))
-          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:) if receipt
+          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
         end
       end
       journal = load_fork_journal(destination_slug)
       if receipt && journal && journal['source_thread_id'] != receipt.fetch('source_thread')
         raise Error, 'fork journal source does not match the accepted conversation'
       end
-      require_fork_journal_options!(journal, destination_slug, model:, effort:) if journal
+      require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:) if journal
       source_slug = if journal
         recorded = journal.fetch('source_slug')
         unless source_input == recorded ||
@@ -1471,6 +1476,7 @@ module DevSession
         source_slug,
         model:,
         effort:,
+        provider:,
         receipt:
       ))
         creation_progress_finish('prepare', preparation_started)
@@ -1511,7 +1517,8 @@ module DevSession
                                           resolve_portal_fork_settings(
                                             source_manifest.dig('codex', 'thread_id'),
                                             model:,
-                                            effort:
+                                            effort:,
+                                            provider:
                                           )
                                         end
 
@@ -1520,7 +1527,7 @@ module DevSession
           guard_portal_preparation_reservation!(destination_slug, receipt)
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
-          require_current_portal_creation!(receipt, destination_slug, model:, effort:) if receipt
+          require_current_portal_creation!(receipt, destination_slug, model:, effort:, provider:) if receipt
           fork_journal = load_fork_journal(destination_slug, source_slug)
           if fork_journal
             if receipt && fork_journal['source_thread_id'] != receipt.fetch('source_thread')
@@ -1530,7 +1537,8 @@ module DevSession
               fork_journal,
               destination_slug,
               model:,
-              effort:
+              effort:,
+              provider:
             )
             resolved_model = fork_journal.fetch('model')
             resolved_effort = fork_journal.fetch('effort')
@@ -1552,9 +1560,11 @@ module DevSession
               model: resolved_model,
               effort: resolved_effort,
               requested_model: model,
-              requested_effort: effort
+              requested_effort: effort,
+              provider:
             )
           end
+          prepare_provider_selection!(destination_slug, fork_journal, fork_journal['provider'])
           ensure_fork_tracking_files(destination_slug)
           manifest = ensure_fork_portal_manifest(destination_slug, source_slug)
           unless manifest['forked_from'] == source_slug &&
@@ -1654,7 +1664,7 @@ module DevSession
       end
     end
 
-    def recover_completed_fork(destination_slug, source_slug, model:, effort:, receipt: nil)
+    def recover_completed_fork(destination_slug, source_slug, model:, effort:, provider: nil, receipt: nil)
       return nil unless path_exists?(fork_journal_file(destination_slug))
 
       with_creation_lock(destination_slug) do
@@ -1667,7 +1677,7 @@ module DevSession
           if receipt && journal['source_thread_id'] != receipt.fetch('source_thread')
             raise Error, 'fork journal source does not match the accepted conversation'
           end
-          require_fork_journal_options!(journal, destination_slug, model:, effort:)
+          require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:)
           return nil unless path_exists?(portal_file(destination_slug))
 
           manifest = load_portal_manifest(portal_file(destination_slug), required: true)
@@ -1682,6 +1692,8 @@ module DevSession
           thread_id = manifest.dig('codex', 'thread_id')
           return nil if thread_id.nil? || thread_id.empty?
 
+          prepare_provider_selection!(destination_slug, journal, journal['provider'])
+          bind_provider_root!(destination_slug, manifest)
           ensure_fork_tracking_files(destination_slug)
           unless Dir.children(worktrees_dir(destination_slug)).empty?
             raise Error, "incomplete fork has unexpected worktrees: #{destination_slug}"
@@ -3975,10 +3987,10 @@ module DevSession
       require_creationless_retained_ready!(slug, manifest) unless manifest.key?('creation')
     end
 
-    def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:, team_binding: nil, direct_team: nil)
+    def prepare_portal_creation_receipt!(receipt, slug, kind, goal:, model:, effort:, team_binding: nil, direct_team: nil, provider: nil)
       return unless receipt
       path = receipt.fetch('evidence') + '.request'
-      history = require_current_portal_creation!(receipt, slug, model:, effort:, direct_team:)
+      history = require_current_portal_creation!(receipt, slug, model:, effort:, direct_team:, provider:)
       binding = {
         'schema' => direct_team ? 3 : (team_binding ? 2 : 1), 'workspace' => workspace, 'slug' => slug, 'kind' => kind,
         'receipt_id' => receipt.fetch('receipt_id'), 'deletion_history_sha256' => history,
@@ -4013,7 +4025,7 @@ module DevSession
 
     # The current receipt is mandatory even after a CLI binding exists. Its
     # disappearance or replacement ends a worker queued before cache retirement.
-    def require_current_portal_creation!(receipt, slug, model:, effort:, direct_team: nil)
+    def require_current_portal_creation!(receipt, slug, model:, effort:, direct_team: nil, provider: nil)
       path = File.join(File.dirname(receipt.fetch('evidence')), "#{slug}.json")
       current = read_private_json_object(
         path, 'creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384, mode: 0o600,
@@ -4025,6 +4037,9 @@ module DevSession
              current['request']['slug'] == slug && current['deletionHistorySha256'].is_a?(String) &&
              current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'creation request is no longer current; start a new request'
+      end
+      if current['request']['kind'] == 'fork' && current['request']['provider'] != provider
+        raise Error, 'fork provider does not match the accepted request'
       end
       unless (current['request']['sensitive'] == true) == sensitive_session?(slug)
         raise Error, 'creation sensitivity does not match the accepted request'
@@ -4307,9 +4322,11 @@ module DevSession
 
       journal = JSON.parse(File.read(path))
       expected = %w[effort model requested_effort requested_model schema slug source_slug source_thread_id state tmux_identity]
+      expected << 'provider' if journal.is_a?(Hash) && journal['schema'] == 2
       expected << 'sensitive' if sensitive_session?(slug)
       unless journal.is_a?(Hash) && journal.keys.sort == expected.sort &&
-             journal['schema'] == 1 && journal['slug'] == slug &&
+             [1, 2].include?(journal['schema']) && journal['slug'] == slug &&
+             (journal['schema'] == 1 || journal['provider'].is_a?(String) && journal['provider'].match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/)) &&
              valid_part?(journal['source_slug']) &&
              (source_slug.nil? || journal['source_slug'] == source_slug) &&
              journal['source_thread_id'].is_a?(String) &&
@@ -4335,7 +4352,8 @@ module DevSession
       model:,
       effort:,
       requested_model: model,
-      requested_effort: effort
+      requested_effort: effort,
+      provider: nil
     )
       unless source_thread_id.is_a?(String) &&
              source_thread_id.match?(/\A[0-9A-Za-z-]+\z/)
@@ -4346,7 +4364,7 @@ module DevSession
         raise Error, "invalid fork options for #{slug}"
       end
       journal = {
-        'schema' => 1,
+        'schema' => provider ? 2 : 1,
         'slug' => slug,
         'source_slug' => source_slug,
         'source_thread_id' => source_thread_id,
@@ -4357,6 +4375,7 @@ module DevSession
         'state' => 'creating',
         'tmux_identity' => SecureRandom.hex(32)
       }
+      journal['provider'] = provider if provider
       journal['sensitive'] = true if sensitive_session?(slug)
       write_creation_journal(fork_journal_file(slug), journal, create: true)
       journal
@@ -4366,9 +4385,10 @@ module DevSession
       value.nil? || value.is_a?(String) && !value.empty? && value.bytesize <= 256
     end
 
-    def require_fork_journal_options!(journal, slug, model:, effort:)
+    def require_fork_journal_options!(journal, slug, model:, effort:, provider: nil)
       return if journal.fetch('requested_model') == model &&
-                journal.fetch('requested_effort') == effort
+                journal.fetch('requested_effort') == effort &&
+                (provider.nil? || journal['provider'] == provider)
 
       raise Error, "fork options do not match the recorded request for #{slug}"
     end
@@ -4939,7 +4959,7 @@ module DevSession
       raise Error, "workspace-portal returned invalid JSON: #{e.message}"
     end
 
-    def resolve_portal_fork_settings(source_thread_id, model:, effort:)
+    def resolve_portal_fork_settings(source_thread_id, model:, effort:, provider: nil)
       unless @portal_command && !@portal_command.empty?
         return [model, effort] unless @require_runtime
 
@@ -4956,6 +4976,7 @@ module DevSession
         '--portal-command', @portal_command.first
       ]
       command += ['--socket', @codex_socket] if @codex_socket
+      command += ['--provider', provider] if provider
       command += ['--model', model] if model
       command += ['--effort', effort] if effort
       stdout, _stderr, _status = @command_runner.capture(command)
@@ -9518,6 +9539,7 @@ module DevSession
         parser_opts.on('--sensitive') { opts[:sensitive] = true }
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--json') { opts[:json] = true }
+        parser_opts.on('--provider PROVIDER') { |value| opts[:provider] = value }
         parser_opts.on('--model MODEL') { |value| opts[:model] = value }
         parser_opts.on('--effort EFFORT') { |value| opts[:effort] = value }
       end

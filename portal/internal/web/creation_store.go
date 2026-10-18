@@ -445,10 +445,6 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 		if json.Unmarshal(rawProvider, &provider) != nil || !codexproviders.ValidID(provider) {
 			return errors.New("creation receipt has an invalid provider")
 		}
-		var kind string
-		if json.Unmarshal(request["kind"], &kind) != nil || kind == "fork" {
-			return errors.New("fork provider selection uses the workspace default; switch it after creation")
-		}
 	}
 	if marker, ok := request["sensitive"]; ok && string(marker) != "true" {
 		return errors.New("sensitive must be true when present")

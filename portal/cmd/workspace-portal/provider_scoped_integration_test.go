@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
@@ -102,7 +103,7 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 			}
 			return
 		}
-		if strings.Contains(string(body), "scoped-block") || strings.Contains(string(body), "unrelated-block") || strings.Contains(r.URL.Path, "/b/") {
+		if strings.Contains(string(body), "scoped-block") || strings.Contains(string(body), "unrelated-block") || strings.Contains(r.URL.Path, "/b/") && !strings.Contains(string(body), "fork source proof") {
 			<-r.Context().Done()
 			return
 		}
@@ -117,7 +118,7 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 		}
 	}
 	config := "model_provider = \"pool-a\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\napproval_policy = \"never\"\n[features]\nmulti_agent_v2 = true\n"
-	for _, provider := range []string{"a", "b"} {
+	for _, provider := range []string{"a", "b", "c"} {
 		config += "[model_providers.pool-" + provider + "]\nname = \"Fixture " + provider + "\"\nwire_api = \"responses\"\nsupports_websockets = false\nenv_key = \"OPENAI_API_KEY\"\nbase_url = " + strconv.Quote(backend.URL+"/"+provider+"/v1") + "\n"
 	}
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(config), 0600); err != nil {
@@ -525,6 +526,92 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 	if !childWasCanceled {
 		t.Fatal("temporary child was expected to stop with its parent")
 	}
+	// A fork's provider comes from its destination incarnation, even when the
+	// source/default are B and the daemon was launched with A. Destination C
+	// must differ from both so daemon fallback cannot satisfy this proof.
+	sourceCwd := filepath.Join(root, "work", "fork-source")
+	if err := os.MkdirAll(sourceCwd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var sourceFork struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := client.Request(ctx, "thread/start", map[string]any{"cwd": sourceCwd, "model": "gpt-5.5", "modelProvider": "pool-b", "config": map[string]any{"model_reasoning_effort": "low"}}, &sourceFork); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Request(ctx, "turn/start", map[string]any{"threadId": sourceFork.Thread.ID, "input": []any{map[string]any{"type": "text", "text": "fork source proof"}}}, &response); err != nil {
+		t.Fatal(err)
+	}
+	wait("fork source materialized and idle", func() bool {
+		mu.Lock()
+		routed := threadRequests[sourceFork.Thread.ID]["/b/v1/responses"] > 0
+		mu.Unlock()
+		return routed && client.RequireThreadIdle(ctx, sourceFork.Thread.ID, sourceCwd) == nil
+	})
+	destination := filepath.Join(root, "work", "fork-destination")
+	if err := os.MkdirAll(destination, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "worktrees", ".locks"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"plan.md": "Fork provider fixture\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(destination, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := "schema: 1\nslug: fork-destination\nrepositories: []\nartifacts: []\ncreation:\n  state: ready\n"
+	if err := os.WriteFile(filepath.Join(destination, "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	incarnation := strings.Repeat("c", 64)
+	if err := providerAtomicJSON(filepath.Join(root, "worktrees", ".locks", "fork-destination.fork.json"), map[string]any{"schema": 2, "slug": "fork-destination", "state": "creating", "provider": "pool-c", "tmux_identity": incarnation}); err != nil {
+		t.Fatal(err)
+	}
+	token := filepath.Join(root, "synthetic.token")
+	if err := os.WriteFile(token, []byte("synthetic-only"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := filepath.Join(root, "fork-catalog.json")
+	catalog := codexproviders.Catalog{Schema: 1, InitialProvider: "pool-b", Providers: []codexproviders.Provider{
+		{ID: "openai", Label: "Subscription", Kind: "subscription"},
+		{ID: "pool-a", Label: "A", Kind: "codex-lb", BaseURL: backend.URL + "/a/v1", TokenFile: token},
+		{ID: "pool-c", Label: "C", Kind: "codex-lb", BaseURL: backend.URL + "/c/v1", TokenFile: token},
+		{ID: "pool-b", Label: "B", Kind: "codex-lb", BaseURL: backend.URL + "/b/v1", TokenFile: token},
+	}}
+	if err := providerAtomicJSON(catalogPath, catalog); err != nil {
+		t.Fatal(err)
+	}
+	statePath, _ := codexproviders.StatePath(stateRoot, "fork-fixture")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	state := codexproviders.State{Schema: 2, Workspace: "fork-fixture", Root: root, Socket: socket, Active: "pool-b", Sessions: map[string]codexproviders.Selection{"fork-destination": {Provider: "pool-c", CreationID: incarnation}}}
+	if err := providerAtomicJSON(statePath, state); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACE_NAME", "fork-fixture")
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalogPath)
+	destinationClient := workspacecodex.NewWithOptions(socket, root, codex.ClientOptions{PreserveThreadInstructionsOnResume: true})
+	destinationClient.RecoveryRoot = stateRoot
+	defer destinationClient.Close()
+	forkID, err := destinationClient.ForkThread(ctx, sourceFork.Thread.ID, destination, map[string]string{}, codex.ThreadSettings{Model: "gpt-5.5", ReasoningEffort: "low"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Request(ctx, "turn/start", map[string]any{"threadId": forkID, "input": []any{map[string]any{"type": "text", "text": "fork destination proof"}}}, &response); err != nil {
+		t.Fatal(err)
+	}
+	wait("fork routes to its explicit destination provider", func() bool { mu.Lock(); defer mu.Unlock(); return threadRequests[forkID]["/c/v1/responses"] > 0 })
+	mu.Lock()
+	wrongRoute := threadRequests[forkID]["/b/v1/responses"] + threadRequests[forkID]["/a/v1/responses"]
+	mu.Unlock()
+	if wrongRoute != 0 {
+		t.Fatal("fork used the source provider")
+	}
+	t.Log("native fork destination override reached C while source and workspace default remained B")
 	if err := syscall.Kill(daemon.Process.Pid, 0); err != nil {
 		t.Fatal("shared daemon exited")
 	}

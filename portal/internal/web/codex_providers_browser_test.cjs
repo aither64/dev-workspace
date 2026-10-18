@@ -207,7 +207,9 @@ test("plan and fork creation load destination catalogs independently of the sour
   assert.equal(planModel.options[0].value,"daybreak");
   assert.equal(sourceModel.options[0].value,"source-model");
   assert.equal(forkModel.options[0].value,"default-model");
-
+  fork.elements.provider={value:"openai",dataset:{providerIntent:"openai"}};
+  await api.loadModels({querySelectorAll:()=>[forkModel]});
+  assert.equal(forkModel.options[0].value,"daybreak");
   assert.equal(context.models[0].model,"source-model");
   assert(calls.includes("/api/models?provider=openai"));
   plan.elements.provider.value="pool";
@@ -330,4 +332,29 @@ test("creation refreshes the workspace-default label while preserving explicit d
 test("structured waiting progress retains the concrete blocker",async()=>{
   const ui=await popup({operation:{id:"waiting",phase:"waiting",stage:"waiting-creation",target:"pool",blockers:["example: initial conversation creation is still running"]}});
   assert.match(ui.status.textContent,/example: initial conversation creation is still running/);
+});
+
+
+test("opening a fork refreshes the default independently of the pinned source", async () => {
+  const ui=await creationProviders();
+  ui.form.id="fork-form";
+  const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const start=source.indexOf('  document.getElementById("fork-open")?.addEventListener');
+  const end=source.indexOf('  forkDialog?.querySelector',start);
+  let open,shown=false,refreshed=false;
+  vm.runInNewContext(source.slice(start,end),{
+    document:{getElementById:()=>({addEventListener:(_,handler)=>{open=handler;}})},
+    forkForm:ui.form,forkDialog:{showModal(){shown=true;}},
+    refreshCreationProvider:form=>{assert.equal(form,ui.form);refreshed=true;return ui.changeDefault("pool");},
+  });
+  open();await tick();
+  assert(shown&&refreshed);
+  assert.equal(ui.select.options[0].textContent,"Workspace default (Pool)");
+  assert.equal(ui.value(),"");assert.equal(ui.reloads.at(-1),ui.form);
+  ui.change("openai");const reloads=ui.reloads.length;
+  await ui.changeDefault("openai");
+  assert.equal(ui.value(),"openai");assert.equal(ui.reloads.length,reloads);
+  const locked=await creationProviders({locked:true});
+  await locked.changeDefault("pool");
+  assert.equal(locked.reloads.length,0);assert(locked.select.disabled);
 });

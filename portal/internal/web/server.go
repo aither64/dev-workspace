@@ -3331,6 +3331,10 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		s.writeError(w, r, http.StatusBadRequest, "invalid browser notification preference")
 		return
 	}
+	if value, ok := raw["provider"]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		s.writeError(w, r, http.StatusBadRequest, "provider must be omitted instead of null")
+		return
+	}
 	r.Body = io.NopCloser(bytes.NewReader(payload))
 	var body struct {
 		Sensitive                   bool   `json:"sensitive,omitempty"`
@@ -3338,6 +3342,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		CreationDate                string `json:"creationDate"`
 		Model                       string `json:"model"`
 		ReasoningEffort             string `json:"reasoningEffort"`
+		Provider                    string `json:"provider,omitempty"`
 		BrowserNotificationsEnabled *bool  `json:"browserNotificationsEnabled,omitempty"`
 	}
 	if !s.decodeJSON(w, r, &body) {
@@ -3347,6 +3352,10 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 	body.CreationDate = strings.TrimSpace(body.CreationDate)
 	body.Model = strings.TrimSpace(body.Model)
 	body.ReasoningEffort = strings.TrimSpace(body.ReasoningEffort)
+	if err := s.validateCreationProvider(body.Provider); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
 	if !session.ValidSlug(body.Name) || len(body.Name) > 48 {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session name is invalid"})
 		return
@@ -3368,7 +3377,7 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 	receipt, err := s.acceptCreation(creationRequest{
 		BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, Sensitive: body.Sensitive, Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
 		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity,
-		Model: body.Model, Effort: body.ReasoningEffort,
+		Model: body.Model, Effort: body.ReasoningEffort, Provider: body.Provider,
 	})
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})

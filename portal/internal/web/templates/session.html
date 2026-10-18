@@ -196,8 +196,10 @@
   {{if .Session.Interactive}}
   <dialog id="fork-dialog">
     <form id="fork-form" class="stack">
-      <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. The fork uses the workspace default provider. Worktrees, files, and development clusters stay with this session.</p></div>
+      <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Choose a provider for the new session. Worktrees, files, and development clusters stay with this session.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label data-creation-provider-label>Provider<select name="provider" data-creation-provider disabled><option value="">Loading providers…</option></select></label>
+      <p class="muted" data-creation-provider-help></p>
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>

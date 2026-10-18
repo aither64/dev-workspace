@@ -135,12 +135,13 @@ class WorkspaceHostTest
   end
 
   def test_creation_provider_is_bound_to_incarnation_and_then_exact_root
+    %w[creation fork].each do |kind|
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'original-root')
       locks = File.join(entry.fetch('root'), 'worktrees', '.locks')
       FileUtils.mkdir_p(locks)
-      journal = File.join(locks, 'one.creation.json')
-      File.write(journal, JSON.generate('slug' => 'one', 'state' => 'creating', 'tmux_identity' => 'b' * 64, 'provider' => 'pool'))
+      journal = File.join(locks, "one.#{kind}.json")
+      File.write(journal, JSON.generate('schema' => kind == 'fork' ? 2 : 1, 'slug' => 'one', 'state' => 'creating', 'tmux_identity' => 'b' * 64, 'provider' => 'pool'))
       File.chmod(0o600, journal)
       host.send(:provider_bind_creation, entry, ['one', 'b' * 64, 'pool'])
       host.send(:provider_bind_creation, entry, ['one', 'b' * 64])
@@ -148,12 +149,13 @@ class WorkspaceHostTest
       host.send(:provider_bind_root, entry, ['one', 'original-root'])
       assert_equal 'pool', host.send(:provider_session_selection, entry, host.send(:provider_state, entry), 'one')
       provider_session_fixture(host, entry, 'one', 'replacement-root')
-      File.write(journal, JSON.generate('slug' => 'one', 'state' => 'creating', 'tmux_identity' => 'c' * 64))
+      File.write(journal, JSON.generate('schema' => 1, 'slug' => 'one', 'state' => 'creating', 'tmux_identity' => 'c' * 64))
       host.send(:provider_bind_creation, entry, ['one', 'c' * 64])
       refute host.send(:provider_state, entry).fetch('sessions').key?('one')
       assert_equal 'openai', host.send(:provider_session_selection, entry, host.send(:provider_state, entry), 'one')
     end
   end
+    end
 
   def test_invalid_scoped_stage_or_root_set_never_reaches_the_worker
     with_scoped_provider_host do |host, entry|

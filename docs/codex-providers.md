@@ -16,14 +16,16 @@ but interrupted delegated tasks may need to be assigned again. New subagents
 inherit their parent's selected provider. Switching uses the selected upstream
 Codex binary without an additional provider-switching patch or rebuild.
 
-New-session and plan creation forms show the provider directly in the form.
+New-session, plan and fork forms show the provider directly in the form.
 **Workspace default (Codex subscription)** follows the current workspace default;
 the name in parentheses updates with the actual default. Choosing an individual
 provider pins the session to it, including when it equals the current default.
+Fork selection belongs to the new session independently of the source provider.
 You can also use:
 
 ```sh
 dev-session start my-task --provider openai
+dev-session fork my-task alternate-approach --provider openai
 ```
 
 Omitting the option inherits the workspace default. The CLI creation journal
@@ -32,6 +34,15 @@ cannot change it by omitting or replacing the flag. An explicit selection binds
 to the accepted creation incarnation, then to its exact root thread. Creation
 retries retain that selection. Reusing a deleted session name cannot inherit
 the previous session's override. Retained members use their session's provider.
+
+Explicit forks retain provider intent in a schema-2 fork journal; inherited
+forks keep schema 1. Both use the existing provider-state format. A package must
+advertise `codexProviderForkCreationPolicy: 1` while provider-bearing fork
+receipts remain, including ready receipts and the window before a CLI journal
+exists. Package admission refuses older readers before selection: their portal
+cannot start with these receipts. Finishing pending forks alone does not remove
+this boundary. Retain a compatible package and recovery evidence; never remove
+journals or receipts to bypass a refusal.
 
 The sidebar shows limits for the current session's provider. The dialog can
 preview either provider independently. Subscription previews use the native

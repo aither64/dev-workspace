@@ -195,8 +195,7 @@ module DevWorkspaceHost
         selection = state.fetch('sessions', {})[slug]
         next if !selected_slug && selection && selection['rootThreadId'] == root
         if !selected_slug && selection && selection['creationId'] && manifest.dig('creation', 'state') == 'creating'
-          journal_path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json")
-          journal = JSON.parse(read_private_json_file!(journal_path, 'provider creation identity', maximum: 64 * 1024))
+          journal = provider_creation_journal(entry, slug)
           next if journal['state'] == 'creating' && journal['tmux_identity'] == selection['creationId']
         end
         sessions[slug] = root
@@ -211,12 +210,30 @@ module DevWorkspaceHost
       selection = state.fetch('sessions', {})[slug]
       return state.fetch('active') unless selection
       return selection.fetch('provider') if selection['rootThreadId'] && selection['rootThreadId'] == manifest.dig('codex', 'thread_id')
-      path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json")
-      if selection['creationId'] && File.file?(path)
-        journal = JSON.parse(read_private_json_file!(path, 'provider creation identity', maximum: 64 * 1024))
+      if selection['creationId'] && (journal = provider_creation_journal(entry, slug, required: false))
         return selection.fetch('provider') if journal['state'] == 'creating' && journal['tmux_identity'] == selection['creationId']
       end
       state.fetch('active')
+    end
+
+    # Forks have their own journal, but share the same provider incarnation.
+    def provider_creation_journal(entry, slug, required: true)
+      paths = %w[creation fork].map do |kind|
+        File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.#{kind}.json")
+      end.select { |path| File.exist?(path) }
+      return nil if paths.empty? && !required
+      raise Error, 'provider creation identity is unavailable or ambiguous' unless paths.length == 1
+
+      journal = JSON.parse(read_private_json_file!(paths.first, 'provider creation identity', maximum: 64 * 1024))
+      unless journal.is_a?(Hash) && journal['slug'] == slug && %w[creating ready].include?(journal['state']) &&
+             journal['tmux_identity'].is_a?(String) && journal['tmux_identity'].match?(SHA256_HEX)
+        raise Error, 'provider creation incarnation changed'
+      end
+      if paths.first.end_with?('.fork.json') &&
+         !([1, 2].include?(journal['schema']) && (journal['schema'] == 1 || journal['provider'].is_a?(String) && journal['provider'].match?(PROVIDER_ID)))
+        raise Error, 'invalid provider fork journal'
+      end
+      journal
     end
 
     # Called after the creation journal exists and before native creation. A
@@ -228,8 +245,7 @@ module DevWorkspaceHost
       with_current_generation_lock(mode: File::LOCK_SH) do
         provider_locked(entry) do
           state = provider_state(entry)
-          journal_path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json")
-          journal = JSON.parse(read_private_json_file!(journal_path, 'provider creation identity', maximum: 64 * 1024))
+          journal = provider_creation_journal(entry, slug)
           raise Error, 'provider creation incarnation changed' unless journal['slug'] == slug && journal['tmux_identity'] == incarnation && journal['state'] == 'creating'
           raise Error, 'creation provider differs from its retained intent' if selected && selected != journal['provider']
           selected = journal['provider']
@@ -277,7 +293,7 @@ module DevWorkspaceHost
           selection = state.fetch('sessions', {})[slug]
           return unless selection && selection['creationId']
           manifest = read_portal_manifest(File.join(entry.fetch('root'), 'work', slug, 'portal.yml'))
-          journal = JSON.parse(read_private_json_file!(File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.creation.json"), 'provider creation identity', maximum: 64 * 1024))
+          journal = provider_creation_journal(entry, slug)
           raise Error, 'provider root has a different creation incarnation' unless journal['state'] == 'creating' && journal['tmux_identity'] == selection['creationId']
           raise Error, 'provider root does not match its creation manifest' unless manifest.dig('codex', 'thread_id') == root && manifest.dig('codex', 'socket_path') == instance_runtime(entry).fetch(:codex)
           selection['rootThreadId'] = root

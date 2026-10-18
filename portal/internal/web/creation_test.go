@@ -572,6 +572,7 @@ func TestCreationCapturesDeletionHistoryUnderDestinationLock(t *testing.T) {
 func TestCreationForkAcceptsBeforeSlowSourceVerification(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
+	providerTestCatalog(t, server, "http://127.0.0.1:1")
 	prepareInteractiveConversation(t, server, "source")
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -588,9 +589,19 @@ func TestCreationForkAcceptsBeforeSlowSourceVerification(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	response := postCreation(t, server, "/api/sessions/source/fork", `{"name":"fork","creationDate":"2026-09-12"}`, "application/json")
+	response := postCreation(t, server, "/api/sessions/source/fork", `{"name":"fork","creationDate":"2026-09-12","provider":"openai"}`, "application/json")
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("fork response: %d %s", response.Code, response.Body.String())
+	}
+	receipt, ok := server.currentCreation("2026-09-12-fork")
+	if !ok || receipt.Request.Provider != "openai" {
+		t.Fatalf("fork provider intent lost: %#v", receipt.Request)
+	}
+	data, _ := json.Marshal(receipt)
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(data, &raw)
+	if err := validateCreationReceiptShape(raw); err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case <-entered:

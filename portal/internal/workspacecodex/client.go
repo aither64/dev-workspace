@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -108,18 +109,33 @@ func (c *Client) providerRequestSettings(ctx context.Context, request codex.Life
 		fenceRoot := summary.Codex.ThreadID
 		provider = state.Provider(slug, summary.Codex.ThreadID)
 		if selection, ok := state.Sessions[slug]; ok && selection.CreationID != "" && selection.RootThreadID == "" {
-			path := filepath.Join(c.workspace, "worktrees", ".locks", slug+".creation.json")
+			var path string
+			for _, suffix := range []string{".creation.json", ".fork.json"} {
+				candidate := filepath.Join(c.workspace, "worktrees", ".locks", slug+suffix)
+				if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+					continue
+				} else if err != nil || path != "" {
+					return codex.ThreadSettings{}, errors.New("provider creation identity is unavailable or ambiguous")
+				}
+				path = candidate
+			}
 			info, err := os.Lstat(path)
 			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64*1024 {
 				return codex.ThreadSettings{}, errors.New("provider creation identity is unavailable")
 			}
 			data, err := os.ReadFile(path)
 			var journal struct {
+				Slug     string `json:"slug"`
+				Schema   int    `json:"schema"`
+				Provider string `json:"provider"`
 				State    string `json:"state"`
 				Identity string `json:"tmux_identity"`
 			}
-			if err != nil || json.Unmarshal(data, &journal) != nil || journal.State != "creating" || journal.Identity != selection.CreationID {
+			if err != nil || json.Unmarshal(data, &journal) != nil || journal.Slug != slug || journal.State != "creating" || journal.Identity != selection.CreationID {
 				return codex.ThreadSettings{}, errors.New("provider creation incarnation changed")
+			}
+			if strings.HasSuffix(path, ".fork.json") && (journal.Schema != 2 || journal.Provider != selection.Provider) {
+				return codex.ThreadSettings{}, errors.New("provider fork selection changed")
 			}
 			provider = selection.Provider
 			// The root may have just reached the manifest while bind-root is
@@ -488,7 +504,7 @@ func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string,
 }
 
 func (c *Client) ResolveForkSettings(
-	ctx context.Context, sourceThreadID string, requested codex.ThreadSettings, modelProfile ...string,
+	ctx context.Context, sourceThreadID string, requested codex.ThreadSettings, modelProfile, provider string,
 ) (codex.ThreadSettings, error) {
 	if sourceThreadID == "" {
 		return codex.ThreadSettings{}, errors.New("fork settings require a source thread")
@@ -498,11 +514,7 @@ func (c *Client) ResolveForkSettings(
 		return codex.ThreadSettings{}, fmt.Errorf("read source Codex settings: %w", err)
 	}
 	var models []codex.Model
-	if len(modelProfile) > 0 {
-		models, err = c.ModelsForDirectory(ctx, "", modelProfile[0], "")
-	} else {
-		models, err = c.ListModels(ctx)
-	}
+	models, err = c.ModelsForDirectory(ctx, "", modelProfile, provider)
 	if err != nil {
 		return codex.ThreadSettings{}, fmt.Errorf("load Codex models: %w", err)
 	}

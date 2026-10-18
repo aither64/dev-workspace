@@ -488,7 +488,8 @@ treat an input as a literal slug before that slug is known to the workspace.
 `fork` creates a new dated session with a native copy of the source Codex
 conversation. It copies no worktrees, tracking content, artifacts, or
 development clusters. Use `--model` and `--effort` to override the inherited
-Codex settings.
+Codex settings. Use `--provider` to pin the destination provider; omitting it
+follows the workspace default independently of the source session.
 
 `sync` creates one managed tmux window for every git worktree under
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no

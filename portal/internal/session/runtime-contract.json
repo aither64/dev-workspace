@@ -13,6 +13,7 @@
   "codexProviderTransitionPolicy": 1,
   "codexProviderScopedStateSchema": 2,
   "codexProviderScopedTransitionPolicy": 1,
+  "codexProviderForkCreationPolicy": 1,
   "agentTeamRegistration": {
     "helperSchema": 1,
     "policy": 1,

@@ -2327,34 +2327,42 @@ module DevWorkspaceHost
 
 	# New receipt fields can precede provider-state adoption, including an
 	# unmanaged plan using the inherited provider. Older portals reject them.
-	def portal_creations_require_scoped_provider?(entry)
-	  directory = private_portal_creation_directory(entry)
-	  if directory && Dir.children(directory).any? do |name|
-		next false unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
-		path = File.join(directory, name)
-		receipt = parse_strict_json_object(read_portal_creation_receipt_probe!(path), 'portal creation receipt', 12 * 20_000 + 16_384)
-		request = receipt['request']
-		next false unless scoped_provider_creation_fields?(request)
-		require_private_portal_creation_receipt!(path)
-		true
-	  end
-		return true
-	  end
-	  # Naming/preparation can be interrupted before a receipt or provider state
-	  # exists. Completed mappings are compact and contain neither field.
-	  directory = private_portal_creation_directory(entry, 'session-preparations')
-	  return false unless directory
-	  maximum = 2 * (12 * 20_000 + 16_384) + 16_384
-	  Dir.children(directory).any? do |name|
-		next false unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
-		path = File.join(directory, name)
-		data = read_private_json_file!(path, 'session preparation', maximum:)
-		record = parse_strict_json_object(data, 'session preparation', maximum)
-		snapshot = record['snapshot']
-		input = snapshot.is_a?(Hash) ? snapshot['input'] : nil
-		scoped_provider_creation_fields?(input) || scoped_provider_creation_fields?(record['handoff'])
-	  end
-	end
+    # 0: no provider fields; 1: scoped creation; 2: explicit fork receipts.
+    def portal_creation_provider_policy(entry)
+      policy = 0
+      directory = private_portal_creation_directory(entry)
+      if directory
+        Dir.children(directory).each do |name|
+          next unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
+
+          path = File.join(directory, name)
+          receipt = parse_strict_json_object(read_portal_creation_receipt_probe!(path), 'portal creation receipt', 12 * 20_000 + 16_384)
+          request = receipt['request']
+          next unless scoped_provider_creation_fields?(request)
+
+          require_private_portal_creation_receipt!(path)
+          policy = [policy, request['kind'] == 'fork' && request.key?('provider') ? 2 : 1].max
+        end
+      end
+      return policy if policy == 2
+
+      # Naming/preparation can precede a receipt or provider-state write.
+      directory = private_portal_creation_directory(entry, 'session-preparations')
+      return policy unless directory
+
+      maximum = 2 * (12 * 20_000 + 16_384) + 16_384
+      preparations = Dir.children(directory).any? do |name|
+        next false unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
+
+        path = File.join(directory, name)
+        data = read_private_json_file!(path, 'session preparation', maximum:)
+        record = parse_strict_json_object(data, 'session preparation', maximum)
+        snapshot = record['snapshot']
+        input = snapshot.is_a?(Hash) ? snapshot['input'] : nil
+        scoped_provider_creation_fields?(input) || scoped_provider_creation_fields?(record['handoff'])
+      end
+      preparations ? [policy, 1].max : policy
+    end
 
 	def scoped_provider_creation_fields?(value)
 	  value.is_a?(Hash) && (value.key?('provider') || value.key?('destinationSettings'))

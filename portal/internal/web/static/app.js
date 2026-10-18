@@ -24,8 +24,8 @@
     deleteQueued: conversation?.deleteQueued,
     startQueue: conversation?.startQueue,
     settings: conversation?.settings,
-    fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true) => request(apiPath(slug, "fork"), {
-      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, browserNotificationsEnabled, ...(sensitive ? {sensitive: true} : {})}),
+    fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true, provider = "") => request(apiPath(slug, "fork"), {
+      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, browserNotificationsEnabled, ...(provider ? {provider} : {}), ...(sensitive ? {sensitive: true} : {})}),
     }),
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
@@ -1903,6 +1903,7 @@
       const defaultID = catalog.default || catalog.active;
       if (!catalog.providers?.some(provider => provider.id === defaultID)) throw new Error("Provider default unavailable");
       const intent = creationProviderValue(form);
+      const defaultChanged = select.dataset.providerDefault && select.dataset.providerDefault !== defaultID;
       select.dataset.providerDefault = defaultID;
       const inherited = document.createElement("option");
       inherited.value = "";
@@ -1917,13 +1918,16 @@
       restoreDraftSelect(select, intent, "Saved provider is unavailable");
       select.disabled = form.dataset.requestLocked === "true";
       updateCreationProviderHelp(form);
+      if (defaultChanged && !intent && form.dataset.requestLocked !== "true") {
+        modelCatalogs.clear(); void loadModels(form);
+      }
     }).catch(() => {
       if (creationProviderReads.get(select) !== pending) return;
       const help = form.querySelector("[data-creation-provider-help]");
       if (help) help.textContent = "Provider list unavailable. New sessions use the workspace default unless a saved request selected a provider.";
     });
   };
-  for (const form of document.querySelectorAll("#new-session-form, #plan-session-form")) {
+  for (const form of document.querySelectorAll("#new-session-form, #plan-session-form, #fork-form")) {
     const select = form.elements.provider;
     if (!select) continue;
     select.dataset.providerIntent = "";
@@ -2118,7 +2122,7 @@
   let models = [];
   const modelCatalogs = new Map(), selectModelCatalogs = new WeakMap(), selectModelURLs = new WeakMap();
   document.addEventListener("workspace-provider-changed", () => {
-    for (const form of document.querySelectorAll("#new-session-form, #plan-session-form")) void refreshCreationProvider(form);
+    for (const form of document.querySelectorAll("#new-session-form, #plan-session-form, #fork-form")) void refreshCreationProvider(form);
     models = []; modelCatalogs.clear(); void loadModels();
   });
   document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {
@@ -2419,7 +2423,7 @@
       const form = select.closest("form");
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
-      const provider = creation ? creationProviderValue(form) : "";
+      const provider = destination ? creationProviderValue(form) : "";
       const url = `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
       if (!groups.has(url)) groups.set(url, []);
       groups.get(url).push({select, creation, destination});
@@ -5434,11 +5438,15 @@
 
   const forkDialog = document.getElementById("fork-dialog");
   const forkForm = document.getElementById("fork-form");
-  document.getElementById("fork-open")?.addEventListener("click", () => forkDialog.showModal());
+  document.getElementById("fork-open")?.addEventListener("click", () => {
+    void refreshCreationProvider(forkForm);
+    forkDialog.showModal();
+  });
   forkDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => forkDialog.close());
   if (forkForm && interactive) {
     forkForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      forkForm.dataset.requestLocked = "true";
       const controls = Array.from(forkForm.querySelectorAll("button, input, select"));
       controls.forEach((control) => { control.disabled = true; });
       const progress = timedProgress(document.getElementById("fork-progress"), "Creating fork");
@@ -5450,10 +5458,12 @@
           forkForm.elements.effort.value,
           Boolean(forkForm.elements.sensitive?.checked),
           forkForm.elements.browserNotificationsEnabled?.checked !== false,
+          creationProviderValue(forkForm),
         );
         progress.stop();
         location.assign(result.url);
       } catch (error) {
+        forkForm.dataset.requestLocked = "false";
         progress.fail(error.message);
         controls.forEach((control) => { control.disabled = false; });
       }
