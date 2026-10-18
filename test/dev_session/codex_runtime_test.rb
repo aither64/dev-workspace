@@ -3,6 +3,23 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_creation_provider_survives_failure_before_provider_binding
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      goal = File.join(workspace, 'goal.txt')
+      File.write(goal, "Initial request\n")
+      slug = 'provider-journal-window'
+      options = {exclusive: true, run_codex: true, model: nil, effort: nil}
+      original = runner.send(:prepare_creation_journal, slug, goal, **options, provider: 'pool')
+      retry_journal = runner.send(:prepare_creation_journal, slug, goal, **options)
+      assert_equal 'pool', retry_journal.fetch('provider')
+      assert_equal original, retry_journal
+      assert_raises(DevSession::Error) do
+        runner.send(:prepare_creation_journal, slug, goal, **options, provider: 'openai')
+      end
+    end
+  end
+
   def test_finalize_runtime_output_uses_deployed_helper
     slug = '2026-06-06-demo'
     with_workspace do |workspace|
@@ -552,7 +569,11 @@ class DevSessionTest < Minitest::Test
       File.write(host, <<~RUBY)
         #!#{RbConfig.ruby}
         require 'json'
-        abort 'wrong provider command' unless ARGV == ['provider', 'native-args', 'demo']
+        if ARGV[0, 4] == ['provider', 'bind-creation', 'demo', #{slug.dump}]
+          abort 'missing creation incarnation' unless ARGV[4]&.match?(/\\A[0-9a-f]{64}\\z/)
+          exit
+        end
+        abort 'wrong provider command' unless ARGV == ['provider', 'native-args', 'demo', #{slug.dump}]
         abort 'missing provider environment' unless ENV['DEV_WORKSPACE_NAME'] == 'demo'
         puts #{JSON.generate('argv' => native).dump}
       RUBY

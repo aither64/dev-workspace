@@ -3132,6 +3132,13 @@ func TestImplementPlanRetriesAfterTheModeChangeResponseIsLost(t *testing.T) {
 func TestImplementPlanStartsANewSessionWithTheExactPlan(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
+	providerTestCatalog(t, server, "http://127.0.0.1:1")
+	if err := os.MkdirAll(filepath.Join(server.config.HostProfile, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(server.config.HostProfile, "bin", "workspace-host"), []byte("#!/bin/sh\nprintf '%s\\n' '[{\"model\":\"model-1\",\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"high\"}]}]'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	prepareInteractiveConversation(t, server, "example")
 	directory := t.TempDir()
 	arguments := filepath.Join(directory, "arguments")
@@ -3156,13 +3163,13 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
 	plan := "1. Make the change.\n2. Test it."
 	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{LatestTurnID: "turn-plan",
-		ThreadID: "thread-1", Status: "idle", Model: "model-1", ReasoningEffort: "high",
+		ThreadID: "thread-1", Status: "idle", Model: "source-only-model", ReasoningEffort: "high",
 		CollaborationMode: "plan", Entries: []codex.TranscriptEntry{{
 			TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: plan,
 		}},
 	}}
 	body := fmt.Sprintf(
-		`{"action":"new","planTurnId":"turn-plan","planSha256":"%s","name":"implement-feature","creationDate":"2026-09-07","model":"model-1","reasoningEffort":"high"}`,
+		`{"action":"new","provider":"openai","planTurnId":"turn-plan","planSha256":"%s","name":"implement-feature","creationDate":"2026-09-07","model":"model-1","reasoningEffort":"high"}`,
 		planDigest(plan),
 	)
 	response := httptest.NewRecorder()
@@ -3175,10 +3182,10 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("new-session plan response = %d %q", response.Code, response.Body.String())
 	}
-	awaitCreation(t, server, "2026-09-07-implement-feature")
+	receipt := awaitCreation(t, server, "2026-09-07-implement-feature")
 	goal, err := os.ReadFile(goalCopy)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("plan helper was not invoked: %v; receipt: %s", err, receipt.Error)
 	}
 	wantGoal := "Implement the following approved plan from session example.\n\n" + plan
 	if string(goal) != wantGoal {
@@ -3189,11 +3196,11 @@ printf '{"slug":"2026-09-07-implement-feature"}\n'
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
-	if len(lines) != 22 || lines[0] != "start" || lines[1] != "2026-09-07-implement-feature" ||
+	if len(lines) != 24 || lines[0] != "start" || lines[1] != "2026-09-07-implement-feature" ||
 		lines[2] != "--as-is" || lines[3] != "--exclusive" || lines[4] != "--no-attach" ||
 		lines[5] != "--goal-file" || lines[7] != "--json" ||
 		lines[8] != "--model" || lines[9] != "model-1" ||
-		lines[10] != "--effort" || lines[11] != "high" {
+		lines[10] != "--effort" || lines[11] != "high" || lines[12] != "--provider" || lines[13] != "openai" {
 		t.Fatalf("new session arguments = %#v", lines)
 	}
 }

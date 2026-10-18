@@ -234,7 +234,7 @@ func (client memberConversationClient) UpdateThreadSettings(ctx context.Context,
 	if update.ReasoningEffort != nil {
 		effort = *update.ReasoningEffort
 	}
-	if err := client.server.validateModelSettings(ctx, codex.ThreadSettings{Model: model, ReasoningEffort: effort}, false); err != nil {
+	if err := client.server.validateModelSettings(ctx, codex.ThreadSettings{Model: model, ReasoningEffort: effort}, false, client.slug); err != nil {
 		return codex.ThreadSettings{}, err
 	}
 	settings, err := client.Client.UpdateThreadSettings(ctx, threadID, update)

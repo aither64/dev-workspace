@@ -15,8 +15,14 @@ import (
 // actual implicit resume boundary, without making recursive App Server calls.
 func (c *Client) allowImplicitResume(thread string) bool {
 	state, err := c.providerState()
-	if err != nil || (state != nil && state.Operation.Reserved()) {
+	if err != nil {
 		return false
+	}
+	if state != nil && state.Operation.Reserved() {
+		owner, err := (session.RecoveryStore{Root: c.RecoveryRoot, Workspace: c.workspace}).ThreadOwner(thread)
+		if err != nil || state.BlocksSession(owner.Slug, owner.Codex.ThreadID) {
+			return false
+		}
 	}
 	if c.RecoveryRoot == "" || c.workspace == "" {
 		return true

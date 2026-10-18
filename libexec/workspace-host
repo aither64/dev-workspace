@@ -1481,7 +1481,7 @@ module DevWorkspaceHost
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       codex = File.realpath(active_codex)
       plan = registration_plan_for(entry, package: package_root)
-      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'stage') != 'shared-start'
+      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') != 'scoped-v1' && provider_state(entry).dig('operation', 'stage') != 'shared-start'
         raise Error, 'provider recovery must finish before the shared native daemon can start'
       end
       write_registration_marker(entry, codex, plan)
@@ -2134,12 +2134,17 @@ module DevWorkspaceHost
       raise Error, "cannot execute Codex registration probe: #{e.message}"
     end
 
-    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil)
+    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil, provider_slugs: nil)
       quiesced = []
       predecessor_package = preselection_session_package
       entries.each do |entry|
         current_socket = instance_runtime(entry).fetch(:codex)
-        Dir[File.join(entry.fetch('root'), 'work', '*', 'portal.yml')].sort.each do |manifest_path|
+        paths = if provider_slugs
+                  provider_slugs.map { |slug| File.join(entry.fetch('root'), 'work', slug, 'portal.yml') }
+                else
+                  Dir[File.join(entry.fetch('root'), 'work', '*', 'portal.yml')].sort
+                end
+        paths.each do |manifest_path|
           manifest = read_portal_manifest(manifest_path)
           next unless manifest.dig('creation', 'state') == 'ready'
           thread_id = manifest.dig('codex', 'thread_id')
@@ -2147,6 +2152,8 @@ module DevWorkspaceHost
           next unless manifest.dig('codex', 'socket_path') == current_socket
 
           slug = File.basename(File.dirname(manifest_path))
+          next if provider_slugs && !provider_slugs.include?(slug)
+          yield slug, quiesced.length, provider_slugs.length if provider_slugs && block_given?
           environment, command, arguments = dev_session_invocation(
             entry,
             ['quiesce', slug, '--as-is'],
@@ -2249,6 +2256,10 @@ module DevWorkspaceHost
         raise Error, 'invalid creation sensitivity' unless journal['sensitive'] == true
         allowed << 'sensitive'
       end
+      if journal.key?('provider')
+        raise Error, 'invalid creation provider' unless journal['provider'].is_a?(String) && journal['provider'].match?(PROVIDER_ID)
+        allowed << 'provider'
+      end
       allowed << 'tmux_identity' if state == 'creating'
       unless journal.keys.sort == allowed.sort && [true, false].include?(journal['run_codex']) &&
              (journal['goal_sha256'].nil? || journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(SHA256_HEX))
@@ -2301,16 +2312,58 @@ module DevWorkspaceHost
 	# Browser acceptance persists a schema-2 receipt before the Ruby creation
 	# journal exists. Inspect that private receipt namespace during package and
 	# Codex transitions so a scheduler gap cannot strand a selected binding.
-	def unfinished_portal_managed_creations(entry)
+	def private_portal_creation_directory(entry, name = 'creations')
 	  workspace = entry.fetch('root')
 	  identifier = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
-	  directory = File.join(@state, 'portal', identifier, 'creations')
-	  return [] unless File.exist?(directory)
+	  directory = File.join(@state, 'portal', identifier, name)
+	  return nil unless File.exist?(directory)
 
 	  stat = File.stat(directory)
 	  unless stat.directory? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
 		raise Error, "portal creation directory is not private and owned: #{directory}"
 	  end
+	  directory
+	end
+
+	# New receipt fields can precede provider-state adoption, including an
+	# unmanaged plan using the inherited provider. Older portals reject them.
+	def portal_creations_require_scoped_provider?(entry)
+	  directory = private_portal_creation_directory(entry)
+	  if directory && Dir.children(directory).any? do |name|
+		next false unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
+		path = File.join(directory, name)
+		receipt = parse_strict_json_object(read_portal_creation_receipt_probe!(path), 'portal creation receipt', 12 * 20_000 + 16_384)
+		request = receipt['request']
+		next false unless scoped_provider_creation_fields?(request)
+		require_private_portal_creation_receipt!(path)
+		true
+	  end
+		return true
+	  end
+	  # Naming/preparation can be interrupted before a receipt or provider state
+	  # exists. Completed mappings are compact and contain neither field.
+	  directory = private_portal_creation_directory(entry, 'session-preparations')
+	  return false unless directory
+	  maximum = 2 * (12 * 20_000 + 16_384) + 16_384
+	  Dir.children(directory).any? do |name|
+		next false unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
+		path = File.join(directory, name)
+		data = read_private_json_file!(path, 'session preparation', maximum:)
+		record = parse_strict_json_object(data, 'session preparation', maximum)
+		snapshot = record['snapshot']
+		input = snapshot.is_a?(Hash) ? snapshot['input'] : nil
+		scoped_provider_creation_fields?(input) || scoped_provider_creation_fields?(record['handoff'])
+	  end
+	end
+
+	def scoped_provider_creation_fields?(value)
+	  value.is_a?(Hash) && (value.key?('provider') || value.key?('destinationSettings'))
+	end
+
+	def unfinished_portal_managed_creations(entry)
+	  workspace = entry.fetch('root')
+	  directory = private_portal_creation_directory(entry)
+	  return [] unless directory
 	  Dir.children(directory).sort.filter_map do |name|
 		  # Completion evidence is terminal, companion data. It is deliberately
 		  # not a creation receipt and cannot block a package transition.
@@ -2489,6 +2542,12 @@ module DevWorkspaceHost
     return false if request.key?('sensitive') && request['sensitive'] != true
     allowed << 'browserNotificationsEnabled'
     return false unless !request.key?('browserNotificationsEnabled') || [true, false].include?(request['browserNotificationsEnabled'])
+    allowed << 'provider'
+    return false if request.key?('provider') && !(request['provider'].is_a?(String) && request['provider'].match?(PROVIDER_ID))
+    if request['kind'] == 'plan'
+      allowed << 'destinationSettings'
+      return false if request.key?('destinationSettings') && request['destinationSettings'] != true
+    end
     return false unless (request.keys - allowed).empty? && (required - request.keys).empty?
 	  return false unless request['slug'] == slug && valid_session_identity?(request['slug']) &&
 						  valid_portal_team_identifier?(request['team']) &&
@@ -2725,7 +2784,7 @@ module DevWorkspaceHost
       false
     end
 
-    def restore_quiesced_sessions(sessions, package: package_root)
+    def restore_quiesced_sessions(sessions, package: package_root, provider_terminal_snapshot: nil)
       failures = []
       sessions.each do |entry, slug|
         begin
@@ -2735,6 +2794,7 @@ module DevWorkspaceHost
             transition_lock: false,
             package:
           )
+          environment['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = provider_terminal_snapshot if provider_terminal_snapshot
           system_env!(environment, command, *arguments)
         rescue StandardError => error
           message = error.message.lines.first.to_s.strip
@@ -2959,7 +3019,7 @@ module DevWorkspaceHost
       FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
       raise Error, "workspace transition lock is a symlink: #{path}" if File.symlink?(path)
       File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
-        file.flock(mode)
+        raise Error, 'workspace package transition is in progress; retry shortly' unless file.flock(mode)
         yield
       end
     end

@@ -11,6 +11,8 @@
   "archiveExecutionPolicy": 1,
   "codexProviderStateSchema": 1,
   "codexProviderTransitionPolicy": 1,
+  "codexProviderScopedStateSchema": 2,
+  "codexProviderScopedTransitionPolicy": 1,
   "agentTeamRegistration": {
     "helperSchema": 1,
     "policy": 1,

@@ -2,15 +2,18 @@ package workspacecodex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 const threadSourceKind = "vscode"
@@ -36,7 +39,7 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
 	options.AllowImplicitResume = client.allowImplicitResume
-	options.LifecycleSettings = client.providerSettings
+	options.LifecycleRequestSettings = client.providerRequestSettings
 	client.submissionLedgerPath = options.SubmissionLedgerPath
 	client.Client = codex.NewWithOptions(socket, options)
 	return client
@@ -65,6 +68,10 @@ func (c *Client) providerState() (*codexproviders.State, error) {
 }
 
 func (c *Client) providerSettings(ctx context.Context, thread string) (codex.ThreadSettings, error) {
+	return c.providerRequestSettings(ctx, codex.LifecycleRequest{Method: "thread/resume", ThreadID: thread})
+}
+
+func (c *Client) providerRequestSettings(ctx context.Context, request codex.LifecycleRequest) (codex.ThreadSettings, error) {
 	state, err := c.providerState()
 	if err != nil {
 		return codex.ThreadSettings{}, err
@@ -72,10 +79,60 @@ func (c *Client) providerSettings(ctx context.Context, thread string) (codex.Thr
 	if state == nil {
 		return codex.ThreadSettings{}, nil
 	}
-	if state.Operation.Reserved() {
-		return codex.ThreadSettings{}, errors.New("workspace provider transition is reserved")
+	thread, cwd := request.ThreadID, request.Cwd
+	if cwd == "" && thread != "" {
+		var response struct {
+			Thread struct {
+				ID  string `json:"id"`
+				Cwd string `json:"cwd"`
+			} `json:"thread"`
+		}
+		if err := c.Request(ctx, "thread/read", map[string]any{"threadId": thread, "excludeTurns": true}, &response); err != nil {
+			return codex.ThreadSettings{}, err
+		}
+		if response.Thread.ID != thread {
+			return codex.ThreadSettings{}, errors.New("provider thread identity changed")
+		}
+		cwd = response.Thread.Cwd
 	}
-	settings := codex.ThreadSettings{ModelProvider: state.Active}
+	provider := state.Active
+	if cwd != "" {
+		slug := filepath.Base(cwd)
+		if !session.ValidSlug(slug) || cwd != filepath.Join(c.workspace, "work", slug) {
+			return codex.ThreadSettings{}, errors.New("provider destination is outside its session")
+		}
+		summary, err := session.Find(c.workspace, slug)
+		if err != nil || summary.Archived || (summary.Codex.ThreadID != "" && summary.Codex.SocketPath != c.socket) {
+			return codex.ThreadSettings{}, errors.New("provider session identity changed")
+		}
+		fenceRoot := summary.Codex.ThreadID
+		provider = state.Provider(slug, summary.Codex.ThreadID)
+		if selection, ok := state.Sessions[slug]; ok && selection.CreationID != "" && selection.RootThreadID == "" {
+			path := filepath.Join(c.workspace, "worktrees", ".locks", slug+".creation.json")
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64*1024 {
+				return codex.ThreadSettings{}, errors.New("provider creation identity is unavailable")
+			}
+			data, err := os.ReadFile(path)
+			var journal struct {
+				State    string `json:"state"`
+				Identity string `json:"tmux_identity"`
+			}
+			if err != nil || json.Unmarshal(data, &journal) != nil || journal.State != "creating" || journal.Identity != selection.CreationID {
+				return codex.ThreadSettings{}, errors.New("provider creation incarnation changed")
+			}
+			provider = selection.Provider
+			// The root may have just reached the manifest while bind-root is
+			// still pending. The verified creation incarnation owns this window.
+			fenceRoot = ""
+		}
+		if state.BlocksSession(slug, fenceRoot) {
+			return codex.ThreadSettings{}, errors.New("this session is changing provider; its work will resume automatically")
+		}
+	} else if state.Operation.Reserved() {
+		return codex.ThreadSettings{}, errors.New("provider scope is unavailable during transition")
+	}
+	settings := codex.ThreadSettings{ModelProvider: provider}
 	if thread != "" {
 		retained, err := c.ReadThreadSettings(ctx, thread)
 		if err != nil {
@@ -431,7 +488,7 @@ func (c *Client) creationCandidates(ctx context.Context, recordedID, cwd string,
 }
 
 func (c *Client) ResolveForkSettings(
-	ctx context.Context, sourceThreadID string, requested codex.ThreadSettings,
+	ctx context.Context, sourceThreadID string, requested codex.ThreadSettings, modelProfile ...string,
 ) (codex.ThreadSettings, error) {
 	if sourceThreadID == "" {
 		return codex.ThreadSettings{}, errors.New("fork settings require a source thread")
@@ -440,7 +497,12 @@ func (c *Client) ResolveForkSettings(
 	if err != nil {
 		return codex.ThreadSettings{}, fmt.Errorf("read source Codex settings: %w", err)
 	}
-	models, err := c.ListModels(ctx)
+	var models []codex.Model
+	if len(modelProfile) > 0 {
+		models, err = c.ModelsForDirectory(ctx, "", modelProfile[0], "")
+	} else {
+		models, err = c.ListModels(ctx)
+	}
 	if err != nil {
 		return codex.ThreadSettings{}, fmt.Errorf("load Codex models: %w", err)
 	}

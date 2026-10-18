@@ -167,6 +167,8 @@ func run(args []string) error {
 func teamPresetCommand(args []string) error {
 	flags := flag.NewFlagSet("team-preset", flag.ContinueOnError)
 	packageRoot := flags.String("package-root", "", "absolute installed package root")
+	workspace := flags.String("workspace", "", "registered workspace root")
+	provider := flags.String("provider", "", "explicit creation provider")
 	id := flags.String("team", "", "package team identifier")
 	model := flags.String("model", "", "explicit lead Codex model")
 	effort := flags.String("effort", "", "explicit lead reasoning effort")
@@ -195,11 +197,11 @@ func teamPresetCommand(args []string) error {
 		return err
 	}
 	if *model != "" {
-		client := newCodexClient(*socket, "")
+		client := newCodexClient(*socket, *workspace)
 		defer client.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		models, err := client.ListModels(ctx)
+		models, err := client.ModelsForDirectory(ctx, "", *packageRoot, *provider)
 		if err != nil {
 			return fmt.Errorf("load live Codex models: %w", err)
 		}
@@ -405,6 +407,10 @@ func portalListener(socketPath string) (net.Listener, error) {
 	return listener, nil
 }
 
+type scopedModelCatalog func(context.Context) ([]codex.Model, error)
+
+func (f scopedModelCatalog) ListModels(ctx context.Context) ([]codex.Model, error) { return f(ctx) }
+
 type teamModelCatalog interface {
 	ListModels(context.Context) ([]codex.Model, error)
 }
@@ -535,7 +541,10 @@ func teamCommand(args []string) error {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	settings, err := resolveTeamMemberSettings(ctx, client, command, *model, *effort)
+	catalog := scopedModelCatalog(func(ctx context.Context) ([]codex.Model, error) {
+		return client.ModelsForDirectory(ctx, *cwd, *hostProfile, "")
+	})
+	settings, err := resolveTeamMemberSettings(ctx, catalog, command, *model, *effort)
 	if err != nil {
 		return err
 	}
@@ -548,7 +557,7 @@ func teamCommand(args []string) error {
 	}
 	service := teamruntime.Service{Progress: creationprogress.FromEnvironment(), Store: store, ExpectedReporterThread: *expectedMemberThread, Client: client, Workspace: *workspace, HostProfile: *hostProfile, Catalog: teamCatalog,
 		ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
-			models, err := client.ListModels(ctx)
+			models, err := catalog.ListModels(ctx)
 			if err != nil {
 				return fmt.Errorf("load live Codex models: %w", err)
 			}
@@ -741,7 +750,7 @@ func threadCommand(args []string) error {
 			"threadId": activities[0].ID, "cwd": activities[0].Cwd, "updatedAt": activities[0].UpdatedAt.Unix(),
 		})
 	case "models":
-		models, err := client.ListModels(ctx)
+		models, err := client.ModelsForDirectory(ctx, *cwd, filepath.Dir(filepath.Dir(*portalCommand)), "")
 		if err != nil {
 			return err
 		}
@@ -752,7 +761,7 @@ func threadCommand(args []string) error {
 		}
 		settings, err := client.ResolveForkSettings(ctx, *threadID, codex.ThreadSettings{
 			Model: *model, ReasoningEffort: *effort,
-		})
+		}, filepath.Dir(filepath.Dir(*portalCommand)))
 		if err != nil {
 			return err
 		}
@@ -783,7 +792,7 @@ func threadCommand(args []string) error {
 			if settings.Model == "" && settings.ReasoningEffort == "" {
 				return settings, nil
 			}
-			models, listErr := client.ListModels(ctx)
+			models, listErr := client.ModelsForDirectory(ctx, *cwd, filepath.Dir(filepath.Dir(*portalCommand)), "")
 			if listErr != nil {
 				return codex.ThreadSettings{}, fmt.Errorf("load Codex models: %w", listErr)
 			}

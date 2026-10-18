@@ -78,7 +78,7 @@ func (s *Server) startActivityMonitor() {
 		ClientInfo:    codex.ClientInfo{Name: "dev-workspace-observer", Title: "Workspace activity", Version: "0.1.0"},
 		ObserverOnly:  true, ActivityRecorder: recorder,
 		AllowImplicitResume: func(thread string) bool {
-			return !s.config.RecoverSessions || s.recoveryStore().AllowsImplicitResume(s.config.CodexSocket, thread)
+			return s.providerThreadResumeAllowed(thread) && (!s.config.RecoverSessions || s.recoveryStore().AllowsImplicitResume(s.config.CodexSocket, thread))
 		},
 	})
 	s.activity = &activityMonitor{server: s, observer: observer, recorder: recorder, workers: make(map[string]activityWorker)}

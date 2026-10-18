@@ -11,12 +11,9 @@ import (
 )
 
 func ProbeModels(ctx context.Context, p Provider, retained []string) error {
-	if _, err := ReadMetrics(ctx, p); err != nil {
-		return err
-	}
 	data, err := providerGET(ctx, p, "/models")
 	if err != nil {
-		return err
+		return &ProbeError{Code: "target_model_catalog_unavailable", Cause: err}
 	}
 	var response struct {
 		Data *[]struct {
@@ -24,7 +21,7 @@ func ProbeModels(ctx context.Context, p Provider, retained []string) error {
 		} `json:"data"`
 	}
 	if json.Unmarshal(data, &response) != nil || response.Data == nil {
-		return errors.New("provider model catalog is unavailable")
+		return &ProbeError{Code: "target_model_catalog_invalid"}
 	}
 	models := map[string]bool{}
 	for _, model := range *response.Data {
@@ -32,11 +29,21 @@ func ProbeModels(ctx context.Context, p Provider, retained []string) error {
 	}
 	for _, model := range retained {
 		if model == "" || !models[model] {
-			return errors.New("provider does not advertise every retained model")
+			return &ProbeError{Code: "target_model_unavailable", Model: model}
 		}
 	}
 	return nil
 }
+
+// ProbeError exposes only a stable reason and the operator-selected model.
+// Credential contents and HTTP endpoint details remain private.
+type ProbeError struct {
+	Code, Model string
+	Cause       error
+}
+
+func (e *ProbeError) Error() string { return e.Code }
+func (e *ProbeError) Unwrap() error { return e.Cause }
 
 func providerGET(ctx context.Context, p Provider, path string) ([]byte, error) {
 	if _, err := CredentialIdentity(p); err != nil {

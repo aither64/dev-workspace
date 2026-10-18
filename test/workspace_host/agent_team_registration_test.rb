@@ -3,6 +3,156 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_provider_plan_receipts_survive_managed_and_direct_host_inspection
+    Dir.mktmpdir do |directory|
+      _package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-10-18-provider-plan'
+      receipt = managed_portal_creation_receipt(workspace, slug, 'c' * 64, state: 'ready')
+      request = receipt.fetch('request')
+      request.delete('goal')
+      request.merge!('kind' => 'plan', 'provider' => 'openai', 'destinationSettings' => true,
+        'source' => '2026-10-18-source', 'sourceThreadId' => 'source-thread',
+        'sourceIdentity' => 'a' * 64, 'planTurnId' => 'plan-turn', 'planSha256' => 'b' * 64)
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      path = File.join(creations, "#{slug}.json")
+      write = lambda do
+        File.write(path, JSON.generate(receipt))
+        File.chmod(0o600, path)
+      end
+      [2, 3].each do |schema|
+        if schema == 3
+          receipt.delete('agentTeamBinding')
+          receipt.delete('agentTeamBindingDigest')
+          receipt['schema'] = 3
+          receipt['directTeam'] = {'id' => request.fetch('team'), 'name' => 'Solo', 'description' => 'Direct threads',
+            'catalogDigest' => request.fetch('catalogDigest'), 'teamDigest' => 'b' * 64,
+            'leadModel' => receipt.fetch('model'), 'leadEffort' => receipt.fetch('effort'), 'roles' => ['lead'], 'members' => []}
+        end
+        receipt['state'] = 'ready'
+        write.call
+        assert_empty host.send(:unfinished_portal_managed_creations, entry)
+        receipt['state'] = 'paused'
+        write.call
+        assert_equal ["#{entry.fetch('name')}/#{slug} (portal #{schema == 2 ? 'managed' : 'direct'} creation)"],
+          host.send(:unfinished_portal_managed_creations, entry)
+      end
+      request['destinationSettings'] = false
+      write.call
+      assert_raises(DevWorkspaceHost::Error) { host.send(:unfinished_portal_managed_creations, entry) }
+      request['destinationSettings'] = true
+      [nil, '../foreign'].each do |value|
+        request['provider'] = value
+        write.call
+        assert_raises(DevWorkspaceHost::Error) { host.send(:unfinished_portal_managed_creations, entry) }
+      end
+      request['provider'] = 'openai'
+      new_request = request.slice('slug', 'team', 'catalogDigest', 'provider', 'destinationSettings').merge('kind' => 'new', 'goal' => 'New request')
+      assert_equal false, host.send(:valid_portal_managed_creation_request?, new_request, slug)
+      new_request.delete('destinationSettings')
+      assert host.send(:valid_portal_managed_creation_request?, new_request, slug)
+    end
+  end
+
+  def test_creation_receipts_require_scoped_package_support_before_provider_state_exists
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-10-18-inherited-plan'
+      receipt = legacy_portal_creation_receipt(workspace, slug, 'c' * 64)
+      request = receipt.fetch('request')
+      request.delete('goal')
+      request.merge!('kind' => 'plan', 'destinationSettings' => true,
+        'source' => '2026-10-18-source', 'sourceThreadId' => 'source-thread',
+        'sourceIdentity' => 'a' * 64, 'planTurnId' => 'plan-turn', 'planSha256' => 'b' * 64)
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      path = File.join(creations, "#{slug}.json")
+      File.write(path, JSON.generate(receipt))
+      File.chmod(0o600, path)
+      refute File.exist?(host.send(:provider_state_path, entry))
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      original = JSON.parse(File.read(contract_path))
+      predecessor = original.reject { |key, _| %w[codexProviderScopedStateSchema codexProviderScopedTransitionPolicy].include?(key) }
+      File.write(contract_path, JSON.generate(predecessor))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+      File.write(contract_path, JSON.generate(original.merge('codexProviderScopedStateSchema' => 2, 'codexProviderScopedTransitionPolicy' => 1)))
+      host.send(:require_compatible_provider_state!, package)
+      request.delete('destinationSettings')
+      request['provider'] = 'openai'
+      File.write(path, JSON.generate(receipt))
+      File.write(contract_path, JSON.generate(predecessor))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+      request.delete('provider')
+      File.write(path, JSON.generate(receipt))
+      File.chmod(0o644, path) # The legacy schema-1 scan retains its original policy.
+      host.send(:require_compatible_provider_state!, package)
+    end
+  end
+
+  def test_provider_preparation_requires_scoped_package_support_before_creation
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      root = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}")
+      preparations = File.join(root, 'session-preparations')
+      FileUtils.mkdir_p(preparations, mode: 0o700)
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      input = {'rawPrompt' => 'Create scoped work', 'date' => '2026-10-18', 'customName' => '', 'uploadScope' => '', 'attachments' => []}
+      %w[team catalog model effort].each { |name| input[name] = {'present' => false, 'value' => ''} }
+      input['provider'] = 'openai'
+      snapshot = {'input' => input, 'goal' => 'Create scoped work'}
+      record = {'schema' => 1, 'workspace' => workspace, 'requestId' => id, 'inputVersion' => 1,
+        'receiptId' => 'b' * 64, 'attempt' => 1, 'state' => 'paused', 'phase' => 'naming',
+        'startedAt' => '2026-10-18T12:00:00Z', 'updatedAt' => '2026-10-18T12:00:00Z', 'snapshot' => snapshot}
+      path = File.join(preparations, "#{id}.json")
+      write = lambda do
+        record['inputDigest'] = Digest::SHA256.hexdigest(JSON.generate('version' => 1, 'input' => input))
+        record['snapshotDigest'] = Digest::SHA256.hexdigest(JSON.generate(snapshot))
+        File.write(path, JSON.generate(record))
+        File.chmod(0o600, path)
+      end
+      write.call
+      refute File.exist?(host.send(:provider_state_path, entry))
+      refute File.exist?(File.join(root, 'creations'))
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+      File.write(contract_path, JSON.generate(contract.merge('codexProviderScopedStateSchema' => 2, 'codexProviderScopedTransitionPolicy' => 1)))
+      host.send(:require_compatible_provider_state!, package)
+      input.delete('provider')
+      write.call
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:require_compatible_provider_state!, package)
+    end
+  end
+
+  def test_ready_cli_creation_provider_survives_host_lifecycle_inspection
+    with_scoped_provider_host do |host, entry|
+      slug = '2026-10-18-cli-provider'
+      directory = File.join(entry.fetch('root'), 'worktrees', '.locks')
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      path = File.join(directory, "#{slug}.creation.json")
+      journal = {'schema' => 1, 'slug' => slug, 'goal_sha256' => nil, 'run_codex' => true, 'state' => 'ready', 'provider' => 'openai'}
+      write = lambda do
+        File.write(path, JSON.generate(journal))
+        File.chmod(0o600, path)
+      end
+      write.call
+      assert_equal journal, host.send(:read_private_creation_journal!, path, slug)
+      host.send(:require_no_unfinished_lifecycle_operations!, [entry])
+      [nil, '', '../foreign'].each do |value|
+        journal['provider'] = value
+        write.call
+        assert_raises(DevWorkspaceHost::Error) { host.send(:read_private_creation_journal!, path, slug) }
+      end
+    end
+  end
+
   def test_portal_creation_notification_preference_survives_host_inspection
     Dir.mktmpdir do |directory|
       _package, entry, host = registration_host(directory)

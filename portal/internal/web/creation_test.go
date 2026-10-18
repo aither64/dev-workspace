@@ -698,6 +698,15 @@ func TestCreationRecoveryRequiresReceiptBoundCompletionAndExactSession(t *testin
 	}
 }
 
+func TestCreationPlanDestinationMarkerRetainsAcceptedRetryPolicy(t *testing.T) {
+	legacy := creationRequest{Kind: "plan", Slug: "2026-10-18-plan", Model: "source-model", Effort: "high"}
+	current := legacy
+	current.DestinationSettings = true
+	if !sameCreationRequest(legacy, current) || legacy.DestinationSettings {
+		t.Fatal("server-owned destination policy changed accepted request identity")
+	}
+}
+
 func TestCreationPlanSnapshotWaitsForMessageLockAndRejectsNewerPlan(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

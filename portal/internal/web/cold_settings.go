@@ -53,11 +53,11 @@ func (c recoveryConversationClient) UpdateThreadSettings(ctx context.Context, th
 		return codex.ThreadSettings{}, errors.New("select model and reasoning effort together")
 	}
 	settings := codex.ThreadSettings{Model: *update.Model, ReasoningEffort: *update.ReasoningEffort}
-	if err := c.server.validateModelSettings(ctx, settings, false); err != nil {
+	if err := c.server.validateModelSettings(ctx, settings, false, c.slug); err != nil {
 		return codex.ThreadSettings{}, err
 	}
 	if c.address != "" {
-		service, err := c.server.teamService()
+		service, err := c.server.teamService(c.slug)
 		if err != nil {
 			return codex.ThreadSettings{}, err
 		}

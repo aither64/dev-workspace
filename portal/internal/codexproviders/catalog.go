@@ -19,6 +19,14 @@ import (
 const DefaultCatalog = "/etc/dev-workspaces/codex-providers.json"
 
 var identifier = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+var operationID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var digestID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func threadIdentity(value string) bool {
+	return value != "" && len(value) <= 512 && !strings.ContainsAny(value, "\x00\t\r\n ")
+}
+
+func ValidID(value string) bool { return identifier.MatchString(value) }
 
 type Provider struct {
 	ID        string `json:"id"`
@@ -97,17 +105,22 @@ func (c Catalog) Find(id string) (Provider, error) {
 }
 
 type Operation struct {
-	ID             string   `json:"id"`
-	Target         string   `json:"target"`
-	CatalogDigest  string   `json:"catalogDigest"`
-	Phase          string   `json:"phase"`
-	Blockers       []string `json:"blockers"`
-	CreatedAt      string   `json:"createdAt"`
-	UpdatedAt      string   `json:"updatedAt"`
-	Snapshot       string   `json:"snapshot,omitempty"`
-	Message        string   `json:"message,omitempty"`
-	Stage          string   `json:"stage,omitempty"`
-	PreviousActive string   `json:"previousActive,omitempty"`
+	ID             string            `json:"id"`
+	Target         string            `json:"target"`
+	CatalogDigest  string            `json:"catalogDigest"`
+	Phase          string            `json:"phase"`
+	Blockers       []string          `json:"blockers"`
+	CreatedAt      string            `json:"createdAt"`
+	UpdatedAt      string            `json:"updatedAt"`
+	Snapshot       string            `json:"snapshot,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	Stage          string            `json:"stage,omitempty"`
+	PreviousActive string            `json:"previousActive,omitempty"`
+	Strategy       string            `json:"strategy,omitempty"`
+	Session        string            `json:"session,omitempty"`
+	Sessions       []string          `json:"sessions,omitempty"`
+	Inherit        bool              `json:"inherit,omitempty"`
+	Roots          map[string]string `json:"roots,omitempty"`
 }
 
 func (o *Operation) Reserved() bool {
@@ -122,11 +135,49 @@ type State struct {
 	Active    string                    `json:"active"`
 	Operation *Operation                `json:"operation,omitempty"`
 	Receipts  map[string]RequestReceipt `json:"receipts,omitempty"`
+	Sessions  map[string]Selection      `json:"sessions,omitempty"`
+}
+
+// Selection binds a session override to its exact retained root. During fresh
+// creation CreationID instead binds it to the CLI's durable creation incarnation.
+type Selection struct {
+	Provider     string `json:"provider"`
+	RootThreadID string `json:"rootThreadId,omitempty"`
+	CreationID   string `json:"creationId,omitempty"`
+}
+
+func (s State) Provider(slug, root string) string {
+	if selection, ok := s.Sessions[slug]; ok && root != "" && selection.RootThreadID == root {
+		return selection.Provider
+	}
+	return s.Active
+}
+
+// BlocksSession excludes only the requested session for scoped transitions.
+// Workspace-default changes preserve explicit overrides and fence new inherited
+// creations as well as the retained sessions inventoried by the worker.
+func (s State) BlocksSession(slug, root string) bool {
+	if !s.Operation.Reserved() {
+		return false
+	}
+	if s.Operation.Strategy != "scoped-v1" {
+		return true
+	}
+	if s.Operation.Session != "" {
+		return s.Operation.Session == slug
+	}
+	selection, explicit := s.Sessions[slug]
+	if explicit && root == "" && selection.RootThreadID == "" && selection.CreationID != "" {
+		return false
+	}
+	return !explicit || root == "" || selection.RootThreadID != root
 }
 
 type RequestReceipt struct {
 	Target        string `json:"target"`
 	CatalogDigest string `json:"catalogDigest"`
+	Session       string `json:"session,omitempty"`
+	Inherit       bool   `json:"inherit,omitempty"`
 }
 
 func StatePath(stateRoot, name string) (string, error) {
@@ -149,7 +200,7 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		return State{}, err
 	}
 	var state State
-	if decode(data, &state) != nil || state.Schema != 1 || state.Workspace != name || state.Root != root || state.Socket != socket {
+	if decode(data, &state) != nil || (state.Schema != 1 && state.Schema != 2) || state.Workspace != name || state.Root != root || state.Socket != socket {
 		return State{}, errors.New("Codex provider state does not match the registered workspace")
 	}
 	if _, err := catalog.Find(state.Active); err != nil {
@@ -159,18 +210,54 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		return State{}, errors.New("provider receipt retention exceeds bounds")
 	}
 	for id, receipt := range state.Receipts {
-		if len(id) != 36 || !identifier.MatchString(receipt.Target) || len(receipt.CatalogDigest) != 64 {
+		if !operationID.MatchString(id) || !identifier.MatchString(receipt.Target) || !digestID.MatchString(receipt.CatalogDigest) || (receipt.Session != "" && !identifier.MatchString(receipt.Session)) || receipt.Inherit && receipt.Session == "" {
 			return State{}, errors.New("invalid provider request receipt")
 		}
 	}
+	if len(state.Sessions) > 4096 || (state.Schema == 1 && len(state.Sessions) != 0) {
+		return State{}, errors.New("invalid session provider selections")
+	}
+	for slug, selection := range state.Sessions {
+		if !identifier.MatchString(slug) || selection.RootThreadID != "" && !threadIdentity(selection.RootThreadID) || selection.CreationID != "" && !digestID.MatchString(selection.CreationID) || selection.RootThreadID == "" && selection.CreationID == "" {
+			return State{}, errors.New("invalid session provider selection identity")
+		}
+		if _, err := catalog.Find(selection.Provider); err != nil {
+			return State{}, err
+		}
+	}
 	if o := state.Operation; o != nil {
-		if !identifier.MatchString(o.Target) || len(o.ID) != 36 || len(o.CatalogDigest) != 64 {
+		if !identifier.MatchString(o.Target) || !operationID.MatchString(o.ID) || !digestID.MatchString(o.CatalogDigest) {
 			return State{}, errors.New("invalid provider operation identity")
 		}
 		switch o.Phase {
 		case "waiting", "applying", "applied", "canceled", "failed", "recovery-required":
 		default:
 			return State{}, errors.New("invalid provider operation phase")
+		}
+		if o.Strategy != "" && (state.Schema != 2 || o.Strategy != "scoped-v1" || (o.Session != "" && !identifier.MatchString(o.Session))) {
+			return State{}, errors.New("unsupported scoped provider operation")
+		}
+
+		if o.Strategy == "scoped-v1" {
+			switch o.Stage {
+			case "accepted", "waiting-creation", "waiting-package":
+				if o.Reserved() {
+					return State{}, errors.New("invalid reserved provider stage")
+				}
+			case "quiescing", "preparing", "switching", "resuming", "restoring-terminals":
+			default:
+				return State{}, errors.New("invalid scoped provider stage")
+			}
+			if len(o.Sessions) > 4096 || len(o.Roots) != len(o.Sessions) || o.Inherit && o.Session == "" || o.Session != "" && (len(o.Sessions) != 1 || o.Sessions[0] != o.Session) {
+				return State{}, errors.New("invalid scoped provider roots")
+			}
+			seen := map[string]bool{}
+			for _, slug := range o.Sessions {
+				if !identifier.MatchString(slug) || seen[slug] || !threadIdentity(o.Roots[slug]) {
+					return State{}, errors.New("invalid scoped provider scope")
+				}
+				seen[slug] = true
+			}
 		}
 	}
 	return state, nil

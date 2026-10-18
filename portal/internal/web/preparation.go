@@ -231,7 +231,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 func preparationCreationRequest(record sessionPreparation) creationRequest {
 	input := record.Snapshot.Input
 	request := creationRequest{BrowserNotificationsEnabled: input.BrowserNotificationsEnabled, Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
-		Model: strings.TrimSpace(input.Model.Value), Effort: strings.TrimSpace(input.Effort.Value)}
+		Model: strings.TrimSpace(input.Model.Value), Effort: strings.TrimSpace(input.Effort.Value), Provider: input.Provider}
 	if record.Snapshot.Preset != nil {
 		request.Team, request.CatalogDigest = record.Snapshot.Preset.ID, record.Snapshot.Preset.CatalogDigest
 		request.directTeam = record.Snapshot.Preset
@@ -321,7 +321,7 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 	}
 	input = preparationInput{Sensitive: r.FormValue("sensitive") == "true", RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
 		UploadScope: r.FormValue("uploadScope"), Attachments: append([]string{}, r.Form["attachmentIds"]...),
-		Team: present("team"), Catalog: present("catalogDigest"), Model: present("model"), Effort: present("effort")}
+		Team: present("team"), Catalog: present("catalogDigest"), Model: present("model"), Effort: present("effort"), Provider: r.FormValue("provider")}
 	if value, found := r.Form["browserNotificationsEnabled"]; found {
 		if len(value) != 1 || (value[0] != "true" && value[0] != "false") {
 			return "", input, errors.New("invalid browser notification preference")
@@ -335,6 +335,10 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	id, input, err := preparationForm(r)
 	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.validateCreationProvider(input.Provider); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}

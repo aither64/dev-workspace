@@ -274,18 +274,7 @@ func (s RecoveryStore) AllowsImplicitResume(socket, thread string) bool {
 	if err != nil {
 		return false
 	}
-	var candidates []string
-	if c := activeCatalog(s.Workspace); c != nil {
-		candidates, err = c.recoveryOwners(s, thread)
-	} else {
-		var owners map[string][]string
-		owners, err = s.readOwners()
-		candidates = owners[thread]
-	}
-	if err != nil || len(candidates) != 1 {
-		return false
-	}
-	summary, err := Find(s.Workspace, candidates[0])
+	summary, err := s.ThreadOwner(thread)
 	if err != nil || summary.Archived || RequireRetainedReady(summary, socket) != nil {
 		return false
 	}
@@ -294,4 +283,23 @@ func (s RecoveryStore) AllowsImplicitResume(socket, thread string) bool {
 	}
 	record, err := s.Load(summary.Slug)
 	return err == nil && record.ThreadID == summary.Codex.ThreadID && record.SocketPath == socket && record.Active(thread, epoch)
+}
+
+// ThreadOwner resolves the retained execution index without native RPCs. It is
+// also used by reconnect admission while one provider scope is reserved.
+func (s RecoveryStore) ThreadOwner(thread string) (*Summary, error) {
+	var candidates []string
+	var err error
+	if c := activeCatalog(s.Workspace); c != nil {
+		candidates, err = c.recoveryOwners(s, thread)
+	} else {
+		var owners map[string][]string
+		owners, err = s.readOwners()
+		candidates = owners[thread]
+	}
+	if err != nil || len(candidates) != 1 {
+		return nil, errors.New("retained thread owner is unavailable or ambiguous")
+	}
+	summary, err := Find(s.Workspace, candidates[0])
+	return summary, err
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -128,6 +129,9 @@ func (s *Server) startRecovery() {
 				if summary.Archived || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != s.config.CodexSocket || time.Now().Before(backoff[summary.Slug]) {
 					continue
 				}
+				if s.requireProviderAdmission(summary.Slug) != nil {
+					continue
+				}
 				s.recoveryMu.Lock()
 				previous := s.recoveryOperations[summary.Slug]
 				s.recoveryMu.Unlock()
@@ -233,6 +237,10 @@ func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summa
 }
 
 func (s *Server) restoreRuntime(ctx context.Context, slug string) {
+	if s.requireProviderAdmission(slug) != nil {
+		s.setRecoveryStatus(slug, recoveryStatus{})
+		return
+	}
 	lock := s.messageLock("recovery:" + slug)
 	if err := lock.Lock(ctx); err != nil {
 		return
@@ -241,6 +249,10 @@ func (s *Server) restoreRuntime(ctx context.Context, slug string) {
 	s.setRecoveryStatus(slug, recoveryStatus{State: "recovering"})
 	_, stderr, err := s.runDevSession(ctx, 90*time.Second, "resume", slug, "--as-is")
 	if err != nil {
+		if s.requireProviderAdmission(slug) != nil || strings.Contains(stderr, "provider transition is reserved") || strings.Contains(stderr, "this session is changing provider") {
+			s.setRecoveryStatus(slug, recoveryStatus{})
+			return
+		}
 		// An unavailable native endpoint or timeout is transient. Canonical
 		// identity/lifecycle refusals need an explicit Retry after repair.
 		_, socketErr := session.SocketIdentity(s.config.CodexSocket)
@@ -348,7 +360,7 @@ func (s *Server) recoveryPolicy(slug, root, address string) (codex.ThreadPolicy,
 		return codex.ThreadPolicy{}, err
 	}
 	if address != "" {
-		service, err := s.teamService()
+		service, err := s.teamService(slug)
 		if err != nil {
 			return codex.ThreadPolicy{}, err
 		}
@@ -387,7 +399,7 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 	}
 	settings := codex.ThreadSettings{Policy: policy}
 	if address != "" {
-		service, err := s.teamService()
+		service, err := s.teamService(slug)
 		if err != nil {
 			return err
 		}
@@ -412,7 +424,7 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 		if !ok {
 			return errors.New("activation with saved settings is unavailable")
 		}
-		if err := s.validateModelSettings(ctx, settings, false); err != nil {
+		if err := s.validateModelSettings(ctx, settings, false, slug); err != nil {
 			return err
 		}
 		if err := activator.ActivateThreadWithSettings(ctx, thread, settings); err != nil {

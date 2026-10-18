@@ -121,7 +121,7 @@ func (s *Server) resolveManagedCreation(_ context.Context, request creationReque
 		if s.config.Codex == nil {
 			return creationRequest{}, errors.New("Codex model catalog is unavailable")
 		}
-		models, err := s.config.Codex.ListModels(context.Background())
+		models, err := s.modelsForSession(context.Background(), "", request.Provider)
 		if err != nil {
 			return creationRequest{}, fmt.Errorf("load Codex models: %w", err)
 		}
@@ -412,6 +412,9 @@ func sameCreationRequest(left, right creationRequest) bool {
 	left.BrowserNotificationsEnabled, right.BrowserNotificationsEnabled = nil, nil
 	left.directTeam = nil
 	right.directTeam = nil
+	// This server-owned marker fixes semantics at initial acceptance; a retry
+	// after an upgrade must still recover the original receipt and its policy.
+	left.DestinationSettings, right.DestinationSettings = false, false
 	left.teamSubmitted, left.digestSubmitted, left.modelSubmitted, left.effortSubmitted = false, false, false, false
 	right.teamSubmitted, right.digestSubmitted, right.modelSubmitted, right.effortSubmitted = false, false, false, false
 	return left == right
@@ -927,16 +930,26 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 				if transcript.Status == "active" || transcript.CollaborationMode != "plan" {
 					return fmt.Errorf("%w: the source conversation is no longer ready to implement this plan", errStaleSourcePlan)
 				}
-				if receipt.Schema == 1 && request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
+				if receipt.Schema == 1 && !request.DestinationSettings && request.Model != "" && (transcript.Model != request.Model || transcript.ReasoningEffort != request.Effort) {
 					return errors.New("source model settings changed; review the plan before implementing it")
 				}
 				receipt.Goal = planCreationGoal(request.Source, plan.Text)
-				if receipt.Schema == 1 {
+				if receipt.Schema == 1 && !request.DestinationSettings {
 					receipt.Model = transcript.Model
 					receipt.Effort = transcript.ReasoningEffort
+				} else if receipt.Schema == 1 {
+					models, err := s.modelsForSession(ctx, "", request.Provider)
+					if err != nil {
+						return err
+					}
+					settings, err := workspacecodex.ResolveNewThreadSettings(models, codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort})
+					if err != nil {
+						return err
+					}
+					receipt.Model, receipt.Effort = settings.Model, settings.ReasoningEffort
 				}
 			} else {
-				models, err := s.config.Codex.ListModels(ctx)
+				models, err := s.modelsForSession(ctx, "", request.Provider)
 				if err != nil {
 					return err
 				}
@@ -962,7 +975,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 				if s.config.Codex == nil {
 					return errors.New("Codex model catalog is unavailable")
 				}
-				models, err := s.config.Codex.ListModels(ctx)
+				models, err := s.modelsForSession(ctx, "", request.Provider)
 				if err != nil {
 					return err
 				}
@@ -979,7 +992,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		if request.Kind != "fork" && (receipt.Goal == "" || len(receipt.Goal) > session.MaxMessageBytes) {
 			return errors.New("initial request is too large or empty")
 		}
-		if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, true); err != nil {
+		if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, true, "", request.Provider); err != nil {
 			return err
 		}
 		receipt.Validated = true
@@ -996,7 +1009,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	allowCapturedDefault := request.Kind == "new" &&
 		request.Model == "" && request.Effort == "" &&
 		receipt.Model == "" && receipt.Effort == ""
-	if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, allowCapturedDefault); err != nil {
+	if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, allowCapturedDefault, "", request.Provider); err != nil {
 		return err
 	}
 	args := []string{}
@@ -1036,6 +1049,9 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	}
 	if receipt.Effort != "" {
 		args = append(args, "--effort", receipt.Effort)
+	}
+	if request.Provider != "" {
+		args = append(args, "--provider", request.Provider)
 	}
 	args = append(args, "--creation-receipt-id", receipt.ReceiptID, "--creation-evidence", s.creationEvidencePath(*receipt))
 	if request.Source != "" {

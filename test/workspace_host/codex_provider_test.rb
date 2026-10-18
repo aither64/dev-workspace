@@ -155,6 +155,7 @@ class WorkspaceHostTest
       host.send(:provider_locked, entry) do
         state = host.send(:provider_state, entry)
         state['operation']['phase'] = 'applying'
+        state['operation']['stage'] = 'quiescing'
         host.send(:provider_write_state, entry, state)
       end
       assert_raises(DevWorkspaceHost::Error) { host.send(:provider_command, ['cancel', 'example', identity]) }
@@ -162,10 +163,10 @@ class WorkspaceHostTest
     end
   end
 
-  def test_waiting_provider_request_does_not_take_exclusive_transition_lock
+  def test_legacy_waiting_provider_request_does_not_take_exclusive_transition_lock
     with_provider_host do |host, entry|
       identity = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', identity])
+      host.send(:legacy_provider_command, ['request', 'example', 'pool', identity])
       host.idle_blockers = ['A thread has an active goal.']
       host.cancel_on_sleep = ['example', identity]
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
@@ -202,7 +203,7 @@ class WorkspaceHostTest
   def test_recovery_before_daemon_stop_leaves_native_work_running
     with_provider_host do |host, entry|
       identity = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', identity])
+      host.send(:legacy_provider_command, ['request', 'example', 'pool', identity])
       state = host.send(:provider_state, entry)
       snapshot = File.join(host.send(:provider_directory, entry), "#{identity}.snapshot.json")
       host.send(:atomic_private_file, snapshot, JSON.generate('schema' => 1, 'threads' => []))
@@ -237,13 +238,13 @@ class WorkspaceHostTest
   def test_worker_observes_request_accepted_after_its_terminal_observation
     with_provider_host do |host, entry|
       first, second = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-      host.send(:provider_command, ['request', 'example', 'openai', first])
+      host.send(:legacy_provider_command, ['request', 'example', 'openai', first])
       observed = false
       host.idle_blockers = ['Still busy.']
       host.on_pause = lambda do
         unless observed
           observed = true
-          host.send(:provider_command, ['request', 'example', 'pool', second])
+          host.send(:legacy_provider_command, ['request', 'example', 'pool', second])
           next
         end
         assert_equal second, host.send(:provider_state, entry).dig('operation', 'id')
@@ -268,7 +269,7 @@ class WorkspaceHostTest
   def test_pre_stop_capture_refusal_leaves_daemon_and_terminals_untouched
     with_provider_host do |host, entry|
       id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', id])
+      host.send(:legacy_provider_command, ['request', 'example', 'pool', id])
       state = host.send(:provider_state, entry)
       snapshot = File.join(host.send(:provider_directory, entry), "#{id}.snapshot.json")
       host.send(:atomic_private_file, snapshot, JSON.generate('schema' => 1, 'threads' => []))
@@ -285,7 +286,7 @@ class WorkspaceHostTest
   def test_terminal_restoration_notice_survives_process_interruption
     with_provider_host do |host, entry|
       id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', id])
+      host.send(:legacy_provider_command, ['request', 'example', 'pool', id])
       state = host.send(:provider_state, entry)
       snapshot = File.join(host.send(:provider_directory, entry), "#{id}.snapshot.json")
       host.send(:atomic_private_file, snapshot, JSON.generate('schema' => 1, 'threads' => []))
@@ -393,7 +394,7 @@ class WorkspaceHostTest
 
   def prepare_diagnostic_apply(host, entry)
     id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    host.send(:provider_command, ['request', 'example', 'pool', id])
+    host.send(:legacy_provider_command, ['request', 'example', 'pool', id])
     state = host.send(:provider_state, entry)
     snapshot = File.join(host.send(:provider_directory, entry), "#{id}.snapshot.json")
     host.send(:atomic_private_file, snapshot, JSON.generate('schema' => 1, 'threads' => []))

@@ -200,7 +200,7 @@ module DevSession
       dev-session start <name-or-slug>
         [--as-is] [--new] [--attach] [--no-attach] [--no-codex]
         [--goal-file FILE] [--json] [--exclusive] [--team TEAM] [--sensitive]
-        [--model MODEL] [--effort EFFORT]
+        [--model MODEL] [--effort EFFORT] [--provider PROVIDER]
       dev-session fork <source-name-or-slug> <new-name-or-slug> [--as-is] [--json]
         [--model MODEL] [--effort EFFORT] [--sensitive]
       dev-session attach <name-or-slug> [--as-is]
@@ -860,6 +860,7 @@ module DevSession
       exclusive: false,
       model: nil,
       effort: nil,
+      provider: nil,
       allow_empty_thread: false,
       lifecycle_operation: nil,
       lifecycle_operation_id: nil,
@@ -872,6 +873,9 @@ module DevSession
       expected_source_thread: nil,
       expected_source_identity: nil
     )
+	  if provider && (!run_codex || !provider.match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/))
+	    raise Error, '--provider requires a configured provider and a new Codex session'
+	  end
 	  if [team, team_binding, team_preset].compact.length > 1
 		raise Error, '--team, --team-binding and --team-preset cannot be combined'
 	  end
@@ -955,7 +959,7 @@ module DevSession
 		elsif journal_exists && (team || direct_team)
 		  raise Error, 'agent team selection does not match the existing session creation'
 		elsif team
-		  direct_team = resolve_current_direct_team!(team, model:, effort:)
+		  direct_team = resolve_current_direct_team!(team, model:, effort:, provider:)
 		  model = direct_team.fetch('leadModel')
 		  effort = direct_team.fetch('leadEffort')
 		end
@@ -995,6 +999,7 @@ module DevSession
             run_codex:,
             model:,
             effort:,
+            provider:,
             team_binding:,
 			direct_team:,
             lifecycle_operation:
@@ -1027,6 +1032,11 @@ module DevSession
             validate_creation_tracking_files!(slug)
           end
           manifest = ensure_portal_manifest(slug, creation_journal:, tracking_only: !run_codex && creation_journal.nil?)
+          if run_codex && creation_journal&.fetch('state', nil) == 'creating'
+            prepare_provider_selection!(slug, creation_journal, creation_journal['provider'])
+          elsif provider
+            validate_retained_provider_selection!(slug, manifest, provider)
+          end
           if creation_journal&.fetch('preserve_tracking', false) &&
              manifest.dig('codex', 'thread_id').to_s.empty? &&
              manifest.dig('creation', 'goal_sha256').nil?
@@ -1735,7 +1745,11 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug)
           session = @tmux.session(slug)
           session = ensure_managed_session!(slug, session:) if session
-          quiesced = quiesce_and_require_idle!(slug, session)
+          quiesced = if WorkspaceProviderAdmission.scoped_pause?(@env, workspace, slug, @codex_socket)
+                       quiesce_native_client!(slug, session)
+                     else
+                       quiesce_and_require_idle!(slug, session)
+                     end
           @out.puts(quiesced ? "quiesced terminal: #{slug}" : "idle session: #{slug}")
         end
       end
@@ -3229,6 +3243,7 @@ module DevSession
       run_codex:,
       model:,
       effort:,
+      provider: nil,
       team_binding: nil,
 	  direct_team: nil,
       lifecycle_operation: nil
@@ -3264,6 +3279,7 @@ module DevSession
       expected['sensitive'] = true if sensitive_session?(slug)
       expected['model'] = model unless model.nil?
       expected['effort'] = effort unless effort.nil?
+      expected['provider'] = provider if provider
 	  if team_binding
 		expected['agent_team_binding'] = team_binding
 		expected['agent_team_binding_digest'] = binding_digest
@@ -3275,6 +3291,11 @@ module DevSession
         actual = read_private_json_object(
           path, 'creation journal', max_size: 64 * 1024, mode: 0o600
         )
+        if provider && provider != actual['provider']
+          raise Error, 'creation retry selected a different provider'
+        end
+        raise Error, 'invalid creation provider selection' unless valid_creation_provider?(actual)
+        expected['provider'] = actual['provider'] if actual.key?('provider')
         unless (actual['sensitive'] == true) == sensitive_session?(slug)
           raise Error, 'creation journal sensitivity changed'
         end
@@ -3449,6 +3470,8 @@ module DevSession
       creating = journal['state'] == 'creating'
       ready = journal['state'] == 'ready'
       required << 'sensitive' if sensitive_session?(slug)
+      required << 'provider' if journal.key?('provider')
+      raise Error, 'invalid creation provider selection' unless valid_creation_provider?(journal)
       expected_keys = creating ? required + ['tmux_identity'] : required
       binding = journal['agent_team_binding']
       binding_match = binding.is_a?(String) && AGENT_TEAM_BINDING_PATTERN.match(binding)
@@ -3493,6 +3516,8 @@ module DevSession
       creating = journal['state'] == 'creating'
       ready = journal['state'] == 'ready'
       required << 'sensitive' if sensitive_session?(slug)
+      required << 'provider' if journal.key?('provider')
+      raise Error, 'invalid creation provider selection' unless valid_creation_provider?(journal)
       expected_keys = creating ? required + ['tmux_identity'] : required
       unless journal.keys.sort == expected_keys.sort && journal['slug'] == slug &&
              journal['run_codex'] == true && (creating || ready) &&
@@ -3542,6 +3567,8 @@ module DevSession
 
       required = %w[schema slug goal_sha256 run_codex state model effort direct_team]
       required << 'sensitive' if sensitive_session?(slug)
+      required << 'provider' if journal.key?('provider')
+      raise Error, 'invalid creation provider selection' unless valid_creation_provider?(journal)
       unless journal.keys.sort == required.sort && journal['slug'] == slug &&
              journal['state'] == 'ready' && journal['run_codex'] == true &&
              journal['goal_sha256'].is_a?(String) && journal['goal_sha256'].match?(/\A[0-9a-f]{64}\z/) &&
@@ -3618,9 +3645,10 @@ module DevSession
       tracking = PRESERVED_JOURNAL_TRACKING_KEYS
       allowed = required + %w[
         model effort agent_team_binding agent_team_binding_digest
-        direct_team preserve_tracking tmux_identity sensitive
+        direct_team preserve_tracking tmux_identity sensitive provider
       ] + tracking
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
+      return false unless valid_creation_provider?(journal)
       return false unless (journal['sensitive'] == true) == sensitive_session?(slug)
       return false unless [1, 2, 3].include?(journal['schema']) && journal['slug'] == slug &&
                           journal['state'] == 'ready' &&
@@ -3679,8 +3707,9 @@ module DevSession
         schema slug goal_sha256 run_codex state preserve_tracking
         tracking_origin tracking_plan_sha256 tracking_state_sha256
       ]
-      allowed = required + %w[model effort tmux_identity sensitive]
+      allowed = required + %w[model effort tmux_identity sensitive provider]
       return false unless (required - journal.keys).empty? && (journal.keys - allowed).empty?
+      return false unless valid_creation_provider?(journal)
       return false unless journal['schema'] == 1 && journal['slug'] == slug &&
                           %w[creating ready].include?(journal['state']) &&
                           journal['preserve_tracking'] == true &&
@@ -3701,6 +3730,10 @@ module DevSession
         !journal.key?(key) ||
           valid_agent_team_persisted_scalar?(journal[key])
       end
+    end
+
+    def valid_creation_provider?(journal)
+      !journal.key?('provider') || journal['provider'].is_a?(String) && journal['provider'].match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/)
     end
 
     def valid_agent_team_persisted_scalar?(value)
@@ -4601,6 +4634,7 @@ module DevSession
         end
         File.rename(temporary, path)
         fsync_directory(File.dirname(path))
+        bind_provider_root!(slug, manifest)
       ensure
         File.unlink(temporary) if path_exists?(temporary)
       end
@@ -4917,7 +4951,9 @@ module DevSession
         'thread',
         'resolve-fork-settings',
         '--thread-id',
-        source_thread_id
+        source_thread_id,
+        '--workspace', workspace, '--user-state-root', @workspace_state_root,
+        '--portal-command', @portal_command.first
       ]
       command += ['--socket', @codex_socket] if @codex_socket
       command += ['--model', model] if model
@@ -4986,7 +5022,7 @@ module DevSession
 	# returned object is a complete snapshot, not a capability token: creation
 	# journals retain it verbatim so later package changes cannot alter staff,
 	# addresses, lead settings, or specialist settings during recovery.
-	def resolve_current_direct_team!(team, model: nil, effort: nil)
+	def resolve_current_direct_team!(team, model: nil, effort: nil, provider: nil)
 	  unless team.is_a?(String) && team.match?(SAFE_PART) && @portal_command && !@portal_command.empty?
 		raise Error, 'direct team selection requires the installed workspace portal'
 	  end
@@ -4996,6 +5032,8 @@ module DevSession
 	  portal = File.realpath(@portal_command.first)
 	  package = File.dirname(File.dirname(portal))
 	  command = [*@portal_command, 'team-preset', '--package-root', package, '--team', team]
+      command.concat(['--workspace', workspace]) if model || provider
+      command.concat(['--provider', provider]) if provider
 	  if model
 		command.concat(['--model', model, '--effort', effort])
 		command.concat(['--socket', @codex_socket]) if @codex_socket
@@ -5035,6 +5073,7 @@ module DevSession
 	  command = [
 		*@portal_command, 'team', 'apply-preset',
 		'--user-state-root', @workspace_state_root,
+        '--host-profile', @host_profile,
 		'--workspace', workspace,
 		'--session-slug', slug,
 		'--root-thread-id', root_thread_id,
@@ -5061,6 +5100,39 @@ module DevSession
         metadata['client_version'] = @codex_version
       end
       metadata
+    end
+
+    def prepare_provider_selection!(slug, journal, provider)
+      name = @env['DEV_WORKSPACE_NAME']
+      raise Error, 'provider selection requires a registered workspace' if provider && !name
+      return unless name
+      catalog = @env.fetch('DEV_WORKSPACES_CODEX_PROVIDERS', '/etc/dev-workspaces/codex-providers.json')
+      state = File.join(@workspace_state_root, 'providers', name, 'state.json')
+      return unless provider || File.file?(catalog) || File.file?(state)
+      @command_runner.capture([File.join(@host_profile, 'bin/workspace-host'), 'provider', 'bind-creation', name, slug, journal.fetch('tmux_identity'), *[provider].compact], env: @env)
+    end
+
+    def bind_provider_root!(slug, manifest)
+      name = @env['DEV_WORKSPACE_NAME']
+      root = manifest.dig('codex', 'thread_id')
+      return unless name && root && %w[creating ready].include?(manifest.dig('creation', 'state'))
+      state_path = File.join(@workspace_state_root, 'providers', name, 'state.json')
+      return unless File.file?(state_path)
+      state = JSON.parse(read_bounded_file(state_path, 'provider selection', max_size: 1024 * 1024))
+      selection = state.fetch('sessions', {})[slug]
+      return unless selection && selection['creationId'] && !selection['rootThreadId']
+      @command_runner.capture([File.join(@host_profile, 'bin/workspace-host'), 'provider', 'bind-root', name, slug, root], env: @env)
+    end
+
+    def validate_retained_provider_selection!(slug, manifest, provider)
+      name = @env['DEV_WORKSPACE_NAME']
+      raise Error, 'provider selection requires a registered workspace' unless name
+      path = File.join(@workspace_state_root, 'providers', name, 'state.json')
+      state = JSON.parse(read_bounded_file(path, 'provider selection', max_size: 1024 * 1024))
+      selection = state.fetch('sessions', {})[slug]
+      unless selection && selection['rootThreadId'] == manifest.dig('codex', 'thread_id') && selection['provider'] == provider
+        raise Error, 'use workspace-host provider request --session to change an existing provider selection'
+      end
     end
 
     def require_current_codex_provenance!(slug, manifest, thread_id)
@@ -7727,12 +7799,14 @@ module DevSession
     end
 
     def with_creation_lock(slug, &block)
+      WorkspaceProviderAdmission.with_creation(@env) do
       with_host_lock(
         session_lock_file(slug, kind: 'creation'),
         "development session creation lock for #{slug}",
         busy_message: "another dev-session command is creating or closing #{slug}",
         &block
       )
+      end
     end
 
     def with_slug_lock(slug, &block)
@@ -7744,6 +7818,9 @@ module DevSession
         wait: authority&.fetch('state', nil) == 'creating',
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|
+        unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
+          WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
+        end
         previous = @held_slug_lock
         @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
         block.call
@@ -7858,7 +7935,7 @@ module DevSession
 
         if launch_codex
           command = if codex_provenance_configured?
-                      (@codex_command_argv + native_provider_arguments).map(&:shellescape).join(' ')
+                      (@codex_command_argv + native_provider_arguments(slug)).map(&:shellescape).join(' ')
                     else
                       @codex_command.dup
                     end
@@ -8890,21 +8967,21 @@ module DevSession
     end
 
     def send_native_client_command(session)
-      command = (@codex_command_argv + native_provider_arguments).map(&:shellescape).join(' ')
+      command = (@codex_command_argv + native_provider_arguments(session.slug)).map(&:shellescape).join(' ')
       remote = "unix://#{session.codex_socket_path}"
       command = "#{command} --remote #{remote.shellescape} resume #{session.codex_thread_id.shellescape}"
       @tmux.run('send-keys', '-t', session.codex_pane_id, '-l', command)
       @tmux.run('send-keys', '-t', session.codex_pane_id, 'Enter')
     end
 
-    def native_provider_arguments
+    def native_provider_arguments(slug = nil)
       name = @env['DEV_WORKSPACE_NAME']
       return [] unless name
       catalog = @env.fetch('DEV_WORKSPACES_CODEX_PROVIDERS', '/etc/dev-workspaces/codex-providers.json')
       state = File.join(@workspace_state_root, 'providers', name, 'state.json')
       return [] unless File.exist?(catalog) || File.exist?(state)
       output, = @command_runner.capture(
-        [File.join(@host_profile, 'bin/workspace-host'), 'provider', 'native-args', name], env: @env
+        [File.join(@host_profile, 'bin/workspace-host'), 'provider', 'native-args', name, *[slug].compact], env: @env
       )
       raise Error, 'provider native arguments exceed bounds' if output.bytesize > 256 * 1024
       data = JSON.parse(output)
@@ -9404,6 +9481,7 @@ module DevSession
         parser_opts.on('--exclusive') { opts[:exclusive] = true }
         parser_opts.on('--model MODEL') { |value| opts[:model] = value }
         parser_opts.on('--effort EFFORT') { |value| opts[:effort] = value }
+        parser_opts.on('--provider PROVIDER') { |value| opts[:provider] = value }
 		parser_opts.on('--team TEAM') { |value| opts[:team] = value }
 		parser_opts.on('--team-binding TOKEN') { |value| opts[:team_binding] = value }
 		# Browser creation passes its accepted immutable snapshot through this

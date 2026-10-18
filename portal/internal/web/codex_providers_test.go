@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 func providerTestCatalog(t *testing.T, s *Server, endpoint string) {
@@ -95,5 +96,67 @@ func TestProviderReservationSurvivesCatalogRemoval(t *testing.T) {
 	}
 	if s.requireProviderAdmission() == nil {
 		t.Fatal("removed catalog hid existing reservation")
+	}
+}
+
+func TestScopedProviderPauseDoesNotLeaveAutomaticRecoveryFailed(t *testing.T) {
+	s := newTestServer(t)
+	defer s.Close()
+	directory := filepath.Join(s.config.Workspace, "work", "example")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"state.md": "---\nlifecycle: active\n---\n", "plan.md": "Scoped switch fixture\n"} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: thread-1\n  socket_path: " + s.config.CodexSocket + "\n  client_version: 0.163.0\n"
+	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Find(s.config.Workspace, "example"); err != nil {
+		t.Fatal(err)
+	}
+	providerTestCatalog(t, s, "http://127.0.0.1:1")
+	path, _ := codexproviders.StatePath(s.config.UserStateRoot, s.config.WorkspaceName)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	state := codexproviders.State{Schema: 2, Workspace: s.config.WorkspaceName, Root: s.config.Workspace, Socket: s.config.CodexSocket, Active: "pool", Operation: &codexproviders.Operation{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Target: "openai", CatalogDigest: strings.Repeat("a", 64), Phase: "applying", Strategy: "scoped-v1", Session: "example", Stage: "preparing", Sessions: []string{"example"}, Roots: map[string]string{"example": "thread-1"}}}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.restoreRuntime(context.Background(), "example")
+	s.recoveryMu.Lock()
+	status := s.recoveryOperations["example"]
+	s.recoveryMu.Unlock()
+	if status.State == "failed" || status.State == "recovering" {
+		t.Fatalf("provider pause poisoned ordinary recovery: %#v", status)
+	}
+}
+
+func TestCreationProviderSurvivesPreparationAndReceiptRestart(t *testing.T) {
+	s := newTestServer(t)
+	defer s.Close()
+	receipt := managedCreationReceiptForRestart(t, s, "new")
+	receipt.Request.Provider = "openai"
+	data, _ := json.Marshal(receipt)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCreationReceiptShape(raw); err != nil {
+		t.Fatal(err)
+	}
+	request := preparationCreationRequest(sessionPreparation{Slug: receipt.Request.Slug, Snapshot: &preparationSnapshot{Goal: receipt.Request.Goal, Input: preparationInput{Provider: "openai"}}})
+	if request.Provider != "openai" {
+		t.Fatal("provider selection lost at preparation handoff")
+	}
+	a, b := receipt.Request, receipt.Request
+	b.Provider = "pool"
+	if preparationDigest(a) == preparationDigest(b) {
+		t.Fatal("provider is absent from accepted creation identity")
 	}
 }

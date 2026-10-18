@@ -189,6 +189,7 @@ type Server struct {
 	codexLimitsWait        *codexLimitsCall
 	codexLimitsGeneration  uint64
 	providerLimits         map[string]*codexLimitsCall
+	providerModels         map[string]*providerModelsCall
 	codexResetMu           sync.Mutex
 	messageMu              sync.Mutex
 	messageLocks           map[string]conversation.MutationLocker
@@ -524,6 +525,7 @@ func New(config Config) (*Server, error) {
 	server.startUploadCollector()
 	server.startRecovery()
 	server.startActivityMonitor()
+	server.startProviderWatchRecovery()
 	server.startNotifications()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
@@ -747,6 +749,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.providerMutation(w, r, false)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/cancel":
 		s.providerMutation(w, r, true)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-providers/recover":
+		s.providerMutation(w, r, false)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/codex-limits/reset":
 		s.consumeCodexReset(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/collaboration-modes":
@@ -789,6 +793,10 @@ func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, slug
 	defer unlock()
 	if err := s.requireCurrentHostProfile(); err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err := s.requireProviderAdmission(slug); err != nil {
+		s.writeError(w, r, http.StatusConflict, err.Error())
 		return
 	}
 	mutate()
@@ -1455,7 +1463,11 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	_, teamSubmitted := r.Form["team"]
 	_, digestSubmitted := r.Form["catalogDigest"]
-	request := creationRequest{Sensitive: r.FormValue("sensitive") == "true", Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort}
+	request := creationRequest{Sensitive: r.FormValue("sensitive") == "true", Kind: "new", Slug: creationDate + "-" + name, Goal: goal, Model: model, Effort: effort, Provider: r.FormValue("provider")}
+	if err := s.validateCreationProvider(request.Provider); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
 	resolvedRequest, resolveErr := s.resolveManagedCreation(r.Context(), request, agentteams.CreationSelectionInput{
 		Team:            agentteams.StringPresence{Present: teamSubmitted, Value: team},
 		CatalogDigest:   agentteams.StringPresence{Present: digestSubmitted, Value: catalogDigest},
@@ -1569,7 +1581,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	models, err := s.config.Codex.ListModels(ctx)
+	models, err := s.modelsForSession(ctx, r.URL.Query().Get("session"), r.URL.Query().Get("provider"))
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -1621,7 +1633,7 @@ func (s *Server) validateCollaborationMode(ctx context.Context, requested string
 	return fmt.Errorf("Codex collaboration mode %q is not available", requested)
 }
 
-func (s *Server) validateModelSettings(ctx context.Context, settings codex.ThreadSettings, allowDefault bool) error {
+func (s *Server) validateModelSettings(ctx context.Context, settings codex.ThreadSettings, allowDefault bool, selection ...string) error {
 	if settings.Model == "" {
 		if settings.ReasoningEffort != "" || !allowDefault {
 			return errors.New("select a Codex model before choosing a reasoning effort")
@@ -1633,7 +1645,14 @@ func (s *Server) validateModelSettings(ctx context.Context, settings codex.Threa
 	}
 	lookupContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	models, err := s.config.Codex.ListModels(lookupContext)
+	slug, provider := "", ""
+	if len(selection) > 0 {
+		slug = selection[0]
+	}
+	if len(selection) > 1 {
+		provider = selection[1]
+	}
+	models, err := s.modelsForSession(lookupContext, slug, provider)
 	if err != nil {
 		return fmt.Errorf("load Codex models: %w", err)
 	}
@@ -2051,7 +2070,7 @@ func (s *Server) directTeamPresets() []teamruntime.Preset {
 	return presets
 }
 
-func (s *Server) teamService() (teamruntime.Service, error) {
+func (s *Server) teamService(slugs ...string) (teamruntime.Service, error) {
 	if s.config.UserStateRoot == "" || s.config.Codex == nil {
 		return teamruntime.Service{}, errors.New("team runtime is unavailable")
 	}
@@ -2064,7 +2083,7 @@ func (s *Server) teamService() (teamruntime.Service, error) {
 		return teamruntime.Service{}, err
 	}
 	service := teamruntime.Service{Store: store, Client: client, Workspace: s.config.Workspace, HostProfile: s.config.HostProfile, ValidateSettings: func(ctx context.Context, settings codex.ThreadSettings) error {
-		return s.validateModelSettings(ctx, settings, false)
+		return s.validateModelSettings(ctx, settings, false, slugs...)
 	}}
 	if s.installedTeams != nil && s.installedTeams.Managed {
 		service.Catalog = s.installedTeams.Catalog
@@ -2156,7 +2175,7 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "The portal can only assign work as lead."})
 		return
 	}
-	service, err := s.teamService()
+	service, err := s.teamService(summary.Slug)
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
@@ -2175,7 +2194,7 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 				return
 			}
 			if request.modelProvided {
-				if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}, false); err != nil {
+				if err := s.validateModelSettings(r.Context(), codex.ThreadSettings{Model: request.Model, ReasoningEffort: request.Effort}, false, summary.Slug); err != nil {
 					s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
 				}
@@ -2365,6 +2384,7 @@ func planDigest(text string) string {
 }
 
 type implementPlanRequest struct {
+	Provider                    string  `json:"provider,omitempty"`
 	Sensitive                   bool    `json:"sensitive,omitempty"`
 	PlanContextVersion          int     `json:"planContextVersion"`
 	PlanText                    string  `json:"planText"`
@@ -2408,7 +2428,7 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 		return
 	}
 	if strings.TrimSpace(body.Action) == "new" {
-		for _, field := range []string{"model", "reasoningEffort", "team", "catalogDigest"} {
+		for _, field := range []string{"model", "reasoningEffort", "team", "catalogDigest", "provider"} {
 			if value, ok := raw[field]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "managed creation fields must be omitted instead of null"})
 				return
@@ -2419,7 +2439,12 @@ func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		request := creationRequest{
+		if err := s.validateCreationProvider(body.Provider); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		request := creationRequest{Provider: body.Provider, DestinationSettings: true,
 			BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, Sensitive: body.Sensitive, Kind: "plan", Slug: destination, PlanTurnID: strings.TrimSpace(body.PlanTurnID),
 			PlanSHA256: strings.TrimSpace(body.PlanSHA256), PlanText: body.PlanText,
 		}
@@ -3413,6 +3438,9 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 // observation. Busy is governed by the requested operation; unknown submissions
 // or another same-CWD identity never authorize a write.
 func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *session.Summary) error {
+	if err := s.requireProviderAdmission(summary.Slug); err != nil {
+		return err
+	}
 	if summary.HasCreation() {
 		return nil
 	}
@@ -3434,7 +3462,7 @@ func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *s
 	if err != nil {
 		return err
 	}
-	service, err := s.teamService()
+	service, err := s.teamService(summary.Slug)
 	if err != nil {
 		return err
 	}
@@ -3551,7 +3579,7 @@ func (s *Server) resolveConversation(
 	conversationClient := conversation.Client(s.config.Codex)
 	threadID := summary.Codex.ThreadID
 	if address != "" {
-		service, serviceErr := s.teamService()
+		service, serviceErr := s.teamService(summary.Slug)
 		if serviceErr != nil {
 			return conversation.Target{}, serviceErr
 		}
@@ -3604,8 +3632,9 @@ func (s *Server) resolveConversation(
 	var once sync.Once
 	failed = false
 	return conversation.Target{
-		Attachments: attachments,
-		Client:      conversationClient, ThreadID: threadID, Directory: expectedCwd,
+		Attachments:  attachments,
+		ModelCatalog: func(ctx context.Context) ([]codex.Model, error) { return s.modelsForSession(ctx, slug, "") },
+		Client:       conversationClient, ThreadID: threadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(request.ID),
 		TransformTranscript: s.presentTranscript,
 		Activity:            s.activityProvider(),

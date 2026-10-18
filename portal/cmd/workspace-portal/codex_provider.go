@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -56,6 +58,10 @@ func codexProviderCommand(args []string) error {
 	catalogPath := flags.String("catalog", codexproviders.CatalogPath(), "operator catalog path")
 	snapshot := flags.String("snapshot", "", "private inventory file")
 	target := flags.String("target", "", "configured provider identity")
+	authority := flags.String("authority", "", "trusted session runtime authority directory")
+	operation := flags.String("operation", "", "durable provider operation identity")
+	scopes := flags.String("sessions", "", "trusted session scope")
+	roots := flags.String("roots", "", "accepted session root identities")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -89,6 +95,16 @@ func codexProviderCommand(args []string) error {
 	// No watches or automatic question answers are installed. Omit the ordinary
 	// routing resolver while inspecting or recovering a reserved operation.
 	defer client.Close()
+	if command == "models" {
+		models, err := client.ListModels(ctx)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(models)
+	}
+	if strings.HasPrefix(command, "scoped-") {
+		return scopedProviderCommand(ctx, client, command, *workspace, *stateRoot, *socket, *profile, *authority, *snapshot, *target, *operation, *scopes, *roots)
+	}
 	if command == "health" {
 		// Connect even when no retained threads were loaded before the restart.
 		var loaded struct {
@@ -122,6 +138,16 @@ func codexProviderCommand(args []string) error {
 		return errors.New("invalid provider snapshot")
 	}
 	if command == "preflight" {
+		var scope struct {
+			Operation string `json:"operation"`
+		}
+		_ = json.Unmarshal(data, &scope)
+		report := func(reason, thread string) {
+			if queueOperationID(scope.Operation) {
+				_ = providerAtomicJSON(*snapshot+".progress", scopedProviderProgress{Operation: scope.Operation, Stage: "checking-provider", Thread: thread, Total: len(inventory.Threads), UpdatedAt: time.Now().UTC().Format(time.RFC3339), Reason: reason})
+			}
+		}
+		report("", "")
 		catalog, err := codexproviders.ReadCatalog(*catalogPath)
 		if err != nil {
 			return err
@@ -136,22 +162,42 @@ func codexProviderCommand(args []string) error {
 		}
 		if provider.Kind == "codex-lb" {
 			if err := codexproviders.ProbeModels(ctx, provider, models); err != nil {
+				var probe *codexproviders.ProbeError
+				if errors.As(err, &probe) {
+					report(probe.Code, "")
+				} else {
+					report("target_provider_unavailable", "")
+				}
 				return err
 			}
 		} else {
-			limits, err := client.ReadAccountRateLimits(ctx)
-			if err != nil {
-				return err
-			}
-			if limits.AccountID == nil || *limits.AccountID == "" {
-				return errors.New("subscription authentication could not be verified")
+			if queueOperationID(scope.Operation) {
+				var account struct {
+					Account *struct {
+						Type string `json:"type"`
+					} `json:"account"`
+				}
+				if err := client.Request(ctx, "account/read", map[string]any{"refreshToken": false}, &account); err != nil || account.Account == nil || account.Account.Type != "chatgpt" {
+					report("subscription_authentication_unavailable", "")
+					return errors.New("subscription authentication could not be verified")
+				}
+			} else {
+				limits, err := client.ReadAccountRateLimits(ctx)
+				if err != nil {
+					return err
+				}
+				if limits.AccountID == nil || *limits.AccountID == "" {
+					return errors.New("subscription authentication could not be verified")
+				}
 			}
 			available, err := client.ListModels(ctx)
 			if err != nil {
+				report("target_model_catalog_unavailable", "")
 				return err
 			}
 			for _, thread := range inventory.Threads {
 				if _, err := workspacecodex.ResolveNewThreadSettings(available, thread.Settings); err != nil {
+					report("target_model_or_effort_unavailable", thread.ID)
 					return err
 				}
 			}
@@ -163,7 +209,7 @@ func codexProviderCommand(args []string) error {
 			thread := &inventory.Threads[index]
 			var original map[string]any
 			params := map[string]any{"threadId": thread.ID, "excludeTurns": true, "model": thread.Settings.Model, "config": map[string]any{"model_reasoning_effort": thread.Settings.ReasoningEffort}}
-			metadata, err := client.ReadThreadMetadata(ctx, thread.ID, false)
+			metadata, err := client.ReadThreadMetadata(ctx, thread.ID, true)
 			if err != nil {
 				return err
 			}
@@ -274,10 +320,31 @@ func codexProviderCommand(args []string) error {
 }
 
 func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, workspace, stateRoot, socket, profile string) (providerInventory, error) {
+	return buildProviderInventoryScope(ctx, client, workspace, stateRoot, socket, profile, nil)
+}
+
+func buildProviderInventoryScope(ctx context.Context, client *workspacecodex.Client, workspace, stateRoot, socket, profile string, scope map[string]bool) (providerInventory, error) {
 	result := providerInventory{Schema: 1, Workspace: workspace, Threads: []providerThread{}, Loaded: []string{}, Blockers: []string{}}
-	summaries, err := session.List(workspace)
-	if err != nil {
-		return result, err
+	var summaries []session.Summary
+	if scope == nil {
+		var err error
+		summaries, err = session.List(workspace)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		slugs := make([]string, 0, len(scope))
+		for slug := range scope {
+			slugs = append(slugs, slug)
+		}
+		sort.Strings(slugs)
+		for _, slug := range slugs {
+			summary, err := session.Find(workspace, slug)
+			if err != nil || summary.Archived {
+				return result, errors.New("scoped provider session is unavailable")
+			}
+			summaries = append(summaries, *summary)
+		}
 	}
 	store, err := teamruntime.NewStore(stateRoot, workspace)
 	if err != nil {
@@ -300,22 +367,24 @@ func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, 
 			return errors.New("provider inventory contains an ambiguous thread identity")
 		}
 		seen[thread.ID] = true
-		metadata, err := client.ReadThreadMetadata(ctx, thread.ID, false)
+		metadata, err := client.ReadThreadMetadata(ctx, thread.ID, true)
 		if err != nil {
 			return err
 		}
 		if metadata.ID != thread.ID || metadata.Cwd != thread.Cwd || metadata.Source != "vscode" || metadata.Path == nil {
 			return errors.New("provider thread ownership or materialization is unproved")
 		}
-		if err := client.RequireThreadIdle(ctx, thread.ID, thread.Cwd); err != nil {
-			result.Blockers = append(result.Blockers, thread.Slug+": thread has active or unresolved work")
-		}
-		goal, err := client.HasActiveGoal(ctx, thread.ID)
-		if err != nil {
-			return err
-		}
-		if goal {
-			result.Blockers = append(result.Blockers, thread.Slug+": thread has an active goal")
+		if scope == nil {
+			if err := client.RequireThreadIdle(ctx, thread.ID, thread.Cwd); err != nil {
+				result.Blockers = append(result.Blockers, thread.Slug+": thread has active or unresolved work")
+			}
+			goal, err := client.HasActiveGoal(ctx, thread.ID)
+			if err != nil {
+				return err
+			}
+			if goal {
+				result.Blockers = append(result.Blockers, thread.Slug+": thread has an active goal")
+			}
 		}
 		if thread.Settings.Model == "" {
 			settings, err := client.ReadThreadSettings(ctx, thread.ID)
@@ -329,6 +398,9 @@ func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, 
 		return nil
 	}
 	for _, summary := range summaries {
+		if scope != nil && !scope[summary.Slug] {
+			continue
+		}
 		if summary.Archived || summary.Codex.ThreadID == "" {
 			continue
 		}
@@ -382,7 +454,7 @@ func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, 
 	}
 	for _, id := range *loaded.Data {
 		result.Loaded = append(result.Loaded, id)
-		if !seen[id] {
+		if scope == nil && !seen[id] {
 			result.Blockers = append(result.Blockers, "an unmanaged native thread is loaded")
 		}
 	}

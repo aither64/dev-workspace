@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -47,6 +48,7 @@ type preparationInput struct {
 	Model                       preparationValue `json:"model"`
 	Effort                      preparationValue `json:"effort"`
 	BrowserNotificationsEnabled *bool            `json:"browserNotificationsEnabled,omitempty"`
+	Provider                    string           `json:"provider,omitempty"`
 }
 
 type preparationSnapshot struct {
@@ -149,6 +151,9 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 		return errors.New("preparation snapshot digest mismatch")
 	}
 	input := record.Snapshot.Input
+	if input.Provider != "" && !codexproviders.ValidID(input.Provider) {
+		return errors.New("preparation has an invalid provider")
+	}
 	if !utf8.ValidString(input.RawPrompt) || len(input.RawPrompt) > session.MaxMessageBytes || len(input.Attachments) > uploads.DefaultPromptFiles ||
 		(strings.TrimSpace(input.RawPrompt) == "" && len(input.Attachments) == 0) {
 		return errors.New("invalid preparation prompt")

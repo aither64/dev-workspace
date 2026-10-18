@@ -353,6 +353,8 @@ buildGoModule {
     ln -s ../workspace-coordination-timing.rb "$out/libexec/workspace-portal/workspace-coordination-timing.rb"
     install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
       "$out/libexec/workspace-codex-providers.rb"
+    install -Dm644 ${src}/libexec/workspace-provider-sessions.rb \
+      "$out/libexec/workspace-provider-sessions.rb"
     install -Dm644 ${src}/libexec/workspace-provider-admission.rb \
       "$out/libexec/workspace-provider-admission.rb"
     ln -s ../workspace-provider-admission.rb \

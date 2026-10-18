@@ -9,7 +9,7 @@ module DevWorkspaceHost
     PROVIDER_OPERATION_ID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
     PROVIDER_ID = /\A[a-z0-9][a-z0-9_-]{0,62}\z/
 
-    def provider_command(argv)
+    def legacy_provider_command(argv)
       action = argv.shift
       name = argv.shift
       entry = registry.find(name.to_s)
@@ -120,19 +120,34 @@ module DevWorkspaceHost
         }
       end
       data = JSON.parse(read_private_json_file!(path, 'workspace provider state', maximum: 1024 * 1024))
-      unless data.is_a?(Hash) && (data.keys - %w[schema workspace root socket active operation receipts]).empty? &&
-             data['schema'] == 1 && data['workspace'] == entry.fetch('name') &&
+      unless data.is_a?(Hash) && (data.keys - %w[schema workspace root socket active operation receipts sessions]).empty? &&
+             [1, 2].include?(data['schema']) && data['workspace'] == entry.fetch('name') &&
              data['root'] == entry.fetch('root') && data['socket'] == instance_runtime(entry).fetch(:codex) &&
              data['active'].is_a?(String) && data['active'].match?(PROVIDER_ID)
         raise Error, 'workspace provider state has a different ownership identity'
       end
       if (receipts = data['receipts'])
         unless receipts.is_a?(Hash) && receipts.length <= 2048 && receipts.all? { |id, receipt|
-          id.match?(PROVIDER_OPERATION_ID) && receipt.is_a?(Hash) && receipt.keys.sort == %w[catalogDigest target] &&
+          id.match?(PROVIDER_OPERATION_ID) && receipt.is_a?(Hash) && (receipt.keys - %w[catalogDigest target session inherit]).empty? &&
+            (!receipt.key?('inherit') || [true, false].include?(receipt['inherit']) && (!receipt['inherit'] || receipt['session'])) &&
+            (!receipt.key?('session') || receipt['session'].is_a?(String) && receipt['session'].match?(PROVIDER_ID)) &&
             receipt['target'].is_a?(String) && receipt['target'].match?(PROVIDER_ID) &&
             receipt['catalogDigest'].is_a?(String) && receipt['catalogDigest'].match?(SHA256_HEX)
         }
           raise Error, 'workspace provider request receipts are invalid'
+        end
+      end
+      if data['sessions']
+        unless data['schema'] == 2 && data['sessions'].is_a?(Hash) && data['sessions'].length <= 4096 &&
+               data['sessions'].all? { |slug, selection|
+                 slug.match?(PROVIDER_ID) && selection.is_a?(Hash) &&
+                   (selection.keys - %w[provider rootThreadId creationId]).empty? &&
+                   selection['provider'].is_a?(String) && selection['provider'].match?(PROVIDER_ID) &&
+                   (!selection.key?('rootThreadId') || provider_thread_identity?(selection['rootThreadId'])) &&
+                   (!selection.key?('creationId') || selection['creationId'].is_a?(String) && selection['creationId'].match?(SHA256_HEX)) &&
+                   (selection.key?('rootThreadId') || selection.key?('creationId'))
+               }
+          raise Error, 'invalid session provider selections'
         end
       end
       if (operation = data['operation'])
@@ -140,6 +155,7 @@ module DevWorkspaceHost
                %w[waiting applying applied canceled failed recovery-required].include?(operation['phase'])
           raise Error, 'workspace provider operation is invalid'
         end
+        validate_scoped_provider_operation!(data) if operation['strategy']
       end
       data
     end
@@ -157,7 +173,8 @@ module DevWorkspaceHost
         'providers' => catalog.fetch('catalog').fetch('providers').map { |p| p.slice('id', 'label', 'kind') },
         'active' => state.fetch('active')
       }
-      result['operation'] = state.fetch('operation').slice('id', 'target', 'phase', 'blockers', 'message') if state['operation']
+      result['operation'] = provider_operation_view(entry, state.fetch('operation')) if state['operation']
+      result['sessions'] = state.fetch('sessions', {}).transform_values { |selection| selection.slice('provider', 'rootThreadId') }
       result
     end
 
@@ -179,10 +196,17 @@ module DevWorkspaceHost
     end
 
     def require_compatible_provider_state!(package)
-      return unless registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) }
+      scoped_creations = registry.entries.any? { |entry| portal_creations_require_scoped_provider?(entry) }
+      return unless scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) }
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       data = JSON.parse(File.binread(path, 64 * 1024 + 1))
-      unless data['codexProviderStateSchema'] == 1 && data['codexProviderTransitionPolicy'] == 1
+      required = scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) && provider_state(entry)['schema'] == 2 } ? 2 : 1
+      supported = if required == 2
+                    data['codexProviderScopedStateSchema'] == 2 && data['codexProviderScopedTransitionPolicy'] == 1
+                  else
+                    data['codexProviderStateSchema'] == 1 && data['codexProviderTransitionPolicy'] == 1
+                  end
+      unless supported
         raise Error, 'target workspace package cannot load retained Codex provider state'
       end
     rescue JSON::ParserError, SystemCallError
@@ -328,8 +352,9 @@ module DevWorkspaceHost
         raise Error, 'provider terminal snapshot ownership changed'
       end
       keys = %w[id name mark slug workspace environment_slug socket_path codex_thread_id codex_socket_path codex_client_version codex_pane_id identity_token]
-      data.fetch('terminals').each do |record|
+      data.fetch('terminals').each_with_index do |record, index|
         session = record.fetch('session')
+        yield session.fetch('slug'), index, data.fetch('terminals').length if block_given?
         unless session.keys.sort == keys.sort && session.fetch('id').match?(/\A\$[0-9]+\z/) &&
                session.fetch('workspace') == entry.fetch('root') && session.fetch('socket_path') == runtime.fetch(:tmux)
           raise Error, 'invalid retained terminal identity'
@@ -340,7 +365,7 @@ module DevWorkspaceHost
         end
         actual = capture!('tmux', '-S', runtime.fetch(:tmux), 'display-message', '-p', '-t', "#{session.fetch('id')}:", '-F', RUNTIME_CONTRACT.fetch('tmuxMetadata').fetch('authorityFormat').join("\t")).chomp.split("\t", -1)
         raise Error, 'retained terminal ownership changed' unless actual == keys.map { |key| session.fetch(key).to_s }
-        restore_quiesced_sessions([[entry, session.fetch('slug')]])
+        restore_quiesced_sessions([[entry, session.fetch('slug')]], provider_terminal_snapshot: path)
       end
     end
 
@@ -350,6 +375,23 @@ module DevWorkspaceHost
         state = provider_state(entry)
         operation = state['operation']
         unless operation && %w[waiting applying recovery-required].include?(operation.fetch('phase'))
+          provider_worker_pause
+          next
+        end
+        if operation['strategy'] == 'scoped-v1'
+          begin
+            with_current_generation_lock(mode: File::LOCK_SH | File::LOCK_NB) { provider_run_scoped(entry) }
+          rescue Error => error
+            raise unless error.message == 'workspace package transition is in progress; retry shortly'
+            provider_locked(entry) do
+              current = provider_state(entry)
+              if current.dig('operation', 'id') == operation['id'] && current.dig('operation', 'phase') == 'waiting'
+                current['operation']['stage'] = 'waiting-package'
+                current['operation']['blockers'] = ['A workspace package update is running. The provider switch will start when it finishes.']
+                provider_write_state(entry, current)
+              end
+            end
+          end
           provider_worker_pause
           next
         end
@@ -438,16 +480,16 @@ module DevWorkspaceHost
       end
     end
 
-    def provider_worker_pause = sleep(5)
+    def provider_worker_pause = sleep(0.5)
 
-    def provider_private_server(entry, provider)
+    def provider_private_server(entry, provider, process_group: true)
       Dir.mktmpdir('workspace-provider-', instance_runtime(entry).fetch(:root)) do |directory|
         socket = File.join(directory, 'app-server.sock')
         plan = registration_plan_for(entry, package: package_root)
         pid = Process.spawn(
           File.realpath(active_codex), *plan.argv, *provider_argv(entry, selected: provider),
           'app-server', '--listen', "unix://#{socket}",
-          out: File::NULL, err: File::NULL, pgroup: true
+          out: File::NULL, err: File::NULL, pgroup: process_group
         )
         begin
           deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
@@ -458,7 +500,7 @@ module DevWorkspaceHost
           end
           yield socket
         ensure
-          Process.kill('TERM', -pid) rescue nil
+          Process.kill('TERM', process_group ? -pid : pid) rescue nil
           Process.waitpid(pid) rescue nil
         end
       end
@@ -654,8 +696,14 @@ module DevWorkspaceHost
         readiness[:mainPID] = properties['MainPID'].to_i if properties['MainPID'].to_s.match?(/\A[0-9]{1,10}\z/)
         readiness[:activeState] = properties['ActiveState'] if %w[active activating inactive deactivating failed reloading maintenance refreshing].include?(properties['ActiveState'])
         raise Error, 'shared native App Server exited during startup' unless %w[active activating].include?(properties['ActiveState']) && properties['MainPID'].to_i.positive?
-        readiness[:executableMatch] = provider_process_binary(properties.fetch('MainPID').to_i) == provider_native_binary
-        if readiness[:executableMatch] && (readiness[:socketPresent] = File.socket?(socket))
+        begin
+          readiness[:executableMatch] = provider_process_binary(properties.fetch('MainPID').to_i) == provider_native_binary
+        rescue Errno::EACCES, Errno::ENOENT
+          # A freshly execing service can transiently deny /proc/PID/exe.
+          # Keep the bounded deadline and require the exact executable later.
+          readiness[:executableMatch] = 'unavailable'
+        end
+        if readiness[:executableMatch] == true && (readiness[:socketPresent] = File.socket?(socket))
           begin
             provider_helper(entry, 'health')
             return
@@ -670,3 +718,5 @@ module DevWorkspaceHost
     end
   end
 end
+
+require_relative 'workspace-provider-sessions'

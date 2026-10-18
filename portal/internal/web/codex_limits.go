@@ -12,6 +12,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 type codexLimitsSnapshot struct {
@@ -37,7 +38,20 @@ func (s *Server) codexLimits(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid provider"})
 		return
 	}
-	result, err := s.loadProviderLimits(r.Context(), r.URL.Query().Get("provider"))
+	provider := r.URL.Query().Get("provider")
+	if slug := r.URL.Query().Get("session"); slug != "" && provider == "" {
+		if !session.ValidSlug(slug) {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid limits session"})
+			return
+		}
+		view, err := s.providerSessionView(slug)
+		if err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Session provider unavailable"})
+			return
+		}
+		provider = view.Active
+	}
+	result, err := s.loadProviderLimits(r.Context(), provider)
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Limits unavailable"})
 		return

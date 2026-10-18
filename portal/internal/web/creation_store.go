@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"golang.org/x/sys/unix"
@@ -31,6 +32,8 @@ type creationRequest struct {
 	Goal                        string `json:"goal,omitempty"`
 	Model                       string `json:"model,omitempty"`
 	Effort                      string `json:"effort,omitempty"`
+	Provider                    string `json:"provider,omitempty"`
+	DestinationSettings         bool   `json:"destinationSettings,omitempty"`
 	Source                      string `json:"source,omitempty"`
 	SourceThreadID              string `json:"sourceThreadId,omitempty"`
 	SourceIdentity              string `json:"sourceIdentity,omitempty"`
@@ -430,6 +433,23 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	if value, exists := request["destinationSettings"]; exists {
+		var kind string
+		if string(value) != "true" || json.Unmarshal(request["kind"], &kind) != nil || kind != "plan" {
+			return errors.New("invalid destination model selection")
+		}
+	}
+
+	if rawProvider, exists := request["provider"]; exists {
+		var provider string
+		if json.Unmarshal(rawProvider, &provider) != nil || !codexproviders.ValidID(provider) {
+			return errors.New("creation receipt has an invalid provider")
+		}
+		var kind string
+		if json.Unmarshal(request["kind"], &kind) != nil || kind == "fork" {
+			return errors.New("fork provider selection uses the workspace default; switch it after creation")
+		}
+	}
 	if marker, ok := request["sensitive"]; ok && string(marker) != "true" {
 		return errors.New("sensitive must be true when present")
 	}
@@ -438,7 +458,7 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	}
 	if schema == 1 {
 		requestAllowed := map[string]bool{}
-		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive", "browserNotificationsEnabled"} {
+		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "provider", "destinationSettings", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive", "browserNotificationsEnabled"} {
 			requestAllowed[field] = true
 		}
 		for field := range request {
@@ -588,7 +608,10 @@ func validateManagedCreationRequestShape(request map[string]json.RawMessage) err
 	default:
 		return errors.New("schema-2 creation request has an invalid kind")
 	}
-	optional = append(optional, "browserNotificationsEnabled")
+	optional = append(optional, "browserNotificationsEnabled", "provider")
+	if kind == "plan" {
+		optional = append(optional, "destinationSettings")
+	}
 	if err := validateBrowserNotificationPreference(request); err != nil {
 		return err
 	}
