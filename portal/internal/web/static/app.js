@@ -1461,7 +1461,7 @@
     resetAction = createResetCreditAction({request, store, withLock,
       confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
       refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
-    const {createProviderPreview, providerOperationText} = await import("/static/codex-providers.js?v=3");
+    const {createProviderPreview, renderProviderOperation} = await import("/static/codex-providers.js?v=4");
     const providerControls = dialog.querySelector("[data-provider-controls]");
     const providerSelect = dialog.querySelector("[data-provider-select]");
     const providerScope = dialog.querySelector("[data-provider-scope]");
@@ -1472,12 +1472,14 @@
     const cancelProvider = dialog.querySelector("[data-provider-cancel]");
     const inheritProvider = dialog.querySelector("[data-provider-inherit]");
     const recoverProvider = dialog.querySelector("[data-provider-recover]");
+    const dismissProvider = dialog.querySelector("[data-provider-dismiss]");
+    const providerActionError = dialog.querySelector("[data-provider-action-error]");
     const providerStatus = dialog.querySelector("[data-provider-status]");
     let providerFeedbackOperationId = "";
     const renderProviderStatus = preview => {
-      providerStatus.textContent = providerOperationText(preview.catalog?.operation, preview.catalog?.providers || [], providerFeedbackOperationId);
+      renderProviderOperation(providerStatus, preview.catalog?.operation, preview.catalog?.providers || [], providerFeedbackOperationId, tag => document.createElement(tag));
     };
-    const clearProviderFeedback = () => {providerFeedbackOperationId = ""; renderProviderStatus(providers.state());};
+    const clearProviderFeedback = () => {providerFeedbackOperationId = ""; providerActionError.hidden = true; renderProviderStatus(providers.state());};
     dialog.addEventListener("close", clearProviderFeedback);
     providers = createProviderPreview({request, session:selectedProviderSession(), onChange: preview => {
       const catalog = preview.catalog;
@@ -1495,7 +1497,9 @@
       inheritProvider.disabled = providerBusy || pending;
       recoverProvider.hidden = catalog.operation?.phase !== "recovery-required";
       recoverProvider.disabled = providerBusy;
-      cancelProvider.hidden = catalog.operation?.phase !== "waiting";
+      cancelProvider.hidden = !(catalog.operation?.canCancel ?? catalog.operation?.phase === "waiting");
+      dismissProvider.hidden = !catalog.operation || catalog.operation.dismissed || !["failed", "canceled", "applied"].includes(catalog.operation.phase);
+      dismissProvider.disabled = providerBusy;
       cancelProvider.disabled = providerBusy;
       renderProviderStatus(preview);
       if (providerAttempt && (catalog.operation?.id === providerAttempt.id || catalog.active === providerAttempt.target)) providerAttempt = null;
@@ -1511,22 +1515,26 @@
     }});
     providerSelect.addEventListener("change", () => {clearProviderFeedback(); providers.select(providerSelect.value);});
     providerScope.addEventListener("change", () => {providerAttempt = null; clearProviderFeedback(); void providers.setSession(selectedProviderSession());});
-    const providerMutation = async (cancel, inherit = false, recover = false) => {
+    const providerMutation = async (action, inherit = false) => {
       if (providerBusy) return;
       const preview = providers.state();
+      const switching = action === "switch";
+      if (!switching && !preview.catalog?.operation) return;
       const target = inherit ? preview.catalog.default : preview.selected;
-      if (!cancel && !recover && (!providerAttempt || providerAttempt.target !== target || providerAttempt.inherit !== inherit)) providerAttempt = {id: crypto.randomUUID(), target, inherit};
-      providerFeedbackOperationId = cancel || recover ? preview.catalog.operation.id : providerAttempt.id;
+      if (switching && (!providerAttempt || providerAttempt.target !== target || providerAttempt.inherit !== inherit)) providerAttempt = {id: crypto.randomUUID(), target, inherit};
+      providerFeedbackOperationId = switching ? providerAttempt.id : preview.catalog.operation.id;
       providerBusy = true; switchProvider.disabled = true; cancelProvider.disabled = true;
+      providerActionError.hidden = true;
       try {
-        await request(`/api/codex-providers/${recover ? "recover" : cancel ? "cancel" : "switch"}`, {method:"POST", body:JSON.stringify(cancel || recover ? {operationId:preview.catalog.operation.id,session:selectedProviderSession()} : {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id,session:selectedProviderSession(),...(inherit ? {inherit:true} : {})})});
-      } catch (error) {providerStatus.textContent = error.message;}
+        await request(`/api/codex-providers/${action}`, {method:"POST", body:JSON.stringify(switching ? {providerId:providerAttempt.target,idempotencyKey:providerAttempt.id,session:selectedProviderSession(),...(inherit ? {inherit:true} : {})} : {operationId:preview.catalog.operation.id,session:selectedProviderSession()})});
+      } catch (error) {providerActionError.textContent = error.message; providerActionError.hidden = false;}
       finally {providerBusy = false; await providers.refresh();}
     };
-    switchProvider.addEventListener("click", () => {void providerMutation(false);});
-    cancelProvider.addEventListener("click", () => {void providerMutation(true);});
-    inheritProvider.addEventListener("click", () => {void providerMutation(false,true);});
-    recoverProvider.addEventListener("click", () => {void providerMutation(false,false,true);});
+    switchProvider.addEventListener("click", () => {void providerMutation("switch");});
+    cancelProvider.addEventListener("click", () => {void providerMutation("cancel");});
+    inheritProvider.addEventListener("click", () => {void providerMutation("switch",true);});
+    recoverProvider.addEventListener("click", () => {void providerMutation("recover");});
+    dismissProvider.addEventListener("click", () => {void providerMutation("dismiss");});
     void providers.refresh();
     const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !limitsLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 1000);
     globalThis.addEventListener("pagehide", event => {if (!event.persisted) {globalThis.clearInterval(providerPoll); providers.stop();}});
@@ -1877,18 +1885,50 @@
     return eligible;
   };
   let initializeNewSession = () => {};
+  const creationProviderValue = form => form?.elements.provider?.dataset?.providerIntent ?? form?.elements.provider?.value ?? "";
+  const updateCreationProviderHelp = form => {
+    const help = form.querySelector("[data-creation-provider-help]");
+    if (help) help.textContent = creationProviderValue(form) ?
+      "This session keeps the selected provider when the workspace default changes." :
+      "Uses the workspace default. This session follows future default changes.";
+  };
+  const creationProviderReads = new WeakMap();
+  const refreshCreationProvider = form => {
+    const select = form?.elements.provider;
+    if (!select) return Promise.resolve();
+    const pending = request("/api/codex-providers");
+    creationProviderReads.set(select, pending);
+    return pending.then(catalog => {
+      if (creationProviderReads.get(select) !== pending) return;
+      const defaultID = catalog.default || catalog.active;
+      if (!catalog.providers?.some(provider => provider.id === defaultID)) throw new Error("Provider default unavailable");
+      const intent = creationProviderValue(form);
+      select.dataset.providerDefault = defaultID;
+      select.replaceChildren(...catalog.providers.map(provider => {
+        const option = document.createElement("option");
+        option.value = provider.id;
+        option.defaultSelected = provider.id === defaultID;
+        option.textContent = provider.label + (provider.id === defaultID ? " (default)" : "");
+        return option;
+      }));
+      restoreDraftSelect(select, intent || defaultID, "Saved provider is unavailable");
+      select.disabled = form.dataset.requestLocked === "true";
+      updateCreationProviderHelp(form);
+    }).catch(() => {
+      if (creationProviderReads.get(select) !== pending) return;
+      const help = form.querySelector("[data-creation-provider-help]");
+      if (help) help.textContent = "Provider list unavailable. New sessions use the workspace default unless a saved request selected a provider.";
+    });
+  };
   for (const form of document.querySelectorAll("#new-session-form, #plan-session-form")) {
-    if (form?.elements.provider) {
-      void request("/api/codex-providers").then(catalog => {
-        const selected = form.elements.provider.value;
-        for (const provider of catalog.providers) {
-          const option = document.createElement("option"); option.value = provider.id; option.textContent = provider.label;
-          form.elements.provider.append(option);
-        }
-        form.elements.provider.value = selected;
-        form.querySelector("[data-creation-provider-label]").hidden = false;
-      }).catch(() => {});
-    }
+    const select = form.elements.provider;
+    if (!select) continue;
+    select.dataset.providerIntent = "";
+    form.addEventListener("reset", () => {
+      select.dataset.providerIntent = "";
+      queueMicrotask(() => {select.value = select.dataset.providerDefault || select.value; updateCreationProviderHelp(form); void loadModels(form);});
+    });
+    void refreshCreationProvider(form);
   }
   if (body.hasAttribute("data-index")) {
     const form = document.getElementById("new-session-form");
@@ -1902,7 +1942,7 @@
       const readFields = () => ({
         sensitive: form.elements.sensitive?.checked ? "true" : "", name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
         browserNotificationsEnabled: form.elements.browserNotificationsEnabled?.checked !== false,
-        provider:form.elements.provider?.value || "",
+        provider:creationProviderValue(form),
         ...managedDraftPolicyForStorage(form, {
           model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
           team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
@@ -1962,7 +2002,7 @@
         const defaultPair = !form.elements.model.value && !form.elements.effort.value;
         const command = creationCLICommand({
           sensitive: Boolean(form.elements.sensitive?.checked), name: form.elements.name.value.trim(), team: form.elements.team?.value || "",
-          provider:form.elements.provider?.value || "",
+          provider:creationProviderValue(form),
           model: defaultPair ? team?.dataset.leadModel : form.elements.model.value,
           effort: defaultPair ? team?.dataset.leadEffort : form.elements.effort.value,
         });
@@ -2074,8 +2114,16 @@
   }
   let models = [];
   const modelCatalogs = new Map(), selectModelCatalogs = new WeakMap(), selectModelURLs = new WeakMap();
-  document.addEventListener("workspace-provider-changed", () => {models = []; modelCatalogs.clear(); void loadModels();});
-  document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {modelCatalogs.clear(); void loadModels(select.closest("form"));}));
+  document.addEventListener("workspace-provider-changed", () => {
+    for (const form of document.querySelectorAll("#new-session-form, #plan-session-form")) void refreshCreationProvider(form);
+    models = []; modelCatalogs.clear(); void loadModels();
+  });
+  document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {
+    const form = select.closest("form");
+    select.dataset.providerIntent = select.value === select.dataset.providerDefault ? "" : select.value;
+    updateCreationProviderHelp(form);
+    modelCatalogs.clear(); void loadModels(form);
+  }));
   let collaborationModes = [];
   let currentModel = "";
   let currentEffort = "";
@@ -2235,8 +2283,11 @@
   const restoreManagedCreationDraft = (form, draft) => {
     if (form?.elements.provider && draft) {
       const provider = draft.provider || "";
-      const providerChanged = form.elements.provider.value !== provider;
-      restoreDraftSelect(form.elements.provider,provider,"Saved provider is unavailable");
+      form.elements.provider.dataset.providerIntent = provider;
+      const selectedProvider = provider || form.elements.provider.dataset.providerDefault || "";
+      const providerChanged = form.elements.provider.value !== selectedProvider;
+      restoreDraftSelect(form.elements.provider,selectedProvider,"Saved provider is unavailable");
+      updateCreationProviderHelp(form);
       if (providerChanged) void loadModels(form);
       form.querySelector("[data-creation-provider-label]").hidden = false;
     }
@@ -2365,7 +2416,7 @@
       const form = select.closest("form");
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
-      const provider = creation ? form.elements.provider?.value || "" : "";
+      const provider = creation ? creationProviderValue(form) : "";
       const url = `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
       if (!groups.has(url)) groups.set(url, []);
       groups.get(url).push({select, creation, destination});
@@ -5144,7 +5195,7 @@
       name: planSessionForm.elements.name.value,
       browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
       date: planSessionForm.elements.creationDate.value,
-      provider: planSessionForm.elements.provider?.value || "",
+      provider: creationProviderValue(planSessionForm),
       ...policy,
     }, "plan");
     if (draft) {
@@ -5174,6 +5225,7 @@
       restoreManagedCreationDrafts();
     }
     updatePlanSessionSubmitEligibility();
+    void refreshCreationProvider(planSessionForm);
     planSessionDialog.showModal();
   });
   planSessionDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => planSessionDialog.close());
@@ -5201,7 +5253,7 @@
       });
       const result = await client.implementPlan({
         action: "new",
-        provider: planSessionForm.elements.provider?.value || "",
+        provider: creationProviderValue(planSessionForm),
         sensitive: Boolean(planSessionForm.elements.sensitive?.checked),
         browserNotificationsEnabled: planSessionForm.elements.browserNotificationsEnabled?.checked !== false,
         ...planSessionSnapshot,

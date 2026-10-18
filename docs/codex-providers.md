@@ -16,8 +16,10 @@ but interrupted delegated tasks may need to be assigned again. New subagents
 inherit their parent's selected provider. Switching uses the selected upstream
 Codex binary without an additional provider-switching patch or rebuild.
 
-Select a provider in the new-session form's **Options** or the plan creation
-dialog, or use:
+The new-session and plan creation forms show the provider above **Options**.
+The actual workspace default is preselected and marked **(default)**. Keeping
+that selection makes the session follow future workspace-default changes; choosing
+a different provider pins the session to it. You can also use:
 
 ```sh
 dev-session start my-task --provider openai
@@ -54,9 +56,14 @@ and accepted lifecycle operations retain their normal ownership rules. A shared
 creation-admission lock prevents an inherited creator from entering between the
 default switch's root inventory and its durable applying fence.
 
-**Cancel waiting switch** cancels the exact request before application begins.
-Once application starts, its journal owns recovery. A failure before any native
-close leaves routing unchanged. A later failure shows **recovery-required** for
+**Cancel switch** cancels the exact request while it is waiting or preparing.
+Cancellation interrupts preparation checks and restores terminal clients before
+releasing the affected scope. The control disappears when native switching begins;
+its journal then owns completion and recovery. A failure before any native
+close leaves routing unchanged. **Dismiss** hides a terminal result while retaining
+its failure evidence. Finished attempts show their final duration instead of a
+running timer. Status separates the current step, retained member, count and reason;
+raw thread IDs appear under technical details. A later failure shows **recovery-required** for
 the affected scope. **Retry provider switch** continues the accepted target;
 it does not silently switch other sessions back to an earlier provider.
 
@@ -65,6 +72,8 @@ workspace-host provider status WORKSPACE
 workspace-host provider request WORKSPACE PROVIDER UUID --session SLUG
 workspace-host provider request WORKSPACE PROVIDER UUID
 workspace-host provider recover WORKSPACE UUID
+workspace-host provider cancel WORKSPACE UUID
+workspace-host provider dismiss WORKSPACE UUID
 ```
 
 Use a fresh operation UUID for a new request and retain it when retrying the
@@ -101,6 +110,10 @@ have durable client identities and ask Codex to inspect tool results before
 retrying actions. It never answers an approval or question; an interrupted
 request can be asked again after continuation. Unsupported named permission
 profiles or cold filesystem settings refuse before closing retained threads.
+Cold workspace-write settings support the standard compiled policy, including
+writable roots, network and temporary-directory flags, and protected metadata
+paths. Equivalent duplicate rules and ordering do not change that policy. Custom
+read/deny/glob restrictions or missing metadata protection refuse before closure.
 Persisted collaboration settings and disabled plugins retain their values.
 
 Native model discovery uses the daemon's configured provider. Model-only private
@@ -154,6 +167,9 @@ workspace root and socket. Schema 2 adds exact-root session selections and
 scoped operations. Receipts bind UUID, provider, scope and inheritance intent.
 Their retention is bounded to 2,048 UUIDs and state to 1 MiB. Private per-operation
 snapshots journal close, reopen, verification and continuation boundaries.
+Exact-operation `.control.json` files hold cooperative cancellation and dismissal
+flags separately, so earlier strict schema-2 readers can still load terminal state.
+An active operation continues to fence package replacement until it finishes.
 
 Schema-1 state remains readable. An unfinished schema-1 operation keeps its
 original workspace-wide engine and compensation rules, including its daemon

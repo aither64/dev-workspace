@@ -533,3 +533,15 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
  .team-add-fields { grid-template-columns: minmax(0, 1fr); }
  .team-table { min-width: 850px; }
 }
+
+.provider-operation { margin-top: 1rem; padding: .8rem; border: 1px solid var(--line); border-radius: 9px; }
+.provider-operation[hidden] { display: none; }
+.provider-operation.error { border-color: #713b46; }
+.provider-operation > strong { display: block; font-size: 1rem; }
+.provider-operation p { margin: .55rem 0; }
+.provider-operation dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .35rem .8rem; margin: .75rem 0; }
+.provider-operation dt { color: var(--muted); }
+.provider-operation dd { margin: 0; overflow-wrap: anywhere; }
+.provider-operation details { font-size: .85rem; }
+.provider-operation code { overflow-wrap: anywhere; white-space: normal; }
+@media (max-width: 480px) { .provider-operation dl { grid-template-columns: 1fr; } .provider-operation dd { margin-bottom: .35rem; } }

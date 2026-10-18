@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
-  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/style.css?v=19">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -196,10 +196,10 @@
   {{if .Session.Interactive}}
   <dialog id="fork-dialog">
     <form id="fork-form" class="stack">
-      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. The fork uses the workspace default provider. Worktrees, files, and development clusters stay with this session.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
+      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>
       <div class="field-grid">
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
@@ -213,11 +213,12 @@
   {{if .Session.Interactive}}
   <dialog id="plan-session-dialog">
     <form id="plan-session-form" class="stack">
-      <label data-creation-provider-label hidden>Provider<select name="provider" data-creation-provider><option value="">Workspace default</option></select></label>
-      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <div><p class="eyebrow">Approved plan</p><h2>Implement in a new session</h2><p class="muted">The new conversation starts with the exact plan.</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      <label data-creation-provider-label>Provider<select name="provider" data-creation-provider disabled><option value="">Loading providers…</option></select></label>
+      <p class="muted" data-creation-provider-help></p>
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
+      <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
       {{if .AgentTeams.Managed}}
       <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
@@ -254,7 +255,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=41" defer></script>
+  <script src="/static/app.js?v=42" defer></script>
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/session-attention.js" defer></script>

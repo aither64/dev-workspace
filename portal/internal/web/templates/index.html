@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Workspace</title>
-  <link rel="stylesheet" href="/static/style.css?v=18">
+  <link rel="stylesheet" href="/static/style.css?v=19">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body data-index data-index-generated-at="{{.IndexGeneratedAt}}">
@@ -41,7 +41,6 @@
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
-        <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         {{if .AgentTeams.Managed}}
         <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
@@ -50,11 +49,13 @@
         <p class="notice warning" data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed since you saved this draft. Check the team and lead settings before creating the session.</p>
         <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>
         {{end}}
+        <label data-creation-provider-label>Provider<select name="provider" data-creation-provider disabled><option value="">Loading providers…</option></select></label>
+        <p class="muted" data-creation-provider-help></p>
         <label class="checkbox"><input type="checkbox" name="sensitive" value="true"> Sensitive session (records stay local)</label>
+        <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
         <details><summary>Options</summary>
         <div class="stack">
         <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
-        <label data-creation-provider-label hidden>Provider<select name="provider" data-creation-provider><option value="">Workspace default</option></select></label>
         <p class="muted">Leave the name blank to generate a dated session name from your request.</p>
         {{if .AgentTeams.Managed}}
         <div class="field-grid"><label>Lead model<select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label>Lead reasoning effort<select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
@@ -97,7 +98,7 @@
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/preparation.js?v=4" defer></script>
-  <script src="/static/app.js?v=41" defer></script>
+  <script src="/static/app.js?v=42" defer></script>
   <script src="/static/coordination.js?v=6" defer></script>
 </body>
 </html>
@@ -141,9 +142,11 @@
     <p>The switch pauses affected threads and resumes their work automatically. Temporary subagents may stop and need their tasks assigned again. Sessions with their own provider keep it when the workspace default changes.</p>
     <button type="button" data-provider-switch>Switch to this provider</button>
     <button type="button" data-provider-inherit hidden>Use workspace default</button>
-    <button type="button" data-provider-cancel hidden>Cancel waiting switch</button>
+    <button type="button" data-provider-cancel hidden>Cancel switch</button>
     <button type="button" data-provider-recover hidden>Retry provider switch</button>
-    <p data-provider-status role="status"></p>
+    <button type="button" data-provider-dismiss hidden>Dismiss</button>
+    <p data-provider-action-error class="notice error" role="alert" hidden></p>
+    <div data-provider-status class="provider-operation" role="status" aria-live="polite" hidden></div>
   </div>
   <div data-account-limits></div><p data-reset-status role="status"></p>
 </dialog>
