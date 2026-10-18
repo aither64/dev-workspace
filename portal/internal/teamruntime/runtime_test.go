@@ -3183,3 +3183,56 @@ func TestPersistedExpandedJournalAtExactBoundRemainsReadable(t *testing.T) {
 		t.Fatal("accepted an oversized persisted file")
 	}
 }
+
+func TestFullExecutionAccessOverridesRetainedRoleSandboxes(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{}
+	service := Service{Store: store, Client: client, Workspace: workspace,
+		Catalog: &agentteams.Catalog{SchemaVersion: 6, ExecutionAccess: "full_access"}}
+	before, err := store.Update(context.Background(), "one", "root-one", true, func(roster *Roster) error {
+		for i, role := range []string{"architect", "implementer", "reviewer"} {
+			behavior := map[string]string{"architect": "designer", "implementer": "implementer", "reviewer": "reviewer"}[role]
+			access := "read_only"
+			if role == "implementer" {
+				access = "workspace_write"
+			}
+			roster.Members = append(roster.Members, Member{Address: role + "0", Role: role, Thread: fmt.Sprintf("member-%d", i),
+				Behavior: behavior, Access: access, Model: "saved-model", Effort: "xhigh", State: "ready", AddedAt: time.Now().UTC()})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range before.Members {
+		policy, err := service.MemberTurnPolicy("one", "root-one", member)
+		if err != nil || policy.Sandbox != "danger-full-access" || policy.ApprovalPolicy != "never" ||
+			!strings.HasSuffix(policy.DeveloperInstructions, legacyBehaviorInstructions[member.Behavior]) {
+			t.Fatalf("%s policy: %#v, %v", member.Address, policy, err)
+		}
+	}
+	// Peer delivery follows the recipient's effective execution policy.
+	for i, pair := range [][2]string{{"architect0", "implementer0"}, {"implementer0", "reviewer0"}, {"reviewer0", "architect0"}} {
+		if _, err := service.Assign(context.Background(), "one", "root-one", pair[0], pair[1], "peer message", "", "", fmt.Sprintf("%032x", i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, options := range client.options {
+		if options.ThreadPolicy.Sandbox != "danger-full-access" || options.ThreadPolicy.ApprovalPolicy != "never" || options.Model != "saved-model" || options.ReasoningEffort != "xhigh" {
+			t.Fatalf("peer options: %#v", options)
+		}
+	}
+	after, err := store.Load("one", "root-one")
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("execution override changed roster: %#v, %v", after, err)
+	}
+	service.Catalog = &agentteams.Catalog{SchemaVersion: 5}
+	policy, err := service.MemberTurnPolicy("one", "root-one", before.Members[0])
+	if err != nil || policy.Sandbox != "read-only" || policy.ApprovalPolicy != "" {
+		t.Fatalf("legacy policy changed: %#v, %v", policy, err)
+	}
+}

@@ -23,6 +23,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -1703,8 +1704,9 @@ func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
-		BaseURL: server.config.BaseURL,
-		Session: &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		BaseURL:             server.config.BaseURL,
+		TeamExecutionAccess: "full_access",
+		Session:             &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
 			{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "high"},
 			{Address: "reviewer0", State: "ready", Access: "read_only", Model: "model-1", Effort: "high"},
@@ -1712,7 +1714,7 @@ func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
 		}},
 	})
 	body := response.Body.String()
-	for _, marker := range []string{`<code>architect0</code>`, `Workspace write`, `<code>reviewer0</code>`, `Read only`, `<code>legacy0</code>`, `Access unrecorded`} {
+	for _, marker := range []string{`Full access for every member.`, `Saved:`, `<code>architect0</code>`, `Workspace write`, `<code>reviewer0</code>`, `Read only`, `<code>legacy0</code>`, `Access unrecorded`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("direct team page omitted %q", marker)
 		}
@@ -4538,6 +4540,18 @@ type memberPageProbe struct {
 	calls int
 }
 
+type memberQueueProbe struct {
+	*workspacecodex.Client
+	policy codex.ThreadPolicy
+	calls  int
+}
+
+func (probe *memberQueueProbe) QueueWithPolicy(_ context.Context, thread, text, id string, policy codex.ThreadPolicy) (codex.QueueEntry, error) {
+	probe.calls++
+	probe.policy = policy
+	return codex.QueueEntry{ID: "queued-member", Text: text, ClientUserMessageID: id}, nil
+}
+
 func (probe *memberPageProbe) ReadThreadPage(_ context.Context, threadID, cursor string) (codex.TranscriptPage, error) {
 	probe.calls++
 	return codex.TranscriptPage{Transcript: codex.Transcript{
@@ -4628,6 +4642,16 @@ func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
 	}
 	if attempted, err := memberClient.SendAttempted(context.Background(), "member-thread", "message", "message-1", ""); err != nil || !attempted {
 		t.Fatalf("member retry discovery = %t, %v", attempted, err)
+	}
+	queueProbe := &memberQueueProbe{Client: controller}
+	memberClient.Client = queueProbe
+	memberClient.service.Catalog = &agentteams.Catalog{SchemaVersion: 6, ExecutionAccess: "full_access"}
+	entry, err := memberClient.Queue(context.Background(), "member-thread", "queued member work", "queued-client")
+	if err != nil || entry.ID != "queued-member" || queueProbe.calls != 1 || queueProbe.policy.Sandbox != "danger-full-access" || queueProbe.policy.ApprovalPolicy != "never" {
+		t.Fatalf("member enqueue omitted installed execution policy: %#v, %#v, %v", entry, queueProbe.policy, err)
+	}
+	if _, err := memberClient.Queue(context.Background(), "other-thread", "queued member work", "queued-client"); err == nil || queueProbe.calls != 1 {
+		t.Fatal("member queue accepted a different thread")
 	}
 	target.Release()
 	for _, id := range []string{"example~reviewer0", "example~architect0", "example~bad-address", "other~implementer0"} {

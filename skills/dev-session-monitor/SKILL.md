@@ -17,7 +17,15 @@ watcher instructions below; do not delegate again.
 Resolve the watcher policy before delegating. For a managed session, read its
 pinned catalog and select the exact model and reasoning effort from the separate
 `utilities.verification_watcher` record, together with the matching native
-utility configuration from that same catalog digest. The watcher is a utility,
+utility configuration from that same catalog digest. Resolve package-wide
+`execution_access` separately from the currently selected installed package's
+catalog, even when the retained catalog predates that field. Keep the retained
+model, effort and utility identity. For installed `full_access`, launch a standalone CLI watcher with
+`--sandbox danger-full-access --ask-for-approval never` (or the executor's
+corresponding explicit policy); do not add sandbox writable roots for Nix cache,
+GC roots or daemon socket directories. Generated schema-6 utility TOMLs carry
+that same execution policy. Verify the actual launch policy before treating a
+watcher as ready. The watcher is a utility,
 not a team member. Create its first native operation with fresh context
 (`fork_turns: "none"`). Its lifetime is one operation: every later long or
 uncertain operation receives a fresh watcher and never reuses this identity.

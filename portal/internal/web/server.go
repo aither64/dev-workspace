@@ -232,41 +232,42 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
-	InitialRequest    string
-	Preparation       *preparationStatus
-	StyleNonce        string
-	BaseURL           string
-	DisplayLabel      string
-	HostLabel         string
-	SSHHost           string
-	CreationDate      string
-	IndexGeneratedAt  string
-	MaxMessageBytes   int
-	Error             string
-	Active            []session.Summary
-	Archived          []session.Summary
-	Session           *session.Summary
-	Repositories      []repository.Status
-	RepositoryWarning string
-	Clusters          []cluster.Status
-	Artifacts         []session.Artifact
-	PendingLifecycle  string
-	LifecycleOnly     bool
-	LifecycleTargetID string
-	AgentTeams        *agentTeamsPage
-	TeamStatusError   string
-	DirectTeam        *teamruntime.Roster
-	RemovedMembers    []teamruntime.Member
-	TeamPresets       []teamruntime.Preset
-	TeamRoles         []teamRoleOption
-	TeamRoleDefaults  []teamRoleDefault
-	ReadyMembers      []teamruntime.Member
-	SelectedMember    string
-	SelectedThreadID  string
-	ConversationID    string
-	MemberNotice      string
-	Recovery          recoveryStatus
-	SourceFileAPI     string
+	InitialRequest      string
+	Preparation         *preparationStatus
+	StyleNonce          string
+	BaseURL             string
+	DisplayLabel        string
+	HostLabel           string
+	SSHHost             string
+	CreationDate        string
+	IndexGeneratedAt    string
+	MaxMessageBytes     int
+	Error               string
+	Active              []session.Summary
+	Archived            []session.Summary
+	Session             *session.Summary
+	Repositories        []repository.Status
+	RepositoryWarning   string
+	Clusters            []cluster.Status
+	Artifacts           []session.Artifact
+	PendingLifecycle    string
+	LifecycleOnly       bool
+	LifecycleTargetID   string
+	AgentTeams          *agentTeamsPage
+	TeamStatusError     string
+	DirectTeam          *teamruntime.Roster
+	TeamExecutionAccess string
+	RemovedMembers      []teamruntime.Member
+	TeamPresets         []teamruntime.Preset
+	TeamRoles           []teamRoleOption
+	TeamRoleDefaults    []teamRoleDefault
+	ReadyMembers        []teamruntime.Member
+	SelectedMember      string
+	SelectedThreadID    string
+	ConversationID      string
+	MemberNotice        string
+	Recovery            recoveryStatus
+	SourceFileAPI       string
 }
 
 type teamRoleOption struct {
@@ -1203,6 +1204,9 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error = "Team roster is unavailable: " + rosterErr.Error()
 	} else {
 		data.DirectTeam = roster
+		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
+			data.TeamExecutionAccess = "full_access"
+		}
 		data.RemovedMembers = removedTeamMembers(roster)
 	}
 	data.TeamRoles = teamRoles(data.TeamPresets)
@@ -1303,6 +1307,9 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
 	} else {
 		data.DirectTeam = roster
+		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
+			data.TeamExecutionAccess = "full_access"
+		}
 		data.RemovedMembers = removedTeamMembers(roster)
 		if roster != nil && summary.RecoveryReady {
 			for _, member := range roster.Members {
@@ -2086,9 +2093,13 @@ func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *sessio
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
+		executionAccess := ""
+		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
+			executionAccess = "full_access"
+		}
 		presets := s.directTeamPresets()
 		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster, "presets": presets,
-			"roleDefaults": s.roleDefaults(roster, teamRoles(presets))})
+			"roleDefaults": s.roleDefaults(roster, teamRoles(presets)), "executionAccess": executionAccess})
 		return
 	}
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	CatalogSchemaVersion        = 5
+	CatalogSchemaVersion        = 6
 	PackageMetadataSchema       = 1
 	maxCatalogBytes             = 4 * 1024 * 1024
 	maxPackageMetadataBytes     = 1024 * 1024
@@ -107,7 +107,7 @@ func (team Team) InitialMemberCount(role string) int {
 }
 
 func supportedCatalogSchema(version int) bool {
-	return version == 4 || version == CatalogSchemaVersion
+	return version == 4 || version == 5 || version == CatalogSchemaVersion
 }
 
 type Team struct {
@@ -164,6 +164,7 @@ type NativeAgentConfigs struct {
 }
 
 type Catalog struct {
+	ExecutionAccess        string             `json:"execution_access,omitempty"`
 	SchemaVersion          int                `json:"schema_version"`
 	DefaultTeam            string             `json:"default_team"`
 	DefaultDevelopmentTeam *string            `json:"default_development_team"`
@@ -391,7 +392,16 @@ func (metadata AgentTeamsMetadata) Validate() error {
 	return nil
 }
 
+// FullExecutionAccess overrides retained role sandboxes without changing rosters.
+func (catalog *Catalog) FullExecutionAccess() bool {
+	return catalog != nil && catalog.SchemaVersion == 6 && catalog.ExecutionAccess == "full_access"
+}
+
 func (catalog Catalog) Validate() error {
+	if (catalog.SchemaVersion == 6 && catalog.ExecutionAccess != "full_access") ||
+		(catalog.SchemaVersion != 6 && catalog.ExecutionAccess != "") {
+		return errors.New("invalid catalog execution access")
+	}
 	if !supportedCatalogSchema(catalog.SchemaVersion) || !identifier(catalog.DefaultTeam) ||
 		catalog.Capacity.RequiredNativeChildThreads < 1 || catalog.Capacity.RequiredNativeChildThreads > 64 || !isDigest(catalog.CatalogDigest) ||
 		len(catalog.Teams) == 0 || !validWorkPolicy(catalog.WorkPolicy.Design) ||
@@ -690,10 +700,14 @@ func validateTeamDigests(data []byte, catalog Catalog) error {
 	for name, rawTeam := range teams {
 		team := rawTeam.(map[string]any)
 		delete(team, "team_digest")
-		want, err := digestJSON(map[string]any{
+		source := map[string]any{
 			"schema_version": object["schema_version"], "capacity": object["capacity"],
 			"work_policy": object["work_policy"], "team_name": name, "team": team,
-		})
+		}
+		if catalog.SchemaVersion == 6 {
+			source["execution_access"] = catalog.ExecutionAccess
+		}
+		want, err := digestJSON(source)
 		if err != nil || catalog.Teams[name].TeamDigest != want {
 			if err != nil {
 				return err
@@ -873,7 +887,17 @@ func objectWithOnly(raw json.RawMessage, fields ...string) (map[string]json.RawM
 }
 
 func validateCatalogShape(data []byte) error {
-	root, err := strictObject(data, "schema_version", "default_team", "default_development_team", "capacity", "work_policy", "teams", "utilities", "catalog_digest", "model_inventory", "native_agent_configs")
+	var version struct {
+		Schema int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(data, &version); err != nil {
+		return err
+	}
+	fields := []string{"schema_version", "default_team", "default_development_team", "capacity", "work_policy", "teams", "utilities", "catalog_digest", "model_inventory", "native_agent_configs"}
+	if version.Schema == 6 {
+		fields = append(fields, "execution_access")
+	}
+	root, err := strictObject(data, fields...)
 	if err != nil {
 		return err
 	}
@@ -903,7 +927,7 @@ func validateCatalogShape(data []byte) error {
 		if err := json.Unmarshal(rawTeam, &object); err != nil {
 			return err
 		}
-		if counts, present := object["initial_member_counts"]; present && schema == CatalogSchemaVersion {
+		if counts, present := object["initial_member_counts"]; present && schema >= 5 {
 			fields = append(fields, "initial_member_counts")
 			var values map[string]int
 			if err := json.Unmarshal(counts, &values); err != nil || values == nil {

@@ -854,7 +854,15 @@ func (service Service) memberTurnPolicy(slug, rootThreadID string, member Member
 	if service.Store == nil || member.Thread == "" || !session.ValidSlug(slug) || rootThreadID == "" || member.Address == "" {
 		return codex.ThreadPolicy{}, errors.New("member policy has incomplete roster identity")
 	}
-	return memberPolicy(service.Store.workspace, slug, member)
+	return service.executionPolicy(slug, member)
+}
+
+func (service Service) executionPolicy(slug string, member Member) (codex.ThreadPolicy, error) {
+	policy, err := memberPolicy(service.Store.workspace, slug, member)
+	if err == nil && service.Catalog.FullExecutionAccess() {
+		policy.Sandbox, policy.ApprovalPolicy = "danger-full-access", "never"
+	}
+	return policy, err
 }
 
 // MemberTurnPolicy is the same package-owned policy used by team assignments.
@@ -1313,7 +1321,7 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 	}
 	threadID := pending.Thread
 	wasStarted := threadID != ""
-	policy, err := memberPolicy(service.Store.workspace, slug, *pending)
+	policy, err := service.executionPolicy(slug, *pending)
 	if err != nil {
 		return Member{}, fmt.Errorf("member %s has no retained policy: %w", address, err)
 	}
@@ -2390,7 +2398,7 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			if member.CreateAttempted {
 				return nil, fmt.Errorf("fork %s outcome is unknown; App Server does not provide a unique fork retry identity", old.Address)
 			}
-			policy, err := memberPolicy(service.Store.workspace, slug, member)
+			policy, err := service.executionPolicy(slug, member)
 			if err != nil {
 				return nil, fmt.Errorf("fork %s without retained policy: %w", old.Address, err)
 			}

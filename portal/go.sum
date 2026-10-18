@@ -1,7 +1,7 @@
 github.com/SherClockHolmes/webpush-go v1.4.0 h1:ocnzNKWN23T9nvHi6IfyrQjkIc0oJWv1B1pULsf9i3s=
 github.com/SherClockHolmes/webpush-go v1.4.0/go.mod h1:XSq8pKX11vNV8MJEMwjrlTkxhAj1zKfxmyhdV7Pd6UA=
-github.com/aither64/codex-web v0.0.0-20261016194058-5daae414ed9c h1:3d57nbzESlglsyxKVATM/oqtiCATeGXz7MXM9FM8a6A=
-github.com/aither64/codex-web v0.0.0-20261016194058-5daae414ed9c/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
+github.com/aither64/codex-web v0.0.0-20261018144811-56ec377d81e8 h1:lIFJWNCjF86vGYUvj2GXqoX1zAC/l25UDBgbMpRoiRU=
+github.com/aither64/codex-web v0.0.0-20261018144811-56ec377d81e8/go.mod h1:wxfbQeNrjnDW43kExN39RdEflxekqogIDfernCytTEc=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

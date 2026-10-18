@@ -448,6 +448,14 @@ or mutate existing rosters.
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.
 
+### Team execution access
+
+Schema-6 team catalogs set `execution_access = "full_access"` for all retained
+and new members and verification utilities. This includes Nix daemon and network
+access. Assigned role instructions still govern editing and review work. See the
+[installed team policy](workspace-portal.md#installed-team-policy) for retained
+state, peer messaging and package compatibility.
+
 ## Attaching and syncing
 
 ```sh

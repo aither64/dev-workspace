@@ -117,6 +117,23 @@ func (client memberConversationClient) SendAttempted(ctx context.Context, thread
 	return discovery.SendAttemptedWithOptions(ctx, threadID, message, clientID, actionContext, options)
 }
 
+func (client memberConversationClient) Queue(ctx context.Context, threadID, message, clientID string) (codex.QueueEntry, error) {
+	if threadID != client.threadID {
+		return codex.QueueEntry{}, errors.New("team member is unavailable")
+	}
+	options, err := client.turnOptions(message, clientID, "")
+	if err != nil {
+		return codex.QueueEntry{}, err
+	}
+	queue, ok := client.Client.(interface {
+		QueueWithPolicy(context.Context, string, string, string, codex.ThreadPolicy) (codex.QueueEntry, error)
+	})
+	if !ok {
+		return codex.QueueEntry{}, errors.New("member queue policy is unavailable")
+	}
+	return queue.QueueWithPolicy(ctx, threadID, message, clientID, options.ThreadPolicy)
+}
+
 func (client memberConversationClient) turnOptions(message, clientID, actionContext string) (codex.TurnOptions, error) {
 	member, err := client.member()
 	if err != nil {
@@ -147,7 +164,7 @@ func (client memberConversationClient) turnOptions(message, clientID, actionCont
 }
 
 func sameThreadPolicy(left, right codex.ThreadPolicy) bool {
-	if left.DeveloperInstructions != right.DeveloperInstructions || left.Sandbox != right.Sandbox {
+	if left.DeveloperInstructions != right.DeveloperInstructions || left.Sandbox != right.Sandbox || left.ApprovalPolicy != right.ApprovalPolicy {
 		return false
 	}
 	if left.MCPServer == nil || right.MCPServer == nil {

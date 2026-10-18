@@ -1849,7 +1849,7 @@ module DevSession
                  '--session-slug', slug,
                  '--root-thread-id', root_thread,
                  '--cwd', work_dir(slug)]
-	  if %w[list add].include?(action)
+	  if !%w[require-archive-ready require-archived archive-retained].include?(action)
 		portal = File.realpath(@portal_command.first)
 		command.concat(['--package-root', File.dirname(File.dirname(portal))])
 	  end

@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 func TestProviderResumePreservesPoliciesAndEnvironment(t *testing.T) {
@@ -88,6 +90,48 @@ func TestProviderCaptureValidatesForwardAndCompensationPayloads(t *testing.T) {
 			}
 			if validateProviderResumePayloads(thread, "pool") == nil {
 				t.Fatal("unsupported pre-stop snapshot accepted")
+			}
+		})
+	}
+}
+
+func TestProviderTransitionPreservesRetainedMemberPolicyAfterPackageUpgrade(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := teamruntime.NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := teamruntime.Service{Store: store, Workspace: workspace, Catalog: &agentteams.Catalog{SchemaVersion: 5}}
+	for _, access := range []string{"read_only", "workspace_write"} {
+		t.Run(access, func(t *testing.T) {
+			role := "reviewer"
+			if access == "workspace_write" {
+				role = "implementer"
+			}
+			member := teamruntime.Member{Address: role + "0", Thread: "member-thread", Role: role, Behavior: role, Access: access}
+			service.Catalog = &agentteams.Catalog{SchemaVersion: 5}
+			legacy, err := service.MemberTurnPolicy("example", "root-thread", member)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.Catalog = &agentteams.Catalog{SchemaVersion: 6, ExecutionAccess: "full_access"}
+			policy, err := service.MemberTurnPolicy("example", "root-thread", member)
+			if err != nil || policy.Sandbox != "danger-full-access" || policy.ApprovalPolicy != "never" || policy.DeveloperInstructions != legacy.DeveloperInstructions {
+				t.Fatalf("upgraded member policy: %#v, %v", policy, err)
+			}
+			for _, native := range []string{legacy.Sandbox, "danger-full-access"} {
+				kind := map[string]string{"read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess"}[native]
+				original := map[string]any{"modelProvider": "openai", "approvalPolicy": "on-request", "sandbox": map[string]any{"type": kind, "networkAccess": false}}
+				thread := providerThread{ID: member.Thread, Cwd: workspace, MemberAddress: member.Address, Settings: codex.ThreadSettings{Model: "retained", ReasoningEffort: "low", Policy: policy}, Original: original}
+				if err := validateProviderResumePayloads(thread, "pool"); err != nil {
+					t.Fatal(err)
+				}
+				for _, provider := range []string{"pool", "openai"} {
+					params, err := providerResumeParams(thread, provider)
+					if err != nil || params["sandbox"] != native || params["approvalPolicy"] != original["approvalPolicy"] || params["modelProvider"] != provider {
+						t.Fatalf("provider operation changed native execution policy: %#v, %v", params, err)
+					}
+				}
 			}
 		})
 	}

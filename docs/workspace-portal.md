@@ -879,6 +879,19 @@ of an already removed or archived member also checks its retired identity and
 unresolved attempts before clearing records left by an older package. Forced
 session deletion may discard unresolved attempts after interrupting members.
 
+Members can message another ready member in the same session through the CLI:
+
+```sh
+dev-session team assign example --as-is --from architect0 --to implementer0 \
+  --message 'Please check this design assumption.' --message-id LOWERCASE_UUID
+```
+
+Use the sender's actual address and a new stable message ID for each message.
+Retry an uncertain delivery with the same ID and exact text. A busy recipient
+receives steering through the existing submission path. `report_to_lead` remains
+the tool for reports to the lead. Full execution access lets members run this CLI
+with the same session locks and socket access as the lead.
+
 The CLI uses the same record:
 
 ```sh
@@ -899,7 +912,29 @@ their root conversation and begin with an empty direct roster.
 ## Installed team policy
 
 An optional `teamConfig` in `lib.mkPackage` builds the installed team
-catalog. The catalog supplies named presets and exact model, reasoning,
+catalog. Schema 6 requires `execution_access = "full_access"`. This package-wide
+policy gives every member unrestricted filesystem, network and Nix daemon access,
+with approvals set to `never`, including members retained from earlier catalogs.
+Role instructions still define which work a member may perform. The Team tab
+shows effective full access separately from the saved role access. Schemas 4 and
+5 retain their role-based sandboxes.
+
+The package applies effective execution policy when starting, resuming or forking
+members and before assignments, browser sends and queue starts. Existing turns
+finish with their original context. Saved rosters, prompts, models and efforts
+remain unchanged. An uncertain submission keeps its original policy and message
+ID until recovery resolves it; changing policy does not authorize resending it.
+
+Native role and verification utility files from schema-6 packages set
+`sandbox_mode = "danger-full-access"` and `approval_policy = "never"`.
+Native queue additions can execute immediately on an already loaded member.
+Both browser enqueueing and recovery assignments apply the installed execution
+policy before adding that work. Cold queues remain unloaded until explicit
+activation supplies the policy.
+Callers still select the catalog's model and effort explicitly. Older packages
+cannot load schema-6 catalogs; use the normal forward-only package transition.
+
+The catalog supplies named presets and exact model, reasoning,
 behavior, purpose, access, and instruction defaults; it is not a virtual-team
 dispatcher. Site configuration may add up to eight roles per team, including
 the lead. Member role names use lowercase letters and digits and are at most
@@ -976,7 +1011,8 @@ Fork destinations receive the same bootstrap before becoming ready.
 The runtime combines each member's retained role instructions with an exact
 workspace, session, and member-address binding. It checks the role purpose and
 configured access before starting a turn. The Team tab shows each member's
-saved access. The built-in architect and reviewer roles use a read-only sandbox;
+saved role access. In schemas 4 and 5, the built-in architect and reviewer roles
+use a read-only sandbox;
 the built-in implementer uses workspace-write. A site catalog can grant its
 architect role workspace-write access to edit assigned design artifacts.
 Changing that catalog does not alter existing rosters. An operator can
@@ -986,7 +1022,8 @@ validates the requested access against the member's retained purpose; an
 implementer cannot become read-only, and a reviewer cannot become writable.
 It preserves the member's thread, instructions, model, and effort. The member's
 catalog digest is cleared to mark a manual access override, and the new
-sandbox takes effect on its next turn. Team model and reasoning
+role sandbox takes effect on its next turn in schemas 4 and 5. Schema 6 keeps
+full execution access regardless of that saved setting. Team model and reasoning
 choices remain in the form during background conversation and roster refreshes
 until they are saved or the page is reloaded.
 Ordinary portal reads leave the thread's persisted instructions alone.

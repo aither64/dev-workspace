@@ -67,6 +67,8 @@ class TeamMcpBindingTest < DevSessionTest
       argv, input = capture.calls.fetch(0)
       assert_equal('Private report text', input)
       assert_equal('/dev/stdin', argv.fetch(argv.index('--input-file') + 1))
+      assert_equal(File.dirname(File.dirname(File.realpath(RbConfig.ruby))),
+                   argv.fetch(argv.index('--package-root') + 1))
       assert_equal('actual-member-thread', argv.fetch(argv.index('--expected-member-thread-id') + 1))
       assert_equal(File.join(workspace, '.xdg-state', 'dev-workspaces', 'profile'),
                    argv.fetch(argv.index('--host-profile') + 1))

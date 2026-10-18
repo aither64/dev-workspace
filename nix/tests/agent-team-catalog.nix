@@ -250,10 +250,22 @@ let
     inherit pkgs;
     teamConfig = leadReviewedConfig;
   };
+  fullAccessConfig = repeatedTeamConfig // {
+    schema_version = 6;
+    execution_access = "full_access";
+  };
+  fullAccessPackage = mkPackage {
+    inherit pkgs;
+    teamConfig = fullAccessConfig;
+  };
   unmanagedPackage = mkPackage { inherit pkgs; };
 in
 assert (evaluate leadReviewedConfig).success;
 assert (evaluate repeatedTeamConfig).success;
+assert (evaluate fullAccessConfig).success;
+assert !((evaluate (fullAccessConfig // { execution_access = "restricted"; })).success);
+assert !((evaluate (builtins.removeAttrs fullAccessConfig [ "execution_access" ])).success);
+assert !((evaluate (validTeamConfig // { execution_access = "full_access"; })).success);
 assert
   !((evaluate (withCounts {
     implementer = 0;
@@ -422,5 +434,17 @@ pkgs.runCommand "dev-workspace-agent-team-catalog" {
     echo "generic fixture selected a forbidden fallback model" >&2
     exit 1
   fi
+  full_catalog=${fullAccessPackage}/share/dev-workspace/agent-teams.json
+  jq -e '.schema_version == 6 and .execution_access == "full_access"' "$full_catalog" >/dev/null
+  jq -r '.native_agent_configs | (.roles + .utilities)[].path' "$full_catalog" |
+    while IFS= read -r path; do
+      config=${fullAccessPackage}/$path
+      grep -Fx 'sandbox_mode = "danger-full-access"' "$config"
+      grep -Fx 'approval_policy = "never"' "$config"
+      if grep -Eq '^(model|model_reasoning_effort) =' "$config"; then
+        echo "native full-access configuration overrides model or effort" >&2
+        exit 1
+      fi
+    done
   touch "$out"
 ''

@@ -89,10 +89,11 @@ func catalogFixture(t *testing.T) Catalog {
 	utilityIdentity.BehaviorDigest = strings.Repeat("b", 64)
 	policy := WorkPolicy{Default: "high", Simple: "high", Allowed: []string{"high"}, SimpleRequiresReason: true, Followup: "retain"}
 	catalog := Catalog{
-		SchemaVersion: CatalogSchemaVersion,
-		DefaultTeam:   "solo",
-		Capacity:      Capacity{RequiredNativeChildThreads: 1},
-		WorkPolicy:    WorkPolicies{Design: policy, Implementation: policy},
+		SchemaVersion:   CatalogSchemaVersion,
+		ExecutionAccess: "full_access",
+		DefaultTeam:     "solo",
+		Capacity:        Capacity{RequiredNativeChildThreads: 1},
+		WorkPolicy:      WorkPolicies{Design: policy, Implementation: policy},
 		Teams: map[string]Team{"solo": {
 			Description: "A neutral solo team.", DesignOwner: "team_lead", MaxOpenAgents: 0, Mode: "solo", ServicePolicy: "unmanaged",
 			Lifecycle: Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"},
@@ -128,7 +129,11 @@ func withFixtureTeamDigest(t *testing.T, team Team, data []byte, name string) Te
 	object := root.(map[string]any)
 	rawTeam := object["teams"].(map[string]any)[name].(map[string]any)
 	delete(rawTeam, "team_digest")
-	digest, err := digestJSON(map[string]any{"schema_version": object["schema_version"], "capacity": object["capacity"], "work_policy": object["work_policy"], "team_name": name, "team": rawTeam})
+	source := map[string]any{"schema_version": object["schema_version"], "capacity": object["capacity"], "work_policy": object["work_policy"], "team_name": name, "team": rawTeam}
+	if execution, exists := object["execution_access"]; exists {
+		source["execution_access"] = execution
+	}
+	digest, err := digestJSON(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,6 +522,7 @@ func TestCatalogCountsShapeAndPreviousSchema(t *testing.T) {
 					t.Fatal(err)
 				}
 				raw["schema_version"] = schema
+				delete(raw, "execution_access")
 				team := raw["teams"].(map[string]any)["solo"].(map[string]any)
 				if value != "absent" {
 					team["initial_member_counts"] = json.RawMessage(value)
@@ -531,6 +537,7 @@ func TestCatalogCountsShapeAndPreviousSchema(t *testing.T) {
 	// Reconstruct preceding schema-4 identities without adding defaults to its JSON.
 	catalog := catalogFixture(t)
 	catalog.SchemaVersion = 4
+	catalog.ExecutionAccess = ""
 	catalog.Teams["solo"] = withFixtureTeamDigest(t, catalog.Teams["solo"], marshalFixture(t, catalog), "solo")
 	digest, err := catalogDigest(marshalFixture(t, catalog))
 	if err != nil {
@@ -547,5 +554,31 @@ func TestCatalogCountsShapeAndPreviousSchema(t *testing.T) {
 	}
 	if _, err := decodeCatalog(marshalFixture(t, catalog)); err != nil {
 		t.Fatalf("schema 4: %v", err)
+	}
+}
+
+func TestCatalogExecutionAccessIsVersionedAndBoundToDigest(t *testing.T) {
+	for _, version := range []int{4, 5, 6} {
+		for _, access := range []string{"", "full_access", "workspace_write"} {
+			catalog := catalogFixture(t)
+			catalog.SchemaVersion, catalog.ExecutionAccess = version, access
+			valid := (version == 6 && access == "full_access") || (version != 6 && access == "")
+			if err := catalog.Validate(); (err == nil) != valid {
+				t.Fatalf("schema %d access %q: %v", version, access, err)
+			}
+			if catalog.FullExecutionAccess() != (version == 6 && access == "full_access") {
+				t.Fatalf("wrong effective execution access")
+			}
+		}
+	}
+	catalog := catalogFixture(t)
+	original, err := catalogDigest(marshalFixture(t, catalog))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.ExecutionAccess = "workspace_write"
+	changed, err := catalogDigest(marshalFixture(t, catalog))
+	if err != nil || original == changed {
+		t.Fatal("execution access omitted from immutable identity")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
@@ -283,6 +284,16 @@ func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, 
 		return result, err
 	}
 	service := teamruntime.Service{Store: store, Client: client, Workspace: workspace, HostProfile: profile}
+	packageRoot, err := filepath.EvalSymlinks(profile)
+	if err != nil {
+		return result, err
+	}
+	installed, err := agentteams.LoadInstalled(packageRoot)
+	if err != nil {
+		return result, err
+	}
+	service.Catalog = installed.Catalog
+
 	seen := map[string]bool{}
 	add := func(thread providerThread) error {
 		if thread.ID == "" || seen[thread.ID] {
@@ -428,7 +439,11 @@ func providerResumeParams(thread providerThread, provider string) (map[string]an
 	}
 	policy := thread.Settings.Policy
 	if policy.Sandbox != "" {
-		if params["sandbox"] != policy.Sandbox {
+		// A retained member may not have run since the package selected full
+		// access. Provider changes preserve its captured native policy in both
+		// directions; the execution override applies on its next ordinary turn.
+		fullAccessMember := thread.MemberAddress != "" && policy.Sandbox == "danger-full-access" && policy.ApprovalPolicy == "never"
+		if params["sandbox"] != policy.Sandbox && !fullAccessMember {
 			return nil, fmt.Errorf("retained team sandbox %s differs from effective native sandbox %v for %s", policy.Sandbox, params["sandbox"], thread.ID)
 		}
 	}

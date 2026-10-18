@@ -484,6 +484,7 @@ func teamCommand(args []string) error {
 	}
 	if command == "list" {
 		presets := teamruntime.Presets()
+		executionAccess := ""
 		if *packageRoot != "" {
 			if !canonicalAbsolutePath(*packageRoot) {
 				return errors.New("team list requires a canonical absolute package root")
@@ -491,6 +492,9 @@ func teamCommand(args []string) error {
 			installed, err := agentteams.LoadInstalled(*packageRoot)
 			if err != nil {
 				return err
+			}
+			if installed.Catalog.FullExecutionAccess() {
+				executionAccess = "full_access"
 			}
 			if installed.Managed && installed.Catalog != nil {
 				presets, err = teamruntime.PresetsFromCatalog(*installed.Catalog)
@@ -501,12 +505,12 @@ func teamCommand(args []string) error {
 		}
 		roster, err := store.Load(*slug, *rootThread)
 		if errors.Is(err, os.ErrNotExist) {
-			return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": nil, "presets": presets})
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": nil, "presets": presets, "executionAccess": executionAccess})
 		}
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": roster, "presets": presets})
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"roster": roster, "presets": presets, "executionAccess": executionAccess})
 	}
 	if *cwd == "" {
 		*cwd = filepath.Join(*workspace, "work", *slug)

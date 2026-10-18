@@ -299,19 +299,24 @@ let
     );
   validTeamConfig =
     builtins.isAttrs teamConfig
-    && hasExactFields [
-      "capacity"
-      "default_development_team"
-      "default_team"
-      "schema_version"
-      "teams"
-      "utilities"
-      "work_policy"
-    ] teamConfig
+    && hasExactFields (lib.sort builtins.lessThan (
+      [
+        "capacity"
+        "default_development_team"
+        "default_team"
+        "schema_version"
+        "teams"
+        "utilities"
+        "work_policy"
+      ]
+      ++ lib.optional (teamConfig.schema_version == 6) "execution_access"
+    )) teamConfig
     && builtins.elem teamConfig.schema_version [
       4
       5
+      6
     ]
+    && (teamConfig.schema_version != 6 || teamConfig.execution_access == "full_access")
     && hasExactFields [ "required_native_child_threads" ] teamConfig.capacity
     && isPositiveInt teamConfig.capacity.required_native_child_threads
     && hasExactFields [ "design" "implementation" ] teamConfig.work_policy
@@ -342,13 +347,20 @@ let
     if teamConfig == null then null else builtins.hashString "sha256" (canonicalJSON teamConfig);
   teamDigest =
     teamName: team:
-    builtins.hashString "sha256" (canonicalJSON {
-      schema_version = teamConfig.schema_version;
-      inherit (teamConfig) capacity;
-      work_policy = teamConfig.work_policy;
-      team_name = teamName;
-      inherit team;
-    });
+    builtins.hashString "sha256" (
+      canonicalJSON (
+        {
+          schema_version = teamConfig.schema_version;
+          inherit (teamConfig) capacity;
+          work_policy = teamConfig.work_policy;
+          team_name = teamName;
+          inherit team;
+        }
+        // lib.optionalAttrs (teamConfig.schema_version == 6) {
+          inherit (teamConfig) execution_access;
+        }
+      )
+    );
   nativeIdentity = developerInstructions: {
     inherit generator;
     native_adapter = nativeAdapter;
@@ -383,6 +395,10 @@ let
         name = ${builtins.toJSON name}
         description = ${builtins.toJSON "Managed ${role.behavior} for team ${team}, effort ${effort}."}
         developer_instructions = ${builtins.toJSON developerInstructions}
+        ${lib.optionalString (teamConfig.schema_version == 6) ''
+          sandbox_mode = "danger-full-access"
+          approval_policy = "never"
+        ''}
       '';
     };
   roleVariants =
@@ -425,6 +441,10 @@ let
           name = ${builtins.toJSON name}
           description = "Managed transient verification watcher."
           developer_instructions = ${builtins.toJSON developerInstructions}
+          ${lib.optionalString (teamConfig.schema_version == 6) ''
+            sandbox_mode = "danger-full-access"
+            approval_policy = "never"
+          ''}
         '';
       };
   nativeRoleConfigs = map (variant: builtins.removeAttrs variant [ "source" ]) roleVariants;

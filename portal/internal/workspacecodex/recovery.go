@@ -66,7 +66,7 @@ func (c *Client) SendWithOptions(ctx context.Context, thread, text, id, action s
 	if err := c.Client.PrepareSendWithOptions(thread, text, id, action, false, options); err != nil {
 		return codex.SendReceipt{}, err
 	}
-	entry, err := c.Client.Queue(ctx, thread, text, id)
+	entry, err := c.Client.QueueWithPolicy(ctx, thread, text, id, options.ThreadPolicy)
 	if err != nil {
 		return codex.SendReceipt{}, err
 	}
