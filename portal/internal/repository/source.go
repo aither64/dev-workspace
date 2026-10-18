@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -12,7 +14,7 @@ import (
 )
 
 // SourceKind identifies whether the displayed bytes came from a live worktree,
-// an archived final commit, a shared workspace, or a published tracking artifact.
+// an archived final commit, a shared workspace, or a session tracking file.
 type SourceKind string
 
 const (
@@ -44,8 +46,8 @@ func ValidSourcePath(path string) bool {
 	return true
 }
 
-// Session files retain their registration and artifact publication checks even
-// when they are tracked by the workspace repository.
+// Session files retain their session lookup and repository registration checks
+// even when they are tracked by the workspace repository.
 func ValidWorkspaceSourcePath(path string) bool {
 	if !ValidSourcePath(path) {
 		return false
@@ -63,14 +65,47 @@ func (r ReviewReader) WorkspaceSource(ctx context.Context, path string) (SourceF
 	if !ValidWorkspaceSourcePath(path) {
 		return result, errors.New("invalid shared workspace path")
 	}
-	root, err := r.git(ctx, r.Workspace, 8192, "rev-parse", "--show-toplevel")
-	if err != nil {
+	if err := r.workspaceSourceRoot(ctx); err != nil {
 		return result, err
 	}
-	if strings.TrimSuffix(string(root), "\n") != r.Workspace {
-		return result, errors.New("configured workspace is not the repository root")
+	var err error
+	result.Content, err = r.workingSource(ctx, "", path)
+	return result, err
+}
+
+func (r ReviewReader) workspaceSourceRoot(ctx context.Context) error {
+	root, err := r.git(ctx, r.Workspace, 8192, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
 	}
-	result.Content, err = r.trackedSource(ctx, "", path)
+	if strings.TrimSuffix(string(root), "\n") != r.Workspace {
+		return errors.New("configured workspace is not the repository root")
+	}
+	return nil
+}
+
+// TrackingSource preserves explicit artifact access and also admits ordinary
+// workspace files beneath the session's actual tracking root. The artifact
+// source values are retained for existing viewer clients.
+func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summary, path string) (SourceFile, error) {
+	result := SourceFile{Path: path, Source: SourceArtifact}
+	if summary.Archived {
+		result.Source = SourceArchivedArtifact
+	}
+	file, info, err := session.OpenArtifact(summary, path, math.MaxInt64)
+	if err == nil {
+		defer file.Close()
+		result.Content, err = ReadSourcePreview(file, info.Size())
+		return result, err
+	}
+	if summary.Workspace != r.Workspace || !session.ValidSlug(summary.Slug) ||
+		(summary.Root != "work" && summary.Root != "archive") || !ValidSourcePath(path) {
+		return result, errors.New("invalid session source path")
+	}
+	if err := r.workspaceSourceRoot(ctx); err != nil {
+		return result, err
+	}
+	result.Content, err = r.workingSource(ctx, "", filepath.Join(summary.Root, summary.Slug, path))
 	return result, err
 }
 
@@ -102,23 +137,48 @@ func (r ReviewReader) Source(ctx context.Context, slug string, item session.Repo
 		return result, err
 	}
 
-	result.Content, err = r.trackedSource(ctx, filepath.Join("worktrees", slug, item.Name), path)
+	result.Content, err = r.workingSource(ctx, filepath.Join("worktrees", slug, item.Name), path)
 	return result, err
 }
 
-func (r ReviewReader) trackedSource(ctx context.Context, directory, path string) (ReviewBlob, error) {
+func (r ReviewReader) workingSource(ctx context.Context, directory, path string) (ReviewBlob, error) {
 	out, err := r.git(ctx, filepath.Join(r.Workspace, directory), 64*1024, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path)
 	if err != nil {
 		return ReviewBlob{}, err
 	}
 	if len(out) == 0 {
-		return ReviewBlob{}, errors.New("file is not tracked")
-	}
-	for _, entry := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
-		metadata, name, ok := strings.Cut(entry, "\t")
-		fields := strings.Fields(metadata)
-		if !ok || name != path || len(fields) != 3 || !regularGitMode(fields[0]) {
-			return ReviewBlob{}, errors.New("file is not a tracked regular file")
+		// Read only the effective ignore-file setting with the operator's
+		// configuration. Do not enable that configuration for repository reads.
+		excludes, configErr := r.runGit(ctx, filepath.Join(r.Workspace, directory), 8192, true, "config", "--null", "--path", "--get", "core.excludesFile")
+		args := []string{}
+		if configErr == nil {
+			if !strings.HasSuffix(string(excludes), "\x00") {
+				return ReviewBlob{}, errors.New("invalid Git excludes file setting")
+			}
+			args = append(args, "-c", "core.excludesFile="+strings.TrimSuffix(string(excludes), "\x00"))
+		} else {
+			var exitError *exec.ExitError
+			if !errors.As(configErr, &exitError) || exitError.ExitCode() != 1 {
+				return ReviewBlob{}, configErr
+			}
+		}
+		args = append(args, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", path)
+		out, err = r.git(ctx, filepath.Join(r.Workspace, directory), 64*1024, args...)
+		if err != nil {
+			return ReviewBlob{}, err
+		}
+		// A literal directory pathspec may return children. Only the exact file
+		// selected by the caller is eligible, never a prefix match.
+		if string(out) != path+"\x00" {
+			return ReviewBlob{}, errors.New("file is neither tracked nor non-ignored untracked")
+		}
+	} else {
+		for _, entry := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
+			metadata, name, ok := strings.Cut(entry, "\t")
+			fields := strings.Fields(metadata)
+			if !ok || name != path || len(fields) != 3 || !regularGitMode(fields[0]) {
+				return ReviewBlob{}, errors.New("file is not a tracked regular file")
+			}
 		}
 	}
 	file, info, err := session.OpenRegularFile(r.Workspace, filepath.Join(directory, path))

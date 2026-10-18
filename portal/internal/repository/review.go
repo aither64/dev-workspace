@@ -145,6 +145,12 @@ func (w *limitedGitOutput) Write(p []byte) (int, error) {
 	return w.buffer.Write(p)
 }
 func (r ReviewReader) git(ctx context.Context, dir string, limit int, args ...string) ([]byte, error) {
+	return r.runGit(ctx, dir, limit, false, args...)
+}
+
+// readConfig is used only to read the operator's effective excludesFile setting.
+// All repository/object operations continue to ignore system/global config.
+func (r ReviewReader) runGit(ctx context.Context, dir string, limit int, readConfig bool, args ...string) ([]byte, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 4 * time.Second
@@ -167,7 +173,10 @@ func (r ReviewReader) git(ctx context.Context, dir string, limit int, args ...st
 			cmd.Env = append(cmd.Env, entry)
 		}
 	}
-	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1", "LC_ALL=C")
+	if !readConfig {
+		cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	}
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "GIT_NO_LAZY_FETCH=1", "LC_ALL=C")
 	out := &limitedGitOutput{max: limit, cancel: cancel}
 	stderr := &limitedGitOutput{max: 8192, cancel: cancel}
 	cmd.Stdout = out

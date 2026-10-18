@@ -14,8 +14,8 @@ export function sourceFileVersion(file) {
   switch (file.source) {
     case "worktree": return "Current worktree · includes uncommitted edits";
     case "archive": return `Archived final commit · ${file.revision}`;
-    case "archived-artifact": return "Archived session artifact";
-    case "artifact": return "Current session artifact";
+    case "archived-artifact": return "Archived session file";
+    case "artifact": return "Current session file";
     case "workspace": return "Current workspace · includes uncommitted edits";
     default: throw new Error("The file source is unknown. Reload the page to try again.");
   }

@@ -111,7 +111,7 @@ func TestSourceLinksEscapingAndRejectedDestinations(t *testing.T) {
 	}
 }
 
-func TestSourceFileReadsCurrentIndexMembersAndRejectsEscapes(t *testing.T) {
+func TestSourceFileReadsEligibleWorkingFilesAndRejectsEscapes(t *testing.T) {
 	s, _, worktree, _ := reviewWebFixture(t)
 	write := func(name, text string) {
 		t.Helper()
@@ -137,13 +137,39 @@ func TestSourceFileReadsCurrentIndexMembersAndRejectsEscapes(t *testing.T) {
 	}
 	write("untracked", "private")
 	write(".env", "private")
-	for _, path := range []string{"untracked", ".env", ".git", ".git/config", "../private", "a/../file", "a//file", "/etc/passwd", "*", ":(glob)*", "file/child"} {
+	write(".gitignore", ".env\nignored/\nfile\n")
+	write("ignored/nested", "ignored")
+	if readSource(t, s, sourceQuery("untracked"), 200).Content.Text != "private" {
+		t.Fatal("non-ignored untracked file was not read")
+	}
+	// Index membership still authorizes a file when a later ignore rule matches.
+	readSource(t, s, sourceQuery("file"), 200)
+	for _, name := range []string{"unstaged space ž.rb", "unstaged*file", "percent%20file", "new:10", "new/nested.rb"} {
+		write(name, "untracked bytes\n")
+		if readSource(t, s, sourceQuery(name), 200).Content.Text != "untracked bytes\n" {
+			t.Fatalf("untracked path was not read literally: %s", name)
+		}
+	}
+	exclude := strings.TrimSpace(webGitOutput(t, "-C", worktree, "rev-parse", "--git-path", "info/exclude"))
+	if err := os.WriteFile(exclude, []byte("local-private\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	write("local-private", "excluded")
+	for _, path := range []string{".env", "ignored/nested", "local-private", ".git", ".git/config", "../private", "a/../file", "a//file", "/etc/passwd", "*", ":(glob)*", "file/child", "new"} {
 		status := 404
 		if !repository.ValidSourcePath(path) {
 			status = 400
 		}
 		readSource(t, s, sourceQuery(path), status)
 	}
+	if err := os.Symlink("untracked", filepath.Join(worktree, "untracked-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(worktree, "untracked-fifo"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	readSource(t, s, sourceQuery("untracked-link"), 404)
+	readSource(t, s, sourceQuery("untracked-fifo"), 404)
 	for _, query := range []string{sourceQuery("file") + "&path=untracked", sourceQuery("file") + "&artifact=plan.md", "?artifact=plan.md&artifact=state.md", "?artifact=%zz"} {
 		readSource(t, s, query, 400)
 	}
@@ -163,6 +189,114 @@ func TestSourceFileReadsCurrentIndexMembersAndRejectsEscapes(t *testing.T) {
 	}
 	readSource(t, s, sourceQuery("file"), 404)
 	reviewRequest(t, s, "GET", "/api/sessions/other/file"+sourceQuery("new space ž.rb"), "", 404)
+}
+
+func TestSourceTrackingFilesDoNotRequireArtifactPublication(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	root := s.config.Workspace
+	runWebGit(t, "init", "--initial-branch=master", root)
+	tracking := filepath.Join(root, "work", "example")
+	write := func(path, text string) {
+		t.Helper()
+		name := filepath.Join(tracking, path)
+		if err := os.MkdirAll(filepath.Dir(name), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(text), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reproduce a catalog entry with a workspace-relative path. Direct links
+	// select design.md relative to the tracking directory, independently of it.
+	manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts:\n  - label: Design\n    path: work/example/design.md\n"
+	write("portal.yml", manifest)
+	write("design.md", "# Rust rewrite plan\n")
+	runWebGit(t, "-C", root, "add", "--", "work/example/design.md")
+	write(".gitignore", "*.secret\ndesign.md\n")
+	write("reports/new space ž.md", "untracked session document\n")
+	write("private.secret", "ignored session content\n")
+	for _, path := range []string{"design.md", "reports/new space ž.md"} {
+		file := readSource(t, s, "?"+url.Values{"artifact": {path}}.Encode(), 200)
+		if file.Source != "artifact" || file.Path != path || file.Content.Text == "" {
+			t.Fatalf("tracking source %q = %#v", path, file)
+		}
+	}
+	readSource(t, s, "?artifact=private.secret", 404)
+	readSource(t, s, "?artifact=missing.md", 404)
+	readSource(t, s, "?artifact=reports", 404)
+	readSource(t, s, "?artifact=.git/config", 404)
+	// Opening a direct source link does not publish the file to artifact APIs.
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=design.md", "", 404)
+	if err := os.Symlink("design.md", filepath.Join(tracking, "link.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(tracking, "fifo"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	readSource(t, s, "?artifact=link.md", 404)
+	readSource(t, s, "?artifact=fifo", 404)
+	// Explicit publication continues to authorize ignored artifacts.
+	manifest += "  - label: Published report\n    path: private.secret\n"
+	write("portal.yml", manifest)
+	readSource(t, s, "?artifact=private.secret", 200)
+	writeWebTrackingFiles(t, tracking, "complete")
+	write("portal.yml", manifest+"finalized_at: '2026-10-18T10:00:00Z'\n")
+	archive := filepath.Join(root, "archive", "example")
+	if err := os.MkdirAll(filepath.Dir(archive), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tracking, archive); err != nil {
+		t.Fatal(err)
+	}
+	file := readSource(t, s, "?artifact=reports%2Fnew+space+%C5%BE.md", 200)
+	if file.Source != "archived-artifact" || file.Content.Text != "untracked session document\n" {
+		t.Fatalf("archived tracking source = %#v", file)
+	}
+	response := httptest.NewRecorder()
+	s.Handler().ServeHTTP(response, httptest.NewRequest("GET", tracking+"/design.md:1", nil))
+	if response.Code != 302 || response.Header().Get("Location") != "/files/example?artifact=design.md#L1" {
+		t.Fatalf("retained tracking link: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSourceFilesRespectConfiguredGlobalExcludes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	exclude := filepath.Join(home, "global-ignore")
+	if err := os.WriteFile(exclude, []byte("private.env\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "config", "--global", "core.excludesFile", exclude)
+	s, _, worktree, _ := reviewWebFixture(t)
+	root := s.config.Workspace
+	runWebGit(t, "init", "--initial-branch=master", root)
+	tracking := filepath.Join(root, "work", "example")
+	for _, directory := range []string{root, worktree, tracking} {
+		if err := os.WriteFile(filepath.Join(directory, "private.env"), []byte("synthetic private fixture\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if out := webGitOutput(t, "-C", directory, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", "private.env"); out != "" {
+			t.Fatalf("ordinary Git did not exclude the fixture: %q", out)
+		}
+	}
+	readSource(t, s, sourceQuery("private.env"), 404)
+	readWorkspaceSource(t, s, "private.env", 404)
+	readSource(t, s, "?artifact=private.env", 404)
+	// Existing index/publication authorization remains independent of excludes.
+	runWebGit(t, "-C", worktree, "add", "--force", "private.env")
+	runWebGit(t, "-C", root, "add", "--force", "private.env")
+	readSource(t, s, sourceQuery("private.env"), 200)
+	readWorkspaceSource(t, s, "private.env", 200)
+	manifest, err := os.ReadFile(filepath.Join(tracking, "portal.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = append(manifest, []byte("artifacts:\n  - label: Published\n    path: private.env\n")...)
+	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), manifest, 0644); err != nil {
+		t.Fatal(err)
+	}
+	readSource(t, s, "?artifact=private.env", 200)
 }
 
 func TestSourceFilesUseArchivedFinalCommitAndCuratedArtifacts(t *testing.T) {
@@ -256,7 +390,6 @@ func TestSourceFilePreviewBounds(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(worktree, test.name), []byte(test.text), 0644); err != nil {
 			t.Fatal(err)
 		}
-		runWebGit(t, "-C", worktree, "add", "--", test.name)
 		got := readSource(t, s, sourceQuery(test.name), 200).Content
 		if got.Binary != test.binary || got.Limited != test.limited || (test.binary || test.limited) && got.Text != "" {
 			t.Fatalf("%s: %#v", test.name, got)

@@ -17,7 +17,7 @@ const fs = require("node:fs");
   assert.match(sourceFileVersion({source: "archive", revision: "exact-final-head"}), /exact-final-head/);
   assert.match(sourceFileVersion({source: "worktree"}), /uncommitted/);
   assert.match(sourceFileVersion({source: "archived-artifact"}), /Archived/);
-  assert.equal(sourceFileVersion({source: "artifact"}), "Current session artifact");
+  assert.equal(sourceFileVersion({source: "artifact"}), "Current session file");
   assert.match(sourceFileVersion({source: "workspace"}), /Current workspace.*uncommitted/);
   assert.throws(() => sourceFileVersion({source: "unknown"}), /source is unknown/);
 

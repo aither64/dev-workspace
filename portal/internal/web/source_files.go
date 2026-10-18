@@ -1,7 +1,6 @@
 package web
 
 import (
-	"math"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -24,8 +23,8 @@ func sourceLine(value string) bool {
 }
 
 // sourceLink maps workspace path structure without filesystem reads. Rendering
-// a transcript never grants access: the file API checks index membership and
-// confinement, plus session registration/publication for session files.
+// a transcript never grants access: the file API checks Git eligibility and
+// confinement, plus session identity and repository registration.
 func (s *Server) sourceLink(input *url.URL) (string, bool) {
 	if input.Scheme != "" || input.Host != "" || input.User != nil || input.RawQuery != "" || input.ForceQuery {
 		return "", false
@@ -175,7 +174,7 @@ func (s *Server) workspaceSourceFile(w http.ResponseWriter, r *http.Request) {
 	result, err := s.reviews().reader.WorkspaceSource(r.Context(), path)
 	if err != nil {
 		s.config.Logger.Printf("workspace source file %s: %v", path, err)
-		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. It must be a tracked regular file in the workspace repository."})
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the workspace and is tracked or not ignored by Git."})
 		return
 	}
 	s.writeJSON(w, http.StatusOK, result)
@@ -189,20 +188,10 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 	}
 	var result repository.SourceFile
 	if artifact := query.Get("artifact"); artifact != "" {
-		// Authorize and inspect the file without reading it. ReadSourcePreview
-		// enforces the display limit even if the artifact grows during the read.
-		file, info, err := session.OpenArtifact(summary, artifact, math.MaxInt64)
+		var err error
+		result, err = s.reviews().reader.TrackingSource(r.Context(), summary, artifact)
 		if err != nil {
-			s.sourceUnavailable(w)
-			return
-		}
-		defer file.Close()
-		result = repository.SourceFile{Path: artifact, Source: repository.SourceArtifact}
-		if summary.Archived {
-			result.Source = repository.SourceArchivedArtifact
-		}
-		result.Content, err = repository.ReadSourcePreview(file, info.Size())
-		if err != nil {
+			s.config.Logger.Printf("session source file %s/%s: %v", summary.Slug, artifact, err)
 			s.sourceUnavailable(w)
 			return
 		}
@@ -224,7 +213,7 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 }
 
 func (s *Server) sourceUnavailable(w http.ResponseWriter) {
-	s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. It must be a tracked file in a verified repository, or a published session artifact."})
+	s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the session, is tracked or not ignored by Git, or is a published artifact."})
 }
 
 // Reject malformed legacy paths before ServeMux can clean or redirect them.

@@ -87,7 +87,7 @@ func TestWorkspaceSourceLinksRewriteAndRedirect(t *testing.T) {
 	}
 }
 
-func TestWorkspaceSourceReadsTrackedCurrentFilesAndPreservesSessionBoundary(t *testing.T) {
+func TestWorkspaceSourceReadsEligibleCurrentFilesAndPreservesSessionBoundary(t *testing.T) {
 	s := newTestServer(t)
 	root := s.config.Workspace
 	runWebGit(t, "init", "--initial-branch=master", root)
@@ -117,7 +117,21 @@ func TestWorkspaceSourceReadsTrackedCurrentFilesAndPreservesSessionBoundary(t *t
 		t.Fatal("workspace preview limits changed")
 	}
 	write("untracked", []byte("private\n"))
-	readWorkspaceSource(t, s, "untracked", 404)
+	if readWorkspaceSource(t, s, "untracked", 200).Content.Text != "private\n" {
+		t.Fatal("untracked workspace file was not read")
+	}
+	write(".gitignore", []byte("ignored/\nAGENTS.md\n"))
+	write("ignored/private", []byte("ignored\n"))
+	readWorkspaceSource(t, s, "ignored/private", 404)
+	readWorkspaceSource(t, s, "AGENTS.md", 200)
+	if err := os.WriteFile(filepath.Join(root, ".git", "info", "exclude"), []byte("local-private\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	write("local-private", []byte("excluded\n"))
+	readWorkspaceSource(t, s, "local-private", 404)
+	write("new/nested space ž.md", []byte("untracked nested\n"))
+	readWorkspaceSource(t, s, "new/nested space ž.md", 200)
+	readWorkspaceSource(t, s, "new", 404)
 	readWorkspaceSource(t, s, "missing", 404)
 	for _, path := range []string{"work/example/private.md", "archive/example/private.md", "worktrees/example/project/private", "repos/project.git/private"} {
 		write(path, []byte("private\n"))

@@ -80,21 +80,34 @@ the address; **Copy link** copies that address. Links without a line reference
 open the beginning of the file.
 
 Active repository links show the current worktree contents, including
-uncommitted edits and newly staged files. The file must be tracked in a verified
-session repository. After archival, the viewer reads the recorded final commit
+uncommitted edits and non-ignored untracked files. The repository must be verified
+for the session. Tracked files remain available even when an ignore rule matches
+them. After archival, the viewer reads the recorded final commit
 and displays its revision. A link is a live reference, so later edits can move
 the referenced line. The viewer reports a missing line instead of selecting a
 different one.
 
-Shared workspace links show current contents of Git-tracked files, including
-uncommitted edits and newly staged files. They can open documentation, the root
+Untracked eligibility follows Git's standard excludes, including repository
+ignore files, local exclusions and the configured global ignore file.
+
+Shared workspace links show current contents of tracked and non-ignored
+untracked files. They can open documentation, the root
 `AGENTS.md`, scripts and notes without a session registration. The configured
 workspace must be the Git repository root. Files under `work/`, `archive/`,
 `worktrees/` and `repos/` are excluded from this shared reader so session files
-keep their repository registration and artifact publication checks.
+keep their session lookup and repository registration checks.
 
-Tracking files are limited to `plan.md`, `state.md` and artifacts declared in
-`portal.yml`. Their links continue to work when tracking moves into `archive/`.
+Session tracking links can open tracked and non-ignored untracked files beneath
+the session's tracking folder without artifact registration. Their links
+continue to work when tracking moves into `archive/`, provided the retained file
+is still eligible at its new path. Untracked project files are unavailable after
+their worktree is removed; the source viewer does not save them.
+
+The built-in `plan.md` and `state.md`, and artifacts declared in `portal.yml`,
+retain explicit access even when Git ignores them or the workspace has no Git
+repository. Artifact paths are relative to the session tracking folder, such as
+`design.md` or `reports/result.json`. Opening a source link does not add the file
+to the artifact list or grant access through artifact preview/download endpoints.
 
 Repeated artifact paths are allowed. The portal shows one link per normalized
 relative path, using the first declaration's label and position. For example,
@@ -113,17 +126,20 @@ A nonempty `label` takes precedence. Writers use only `label`. Both spellings
 retain the same string and path validation; an alias cannot authorize files
 outside the tracking directory.
 
-Untracked repository files, Git metadata, symlinks and other host files are not
-available. Text previews are limited to 512 KiB and 12,000 lines. Markdown files
+Git-ignored untracked files require explicit artifact publication. Git metadata,
+symlinks, special files and files outside the authorized roots are unavailable.
+Text previews are limited to 512 KiB and 12,000 lines. Markdown files
 appear as source; binary files receive a notice instead of a text preview.
 
 The viewer route is `/files/<slug>?repository=<id>&path=<relative-path>#L10`,
-or `/files/<slug>?artifact=<relative-path>#L10` for a tracking artifact. The
+or `/files/<slug>?artifact=<relative-path>#L10` for a session tracking file. The
 repository ID is the same opaque ID used by repository review. The read-only
 `GET /api/sessions/<slug>/file` endpoint accepts the same query parameters and
 returns `path`, `repository` when applicable, `source`, the archived `revision`
 when applicable, and a `content` object with the existing review preview fields.
 Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
+The `artifact` and `archived-artifact` values identify session tracking files,
+including those opened without publication.
 Shared files use `/workspace-files?path=<relative-path>#L10` and
 `GET /api/workspace/file?path=<relative-path>`. This endpoint returns the same
 preview fields with `source: "workspace"` and no repository or revision. It
@@ -209,8 +225,8 @@ between them. Capturing changes does not stage or discard files. Snapshot links
 last only while the portal process retains them and cannot be saved as durable
 comparison IDs. An open snapshot keeps its captured content when the repository
 changes; an expired link returns a conflict and must be recaptured. Archived
-repositories show committed comparisons only. Untracked content is available
-through an authorized review snapshot, not the source viewer.
+repositories show committed comparisons only. Untracked content can also be
+opened directly in the source viewer while the verified worktree exists.
 
 Before publishing, capture checks HEAD, index entries and bytes, non-ignored
 untracked paths, and candidate file identities again. It refuses conflicts,
