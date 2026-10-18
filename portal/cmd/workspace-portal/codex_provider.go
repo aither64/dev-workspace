@@ -631,7 +631,27 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 		case isColdReadOnlyProfile(compiled):
 			sandbox = map[string]any{"type": "read-only"}
 		default:
-			return errors.New("updated cold filesystem permissions cannot be preserved")
+			cwd, _ := params["cwd"].(string)
+			sandbox, err = coldWorkspaceSandbox(compiled, cwd)
+			if err != nil {
+				return err
+			}
+			// These are the compiled workspace roots. Falling back to cwd
+			// would introduce different metadata protections on cold resume.
+			params["runtimeWorkspaceRoots"] = sandbox["writable_roots"]
+		}
+		if raw, present := retained["runtime_workspace_roots"]; present && raw != nil {
+			roots, valid := raw.([]any)
+			if !valid || len(roots) > 4096 {
+				return errors.New("cold runtime workspace roots are invalid")
+			}
+			for _, value := range roots {
+				root, valid := value.(string)
+				if !valid || !canonicalAbsolutePath(root) {
+					return errors.New("cold runtime workspace roots are invalid")
+				}
+			}
+			params["runtimeWorkspaceRoots"] = roots
 		}
 		ok = true
 	}

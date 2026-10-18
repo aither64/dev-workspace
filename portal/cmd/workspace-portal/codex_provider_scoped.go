@@ -438,7 +438,7 @@ func captureScopedProviderThread(ctx context.Context, client *workspacecodex.Cli
 	if metadata.Thread.ID != thread.ID || metadata.Thread.Cwd != thread.Cwd || metadata.Thread.Status == nil || metadata.Thread.Provider == "" {
 		return fail("thread_identity_unproved", errors.New("native thread metadata has an unexpected identity"))
 	}
-	params := map[string]any{"threadId": thread.ID, "excludeTurns": true, "modelProvider": metadata.Thread.Provider, "model": thread.Settings.Model, "config": map[string]any{"model_reasoning_effort": thread.Settings.ReasoningEffort}}
+	params := map[string]any{"threadId": thread.ID, "cwd": thread.Cwd, "excludeTurns": true, "modelProvider": metadata.Thread.Provider, "model": thread.Settings.Model, "config": map[string]any{"model_reasoning_effort": thread.Settings.ReasoningEffort}}
 	if metadata.Thread.Status["type"] == "notLoaded" {
 		if metadata.Thread.Path == nil {
 			return errors.New("cold provider thread has no settings history")

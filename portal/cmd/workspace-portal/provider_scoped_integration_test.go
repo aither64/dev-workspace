@@ -262,6 +262,44 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 	if err != nil || len(queueBefore) != 1 {
 		t.Fatalf("queue before: %v %v", queueBefore, err)
 	}
+	// Reproduce the failed idle thread using native settings writes. The old
+	// turn is read-only; newer snapshots carry workspace-write permissions,
+	// duplicate configured roots and separately saved runtime workspace roots.
+	var coldRead struct {
+		Thread struct {
+			Path   *string        `json:"path"`
+			Status map[string]any `json:"status"`
+		} `json:"thread"`
+	}
+	unloadIdle := func() {
+		t.Helper()
+		if err := client.Request(ctx, "thread/archive", map[string]any{"threadId": threads["idle"]}, &response); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Request(ctx, "thread/unarchive", map[string]any{"threadId": threads["idle"]}, &response); err != nil {
+			t.Fatal(err)
+		}
+		wait("cold idle thread", func() bool {
+			if err := client.Request(ctx, "thread/read", map[string]any{"threadId": threads["idle"], "excludeTurns": true}, &coldRead); err != nil {
+				return false
+			}
+			return coldRead.Thread.Path != nil && coldRead.Thread.Status["type"] == "notLoaded"
+		})
+	}
+	unloadIdle()
+	if err := client.Request(ctx, "thread/resume", map[string]any{
+		"threadId": threads["idle"], "excludeTurns": true, "cwd": filepath.Join(root, "work", "idle"),
+		"runtimeWorkspaceRoots": []string{root}, "sandbox": "workspace-write",
+		"config": map[string]any{"sandbox_workspace_write": map[string]any{"writable_roots": []string{root, root, "/tmp"}, "network_access": false, "exclude_tmpdir_env_var": true, "exclude_slash_tmp": false}},
+	}, &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Request(ctx, "thread/settings/update", map[string]any{"threadId": threads["idle"], "approvalPolicy": "never"}, &response); err != nil {
+		t.Fatal(err)
+	}
+	unloadIdle()
+	historyPath := *coldRead.Thread.Path
+	expectedPermissions := compiledWorkspacePolicy([]string{root, root, "/tmp"})
 	beforeIdle, err := client.ActiveTurnID(ctx, threads["idle"])
 	if err != nil || beforeIdle != "" {
 		t.Fatalf("idle before: %s %v", beforeIdle, err)
@@ -307,6 +345,54 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 	helper("scoped-switch")
 	helper("scoped-continue")
 	helper("scoped-continue")
+	// A no-op approval update persists the current native compiled policy,
+	// proving that the comparison cannot use the synthetic input snapshot.
+	if err := client.Request(ctx, "thread/settings/update", map[string]any{"threadId": threads["idle"], "approvalPolicy": "never"}, &response); err != nil {
+		t.Fatal(err)
+	}
+	// Inspect only settings metadata, never transcript content. Native compilation
+	// must preserve the effective entries, including metadata protections.
+	var latestCompiled map[string]any
+	wait("persisted target permission snapshot", func() bool {
+		data, err := os.ReadFile(historyPath)
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if !strings.Contains(line, "thread_settings_applied") {
+				continue
+			}
+			var record struct {
+				Payload struct {
+					ThreadID string `json:"thread_id"`
+					Settings struct {
+						Profile  map[string]any `json:"permission_profile"`
+						Provider string         `json:"model_provider_id"`
+						Roots    []string       `json:"runtime_workspace_roots"`
+					} `json:"thread_settings"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal([]byte(line), &record) == nil && record.Payload.ThreadID == threads["idle"] && record.Payload.Settings.Provider == "pool-b" {
+				if !reflect.DeepEqual(record.Payload.Settings.Roots, []string{root}) {
+					t.Fatalf("persisted native runtime roots changed: %#v", record.Payload.Settings.Roots)
+				}
+				latestCompiled = record.Payload.Settings.Profile
+			}
+		}
+		return latestCompiled != nil
+	})
+	actualPolicy, err := coldWorkspaceSandbox(latestCompiled, filepath.Join(root, "work", "idle"))
+	if err != nil {
+		t.Fatalf("native compiled policy: %v %#v", err, latestCompiled)
+	}
+	expectedPolicy, err := coldWorkspaceSandbox(expectedPermissions, filepath.Join(root, "work", "idle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(actualPolicy, expectedPolicy) {
+		t.Fatalf("native changed permissions: got %#v want %#v", actualPolicy, expectedPolicy)
+	}
+
 	for _, slug := range []string{"busy", "idle", "plain", "goal", "member", "unrelated"} {
 		var result map[string]any
 		if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": threads[slug], "excludeTurns": true}, &result); err != nil {
@@ -315,6 +401,9 @@ func TestNativeScopedProviderSwitch(t *testing.T) {
 		wanted := "pool-b"
 		if slug == "unrelated" {
 			wanted = "pool-a"
+		}
+		if slug == "idle" && !reflect.DeepEqual(result["runtimeWorkspaceRoots"], []any{root}) {
+			t.Fatalf("native changed cold runtime roots: %#v", result["runtimeWorkspaceRoots"])
 		}
 		if result["modelProvider"] != wanted {
 			t.Fatalf("%s provider=%v", slug, result["modelProvider"])
