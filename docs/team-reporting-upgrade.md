@@ -10,8 +10,12 @@ version or codex-web API change.
 
 Complete review, verification, exact builds and snapshot preparation before
 activation. Keep the normal system-before-profile order and machine reservation.
-A changed complete startup argv requires normal idle restart, even with an
-identical native executable. Busy conversations defer cutover; do not stop them,
+A changed startup contract requires normal idle restart, even with an
+identical native executable. Once reporting policy 1 is installed, a package-only
+MCP command-path change is compatible when both complete invocations retain the
+same authorities and tool policy. The host preserves the actual launch marker
+and the retained helper dispatches each report through the selected profile.
+When a restart is required, busy conversations defer cutover; do not stop them,
 expand sandbox access, bypass ownership or select a different package around the
 reservation. Normal reconciliation quiesces idle terminal clients, restarts the
 shared daemon and restores retained conversations. Browser clients reconnect.
@@ -25,11 +29,13 @@ message for each stable ID, including duplicate-ID retry. Concurrent reports fro
 distinct members must keep their own native caller/session identities. Never send
 from a member address as an operator to manufacture acceptance.
 
-## Predecessor cannot decode startup argv
+## Predecessor cannot decode or compare startup argv
 
 A predecessor limited to `agents.*` launch arguments cannot prepare or activate
-the new MCP plan. The reviewed candidate provides narrow managed entries for
-this first upgrade. These are not bootstrap and cannot create a new owner,
+the new MCP plan. A reporting-policy-1 predecessor with strict argv comparison
+also needs the candidate host's comparison for its first live package update.
+The reviewed candidate provides narrow managed entries for these upgrades.
+These are not bootstrap and cannot create a new owner,
 reservation, approval or activation job. Use the actual managed lead, held
 reservation and an explicit current predecessor profile token from ordinary
 coordination evidence. The executing candidate must equal the output built from
@@ -50,7 +56,8 @@ retains the exact source and artifact. Approve and submit the returned normal
 snapshot with the stable coordinator, preserving explicit system dependency and
 the same reservation. Candidate preparation grants no deployment permission.
 
-If the predecessor worker refuses the new argv before profile selection, retain
+If the predecessor worker refuses the new argv or requires idle solely because
+its reporting command path changed, before profile selection, retain
 its original result and claim. Once that exact attempt's service has exited,
 recover it through the same reviewed candidate:
 

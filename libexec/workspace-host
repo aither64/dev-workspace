@@ -1801,8 +1801,22 @@ module DevWorkspaceHost
 
     def marker_has_semantics?(marker, codex, plan)
       marker.is_a?(Hash) && marker.dig('launch', 'codex_path') == codex &&
-        marker.dig('launch', 'policy') == plan.policy && marker.dig('launch', 'argv') == plan.argv &&
+        marker.dig('launch', 'policy') == plan.policy && registration_argv_equivalent?(marker, plan) &&
         marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads
+    end
+
+    def registration_argv_equivalent?(marker, plan)
+      launch = marker.fetch('launch')
+      return true if launch['argv'] == plan.argv
+
+      # Policy 1 reporting processes resolve the selected profile on every
+      # report. Only their package-dependent executable path may differ. Check
+      # both complete invocations so authority or tool-policy changes still
+      # require the ordinary idle restart. Keep the actual launch marker intact.
+      entry = marker.fetch('workspace')
+      reporting_startup_contract?(launch['package_root']) && reporting_startup_contract?(plan.package_root) &&
+        valid_reporting_registration_argv?(launch['argv'], entry, launch['package_root']) &&
+        valid_reporting_registration_argv?(plan.argv, entry, plan.package_root)
     end
 
     def marker_matches_plan?(entry, marker, codex, plan)

@@ -15,8 +15,9 @@ const RegistrationPolicyVersion = 1
 // The installed catalog identity still participates in the marker digest: a
 // creation request uses the selected package's validated catalog. The digest
 // records launch provenance; catalog changes alone do not alter the native
-// executable or capacity. WithWorkspaceReporting adds the owned startup server;
-// any change to that complete argv requires ordinary idle restart.
+// executable or capacity. WithWorkspaceReporting records the exact owned startup
+// server argv. The host validates policy-1 reporting invocations before allowing
+// a package-only command-path change without restarting the native daemon.
 type RegistrationPlan struct {
 	Schema                     int      `json:"schema"`
 	Policy                     int      `json:"policy"`

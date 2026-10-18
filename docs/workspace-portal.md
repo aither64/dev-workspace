@@ -427,10 +427,13 @@ must be run again.
 
 Packages publishing `livePackageSwitchPolicy = 1` can switch while threads are
 active when the candidate resolves to the same native Codex executable, launch
-policy, complete arguments and native child-thread capacity as every running
-workspace's launch marker. Catalog defaults, portal code, session tools and
-package paths do not themselves require a Codex restart unless they change the
-complete reporting-server launch argv. The host refreshes
+policy, launch arguments and native child-thread capacity as every running
+workspace's launch marker. Reporting policy 1 permits the package-dependent MCP
+executable path to change: both complete invocations must validate against their
+own package and the same workspace, state root, profile and tool policy. The
+retained reporting process resolves the selected profile on every report. Other
+argument changes still require idle restart. Catalog defaults, portal code,
+session tools and package paths alone do not require a Codex restart. The host refreshes
 registration inventory and restarts the portal and router; Codex, tmux and
 managed terminal clients keep running. Browser clients reconnect to the portal.
 
@@ -1004,8 +1007,11 @@ outcome remains uncertain, stop and investigate before resending.
 The shared workspace daemon installs one package-owned `team_reporting` MCP
 server at startup. Materialized warm threads do not accept a newly inserted MCP
 server through `thread/resume`, so member turns no longer depend on late
-per-thread insertion. A changed startup argv requires ordinary idle daemon
-reconciliation even when the native executable is unchanged. Unrelated MCP
+per-thread insertion. A changed startup contract requires ordinary idle daemon
+reconciliation even when the native executable is unchanged. Reporting policy 1
+allows only the package-dependent command path to differ after validating both
+complete invocations; the running helper dispatches through the selected profile.
+Unrelated MCP
 servers remain configured. New members, resumed histories and forks receive the
 startup server without changing their saved model, effort, access or instructions.
 
