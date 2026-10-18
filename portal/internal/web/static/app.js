@@ -220,9 +220,9 @@
     }));
     return changed;
   };
-  const messageReceiptLabel = (entry) => entry.state === "observed" ? "" :
+  const messageReceiptLabel = (entry) => entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
-      "Outcome unknown. Retry to check.";
+      "Outcome unknown.";
   const captureTranscriptDisclosureState = (container) => {
     const states = new Map();
     for (const element of container.querySelectorAll("[data-transcript-entry-key]")) {
@@ -739,6 +739,7 @@
         return {
           id, message: value.message, steered: Boolean(value.steered), ...attemptAttachmentFields(value),
           context: value.context || "",
+          ...(value.dismissed === true ? {dismissed: true} : {}),
           ...(["accepted", "observed"].includes(value.state) ? {state: value.state} : {}),
           ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
@@ -746,6 +747,7 @@
       encode: (attempt) => ({
         message: attempt.message, steered: Boolean(attempt.steered), ...attemptAttachmentFields(attempt),
         context: typeof attempt.context === "string" ? attempt.context : "",
+        ...(attempt.dismissed === true ? {dismissed: true} : {}),
         ...(["accepted", "observed"].includes(attempt.state) ? {state: attempt.state} : {}),
         ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
       }),
@@ -3734,6 +3736,38 @@
       const messageText = document.createElement("span");
       messageText.textContent = entry.message;
       item.append(statusText, messageText);
+      if (!(entry.context || "") && entry.state !== "sending") {
+        const actions = document.createElement("div");
+        actions.className = "message-receipt-actions";
+        if (entry.state === "unknown") {
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.className = "quiet";
+          retry.textContent = "Retry original";
+          retry.disabled = !interactive || executionHeld || liveSettingsSaving || inFlightMessageIDs.has(entry.id);
+          retry.addEventListener("click", () => { void retryMessageReceipt(entry.id); });
+          actions.append(retry);
+        }
+        const dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.className = "quiet";
+        dismiss.textContent = "Dismiss";
+        dismiss.title = "Hide this warning. The message may still be delivered.";
+        dismiss.disabled = inFlightMessageIDs.has(entry.id);
+        dismiss.addEventListener("click", () => {
+          const current = pendingMessages.get(entry.id);
+          if (!current || inFlightMessageIDs.has(entry.id)) return;
+          const dismissed = {...current, dismissed: true};
+          if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, dismissed)) {
+            alert("The warning could not be dismissed because browser storage is unavailable.");
+            return;
+          }
+          pendingMessages.set(entry.id, dismissed);
+          renderMessageReceipts();
+        });
+        actions.append(dismiss);
+        item.append(actions);
+      }
       container.append(item);
     }
     container.hidden = container.childElementCount === 0;
@@ -3957,6 +3991,7 @@
   addEventListener("pagehide", resetHistoryNavigation);
 
   const updateMessageActions = () => {
+    renderMessageReceipts();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
     if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving; }
@@ -4957,18 +4992,45 @@
     renderMessageReceipts();
     scheduleRefresh(0);
   };
-  const acceptMessageReceipt = (attempt, receipt) => {
-    const current = pendingMessages.get(attempt.id);
+  const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId) => {
+    const current = threadID === currentThreadId ? pendingMessages.get(attempt.id) : null;
     const accepted = {
       ...attempt, ...current,
       state: current?.state === "observed" || attempt.state === "observed" ? "observed" : "accepted",
       steered: Boolean(receipt.steered),
     };
-    pendingMessages.set(attempt.id, accepted);
+    if (threadID === currentThreadId) pendingMessages.set(attempt.id, accepted);
     // The original retry identity remains durable even when this metadata
     // update fails. Keep the known acceptance visible for this page lifetime.
-    storeSendAttempt(sendAttemptStorage, slug, currentThreadId, accepted);
+    storeSendAttempt(sendAttemptStorage, slug, threadID, accepted);
     renderMessageReceipts();
+  };
+
+  const retryMessageReceipt = async (id) => {
+    if (!interactive || executionHeld || liveSettingsSaving || inFlightMessageIDs.has(id)) return;
+    const attempt = pendingMessages.get(id);
+    if (!attempt || attempt.state !== "unknown" || attempt.context) return;
+    const threadID = currentThreadId;
+    inFlightMessageIDs.add(id);
+    pendingMessages.set(id, {...attempt, dismissed: false, state: "sending"});
+    renderMessageReceipts();
+    try {
+      const receipt = await client.message(attempt.message, id, true, attempt.attachmentIds || []);
+      acceptMessageReceipt(attempt, receipt, threadID);
+      if (threadID === currentThreadId && form?.elements.message.value.trim() === attempt.message &&
+          composerUploads?.ready() && conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
+        form.elements.message.value = "";
+        composerUploads.clear();
+      }
+    } catch (error) {
+      if (threadID === currentThreadId) markMessageOutcomeUnknown(id);
+      alert(error.message);
+    } finally {
+      inFlightMessageIDs.delete(id);
+      renderMessageReceipts();
+      scheduleRefresh(0);
+      acknowledgeTranscriptMessages();
+    }
   };
 
   const recoverPlanAttempts = (latestTurnId) => {
@@ -5010,6 +5072,7 @@
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
       if (!interactive || liveSettingsSaving) return;
+      const threadID = currentThreadId;
       const message = textarea.value.trim();
       if (!message && !composerUploads.count()) return;
       let attachments;
@@ -5049,18 +5112,22 @@
             }
           }
           const id = attempt.id;
+          if (inFlightMessageIDs.has(id)) throw new Error("This message is already being retried.");
           inFlightMessageIDs.add(id);
-          pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
+          pendingMessages.set(id, {...attempt, dismissed: false, state: attempt.state || "sending"});
           renderMessageReceipts();
           try {
-            acceptMessageReceipt(attempt, await client.message(message, id, retry, attachments));
+            acceptMessageReceipt(attempt, await client.message(message, id, retry, attachments), threadID);
           } finally {
             inFlightMessageIDs.delete(id);
             scheduleRefresh(0);
           }
         }
-        textarea.value = "";
-        composerUploads.clear();
+        if (threadID === currentThreadId && textarea.value.trim() === message &&
+            composerUploads.ready() && conversationAssets.sameAttachments(composerUploads.ids(), attachments)) {
+          textarea.value = "";
+          composerUploads.clear();
+        }
         if (!queue) followTranscript();
         else {
           void refreshQueue(true);
@@ -5069,7 +5136,7 @@
         scheduleRefresh(0);
       } catch (error) {
         for (const [id, entry] of pendingMessages) {
-          if (entry.state === "sending" && entry.message === message) {
+          if (threadID === currentThreadId && entry.state === "sending" && entry.message === message) {
             markMessageOutcomeUnknown(id);
           }
         }

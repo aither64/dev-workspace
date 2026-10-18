@@ -329,6 +329,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .message-receipt[data-receipt-state="accepted"] strong { color: var(--accent); }
 .message-receipt strong { display: block; font-weight: 500; }
 .message-receipt span { display: block; margin-top: .2rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-receipt-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .4rem; }
 .new-output { align-self: center; margin: -.25rem 0 .6rem; padding: .45rem .72rem; font-size: .8rem; box-shadow: 0 6px 22px rgba(0,0,0,.35); }
 .plan-actions { border: 1px solid #704b9d; border-radius: 10px; padding: .75rem; margin-bottom: .7rem; background: var(--plan-bg); display: flex; align-items: center; justify-content: space-between; gap: .8rem; }
 .plan-actions[hidden] { display: none; }

@@ -853,7 +853,12 @@ const [reloadedSteer] = loadSendAttempts(storage, "example", "thread-1");
 assert.deepEqual(reloadedSteer, acceptedSteer);
 assert.equal(messageReceiptLabel(reloadedSteer), "Sent to Codex");
 assert.equal(messageReceiptLabel({state: "sending"}), "Sending…");
-assert.equal(messageReceiptLabel({state: "unknown"}), "Outcome unknown. Retry to check.");
+assert.equal(messageReceiptLabel({state: "unknown"}), "Outcome unknown.");
+const dismissedSend = {...acceptedSteer, dismissed: true};
+assert.equal(storeSendAttempt(storage, "dismissed", "thread-1", dismissedSend), true);
+assert.deepEqual(loadSendAttempts(storage, "dismissed", "thread-1"), [dismissedSend]);
+assert.equal(messageReceiptLabel(dismissedSend), "");
+assert.equal(matchingSendAttempt(loadSendAttempts(storage, "dismissed", "thread-1"), dismissedSend.message).id, dismissedSend.id);
 const observedReceipts = new Map([
   [sendAttempt.id, reloadedSteer],
   ["same-text", {...acceptedSteer, id: "same-text"}],

@@ -308,6 +308,15 @@ failures appear after 30 continuous visible seconds; returning to a hidden tab
 or restoring a page starts a fresh grace period. Access errors and failures of
 user actions appear immediately.
 
+An unconfirmed send keeps its message in the composer and shows an outcome
+receipt. **Retry original** retries the receipt's saved text and attachments
+with its original attempt ID, independently of the composer draft. A changed
+draft remains intact. **Dismiss** hides the receipt across reloads while keeping
+its retry identity; delivery can still complete. Transcript confirmation retires
+the receipt normally. Sending revised wording creates a separate attempt and
+does not resolve the earlier one. Browser storage must save a dismissal before
+the portal hides it.
+
 Automatic history repair retries with capped backoff without loading banners.
 A manual older-page failure offers Retry for that page. Expired cursors trigger
 reconnection and a check of retained history. Servers without paging keep the
