@@ -1904,14 +1904,17 @@
       if (!catalog.providers?.some(provider => provider.id === defaultID)) throw new Error("Provider default unavailable");
       const intent = creationProviderValue(form);
       select.dataset.providerDefault = defaultID;
-      select.replaceChildren(...catalog.providers.map(provider => {
+      const inherited = document.createElement("option");
+      inherited.value = "";
+      inherited.defaultSelected = true;
+      inherited.textContent = `Workspace default (${catalog.providers.find(provider => provider.id === defaultID).label})`;
+      select.replaceChildren(inherited, ...catalog.providers.map(provider => {
         const option = document.createElement("option");
         option.value = provider.id;
-        option.defaultSelected = provider.id === defaultID;
-        option.textContent = provider.label + (provider.id === defaultID ? " (default)" : "");
+        option.textContent = provider.label;
         return option;
       }));
-      restoreDraftSelect(select, intent || defaultID, "Saved provider is unavailable");
+      restoreDraftSelect(select, intent, "Saved provider is unavailable");
       select.disabled = form.dataset.requestLocked === "true";
       updateCreationProviderHelp(form);
     }).catch(() => {
@@ -1926,7 +1929,7 @@
     select.dataset.providerIntent = "";
     form.addEventListener("reset", () => {
       select.dataset.providerIntent = "";
-      queueMicrotask(() => {select.value = select.dataset.providerDefault || select.value; updateCreationProviderHelp(form); void loadModels(form);});
+      queueMicrotask(() => {select.value = ""; updateCreationProviderHelp(form); void loadModels(form);});
     });
     void refreshCreationProvider(form);
   }
@@ -2120,7 +2123,7 @@
   });
   document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {
     const form = select.closest("form");
-    select.dataset.providerIntent = select.value === select.dataset.providerDefault ? "" : select.value;
+    select.dataset.providerIntent = select.value;
     updateCreationProviderHelp(form);
     modelCatalogs.clear(); void loadModels(form);
   }));
@@ -2284,7 +2287,7 @@
     if (form?.elements.provider && draft) {
       const provider = draft.provider || "";
       form.elements.provider.dataset.providerIntent = provider;
-      const selectedProvider = provider || form.elements.provider.dataset.providerDefault || "";
+      const selectedProvider = provider;
       const providerChanged = form.elements.provider.value !== selectedProvider;
       restoreDraftSelect(form.elements.provider,selectedProvider,"Saved provider is unavailable");
       updateCreationProviderHelp(form);

@@ -16,10 +16,11 @@ but interrupted delegated tasks may need to be assigned again. New subagents
 inherit their parent's selected provider. Switching uses the selected upstream
 Codex binary without an additional provider-switching patch or rebuild.
 
-The new-session and plan creation forms show the provider above **Options**.
-The actual workspace default is preselected and marked **(default)**. Keeping
-that selection makes the session follow future workspace-default changes; choosing
-a different provider pins the session to it. You can also use:
+New-session and plan creation forms show the provider directly in the form.
+**Workspace default (Codex subscription)** follows the current workspace default;
+the name in parentheses updates with the actual default. Choosing an individual
+provider pins the session to it, including when it equals the current default.
+You can also use:
 
 ```sh
 dev-session start my-task --provider openai

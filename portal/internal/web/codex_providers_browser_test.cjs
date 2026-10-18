@@ -207,6 +207,7 @@ test("plan and fork creation load destination catalogs independently of the sour
   assert.equal(planModel.options[0].value,"daybreak");
   assert.equal(sourceModel.options[0].value,"source-model");
   assert.equal(forkModel.options[0].value,"default-model");
+
   assert.equal(context.models[0].model,"source-model");
   assert(calls.includes("/api/models?provider=openai"));
   plan.elements.provider.value="pool";
@@ -296,14 +297,15 @@ async function creationProviders({locked=false, fail=false}={}) {
   return {select,form,help,reloads,value:api.value,changeDefault:async id=>{nextCatalog={...catalog,default:id,active:id};await api.refresh();},change:value=>{select.value=value;listeners.get("select-change")();},reset:async()=>{listeners.get("reset")();await tick();}};
 }
 
-test("creation shows the real default once and preserves inheritance across selection and reset",async()=>{
+test("creation separates workspace inheritance from every explicit provider",async()=>{
   const ui=await creationProviders();
-  assert.equal(ui.select.disabled,false);assert.equal(ui.select.value,"openai");assert.equal(ui.value(),"");
-  assert.deepEqual(ui.select.options.map(x=>x.value),["openai","pool"]);
-  assert.equal(ui.select.options[0].textContent,"Subscription (default)");assert.match(ui.help.textContent,/follows future default/);
+  assert.equal(ui.select.disabled,false);assert.equal(ui.select.value,"");assert.equal(ui.value(),"");
+  assert.deepEqual(ui.select.options.map(x=>x.value),["","openai","pool"]);
+  assert.equal(ui.select.options[0].textContent,"Workspace default (Subscription)");assert.match(ui.help.textContent,/follows future default/);
   ui.change("pool");assert.equal(ui.value(),"pool");assert.match(ui.help.textContent,/keeps the selected provider/);
-  ui.change("openai");assert.equal(ui.value(),"");
-  ui.change("pool");await ui.reset();assert.equal(ui.select.value,"openai");assert.equal(ui.value(),"");
+  ui.change("openai");assert.equal(ui.value(),"openai");
+  ui.change("");assert.equal(ui.value(),"");
+  ui.change("pool");await ui.reset();assert.equal(ui.select.value,"");assert.equal(ui.value(),"");
   assert.equal(ui.reloads.at(-1),ui.form);
 });
 
@@ -314,10 +316,10 @@ test("creation provider loading respects a locked request and reports unavailabl
 });
 
 
-test("creation refreshes the concrete default while preserving explicit drafts and locked intent",async()=>{
+test("creation refreshes the workspace-default label while preserving explicit drafts and locked intent",async()=>{
   const inherited=await creationProviders();await inherited.changeDefault("pool");
-  assert.equal(inherited.select.value,"pool");assert.equal(inherited.value(),"");
-  assert.equal(inherited.select.options.find(x=>x.value==="pool").textContent,"Pool (default)");
+  assert.equal(inherited.select.value,"");assert.equal(inherited.value(),"");
+  assert.equal(inherited.select.options.find(x=>x.value==="").textContent,"Workspace default (Pool)");
   inherited.change("openai");assert.equal(inherited.value(),"openai");
   // A previously explicit choice stays explicit even if it becomes the default.
   await inherited.changeDefault("openai");assert.equal(inherited.select.value,"openai");assert.equal(inherited.value(),"openai");
