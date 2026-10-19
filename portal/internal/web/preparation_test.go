@@ -954,6 +954,26 @@ func TestSessionPreparationCompactionSurvivesReceiptRetirement(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(server.config.Workspace, "work", record.Slug)); err != nil {
 		t.Fatal(err)
 	}
+	retry := func() *httptest.ResponseRecorder {
+		return postCreation(t, server, "/api/session-creations/"+record.RequestID+"/retry",
+			fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, record.ReceiptID, compact.Attempt), "application/json")
+	}
+	var status preparationStatus
+	response = retry()
+	if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 202 || status.State != "ready" || len(server.creations) != 0 {
+		t.Fatalf("ready compacted retry=%d %s", response.Code, response.Body.String())
+	}
+	directory := filepath.Join(server.config.Workspace, "work", record.Slug)
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	response = retry()
+	if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 409 || status.State != "gone" || status.ReceiptID != record.ReceiptID || len(server.creations) != 0 {
+		t.Fatalf("removed compacted retry=%d %s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("removed destination recreated", err)
+	}
 }
 
 func TestSessionPreparationPathsRejectAmbiguousIdentifiers(t *testing.T) {

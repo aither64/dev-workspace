@@ -33,10 +33,12 @@ exact receipt installation, a server-generated `canonicalUrl` and final slug.
 `POST /api/session-creations/<request-id>/retry` requires the current
 `receiptId` and `attempt`; stale offers conflict. Before handoff a retry starts
 a new preparation attempt, or resumes an attempt already published but not
-launched. After handoff the ordinary creation receipt owns
-attempts and progress. `preparationAttempt` retains the preparation generation
-through initialization and terminal compaction. `attempt` identifies the current
-retry owner: preparation before handoff, initialization afterward. Name-selection
+launched. Retrying a ready session returns 202 without restarting work.
+Deleted, cancelled or conflicting destinations return 409. After handoff the
+ordinary creation receipt owns attempts and progress. `preparationAttempt`
+retains the preparation generation through initialization and terminal compaction.
+During unfinished work, `attempt` identifies the current retry owner: preparation
+before handoff, initialization afterward. Name-selection
 confirmation uses `preparationAttempt`; initialization retry uses `attempt`.
 These endpoints require canonical unescaped UUID paths;
 mutations retain the portal's exact-origin and package-generation checks.

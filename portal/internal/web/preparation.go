@@ -718,7 +718,17 @@ func (s *Server) retryPreparation(w http.ResponseWriter, r *http.Request, id str
 		s.writeError(w, r, http.StatusServiceUnavailable, "Portal is stopping.")
 		return
 	}
-	if record.State == "terminal" || record.State == "running" && !(work.attempt == record.Attempt && work.stopped) {
+	if record.State == "terminal" {
+		s.operationMu.Unlock()
+		status, _ := s.preparationStatus(id)
+		code := http.StatusAccepted
+		if status.State != "ready" {
+			code = http.StatusConflict
+		}
+		s.writeJSON(w, code, status)
+		return
+	}
+	if record.State == "running" && !(work.attempt == record.Attempt && work.stopped) {
 		if !s.closing {
 			s.launchPreparationLocked(record)
 		}
