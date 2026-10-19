@@ -1620,6 +1620,17 @@
   const indexNotice = conversationAssets.createRefreshNotice({render: state => {indexFailure = state; renderIndexWarning();}});
   const updateIndexSnapshotNotice = createIndexSnapshotNotice(indexNotice);
   const progressNotice = conversationAssets.createRefreshNotice({render: state => {progressFailure = state; renderIndexWarning();}});
+  const updateText = (element, value) => {
+    if (element.textContent !== value) element.textContent = value;
+  };
+  const reconcileOrder = (parent, elements) => {
+    let next = parent.firstElementChild;
+    for (const element of elements) {
+      if (element === next) next = next.nextElementSibling;
+      else parent.insertBefore(element, next);
+    }
+  };
+  const indexOperationRows = new Map();
   const renderIndexOperations = (operations) => {
     const panel = document.getElementById("operations");
     const list = document.getElementById("operation-list");
@@ -1629,140 +1640,173 @@
       (Date.parse(right.updatedAt || right.startedAt || "") || 0) -
       (Date.parse(left.updatedAt || left.startedAt || "") || 0)
     ));
-    list.replaceChildren();
-    count.textContent = String(records.length);
+    updateText(count, String(records.length));
     panel.hidden = records.length === 0;
     let localStorage = null;
     let sessionStorage = null;
     try { localStorage = globalThis.localStorage; } catch (_error) {}
     try { sessionStorage = globalThis.sessionStorage; } catch (_error) {}
     cleanupCompletedDeleteStorage(records, [localStorage, sessionStorage]);
+    const present = new Set(), ordered = [];
     for (const operation of records) {
-      const item = document.createElement("article");
-      item.className = `operation-item ${operation.state || "paused"}`;
-
-      const summary = document.createElement("div");
-      summary.className = "operation-item-summary";
-      const identity = document.createElement("div");
-      const name = operation.state === "complete" && operation.kind === "delete" ?
-        document.createElement("strong") : document.createElement("a");
-      name.textContent = operation.slug || "Unknown session";
-      if (name instanceof HTMLAnchorElement) name.href = `/${encodeURIComponent(operation.slug)}/`;
-      const phase = document.createElement("span");
-      phase.className = "muted";
-      phase.textContent = `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`;
-      identity.append(name, phase);
-
+      const key = JSON.stringify([operation.slug, operation.kind, operation.receiptId || operation.options?.journalId || ""]);
+      present.add(key);
+      const shape = JSON.stringify([operation.state, Boolean(operation.options?.force)]);
       const elapsedStart = Date.parse(operation.startedAt || operation.updatedAt || "");
       const presentation = lifecyclePresentation(
         operation, "", Number.isFinite(elapsedStart) ? Date.now() - elapsedStart : 0,
       );
-      const state = document.createElement("span");
-      state.className = `operation-state ${presentation.tone}`;
-      state.textContent = operation.state === "running" ? presentation.detail : presentation.title;
-      summary.append(identity, state);
-      item.append(summary);
-
-      if (operation.state === "failed" || operation.state === "paused") {
-        const detail = document.createElement("p");
-        detail.className = operation.state === "failed" ? "operation-error" : "muted";
-        detail.textContent = presentation.detail;
-        item.append(detail);
+      let entry = indexOperationRows.get(key);
+      if (entry && entry.shape !== shape) {
+        entry.item.remove();
+        indexOperationRows.delete(key);
+        entry = null;
       }
+      if (!entry) {
+        entry = {operation, shape};
+        const item = document.createElement("article");
+        item.className = `operation-item ${operation.state || "paused"}`;
 
-      const actions = document.createElement("div");
-      actions.className = "operation-item-actions";
-      if (operation.state === "failed" || operation.state === "paused") {
-        const retry = document.createElement("button");
-        retry.type = "button";
-        retry.textContent = `Retry ${operation.kind}`;
-        retry.addEventListener("click", async () => {
-          retry.disabled = true;
-          retry.textContent = "Retrying…";
-          try {
-            await request(`${apiPath(operation.slug, "operation")}/retry`, {
-              method: "POST", body: JSON.stringify({
-                receiptId: operation.receiptId || "",
-                journalId: operation.options?.journalId || "",
-              }),
-            });
-            if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
-            indexRefreshTimer = setTimeout(refreshIndexStatus, 0);
-          } catch (error) {
-            retry.disabled = false;
-            retry.textContent = `Retry ${operation.kind}`;
-            const warning = document.getElementById("index-status-warning");
-            if (warning) {
-              warning.textContent = `Unable to retry ${operation.kind}: ${error.message}`;
-              warning.hidden = false;
-            }
-          }
-        });
-        actions.append(retry);
-        if (operation.kind === "delete" && !operation.options?.force) {
-          const forceRetry = document.createElement("button");
-          forceRetry.type = "button";
-          forceRetry.className = "danger";
-          forceRetry.textContent = "Force delete";
-          forceRetry.addEventListener("click", async () => {
-            if (!globalThis.confirm(
-              "Force deletion may discard dirty worktrees or interrupt an active Codex turn. Continue?",
-            )) return;
-            forceRetry.disabled = true;
-            forceRetry.textContent = "Forcing…";
+        const summary = document.createElement("div");
+        summary.className = "operation-item-summary";
+        const identity = document.createElement("div");
+        const name = operation.state === "complete" && operation.kind === "delete" ?
+          document.createElement("strong") : document.createElement("a");
+        name.textContent = operation.slug || "Unknown session";
+        if (name instanceof HTMLAnchorElement) name.href = `/${encodeURIComponent(operation.slug)}/`;
+        const phase = document.createElement("span");
+        phase.className = "muted";
+        phase.textContent = `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`;
+        identity.append(name, phase);
+
+        const state = document.createElement("span");
+        state.className = `operation-state ${presentation.tone}`;
+        state.textContent = operation.state === "running" ? presentation.detail : presentation.title;
+        summary.append(identity, state);
+        item.append(summary);
+
+        let detail = null;
+        if (operation.state === "failed" || operation.state === "paused") {
+          detail = document.createElement("p");
+          detail.className = operation.state === "failed" ? "operation-error" : "muted";
+          detail.textContent = presentation.detail;
+          item.append(detail);
+        }
+
+        const actions = document.createElement("div");
+        actions.className = "operation-item-actions";
+        if (operation.state === "failed" || operation.state === "paused") {
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.textContent = `Retry ${operation.kind}`;
+          retry.addEventListener("click", async () => {
+            const operation = entry.operation;
+            retry.disabled = true;
+            retry.textContent = "Retrying…";
             try {
               await request(`${apiPath(operation.slug, "operation")}/retry`, {
                 method: "POST", body: JSON.stringify({
                   receiptId: operation.receiptId || "",
                   journalId: operation.options?.journalId || "",
-                  force: true,
                 }),
               });
               if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
               indexRefreshTimer = setTimeout(refreshIndexStatus, 0);
             } catch (error) {
-              forceRetry.disabled = false;
-              forceRetry.textContent = "Force delete";
               const warning = document.getElementById("index-status-warning");
               if (warning) {
-                warning.textContent = `Unable to force deletion: ${error.message}`;
+                warning.textContent = `Unable to retry ${operation.kind}: ${error.message}`;
+                warning.hidden = false;
+              }
+            } finally {
+              retry.disabled = false;
+              retry.textContent = `Retry ${operation.kind}`;
+            }
+          });
+          actions.append(retry);
+          if (operation.kind === "delete" && !operation.options?.force) {
+            const forceRetry = document.createElement("button");
+            forceRetry.type = "button";
+            forceRetry.className = "danger";
+            forceRetry.textContent = "Force delete";
+            forceRetry.addEventListener("click", async () => {
+              const operation = entry.operation;
+              if (!globalThis.confirm(
+                "Force deletion may discard dirty worktrees or interrupt an active Codex turn. Continue?",
+              )) return;
+              forceRetry.disabled = true;
+              forceRetry.textContent = "Forcing…";
+              try {
+                await request(`${apiPath(operation.slug, "operation")}/retry`, {
+                  method: "POST", body: JSON.stringify({
+                    receiptId: operation.receiptId || "",
+                    journalId: operation.options?.journalId || "",
+                    force: true,
+                  }),
+                });
+                if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+                indexRefreshTimer = setTimeout(refreshIndexStatus, 0);
+              } catch (error) {
+                const warning = document.getElementById("index-status-warning");
+                if (warning) {
+                  warning.textContent = `Unable to force deletion: ${error.message}`;
+                  warning.hidden = false;
+                }
+              } finally {
+                forceRetry.disabled = false;
+                forceRetry.textContent = "Force delete";
+              }
+            });
+            actions.append(forceRetry);
+          }
+        }
+        if (operation.state === "failed" || operation.state === "complete") {
+          const dismiss = document.createElement("button");
+          dismiss.type = "button";
+          dismiss.className = "quiet";
+          dismiss.textContent = "Dismiss";
+          dismiss.addEventListener("click", async () => {
+            const operation = entry.operation;
+            dismiss.disabled = true;
+            try {
+              await request(apiPath(operation.slug, "operation"), {
+                method: "DELETE",
+                body: JSON.stringify({receiptId: operation.receiptId || ""}),
+              });
+              item.remove();
+              const remaining = list.childElementCount;
+              count.textContent = String(remaining);
+              panel.hidden = remaining === 0;
+            } catch (error) {
+              dismiss.disabled = false;
+              const warning = document.getElementById("index-status-warning");
+              if (warning) {
+                warning.textContent = `Unable to dismiss operation: ${error.message}`;
                 warning.hidden = false;
               }
             }
           });
-          actions.append(forceRetry);
+          actions.append(dismiss);
         }
+        if (actions.childElementCount) item.append(actions);
+
+        entry.item = item;
+        entry.update = (operation, presentation) => {
+          updateText(phase, `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`);
+          state.className = `operation-state ${presentation.tone}`;
+          updateText(state, operation.state === "running" ? presentation.detail : presentation.title);
+          if (detail) updateText(detail, presentation.detail);
+        };
+        indexOperationRows.set(key, entry);
       }
-      if (operation.state === "failed" || operation.state === "complete") {
-        const dismiss = document.createElement("button");
-        dismiss.type = "button";
-        dismiss.className = "quiet";
-        dismiss.textContent = "Dismiss";
-        dismiss.addEventListener("click", async () => {
-          dismiss.disabled = true;
-          try {
-            await request(apiPath(operation.slug, "operation"), {
-              method: "DELETE",
-              body: JSON.stringify({receiptId: operation.receiptId || ""}),
-            });
-            item.remove();
-            const remaining = list.childElementCount;
-            count.textContent = String(remaining);
-            panel.hidden = remaining === 0;
-          } catch (error) {
-            dismiss.disabled = false;
-            const warning = document.getElementById("index-status-warning");
-            if (warning) {
-              warning.textContent = `Unable to dismiss operation: ${error.message}`;
-              warning.hidden = false;
-            }
-          }
-        });
-        actions.append(dismiss);
-      }
-      if (actions.childElementCount) item.append(actions);
-      list.append(item);
+      entry.operation = operation;
+      entry.update(operation, presentation);
+      ordered.push(entry.item);
     }
+    for (const [key, entry] of indexOperationRows) {
+      if (!present.has(key)) { entry.item.remove(); indexOperationRows.delete(key); }
+    }
+    reconcileOrder(list, ordered);
     return records.some((operation) => operation.state === "running");
   };
   const refreshIndexStatus = async () => {
@@ -1802,12 +1846,13 @@
         card.dataset.sessionObservation = item.observationIdentity || "";
         card.classList.toggle("archived", item.archived);
         card.querySelector(".status-dot").classList.toggle("active", !item.archived);
-        document.querySelector(`[data-session-list="${item.archived ? "archived" : "active"}"]`).append(card);
+        const target = document.querySelector(`[data-session-list="${item.archived ? "archived" : "active"}"]`);
+        if (card.parentElement !== target) target.append(card);
       }
       for (const [kind, counter] of [["active", "active-count"], ["archived", "archive-count"]]) {
         const list = document.querySelector(`[data-session-list="${kind}"]`);
         const count = list.querySelectorAll("[data-session-slug]").length;
-        document.getElementById(counter).textContent = String(count);
+        updateText(document.getElementById(counter), String(count));
         list.querySelectorAll(".empty").forEach((element) => element.remove());
         if (!count) {
           const empty = document.createElement("p");
@@ -1824,16 +1869,17 @@
         const updated = card.querySelector("[data-session-updated]");
         if (updated) {
           const prefix = card.classList.contains("archived") ? "Finalized" : "Updated";
-          updated.textContent = `${prefix} ${activityAge(item.updatedAt)}`;
+          updateText(updated, `${prefix} ${activityAge(item.updatedAt)}`);
           updated.dataset.updatedAt = item.updatedAt;
           updated.title = new Date(item.updatedAt).toLocaleString();
         }
         const repositories = card.querySelector("[data-session-repositories]");
-        if (repositories) repositories.textContent = `${item.repositoryCount} ${item.repositoryCount === 1 ? "repository" : "repositories"}`;
+        if (repositories) updateText(repositories, `${item.repositoryCount} ${item.repositoryCount === 1 ? "repository" : "repositories"}`);
         const clusters = card.querySelector("[data-session-clusters]");
         if (clusters) {
-          clusters.textContent = `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}`;
-          if (item.clusterNotice) clusters.textContent = item.runningClusters ? `${clusters.textContent} · Status updating` : "Cluster status updating";
+          let text = `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}`;
+          if (item.clusterNotice) text = item.runningClusters ? `${text} · Status updating` : "Cluster status updating";
+          updateText(clusters, text);
           clusters.title = item.clusterNotice || "";
           clusters.hidden = item.runningClusters === 0 && !item.clusterNotice;
         }
@@ -1841,7 +1887,7 @@
         if (sensitiveBadge) sensitiveBadge.hidden = !item.sensitive;
         const lifecycle = card.querySelector("[data-session-lifecycle]");
         if (lifecycle) {
-          lifecycle.textContent = item.pendingLifecycle ? `${item.pendingLifecycle} pending` : "";
+          updateText(lifecycle, item.pendingLifecycle ? `${item.pendingLifecycle} pending` : "");
           lifecycle.hidden = !item.pendingLifecycle;
         }
       }
@@ -1850,7 +1896,7 @@
         const ordered = indexStatusOrder(gridCards.map((card) => bySlug.get(card.dataset.sessionSlug)).filter(Boolean))
           .map((item) => gridCards.find((card) => card.dataset.sessionSlug === item.slug))
           .filter(Boolean);
-        ordered.forEach((card) => grid.append(card));
+        reconcileOrder(grid, ordered);
       }
       document.dispatchEvent(new Event("session-list-updated"));
       if (sidebar) sidebar.scrollTop = previousSidebarTop;
