@@ -472,13 +472,12 @@ module WorkspaceCoordination
     end
 
     def fence_owners!(data, owners, command)
+      require_idle_owners!(data, owners.map { |owner| owner['id'] })
       owners.each do |owner|
         if owner['fence'] && owner['fence']['command'] != command && !owner['fence']['completed']
           raise Error.new("coordination lifecycle intent requires #{owner['fence']['command']}", 5)
         end
         jobs = data['jobs'].values.select { |job| job['ownerId'] == owner['id'] }
-        active = jobs.find { |job| CLAIMED.include?(job['state']) }
-        raise Error.new("lifecycle waits for coordinated operation #{active['id']}", 5) if active
         integration_journals.each do |run|
           next unless run['schema'] == 2 && run['ownerId'] == owner['id'] && run['phase'] != 'complete'
           # A separate marker survives a preparing worker's journal publication.
@@ -493,7 +492,11 @@ module WorkspaceCoordination
         end
         data['reservations'].each_value do |reservation|
           next unless reservation['ownerId'] == owner['id'] && reservation['state'] != 'released'
-          reservation['state'] = reservation['history'].empty? ? 'released' : 'blocked_recovery'
+          if command == 'archive'
+            reservation['state'] = 'blocked_recovery' unless reservation['state'] == 'requested'
+          else
+            reservation['state'] = reservation['history'].empty? ? 'released' : 'blocked_recovery'
+          end
           reservation['revision'] += 1
         end
         data['outbox'].each_value do |event|
@@ -528,8 +531,17 @@ module WorkspaceCoordination
     def require_lifecycle_idle!(workspace, slug)
       data = read
       ids = lifecycle_owners(data, workspace, slug).map { |owner| owner['id'] }
+      require_idle_owners!(data, ids)
+    end
+
+    def require_idle_owners!(data, ids)
       active = data['jobs'].values.find { |job| ids.include?(job['ownerId']) && CLAIMED.include?(job['state']) }
       raise Error.new("lifecycle waits for coordinated operation #{active['id']}", 5) if active
+      uncertain = data['reservations'].values.any? do |reservation|
+        ids.include?(reservation['ownerId']) && reservation['state'] != 'released' &&
+          reservation['history'].any? { |record| record['outcome'] == 'unknown' }
+      end
+      raise Error.new('lifecycle waits for uncertain deployment recovery', 5) if uncertain
     end
 
     def require_lifecycle_capacity!(workspace, slug, command)
@@ -609,11 +621,22 @@ module WorkspaceCoordination
         unless receipt.slice('workspace', 'slug', 'command') == {'workspace' => workspace, 'slug' => slug, 'command' => command}
           raise Error.new('lifecycle completion identity changed', 5)
         end
-        next if receipt['completed']
+        # A completed archive closes deployment review too. Rechecking this
+        # on retry also releases holds left by a predecessor executor.
         receipt['owners'].each do |binding|
           owner = data['owners'].fetch(binding['id'])
           unless owner['identity'] == binding['identity'] && owner.dig('fence', 'operationId') == operation_id
+            next if receipt['completed']
+
             raise Error.new('lifecycle completion owner changed', 5)
+          end
+          if command == 'archive'
+            require_idle_owners!(data, [owner['id']])
+            reservations = data['reservations'].values.select { |item| item['ownerId'] == owner['id'] && item['state'] != 'released' }
+            reservations.each do |reservation|
+              reservation['state'] = 'released'
+              reservation['revision'] += 1
+            end
           end
           owner['fence']['completed'] = true
         end

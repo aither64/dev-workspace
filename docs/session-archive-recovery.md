@@ -133,6 +133,12 @@ Conversation mutations retain a shared session lock until completion. Portal
 lifecycle execution does not hold a conversation mutex while waiting for the
 exclusive session lock, so an existing mutation can finish and release access.
 
+Successful local archive completion also releases the session's machine
+reservations. Interrupted archives retain their reservations until the same
+operation finishes. Running or uncertain coordinated deployments must settle
+before archival starts. Queued jobs are canceled and remain canceled after
+revival; deployment history and recovery artifacts are retained.
+
 Automatic scans skip busy sessions and preserve their cached inactivity evidence.
 They recheck eligibility on a later scan. A busy lock is not a failed activity or
 merge proof. Other session writers retain their existing contention policy.

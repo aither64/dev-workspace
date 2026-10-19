@@ -768,6 +768,23 @@ class DevSessionTest < Minitest::Test
 
   def test_archive_cleanup_completed_receipt_recovers_without_repeating_the_tracking_commit
     with_archive_cleanup_fixture do |runner, workspace, slug, _common, _feature|
+      store = runner.send(:coordination_store)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      stat = File.stat(File.join(workspace, 'work', slug))
+      owner_id, reservation_id = SecureRandom.uuid, SecureRandom.uuid
+      store.transaction do |data|
+        data['owners'][owner_id] = {'id' => owner_id,
+          'identity' => WorkspaceCoordination.digest([workspace, 'fixture', slug, stat.dev, stat.ino,
+            manifest.dig('codex', 'thread_id'), WorkspaceCoordination.creation_identity(manifest)]),
+          'workspace' => workspace, 'workspaceName' => 'fixture', 'slug' => slug,
+          'thread' => nil, 'socket' => '/fixture', 'portalUrl' => 'https://fixture.test', 'bootstrap' => true, 'fence' => nil}
+        data['reservations'][reservation_id] = {'id' => reservation_id, 'ownerId' => owner_id,
+          'machine' => 'fixture:machine', 'target' => 'machine', 'state' => 'deployed_review',
+          'revision' => 1, 'sequence' => store.sequence(data), 'mode' => 'deploy_first',
+          'approvalId' => nil, 'integrationObligations' => [], 'history' => [
+            {'attempt' => SecureRandom.uuid, 'kind' => 'machine_activate', 'artifact' => 'sha256:' + 'a' * 64,
+             'coverage' => [], 'coverageContracts' => [], 'observed' => {}, 'outcome' => 'applied'}]}
+      end
       interrupt_completion = true
       runner.define_singleton_method(:archive_cleanup_check_completed!) do |*arguments, **options|
         if interrupt_completion && options[:recorded_retirement]
@@ -780,6 +797,15 @@ class DevSessionTest < Minitest::Test
       cleanup = DevSession::ArchiveCleanup.new(runner, slug)
       assert_equal(true, cleanup.load.fetch('completed'))
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+      # A predecessor marked completion but retained deployed reservations.
+      store.transaction { |data| data['reservations'][reservation_id]['state'] = 'blocked_recovery' }
+      failed_store = Object.new
+      failed_store.define_singleton_method(:lifecycle_completed) { |*args, **options| raise WorkspaceCoordination::Error, 'injected completion replay failure' }
+      runner.define_singleton_method(:coordination_store) { failed_store }
+      assert_raises(WorkspaceCoordination::Error) { runner.archive(slug, as_is: true) }
+      assert(File.exist?(cleanup.path), 'completion failure discarded recovery evidence')
+      assert_equal 'blocked_recovery', store.read['reservations'][reservation_id]['state']
+      runner.define_singleton_method(:coordination_store) { store }
       head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip
       assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, abandoned: true) }
       assert(File.exist?(cleanup.path))
@@ -787,6 +813,7 @@ class DevSessionTest < Minitest::Test
       runner.archive(slug, as_is: true)
 
       assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD').strip)
+      assert_equal 'released', store.read['reservations'][reservation_id]['state']
       refute(File.exist?(cleanup.path))
     end
   end

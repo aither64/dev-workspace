@@ -1994,7 +1994,9 @@ module DevSession
           end
           @archive_progress_operation_id = operation_id || journal&.fetch('operation_id')
           if sidecar && !journal && sidecar.fetch('completed')
-            cleanup.discard_completed!(sidecar)
+            cleanup.discard_completed!(sidecar) do
+              coordination_store.lifecycle_completed(workspace, slug, 'archive', operation_id: sidecar.fetch('operation_id'))
+            end
             @out.puts "archived session: #{slug}"
             next
           end
