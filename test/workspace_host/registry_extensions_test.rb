@@ -3,6 +3,75 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_install_links_repairs_collected_package_instances_and_enablement
+    Dir.mktmpdir do |directory|
+      package = make_package(directory, 'current')
+      env = host_environment(directory, config: File.join(directory, 'registry.json'))
+      profile = env.fetch('DEV_WORKSPACES_PROFILE')
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(package, profile)
+      units = File.join(directory, '.config/systemd/user')
+      packaged = File.join(package, 'share/systemd/user')
+      FileUtils.mkdir_p(packaged)
+      FileUtils.mkdir_p(File.join(units, 'default.target.wants'))
+      FileUtils.mkdir_p(File.join(units, 'custom.target.requires'))
+      old = '/nix/store/00000000000000000000000000000000-dev-workspace-0.2.0/share/systemd/user'
+      cases = {
+        'workspace-codex-provider@example.service' => 'workspace-codex-provider@.service',
+        'workspace-portal@example.service' => 'workspace-portal@.service',
+        'workspace-auto-archive@example.timer' => 'workspace-auto-archive@.timer',
+        'workspace-router.service' => 'workspace-router.service'
+      }
+      cases.each do |name, template|
+        File.write(File.join(packaged, template), "[Unit]\n")
+        paths = [File.join(units, name), File.join(units, 'default.target.wants', name),
+                 File.join(units, 'custom.target.requires', name)]
+        paths.each { |path| File.symlink(File.join(old, template), path) }
+      end
+      host = UnregisterHost.new(env:, out: StringIO.new, err: StringIO.new)
+      2.times do
+        host.send(:install_links, package:)
+        cases.each do |name, template|
+          [units, File.join(units, 'default.target.wants'), File.join(units, 'custom.target.requires')].each do |parent|
+            link = File.join(parent, name)
+            assert_equal(File.join(packaged, template), File.realpath(link))
+            refute(File.readlink(link).start_with?('/nix/store/'), link)
+          end
+        end
+      end
+      assert_empty(host.commands)
+      refute(File.symlink?(File.join(units, 'workspace-codex-provider@disabled.service')))
+    end
+  end
+
+  def test_install_links_preserves_custom_instances_and_unrelated_units
+    Dir.mktmpdir do |directory|
+      package = make_package(directory, 'current')
+      env = host_environment(directory, config: File.join(directory, 'registry.json'))
+      profile = env.fetch('DEV_WORKSPACES_PROFILE')
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(package, profile)
+      units = File.join(directory, '.config/systemd/user')
+      packaged = File.join(package, 'share/systemd/user')
+      FileUtils.mkdir_p(packaged)
+      FileUtils.mkdir_p(File.join(units, 'default.target.wants'))
+      File.write(File.join(packaged, 'workspace-codex-provider@.service'), "[Unit]\n")
+      regular = File.join(units, 'workspace-codex-provider@custom.service')
+      File.write(regular, "custom unit\n")
+      custom = File.join(units, 'default.target.wants/workspace-codex-provider@custom.service')
+      File.symlink('/custom/provider.service', custom)
+      unrelated = File.join(units, 'workspace-other@example.service')
+      absent = '/nix/store/00000000000000000000000000000000-dev-workspace-0.2.0/share/systemd/user/workspace-other@.service'
+      File.symlink(absent, unrelated)
+      host = UnregisterHost.new(env:, out: StringIO.new, err: StringIO.new)
+      host.send(:install_links, package:)
+      assert_equal("custom unit\n", File.read(regular))
+      assert_equal('/custom/provider.service', File.readlink(custom))
+      assert_equal(absent, File.readlink(unrelated))
+      assert_empty(host.commands)
+    end
+  end
+
   def test_auto_archive_units_are_enabled_and_removed_on_rollback
     Dir.mktmpdir do |directory|
       root = make_workspace(directory, 'workspace')

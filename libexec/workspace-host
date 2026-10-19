@@ -1111,9 +1111,11 @@ module DevWorkspaceHost
       selected_catalog.provider_programs.each_key do |program|
         atomic_symlink(File.join(@profile, 'bin', program), File.join(bin, program))
       end
-      Dir[File.join(@profile, 'share/systemd/user/workspace-*')].each do |source|
+      packaged_units = Dir[File.join(@profile, 'share/systemd/user/workspace-*')]
+      packaged_units.each do |source|
         atomic_symlink(source, File.join(units, File.basename(source)))
       end
+      refresh_systemd_instance_links(units, packaged_units)
       selected_catalog.skills.each do |skill, source|
         raise Error, "packaged skill is not a directory: #{source}" unless File.directory?(source)
         atomic_symlink(source, File.join(@skills, skill))
@@ -1139,6 +1141,32 @@ module DevWorkspaceHost
       end
       unless File.file?(File.join(selected_package, 'share/systemd/user/workspace-auto-archive@.timer'))
         remove_auto_archive_links
+      end
+    end
+
+    def refresh_systemd_instance_links(units, packaged_units)
+      names = packaged_units.map { |source| File.basename(source) }
+      links = Dir[File.join(units, 'workspace-*')]
+      links.concat(Dir[File.join(units, '*.wants/workspace-*')])
+      links.concat(Dir[File.join(units, '*.requires/workspace-*')])
+      links.each do |link|
+        next unless File.symlink?(link)
+
+        name = File.basename(link)
+        template = name.include?('@') ? "#{name.split('@', 2).first}@#{File.extname(name)}" : name
+        next unless names.include?(template)
+
+        # systemctl can retain a canonical store target for both the instance
+        # alias and its enablement link. It can already be dangling after GC.
+        target = File.expand_path(File.readlink(link), File.dirname(link))
+        next unless target.match?(%r{\A/nix/store/[^/]+-dev-workspace-[^/]+/share/systemd/user/#{Regexp.escape(template)}\z})
+
+        source = if File.dirname(link) == units
+                   File.join(@profile, 'share/systemd/user', template)
+                 else
+                   File.join(units, template)
+                 end
+        atomic_symlink(source, link)
       end
     end
 

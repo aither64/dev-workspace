@@ -446,6 +446,12 @@ an older package; recover by repeating the same switch or selecting a newer
 package. Commands waiting on a transition lock reject a generation change and
 must be run again.
 
+Profile activation also refreshes existing systemd instance and enablement links
+that point into older dev-workspace packages. They follow the stable profile or
+local unit template, so collecting an older package does not shadow the current
+template with a broken instance. Disabled services remain disabled, and custom
+unit files or links are preserved.
+
 ### Switching while Codex threads are active
 
 Packages publishing `livePackageSwitchPolicy = 1` can switch while threads are

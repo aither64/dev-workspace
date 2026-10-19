@@ -244,7 +244,19 @@ pkgs.testers.runNixOSTest {
             + " && printf '/worktrees/\\n' > .gitignore && git add .gitignore && git commit -m 'fixture: workspace' "
             + "&& git remote add origin git@github.com:fixture/workspace.git && git push origin master")
         user("nix-env --profile " + state + "/profile --set " + package)
+        # Reproduce an old systemctl-created instance alias whose package was
+        # collected. Ordinary registration must repair it before creation starts.
+        unit_dir = "/home/developer/.config/systemd/user"
+        provider_unit = "workspace-codex-provider@fixture.service"
+        stale_template = "/nix/store/00000000000000000000000000000000-dev-workspace-0.2.0/share/systemd/user/workspace-codex-provider@.service"
+        user("mkdir -p " + unit_dir + "/default.target.wants && ln -s " + stale_template + " " + unit_dir + "/" + provider_unit
+            + " && ln -s " + stale_template + " " + unit_dir + "/default.target.wants/" + provider_unit)
         user(package + "/bin/workspace-host register fixture " + root + " --hostname fixture.workspace.example.test")
+        assert user("systemctl --user show " + provider_unit + " -p LoadState --value").strip() == "loaded"
+        user("systemctl --user is-enabled " + provider_unit)
+        user("systemctl --user start " + provider_unit)
+        user("systemctl --user is-active " + provider_unit)
+        assert user("readlink -f " + unit_dir + "/" + provider_unit).strip() == package + "/share/systemd/user/workspace-codex-provider@.service"
         for service in ["workspace-codex@fixture", "workspace-portal@fixture", "workspace-tmux@fixture", "workspace-router"]:
             machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + service)
 
