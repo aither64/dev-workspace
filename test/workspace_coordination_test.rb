@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'minitest/autorun'
+require 'shellwords'
 require 'tmpdir'
 require 'timeout'
 require_relative 'support/coordination_capacity_fixture'
@@ -52,7 +53,11 @@ class WorkspaceCoordinationTest < Minitest::Test
   def test_hook_preparation_enters_initialized_shell_and_captures_only_allowlisted_values
     source = File.join(@tmp, 'hook-source')
     tools = File.join(@tmp, 'preparation-tools')
-    FileUtils.mkdir_p([source, tools, File.join(source, '.husky')])
+    prepared_tools = File.join(source, 'prepared-tools')
+    FileUtils.mkdir_p([source, tools, prepared_tools, File.join(source, '.husky')])
+    ruby = File.join(prepared_tools, 'ruby')
+    File.write(ruby, "#!/bin/sh\nprintf 'selected\\n' > \"$0.selected\"\nexec #{Shellwords.escape(RbConfig.ruby)} \"$@\"\n")
+    File.chmod(0o700, ruby)
     File.write(File.join(source, 'flake.nix'), 'fixture declared shell')
     script = <<~SH
       #!/bin/sh
@@ -60,6 +65,7 @@ class WorkspaceCoordinationTest < Minitest::Test
       test "$2" = "$PWD" || exit 42
       test "$3" = --command || exit 43
       shift 3
+      test -z "${BUNDLE_PATH+x}" || exit 44
       export PATH="$PWD/prepared-tools"
       export BUNDLE_PATH="$PWD/prepared-gems"
       export BUNDLE_APP_CONFIG="$PWD/prepared-config"
@@ -70,10 +76,14 @@ class WorkspaceCoordinationTest < Minitest::Test
     File.write(File.join(tools, 'nix'), script)
     File.chmod(0o700, File.join(tools, 'nix'))
     @engine.instance_variable_set(:@env, ENV.to_h.merge('PATH' => tools, 'BUNDLE_PATH' => '/wrong/inherited/path'))
+    original = @engine.instance_variable_get(:@env)
     artifact = @engine.prepare_merge_hooks(source, 'code', @base)
+    assert File.file?("#{ruby}.selected"), 'preparation must select Ruby from the initialized repository shell PATH'
+    assert_equal prepared_tools, artifact['environment']['PATH']
     assert_equal File.join(source, 'prepared-gems'), artifact['environment']['BUNDLE_PATH']
     assert_equal File.join(source, 'prepared-config'), artifact['environment']['BUNDLE_APP_CONFIG']
     refute_includes artifact['environment'].keys, 'PRIVATE_FIXTURE_SECRET'
+    assert_same original, @engine.instance_variable_get(:@env)
     assert_equal '/wrong/inherited/path', @engine.instance_variable_get(:@env)['BUNDLE_PATH']
   end
 
@@ -86,8 +96,12 @@ class WorkspaceCoordinationTest < Minitest::Test
     File.write(File.join(source, 'flake.nix'), 'fixture declared shell')
     File.write(File.join(tools, 'nix'), "#!/bin/sh\nshift 3\nexec \"$@\"\n")
     File.chmod(0o700, File.join(tools, 'nix'))
+    File.symlink(RbConfig.ruby, File.join(tools, 'ruby'))
     @engine.instance_variable_set(:@env, ENV.to_h.merge('PATH' => tools))
-    assert_raises(WorkspaceCoordination::Error) { @engine.prepare_merge_hooks(source, 'code', @base) }
+    original = @engine.instance_variable_get(:@env)
+    error = assert_raises(WorkspaceCoordination::Error) { @engine.prepare_merge_hooks(source, 'code', @base) }
+    assert_includes error.message, 'absent_coordination_fixture'
+    assert_same original, @engine.instance_variable_get(:@env)
     assert_empty @engine.store.read['jobs']
   end
 

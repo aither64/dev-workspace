@@ -21,10 +21,11 @@ and prepared evidence after acquiring admission, and Git baselines after acquiri
 the tracking lock. A busy lock does not require snapshot refresh.
 
 Merge preparation enters the repository's declared Nix shell, including its
-shell initialization, before retaining the hook environment. Bundler-based
-Overcommit dependencies and the runtime SSH transport are checked before a job
-can be admitted. Dependency installation happens in the retained source outside
-claims. Target checkout creation and merge/push hooks use that same prepared
+shell initialization, before retaining the hook environment. Validation uses Ruby
+from that shell's `PATH` so native gems match the repository's Ruby version.
+Bundler-based Overcommit dependencies and the runtime SSH transport are checked
+before a job can be admitted. Dependency installation happens in the retained
+source outside claims. Target checkout creation and merge/push hooks use that same prepared
 environment, with the runtime transport path retained. Workers install no
 dependencies while holding Git resources.
 

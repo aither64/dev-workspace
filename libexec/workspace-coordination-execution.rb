@@ -352,7 +352,7 @@ module WorkspaceCoordination
       original = @env
       begin
         @env = @env.merge(allowed.reject { |key| %w[PATH NIX_SSL_CERT_FILE SSL_CERT_FILE].include?(key) }.to_h { |key| [key, nil] })
-        output = capture('nix', 'develop', source, '--command', RbConfig.ruby, '-e', program, *allowed, cwd: source, limit: MAX_LEDGER)
+        output = capture('nix', 'develop', source, '--command', 'ruby', '-e', program, *allowed, cwd: source, limit: MAX_LEDGER)
       ensure
         @env = original
       end
