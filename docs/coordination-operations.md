@@ -56,14 +56,21 @@ verified receipt and both live-system/profile identities. Ambiguous rollback or
 partial publication keeps the reservation and claim. Do not replay activation or
 use a fresh job to hide the original uncertainty.
 
-Archive and deletion hold notifications and deployed ownership. Coordination
-receipts bind each ordinary lifecycle journal to exact owner incarnations.
-Completion persists before journal removal; retries after an interrupted removal
-are idempotent. Revival freezes its archive association before tracking changes. Explicit revival
-reconnects the same owner but does not resolve its deployment blocker. A recreated
-slug has no claim to the previous owner's resources. An exceptional release or
-transfer needs a separate reviewed operation with exact user direction and live
-evidence; there is no force-release command.
+Archive and deletion hold notifications and cancel queued operations before
+cleanup. Coordination receipts bind each ordinary lifecycle journal to exact
+owner incarnations. Archive completion releases that owner's machine
+reservations in the same ledger transaction that records lifecycle completion.
+The reservation stays held during failed or interrupted cleanup. Retrying a
+completed archive receipt can release a hold retained by a predecessor executor;
+the exact owner binding must still match. Deployment history and recovery
+artifacts remain available after release.
+
+Revival freezes its archive association before tracking changes. It reconnects
+the same owner without reacquiring reservations or resuming canceled jobs. A
+recreated slug has no claim to the previous owner's resources. Running or
+uncertain deployments require their original recovery before archival. Deletion
+retains its existing deployed-ownership hold. Exceptional transfers remain
+separate recovery operations; there is no force-release command.
 
 ## First reporting-startup upgrade
 

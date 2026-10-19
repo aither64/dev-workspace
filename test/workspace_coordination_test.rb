@@ -212,10 +212,13 @@ class WorkspaceCoordinationTest < Minitest::Test
       end
     end
     assert_equal '2026-01-02T00:00:00Z', timing.read['reservations'][@reservation_id]['heldAt']
-    with_time(Time.utc(2026, 1, 3)) { @engine.store.transaction { |data| @engine.store.fence_owners!(data, [data['owners'][first['id']]], 'archive') } }
+    archive_id = '7' * 64
+    with_time(Time.utc(2026, 1, 3)) { @engine.store.bind_lifecycle(@workspace, first['slug'], 'archive', archive_id) }
+    refute timing.read['reservations'][@reservation_id].key?('finishedAt')
+    with_time(Time.utc(2026, 1, 4)) { @engine.store.lifecycle_completed(@workspace, first['slug'], 'archive', operation_id: archive_id) }
     dates = timing.read['reservations'][@reservation_id]
     assert_equal '2026-01-02T00:00:00Z', dates['heldAt']
-    assert_equal '2026-01-03T00:00:00Z', dates['finishedAt']
+    assert_equal '2026-01-04T00:00:00Z', dates['finishedAt']
   end
 
   def test_session_projection_excludes_a_recreated_slugs_retained_history
@@ -704,7 +707,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     [reservation, job]
   end
 
-  def test_review_reservation_survives_idle_and_lifecycle
+  def test_review_reservation_survives_idle_then_releases_after_archive
     configure_machine
     first, second = owner('first'), owner('second')
     reservation, a = deployment(first)
@@ -725,9 +728,83 @@ class WorkspaceCoordinationTest < Minitest::Test
     @engine.store.bind_lifecycle(@workspace, first['slug'], 'archive', archive_id)
     assert_equal 'blocked_recovery', @engine.store.read['reservations'][reservation['id']]['state']
     @engine.store.lifecycle_completed(@workspace, first['slug'], 'archive', operation_id: archive_id)
+    released = @engine.store.read['reservations'][reservation['id']]
+    assert_equal 'released', released['state']
+    @engine.store.lifecycle_completed(@workspace, first['slug'], 'archive', operation_id: archive_id)
+    assert_equal released, @engine.store.read['reservations'][reservation['id']]
+    assert_equal [b['id']], @engine.claim.map { |job| job['id'] }
     @engine.store.revived(@workspace, first['slug'], operation_id: 'b' * 64, archive_operation_id: archive_id)
-    assert_equal 'blocked_recovery', @engine.store.read['reservations'][reservation['id']]['state']
+    assert_equal 'released', @engine.store.read['reservations'][reservation['id']]['state']
+  end
+
+  def test_archive_cancels_queued_deployment_and_revival_does_not_resume_it
+    configure_machine
+    first = owner('queued-deployer')
+    reservation, job = deployment(first)
+    archive_id = '9' * 64
+    @engine.store.bind_lifecycle(@workspace, first['slug'], 'archive', archive_id)
+    assert_equal 'canceled', @engine.store.read['jobs'][job['id']]['state']
+    assert_equal 'requested', @engine.store.read['reservations'][reservation['id']]['state']
+    @engine.store.lifecycle_completed(@workspace, first['slug'], 'archive', operation_id: archive_id)
+    @engine.store.revived(@workspace, first['slug'], operation_id: '8' * 64, archive_operation_id: archive_id)
+    assert_equal 'released', @engine.store.read['reservations'][reservation['id']]['state']
+    assert_equal 'canceled', @engine.store.read['jobs'][job['id']]['state']
     assert_empty @engine.claim
+  end
+
+  def test_archive_of_waiting_owner_never_claims_another_owners_machine
+    configure_machine
+    first, second = owner('live-deployer'), owner('waiting-deployer')
+    held, = deployment(first)
+    @engine.claim
+    waiting, queued = deployment(second)
+    archive_id = '6' * 64
+    @engine.store.bind_lifecycle(@workspace, second['slug'], 'archive', archive_id)
+    assert_equal 'held', @engine.store.read['reservations'][held['id']]['state']
+    assert_equal 'requested', @engine.store.read['reservations'][waiting['id']]['state']
+    assert_equal 'canceled', @engine.store.read['jobs'][queued['id']]['state']
+    @engine.store.lifecycle_completed(@workspace, second['slug'], 'archive', operation_id: archive_id)
+    assert_equal 'held', @engine.store.read['reservations'][held['id']]['state']
+    assert_equal 'released', @engine.store.read['reservations'][waiting['id']]['state']
+  end
+
+  def test_archive_completion_releases_predecessor_hold_but_not_another_owner
+    configure_machine
+    first, second = owner('archived-holder'), owner('waiting-holder')
+    reservation, job = deployment(first)
+    other, = deployment(second, submit: false)
+    @engine.claim
+    @engine.store.transaction do |data|
+      data['jobs'][job['id']]['state'] = 'succeeded'
+      data['reservations'][reservation['id']]['state'] = 'deployed_review'
+    end
+    archive_id = 'c' * 64
+    @engine.store.bind_lifecycle(@workspace, first['slug'], 'archive', archive_id)
+    @engine.store.transaction do |data|
+      data['lifecycles'][archive_id]['completed'] = true
+      data['owners'][first['id']]['fence']['completed'] = true
+      data['reservations'][reservation['id']]['state'] = 'blocked_recovery'
+    end
+    @engine.store.lifecycle_completed(@workspace, first['slug'], 'archive', operation_id: archive_id)
+    assert_equal 'released', @engine.store.read['reservations'][reservation['id']]['state']
+    assert_equal 'requested', @engine.store.read['reservations'][other['id']]['state']
+  end
+
+  def test_unknown_deployment_blocks_archive_before_releasing_ownership
+    configure_machine
+    first = owner('uncertain-holder')
+    reservation, submitted = deployment(first)
+    job = @engine.claim.first
+    @engine.store.transaction do |data|
+      data['jobs'][submitted['id']]['state'] = 'failed'
+      data['reservations'][reservation['id']]['state'] = 'blocked_recovery'
+      data['reservations'][reservation['id']]['history'] << {'attempt' => job['attempt'], 'kind' => job['kind'],
+        'artifact' => job.dig('snapshot', 'operation', 'preparedArtifact'), 'coverage' => [],
+        'coverageContracts' => job['coverageContracts'], 'observed' => nil, 'outcome' => 'unknown'}
+    end
+    assert_raises(WorkspaceCoordination::Error) { @engine.store.require_lifecycle_idle!(@workspace, first['slug']) }
+    assert_raises(WorkspaceCoordination::Error) { @engine.store.bind_lifecycle(@workspace, first['slug'], 'archive', 'e' * 64) }
+    assert_equal 'blocked_recovery', @engine.store.read['reservations'][reservation['id']]['state']
   end
 
   def test_portal_badges_report_held_states_and_archived_owners_without_mutation

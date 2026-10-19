@@ -41,12 +41,18 @@ unchanged live identities, and an explicit declaration that deployment and revie
 work is finished. Integration alone does not release a machine. Deployment or
 review does not supply merge approval.
 
-Archive and deletion retain deployed or uncertain reservations as recovery
-blockers. Revival preserves ownership. An uncertain effect retains its execution
-claim too; a dead process, failed SSH command or timeout cannot prove no effect.
-The first implementation refuses exceptional release without integration. Resolve
-it through an explicitly authorized, reviewed recovery operation rather than
-editing or deleting the ledger.
+Archival releases the session's machine reservations when its local lifecycle
+transition completes. It cancels queued jobs and holds notifications before
+cleanup; a paused or failed archive retains reservations until recovery finishes.
+Release preserves deployment history, artifacts and recovery evidence and does
+not claim that feature branches were integrated. Revival does not reacquire the
+released reservations or resume canceled jobs. A later deployment requests a new
+reservation through the ordinary approval flow.
+
+A running or uncertain deployment must settle before archival can begin. Its
+execution claim remains held; a dead process, failed SSH command or timeout cannot
+prove no effect. Deletion retains its existing recovery holds. Never edit or
+delete the ledger to bypass a refusal.
 
 ## Session commands
 

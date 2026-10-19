@@ -408,6 +408,7 @@ module DevSession
         raise Error, 'archive retirement phases are unfinished' unless recorded_journal.fetch('phase') == 'archived'
       end
       @runner.archive_cleanup_check_completed!(@slug, journal, recorded_retirement: !recorded_journal.nil?)
+      yield if block_given?
       File.unlink(path)
       fsync_directory(File.dirname(path))
     end
