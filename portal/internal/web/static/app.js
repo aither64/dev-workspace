@@ -1177,7 +1177,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=14");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=15");
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");
@@ -3673,6 +3673,21 @@
   let latestThreadPayload = null;
   let transcriptFilter = "messages";
   let transcriptEntries = [];
+  let optionalQuestionStorage;
+  try { optionalQuestionStorage = globalThis.localStorage; } catch (_) {}
+  const optionalQuestionPanel = document.getElementById("optional-questions");
+  const optionalQuestions = conversationAssets.createAsyncQuestions?.({
+    storage: optionalQuestionStorage, namespace: `/codex/${conversationID}`,
+    maxMessageBytes: Number(document.querySelector("#message-form textarea")?.getAttribute("maxlength")) || undefined,
+    canSend: () => interactive && !executionHeld && !liveSettingsSaving,
+    send: async ({threadId, message, id, retry}) => {
+      if (threadId !== currentThreadId) throw new Error("The conversation changed. Refresh before answering.");
+      const receipt = await client.message(message, id, retry);
+      scheduleRefresh(0); return receipt;
+    },
+    acknowledge: entries => client.acknowledgeMessages(entries),
+    onChange: () => { if (optionalQuestionPanel) optionalQuestions.renderPinned(optionalQuestionPanel); },
+  });
   const transcriptViews = new Map(["all", "messages", "activity"].map((filter) => [filter, {
     disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
   }]));
@@ -4262,6 +4277,8 @@
     } else {
       element.textContent = text;
     }
+    const questionControls = optionalQuestions?.inline(entry);
+    if (questionControls) element.append(questionControls);
     if (entry.attachments?.length) element.append(conversationAssets.renderAttachments(entry.attachments, {onRemove: async (file) => {
       await request(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
     }}));
@@ -4462,6 +4479,7 @@
       kind === "repair" ? transcriptHistory.applyRepair(payload) : transcriptHistory.applyNewest(payload)) :
       {changed: legacyTranscriptChanges(transcriptEntries, payload.entries || []), reset: false};
     transcriptEntries = transcriptHistory ? transcriptHistory.entries : payload.entries || [];
+    optionalQuestions?.update({...((kind === "newest" ? payload : latestThreadPayload) || payload), entries: transcriptEntries});
     if (update.reset) {
       transcriptInitialized = false;
     }
@@ -5114,6 +5132,7 @@
     scheduleRefresh(0);
   };
   const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId) => {
+    if (threadID === currentThreadId) optionalQuestions?.ordinaryAccepted();
     const current = threadID === currentThreadId ? pendingMessages.get(attempt.id) : null;
     const accepted = {
       ...attempt, ...current,
@@ -5212,6 +5231,7 @@
             }
           }
           await client.queueMessage(message, attempt.id, attachments);
+          optionalQuestions?.ordinaryAccepted();
           if (!deleteQueueAttempt(queueAttemptStorage, slug, currentThreadId, attempt.id)) {
             throw new Error("The queued message was accepted, but its retry record could not be cleared.");
           }
