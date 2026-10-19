@@ -122,6 +122,16 @@ publishing its creation journal; omitted providers continue to inherit the
 workspace default. Direct-team plan requests retain their destination-settings
 flag as an optional boolean.
 
+The shared Ruby producer and Go consumer accept the optional `provider` field
+in schema-1, schema-2 and schema-3 creation journals, in both creating and ready
+states. Its value follows the provider ID syntax without requiring the current
+catalog to contain that provider. Unknown fields, duplicates and invalid values
+remain errors. A package whose Go reader predates this field cannot read an
+explicit-provider journal, even when the Ruby initializer supports the option.
+Recovery must retain a corrected compatible reader. The Ruby-to-Go contract
+test covers this boundary; the packaged `session-creation` check covers the
+complete creation workflow described in the README.
+
 ## Naming and reservation
 
 The portal owns one naming-only Codex App Server for its service lifetime.

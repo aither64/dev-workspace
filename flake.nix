@@ -115,6 +115,9 @@
         session-archive-lifecycle = import ./nix/tests/session-archive-lifecycle.nix {
           inherit pkgs self devWorkspace;
         };
+        session-creation = import ./nix/tests/session-creation.nix {
+          inherit pkgs self mkPackage;
+        };
         host-package-contract = import ./nix/tests/host-package-contract.nix {
           inherit devWorkspace hostPaths pkgs;
         };
