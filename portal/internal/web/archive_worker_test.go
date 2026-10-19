@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,5 +141,26 @@ func TestCommandFailurePreservesDeadlineOverSuccessfulFetchOutput(t *testing.T) 
 	err := commandFailure("archive session", "", "From github.com:example/workspace\n * branch master -> FETCH_HEAD", context.DeadlineExceeded)
 	if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "FETCH_HEAD") {
 		t.Fatalf("deadline hidden by fetch output: %v", err)
+	}
+}
+
+func TestLifecycleDisplayIncludesProgressForItsExactArchiveOperation(t *testing.T) {
+	server := newTestServer(t)
+	operation := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Options: lifecycleOperationOptions{JournalID: strings.Repeat("a", 64)}}
+	directory := filepath.Join(server.config.UserStateRoot, "archive-progress", fmt.Sprintf("%x", sha256.Sum256([]byte(server.config.Workspace))))
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := fmt.Sprintf(`{"schema":1,"workspace":%q,"slug":"example","operation_id":%q,"stage":"Waiting for session access"}`, server.config.Workspace, operation.Options.JournalID)
+	if err := os.WriteFile(filepath.Join(directory, "example.json"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	view := server.lifecycleOperationView("example", operation)
+	if view.Progress == nil || view.Progress.Stage != "Waiting for session access" {
+		t.Fatalf("waiting progress missing from display: %#v", view)
+	}
+	operation.Options.JournalID = strings.Repeat("b", 64)
+	if view := server.lifecycleOperationView("example", operation); view.Progress != nil {
+		t.Fatalf("display adopted another operation's progress: %#v", view)
 	}
 }

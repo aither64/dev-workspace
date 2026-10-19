@@ -118,10 +118,24 @@ Completion and abandoned cleanup use non-force `git worktree remove` and `rmdir`
 containers. Stop external writers first; helper locks do not serialize arbitrary
 Git commands, editors or native clients.
 
-Ordinary archive, delete, revive and hold commands retain a shared package
-transition lock and their existing session locks. Different sessions can proceed
-while package switches and recovery retain the exclusive transition lock.
-For operations with a deadline, lock waits count toward that deadline.
+Archive, delete and revive retain a shared package transition lock, then acquire
+the creation lock and exclusive session lock in that order. Confirmed requests
+wait for session access and recheck their target and operation ownership after
+acquisition. Revival keeps this policy when starting its retained runtime and
+reacquiring locks. Different sessions can proceed while package switches and
+recovery retain the exclusive transition lock. For operations with a deadline,
+lock waits count toward that deadline. Archive has no total wall-clock deadline.
+
+The portal shows “Waiting for session access” while an archive waits. Its
+supervised worker and accepted receipt remain the same across portal restarts;
+waiting does not create a lifecycle journal or authorize another attempt.
+Conversation mutations retain a shared session lock until completion. Portal
+lifecycle execution does not hold a conversation mutex while waiting for the
+exclusive session lock, so an existing mutation can finish and release access.
+
+Automatic scans skip busy sessions and preserve their cached inactivity evidence.
+They recheck eligibility on a later scan. A busy lock is not a failed activity or
+merge proof. Other session writers retain their existing contention policy.
 Managed browser archives run in independent `workspace-archive-RECEIPT-ATTEMPT`
 user services. The unit identity must match the retained portal authorization.
 Portal restart reconciles the unit instead of starting another worker. Private

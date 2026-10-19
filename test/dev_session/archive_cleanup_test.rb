@@ -125,11 +125,11 @@ class DevSessionTest < Minitest::Test
         sleep 0.02
       end
       reviver = archive_runner_for(workspace, env: {'DEV_WORKSPACE_DEFER_TRACKING' => '1'})
-      assert_raises(DevSession::Error) { reviver.revive(slug, as_is: true) }
+      revive = Thread.new { reviver.revive(slug, as_is: true) }
       assert(sync.join(10), 'tracking hook retained lifecycle locks')
-      assert_equal('pending', runner.tracking_sync_receipt(slug).fetch('state'))
+      assert(revive.join(10), 'revival did not continue after tracking sync yielded access')
+      revive.value
       File.unlink(hook)
-      reviver.revive(slug, as_is: true)
       assert_equal('revive', reviver.tracking_sync_receipt(slug).fetch('direction'))
       reviver.tracking_sync(slug, force: true)
       assert_equal('synced', reviver.tracking_sync_receipt(slug).fetch('state'))
@@ -137,6 +137,7 @@ class DevSessionTest < Minitest::Test
     ensure
       File.unlink(hook) if hook && File.file?(hook)
       sync&.join(10)
+      revive&.join(10)
     end
   end
 

@@ -28,3 +28,5 @@ require_relative 'dev_session/retained_tracking_test'
 require_relative 'dev_session/ordinary_readiness_test'
 
 require_relative 'dev_session/sensitive_test'
+
+require_relative 'dev_session/lifecycle_access_test'

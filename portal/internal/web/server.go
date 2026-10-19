@@ -3064,11 +3064,9 @@ func (s *Server) executeLifecycleOperation(
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
-	mutationLock := s.messageLock(slug)
-	if err := mutationLock.Lock(ctx); err != nil {
-		return fmt.Errorf("lock conversation mutations for %s: %w", kind, err)
-	}
-	defer mutationLock.Unlock()
+	// The executor takes the exclusive runtime lock. Conversation mutations
+	// retain a shared runtime lock before taking their message mutex; holding
+	// that mutex here while waiting for the executor would invert that order.
 	progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
 	if progressErr != nil {
 		return fmt.Errorf("verify %s operation identity: %w", kind, progressErr)
