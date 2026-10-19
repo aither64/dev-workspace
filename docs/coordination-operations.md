@@ -208,11 +208,12 @@ jobs/recovery obligations end. Fresh submission of an expired/consumed snapshot
 without a live job reference requires preparation; an exact completed request
 retry returns its saved receipt.
 
-A `.keep` file, local worktree changes, process references, busy Git resources or
-unknown layouts preserve a payload. Collection uses Git to remove registered
-worktrees; it does not delete user branches. Source payload deletion is final,
-but original repository refs and compact evidence remain available for a fresh
-preparation. Nix store paths are reclaimed only by ordinary Nix GC.
+A `.keep` file, a native Git worktree lock, local changes, process references,
+busy Git resources or unknown layouts preserve a payload. Collection uses Git
+to remove registered worktrees; it does not delete user branches. Source
+payload deletion is final, but original repository refs and compact evidence
+remain available for a fresh preparation. Nix store paths are reclaimed only
+by ordinary Nix GC.
 
 `retention.json` is separate schema-1 bookkeeping for leases and interrupted
 worktree removal. Existing ledger, snapshot and artifact formats are unchanged.
@@ -224,7 +225,39 @@ directory. Do not hand-edit the bookkeeping to bypass a preservation reason.
 
 Collection also takes each integration driver's existing lock without waiting.
 An active driver postpones the sweep; unfinished journals retain hook dependencies
-for their source heads between invocations. Integration scratch worktrees below
-`integrations/<UUID>/` and owner-keyed notification worker roots remain outside
-this collector. They are retained, including after completion; this command does
-not establish a disk bound for those two layouts.
+for their source heads between invocations. Once an integration is complete,
+its registered, detached scratch worktrees below `integrations/<UUID>/` become
+eligible. Collection verifies the recorded repository, workspace ownership,
+cleanliness, process references and explicit holds. It preserves the compact
+integration journal, feature branches and published history. Unknown files or
+layouts survive for operator inspection.
+
+Before removing integration scratch, the collector records its exact path,
+common Git directory and HEAD in the journal's optional `payloadGcPending`
+field. This is an admitted removal intent: retries continue deleting that exact
+scratch checkout even if tracked files or `.git` have already disappeared.
+The retained Git registration must still identify its original detached HEAD
+and repository; a changed or missing registration preserves a surviving path.
+If `.git` is already gone, Git cannot remove the surviving directory. The
+collector finishes that admitted directory deletion, then asks Git to remove
+its exact retained registration.
+Do not reuse a checkout while its removal is pending. Process references and
+`.keep` still postpone a retry, but remaining files are already admitted for
+deletion rather than checked again for local changes. The field is removed
+after completion.
+Existing source retention bookkeeping is unchanged; older journal readers
+preserve this additive field. An older collector leaves integration scratch and
+this pending work untouched; resume collection with the newer runtime to finish.
+
+Worker package roots also have a bounded lifetime. Notification roots are
+released after their worker lock and service are idle. Pending messages and
+their payload dependencies remain retained; the next dispatch roots its selected
+package again. Background integration worker roots survive unfinished journals
+and running services. Unknown root ownership or a mismatched package digest
+prevents removal.
+
+These policies release disposable references; they do not impose a byte limit
+on active work. A live operation, held checkout, retained feature worktree or
+running process can still keep an old closure. Nix GC decides when store paths
+are reclaimable. Bulk archives included in a workspace Git input still multiply
+its size until their copies and package roots become unreferenced.

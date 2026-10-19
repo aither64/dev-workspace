@@ -84,9 +84,20 @@ module WorkspaceCoordination
     end
 
     def call(apply: false)
+      @notification_locks = Set.new
       with_integration_exclusion(Dir[File.join(@store.root, 'integrations', '*.json')].sort, apply: apply) do
-        sweep(apply: apply)
+        with_notification_exclusion(@store.read['owners'].keys.sort) { sweep(apply: apply) }
       end
+    end
+
+    def with_notification_exclusion(owners, &block)
+      return yield if owners.empty?
+      id = owners.first
+      result = @store.lock("notifications-#{id}", nonblock: true) do
+        @notification_locks << id
+        with_notification_exclusion(owners.drop(1), &block)
+      end
+      result || with_notification_exclusion(owners.drop(1), &block)
     end
 
     def with_integration_exclusion(paths, apply:, &block)
@@ -109,6 +120,7 @@ module WorkspaceCoordination
         @book = @retention.read
         @metadata, @snapshots = {}, {}
         @payloads, @live_payloads, @live_ids = {}, Set.new, Set.new
+        @journals = @store.integration_journals.to_h { |run| [run['id'], run] }
         @skipped, @actions = [], []
         preparing = preparation_processes
         unless preparing.empty?
@@ -116,7 +128,9 @@ module WorkspaceCoordination
             'preserved' => preparing.map { |pid| {'pid' => pid, 'reason' => 'preparation is running'} }, 'retry' => true}
         end
         inventory
+        inventory_integrations
         recover_pending
+        recover_integration_pending
         adopt_preparations
         mark_live
         plan
@@ -139,6 +153,7 @@ module WorkspaceCoordination
     end
 
     def preparation_processes
+      return [] if @engine.instance_variable_get(:@fixtures)
       Dir['/proc/[0-9]*'].filter_map do |directory|
         next if File.basename(directory).to_i == Process.pid || File.stat(directory).uid != Process.uid
         argv = File.binread(File.join(directory, 'cmdline')).split("\0")
@@ -216,6 +231,72 @@ module WorkspaceCoordination
       end
     end
 
+    def integration_finished?(run)
+      run['phase'] == 'complete' && (run['schema'] == 1 || run.dig('continuation', 'state') == 'complete')
+    end
+
+    def inventory_integrations
+      Dir[File.join(@store.root, 'integrations', '*')].sort.each do |directory|
+        next unless File.directory?(directory) || File.symlink?(directory)
+        id = File.basename(directory)
+        run = @journals[id]
+        unless id.match?(UUID) && run && !File.symlink?(directory) && integration_finished?(run)
+          @skipped << {'path' => directory, 'reason' => 'unknown or unfinished integration'}
+          next
+        end
+        repositories = Array(run.dig('request', 'repositories')).filter_map { |item| item['repository'] if item.is_a?(Hash) }
+        Dir[File.join(directory, '*')].sort.each do |path|
+          match = File.basename(path).match(/\A(.+)-[0-9a-f]{12}-[0-9a-f]{12}\z/)
+          unless match && repositories.include?(match[1]) && File.directory?(path) && !File.symlink?(path)
+            @skipped << {'path' => path, 'reason' => 'unknown integration payload layout'}
+            next
+          end
+          @payloads[path] = {'kind' => 'worktree', 'path' => path, 'source' => id,
+            'integration' => id, 'repository' => match[1]}
+        end
+      end
+    end
+
+    def recover_integration_pending
+      @journals.each_value do |run|
+        pending = run.fetch('payloadGcPending', {})
+        raise Error, 'invalid integration collection record' unless pending.is_a?(Hash)
+        pending.each do |leaf, action|
+          path = File.join(@store.root, 'integrations', run['id'], leaf)
+          unless leaf.match?(/\A[A-Za-z0-9][A-Za-z0-9_-]*-[0-9a-f]{12}-[0-9a-f]{12}\z/) &&
+                 action.is_a?(Hash) && action['path'] == path && action['integration'] == run['id'] &&
+                 action['kind'] == 'worktree' && action['source'] == run['id'] &&
+                 action['common'].is_a?(String) && action['head'].to_s.match?(SOURCE) &&
+                 action['repository'].is_a?(String) && File.basename(path).start_with?(action['repository'] + '-') &&
+                 Array(run.dig('request', 'repositories')).any? { |item| item.is_a?(Hash) && item['repository'] == action['repository'] }
+            raise Error, 'invalid interrupted integration collection record'
+          end
+          if File.symlink?(path) || File.exist?(path) && !File.directory?(path)
+            raise Error, 'interrupted integration checkout is not an ordinary directory'
+          end
+          @payloads[path] = action.merge('missing' => !File.exist?(path))
+          @live_payloads << path unless integration_finished?(run)
+        end
+      end
+    end
+
+    def verify_integration_repository(action, common)
+      run = @journals.fetch(action.fetch('integration'))
+      owner = @ledger['owners'][run['ownerId']]
+      raise Error, 'integration checkout owner is unavailable' unless owner
+      common = File.realpath(common)
+      root = owner.fetch('workspace')
+      unless common == File.join(root, '.git') || common.start_with?(File.join(root, 'repos') + '/')
+        raise Error, 'integration checkout belongs to another workspace'
+      end
+      remote = @engine.capture('git', '--git-dir', common, 'remote', 'get-url', 'origin').strip
+      expected = @engine.catalog.repository(action.fetch('repository')).fetch('remote')
+      fixtures = @engine.instance_variable_get(:@fixtures)
+      unless WorkspaceCoordination.remote_identity(remote, fixtures: fixtures) == WorkspaceCoordination.remote_identity(expected, fixtures: fixtures)
+        raise Error, 'integration checkout repository changed'
+      end
+    end
+
     def protect_payload(action)
       @metadata.each_value do |value|
         bytes = JSON.generate(value)
@@ -287,8 +368,8 @@ module WorkspaceCoordination
         closed = owner && owner['fence'] && owner['fence']['completed']
         mark(value) if !closed && @retention.live?(id, @ledger, @book)
       end
-      @store.integration_journals.each do |value|
-        next if value['phase'] == 'complete'
+      @journals.each_value do |value|
+        next if integration_finished?(value)
         mark(value)
         # Existing journals bind source heads, but do not record hook artifact
         # IDs. Derive those dependencies from the sealed merge-hook artifacts.
@@ -305,7 +386,7 @@ module WorkspaceCoordination
       @payloads.each_value do |action|
         path = action['path']
         key = path.delete_prefix(@sources + '/')
-        unless all_metadata.include?(path) || all_metadata.include?(action['source']) || @book['pending'].key?(key)
+        unless action['integration'] || all_metadata.include?(path) || all_metadata.include?(action['source']) || @book['pending'].key?(key)
           @book['orphans'][key] ||= Time.now.to_i + Retention::TTL
           unless @book['orphans'][key].is_a?(Integer)
             raise Error, 'invalid orphan retention age'
@@ -330,11 +411,40 @@ module WorkspaceCoordination
           next
         end
         begin
+          if action['integration'] && action['head']
+            # Admission already proved this disposable checkout clean. Partial
+            # removal may have deleted tracked files or .git, so use Git's
+            # retained registration rather than readmission as a clean checkout.
+            common = action.fetch('common')
+            verify_integration_repository(action, common)
+            registered = @engine.capture('git', '--git-dir', common, 'worktree', 'list', '--porcelain')
+            raise Error, 'retained worktree is locked' if worktree_locked?(registered, path)
+            record = registered.split("\n\n").find { |item| item.lines.include?("worktree #{path}\n") }
+            if record
+              unless record.lines.include?("HEAD #{action['head']}\n") && record.lines.map(&:strip).include?('detached')
+                raise Error, 'interrupted integration checkout registration changed'
+              end
+            elsif !action['missing']
+              raise Error, 'interrupted integration checkout registration is missing'
+            end
+            if File.exist?(File.join(path, '.git')) || File.symlink?(File.join(path, '.git'))
+              actual = @engine.capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
+              raise Error, 'interrupted integration checkout repository changed' unless File.realpath(actual) == File.realpath(common)
+              head = @engine.capture('git', '-C', path, 'rev-parse', 'HEAD').strip
+              raise Error, 'interrupted integration checkout HEAD changed' unless head == action['head']
+            end
+            if @ledger['jobs'].values.any? { |job| CLAIMED.include?(job['state']) && job['resources'].include?("git:#{common}") }
+              raise Error, 'Git resource is busy'
+            end
+            @actions << action
+            next
+          end
           if action['missing']
             @actions << action
             next
           end
           common = @engine.capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
+          verify_integration_repository(action, common) if action['integration']
           if @ledger['jobs'].values.any? { |job| CLAIMED.include?(job['state']) && job['resources'].include?("git:#{common}") }
             protect_payload(action)
             @skipped << {'path' => path, 'reason' => 'Git resource is busy'}
@@ -347,7 +457,11 @@ module WorkspaceCoordination
           dirty = @engine.capture('git', '-C', path, 'status', '--porcelain', '--untracked-files=all').strip
           raise Error, 'retained worktree has local changes' unless dirty.empty?
           registered = @engine.capture('git', '--git-dir', common, 'worktree', 'list', '--porcelain')
+          raise Error, 'retained worktree is locked' if worktree_locked?(registered, path)
           raise Error, 'payload is not a registered worktree' unless registered.lines.include?("worktree #{path}\n")
+          if action['integration'] && !registered.split("\n\n").any? { |record| record.lines.include?("worktree #{path}\n") && record.lines.map(&:strip).include?('detached') }
+            raise Error, 'integration checkout is not detached'
+          end
           @actions << action.merge('common' => common, 'head' => head)
         rescue Error => error
           protect_payload(action)
@@ -358,6 +472,11 @@ module WorkspaceCoordination
       Dir[File.join(@store.root, 'roots', '*')].sort.each do |path|
         next unless File.symlink?(path)
         name = File.basename(path)
+        worker = name.match(/\A(#{UUID.source.delete_prefix('\\A').delete_suffix('\\z')})-([0-9a-f]{12})-(notification|integration)\z/)
+        if worker
+          plan_worker_root(path, worker)
+          next
+        end
         id = name[/\A([0-9a-f]{64})-/, 1]
         attempt = name[/\A(#{UUID.source.delete_prefix('\\A').delete_suffix('\\z')})-/, 1]
         known = id && @metadata.key?("sha256:#{id}") || attempt && @known_attempts.include?(attempt)
@@ -370,19 +489,77 @@ module WorkspaceCoordination
       end
     end
 
+    def service_running?(unit)
+      return false if @engine.instance_variable_get(:@fixtures)
+      properties = @engine.capture('systemctl', '--user', 'show', unit,
+        '--property=ActiveState,MainPID').lines.to_h { |line| line.strip.split('=', 2) }
+      properties['MainPID'].to_i > 0 || %w[active activating deactivating].include?(properties['ActiveState'])
+    end
+
+    def plan_worker_root(path, match)
+      id, digest, kind = match.captures
+      known = kind == 'notification' ? @ledger['owners'].key?(id) : @journals.key?(id)
+      unless known && Digest::SHA256.hexdigest(File.realpath(path))[0, 12] == digest
+        @skipped << {'path' => path, 'reason' => 'unknown worker root ownership'}
+        return
+      end
+      live = if kind == 'notification'
+        !@notification_locks.include?(id) || service_running?("workspace-notifications-#{id}.service")
+      else
+        !integration_finished?(@journals.fetch(id)) || service_running?("workspace-integration-#{id}.service")
+      end
+      if live
+        @skipped << {'path' => path, 'reason' => 'worker is running or integration is unfinished'}
+      else
+        @actions << {'kind' => 'root', 'path' => path}
+      end
+    rescue Errno::ENOENT, Errno::ELOOP
+      @skipped << {'path' => path, 'reason' => 'worker root target is unavailable'}
+    end
+
+    def worktree_locked?(registered, path)
+      registered.split("\n\n").any? do |record|
+        record.lines.include?("worktree #{path}\n") &&
+          record.lines.any? { |line| line.strip == 'locked' || line.start_with?('locked ') }
+      end
+    end
+
     def remove_worktree(action)
       path = action.fetch('path')
       key = path.delete_prefix(@sources + '/')
-      @book['pending'][key] = action
-      @retention.write(@book)
+      if action['integration']
+        run = @journals.fetch(action['integration'])
+        run['payloadGcPending'] ||= {}
+        run['payloadGcPending'][File.basename(path)] = action
+        save_integration_gc(run)
+      else
+        @book['pending'][key] = action
+        @retention.write(@book)
+      end
       # Ignored shell dependencies are owned preparation output. The explicit
       # porcelain check above still protects all tracked and untracked edits.
       registered = @engine.capture('git', '--git-dir', action.fetch('common'), 'worktree', 'list', '--porcelain')
+      raise Error, 'retained worktree is locked' if worktree_locked?(registered, path)
       if File.exist?(path) || registered.lines.include?("worktree #{path}\n")
+        if action['integration'] && File.directory?(path) && !File.exist?(File.join(path, '.git'))
+          # Git refuses a surviving directory after .git was deleted. Finish
+          # this already-admitted removal, then let Git retire its registration.
+          FileUtils.remove_entry(path)
+        end
         @engine.capture('git', '--git-dir', action.fetch('common'), 'worktree', 'remove', '--force', path)
       end
-      @book['pending'].delete(key)
-      @retention.write(@book)
+      if action['integration']
+        run['payloadGcPending'].delete(File.basename(path))
+        run.delete('payloadGcPending') if run['payloadGcPending'].empty?
+        save_integration_gc(run)
+      else
+        @book['pending'].delete(key)
+        @retention.write(@book)
+      end
+    end
+
+    def save_integration_gc(run)
+      WorkspaceCoordination.atomic(File.join(@store.root, 'integrations', "#{run.fetch('id')}.json"), run)
     end
   end
 end

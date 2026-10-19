@@ -291,4 +291,261 @@ class CoordinationGcTest < Minitest::Test
     refute File.exist?(source(snapshot))
   end
 
+  def integration_scratch(person, phase: 'complete')
+    id = SecureRandom.uuid
+    path = File.join(@engine.store.root, 'integrations', id, "code-#{@base[0, 12]}-#{SecureRandom.hex(6)}")
+    FileUtils.mkdir_p(File.dirname(path))
+    git('-C', @bare, 'worktree', 'add', '--detach', path, @base)
+    run = {'schema' => 1, 'id' => id, 'ownerId' => person['id'], 'identity' => person['identity'],
+      'phase' => phase, 'request' => {'repositories' => [{'repository' => 'code'}]}}
+    save_integration(run)
+    [run, path]
+  end
+
+  def save_integration(run)
+    WorkspaceCoordination.atomic(File.join(@engine.store.root, 'integrations', "#{run['id']}.json"), run)
+  end
+
+  def worker_root(id, kind, package = @package)
+    @engine.retain_root("#{id}-#{Digest::SHA256.hexdigest(File.realpath(package))[0, 12]}", kind, package)
+    File.join(@engine.store.root, 'roots', "#{id}-#{Digest::SHA256.hexdigest(File.realpath(package))[0, 12]}-#{kind}")
+  end
+
+  def test_completed_integration_scratch_is_collected_without_losing_journal_or_refs
+    run, path = integration_scratch(owner('scratch'))
+    journal = File.join(@engine.store.root, 'integrations', "#{run['id']}.json")
+    before = File.binread(journal)
+    refs = git('-C', @bare, 'show-ref')
+    assert_equal [path], collect['actions'].map { |item| item['path'] }
+    assert_equal before, File.binread(journal)
+    assert_equal 1, collect(apply: true)['removed'].length
+    refute File.exist?(path)
+    assert_equal run, WorkspaceCoordination.private_read(journal)
+    assert_equal refs, git('-C', @bare, 'show-ref')
+    refute_includes git('-C', @bare, 'worktree', 'list', '--porcelain'), "worktree #{path}\n"
+    assert_empty collect(apply: true)['removed']
+  end
+
+  def test_unfinished_or_locked_integration_preserves_its_scratch
+    run, path = integration_scratch(owner('unfinished-scratch'), phase: 'prepare')
+    assert_empty collect(apply: true)['removed']
+    run['phase'] = 'complete'
+    save_integration(run)
+    @engine.store.lock("integration-#{run['id']}") do
+      result = Thread.new { collect(apply: true) }.value
+      assert result['retry']
+      assert_empty result['removed']
+    end
+    assert File.directory?(path)
+    collect(apply: true)
+    refute File.exist?(path)
+  end
+
+  def test_edited_held_unknown_and_foreign_integration_data_survive
+    person = owner('scratch-holds')
+    _run, edited = integration_scratch(person)
+    File.write(File.join(edited, 'local-data'), 'operator work')
+    _run, held = integration_scratch(person)
+    File.write(File.join(held, '.keep'), 'keep')
+    run, foreign = integration_scratch(person)
+    git('-C', @bare, 'worktree', 'remove', foreign)
+    other = File.join(@tmp, 'other.git')
+    git('clone', '--bare', @remote, other)
+    git('-C', other, 'worktree', 'add', '--detach', foreign, @base)
+    unknown = File.join(File.dirname(foreign), 'operator-data')
+    FileUtils.mkdir_p(unknown)
+    assert_empty collect(apply: true)['removed']
+    [edited, held, foreign, unknown].each { |path| assert File.directory?(path) }
+  end
+
+  def test_process_and_live_artifact_references_keep_completed_scratch
+    person, snapshot = prepare('scratch-reference')
+    _run, path = integration_scratch(person)
+    hook = @engine.save_artifact('kind' => 'merge_hooks', 'repository' => 'code',
+      'featureHead' => snapshot.dig('operation', 'featureHead'), 'environment' => {'BUNDLE_PATH' => path})
+    snapshot = @engine.prepare_snapshot(person, 'merge', snapshot['operation'].merge('hookArtifact' => hook['id']), evidence(person))
+    job = submit(person, snapshot)
+    collect(apply: true)
+    assert File.directory?(path)
+    cancel(person, job)
+    pid = Process.spawn(RbConfig.ruby, '-e', 'sleep 60', chdir: path)
+    begin
+      collect(apply: true)
+      assert File.directory?(path)
+    ensure
+      Process.kill('TERM', pid)
+      Process.wait(pid)
+    end
+    collect(apply: true)
+    refute File.exist?(path)
+  end
+
+  def test_integration_removal_recovers_after_git_has_removed_the_directory
+    run, path = integration_scratch(owner('scratch-interruption'))
+    capture = @engine.method(:capture)
+    interrupted = false
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      result = capture.call(*args, **options)
+      if !interrupted && args.include?('remove')
+        interrupted = true
+        raise WorkspaceCoordination::Error, 'fixture interruption after deletion'
+      end
+      result
+    end
+    assert_raises(WorkspaceCoordination::Error) { collect(apply: true) }
+    refute File.exist?(path)
+    assert @engine.store.integration_journals.first['payloadGcPending'].key?(File.basename(path))
+    assert_equal 1, collect(apply: true)['removed'].length
+    assert_equal run, @engine.store.integration_journals.first
+  end
+
+  def interrupt_scratch_removal(path, remove_git: false)
+    capture = @engine.method(:capture)
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      if args.include?('remove')
+        File.unlink(File.join(path, 'base'))
+        File.unlink(File.join(path, '.git')) if remove_git
+        raise WorkspaceCoordination::Error, 'fixture partial deletion'
+      end
+      capture.call(*args, **options)
+    end
+    assert_raises(WorkspaceCoordination::Error) { collect(apply: true) }
+  ensure
+    @engine.define_singleton_method(:capture, capture)
+  end
+
+  def test_integration_removal_recovers_from_partial_deletion_with_or_without_git_file
+    [false, true].each do |remove_git|
+      run, path = integration_scratch(owner("partial-scratch-#{remove_git}"))
+      interrupt_scratch_removal(path, remove_git: remove_git)
+      assert File.directory?(path)
+      assert_equal 1, collect(apply: true)['removed'].length
+      refute File.exist?(path)
+      assert_equal run, @engine.store.integration_journals.find { |item| item['id'] == run['id'] }
+    end
+  end
+
+  def test_pending_integration_removal_preserves_changed_registration_and_explicit_holds
+    person = owner('changed-pending-scratch')
+    run, path = integration_scratch(person)
+    interrupt_scratch_removal(path)
+    File.write(File.join(path, '.keep'), 'hold pending removal')
+    assert_empty collect(apply: true)['removed']
+    File.unlink(File.join(path, '.keep'))
+    git('-C', path, 'checkout', '-b', 'reused-scratch')
+    result = collect(apply: true)
+    assert_empty result['removed']
+    assert result['preserved'].any? { |item| item['reason'] == 'interrupted integration checkout registration changed' }
+    assert File.directory?(path)
+    assert @engine.store.integration_journals.first['payloadGcPending'].key?(File.basename(path))
+    git('-C', path, 'checkout', '--detach', @base)
+    feature(person)
+    git('-C', path, 'checkout', '--detach', person['slug'])
+    assert_empty collect(apply: true)['removed']
+    assert_equal run['id'], @engine.store.integration_journals.first['id']
+  end
+
+  def test_pending_integration_removal_does_not_delete_replacement_data_without_registration
+    _run, path = integration_scratch(owner('replaced-pending-scratch'))
+    interrupt_scratch_removal(path)
+    git('-C', @bare, 'worktree', 'remove', '--force', path)
+    FileUtils.mkdir_p(path)
+    File.write(File.join(path, 'new-data'), 'replacement operator data')
+    result = collect(apply: true)
+    assert_empty result['removed']
+    assert result['preserved'].any? { |item| item['reason'] == 'interrupted integration checkout registration is missing' }
+    assert_equal 'replacement operator data', File.read(File.join(path, 'new-data'))
+  end
+
+  def test_pending_integration_removal_preserves_native_git_worktree_lock
+    _run, path = integration_scratch(owner('locked-pending-scratch'))
+    File.write(File.join(@bare, 'info', 'exclude'), "retained-cache\n")
+    File.write(File.join(path, 'retained-cache'), 'retained contents')
+    interrupt_scratch_removal(path, remove_git: true)
+    git('-C', @bare, 'worktree', 'lock', '--reason', 'operator inspection', path)
+    result = collect(apply: true)
+    assert_empty result['removed']
+    assert result['preserved'].any? { |item| item['reason'] == 'retained worktree is locked' }
+    assert File.directory?(path)
+    assert_equal 'retained contents', File.read(File.join(path, 'retained-cache'))
+    git('-C', @bare, 'worktree', 'unlock', path)
+    assert_equal 1, collect(apply: true)['removed'].length
+    refute File.exist?(path)
+  end
+
+  def test_pending_integration_removal_rechecks_native_lock_before_directory_deletion
+    _run, path = integration_scratch(owner('late-locked-pending-scratch'))
+    File.write(File.join(@bare, 'info', 'exclude'), "retained-cache\n")
+    File.write(File.join(path, 'retained-cache'), 'late-held contents')
+    interrupt_scratch_removal(path, remove_git: true)
+    capture = @engine.method(:capture)
+    common = @bare
+    lists = 0
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      if args.include?('list') && (lists += 1) == 2
+        capture.call('git', '--git-dir', common, 'worktree', 'lock', path)
+      end
+      capture.call(*args, **options)
+    end
+    error = assert_raises(WorkspaceCoordination::Error) { collect(apply: true) }
+    assert_equal 'retained worktree is locked', error.message
+    assert File.directory?(path)
+    assert_equal 'late-held contents', File.read(File.join(path, 'retained-cache'))
+  ensure
+    @engine.define_singleton_method(:capture, capture) if capture
+  end
+
+  def test_stopped_notification_roots_are_released_even_with_pending_delivery
+    person, snapshot = prepare('notification-roots')
+    submit(person, snapshot)
+    @engine.claim
+    root = worker_root(person['id'], 'notification')
+    assert @engine.store.read['outbox'].values.any? { |event| event['state'] != 'delivered' }
+    collect(apply: true)
+    refute File.symlink?(root)
+    assert File.directory?(source(snapshot))
+    assert_equal root, worker_root(person['id'], 'notification')
+  end
+
+  def test_notification_lock_and_active_service_protect_worker_roots
+    person = owner('notification-lock')
+    root = worker_root(person['id'], 'notification')
+    @engine.store.lock("notifications-#{person['id']}") do
+      result = Thread.new { collect(apply: true) }.value
+      assert_empty result['removed']
+    end
+    assert File.symlink?(root)
+    collector = WorkspaceCoordination::Collector.new(@engine)
+    collector.define_singleton_method(:service_running?) { |_unit| true }
+    assert_empty collector.call(apply: true)['removed']
+    collect(apply: true)
+    refute File.symlink?(root)
+  end
+
+  def test_background_worker_roots_follow_journal_completion_and_known_targets
+    run, _path = integration_scratch(owner('integration-root'), phase: 'prepare')
+    root = worker_root(run['id'], 'integration')
+    collect(apply: true)
+    assert File.symlink?(root)
+    run['phase'] = 'complete'
+    save_integration(run)
+    collect(apply: true)
+    refute File.symlink?(root)
+    wrong = File.join(@engine.store.root, 'roots', "#{run['ownerId']}-#{'0' * 12}-notification")
+    File.symlink(@package, wrong)
+    assert_empty collect(apply: true)['removed']
+    assert File.symlink?(wrong)
+  end
+
+  def test_running_preparation_defers_all_collection
+    _run, path = integration_scratch(owner('preparation-guard'))
+    collector = WorkspaceCoordination::Collector.new(@engine)
+    collector.define_singleton_method(:preparation_processes) { [12345] }
+    result = collector.call(apply: true)
+    assert result['retry']
+    assert_empty result['removed']
+    assert File.directory?(path)
+    assert_equal 12345, result['preserved'].first['pid']
+  end
+
 end
