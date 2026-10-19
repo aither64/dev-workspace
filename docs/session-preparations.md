@@ -113,6 +113,12 @@ same-origin session path. Gone, replaced, conflicting and cancelled operations
 stay on their preparation page. The legacy slug-based initialization page
 continues to serve forks, plan sessions and explicit-name callers.
 
+Retry resumes the saved request with its original provider and team settings.
+The Ruby initializer validates that provider against the accepted receipt before
+publishing its creation journal; omitted providers continue to inherit the
+workspace default. Direct-team plan requests retain their destination-settings
+flag as an optional boolean.
+
 ## Naming and reservation
 
 The portal owns one naming-only Codex App Server for its service lifetime.

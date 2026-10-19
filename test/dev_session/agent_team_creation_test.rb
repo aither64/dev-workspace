@@ -84,6 +84,83 @@ class DevSessionTest < Minitest::Test
         current['request']['browserNotificationsEnabled'] = value
         assert_raises(DevSession::Error) { validate.call }
       end
+      current['request'].delete('browserNotificationsEnabled')
+      current['request']['destinationSettings'] = true
+      assert_raises(DevSession::Error) { validate.call } # Plan-only field.
+      current['request'].merge!(
+        'kind' => 'plan', 'source' => 'source', 'sourceThreadId' => 'source-thread',
+        'sourceIdentity' => 'e' * 64, 'planTurnId' => 'plan-turn', 'planSha256' => 'f' * 64
+      )
+      current['request'].delete('goal')
+      [true, false].each do |value|
+        current['request']['destinationSettings'] = value
+        validate.call
+      end
+      [nil, 0, 'true', [], {}].each do |value|
+        current['request']['destinationSettings'] = value
+        assert_raises(DevSession::Error) { validate.call }
+      end
+    end
+  end
+
+  def test_portal_direct_creation_preserves_provider_through_initialization_and_retry
+    [nil, 'openai', 'pool'].each do |provider|
+      with_workspace do |workspace|
+        slug = '2026-09-22-portal-provider'
+        preset = recovery_direct_team_preset
+        scenario = DirectCreationScenario.new
+        runner = direct_creation_runner(workspace, scenario)
+        selections = []
+        # Provider host effects and native threads are external to this Ruby
+        # initialization test; receipt, binding, journal and retry are real.
+        runner.define_singleton_method(:prepare_provider_selection!) do |_slug, journal, selected|
+          selections << selected
+          raise 'provider lost before binding' unless journal['provider'] == provider && selected == provider
+        end
+        runner.define_singleton_method(:validate_retained_provider_selection!) do |_slug, _manifest, selected|
+          raise 'provider changed on retry' unless selected == provider
+        end
+        directory = File.join(workspace, '.portal-private')
+        FileUtils.mkdir_p(directory, mode: 0o700)
+        preset_path = File.join(workspace, 'preset.json')
+        File.write(preset_path, JSON.generate(preset))
+        File.chmod(0o600, preset_path)
+        id = 'c' * 64
+        current = {
+          'schema' => 3, 'workspace' => workspace, 'receiptId' => id,
+          'deletionHistorySha256' => Digest::SHA256.hexdigest(''), 'attempt' => 1,
+          'validated' => true, 'state' => 'failed', 'phase' => 'Initialization stopped',
+          'startedAt' => '2026-10-14T12:00:00Z', 'updatedAt' => '2026-10-14T12:00:00Z',
+          'error' => 'initialize session: direct team creation request is no longer current',
+          'directTeam' => preset, 'model' => preset.fetch('leadModel'), 'effort' => preset.fetch('leadEffort'),
+          'request' => {'kind' => 'new', 'slug' => slug, 'goal' => 'Work',
+                        'team' => preset.fetch('id'), 'catalogDigest' => preset.fetch('catalogDigest'),
+                        'browserNotificationsEnabled' => false}
+        }
+        current['request']['provider'] = provider if provider
+        path = File.join(directory, "#{slug}.json")
+        File.write(path, JSON.generate(current))
+        File.chmod(0o600, path)
+        options = {as_is: true, new: false, attach: false, run_codex: true,
+                   goal_text: 'Work', json: true, exclusive: true, team_preset: preset_path,
+                   model: preset.fetch('leadModel'), effort: preset.fetch('leadEffort'), provider:,
+                   creation_receipt_id: id, creation_evidence: File.join(directory, "#{slug}.#{id}.complete.json")}
+        scenario.queue_send(:success)
+        runner.start(slug, **options)
+        runner.start(slug, **options)
+        assert_equal(1, scenario.events.count(:root_created))
+        assert_equal(1, scenario.turn_starts)
+        assert_equal(1, scenario.applied_presets.length)
+        journal = JSON.parse(File.read(runner.send(:creation_journal_file, slug)))
+        assert_equal('ready', journal.fetch('state'))
+        provider ? assert_equal(provider, journal['provider']) : assert_nil(journal['provider'])
+        assert_equal([provider], selections)
+        [nil, 'openai', 'pool'].reject { |value| value == provider }.each do |changed|
+          error = assert_raises(DevSession::Error) { runner.start(slug, **options.merge(provider: changed)) }
+          assert_includes(error.message, 'provider does not match the accepted request')
+        end
+        assert_equal(1, scenario.turn_starts)
+      end
     end
   end
 

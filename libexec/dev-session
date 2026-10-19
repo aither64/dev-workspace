@@ -986,7 +986,7 @@ module DevSession
             revive_runtime_journal = prepare_revive_runtime_start!(slug, operation_id: lifecycle_operation_id)
           end
           prepare_portal_creation_receipt!(
-            receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:, team_binding:, direct_team:
+            receipt, slug, 'start', goal: goal_file && read_goal(goal_file), model:, effort:, provider:, team_binding:, direct_team:
           )
           # Only this locked invocation can prove that no prior submitter exists.
           # Publishing the journal destroys freshness for every subsequent retry.
@@ -4038,8 +4038,8 @@ module DevSession
              current['deletionHistorySha256'].match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'creation request is no longer current; start a new request'
       end
-      if current['request']['kind'] == 'fork' && current['request']['provider'] != provider
-        raise Error, 'fork provider does not match the accepted request'
+      unless valid_creation_provider?(current['request']) && current['request']['provider'] == provider
+        raise Error, 'creation provider does not match the accepted request'
       end
       unless (current['request']['sensitive'] == true) == sensitive_session?(slug)
         raise Error, 'creation sensitivity does not match the accepted request'
@@ -4089,13 +4089,14 @@ module DevSession
                    []
                  end
 	  allowed = required.dup
-	  allowed << 'planText' if request['kind'] == 'plan'
+	  allowed.concat(%w[planText destinationSettings]) if request['kind'] == 'plan'
 	  # An explicit lead override remains in the accepted browser request as
 	  # provenance. Its resolved, immutable values live in directTeam.
-	  allowed.concat(%w[model effort sensitive browserNotificationsEnabled])
+      allowed.concat(%w[model effort provider sensitive browserNotificationsEnabled])
       unless required.any? && request.keys.all? { |key| allowed.include?(key) } &&
              (required - request.keys).empty? && request['slug'] == slug &&
              request['team'] == direct_team['id'] && request['catalogDigest'] == direct_team['catalogDigest'] &&
+             (!request.key?('destinationSettings') || [true, false].include?(request['destinationSettings'])) &&
              (!request.key?('browserNotificationsEnabled') || [true, false].include?(request['browserNotificationsEnabled']))
         raise Error, 'direct team creation request is no longer current; start a new request'
       end
