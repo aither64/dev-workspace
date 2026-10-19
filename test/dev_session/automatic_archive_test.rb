@@ -306,6 +306,37 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_local_automatic_archive_accepts_uncommitted_tracking_in_every_tier
+    %w[complete merged empty].product([false, true]).each do |tier, partial|
+      with_workspace do |workspace|
+        slug = '2026-06-06-uncommitted'
+        runner = automatic_fixture(workspace, slug, lifecycle: tier == 'complete' ? 'complete' : 'active', tracking_commit: false)
+        runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
+        if tier == 'merged'
+          create_bare_repo(workspace, 'sample')
+          runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+          merge_registered_branches(workspace, slug)
+        end
+        if partial
+          assert_git_success('git', '-C', workspace, 'add', File.join('work', slug, 'plan.md'))
+          assert_git_success('git', '-C', workspace, 'commit', '-m', 'plan only')
+          assert_git_success('git', '-C', workspace, 'push', 'origin', 'master')
+        end
+        assert_equal(tier, automatic_scan(runner).fetch(0)['tier'])
+        age_automatic_session(runner, slug, WorkspaceAutoArchive::Policy::TIERS.fetch(tier) + 1)
+        result = automatic_scan(runner).fetch(0)
+        assert_equal('archived', result['result'], result.inspect)
+        assert_equal(tier == 'empty' ? 'abandoned' : 'complete', result['archive_mode'])
+        assert_equal('pending', runner.tracking_sync_receipt(slug).fetch('state'))
+        runner.tracking_sync(slug, force: true)
+        assert_equal('synced', runner.tracking_sync_receipt(slug).fetch('state'))
+        runner.define_singleton_method(:start) { |*, **| nil }
+        runner.revive(slug, as_is: true, allow_abandoned: tier == 'empty')
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+      end
+    end
+  end
+
   def test_automatic_archive_completes_the_merged_branch_tier
     with_workspace do |workspace|
       slug = '2026-06-06-merged'

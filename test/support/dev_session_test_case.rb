@@ -82,7 +82,7 @@ class DevSessionTest < Minitest::Test
     File.write(path, YAML.dump(manifest))
   end
 
-  def automatic_fixture(workspace, slug, lifecycle: 'active', out: nil)
+  def automatic_fixture(workspace, slug, lifecycle: 'active', out: nil, tracking_commit: true)
     portal = File.join(workspace, 'automatic-portal.rb')
     stamp = Time.now.to_i
     File.write(portal, <<~RUBY)
@@ -134,7 +134,14 @@ class DevSessionTest < Minitest::Test
       'thread_id' => "thread-#{slug}", 'socket_path' => '/run/test/codex.sock', 'client_version' => '0.152.1'
     }
     File.write(path, YAML.dump(manifest))
-    commit_tracking(workspace, slug, lifecycle:)
+    if tracking_commit
+      commit_tracking(workspace, slug, lifecycle:)
+    else
+      set_lifecycle(workspace, slug, lifecycle)
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'commit', '--allow-empty', '-m', 'workspace baseline')
+    end
     configure_workspace_origin(workspace)
     runner.auto_archive_configure(true)
     runner

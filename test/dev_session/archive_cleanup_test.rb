@@ -3,6 +3,46 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_explicit_local_archive_without_tracking_history_retries_sync_and_revives
+    [false, true].product([false, true]).each do |partial, sync_before_revive|
+      with_workspace do |workspace|
+        slug = '2026-06-06-no-tracking-history'
+        runner = automatic_fixture(workspace, slug, tracking_commit: false)
+        runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
+        if partial
+          assert_git_success('git', '-C', workspace, 'add', File.join('work', slug, 'plan.md'))
+          assert_git_success('git', '-C', workspace, 'commit', '-m', 'plan only')
+          assert_git_success('git', '-C', workspace, 'push', 'origin', 'master')
+        end
+        plan = File.read(File.join(workspace, 'work', slug, 'plan.md'))
+        File.write(File.join(workspace, 'unrelated'), 'keep this staged')
+        assert_git_success('git', '-C', workspace, 'add', 'unrelated')
+        staged = git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary')
+        runner.define_singleton_method(:finalize_locked!) { |*, **| raise DevSession::Error, 'interrupted before move' }
+        error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
+        assert_includes(error.message, 'interrupted before move')
+        runner.singleton_class.remove_method(:finalize_locked!)
+        runner.archive(slug, as_is: true, explicit: true)
+        assert_equal(plan, File.read(File.join(workspace, 'archive', slug, 'plan.md')))
+        assert_equal('pending', runner.tracking_sync_receipt(slug).fetch('state'))
+        runner.define_singleton_method(:require_linear_workspace_master_for_tracking!) { |**| raise DevSession::Error, 'remote unavailable' }
+        runner.tracking_sync(slug, force: true)
+        assert_includes(runner.tracking_sync_receipt(slug).fetch('error'), 'remote unavailable')
+        runner.singleton_class.remove_method(:require_linear_workspace_master_for_tracking!)
+        if sync_before_revive
+          runner.tracking_sync(slug, force: true)
+          assert_equal('synced', runner.tracking_sync_receipt(slug).fetch('state'))
+        end
+        runner.define_singleton_method(:start) { |*, **| nil }
+        runner.revive(slug, as_is: true)
+        assert_equal(plan, File.read(File.join(workspace, 'work', slug, 'plan.md')))
+        runner.tracking_sync(slug, force: true)
+        assert_equal('synced', runner.tracking_sync_receipt(slug).fetch('state'))
+        assert_equal(staged, git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary'))
+      end
+    end
+  end
+
   def test_git_archive_retains_checkout_when_saved_blobs_are_missing_or_corrupt
     require 'zlib'
     %w[missing corrupt].product(%w[before_capture before_removal]).each do |damage, timing|

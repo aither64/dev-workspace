@@ -145,6 +145,12 @@ finds no pending journal. Failed or paused receipts still require recovery.
 
 Local tracking receipts live under private `tracking-sync/` state. An archive
 receipt binds its operation and exact tracking digest before runtime retirement.
+Local-first archival accepts valid tracking files that have never been committed,
+including partially committed tracking. This applies to explicit archival and
+every automatic tier. Automatic archival still requires its normal inactivity,
+hold, ownership, cleanliness, publication and merge proofs. The local receipt makes the transition durable while Git bookkeeping is
+pending. Older synchronous journals retain their saved
+commit requirements.
 The per-workspace retry timer commits only owned paths under the existing shared
 tracking lock. Each attempt has a 60-second deadline covering lock waits, fetches
 and hooks; fetches also retain their 30-second limit. Timed-out commands receive

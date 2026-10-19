@@ -2005,7 +2005,9 @@ module DevSession
               raise Error,
                     "initiative lifecycle is #{lifecycle}; use the matching archive mode"
             end
-            validate_tracking_committed!(slug)
+            # Local tracking receipts prove closure independently of Git history.
+            # A prepared intent still owns its original executor's commit policy.
+            validate_tracking_committed!(slug) unless (prepared ? local_tracking_journal?(prepared) : defer_tracking?)
             if sidecar
               cleanup.revalidate!(sidecar, journal: prepared)
               inventory = sidecar.fetch('inventory')
@@ -2376,7 +2378,7 @@ module DevSession
 
       lifecycle = validate_tracking_files!(slug)
       validate_terminal_lifecycle!(slug)
-      validate_tracking_committed!(slug)
+      validate_tracking_committed!(slug) unless journal && local_tracking_journal?(journal)
       archive_root = File.join(workspace, 'archive')
       archive_device = File.directory?(archive_root) ? File.stat(archive_root).dev : File.stat(workspace).dev
       unless File.stat(source).dev == archive_device
