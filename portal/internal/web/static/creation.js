@@ -82,6 +82,7 @@
   const title = document.getElementById("creation-title");
   const phase = document.getElementById("creation-phase");
   const error = document.getElementById("creation-error");
+  const errorCopy = document.getElementById("creation-error-copy");
   const retry = document.getElementById("creation-retry");
   const elapsed = document.getElementById("creation-elapsed");
   const source = document.getElementById("creation-source");
@@ -101,8 +102,15 @@
     document.getElementById("creation-request-copy").append(createCopyButton({
       getText: () => initialRequest.textContent, label: "Copy initial request",
     }));
+    errorCopy.append(createCopyButton({getText: () => error.textContent, label: "Copy error"}));
   }).catch(() => {});
   let receipt, retrying = false, stopped = false;
+  function showError(message) {
+    // Replacing an unchanged text node clears the user's selection each poll.
+    if (error.textContent !== message) error.textContent = message;
+    error.hidden = !message;
+    errorCopy.hidden = !message;
+  }
   async function request(url, options) {
     const response = await fetch(url, {credentials: "same-origin", cache: "no-store", ...options});
     const result = await response.json();
@@ -134,8 +142,7 @@
     source.hidden = !sourceURL || next.state === "running";
     if (sourceURL) source.href = sourceURL;
     else source.removeAttribute("href");
-    error.textContent = next.error || "";
-    error.hidden = !next.error;
+    showError(nameStorageError || next.error || "");
     retry.hidden = requestId ? !presentation.retry : !["failed", "paused"].includes(next.state);
     retry.textContent = presentation?.canSetName ? "Retry naming" : requestId ? "Retry creation" : "Retry initialization";
     retry.disabled = retrying || Boolean(nameSelection?.pending);
@@ -147,12 +154,11 @@
       nameInput.required = !pending;
       nameSubmit.disabled = retrying || Boolean(nameStorageError);
       nameSubmit.textContent = pending ? "Retry saved name" : "Use name and continue";
-      if (nameStorageError) { error.textContent = nameStorageError; error.hidden = false; }
     }
   }
   async function poll() {
     try { render(await request(endpoint)); }
-    catch (failure) { error.textContent = failure.message; error.hidden = false; }
+    catch (failure) { showError(failure.message); }
     finally { if (!stopped) window.setTimeout(poll, 1000); }
   }
   retry.addEventListener("click", async () => {
@@ -163,7 +169,7 @@
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({receiptId: receipt.receiptId, attempt: receipt.attempt}),
       }));
-    } catch (failure) { error.textContent = failure.message; error.hidden = false; }
+    } catch (failure) { showError(failure.message); }
     finally { retrying = false; retry.disabled = false; }
   });
   nameForm?.addEventListener("submit", async (event) => {
@@ -175,7 +181,7 @@
     catch (failure) { nameFailure = failure.message; }
     finally {
       retrying = false; render(receipt);
-      if (nameFailure) { error.textContent = nameFailure; error.hidden = false; }
+      if (nameFailure) showError(nameFailure);
     }
   });
   poll();

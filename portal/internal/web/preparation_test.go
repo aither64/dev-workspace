@@ -1034,7 +1034,7 @@ func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing
 	for _, expected := range []string{
 		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
 		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
-		`/static/preparation.js?v=5`, `/static/creation.js?v=4`,
+		`/static/preparation.js?v=5`, `/static/creation.js?v=5`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("preparation page omits %q", expected)

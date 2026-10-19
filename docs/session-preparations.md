@@ -113,6 +113,9 @@ same-origin session path. Gone, replaced, conflicting and cancelled operations
 stay on their preparation page. The legacy slug-based initialization page
 continues to serve forks, plan sessions and explicit-name callers.
 
+Polling preserves the text node when an error is unchanged, so text selection
+survives status refreshes. **Copy error** copies the complete displayed message.
+
 Retry resumes the saved request with its original provider and team settings.
 The Ruby initializer validates that provider against the accepted receipt before
 publishing its creation journal; omitted providers continue to inherit the

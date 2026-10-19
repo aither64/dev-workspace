@@ -285,6 +285,29 @@ const baseURL = process.argv[2];
       await expect(actual).toHaveURL(`${baseURL}/creations/${status.requestId}/`);
       await actual.reload({waitUntil:"domcontentloaded"});
       await expect(actual.locator("body")).not.toContainText("unknown session request field");
+      // Exercise the shipped renderer while real browser text is selected.
+      // Identical status polls must preserve the selected text node.
+      const failure="initialize session: error: direct team creation request is no longer current; start a new request";
+      let polls=0;
+      await actual.route(`**/api/session-creations/${status.requestId}`,route=>{
+        polls++;
+        return route.fulfill({json:{...status,state:"failed",phase:"initializing",error:failure}});
+      });
+      await actual.reload({waitUntil:"domcontentloaded"});
+      await expect(actual.locator("#creation-error")).toHaveText(failure);
+      await actual.evaluate(()=>{
+        const node=document.getElementById("creation-error").firstChild;
+        window.selectedErrorNode=node;
+        const range=document.createRange();range.selectNodeContents(node);
+        const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+      });
+      const initialPolls=polls;
+      await expect.poll(()=>polls).toBeGreaterThanOrEqual(initialPolls+2);
+      assert.equal(await actual.evaluate(()=>window.getSelection().toString()),failure);
+      assert.equal(await actual.evaluate(()=>window.selectedErrorNode===document.getElementById("creation-error").firstChild),true);
+      await actual.context().grantPermissions(["clipboard-read","clipboard-write"]);
+      await actual.getByRole("button",{name:"Copy error",exact:true}).click();
+      assert.equal(await actual.evaluate(()=>navigator.clipboard.readText()),failure);
       await actual.close();
     }
     assert.deepEqual(errors, []);

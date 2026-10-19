@@ -17,6 +17,7 @@
       <p id="creation-phase" role="status" aria-live="polite">Loading initialization status…</p>
       <p id="creation-elapsed" role="timer"></p>
       <p id="creation-error" class="notice error" hidden></p>
+      <span id="creation-error-copy" hidden></span>
       <button id="creation-retry" type="button" hidden>{{if .Preparation}}Retry creation{{else}}Retry initialization{{end}}</button>
       {{if .Preparation}}
       <form id="creation-name-form" hidden>
@@ -35,7 +36,7 @@
     </section>
   </main>
   <script src="/static/preparation.js?v=5" defer></script>
-  <script src="/static/creation.js?v=4" defer></script>
+  <script src="/static/creation.js?v=5" defer></script>
 </body>
 </html>
 {{end}}
