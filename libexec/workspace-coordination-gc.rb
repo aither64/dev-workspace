@@ -119,7 +119,7 @@ module WorkspaceCoordination
         @ledger = @store.read
         @book = @retention.read
         @metadata, @snapshots = {}, {}
-        @payloads, @live_payloads, @live_ids = {}, Set.new, Set.new
+        @payloads, @live_payloads, @live_ids, @live_paths = {}, Set.new, Set.new, Set.new
         @journals = @store.integration_journals.to_h { |run| [run['id'], run] }
         @skipped, @actions = [], []
         preparing = preparation_processes
@@ -141,6 +141,8 @@ module WorkspaceCoordination
           next unless apply
           if action['kind'] == 'worktree'
             remove_worktree(action)
+          elsif action['kind'] == 'profile_generation'
+            remove_profile_generation(action)
           else
             File.unlink(action.fetch('path')) if File.symlink?(action.fetch('path'))
           end
@@ -323,6 +325,7 @@ module WorkspaceCoordination
       when Hash then value.each_value { |item| mark(item) }
       when Array then value.each { |item| mark(item) }
       when String
+        @live_paths << value
         value.scan(/sha256:[0-9a-f]{64}/).each do |id|
           next if @live_ids.include?(id)
           @live_ids << id
@@ -487,6 +490,7 @@ module WorkspaceCoordination
           @skipped << {'path' => path, 'reason' => live ? 'required by live work' : 'unknown root ownership'}
         end
       end
+      plan_profile_generations
     end
 
     def service_running?(unit)
@@ -515,6 +519,38 @@ module WorkspaceCoordination
       end
     rescue Errno::ENOENT, Errno::ELOOP
       @skipped << {'path' => path, 'reason' => 'worker root target is unavailable'}
+    end
+
+    def plan_profile_generations
+      profile = @engine.profile
+      return unless File.symlink?(profile)
+      current_path = File.expand_path(File.readlink(profile), File.dirname(profile))
+      match = current_path.match(/\A#{Regexp.escape(profile)}-([0-9]+)-link\z/)
+      return unless match && File.symlink?(current_path)
+      current = match[1].to_i
+      generations = Dir["#{profile}-*-link"].filter_map do |path|
+        item = path.match(/\A#{Regexp.escape(profile)}-([0-9]+)-link\z/)
+        [item[1].to_i, path] if item && File.symlink?(path)
+      end.sort
+      keep = generations.select { |number, _| number <= current }.last(2).map(&:first)
+      generations.each do |number, path|
+        next if number > current || keep.include?(number)
+        target = File.realpath(path)
+        if @live_paths.any? { |value| value == target || value.start_with?(target + '/') }
+          @skipped << {'path' => path, 'reason' => 'profile generation is required by live work'}
+          next
+        end
+        @actions << {'kind' => 'profile_generation', 'path' => path, 'profile' => profile,
+          'generation' => number, 'profileToken' => DevWorkspaceProfileIdentity.token(profile), 'target' => target}
+      end
+    end
+
+    def remove_profile_generation(action)
+      unless DevWorkspaceProfileIdentity.token(action['profile']) == action['profileToken'] &&
+             File.symlink?(action['path']) && File.realpath(action['path']) == action['target']
+        raise Error, 'workspace profile changed during collection; retry'
+      end
+      @engine.capture('nix-env', '--profile', action['profile'], '--delete-generations', action['generation'].to_s)
     end
 
     def worktree_locked?(registered, path)

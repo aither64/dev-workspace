@@ -197,8 +197,8 @@ through `workspace-coordination-gc.service`. It keeps deletion out of scheduling
 Collection preserves pending jobs, live worker locks/services, all unreleased
 reservation recovery, unfinished integration journals, pending notification
 artifacts and shared references. An operation succeeding does not retire a
-reservation still held for deployment review. Existing profile generations and
-their independent Nix roots continue to retain installed/rollback closures.
+reservation still held for deployment review. The selected workspace profile,
+its predecessor and generations required by live work keep their package roots.
 
 A preparation not submitted within seven days expires. A new preparation renews
 its lease; status and collection previews do not. Older unused preparations and
@@ -255,6 +255,16 @@ their payload dependencies remain retained; the next dispatch roots its selected
 package again. Background integration worker roots survive unfinished journals
 and running services. Unknown root ownership or a mismatched package digest
 prevents removal.
+
+The collector prunes recognized workspace Nix profile generations through
+`nix-env` under the existing profile-transition exclusion. It retains the
+selected generation, one predecessor, all newer generations after a legacy
+rollback, and package generations referenced by live operations, preparations or
+recovery. It rechecks the selected profile identity before each removal and
+does not change profile selection. Separate Codex generation roots remain.
+Other users' or system Nix profiles are outside this policy. Workspace package
+switches are forward-only; retaining the predecessor supports diagnosis and
+recovery evidence, not automatic workspace rollback.
 
 These policies release disposable references; they do not impose a byte limit
 on active work. A live operation, held checkout, retained feature worktree or

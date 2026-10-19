@@ -311,6 +311,26 @@ class CoordinationGcTest < Minitest::Test
     File.join(@engine.store.root, 'roots', "#{id}-#{Digest::SHA256.hexdigest(File.realpath(package))[0, 12]}-#{kind}")
   end
 
+  def profile_generations(current: 5)
+    File.unlink(@profile)
+    1.upto(5) do |number|
+      package = number == 5 ? @package : File.join(@tmp, "old-package-#{number}")
+      FileUtils.mkdir_p(package)
+      File.symlink(package, "#{@profile}-#{number}-link")
+    end
+    File.symlink(File.basename("#{@profile}-#{current}-link"), @profile)
+    capture = @engine.method(:capture)
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      if args.first == 'nix-env'
+        raise 'unexpected profile mutation' unless args[1..3] == ['--profile', @profile, '--delete-generations']
+        File.unlink("#{@profile}-#{args.fetch(4)}-link")
+        ''
+      else
+        capture.call(*args, **options)
+      end
+    end
+  end
+
   def test_completed_integration_scratch_is_collected_without_losing_journal_or_refs
     run, path = integration_scratch(owner('scratch'))
     journal = File.join(@engine.store.root, 'integrations', "#{run['id']}.json")
@@ -535,6 +555,59 @@ class CoordinationGcTest < Minitest::Test
     File.symlink(@package, wrong)
     assert_empty collect(apply: true)['removed']
     assert File.symlink?(wrong)
+  end
+
+  def test_profile_cleanup_keeps_current_predecessor_and_separate_codex_roots
+    profile_generations
+    codex = File.join(@state, 'codex', 'generations', '1')
+    FileUtils.mkdir_p(File.dirname(codex))
+    File.symlink(@package, codex)
+    before = File.readlink(@profile)
+    assert_equal [1, 2, 3], collect['actions'].map { |action| action['generation'] }
+    assert File.symlink?("#{@profile}-1-link")
+    assert_equal 3, collect(apply: true)['removed'].length
+    assert_equal before, File.readlink(@profile)
+    assert File.symlink?("#{@profile}-4-link")
+    assert File.symlink?("#{@profile}-5-link")
+    assert File.symlink?(codex)
+    assert_empty collect(apply: true)['removed']
+  end
+
+  def test_profile_cleanup_preserves_newer_generations_after_a_legacy_rollback
+    profile_generations(current: 3)
+    assert_equal [1], collect(apply: true)['removed'].map { |action| action['generation'] }
+    2.upto(5) { |number| assert File.symlink?("#{@profile}-#{number}-link") }
+    assert_equal File.basename("#{@profile}-3-link"), File.readlink(@profile)
+  end
+
+  def test_profile_cleanup_retains_packages_referenced_by_live_preparations
+    person, snapshot = prepare('profile-reference')
+    old = File.join(@tmp, 'old-package-1')
+    hook = @engine.save_artifact('kind' => 'merge_hooks', 'repository' => 'code',
+      'featureHead' => snapshot.dig('operation', 'featureHead'), 'environment' => {'DEPENDENCY' => old})
+    @engine.prepare_snapshot(person, 'merge', snapshot['operation'].merge('hookArtifact' => hook['id']), evidence(person))
+    profile_generations
+    removed = collect(apply: true)['removed'].select { |action| action['kind'] == 'profile_generation' }
+    assert_equal [2, 3], removed.map { |action| action['generation'] }
+    assert File.symlink?("#{@profile}-1-link")
+  end
+
+  def test_profile_selection_change_stops_further_generation_removal
+    profile_generations
+    capture = @engine.method(:capture)
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      result = capture.call(*args, **options)
+      if args.first == 'nix-env' && args.last == '1'
+        File.unlink(@profile)
+        File.symlink(File.basename("#{@profile}-2-link"), @profile)
+      end
+      result
+    end
+    error = assert_raises(WorkspaceCoordination::Error) { collect(apply: true) }
+    assert_match(/profile changed/, error.message)
+    refute File.symlink?("#{@profile}-1-link")
+    assert File.symlink?("#{@profile}-2-link")
+    assert_equal File.basename("#{@profile}-2-link"), File.readlink(@profile)
   end
 
   def test_running_preparation_defers_all_collection
