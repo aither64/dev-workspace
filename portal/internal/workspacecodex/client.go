@@ -695,10 +695,7 @@ func (c *Client) RequireThreadMaterialized(ctx context.Context, threadID, cwd st
 func (c *Client) retirementCandidate(
 	ctx context.Context, cwd string, archived, indexed bool,
 ) (codex.ThreadMetadata, bool, error) {
-	threads, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
-		Cwd: cwd, SourceKinds: []string{threadSourceKind}, Archived: &archived,
-		Limit: 2, SortDirection: "asc", UseStateDBOnly: indexed,
-	})
+	threads, next, err := c.retirementThreads(ctx, cwd, archived, indexed, 2, "")
 	if err != nil {
 		return codex.ThreadMetadata{}, false, err
 	}
@@ -722,10 +719,7 @@ func (c *Client) retirementThreadByID(
 	seenCursors := make(map[string]struct{})
 	var cursor string
 	for {
-		threads, next, err := c.ListThreads(ctx, codex.ThreadListOptions{
-			Cwd: cwd, SourceKinds: []string{threadSourceKind}, Archived: &archived,
-			Limit: 100, SortDirection: "asc", Cursor: cursor,
-		})
+		threads, next, err := c.retirementThreads(ctx, cwd, archived, false, 100, cursor)
 		if err != nil {
 			return codex.ThreadMetadata{}, false, err
 		}
@@ -748,6 +742,36 @@ func (c *Client) retirementThreadByID(
 		}
 		seenCursors[cursor] = struct{}{}
 	}
+}
+
+// The pinned shared list options cannot express the native all-provider filter.
+// Retirement must see both the recorded root and conflicting directory users
+// even when their provider differs from the daemon's default. An explicit empty
+// modelProviders array means all providers; omission uses the native default.
+func (c *Client) retirementThreads(
+	ctx context.Context, cwd string, archived, indexed bool, limit int, cursor string,
+) ([]codex.ThreadMetadata, *string, error) {
+	params := map[string]any{
+		"cwd": cwd, "sourceKinds": []string{threadSourceKind}, "archived": archived,
+		"limit": limit, "sortDirection": "asc", "modelProviders": []string{},
+	}
+	if indexed {
+		params["useStateDbOnly"] = true
+	}
+	if cursor != "" {
+		params["cursor"] = cursor
+	}
+	var page struct {
+		Data       *[]codex.ThreadMetadata `json:"data"`
+		NextCursor *string                 `json:"nextCursor"`
+	}
+	if err := c.Request(ctx, "thread/list", params, &page); err != nil {
+		return nil, nil, err
+	}
+	if page.Data == nil {
+		return nil, nil, errors.New("thread/list returned no data")
+	}
+	return *page.Data, page.NextCursor, nil
 }
 
 func workspaceThread(source any) bool {

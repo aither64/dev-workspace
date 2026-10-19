@@ -123,6 +123,11 @@ Cold resumes explicitly retain provider, model, effort, sandbox, approval
 policy, runtime roots and saved team instructions. Member environments retain
 their member address. Effective native responses prove routing.
 
+Deleting a session supports its selected provider even when the workspace
+default differs. Retirement checks all providers for conversations using the
+same session directory and refuses ambiguous ownership. It still verifies the
+recorded root and waits for idle state before native archival.
+
 The worker restores only work interrupted by the close. Continuation messages
 have durable client identities and ask Codex to inspect tool results before
 retrying actions. It never answers an approval or question; an interrupted

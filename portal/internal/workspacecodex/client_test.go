@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -740,6 +741,53 @@ func TestRetireThreadRefusesAmbiguousCwdLookup(t *testing.T) {
 	if err := client.RetireThread(ctx, "", "/workspace/work/example", false); err == nil ||
 		!strings.Contains(err.Error(), "ambiguous retirement") {
 		t.Fatalf("ambiguous retirement error = %v", err)
+	}
+}
+
+func TestRetirementDiscoveryFindsRootsOutsideTheDefaultProvider(t *testing.T) {
+	for _, byID := range []bool{false, true} {
+		t.Run(fmt.Sprintf("byID=%t", byID), func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil {
+					return err
+				}
+				params := request["params"].(map[string]any)
+				if request["method"] != "thread/list" || params["cwd"] != "/workspace/work/example" ||
+					params["archived"] != byID || !reflect.DeepEqual(params["sourceKinds"], []any{"vscode"}) {
+					return fmt.Errorf("retirement discovery scope changed: %#v", request)
+				}
+				if !byID && params["useStateDbOnly"] != true {
+					return fmt.Errorf("retirement lost indexed discovery: %#v", request)
+				}
+				// Match native filtering: omitting modelProviders hides this
+				// alternate-provider root. A present empty list includes it.
+				threads := []any{}
+				if providers, ok := params["modelProviders"].([]any); ok && len(providers) == 0 {
+					threads = append(threads, map[string]any{"id": "alternate-root", "cwd": "/workspace/work/example",
+						"source": "vscode", "modelProvider": "alternate"})
+				}
+				return writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"data": threads}})
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var thread codex.ThreadMetadata
+			var found bool
+			var err error
+			if byID {
+				thread, found, err = client.retirementThreadByID(ctx, "alternate-root", "/workspace/work/example", true)
+			} else {
+				thread, found, err = client.retirementCandidate(ctx, "/workspace/work/example", false, true)
+			}
+			if err != nil || !found || thread.ID != "alternate-root" {
+				t.Fatalf("alternate-provider root discovery: thread=%#v found=%t error=%v", thread, found, err)
+			}
+		})
 	}
 }
 
