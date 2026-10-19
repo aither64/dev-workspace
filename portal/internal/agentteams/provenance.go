@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
@@ -33,6 +34,7 @@ type CreationJournal struct {
 	GoalSHA256   *string
 	Model        *string
 	Effort       *string
+	Provider     *string
 	TMUXIdentity string
 }
 
@@ -94,6 +96,13 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 		}
 		allowed = append(allowed, "sensitive")
 	}
+	if value, ok := raw["provider"]; ok {
+		var provider string
+		if json.Unmarshal(value, &provider) != nil || !codexproviders.ValidID(provider) {
+			return CreationJournal{}, errors.New("creation journal has an invalid provider")
+		}
+		allowed = append(allowed, "provider")
+	}
 	if header.Schema == 2 {
 		allowed = append(allowed, "model", "effort", "agent_team_binding", "agent_team_binding_digest")
 	} else if header.Schema == 3 {
@@ -133,6 +142,7 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 		State          string          `json:"state"`
 		Model          *string         `json:"model"`
 		Effort         *string         `json:"effort"`
+		Provider       *string         `json:"provider"`
 		Binding        string          `json:"agent_team_binding"`
 		BindingDigest  string          `json:"agent_team_binding_digest"`
 		DirectTeam     json.RawMessage `json:"direct_team"`
@@ -172,21 +182,21 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 				(wire.TrackingOrigin != "revived" && wire.TrackingOrigin != "retained") || !isDigest(wire.TrackingPlan) || !isDigest(wire.TrackingState))) {
 			return CreationJournal{}, errors.New("creation journal has invalid preserved tracking")
 		}
-		return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, TMUXIdentity: wire.TMUXIdentity}, nil
+		return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, Provider: wire.Provider, TMUXIdentity: wire.TMUXIdentity}, nil
 	}
 	if header.Schema == 3 {
 		if !wire.RunCodex || wire.GoalSHA256 == nil || wire.Model == nil || wire.Effort == nil ||
 			validateDirectCreationTeam(wire.DirectTeam, *wire.Model, *wire.Effort) != nil {
 			return CreationJournal{}, errors.New("direct creation journal has an invalid team snapshot")
 		}
-		return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, TMUXIdentity: wire.TMUXIdentity}, nil
+		return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, Provider: wire.Provider, TMUXIdentity: wire.TMUXIdentity}, nil
 	}
 	if !wire.RunCodex || wire.GoalSHA256 == nil || wire.Model == nil || wire.Effort == nil ||
 		len(wire.Binding) < 5 || len(wire.Binding) > 32*1024 || !isDigest(wire.BindingDigest) ||
 		!strings.HasPrefix(wire.Binding, "v1.") || !strings.HasSuffix(wire.Binding, "."+wire.BindingDigest) {
 		return CreationJournal{}, errors.New("managed creation journal has incomplete values")
 	}
-	return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, TMUXIdentity: wire.TMUXIdentity}, nil
+	return CreationJournal{Schema: wire.Schema, Slug: wire.Slug, State: wire.State, RunCodex: wire.RunCodex, GoalSHA256: wire.GoalSHA256, Model: wire.Model, Effort: wire.Effort, Provider: wire.Provider, TMUXIdentity: wire.TMUXIdentity}, nil
 }
 
 // Keep this reader independent of teamruntime: registration and lifecycle
