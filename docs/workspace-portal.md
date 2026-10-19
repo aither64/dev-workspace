@@ -39,6 +39,26 @@ explains permission, per-session mute, event identity and delivery limits;
 [operations](browser-notifications-operations.md) covers provider egress and
 private-state recovery.
 
+## Optional Codex questions
+
+Optional questions appear in their original Codex message and in a panel below
+the scrolling output. The message box remains available. Click an option to send
+it immediately, or type a response and choose **Send answer**. Both views show
+the same draft, delivery status and accepted answer.
+
+**Dismiss** removes a question from the pinned panel without sending anything.
+The panel also clears when the turn ends or an ordinary follow-up is accepted,
+matching the CLI lifetime. Unanswered questions remain answerable from the
+original message. Answered questions show the actual answer, including answers
+received from another client. Unsent drafts remain available inline after
+unpinning or reloading the page. Browser storage keeps them separate for each
+conversation and member thread. If delivery is uncertain, use **Retry answer**;
+it checks the same submission instead of creating a second reply.
+
+The portal uses codex-web's shared question controller and native reply envelope.
+Optional questions use ordinary authorized message delivery and do not create
+pending approval requests or mark Codex as blocked on user input.
+
 ## Workspace configuration
 
 Each workspace can contain `.dev-workspace.json`:
