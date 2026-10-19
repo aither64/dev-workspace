@@ -726,6 +726,13 @@ func threadCommand(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	runtime := threadRuntime{
+		Slug: *sessionSlug, Workspace: *workspace, WorkDir: *cwd,
+		WorktreesDir: *worktreesDir, PortalBaseURL: *portalBaseURL, PortalURL: *portalURL,
+		AuthorityDir: *authorityDir, TmuxSocket: *tmuxSocket,
+		CodexCommand: *codexCommand, CodexSocket: *socket, CodexVersion: *codexVersion,
+		PortalCommand: *portalCommand,
+	}
 	switch command {
 	case "observe":
 		if *threadID == "" || *cwd == "" {
@@ -770,13 +777,6 @@ func threadCommand(args []string) error {
 			"model": settings.Model, "reasoningEffort": settings.ReasoningEffort,
 		})
 	case "create":
-		runtime := threadRuntime{
-			Slug: *sessionSlug, Workspace: *workspace, WorkDir: *cwd,
-			WorktreesDir: *worktreesDir, PortalBaseURL: *portalBaseURL, PortalURL: *portalURL,
-			AuthorityDir: *authorityDir, TmuxSocket: *tmuxSocket,
-			CodexCommand: *codexCommand, CodexSocket: *socket, CodexVersion: *codexVersion,
-			PortalCommand: *portalCommand,
-		}
 		if !*requireRuntime || !runtime.complete() {
 			return errors.New("thread create requires complete workspace, lifecycle, tmux and Codex provenance")
 		}
@@ -823,13 +823,6 @@ func threadCommand(args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{"threadId": id})
 	case "fork":
-		runtime := threadRuntime{
-			Slug: *sessionSlug, Workspace: *workspace, WorkDir: *cwd,
-			WorktreesDir: *worktreesDir, PortalBaseURL: *portalBaseURL, PortalURL: *portalURL,
-			AuthorityDir: *authorityDir, TmuxSocket: *tmuxSocket,
-			CodexCommand: *codexCommand, CodexSocket: *socket, CodexVersion: *codexVersion,
-			PortalCommand: *portalCommand,
-		}
 		if !*requireRuntime || !runtime.complete() || *threadID == "" {
 			return errors.New("thread fork requires a source thread and complete runtime provenance")
 		}
@@ -904,6 +897,25 @@ func threadCommand(args []string) error {
 			return errors.New("thread input must not be blank")
 		}
 		return client.EnsureInitialMessage(ctx, *threadID, *cwd, string(message), *startUnmaterialized)
+	case "ensure-settings":
+		if !*requireRuntime || !runtime.complete() || *threadID == "" || *model == "" || *effort == "" {
+			return errors.New("thread ensure-settings requires frozen settings and complete runtime provenance")
+		}
+		if err := client.RequireThreadIdle(ctx, *threadID, *cwd); err != nil {
+			return err
+		}
+		actual, err := client.UpdateThreadSettings(ctx, *threadID, codex.ThreadSettingsUpdate{
+			Model: model, ReasoningEffort: effort,
+		})
+		if err != nil {
+			return err
+		}
+		if actual.Model != *model || actual.ReasoningEffort != *effort {
+			return errors.New("Codex did not restore the frozen fork settings")
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{
+			"model": actual.Model, "reasoningEffort": actual.ReasoningEffort,
+		})
 	case "require-idle":
 		if *threadID == "" || *cwd == "" {
 			return errors.New("thread require-idle requires --thread-id and --cwd")

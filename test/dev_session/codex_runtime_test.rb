@@ -626,6 +626,10 @@ class DevSessionTest < Minitest::Test
       commands = File.readlines(calls).map { |line| JSON.parse(line).first(2) }
       assert_equal(1, commands.count(['thread', 'create']))
       assert_equal(1, commands.count(['thread', 'ensure-initial']))
+      runner.send(:send_native_client_command, session, model: 'gpt-captured', effort: 'high')
+      assert_equal([codex, *native, '--model', 'gpt-captured', '-c', 'model_reasoning_effort="high"',
+                    '--remote', 'unix:///run/test/codex.sock', 'resume', 'thread-provider'],
+                   Shellwords.split(tmux.sent_commands.last))
     end
   end
 

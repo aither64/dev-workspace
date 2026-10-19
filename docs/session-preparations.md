@@ -14,6 +14,12 @@ their presence, provider selection, and an exact resolved team preset. Presets i
 lead settings and instructions. For managed selections, admission validates
 local structure and policy; the initialization worker checks live model/effort
 availability. It never replaces unavailable captured settings with defaults.
+Fork creation also passes its frozen model and effort to the remote terminal
+client. A fork has no initial destination message to restore these settings,
+so its terminal resume must preserve them rather than use host defaults.
+An interrupted fork keeps its journal until recovery confirms the effective
+settings on its idle root. Active work, an unexpected terminal process or a
+settings-update failure leaves that journal available for retry.
 
 A versioned input digest binds the request ID. Repeating the same ID and input
 returns the original operation before consulting current catalog or upload

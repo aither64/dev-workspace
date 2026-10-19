@@ -61,7 +61,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     }
     await form.locator("[name=model]:not([disabled])").waitFor();
     await form.locator("[name=model]").selectOption("gpt-5.5");
-    await form.locator("[name=effort]").selectOption("xhigh");
+    await form.locator("[name=effort]").selectOption("high");
     if (options.sensitive) await form.locator("[name=sensitive]").check();
     await form.locator("[name=browserNotificationsEnabled]").setChecked(options.notifications !== false);
   }
@@ -111,7 +111,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
       entry.text?.includes(record.marker));
     if (record.kind !== "fork") assert.equal(initial.length, 1, JSON.stringify(thread));
     assert.equal(thread.model, "gpt-5.5");
-    assert.equal(thread.reasoningEffort, "xhigh");
+    assert.equal(thread.reasoningEffort, "high");
     const attention = await get(`/api/sessions/${record.slug}/attention`);
     assert.equal(attention.enabled, record.options.notifications !== false);
     record.transcript = thread; save();
@@ -163,7 +163,24 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
       if (action === "create") await usable();
     } else {
       record = JSON.parse(fs.readFileSync(filename));
-      if (action === "failed") await terminal("failed");
+      if (action === "change-effort") {
+        await openConversation(record.canonicalUrl || record.url, record.slug);
+        await page.locator("#codex-settings-open:not([disabled])").click();
+        await page.locator("#codex-effort:not([disabled])").waitFor();
+        await page.locator("#codex-effort").selectOption("xhigh");
+        const [saved] = await Promise.all([
+          page.waitForResponse(response => response.request().method() === "POST" &&
+            new URL(response.url()).pathname === `/api/sessions/${record.slug}/settings`),
+          page.locator("#codex-settings-save:not([disabled])").click(),
+        ]);
+        assert(saved.ok(), `save effort: ${saved.status()} ${await saved.text()}`);
+        await page.locator("#codex-settings-dialog").waitFor({state: "hidden"});
+        const deadline = Date.now() + 30000;
+        while ((await get(`/api/sessions/${record.slug}/thread`)).reasoningEffort !== "xhigh") {
+          assert(Date.now() < deadline, "reasoning change did not become effective");
+          await pause(100);
+        }
+      } else if (action === "failed") await terminal("failed");
       else if (action === "finish") await usable();
       else if (action === "retry") {
         await terminal(["failed", "paused"]);

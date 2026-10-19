@@ -430,6 +430,10 @@ interrupt creation before native root creation and after native initial-send
 acceptance, restart the portal, and retry the original request. The suite also
 checks error selection/copy and stale retry after ordinary fixture deletion.
 Native reads and durable records check the final identities and initial turn.
+Root reasoning effort differs from the host default so terminal startup cannot
+silently reset the submitted setting.
+The suite also changes a loaded fork's effort through the browser and verifies
+restoration through the host helper while the terminal remains subscribed.
 The VM retains fixture evidence with its test output. After deployment, create
 dedicated live sessions and complete follow-up exchanges too; package acceptance
 does not establish that the deployed configuration works.

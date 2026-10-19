@@ -1596,7 +1596,7 @@ module DevSession
           if selected
             terminal_started = creation_progress_begin('terminal')
             selected = ensure_managed_session!(destination_slug, session: selected)
-            selected = reconcile_native_client!(destination_slug, selected)
+            selected = reconcile_fork_terminal!(destination_slug, selected, fork_journal)
             write_session_authority(destination_slug, selected, state: 'ready')
             creation_progress_finish('terminal', terminal_started)
 			fork_team_members!(source_slug, destination_slug)
@@ -1630,7 +1630,9 @@ module DevSession
             destination_slug,
             run_codex: true,
             thread_id:,
-            identity_token: fork_journal.fetch('tmux_identity')
+            identity_token: fork_journal.fetch('tmux_identity'),
+            model: fork_journal.fetch('model'),
+            effort: fork_journal.fetch('effort')
           )
           selected = sync_slug(destination_slug, require_session: true, session: selected)
           unless selected.identity_token == fork_journal.fetch('tmux_identity')
@@ -1723,11 +1725,14 @@ module DevSession
               destination_slug,
               run_codex: true,
               thread_id:,
-              identity_token: journal.fetch('tmux_identity')
+              launch_codex: false,
+              identity_token: journal.fetch('tmux_identity'),
+              model: journal.fetch('model'),
+              effort: journal.fetch('effort')
             )
           end
           selected = ensure_managed_session!(destination_slug, session: selected)
-          selected = reconcile_native_client!(destination_slug, selected)
+          selected = reconcile_fork_terminal!(destination_slug, selected, journal)
           selected = sync_slug(destination_slug, require_session: true, session: selected)
           write_session_authority(destination_slug, selected, state: 'ready')
 		  fork_team_members!(source_slug, destination_slug)
@@ -7874,7 +7879,9 @@ module DevSession
       run_codex:,
       thread_id: nil,
       launch_codex: run_codex,
-      identity_token: nil
+      identity_token: nil,
+      model: nil,
+      effort: nil
     )
       if launch_codex && !run_codex
         raise Error, 'cannot launch Codex for a session configured without Codex'
@@ -7957,7 +7964,7 @@ module DevSession
 
         if launch_codex
           command = if codex_provenance_configured?
-                      (@codex_command_argv + native_provider_arguments(slug)).map(&:shellescape).join(' ')
+                      native_client_arguments(slug, model:, effort:).map(&:shellescape).join(' ')
                     else
                       @codex_command.dup
                     end
@@ -8917,7 +8924,8 @@ module DevSession
       raise Error, "unable to restore terminal Codex client for #{slug}: #{e.message}"
     end
 
-    def reconcile_native_client!(slug, session, allow_creating: false, start_journal: nil, revive_journal: nil)
+    def reconcile_native_client!(slug, session, allow_creating: false, start_journal: nil, revive_journal: nil,
+                                 model: nil, effort: nil)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
       return session if !allow_creating && recovery_held?(slug, session.codex_thread_id)
@@ -8936,7 +8944,7 @@ module DevSession
               "managed Codex pane for #{slug} is running unexpected command #{current.inspect}"
       end
       verify_codex_client!
-      send_native_client_command(session)
+      send_native_client_command(session, model:, effort:)
       session = update_native_client_version!(slug, session)
       @err.puts "restarted terminal Codex client for #{slug} after App Server disconnect"
       session
@@ -8988,12 +8996,47 @@ module DevSession
       end
     end
 
-    def send_native_client_command(session)
-      command = (@codex_command_argv + native_provider_arguments(session.slug)).map(&:shellescape).join(' ')
+    def send_native_client_command(session, model: nil, effort: nil)
+      command = native_client_arguments(session.slug, model:, effort:).map(&:shellescape).join(' ')
       remote = "unix://#{session.codex_socket_path}"
       command = "#{command} --remote #{remote.shellescape} resume #{session.codex_thread_id.shellescape}"
       @tmux.run('send-keys', '-t', session.codex_pane_id, '-l', command)
       @tmux.run('send-keys', '-t', session.codex_pane_id, 'Enter')
+    end
+
+    def native_client_arguments(slug, model: nil, effort: nil)
+      arguments = @codex_command_argv + native_provider_arguments(slug)
+      arguments += ['--model', model] if model
+      arguments += ['-c', "model_reasoning_effort=#{JSON.generate(effort)}"] if effort
+      arguments
+    end
+
+    def reconcile_fork_terminal!(slug, session, journal)
+      model, effort = journal.fetch('model'), journal.fetch('effort')
+      if @portal_command && codex_provenance_configured?
+        quiesced = quiesce_native_client!(slug, session)
+        begin
+          ensure_portal_thread_idle!(slug, @selected_authority)
+        rescue StandardError
+          restore_native_client!(slug, quiesced) if quiesced
+          raise
+        end
+        command = [*@portal_command, 'thread', 'ensure-settings',
+                   '--thread-id', session.codex_thread_id, '--user-state-root', @workspace_state_root]
+        environment = session_environment(slug)
+        THREAD_ENV_ARGUMENTS.each do |name, argument|
+          command += [argument, environment.fetch(name)] if environment.key?(name)
+        end
+        command += ['--require-runtime', '--model', model, '--effort', effort]
+        stdout, = @command_runner.capture(command)
+        actual = JSON.parse(stdout)
+        unless actual == { 'model' => model, 'reasoningEffort' => effort }
+          raise Error, "fork settings were not restored for #{slug}"
+        end
+      end
+      reconcile_native_client!(slug, session, model:, effort:)
+    rescue JSON::ParserError => e
+      raise Error, "workspace-portal returned invalid fork settings: #{e.message}"
     end
 
     def native_provider_arguments(slug = nil)

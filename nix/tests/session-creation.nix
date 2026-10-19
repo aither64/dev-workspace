@@ -183,6 +183,7 @@ pkgs.testers.runNixOSTest {
         metadata = native(record["threadId"])["thread"]
         assert metadata["modelProvider"] == provider, metadata
         assert metadata["cwd"] == directory, metadata
+        assert metadata["model"] == "gpt-5.5" and metadata["reasoningEffort"] == "high", metadata
         assert sum(item.get("type") == "userMessage" and record["marker"] in json.dumps(item)
             for turn in metadata["turns"] for item in turn["items"]) == 1, metadata
         assert len({turn["id"] for turn in metadata["turns"]}) == len(metadata["turns"]), metadata
@@ -191,7 +192,7 @@ pkgs.testers.runNixOSTest {
         retained = saved["members"] or []
         assert len(retained) == members, saved
         assert saved["rootThreadId"] == record["threadId"] and saved["slug"] == slug, saved
-        assert saved["leadModel"] == "gpt-5.5" and saved["leadEffort"] == "xhigh", saved
+        assert saved["leadModel"] == "gpt-5.5" and saved["leadEffort"] == "high", saved
         assert saved["leadInstructions"] == "CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools.", saved
         identities = [record["threadId"]]
         for member in retained:
@@ -279,6 +280,28 @@ pkgs.testers.runNixOSTest {
             for kind in ["fork", "plan"]:
                 record = checkpoint("explicit-" + kind)
                 assert native(record["threadId"])["thread"]["modelProvider"] == "alternate", record
+
+        with subtest("frozen fork settings can be restored while its terminal is subscribed"):
+            browser("change-effort", "explicit-fork")
+            record = checkpoint("explicit-fork")
+            assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
+            slug = record["slug"]
+            args = [package + "/bin/workspace-portal", "thread", "ensure-settings", "--require-runtime",
+                "--thread-id", record["threadId"], "--socket", runtime + "/app-server.sock",
+                "--user-state-root", state, "--workspace", root, "--session-slug", slug,
+                "--cwd", root + "/work/" + slug, "--worktrees-dir", root + "/worktrees/" + slug,
+                "--portal-base-url", "https://fixture.workspace.example.test",
+                "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
+                "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
+                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.163.0",
+                "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
+            wrong = args.copy()
+            wrong[wrong.index("--cwd") + 1] += "-foreign"
+            machine.fail(user_prefix + "sh -c " + shlex.quote(shlex.join(wrong)))
+            assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
+            restored = json.loads(user(shlex.join(args)))
+            assert restored == {"model": "gpt-5.5", "reasoningEffort": "high"}, restored
+            proof("explicit-fork", "alternate")
 
         with subtest("failed naming renders a selectable, copyable error and retries the same request"):
             user("touch /tmp/creation-model/bad-name")

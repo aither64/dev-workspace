@@ -91,7 +91,7 @@ class DevSessionTest < Minitest::Test
           File.open(#{log.dump}, 'a') { |file| file.puts ARGV.join(' ') }
           case ARGV[0, 2]
           when ['thread', 'resolve-fork-settings']
-            puts JSON.generate(model: 'gpt-test', reasoningEffort: 'xhigh')
+            puts JSON.generate(model: 'gpt-test', reasoningEffort: 'high')
           when ['thread', 'fork']
             puts JSON.generate(threadId: 'thread-fork')
           end
@@ -100,8 +100,10 @@ class DevSessionTest < Minitest::Test
           id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
           workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
         )
+        terminal_settings = []
         runner_class = Class.new(DevSession::Runner) do
           define_method(:create_tmux_session) do |*_args, **kwargs|
+            terminal_settings << [kwargs.fetch(:model), kwargs.fetch(:effort)]
             session.identity_token = kwargs.fetch(:identity_token)
             session
           end
@@ -115,9 +117,10 @@ class DevSessionTest < Minitest::Test
 
         runner.fork(
           source_slug, 'alternative', as_is: false, json: true,
-          model: 'gpt-test', effort: 'xhigh'
+          model: 'gpt-test', effort: 'high'
         )
 
+        assert_equal([['gpt-test', 'high']], terminal_settings)
         result = JSON.parse(out.string)
         assert_equal(destination_slug, result.fetch('slug'))
         assert_equal(source_slug, result.fetch('forkedFrom'))
@@ -137,7 +140,7 @@ class DevSessionTest < Minitest::Test
         assert_includes(command, '--fresh')
         assert_includes(command, '--thread-id thread-source')
         assert_includes(command, '--model gpt-test')
-        assert_includes(command, '--effort xhigh')
+        assert_includes(command, '--effort high')
       end
     end
   end
@@ -233,8 +236,10 @@ class DevSessionTest < Minitest::Test
         id: '$fork', name: destination_slug, mark: '1', slug: destination_slug,
         workspace:, socket_path: '/run/test/tmux.sock', codex_thread_id: 'thread-fork'
       )
+      terminal_settings = []
       retry_class = Class.new(DevSession::Runner) do
         define_method(:create_tmux_session) do |*_args, **kwargs|
+          terminal_settings << [kwargs.fetch(:model), kwargs.fetch(:effort), kwargs.fetch(:launch_codex)]
           session.identity_token = kwargs.fetch(:identity_token)
           session
         end
@@ -245,7 +250,92 @@ class DevSessionTest < Minitest::Test
         out: StringIO.new, err: StringIO.new, today: TODAY, env: {}
       )
       retry_runner.fork(source_slug, 'retry', as_is: false, json: true)
+      assert_equal([['source-model', 'medium', false]], terminal_settings)
       assert_equal(["fork\n"], File.readlines(calls))
+    end
+  end
+
+  def test_unfinished_fork_restores_frozen_settings_or_retains_recovery_journal
+    %w[codex sh refuse active foreign].each do |mode|
+      with_workspace do |workspace|
+        source, destination = '2026-06-05-source', '2026-06-06-retry'
+        setup = runner_for(workspace)
+        setup.ensure_tracking_files(source)
+        manifest = setup.send(:ensure_portal_manifest, source)
+        manifest['codex'] = { 'thread_id' => 'thread-source', 'socket_path' => '/run/test/codex.sock',
+                              'client_version' => '0.163.0' }
+        setup.send(:write_portal_manifest, source, manifest)
+        calls = File.join(workspace, 'portal-calls.jsonl')
+        settings_file = File.join(workspace, 'native-effort')
+        File.write(settings_file, 'xhigh')
+        portal = File.join(workspace, 'portal.rb')
+        File.write(portal, <<~RUBY)
+          require 'json'
+          File.open(#{calls.dump}, 'a') { |f| f.puts JSON.generate(ARGV) }
+          case ARGV.first(2)
+          when ['thread', 'resolve-fork-settings']
+            puts JSON.generate(model: 'source-model', reasoningEffort: 'high')
+          when ['thread', 'fork']
+            puts JSON.generate(threadId: 'thread-fork')
+          when ['thread', 'require-idle']
+            abort 'synthetic active thread' if #{mode.dump} == 'active'
+          when ['thread', 'ensure-settings']
+            abort 'synthetic settings refusal' if #{mode.dump} == 'refuse'
+            abort 'changed thread' unless ARGV[ARGV.index('--thread-id') + 1] == 'thread-fork'
+            abort 'lost frozen model' unless ARGV[ARGV.index('--model') + 1] == 'source-model'
+            effort = ARGV[ARGV.index('--effort') + 1]
+            abort 'lost frozen effort' unless effort == 'high'
+            File.write(#{settings_file.dump}, effort)
+            puts JSON.generate(model: 'source-model', reasoningEffort: effort)
+          end
+        RUBY
+        codex = File.join(workspace, 'codex')
+        File.write(codex, "#!/bin/sh\necho 'codex-cli 0.163.0'\n")
+        File.chmod(0o755, codex)
+        options = {workspace:, portal_command: [RbConfig.ruby, portal], codex_command: codex,
+                   codex_socket: '/run/test/codex.sock', codex_version: '0.163.0',
+                   out: StringIO.new, err: StringIO.new, today: TODAY, env: {'SHELL' => '/bin/sh'}}
+        failing_class = Class.new(DevSession::Runner) do
+          define_method(:create_tmux_session) { |*_, **_| raise DevSession::Error, 'tmux interrupted' }
+        end
+        assert_raises(DevSession::Error) do
+          failing_class.new(**options, tmux: NullTmux.new).fork(source, destination, as_is: true, json: true)
+        end
+        journal_path = setup.send(:fork_journal_file, destination)
+        journal = JSON.parse(File.read(journal_path))
+        tmux = ManagedTmux.new(destination, workspace:, socket_path: '/run/test/tmux.sock',
+          codex_thread_id: 'thread-fork', codex_socket_path: '/run/test/codex.sock',
+          codex_client_version: '0.163.0', identity_token: journal.fetch('tmux_identity'),
+          pane_current_command: %w[sh foreign].include?(mode) ? mode : 'codex')
+        session = tmux.session(destination)
+        retry_class = Class.new(DevSession::Runner) do
+          define_method(:sync_slug) { |*_, **_| session }
+        end
+        retry_runner = retry_class.new(**options, tmux:)
+        if %w[refuse active foreign].include?(mode)
+          assert_raises(DevSession::Error) { retry_runner.fork(source, destination, as_is: true, json: true) }
+          assert File.exist?(journal_path)
+          assert_equal('xhigh', File.read(settings_file))
+          if mode == 'active'
+            refute_empty tmux.sent_commands # The existing idle-refusal path restores the owned client.
+          else
+            assert_empty tmux.sent_commands
+          end
+        else
+          retry_runner.fork(source, destination, as_is: true, json: true)
+          refute File.exist?(journal_path)
+          assert_equal('high', File.read(settings_file))
+          assert_includes Shellwords.split(tmux.sent_commands.last), 'model_reasoning_effort="high"'
+          assert_includes Shellwords.split(tmux.sent_commands.last), 'source-model'
+        end
+        recorded = File.readlines(calls).map { |line| JSON.parse(line) }
+        assert_equal 1, recorded.count { |args| args.first(2) == ['thread', 'fork'] }
+        assert_equal(%w[active foreign].include?(mode) ? 0 : 1,
+                     recorded.count { |args| args.first(2) == ['thread', 'ensure-settings'] })
+        current = YAML.safe_load(File.read(File.join(workspace, 'work', destination, 'portal.yml')))
+        assert_equal 'thread-fork', current.dig('codex', 'thread_id')
+        assert_equal 'thread-source', YAML.safe_load(File.read(File.join(workspace, 'work', source, 'portal.yml'))).dig('codex', 'thread_id')
+      end
     end
   end
 
