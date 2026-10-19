@@ -438,6 +438,10 @@ module WorkspaceAutoArchive
       result
     rescue DevSession::SupersededGenerationError
       raise
+    rescue DevSession::SessionBusyError
+      # Busy is not a failed activity/merge proof. Keep continuity and cached
+      # evidence intact; a later scan will observe this session normally.
+      { 'slug' => slug, 'eligible' => false, 'blockers' => ['Session is busy; waiting for a later scan.'], 'result' => 'deferred' }
     rescue StandardError => e
       unless dry_run
         observation.call do

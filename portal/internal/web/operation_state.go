@@ -469,6 +469,7 @@ func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOpera
 // Copy target data only after native/tracking proof, outside both display and
 // receipt mutexes. This response-only view never changes receipt authority.
 func (s *Server) lifecycleOperationView(slug string, operation lifecycleOperation) lifecycleOperation {
+	operation.Progress = session.ReadArchiveProgress(s.config.Workspace, s.config.UserStateRoot, slug, operation.Options.JournalID)
 	operation.CurrentTarget = s.lifecycleSnapshot(slug)
 	if operation.State == "failed" && !operation.Options.JournalExpected {
 		if summary, err := session.Find(s.config.Workspace, slug); err == nil {

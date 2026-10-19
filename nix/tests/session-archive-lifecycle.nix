@@ -19,11 +19,19 @@ pkgs.testers.runNixOSTest {
       wildcardHost = "*.workspace.example.test";
     };
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
-    environment.systemPackages = [ pkgs.git pkgs.curl pkgs.nodejs pkgs.chromium ];
+    environment.systemPackages = [
+      pkgs.git
+      pkgs.curl
+      pkgs.nodejs
+      pkgs.chromium
+    ];
     virtualisation = {
       memorySize = 4096;
       cores = 2;
-      additionalPaths = [ devWorkspace pkgs.playwright-driver ];
+      additionalPaths = [
+        devWorkspace
+        pkgs.playwright-driver
+      ];
     };
     system.stateVersion = "26.05";
   };
@@ -144,6 +152,33 @@ pkgs.testers.runNixOSTest {
             completed = archived(slug, checkout)
             assert accepted["receiptId"] == completed["receiptId"]
             assert user("systemctl --user show " + unit(completed) + " -p ExecMainStatus --value").strip() == "0"
+            revive(slug, checkout)
+
+        with subtest("accepted archive waits for shared session access across portal restart"):
+            slug = "2026-10-19-contended-archive"
+            checkout = fixture(slug)
+            lock = "/run/user/1000/dev-workspaces/fixture/authority/" + slug + ".lock"
+            holder = "archive-lock-holder.service"
+            user("systemd-run --user --quiet --unit=" + holder + " ${pkgs.util-linux}/bin/flock -s "
+                 + lock + " ${pkgs.bash}/bin/bash -c 'touch /tmp/archive-lock-ready; exec sleep infinity'")
+            machine.wait_until_succeeds(user_prefix + "test -f /tmp/archive-lock-ready")
+            accepted = browser(slug, "archive")
+            command = "curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
+            command += "http://localhost/api/sessions/" + slug + "/operation"
+            command += " | ${pkgs.python3}/bin/python3 -c " + shlex.quote(
+                "import sys,json; d=json.load(sys.stdin); assert d.get('state') == 'running' and "
+                "d.get('progress', {}).get('stage') == 'Waiting for session access', d")
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(command), timeout=60)
+            user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
+            worker = unit(accepted)
+            before = user("systemctl --user show " + worker + " -p InvocationID --value").strip()
+            user("systemctl --user restart workspace-portal@fixture")
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(command), timeout=60)
+            current = operation(slug)
+            assert current["receiptId"] == accepted["receiptId"] and current["attempt"] == accepted["attempt"], current
+            assert before == user("systemctl --user show " + worker + " -p InvocationID --value").strip()
+            user("systemctl --user stop " + holder)
+            archived(slug, checkout)
             revive(slug, checkout)
 
         with subtest("portal restart and worker interruption preserve admitted identity"):

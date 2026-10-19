@@ -8,18 +8,27 @@ module DevSession
       @env['DEV_WORKSPACE_DEFER_TRACKING'] == '1'
     end
 
-    def authorized_archive_worker?(slug, operation_id, unit)
+    def portal_lifecycle_receipt(slug, operation, operation_id)
       workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
       path = File.join(@workspace_state_root, 'portal', workspace_id, 'lifecycle-operations.json')
-      receipts = read_private_json_object(path, 'portal archive authorization', max_size: 256 * 1024, mode: 0o600)
-      return false unless [1, 2].include?(receipts['schema']) && receipts['workspace'] == workspace
-
-      Array(receipts['operations']).any? do |receipt|
-        receipt['slug'] == slug && receipt['kind'] == 'archive' &&
-          %w[running paused failed].include?(receipt['state']) &&
-          receipt.dig('options', 'journalId') == operation_id &&
-          unit == "workspace-archive-#{receipt['receiptId']}-#{receipt['attempt']}.service"
+      receipts = read_private_json_object(path, 'portal lifecycle authorization', max_size: 256 * 1024, mode: 0o600)
+      unless [1, 2].include?(receipts['schema']) && receipts['workspace'] == workspace
+        raise Error, 'invalid portal lifecycle authorization'
       end
+      receipt = Array(receipts['operations']).find do |item|
+        item['slug'] == slug && item['kind'] == operation &&
+          %w[running paused failed].include?(item['state']) && item.dig('options', 'journalId') == operation_id
+      end
+      raise Error, 'portal lifecycle authorization is no longer available' unless receipt
+
+      receipt
+    end
+
+    def authorized_archive_worker?(slug, operation_id, unit)
+      receipt = portal_lifecycle_receipt(slug, 'archive', operation_id)
+      unit == "workspace-archive-#{receipt['receiptId']}-#{receipt['attempt']}.service"
+    rescue Error
+      false
     end
 
     def tracking_sync_root

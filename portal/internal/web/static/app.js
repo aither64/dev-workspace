@@ -1676,7 +1676,7 @@
         if (name instanceof HTMLAnchorElement) name.href = `/${encodeURIComponent(operation.slug)}/`;
         const phase = document.createElement("span");
         phase.className = "muted";
-        phase.textContent = `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`;
+        phase.textContent = `${lifecycleKindLabel(operation.kind)} · ${operation.progress?.stage || lifecyclePhaseLabel(operation.phase)}`;
         identity.append(name, phase);
 
         const state = document.createElement("span");
@@ -1792,7 +1792,7 @@
 
         entry.item = item;
         entry.update = (operation, presentation) => {
-          updateText(phase, `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`);
+          updateText(phase, `${lifecycleKindLabel(operation.kind)} · ${operation.progress?.stage || lifecyclePhaseLabel(operation.phase)}`);
           state.className = `operation-state ${presentation.tone}`;
           updateText(state, operation.state === "running" ? presentation.detail : presentation.title);
           if (detail) updateText(detail, presentation.detail);

@@ -241,6 +241,7 @@ module DevSession
   class Error < StandardError; end
   class SupersededGenerationError < Error; end
   class TemporaryRecoveryError < Error; end
+  class SessionBusyError < Error; end
 
   class CommandError < Error
     attr_reader :argv, :status, :stdout, :stderr
@@ -1960,6 +1961,13 @@ module DevSession
 
     def archive(input, as_is:, abandoned: false, explicit: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
+      with_lifecycle_access(slug, 'archive', operation_id:, wait: !automatic) do
+        archive_with_access(slug, as_is: true, abandoned:, explicit:, operation_id:, automatic:)
+      end
+    end
+
+    def archive_with_access(input, as_is:, abandoned: false, explicit: false, operation_id: nil, automatic: nil)
+      slug = lookup_slug(input, as_is:)
       mode = abandoned ? 'abandoned' : (explicit ? 'archived' : 'complete')
       @explicit_archive_operation_id = nil
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
@@ -2157,6 +2165,8 @@ module DevSession
       @archive_progress_operation_id = nil
     end
 
+    private :archive_with_access
+
     def with_verified_committed_archive(slug, expected_journal)
       with_creation_lock(slug) do
         with_slug_lock(slug) do
@@ -2172,6 +2182,13 @@ module DevSession
     end
 
     def revive(input, as_is:, allow_abandoned: false, operation_id: nil)
+      slug = lookup_slug(input, as_is:)
+      with_lifecycle_access(slug, 'revive', operation_id:) do
+        revive_with_access(slug, as_is: true, allow_abandoned:, operation_id:)
+      end
+    end
+
+    def revive_with_access(input, as_is:, allow_abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session revive operation identity'
@@ -2277,24 +2294,35 @@ module DevSession
       @out.puts "revived session: #{slug}"
     end
 
+    private :revive_with_access
+
     def revive_confirmation(input, as_is: true)
       slug = lookup_slug(input, as_is:)
-      with_creation_lock(slug) do
-        with_slug_lock(slug) do
-          journal = load_revive_journal(slug)
-          next({ lifecycle: journal.fetch('lifecycle'), pending: true }) if journal
+      with_lifecycle_access(slug, 'revive', operation_id: nil) do
+        with_creation_lock(slug) do
+          with_slug_lock(slug) do
+            journal = load_revive_journal(slug)
+            next({ lifecycle: journal.fetch('lifecycle'), pending: true }) if journal
 
-          {
-            lifecycle: lifecycle_state(
-              read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
-            ),
-            pending: false
-          }
+            {
+              lifecycle: lifecycle_state(
+                read_bounded_file(File.join(archive_dir(slug), 'state.md'), 'state.md')
+              ),
+              pending: false
+            }
+          end
         end
       end
     end
 
     def delete(input, as_is:, force:, operation_id: nil)
+      slug = lookup_slug(input, as_is:)
+      with_lifecycle_access(slug, 'delete', operation_id:) do
+        delete_with_access(slug, as_is: true, force:, operation_id:)
+      end
+    end
+
+    def delete_with_access(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       removal = nil
       quiesced = nil
@@ -2364,6 +2392,8 @@ module DevSession
         end
       end
     end
+
+    private :delete_with_access
 
     def finalize_locked!(
       slug,
@@ -7765,7 +7795,7 @@ module DevSession
       ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
-    def with_host_lock(path, description, wait: false, busy_message: nil, mode: File::LOCK_EX)
+    def with_host_lock(path, description, wait: false, busy_message: nil, mode: File::LOCK_EX, on_wait: nil)
       raise Error, "invalid #{description} mode" unless [File::LOCK_SH, File::LOCK_EX].include?(mode)
       reject_symlink_components!(path, description)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |file|
@@ -7778,6 +7808,7 @@ module DevSession
         end
         locked = file.flock(mode | File::LOCK_NB)
         if !locked && wait
+          on_wait&.call
           if @tracking_sync_deadline
             until locked
               remaining = @tracking_sync_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -7791,7 +7822,7 @@ module DevSession
           end
         end
         unless locked
-          raise Error, busy_message || "cannot lock #{description}: #{path}"
+          raise SessionBusyError, busy_message || "cannot lock #{description}: #{path}"
         end
 
         yield file
@@ -7817,6 +7848,98 @@ module DevSession
       end
     end
 
+    # Scope waiting to the accepted lifecycle request, including revive's start
+    # and reacquisitions. Other writers and background scans remain opportunistic.
+    def with_lifecycle_access(slug, operation, operation_id:, wait: true)
+      if @lifecycle_access
+        unless @lifecycle_access.values_at(:slug, :operation) == [slug, operation]
+          raise Error, 'another lifecycle request owns this executor'
+        end
+        return yield
+      end
+      owns_access = true
+      if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "invalid session #{operation} operation identity"
+      end
+      journal = lifecycle_access_journal(slug, operation)
+      receipt = portal_lifecycle_receipt(slug, operation, operation_id) if @require_runtime && operation_id && wait
+      @lifecycle_access = {
+        slug:, operation:, operation_id:, wait:, journal:, receipt:,
+        target: journal ? nil : (receipt ? receipt.dig('options', 'targetId') : lifecycle_access_target(slug)),
+        admitted: false
+      }
+      @archive_progress_operation_id = operation_id if operation == 'archive'
+      yield
+    ensure
+      @lifecycle_access = nil if owns_access
+    end
+
+    def lifecycle_access_wait?(slug)
+      @lifecycle_access && @lifecycle_access[:slug] == slug && @lifecycle_access[:wait]
+    end
+
+    def lifecycle_access_waiting(slug)
+      return unless @lifecycle_access && @lifecycle_access[:slug] == slug
+
+      @lifecycle_access[:waiting] = true
+      if @lifecycle_access[:operation] == 'archive'
+        archive_progress!(slug, 'Waiting for session access')
+      else
+        @err.puts 'Waiting for session access'
+      end
+    end
+
+    def lifecycle_access_journal(slug, operation)
+      path = lifecycle_journal_file(slug, operation)
+      path = ArchiveCleanup.new(self, slug).path if operation == 'archive' && !path_exists?(path)
+      return nil unless path_exists?(path)
+
+      read_private_json_object(path, 'lifecycle operation', max_size: ArchiveCleanup::MAX_BYTES, mode: 0o600)['operation_id']
+    end
+
+    # Same version-2 identity as the portal: administrative writes do not change
+    # confirmation, but replacing tracking, its location or its root does.
+    def lifecycle_access_target(slug)
+      location = path_exists?(work_dir(slug)) ? 'work' : 'archive'
+      directory = File.join(workspace, location, slug)
+      return nil unless path_exists?(directory)
+
+      stat = File.lstat(directory)
+      raise Error, 'session tracking is not a directory' unless stat.directory?
+      manifest = load_portal_manifest(File.join(directory, PORTAL_MANIFEST), required: false, expected_slug: slug)
+      thread = manifest&.dig('codex', 'thread_id')
+      root = thread && !thread.empty? ? "present\0#{thread}" : 'absent'
+      Digest::SHA256.hexdigest("2\0#{workspace}\0#{slug}\0#{location}\0#{stat.dev}\0#{stat.ino}\0#{root}")
+    end
+
+    def revalidate_lifecycle_access!(slug)
+      request = @lifecycle_access
+      return unless request[:slug] == slug
+
+      if request[:receipt]
+        current = portal_lifecycle_receipt(slug, request[:operation], request[:operation_id])
+        identity = ->(receipt) do
+          [receipt.values_at('receiptId', 'attempt', 'targetIdentityVersion'),
+           receipt.fetch('options').slice('journalId', 'targetId', 'mode', 'force', 'allowAbandoned')]
+        end
+        unless identity.call(current) == identity.call(request[:receipt])
+          raise Error, 'portal lifecycle authorization changed while waiting'
+        end
+      end
+      return if request[:admitted]
+
+      reject_conflicting_lifecycle_journal!(slug, operation: request[:operation])
+      journal = lifecycle_access_journal(slug, request[:operation])
+      unless journal == request[:journal] || (journal && journal == request[:operation_id])
+        raise Error, 'another lifecycle operation started while waiting; retry its original request'
+      end
+      if !journal && request[:target] != lifecycle_access_target(slug)
+        raise Error, 'session changed while waiting; review the current session and confirm again'
+      end
+      request[:admitted] = true
+      archive_progress!(slug, 'Preparing archive') if request[:waiting] && request[:operation] == 'archive'
+    end
+
     # All cooperating session tracking commits share the Git common directory.
     # Fetch before this boundary; hooks, owned-path rollback and final proof stay
     # inside it, so a waiter validates the HEAD it actually commits on.
@@ -7832,6 +7955,8 @@ module DevSession
       with_host_lock(
         session_lock_file(slug, kind: 'creation'),
         "development session creation lock for #{slug}",
+        wait: lifecycle_access_wait?(slug),
+        on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is creating or closing #{slug}",
         &block
       )
@@ -7844,12 +7969,14 @@ module DevSession
       with_host_lock(
         path,
         "development session lock for #{slug}",
-        wait: authority&.fetch('state', nil) == 'creating',
+        wait: lifecycle_access_wait?(slug) || (!@lifecycle_access && authority&.fetch('state', nil) == 'creating'),
+        on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|
         unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
           WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
         end
+        revalidate_lifecycle_access!(slug) if @lifecycle_access
         previous = @held_slug_lock
         @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
         block.call
@@ -9941,7 +10068,7 @@ module DevSession
         if opts.fetch(:allow_abandoned)
           raise Error, '--allow-abandoned is reserved for the portal confirmation flow'
         end
-        confirmation = runner.revive_confirmation(slug, as_is: true)
+        confirmation = with_lifecycle_transition { runner.revive_confirmation(slug, as_is: true) }
         lifecycle = confirmation.fetch(:lifecycle)
         unless confirmation.fetch(:pending)
           warnings = lifecycle == 'abandoned' ? [

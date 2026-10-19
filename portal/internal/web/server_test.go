@@ -314,86 +314,67 @@ func TestPortalMutationRejectsProfileSwitchWhileWaiting(t *testing.T) {
 	}
 }
 
-func TestLifecycleOperationAcquiresTransitionBeforeTheSessionMutationLock(t *testing.T) {
+func TestLifecycleExecutorDoesNotHoldConversationMutexWhileWaitingForRuntime(t *testing.T) {
+	server := newTestServer(t)
 	path := filepath.Join(t.TempDir(), "transition.lock")
-	owner, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	owner.Close()
-	server := newTestServer(t)
 	server.config.TransitionLock = path
+	started, release := filepath.Join(t.TempDir(), "started"), filepath.Join(t.TempDir(), "release")
+	t.Setenv("LIFECYCLE_STARTED", started)
+	t.Setenv("LIFECYCLE_RELEASE", release)
 	helper := filepath.Join(t.TempDir(), "dev-session")
-	if err := os.WriteFile(helper, []byte(
-		"#!/bin/sh\n"+
-			"[ \"$DEV_WORKSPACE_TRANSITION_LOCK_FD\" = 3 ] || exit 23\n"+
-			"[ -e /proc/$$/fd/3 ] || exit 24\n",
-	), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+
+		"[ \"$DEV_WORKSPACE_TRANSITION_LOCK_FD\" = 3 ] || exit 23\n"+
+		"touch \"$LIFECYCLE_STARTED\"\nwhile [ ! -e \"$LIFECYCLE_RELEASE\" ]; do sleep 0.01; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	slug := "2026-09-06-lock-order"
-	tracking := filepath.Join(server.config.Workspace, "work", slug)
-	if err := os.MkdirAll(tracking, 0o755); err != nil {
+	summary := browserTargetFixture(t, server, "work", "active", "")
+	targetID, err := lifecycleTargetIdentity(summary)
+	if err != nil {
 		t.Fatal(err)
 	}
-	writeWebTrackingFiles(t, tracking, "active")
-	if err := os.WriteFile(
-		filepath.Join(tracking, "portal.yml"),
-		[]byte("schema: 1\nslug: "+slug+"\n"), 0o644,
-	); err != nil {
+	mutation := server.messageLock("example")
+	if err := mutation.Lock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	targetID := deletionTargetForTest(t, server, slug)
-	mutationLock := server.messageLock(slug)
-	if err := mutationLock.Lock(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	defer mutation.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		result <- server.runLifecycleOperation(
-			context.Background(), slug, "archive", []string{"archive", slug, "--as-is"},
-			lifecycleOperationOptions{Mode: "abandoned", TargetID: targetID},
-		)
+		result <- server.runLifecycleOperation(ctx, "example", "archive", []string{"archive", "example", "--as-is"}, lifecycleOperationOptions{Mode: "abandoned", TargetID: targetID})
 	}()
-
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("executor blocked behind the conversation mutex")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	probe, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer probe.Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		err = unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if errors.Is(err, unix.EWOULDBLOCK) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := unix.Flock(int(probe.Fd()), unix.LOCK_UN); err != nil {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("lifecycle operation waited for the session lock before excluding package switches")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if err := unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("executor lost package exclusion: %v", err)
 	}
-
-	if err := unix.Flock(int(probe.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
-		t.Fatalf("ordinary SH was blocked: %v", err)
-	}
-	if err := unix.Flock(int(probe.Fd()), unix.LOCK_UN); err != nil {
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mutationLock.Unlock()
 	select {
 	case err := <-result:
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("lifecycle operation did not release its locks")
+	case <-time.After(3 * time.Second):
+		t.Fatal("executor did not complete while conversation mutex was held")
 	}
 }
 
@@ -3519,170 +3500,57 @@ func TestDeleteRetryRequiresTheDisplayedReceiptBeforeAJournalExists(t *testing.T
 	}
 }
 
-func TestDeleteJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *testing.T) {
-	server := newTestServer(t)
-	tracking := filepath.Join(server.config.Workspace, "work", "example")
-	if err := os.MkdirAll(tracking, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeWebTrackingFiles(t, tracking, "active")
-	if err := os.WriteFile(
-		filepath.Join(tracking, "portal.yml"),
-		[]byte("schema: 1\nslug: example\nrepositories: []\n"), 0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
-	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
-	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	journalPath := filepath.Join(journalRoot, "example.removal.json")
-	journalA := strings.Repeat("a", 64)
-	journal := fmt.Sprintf(
-		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":true,"operation_id":%q}`,
-		server.config.Workspace, journalA,
-	)
-	if err := os.WriteFile(journalPath, []byte(journal), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	invoked := filepath.Join(t.TempDir(), "invoked")
-	helper := filepath.Join(t.TempDir(), "dev-session")
-	if err := os.WriteFile(
-		helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755,
-	); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	mutationLock := server.messageLock("example")
-	if err := mutationLock.Lock(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	locked := true
-	defer func() {
-		if locked {
-			mutationLock.Unlock()
-		}
-	}()
-	initialOperation, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists {
-		t.Fatalf("discover initial journal receipt = %t, %v", exists, err)
-	}
-	response := httptest.NewRecorder()
-	server.retryLifecycleOperation(response, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
-			`{"receiptId":%q,"journalId":%q}`,
-			initialOperation.ReceiptID, journalA,
-		)),
-	), "example")
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("journal retry response = %d %q", response.Code, response.Body.String())
-	}
-	server.operationMu.Lock()
-	attemptA := server.operations["example"]
-	server.operationMu.Unlock()
-	replacement := fmt.Sprintf(
-		`{"schema":1,"slug":"example","workspace":%q,"phase":"validated","force":false,"operation_id":%q}`,
-		server.config.Workspace, strings.Repeat("b", 64),
-	)
-	if err := os.WriteFile(journalPath, []byte(replacement), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	replacementOperation, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists || replacementOperation.State != "paused" ||
-		replacementOperation.Options.JournalID != strings.Repeat("b", 64) ||
-		replacementOperation.ReceiptID == attemptA.ReceiptID {
-		t.Fatalf("replacement receipt = %#v, %t, %v", replacementOperation, exists, err)
-	}
-	mutationLock.Unlock()
-	locked = false
-	server.operationWG.Wait()
-	operation, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists || operation.State != "paused" ||
-		operation.ReceiptID != replacementOperation.ReceiptID ||
-		operation.Options.JournalID != strings.Repeat("b", 64) {
-		t.Fatalf("replacement journal receipt was overwritten = %#v, %t, %v", operation, exists, err)
-	}
-	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("replacement session delete command ran: %v", err)
-	}
-}
-
-func TestArchiveJournalRetryRefusesASameKindReplacementWhileWaitingForTheLock(t *testing.T) {
-	server := newTestServer(t)
-	journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
-	if err := os.MkdirAll(journalRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	journalPath := filepath.Join(journalRoot, "example.archive.json")
-	journalA := strings.Repeat("a", 64)
-	writeJournal := func(mode, journalID string) {
-		t.Helper()
-		journal := fmt.Sprintf(
-			`{"schema":2,"slug":"example","workspace":%q,"phase":"prepared","mode":%q,"operation_id":%q}`,
-			server.config.Workspace, mode, journalID,
-		)
-		temporary := journalPath + ".tmp"
-		if err := os.WriteFile(temporary, []byte(journal), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(temporary, journalPath); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeJournal("complete", journalA)
-
-	invoked := filepath.Join(t.TempDir(), "invoked")
-	helper := filepath.Join(t.TempDir(), "dev-session")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch \"$INVOKED\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("INVOKED", invoked)
-	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	mutationLock := server.messageLock("example")
-	if err := mutationLock.Lock(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	locked := true
-	defer func() {
-		if locked {
-			mutationLock.Unlock()
-		}
-	}()
-	initial, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists {
-		t.Fatalf("discover archive receipt = %t, %v", exists, err)
-	}
-	response := httptest.NewRecorder()
-	server.retryLifecycleOperation(response, httptest.NewRequest(
-		http.MethodPost, "/", strings.NewReader(fmt.Sprintf(
-			`{"receiptId":%q,"journalId":%q}`, initial.ReceiptID, journalA,
-		)),
-	), "example")
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("archive retry = %d %q", response.Code, response.Body.String())
-	}
-	server.operationMu.Lock()
-	attemptA := server.operations["example"]
-	server.operationMu.Unlock()
-	journalB := strings.Repeat("b", 64)
-	writeJournal("abandoned", journalB)
-	replacement, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists || replacement.State != "paused" ||
-		replacement.Options.Mode != "abandoned" || replacement.Options.JournalID != journalB ||
-		replacement.ReceiptID == attemptA.ReceiptID {
-		t.Fatalf("replacement archive receipt = %#v, %t, %v", replacement, exists, err)
-	}
-	mutationLock.Unlock()
-	locked = false
-	server.operationWG.Wait()
-	current, exists, err := server.lifecycleOperationForSlug("example")
-	if err != nil || !exists || current.ReceiptID != replacement.ReceiptID ||
-		current.Options.Mode != "abandoned" || current.Options.JournalID != journalB {
-		t.Fatalf("replacement archive was overwritten = %#v, %t, %v", current, exists, err)
-	}
-	if _, err := os.Stat(invoked); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("replacement archive command ran: %v", err)
+func TestLifecycleJournalRevalidatedAfterPackageAdmission(t *testing.T) {
+	for _, kind := range []string{"archive", "delete"} {
+		t.Run(kind, func(t *testing.T) {
+			server := newTestServer(t)
+			journalRoot := filepath.Join(server.config.Workspace, "worktrees", ".locks")
+			if err := os.MkdirAll(journalRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name, payload := "archive", `"schema":2,"phase":"prepared","mode":"complete"`
+			if kind == "delete" {
+				name, payload = "removal", `"schema":1,"phase":"validated","force":true`
+			}
+			journal := filepath.Join(journalRoot, "example."+name+".json")
+			write := func(id string) {
+				t.Helper()
+				if err := os.WriteFile(journal, []byte(fmt.Sprintf(`{%s,"slug":"example","workspace":%q,"operation_id":%q}`, payload, server.config.Workspace, id)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(strings.Repeat("a", 64))
+			progress, err := session.PendingLifecycleProgress(server.config.Workspace, "example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "transition.lock")
+			gate, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gate.Close()
+			if err := unix.Flock(int(gate.Fd()), unix.LOCK_EX); err != nil {
+				t.Fatal(err)
+			}
+			server.config.TransitionLock = path
+			result := make(chan error, 1)
+			go func() {
+				result <- server.runLifecycleOperation(context.Background(), "example", kind, nil, lifecycleOperationOptions{JournalExpected: true, JournalID: progress.JournalID, JournalEvidence: progress.Evidence})
+			}()
+			write(strings.Repeat("b", 64))
+			if err := unix.Flock(int(gate.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-result:
+				if err == nil || !strings.Contains(err.Error(), "lifecycle operation changed") {
+					t.Fatalf("replaced journal reached executor: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("executor did not settle")
+			}
+		})
 	}
 }
 
@@ -3933,20 +3801,16 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(t.TempDir(), "dev-session")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexec flock -x \"$DELETE_RUNTIME_LOCK\" true\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
-	mutationLock := server.messageLock("example")
-	if err := mutationLock.Lock(context.Background()); err != nil {
+	t.Setenv("DELETE_RUNTIME_LOCK", filepath.Join(server.config.AuthorityDir, "example.lock"))
+	runtimeLock, err := session.LockRuntimeShared(server.config.AuthorityDir, "example")
+	if err != nil {
 		t.Fatal(err)
 	}
-	locked := true
-	defer func() {
-		if locked {
-			mutationLock.Unlock()
-		}
-	}()
+	defer runtimeLock.Close()
 
 	request := httptest.NewRequest(
 		http.MethodPost, "/api/sessions/example/delete",
@@ -3966,13 +3830,12 @@ func TestDeleteSessionExcludesConcurrentWorkspaceOperations(t *testing.T) {
 	operation := server.operations["example"]
 	server.operationMu.Unlock()
 	if operation.State != "running" {
-		t.Fatalf("deletion did not wait for the session mutation lock: %#v", operation)
+		t.Fatalf("deletion did not wait for the shared session runtime lock: %#v", operation)
 	}
-	mutationLock.Unlock()
-	locked = false
+	runtimeLock.Close()
 	operation = waitLifecycleOperation(t, server, "example")
 	if operation.State != "complete" {
-		t.Fatalf("deletion did not continue after the session mutation lock was released: %#v", operation)
+		t.Fatalf("deletion did not continue after the shared session runtime lock was released: %#v", operation)
 	}
 }
 

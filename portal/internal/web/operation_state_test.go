@@ -1078,8 +1078,8 @@ func TestLifecycleFreshOwnerReconciliationAcceptsNoopAndAbsence(t *testing.T) {
 	}
 }
 
-func TestLifecycleOperationTimeoutIncludesBothLockWaits(t *testing.T) {
-	for _, gate := range []string{"generation", "session"} {
+func TestLifecycleOperationTimeoutIncludesPackageAndExecutorWaits(t *testing.T) {
+	for _, gate := range []string{"generation", "executor"} {
 		t.Run(gate, func(t *testing.T) {
 			server := newTestServer(t)
 			path := filepath.Join(t.TempDir(), "transition.lock")
@@ -1094,14 +1094,27 @@ func TestLifecycleOperationTimeoutIncludesBothLockWaits(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
-				lock := server.messageLock("example")
-				if err := lock.Lock(context.Background()); err != nil {
+				browserTargetFixture(t, server, "work", "active", "")
+				helper := filepath.Join(t.TempDir(), "dev-session")
+				if err := os.WriteFile(helper, []byte("#!/bin/sh\nexec sleep infinity\n"), 0o755); err != nil {
 					t.Fatal(err)
 				}
-				defer lock.Unlock()
+				server.config.DevSession = fixtureDevSessionCommand(t, server.config.Workspace, helper)
+			}
+
+			options := lifecycleOperationOptions{}
+			if gate == "executor" {
+				summary, findErr := session.Find(server.config.Workspace, "example")
+				if findErr != nil {
+					t.Fatal(findErr)
+				}
+				options.TargetID, err = lifecycleTargetIdentity(summary)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			started := time.Now()
-			err = server.executeLifecycleOperation(context.Background(), 25*time.Millisecond, "example", "archive", nil, lifecycleOperationOptions{})
+			err = server.executeLifecycleOperation(context.Background(), 25*time.Millisecond, "example", "archive", nil, options)
 			if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
 				t.Fatalf("%s wait = %v after %s", gate, err, time.Since(started))
 			}

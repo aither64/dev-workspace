@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'timeout'
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
@@ -640,16 +641,18 @@ class DevSessionTest < Minitest::Test
       File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
         assert(lock.flock(File::LOCK_EX | File::LOCK_NB))
 
-        error = assert_raises(DevSession::Error) do
-          runner.delete(slug, as_is: true, force: false)
-        end
-        assert_match(/another dev-session command/, error.message)
-
-        runner.delete(other_slug, as_is: true, force: false)
+        waiting = Queue.new
+        runner.define_singleton_method(:lifecycle_access_waiting) { |_slug| waiting << true }
+        worker = Thread.new { runner.delete(slug, as_is: true, force: false) }
+        Timeout.timeout(5) { waiting.pop }
+        assert(worker.alive?)
+        other_runner = runner_for(workspace)
+        other_runner.delete(other_slug, as_is: true, force: false)
         refute(File.exist?(File.join(workspace, 'worktrees', other_slug)))
+        lock.flock(File::LOCK_UN)
+        Timeout.timeout(5) { worker.value }
       end
 
-      runner.delete(slug, as_is: true, force: false)
       refute(File.exist?(File.join(workspace, 'worktrees', slug)))
     end
   end
