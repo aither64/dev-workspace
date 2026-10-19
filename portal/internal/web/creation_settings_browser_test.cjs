@@ -279,8 +279,14 @@ const baseURL = process.argv[2];
       const submitted=actual.waitForResponse(response=>new URL(response.url()).pathname==="/sessions" && response.request().method()==="POST");
       await realForm.locator("[type=submit]").click();
       const response=await submitted;
-      assert.equal(response.status(),202,await response.text());
-      const status=await response.json();
+      assert.equal(response.status(),202);
+      // Navigation can retire Chromium's POST response body before CDP reads
+      // it. Recover the authoritative receipt using the actual submitted ID.
+      const requestID=new URLSearchParams(response.request().postData()).get("clientRequestId");
+      const persisted=await actual.request.get(`${baseURL}/api/session-creations/${requestID}`);
+      assert.equal(persisted.status(),200);
+      const status=await persisted.json();
+      assert.equal(status.requestId,requestID);
       assert.equal(new URLSearchParams(response.request().postData()).get("provider"),value || null);
       await expect(actual).toHaveURL(`${baseURL}/creations/${status.requestId}/`);
       await actual.reload({waitUntil:"domcontentloaded"});
