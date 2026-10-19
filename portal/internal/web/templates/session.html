@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
-  <link rel="stylesheet" href="/codex/assets/conversation.css?v=5">
+  <link rel="stylesheet" href="/codex/assets/conversation.css?v=6">
   <link rel="stylesheet" href="/static/style.css?v=19">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
@@ -110,6 +110,7 @@
           <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
         </div>
         {{if and .Session.RecoveryReady (not .PendingLifecycle)}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
+        <section id="optional-questions" class="codex-question-panel" aria-label="Optional questions" hidden></section>
         <div class="composer-context">
         {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
         <div id="message-receipts" class="message-receipts" hidden></div>
@@ -257,7 +258,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=44" defer></script>
+  <script src="/static/app.js?v=45" defer></script>
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/session-attention.js" defer></script>
