@@ -148,7 +148,8 @@ pkgs.testers.runNixOSTest {
     def restart():
         user("systemctl --user kill --signal=SIGKILL --kill-whom=all workspace-portal@fixture.service")
         user("systemctl --user restart workspace-portal@fixture.service")
-        machine.wait_until_succeeds(user_prefix + "test -S " + runtime + "/portal.sock")
+        machine.wait_until_succeeds(user_prefix + "curl -fsS --unix-socket " + runtime
+            + "/portal.sock http://localhost/ >/dev/null")
 
     def native(identity):
         return json.loads(user("${python}/bin/python ${../../test/creation_transport.py} read "
