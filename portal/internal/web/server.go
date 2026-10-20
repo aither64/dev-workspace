@@ -454,6 +454,8 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	policy := bluemonday.UGCPolicy()
+	// Source titles are text attributes and may contain Unicode punctuation.
+	policy.AllowAttrs("title").OnElements("a")
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
 	operationContext, cancelOperations := context.WithCancel(context.Background())
@@ -3659,7 +3661,7 @@ func (s *Server) presentTranscript(transcript *codex.Transcript) {
 		entry := &transcript.Entries[index]
 		if entry.Text != "" &&
 			(entry.Kind == "agentMessage" || entry.Kind == "reasoning" || entry.Kind == "plan") {
-			entry.HTML = string(s.renderTextMarkdown(entry.Text))
+			entry.HTML = string(s.renderTextMarkdown(codex.CitationMarkdown(*entry)))
 		}
 	}
 }

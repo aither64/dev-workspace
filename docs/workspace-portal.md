@@ -1417,3 +1417,20 @@ session list and session page. Forks and new sessions implementing a
 sensitive plan inherit the setting. Records remain local while portal access and
 Codex processing retain their existing behavior. See the
 [session guide](dev-sessions.md#sensitive-sessions) for storage and recovery.
+
+## Citation links
+
+Web citations in assistant answers appear as numbered links. Hover over a number
+to see the source title. Numbers restart in each message, and repeated references
+to the same URL share a number. Copy message includes ordinary Markdown links.
+
+The shared codex-web client resolves references from retained web-tool metadata,
+including sources outside the visible history page. The portal keeps the answer
+visible while sources load and updates its links when resolution finishes. An
+unavailable source appears as `[source unavailable]`. Literal examples in code
+remain unchanged. Citation links pass through the same Markdown sanitizer as
+other message links; user messages and artifact previews do not resolve citations.
+
+The shared client's [citation contract](https://github.com/aither64/codex-web/blob/master/docs/reference.md#web-citations)
+owns source extraction, offsets and history resolution. This presentation does
+not change persisted conversations or require a Codex version upgrade.

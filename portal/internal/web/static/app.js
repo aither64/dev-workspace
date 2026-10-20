@@ -1177,7 +1177,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=17");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=18");
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");
@@ -4539,7 +4539,7 @@
       status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
       if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
       metadataRetryTimer = null;
-      if (payload.metadataPending && !pageReads.paused) {
+      if ((payload.metadataPending || payload.entries.some(entry => entry.citationsPending)) && !pageReads.paused) {
         metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; scheduleRefresh(0); }, metadataRetryDelay);
         metadataRetryDelay = Math.min(refreshPolicy.retryMaxMs, metadataRetryDelay * 2);
       } else metadataRetryDelay = refreshPolicy.retryInitialMs;
@@ -4599,14 +4599,14 @@
       historyRead = null;
       historyNotice.cancel();
       renderHistoryControls();
-      if (!historyError && transcriptHistory.gap && transcriptHistory.repairCursor) scheduleHistoryRepair(refreshPolicy.historyPageMs);
+      if (!historyError && (transcriptHistory.gap || transcriptHistory.citationsPending) && transcriptHistory.repairCursor) scheduleHistoryRepair();
     }
   };
   startOlderHistoryRead = () => { void runHistoryRead("older"); };
-  const canRepairHistory = () => transcriptHistory?.gap && transcriptHistory.repairCursor &&
+  const canRepairHistory = () => (transcriptHistory?.gap || transcriptHistory?.citationsPending) && transcriptHistory.repairCursor &&
     (!historyFailure || historyFailure.kind === "repair") && (!historyError || historyFailure?.kind === "repair") &&
     !pageReads.paused && !document.hidden && !pagingUnavailable;
-  const scheduleHistoryRepair = (delay = refreshPolicy.historyPageMs) => {
+  const scheduleHistoryRepair = (delay = transcriptHistory?.gap ? refreshPolicy.historyPageMs : refreshPolicy.retryInitialMs) => {
     if (!canRepairHistory() || historyRetryTimer !== null) return;
     historyRetryTimer = setTimeout(() => {
       historyRetryTimer = null;

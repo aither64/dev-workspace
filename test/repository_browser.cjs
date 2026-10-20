@@ -82,6 +82,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/uploads.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/uploads.js")));
   if (url.pathname === "/refresh.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/refresh.js")));
   if (url.pathname === "/questions.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/questions.js")));
+  if (url.pathname === "/citations.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/citations.js")));
   if (url.pathname === "/conversation.js") return send("text/javascript", fs.readFileSync(path.join(provider, "conversation/assets/conversation.js")));
   if (url.pathname === "/copy.css") return send("text/css", fs.readFileSync(path.join(provider, "conversation/assets/conversation.css")));
   if (url.pathname.startsWith("/static/")) {
