@@ -130,6 +130,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
       await form.locator("[name=goal]").fill(marker);
       if (!options.auto) await form.locator("[name=name]").fill(name);
       if (options.attachment) {
+        await form.locator("#creation-upload-controls button[aria-label='Add attachments']:not([disabled])").waitFor();
         const rejectedUpload = page.waitForResponse(r => r.status() >= 400 &&
           new URL(r.url()).pathname.startsWith("/uploads/")).then(async response => {
           throw Error(`upload rejected (${response.status()}): ${await response.text()}`);
