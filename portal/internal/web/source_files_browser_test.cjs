@@ -27,8 +27,10 @@ const fs = require("node:fs");
   assert(source.includes(editorImport));
   const mountedSource = source.replace(editorImport, '({createReviewEditor: () => globalThis.sourceTestEditor})');
   const {mountSourceFile} = await import("data:text/javascript;base64," + Buffer.from(mountedSource).toString("base64"));
-  const elements = Object.fromEntries(["notice", "content", "title", "version", "copy"].map(name =>
-    [`source-file-${name}`, {textContent: "", hidden: false, addEventListener() {}}]));
+  const elements = Object.fromEntries(["notice", "content", "title", "version", "copy", "copy-content", "download"].map(name =>
+    [`source-file-${name}`, {textContent: "", hidden: false, handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; }}]));
+  let copied;
+  Object.defineProperty(globalThis, "navigator", {value: {clipboard: {writeText: async text => {copied = text;}}}});
   const events = {};
   globalThis.document = {getElementById: id => elements[id], querySelector: () => ({content: "nonce"})};
   globalThis.location = new URL(original + "#L10");
@@ -70,5 +72,8 @@ const fs = require("node:fs");
   assert.equal(revealedLine, 93);
   assert.equal(elements["source-file-title"].textContent, "docs/guide.md");
   assert.match(elements["source-file-version"].textContent, /Current workspace/);
+  await elements["source-file-copy-content"].handlers.click();
+  assert.equal(copied, "line\n");
+  assert.equal(elements["source-file-download"].href, "/api/workspace/file/download?path=docs%2Fguide.md");
   console.log("Source file URL and source identity contracts passed.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -102,7 +102,12 @@ files cannot choose executable paths or labels.
 ## File links
 
 Absolute file links in conversations and Markdown artifacts open a read-only
-source viewer. The viewer shows line numbers and syntax highlighting. A link
+source viewer in a new tab. The viewer shows line numbers and syntax highlighting.
+**Copy content** copies the complete UTF-8 preview without line numbers.
+**Download** saves the original bytes, including binary files and files whose
+preview is omitted, up to 10 MiB. Larger files cannot be downloaded through this
+endpoint. A link
+
 ending in `:10`, `:10:5` or `#L10` selects line 10. Clicking a line number updates
 the address; **Copy link** copies that address. Links without a line reference
 open the beginning of the file.
@@ -176,6 +181,13 @@ these files as current workspace contents; archived conversations still open
 their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
+
+Downloads use `GET /api/sessions/<slug>/file/download` and
+`GET /api/workspace/file/download` with the same query parameters and eligibility
+checks as their preview endpoints. They return an attachment with an
+`application/octet-stream` content type and a 10 MiB limit, independent of the
+preview limit. Oversized downloads return HTTP 413. Archived repository downloads
+read the recorded final Git object. No new file access is granted by downloading.
 
 ## Development cluster controls
 

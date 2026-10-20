@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -54,7 +56,7 @@ func TestSourceLinksRewriteHistoryAndRedirect(t *testing.T) {
 	s.presentTranscript(&transcript)
 	entry := transcript.Entries[0]
 	if entry.Text != original || !strings.Contains(entry.HTML, "/files/example?") ||
-		!strings.Contains(entry.HTML, "#L10") || !strings.Contains(entry.HTML, ">The route</a>") ||
+		!strings.Contains(entry.HTML, `target="_blank"`) || !strings.Contains(entry.HTML, "noopener") || !strings.Contains(entry.HTML, "#L10") || !strings.Contains(entry.HTML, ">The route</a>") ||
 		!strings.Contains(entry.HTML, "https://example.test/a:10") {
 		t.Fatalf("transcript changed or links missing: %#v", entry)
 	}
@@ -357,8 +359,11 @@ func TestSourceFilesUseArchivedFinalCommitAndCuratedArtifacts(t *testing.T) {
 	// still load the final snapshot and must not require a live worktree.
 	base := strings.TrimSpace(webGitOutput(t, "--git-dir="+bare, "rev-parse", head+"^"))
 	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/heads/feature", base)
-	file := readSource(t, s, sourceQuery("file"), 200)
-	if file.Source != "archive" || file.Revision != head || file.Content.Text != "after\n" {
+	download := httptest.NewRecorder()
+ s.Handler().ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/sessions/example/file/download"+sourceQuery("file"), nil))
+ if download.Code != 200 || download.Body.String() != "after\n" { t.Fatalf("archived raw download: %d %q", download.Code, download.Body.String()) }
+ file := readSource(t, s, sourceQuery("file"), 200)
+ if file.Source != "archive" || file.Revision != head || file.Content.Text != "after\n" {
 		t.Fatalf("archived file = %#v", file)
 	}
 	if readSource(t, s, sourceQuery("nested/route.nix"), 200).Content.Text != "# nested route\n" {
@@ -452,4 +457,59 @@ func TestSourceLegacyPathsRejectTraversalBeforeMuxCleaning(t *testing.T) {
 			t.Fatalf("%s = %d", suffix, response.Code)
 		}
 	}
+}
+
+func TestSourceDownloadsReuseEligibilityAndPreserveBytes(t *testing.T) {
+	s, _, worktree, _ := reviewWebFixture(t)
+	request := func(path string, status int) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != status {
+			t.Fatalf("download %s: %d %s", path, response.Code, response.Body.String())
+		}
+		return response
+	}
+	raw := []byte{0, 255, 'a', '\r', '\n'}
+	name := "space ž %.bin"
+	if err := os.WriteFile(filepath.Join(worktree, name), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	result := request("/api/sessions/example/file/download"+sourceQuery(name), 200)
+	if !bytes.Equal(result.Body.Bytes(), raw) || result.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Fatal("download changed original bytes")
+	}
+	disposition, params, err := mime.ParseMediaType(result.Header().Get("Content-Disposition"))
+	if err != nil || disposition != "attachment" || params["filename"] != name {
+		t.Fatalf("unsafe disposition: %v %v", params, err)
+	}
+	large := bytes.Repeat([]byte("x"), repository.MaxReviewBlobBytes+1)
+	if err := os.WriteFile(filepath.Join(worktree, "large"), large, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !readSource(t, s, sourceQuery("large"), 200).Content.Limited {
+		t.Fatal("expected omitted preview")
+	}
+	if !bytes.Equal(request("/api/sessions/example/file/download"+sourceQuery("large"), 200).Body.Bytes(), large) {
+		t.Fatal("limited preview prevented raw download")
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "oversized"), bytes.Repeat([]byte("x"), repository.MaxSourceDownloadBytes+1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request("/api/sessions/example/file/download"+sourceQuery("oversized"), 413)
+	if err := os.WriteFile(filepath.Join(worktree, ".gitignore"), []byte("private\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "private"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(name, filepath.Join(worktree, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"private", "linked"} {
+		request("/api/sessions/example/file/download"+sourceQuery(path), 404)
+	}
+	request("/api/sessions/example/file/download"+sourceQuery("../escape"), 400)
+	request("/api/sessions/example/file/download"+sourceQuery(".git/config"), 400)
+	request("/api/sessions/example/file/download?artifact=plan.md", 200)
 }

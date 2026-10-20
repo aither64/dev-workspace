@@ -1,6 +1,9 @@
 package web
 
 import (
+	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -96,6 +99,7 @@ func (s *Server) rewriteSourceLinks(document ast.Node) {
 			if err == nil {
 				if target, ok := s.sourceLink(input); ok {
 					link.Destination = []byte(target)
+					link.SetAttributeString("target", []byte("_blank"))
 				}
 			}
 		}
@@ -171,13 +175,17 @@ func (s *Server) workspaceSourceFile(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This workspace file link is invalid."})
 		return
 	}
-	result, err := s.reviews().reader.WorkspaceSource(r.Context(), path)
+	download := strings.HasSuffix(r.URL.Path, "/download")
+	result, err := s.reviews().reader.WorkspaceSourceContent(r.Context(), path, download)
+	if s.sourceDownloadError(w, err) {
+		return
+	}
 	if err != nil {
 		s.config.Logger.Printf("workspace source file %s: %v", path, err)
 		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the workspace and is tracked or not ignored by Git."})
 		return
 	}
-	s.writeJSON(w, http.StatusOK, result)
+	s.serveSourceContent(w, result, download)
 }
 
 func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
@@ -186,10 +194,14 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This file link is invalid."})
 		return
 	}
+	download := strings.HasSuffix(r.URL.Path, "/download")
 	var result repository.SourceFile
 	if artifact := query.Get("artifact"); artifact != "" {
 		var err error
-		result, err = s.reviews().reader.TrackingSource(r.Context(), summary, artifact)
+		result, err = s.reviews().reader.TrackingSourceContent(r.Context(), summary, artifact, download)
+		if s.sourceDownloadError(w, err) {
+			return
+		}
 		if err != nil {
 			s.config.Logger.Printf("session source file %s/%s: %v", summary.Slug, artifact, err)
 			s.sourceUnavailable(w)
@@ -202,14 +214,17 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 			return
 		}
 		var err error
-		result, err = s.reviews().reader.Source(r.Context(), summary.Slug, item, summary.Archived, query.Get("path"))
+		result, err = s.reviews().reader.SourceContent(r.Context(), summary.Slug, item, summary.Archived, query.Get("path"), download)
+		if s.sourceDownloadError(w, err) {
+			return
+		}
 		if err != nil {
 			s.config.Logger.Printf("source file %s/%s: %v", summary.Slug, item.Name, err)
 			s.sourceUnavailable(w)
 			return
 		}
 	}
-	s.writeJSON(w, http.StatusOK, result)
+	s.serveSourceContent(w, result, download)
 }
 
 func (s *Server) sourceUnavailable(w http.ResponseWriter) {
@@ -219,4 +234,24 @@ func (s *Server) sourceUnavailable(w http.ResponseWriter) {
 // Reject malformed legacy paths before ServeMux can clean or redirect them.
 func (s *Server) invalidSourceRequest(r *http.Request) bool {
 	return strings.HasPrefix(r.URL.Path, s.config.Workspace+"/") && filepath.Clean(r.URL.Path) != r.URL.Path
+}
+
+func (s *Server) sourceDownloadError(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, repository.ErrSourceDownloadLimit) {
+		return false
+	}
+	s.writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "This file exceeds the 10 MiB download limit."})
+	return true
+}
+
+func (s *Server) serveSourceContent(w http.ResponseWriter, file repository.SourceFile, download bool) {
+	if !download {
+		s.writeJSON(w, http.StatusOK, file)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(file.Path)}))
+	w.Header().Set("Content-Length", strconv.Itoa(len(file.Content.Text)))
+	_, _ = io.WriteString(w, file.Content.Text)
 }

@@ -27,6 +27,14 @@ export async function mountSourceFile(root) {
   const title = document.getElementById("source-file-title");
   const version = document.getElementById("source-file-version");
   const copy = document.getElementById("source-file-copy");
+  const copyContent = document.getElementById("source-file-copy-content");
+  const download = document.getElementById("source-file-download");
+  let completeText = null;
+  copyContent?.addEventListener("click", async () => {
+    if (completeText === null) return;
+    try { await navigator.clipboard.writeText(completeText); announce("Content copied."); }
+    catch (_) { announce("Unable to copy the content. Download the file instead."); }
+  });
   const announce = text => { notice.textContent = text; notice.hidden = !text; };
   copy.addEventListener("click", async () => {
     try {
@@ -44,6 +52,7 @@ export async function mountSourceFile(root) {
     title.textContent = file.repository ? `${file.repository}/${file.path}` : file.path;
     document.title = `${title.textContent} · File`;
     version.textContent = sourceFileVersion(file);
+    if (download) { download.href = `${api}/download${location.search}`; download.hidden = false; }
     if (file.content.limited) {
       announce(`Preview omitted: the file exceeds 512 KiB or 12,000 lines (${file.content.bytes.toLocaleString()} bytes).`);
       return;
@@ -52,6 +61,8 @@ export async function mountSourceFile(root) {
       announce("This file cannot be displayed as UTF-8 text.");
       return;
     }
+    completeText = file.content.text;
+    if (copyContent) copyContent.disabled = typeof completeText !== "string";
     const {createReviewEditor} = await import("/static/review-editor.js");
     const editor = createReviewEditor({
       parent: content, after: file.content.text, newPath: file.path, mode: "file", fileLabel: "Read-only file",

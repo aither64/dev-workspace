@@ -13,3 +13,5 @@
   .source-file-heading { flex-direction: column; gap: .5rem; }
   #source-file-content .cm-editor { max-height: calc(100dvh - 17rem); }
 }
+
+.source-file-actions { display: flex; align-items: center; gap: .4rem; flex-shrink: 0; }
