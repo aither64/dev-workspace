@@ -900,7 +900,10 @@ and does not replace final review. A preset reviewer receives no automatic
 assignment. See the [session guide](dev-sessions.md#team-members) for orchestration.
 
 After creation, the Team tab can add, remove, and configure members, and
-show their activity and statistics. Adding, replacing or reconfiguring members requires
+show their activity and statistics. After **Add member** succeeds, the form keeps
+the selected role, model and reasoning effort for the next addition. It prevents
+another submission while an addition is pending. Each request uses the settings
+shown when you select **Add member**. Adding, replacing or reconfiguring members requires
 explicit user direction; agents do not automatically grow a Solo roster or add
 a designer to a Lead-designed team. The mandatory-review workflow uses a
 temporary independent final reviewer when no eligible retained reviewer exists,
