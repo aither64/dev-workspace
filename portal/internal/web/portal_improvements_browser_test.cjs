@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
     page.on("pageerror", error => errors.push(error.message));
     page.on("dialog", dialog => { dialogs.push(dialog.message()); void dialog.dismiss(); });
     let removed = false, detailsReads = 0, previewVersion = 0, releasePreview, releaseAdd, turns = 0;
+    let loseResponse = true, showReceipt = false, observedEntry = null, releaseObserved = null;
     const transcript = await (await context.request.get(baseURL + "/fixture/presentation")).json();
     const fullTree = await (await context.request.get(baseURL + "/fixture/artifact-tree")).text();
     const smallerTree = await (await context.request.get(baseURL + "/fixture/artifact-tree?remove=1")).text();
@@ -20,7 +21,7 @@ const fs = require("node:fs/promises");
     await page.route("**/api/collaboration-modes", route => route.fulfill({json: [{mode:"default", name:"Default"}]}));
     await page.route("**/api/sessions/example/**", async route => {
       const url = new URL(route.request().url()), operation = url.pathname.split("/").at(-1);
-      if (["thread", "page"].includes(operation)) return route.fulfill({json: transcript});
+      if (["thread", "page"].includes(operation)) return route.fulfill({json: {...transcript, ...(showReceipt ? {entries: [...transcript.entries, observedEntry]} : {})}});
       if (operation === "details") { detailsReads++; return route.fulfill({json: {artifactsHTML: (removed ? smallerTree : fullTree)+`<!--refresh ${detailsReads}-->`, artifactCount: removed ? 499 : 500, repositoriesHTML:"", teamHTML}}); }
       if (operation === "artifact-preview") {
         const version = ++previewVersion;
@@ -31,6 +32,20 @@ const fs = require("node:fs/promises");
         additions.push(route.request().postDataJSON());
         if (additions.length === 1) await new Promise(resolve => {releaseAdd = resolve;});
         return route.fulfill({json:{ok:true}});
+      }
+      if (operation === "message") {
+        const body = route.request().postDataJSON(); sends.push(body);
+        if (body.message === "Fail before dispatch" && !body.retry) return route.fulfill({status:502, body:"fixture before dispatch"});
+        if (body.message === "Observed before failure") {
+          const digest = await require("node:crypto").webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(body.message));
+          observedEntry = {kind:"userMessage", itemId:"observed-before-failure", text:body.message, clientUserMessageId:body.clientUserMessageId, clientUserMessageDigest:Buffer.from(digest).toString("hex")};
+          showReceipt = true;
+          await new Promise(resolve => {releaseObserved = resolve;});
+          return route.fulfill({status:502, body:"fixture response lost after transcript confirmation"});
+        }
+        if (!sends.slice(0, -1).some(previous => previous.clientUserMessageId === body.clientUserMessageId)) turns++;
+        if (loseResponse) { loseResponse = false; return route.fulfill({status:502, body:"upstream unavailable"}); }
+        return route.fulfill({json:{turnId:"turn-once", clientUserMessageId:body.clientUserMessageId}});
       }
       if (["queue", "pending"].includes(operation)) return route.fulfill({json:[]});
       if (operation === "team-stats") return route.fulfill({json:{members:[]}});
@@ -64,6 +79,36 @@ const fs = require("node:fs/promises");
     assert.equal(download.suggestedFilename(), "plan.md");
     assert.equal(await fs.readFile(await download.path(), "utf8"), source.content.text);
     await popup.close(); await page.bringToFront();
+
+    const input = page.locator('#message-form textarea');
+    await input.fill("Keep this exact input"); await page.locator("#message-send").click();
+    await expect(page.locator("#message-submission-status")).toBeVisible();
+    await expect(input).toHaveValue("Keep this exact input");
+    await expect(page.locator("#message-receipts")).toContainText("Outcome unknown");
+    await page.reload();
+    await page.getByRole("button", {name:"Retry original", exact:true}).click();
+    await expect.poll(() => sends.length).toBe(2);
+    assert.equal(sends[0].clientUserMessageId, sends[1].clientUserMessageId); assert.equal(turns, 1);
+    await expect(page.locator("#message-submission-status")).toBeHidden();
+    await expect(page.getByRole("button", {name:"Dismiss message", exact:true})).toHaveText("×");
+    await expect(page.getByRole("button", {name:"Dismiss message", exact:true})).toHaveAttribute("title", "Dismiss message");
+    await page.getByRole("button", {name:"Dismiss message", exact:true}).click();
+    const acceptedKey = await page.evaluate(() => Object.keys(sessionStorage).find(key => key.startsWith("workspace-portal.send-attempts")));
+    // Dismissal changes presentation while retry identity remains in storage.
+    if (acceptedKey) assert(await page.evaluate(key => sessionStorage.getItem(key), acceptedKey));
+    await input.fill("Fail before dispatch"); await page.locator("#message-send").click();
+    await expect(input).toHaveValue("Fail before dispatch");
+    await page.getByRole("button", {name:"Retry original", exact:true}).click();
+    await expect.poll(() => sends.length).toBe(4);
+    assert.equal(sends[2].clientUserMessageId,sends[3].clientUserMessageId);
+    await page.getByRole("button", {name:"Dismiss message", exact:true}).click();
+    await input.fill("Observed before failure"); await page.locator("#message-send").click();
+    await expect.poll(() => Boolean(releaseObserved)).toBe(true);
+    await page.request.post(baseURL + "/fixture/refresh");
+    await expect(page.locator("#transcript")).toContainText("Observed before failure");
+    releaseObserved(); await expect(page.locator("#message-send")).toBeEnabled();
+    await expect(page.locator("#message-receipts")).not.toContainText("Outcome unknown");
+    await expect(page.locator("#message-submission-status")).toBeHidden();
 
     await page.getByRole("tab", {name:/Artifacts/}).click();
     await expect(page.locator('[data-artifact-path]')).toHaveCount(500);

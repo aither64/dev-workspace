@@ -1188,7 +1188,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=19");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=20");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -3918,8 +3918,8 @@
         dismiss.type = "button";
         dismiss.className = "message-receipt-close";
         dismiss.textContent = "×";
-        dismiss.setAttribute("aria-label", "Dismiss message notification");
-        dismiss.title = entry.state === "accepted" ? "Hide this notification" : "Hide this warning. The message may still be delivered.";
+        dismiss.setAttribute("aria-label", "Dismiss message");
+        dismiss.title = "Dismiss message";
         dismiss.disabled = inFlightMessageIDs.has(entry.id);
         dismiss.addEventListener("click", () => {
           const current = pendingMessages.get(entry.id);
@@ -4518,6 +4518,7 @@
         if (!current || current.message !== receipt.message || current.state === "observed") continue;
         pendingMessages.set(receipt.id, receipt);
         storeSendAttempt(sendAttemptStorage, slug, threadID, receipt);
+        clearSubmissionFailure(submissionIdentity(threadID, receipt.id));
       }
       if (observed.length) renderMessageReceipts();
       acknowledgeTranscriptMessages();
@@ -5205,6 +5206,7 @@
     // The original retry identity remains durable even when this metadata
     // update fails. Keep the known acceptance visible for this page lifetime.
     storeSendAttempt(sendAttemptStorage, slug, threadID, accepted);
+    clearSubmissionFailure(submissionIdentity(threadID, attempt.id));
     renderMessageReceipts();
   };
 
@@ -5225,8 +5227,10 @@
         composerUploads.clear();
       }
     } catch (error) {
-      if (threadID === currentThreadId) markMessageOutcomeUnknown(id);
-      alert(error.message);
+      if (threadID === currentThreadId) {
+        markMessageOutcomeUnknown(id);
+        if (!["accepted", "observed"].includes(pendingMessages.get(id)?.state)) showSubmissionFailure(error, submissionIdentity(threadID, id));
+      }
     } finally {
       inFlightMessageIDs.delete(id);
       renderMessageReceipts();
@@ -5259,6 +5263,22 @@
     }
   };
 
+  const submissionStatus = document.getElementById("message-submission-status");
+  const submissionIdentity = (threadID, id, action = "send") => ({conversationID, threadID, id, action});
+  let submissionFailure = null;
+  const clearSubmissionFailure = identity => {
+    if (!submissionFailure || !identity.id ||
+        ["conversationID", "threadID", "id", "action"].some(key => submissionFailure[key] !== identity[key])) return;
+    submissionFailure = null;
+    submissionStatus.hidden = true;
+    submissionStatus.textContent = "";
+  };
+  const showSubmissionFailure = (error, identity) => {
+    if (!submissionStatus || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
+    submissionFailure = {...identity};
+    submissionStatus.textContent = conversationAssets.submissionFailurePresentation?.(error).message || error.message || "Delivery could not be confirmed. Retry the original message to check its status.";
+    submissionStatus.hidden = false;
+  };
   const form = document.getElementById("message-form");
   if (form) {
     const textarea = form.elements.message;
@@ -5273,12 +5293,14 @@
     let queueAttemptStorage = null;
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
-      if (!interactive || liveSettingsSaving) return;
+      if (!interactive || liveSettingsSaving || form.dataset.submitting) return;
       const threadID = currentThreadId;
+      const action = queue ? "queue" : "send";
       const message = textarea.value.trim();
       if (!message && !composerUploads.count()) return;
-      let attachments;
-      try { attachments = composerUploads.ids(); } catch (error) { alert(error.message); return; }
+      let attachments, submittingAttemptID = null;
+      try { attachments = composerUploads.ids(); } catch (error) { showSubmissionFailure(error, submissionIdentity(threadID, null, action)); return; }
+      form.dataset.submitting = "true";
       composerUploads.lock(true);
       const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
       controls.forEach((control) => { control.disabled = true; });
@@ -5292,11 +5314,13 @@
               throw new Error("Browser storage is unavailable; queued messages cannot be submitted safely.");
             }
           }
+          submittingAttemptID = attempt.id;
           await client.queueMessage(message, attempt.id, attachments);
           optionalQuestions?.ordinaryAccepted();
           if (!deleteQueueAttempt(queueAttemptStorage, slug, currentThreadId, attempt.id)) {
             throw new Error("The queued message was accepted, but its retry record could not be cleared.");
           }
+          clearSubmissionFailure(submissionIdentity(threadID, attempt.id, action));
         } else {
           const queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, currentThreadId);
           if (queueAttempts.some((candidate) => candidate.message === message && sameAttemptAttachments(candidate.attachmentIds, attachments))) {
@@ -5315,6 +5339,7 @@
             }
           }
           const id = attempt.id;
+          submittingAttemptID = id;
           if (inFlightMessageIDs.has(id)) throw new Error("This message is already being retried.");
           inFlightMessageIDs.add(id);
           pendingMessages.set(id, {...attempt, dismissed: false, state: attempt.state || "sending"});
@@ -5338,14 +5363,12 @@
         }
         scheduleRefresh(0);
       } catch (error) {
-        for (const [id, entry] of pendingMessages) {
-          if (threadID === currentThreadId && entry.state === "sending" && entry.message === message) {
-            markMessageOutcomeUnknown(id);
-          }
-        }
-        alert(error.message);
+        if (!queue && threadID === currentThreadId && submittingAttemptID) markMessageOutcomeUnknown(submittingAttemptID);
+        const knownReceipt = !queue && threadID === currentThreadId && ["accepted", "observed"].includes(pendingMessages.get(submittingAttemptID)?.state);
+        if (!knownReceipt) showSubmissionFailure(error, submissionIdentity(threadID, submittingAttemptID, action));
       }
       finally {
+        delete form.dataset.submitting;
         controls.forEach((control) => { control.disabled = false; });
         composerUploads.lock(false);
         applyCurrentSettings();
@@ -5377,13 +5400,15 @@
     if (liveSettingsSaving) return;
     const queuedSubmissionId = queueStart.dataset.queuedSubmissionId;
     if (!queuedSubmissionId) return;
+    const identity = submissionIdentity(currentThreadId, queuedSubmissionId, "startQueue");
     queueStartInFlight = true;
     queueStart.disabled = true;
     try {
       await client.startQueue(queuedSubmissionId);
+      clearSubmissionFailure(identity);
       followTranscript();
     } catch (error) {
-      alert(error.message);
+      showSubmissionFailure(error, identity);
     } finally {
       queueStartInFlight = false;
       await refreshQueue(true);
