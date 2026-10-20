@@ -94,8 +94,9 @@ type Config struct {
 	VerifyThread           func(context.Context, string, string) error
 	ReadThread             func(context.Context, string) (codex.Transcript, error)
 	// SessionNamer injects the isolated naming boundary in tests. Normal server
-	// construction uses the owned naming socket/catalog; missing inputs use fallback.
-	SessionNamer func(context.Context, string) (string, error)
+	// construction uses the owned naming socket/catalog and resolves the accepted
+	// provider selection. Missing inputs leave naming unavailable.
+	SessionNamer func(context.Context, string, string) (string, error)
 }
 
 type cachedRepositories struct {
@@ -466,9 +467,6 @@ func New(config Config) (*Server, error) {
 		cancelOperations()
 		return nil, err
 	}
-	if config.SessionNamer == nil && config.NamingSocket != "" && config.NamingModelCatalogFile != "" {
-		config.SessionNamer = normalSessionNamer(config.NamingSocket, config.NamingModelCatalogFile, operationStore)
-	}
 	server := &Server{
 		uploadCreationMu: conversation.NewMutationLock(),
 		config:           config, hostProfile: hostProfile, templates: templates,
@@ -488,6 +486,9 @@ func New(config Config) (*Server, error) {
 		trustedOrigins:     trustedOrigins,
 		installedTeams:     installedTeams,
 		namingSlots:        make(chan struct{}, 2),
+	}
+	if config.SessionNamer == nil && config.NamingSocket != "" && config.NamingModelCatalogFile != "" {
+		server.config.SessionNamer = server.normalSessionName
 	}
 	if err := server.loadPreparations(); err != nil {
 		cancelOperations()

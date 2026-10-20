@@ -532,7 +532,7 @@ func (s *Server) runPreparation(id string, attempt int) {
 	if err == nil && record.Base == "" {
 		base, outcome := record.Snapshot.Input.CustomName, "custom"
 		if base == "" {
-			base, outcome, err = s.namePreparation(s.operationContext, record.Snapshot.Input.RawPrompt)
+			base, outcome, err = s.namePreparation(s.operationContext, record.Snapshot.Input.RawPrompt, record.Snapshot.Input.Provider)
 			namingOutcome = outcome
 		}
 		if err == nil {

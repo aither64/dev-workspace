@@ -1,9 +1,16 @@
-{ pkgs, self, mkPackage }:
+{
+  pkgs,
+  self,
+  mkPackage,
+}:
 let
   policy = {
     default = "xhigh";
     simple = "high";
-    allowed = [ "high" "xhigh" ];
+    allowed = [
+      "high"
+      "xhigh"
+    ];
     simple_requires_reason = true;
     followup = "retain";
   };
@@ -19,7 +26,10 @@ let
     purpose = "lead";
     instructions = "CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools.";
     lifetime = "session";
-    allowed_efforts = [ "high" "xhigh" ];
+    allowed_efforts = [
+      "high"
+      "xhigh"
+    ];
     access = "workspace_write";
     fresh_context = false;
   };
@@ -31,7 +41,10 @@ let
       default_team = "solo";
       default_development_team = "development";
       capacity.required_native_child_threads = 4;
-      work_policy = { design = policy; implementation = policy; };
+      work_policy = {
+        design = policy;
+        implementation = policy;
+      };
       teams = {
         solo = {
           description = "Creation acceptance solo";
@@ -78,37 +91,62 @@ let
         access = "workspace_write";
         startup = "on_demand";
         max_concurrent = 1;
-        required_for = [ "long_check" "ci_wait" ];
+        required_for = [
+          "long_check"
+          "ci_wait"
+        ];
       };
     };
   };
-  python = pkgs.python3.withPackages (p: [ p.websockets p.pyyaml ]);
+  python = pkgs.python3.withPackages (p: [
+    p.websockets
+    p.pyyaml
+  ]);
 in
 pkgs.testers.runNixOSTest {
   name = "dev-workspace-session-creation";
   nodes.machine = {
     imports = [ self.nixosModules.host ];
-    users.users.developer = { isNormalUser = true; uid = 1000; linger = true; };
+    users.users.developer = {
+      isNormalUser = true;
+      uid = 1000;
+      linger = true;
+    };
     services.dev-workspaces = {
       enable = true;
       owner = "developer";
       hostName = "workspace.example.test";
       wildcardHost = "*.workspace.example.test";
       codexInitialProvider = "primary";
-      codexProviders = map (id: {
-        inherit id;
-        label = "Creation fixture " + id;
-        baseURL = "http://127.0.0.1:2455/" + id + "/v1";
-        tokenFile = "/home/developer/.codex/fixture.token";
-      }) [ "primary" "alternate" ];
+      codexProviders =
+        map
+          (id: {
+            inherit id;
+            label = "Creation fixture " + id;
+            baseURL = "http://127.0.0.1:2455/" + id + "/v1";
+            tokenFile = "/home/developer/.codex/fixture.token";
+          })
+          [
+            "primary"
+            "alternate"
+          ];
     };
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
-    environment.systemPackages = [ pkgs.git pkgs.curl pkgs.nodejs pkgs.chromium python ];
+    environment.systemPackages = [
+      pkgs.git
+      pkgs.curl
+      pkgs.nodejs
+      pkgs.chromium
+      python
+    ];
     virtualisation = {
       memorySize = 6144;
       diskSize = 4096;
       cores = 4;
-      additionalPaths = [ package pkgs.playwright-driver ];
+      additionalPaths = [
+        package
+        pkgs.playwright-driver
+      ];
     };
     system.stateVersion = "26.05";
   };
@@ -154,6 +192,17 @@ pkgs.testers.runNixOSTest {
     def native(identity):
         return json.loads(user("${python}/bin/python ${../../test/creation_transport.py} read "
             + runtime + "/app-server.sock " + shlex.quote(identity)))
+
+    def naming_proof(name, provider, attempts=1):
+        marker = checkpoint(name)["marker"]
+        # Keep large request bodies inside the guest. Ignore an incomplete last
+        # line from unrelated inference still being logged after naming finished.
+        script = ("import json; marker=" + repr(marker) + "; "
+            + "rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
+            + "print(json.dumps([row['provider'] for row in rows if row['body'].get('model')=='gpt-6-luna' "
+            + "and marker in json.dumps(row['body'].get('input',[]))]))")
+        routes = json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
+        assert routes == [provider] * attempts, routes
 
     def proof(name, provider, members=0, sensitive=False):
         record = checkpoint(name)
@@ -233,6 +282,8 @@ pkgs.testers.runNixOSTest {
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.codex " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
         user("printf fixture-private-token > ~/.codex/fixture.token && chmod 0600 ~/.codex/fixture.token")
+        # Alternate exists only in the host catalog. Naming must import that
+        # definition rather than relying on this global primary configuration.
         config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n'
         user("printf %s " + shlex.quote(config) + " > ~/.codex/config.toml")
         user("systemd-run --user --unit=creation-model ${python}/bin/python ${../../test/creation_model.py}")
@@ -279,6 +330,7 @@ pkgs.testers.runNixOSTest {
         with subtest("automatic naming, inherited default provider, sensitive retained team and notifications off"):
             browser("create", "automatic", auto=True, team="development", sensitive=True, notifications=False)
             proof("automatic", "primary", members=2, sensitive=True)
+            naming_proof("automatic", "primary")
             assert checkpoint("automatic")["slug"].endswith("accepted-session")
 
         with subtest("alternate provider, fork and approved-plan destinations preserve source"):
@@ -322,6 +374,7 @@ pkgs.testers.runNixOSTest {
             user("rm /tmp/creation-model/bad-name")
             browser("retry", "naming-error", error=True)
             proof("naming-error", "alternate")
+            naming_proof("naming-error", "alternate", attempts=2)
 
         # Transport faults forward only real native responses. The application
         # binaries, protocol and ordinary service endpoints remain unchanged.

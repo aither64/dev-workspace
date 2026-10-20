@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 )
 
 type ephemeralNamingMock struct {
@@ -48,7 +49,7 @@ func TestSessionNamingUtilityAdapterExactInputsAndPrivateState(t *testing.T) {
 		if got, _ := call.Deadline(); got != deadline {
 			t.Fatal("adapter restarted deadline")
 		}
-		if options.ModelCatalogFile != "/trusted/models.json" || options.Model != "gpt-6-luna" || options.Effort != "low" || options.Input != strings.Repeat("a", 8191) || !utf8.ValidString(options.Input) {
+		if options.ModelProvider != "openai" || options.ModelCatalogFile != "/trusted/models.json" || options.Model != "gpt-6-luna" || options.Effort != "low" || options.Input != strings.Repeat("a", 8191) || !utf8.ValidString(options.Input) {
 			t.Fatalf("settings/input=%#v", options)
 		}
 		if options.Instructions != sessionNamingInstructions || string(options.OutputSchema) != sessionNamingSchema {
@@ -85,7 +86,7 @@ func TestSessionNamingUtilityAdapterExactInputsAndPrivateState(t *testing.T) {
 		return codex.EphemeralTurnResult{Text: `{"name":"fix runtime session names"}`}, nil
 	}}
 	for call := 0; call < 2; call++ {
-		result, err := modelSessionName(ctx, raw, client, store, "/trusted/models.json")
+		result, err := modelSessionName(ctx, raw, "openai", client, store, "/trusted/models.json")
 		if err != nil || result != `{"name":"fix runtime session names"}` {
 			t.Fatalf("result=%q err=%v", result, err)
 		}
@@ -119,7 +120,7 @@ func TestSessionNamingUtilityCleanupAndCancellation(t *testing.T) {
 					return codex.EphemeralTurnResult{Text: strings.Repeat("x", 257)}, nil
 				}
 			}}
-			output, err := modelSessionName(ctx, "raw request", client, store, "/trusted/models.json")
+			output, err := modelSessionName(ctx, "raw request", "openai", client, store, "/trusted/models.json")
 			if output != "" || err == nil {
 				t.Fatalf("output=%q err=%v", output, err)
 			}
@@ -164,7 +165,7 @@ func TestSessionNamingUtilityUnsafePrivateStateNeverCallsClient(t *testing.T) {
 			}}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			_, err := modelSessionName(ctx, raw, client, store, "/trusted/models.json")
+			_, err := modelSessionName(ctx, raw, "openai", client, store, "/trusted/models.json")
 			if !errors.Is(err, codex.ErrEphemeralIsolation) {
 				t.Fatalf("err=%v", err)
 			}
@@ -179,10 +180,10 @@ func TestSessionNamingUtilityErrorStopsNaming(t *testing.T) {
 	client := ephemeralNamingMock{run: func(context.Context, codex.EphemeralTurnOptions) (codex.EphemeralTurnResult, error) {
 		return codex.EphemeralTurnResult{}, codex.ErrEphemeralIsolation
 	}}
-	server.config.SessionNamer = func(ctx context.Context, input string) (string, error) {
-		return modelSessionName(ctx, input, client, store, "/trusted/models.json")
+	server.config.SessionNamer = func(ctx context.Context, input string, _ string) (string, error) {
+		return modelSessionName(ctx, input, "openai", client, store, "/trusted/models.json")
 	}
-	name, outcome, err := server.namePreparation(context.Background(), "Fix runtime session names")
+	name, outcome, err := server.namePreparation(context.Background(), "Fix runtime session names", "")
 	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q err=%v", name, outcome, err)
 	}
@@ -216,7 +217,9 @@ func TestSessionNamingUtilityNormalConstructionAndInjectedBoundary(t *testing.T)
 	if normal.config.SessionNamer == nil {
 		t.Fatal("owned naming socket did not install adapter")
 	}
-	config.SessionNamer = func(context.Context, string) (string, error) { return `{"name":"injected test naming boundary"}`, nil }
+	config.SessionNamer = func(context.Context, string, string) (string, error) {
+		return `{"name":"injected test naming boundary"}`, nil
+	}
 	injected, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -224,9 +227,59 @@ func TestSessionNamingUtilityNormalConstructionAndInjectedBoundary(t *testing.T)
 	defer injected.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	output, err := injected.config.SessionNamer(ctx, "raw input")
+	output, err := injected.config.SessionNamer(ctx, "raw input", "")
 	if err != nil || output != `{"name":"injected test naming boundary"}` {
 		t.Fatal("injected seam replaced")
+	}
+}
+
+func TestSessionNamingProviderFollowsDefaultAndExplicitSelection(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	providerTestCatalog(t, server, "http://127.0.0.1:1")
+	path, err := codexproviders.StatePath(server.config.UserStateRoot, server.config.WorkspaceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, active := range []string{"openai", "pool"} {
+		state := codexproviders.State{Schema: 1, Workspace: server.config.WorkspaceName, Root: server.config.Workspace, Socket: server.config.CodexSocket, Active: active}
+		encoded, _ := json.Marshal(state)
+		if err := os.WriteFile(path, encoded, 0600); err != nil {
+			t.Fatal(err)
+		}
+		for _, selected := range []string{"", "openai", "pool"} {
+			want := selected
+			if want == "" {
+				want = active
+			}
+			if got, err := server.sessionNamingProvider(selected); err != nil || got != want {
+				t.Fatalf("active=%s selected=%s provider=%s error=%v", active, selected, got, err)
+			}
+		}
+	}
+	if _, err := server.sessionNamingProvider("removed-provider"); !errors.Is(err, codex.ErrEphemeralSettings) {
+		t.Fatalf("unknown provider accepted: %v", err)
+	}
+	if err := os.Remove(codexproviders.CatalogPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.sessionNamingProvider(""); !errors.Is(err, codex.ErrEphemeralSettings) {
+		t.Fatalf("removed configured catalog fell back to native defaults: %v", err)
+	}
+}
+
+func TestSessionNamingUnconfiguredProviderCompatibility(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", filepath.Join(t.TempDir(), "absent.json"))
+	if provider, err := server.sessionNamingProvider(""); err != nil || provider != "" {
+		t.Fatalf("unconfigured provider=%s error=%v", provider, err)
+	}
+	if _, err := server.sessionNamingProvider("openai"); !errors.Is(err, codex.ErrEphemeralSettings) {
+		t.Fatalf("unvalidated explicit provider accepted: %v", err)
 	}
 }
 
@@ -244,7 +297,7 @@ func TestSessionNamingUtilityUnavailableOwnedSocketStopsNaming(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	name, outcome, err := server.namePreparation(ctx, "Fix runtime session names")
+	name, outcome, err := server.namePreparation(ctx, "Fix runtime session names", "")
 	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q error=%v", name, outcome, err)
 	}

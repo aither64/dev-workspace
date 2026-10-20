@@ -315,7 +315,7 @@ func serve(args []string) error {
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
 	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	naming := startNamingRuntime(options.packageRoot, options.unixSocket, logger)
+	naming := startNamingRuntime(options.packageRoot, options.unixSocket, options.workspaceName, logger)
 	defer naming.Close()
 	var namingSocket, namingCatalog string
 	if naming != nil {

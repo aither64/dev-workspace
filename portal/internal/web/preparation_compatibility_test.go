@@ -77,7 +77,7 @@ func TestPreparationCompatibilityFixtureWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		close(entered)
 		<-ctx.Done()
 		return "", ctx.Err()

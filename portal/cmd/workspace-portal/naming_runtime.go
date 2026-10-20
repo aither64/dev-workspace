@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -25,7 +26,7 @@ type namingRuntime struct {
 	once                       sync.Once
 }
 
-func startNamingRuntime(packageRoot, portalSocket string, logger *log.Logger) *namingRuntime {
+func startNamingRuntime(packageRoot, portalSocket, workspaceName string, logger *log.Logger) *namingRuntime {
 	unavailable := func() *namingRuntime { logger.Print("session naming runtime unavailable"); return nil }
 	if packageRoot == "" || !filepath.IsAbs(portalSocket) {
 		return unavailable()
@@ -64,7 +65,7 @@ func startNamingRuntime(packageRoot, portalSocket string, logger *log.Logger) *n
 		probe := exec.Command(native, "--version")
 		probe.Dir = cwd
 		probe.Env = namingRuntimeEnvironment(os.Environ(), home)
-		version := &namingVersionOutput{}
+		version := &namingCommandOutput{limit: 128}
 		probe.Stdout = version
 		probe.Stderr = io.Discard
 		probeErr := runNamingProcess(probeCtx, probe, 0)
@@ -76,7 +77,13 @@ func startNamingRuntime(packageRoot, portalSocket string, logger *log.Logger) *n
 		if ctx.Err() != nil {
 			return
 		}
-		command := exec.Command(native, "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server", "--strict-config", "--listen", "unix://"+owner.socket)
+		arguments, err := namingProviderArguments(ctx, packageRoot, workspaceName)
+		if err != nil {
+			logger.Print("session naming provider configuration unavailable")
+			return
+		}
+		arguments = append(arguments, "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server", "--strict-config", "--listen", "unix://"+owner.socket)
+		command := exec.Command(native, arguments...)
 		command.Dir = cwd
 		command.Env = namingRuntimeEnvironment(os.Environ(), home)
 		command.Stdout = io.Discard
@@ -86,6 +93,30 @@ func startNamingRuntime(packageRoot, portalSocket string, logger *log.Logger) *n
 		}
 	}()
 	return owner
+}
+
+// The host owns provider definitions and token-file authentication arguments.
+// Import that read-only projection rather than reconstructing it in Go. A
+// generic launcher without workspace identity keeps native configuration.
+func namingProviderArguments(ctx context.Context, packageRoot, workspaceName string) ([]string, error) {
+	if workspaceName == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	command := exec.Command(filepath.Join(packageRoot, "bin/workspace-host"), "provider", "native-args", workspaceName)
+	output := &namingCommandOutput{limit: 256 * 1024}
+	command.Stdout, command.Stderr = output, io.Discard
+	if runNamingProcess(ctx, command, 0) != nil || output.overflow {
+		return nil, errors.New("naming provider arguments unavailable")
+	}
+	var result struct {
+		Arguments []string `json:"argv"`
+	}
+	if json.Unmarshal([]byte(output.text), &result) != nil || result.Arguments == nil {
+		return nil, errors.New("invalid naming provider arguments")
+	}
+	return result.Arguments, nil
 }
 
 func namingRuntimeEnvironment(environment []string, home string) []string {
@@ -101,14 +132,15 @@ func namingRuntimeEnvironment(environment []string, home string) []string {
 
 // Version output is public, but a broken executable still cannot grow memory
 // or relay arbitrary diagnostics through the portal.
-type namingVersionOutput struct {
+type namingCommandOutput struct {
+	limit    int
 	text     string
 	overflow bool
 }
 
-func (output *namingVersionOutput) Write(data []byte) (int, error) {
+func (output *namingCommandOutput) Write(data []byte) (int, error) {
 	count := len(data)
-	if len(output.text)+count > 128 {
+	if len(output.text)+count > output.limit {
 		output.overflow = true
 		return count, nil
 	}
