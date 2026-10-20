@@ -1,0 +1,26 @@
+"use strict";
+const assert = require("node:assert/strict");
+module.exports = assets => {
+  const token = "\ue200cite\ue202ref\ue201", prefix = "Příliš 🐈 **answer** ";
+  const text = `${prefix}${token}\n\n\`${token}\``;
+  const citation = {start:Buffer.byteLength(prefix),end:Buffer.byteLength(prefix+token),sources:[]};
+  const agent = {turnId:"turn",itemId:"agent",kind:"agentMessage",turnStatus:"completed",text,citations:[citation],citationsPending:true};
+  const user = {turnId:"turn",itemId:"user",kind:"userMessage",text:"canonical attachment envelope",displayText:`# User\n${token}`,citations:[citation]};
+  const team = {turnId:"turn",itemId:"team",kind:"userMessage",text:"unchanged team",communication:{kind:"team",from:"lead",to:"implementer0"}};
+  const history = assets.createTranscriptHistory({policy:{historyRepairMs:0}});
+  history.applyNewest({threadId:"thread",entries:[agent,user,team],hasOlder:true,olderCursor:"older"});
+  const next = {turnId:"turn",itemId:"next",kind:"agentMessage",turnStatus:"completed",text:"Next"};
+  history.applyNewest({threadId:"thread",entries:[user,team,next],hasOlder:true,olderCursor:"pending-page"});
+  assert.equal(history.repairCursor,"pending-page");
+  assert.equal(assets.transcriptEntryVisible(team,"messages"),false);
+  assert.equal(assets.transcriptEntryVisible(team,"team"),true);
+  assert.equal(assets.transcriptEntryPresentation(team).label,"lead → implementer0");
+  const resolved = {...agent,citationsPending:false,citations:[{...citation,sources:[{url:"https://example.test/source",title:'Český "title"',number:1}]}]};
+  history.applyRepair({threadId:"thread",requestCursor:"pending-page",entries:[resolved,user],hasOlder:false});
+  const retained = history.entries.find(entry=>entry.itemId==="agent");
+  assert.equal(retained.text,text); assert.equal(retained.citationsPending,false);
+  const copied = assets.citationCopyText(retained);
+  assert(copied.includes("https://example.test/source")); assert(copied.includes(`\`${token}\``));
+  assert.equal(assets.citationCopyText(user),user.text);
+  assert.deepEqual(history.entries.filter(entry=>assets.transcriptEntryVisible(entry,"messages")).map(entry=>entry.itemId),["agent","user","next"]);
+};

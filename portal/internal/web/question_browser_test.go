@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,11 +31,19 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	manifest := "schema: 1\nslug: example\ncodex:\n" +
 		"  thread_id: thread-1\n  socket_path: /run/dev-workspace-codex/app-server.sock\n" +
-		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+		"  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n" +
+		"artifacts:\n  - path: reports/deep/499.md\n    label: Report 499\n"
 	if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, directory, "active")
+	artifactPath := filepath.Join(directory, "reports", "deep", "499.md")
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, []byte("# Original artifact bytes\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	writeWebRuntimeAuthority(t, server, "example")
 	events := make(chan struct{}, 1)
 	server.config.Codex = &browserContractCodex{emptyPrompts: true, events: events, transcript: codex.Transcript{
@@ -100,6 +109,38 @@ func TestQuestionBrowser(t *testing.T) {
 			}
 			return
 		}
+
+		if r.URL.Path == "/fixture/artifact-tree" {
+			artifacts := make([]session.Artifact, 500)
+			for i := range artifacts {
+				artifacts[i] = session.Artifact{Path: fmt.Sprintf("reports/deep/%03d.md", i), Label: fmt.Sprintf("Report %d", i)}
+			}
+			if r.URL.Query().Get("remove") == "1" {
+				artifacts = artifacts[:499]
+			}
+			if err := server.templates.ExecuteTemplate(w, "artifact-list", pageData{Artifacts: artifacts}); err != nil {
+				t.Error(err)
+			}
+			return
+		}
+		if r.URL.Path == "/fixture/presentation" {
+			transcript := codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "default", Entries: []codex.TranscriptEntry{
+				{Kind: "userMessage", ItemID: "user", Text: "# User heading\n\n- item\n\n[Plan](" + filepath.Join(server.config.Workspace, "work", "example", "plan.md") + ":1)"},
+				{Kind: "userMessage", ItemID: "team", Text: "Team assignment from lead to implementer0:\n\nInternal work."},
+				{Kind: "agentMessage", ItemID: "agent", Text: "A reply."},
+			}}
+			token, prefix := "\ue200cite\ue202ref\ue201", "Příliš 🐈 **answer** "
+			transcript.Entries[2].Text = prefix + token + "\n\n`" + token + "`"
+			transcript.Entries[2].Citations = []codex.CitationSpan{{Start: len(prefix), End: len(prefix) + len(token), Sources: []codex.CitationSource{{URL: "https://example.test/source", Title: `Český "title"`, Number: 1}}}}
+			display := transcript.Entries[0].Text
+			transcript.Entries[0].Text += "\n\nGenerated attachment envelope"
+			transcript.Entries[0].DisplayText = &display
+			transcript.Entries[0].Attachments = []codex.Attachment{{ID: "fixture-attachment", Name: "fixture.txt", Size: 17, State: "ready", DownloadURL: "/fixture/download"}}
+			server.presentTranscript(&transcript)
+			s := codex.TranscriptPage{Transcript: transcript}
+			server.writeJSON(w, http.StatusOK, s)
+			return
+		}
 		if r.URL.Path == "/fixture/download" {
 			w.Header().Set("Content-Type", "text/plain")
 			w.Header().Set("Content-Disposition", `attachment; filename="fixture.txt"`)
@@ -118,7 +159,7 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs"} {
+	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
 			command := exec.Command("node", script, httpServer.URL)
 			if output, err := command.CombinedOutput(); err != nil {

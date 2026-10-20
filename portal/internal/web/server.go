@@ -3684,18 +3684,32 @@ func (s *Server) resolveConversation(
 		ModelCatalog: func(ctx context.Context) ([]codex.Model, error) { return s.modelsForSession(ctx, slug, "") },
 		Client:       conversationClient, ThreadID: threadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(request.ID),
-		TransformTranscript: s.presentTranscript,
-		Activity:            s.activityProvider(),
-		Release:             func() { once.Do(release) },
+		PresentTranscript: s.presentTranscript,
+		Activity:          s.activityProvider(),
+		Release:           func() { once.Do(release) },
 	}, nil
 }
+
+var teamEnvelopePattern = regexp.MustCompile(`^Team assignment from ([a-z][a-z0-9]{0,127}) to ([a-z][a-z0-9]{0,127}):\r?\n`)
 
 func (s *Server) presentTranscript(transcript *codex.Transcript) {
 	for index := range transcript.Entries {
 		entry := &transcript.Entries[index]
-		if entry.Text != "" &&
-			(entry.Kind == "agentMessage" || entry.Kind == "reasoning" || entry.Kind == "plan") {
+		if entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/report_to_lead" {
+			entry.Communication = &codex.TranscriptCommunication{Kind: "team", To: "lead"}
+		}
+		if entry.Kind == "userMessage" {
+			if envelope := teamEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
+				entry.Communication = &codex.TranscriptCommunication{Kind: "team", From: envelope[1], To: envelope[2]}
+			}
+			text := entry.Text
+			if entry.DisplayText != nil {
+				text = *entry.DisplayText
+			}
+			entry.HTML = string(s.renderTextMarkdown(text))
+		} else if entry.Kind == "agentMessage" || entry.Kind == "reasoning" || entry.Kind == "plan" {
 			entry.HTML = string(s.renderTextMarkdown(codex.CitationMarkdown(*entry)))
+
 		}
 	}
 }

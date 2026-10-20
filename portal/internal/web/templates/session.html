@@ -101,6 +101,7 @@
         <div class="chat-heading"><h2>Codex</h2><div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="all">All</button>
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
+          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="team">Team</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><label class="member-selector"><span>Member</span><select id="codex-member"><option value="lead">lead</option>{{range .ReadyMembers}}<option value="{{.Address}}"{{if eq .Address $.SelectedMember}} selected{{end}}>{{.Address}}</option>{{end}}</select></label><span id="codex-status" class="badge">Connecting</span></div>
         <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
@@ -258,7 +259,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=48" defer></script>
+  <script src="/static/app.js?v=49" defer></script>
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/session-attention.js" defer></script>
