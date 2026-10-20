@@ -212,6 +212,13 @@ only after proving both the path and Git registration absent. A recreated path,
 even at the same HEAD, is refused. Retention proof continues after removal: a
 deleted or rewound ref that no longer reaches the sealed commit blocks recovery.
 
+Git can reuse a removed worktree's internal administration name for a new
+checkout. Recovery accepts that reuse only when the directory has a different
+identity, its reciprocal Git pointers and registration identify a checkout
+outside the archived session, and its common repository is unchanged. It reads
+the replacement's identity without changing its files, Git state or runtime.
+An unverified or dangling administration directory still blocks recovery.
+
 After the final journal phase, the command marks the sidecar complete before
 removing the journal. If interruption leaves only that completed receipt, retry
 proves the committed archive and retained conversation/team/runtime retirement
@@ -291,8 +298,22 @@ or Codex. An active idle root and an archived root are both supported after the
 same retained-set proof. Recovery archives and proves members before invoking
 the selected ordinary lifecycle executor with only its portal helper replaced.
 The schema-2 journal, exact tracking/head/root proof, profile token and normal
-transition/session locks remain authoritative. New sidecars require a capable
-ordinary executor and remain outside this temporary recovery adapter's inputs.
+transition/session locks remain authoritative.
+
+For schema-4 local-first journals with schema-3 cleanup sidecars, the same
+candidate recovery command can finish an archive whose tracking has moved and
+whose checkout and container removals are all recorded. It verifies the exact
+journal, sealed inventory, retained heads and archived tracking under the normal
+session locks. The candidate's ordinary archive executor then completes the
+saved operation, including conversation and runtime retirement. Its generation
+check remains bound to the selected predecessor while the host holds the
+transition lock. The profile and Codex executable remain selected throughout.
+This path cannot start an archive or remove a remaining checkout; resume those
+operations with their ordinary capable executor.
+If interruption leaves only the completed schema-3 cleanup receipt, candidate
+recovery reconstructs its exact final journal identity through the cleanup
+owner, revalidates the saved state and finishes the ordinary receipt cleanup.
+An incomplete receipt without its journal remains a refusal.
 
 ## Threadless conversation absence
 
