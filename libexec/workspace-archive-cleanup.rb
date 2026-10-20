@@ -395,13 +395,17 @@ module DevSession
       write(sidecar)
     end
 
-    def discard_completed!(sidecar, recorded_journal: nil)
+    def completed_journal(sidecar)
       raise Error, "archive cleanup is not completed: #{@slug}" unless sidecar.fetch('completed')
 
-      journal = sidecar.slice(*BINDING_KEYS).merge(
+      sidecar.slice(*BINDING_KEYS).merge(
         'schema' => sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2), 'phase' => 'archived',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
       )
+    end
+
+    def discard_completed!(sidecar, recorded_journal: nil)
+      journal = completed_journal(sidecar)
       revalidate!(sidecar, journal:)
       if recorded_journal
         match_journal!(sidecar, recorded_journal)
@@ -535,7 +539,7 @@ module DevSession
       sources.uniq { |_project, common| common }
     end
 
-    def registrations(allow_locked: false)
+    def registrations(allow_locked: false, target: nil)
       canonical_repositories.flat_map do |project, common|
         output = git(['git', "--git-dir=#{common}", 'worktree', 'list', '--porcelain', '-z'])
         output.split("\0\0").filter_map do |stanza|
@@ -550,7 +554,7 @@ module DevSession
           end
           raw_path = values.fetch('worktree') { raise Error, 'Git worktree registration has no path' }
           normalized = File.expand_path(raw_path)
-          next unless below_group?(normalized)
+          next unless target ? normalized == target : below_group?(normalized)
           unless raw_path == normalized && !raw_path.match?(/[[:cntrl:]]/)
             raise Error, "invalid archive worktree registration path: #{raw_path.inspect}"
           end
@@ -762,10 +766,31 @@ module DevSession
     end
 
     def prove_absent!(record)
-      if exists?(absolute(record.fetch('path'))) || exists?(record.fetch('admin_dir')) ||
+      if exists?(absolute(record.fetch('path'))) ||
          registrations(allow_locked: true).any? { |registration| registration.fetch('path') == absolute(record.fetch('path')) }
         raise Error, "archive worktree path or registration remains after removal: #{absolute(record.fetch('path'))}"
       end
+      return unless exists?(record.fetch('admin_dir'))
+
+      # Git reuses administration basenames after worktree removal. A different
+      # registered checkout can own this name now; never remove or edit it.
+      admin = record.fetch('admin_dir')
+      identity = directory_identity(admin)
+      pointer = File.binread(File.join(admin, 'gitdir'), 4097).strip
+      checkout = File.dirname(pointer)
+      unless identity != record.fetch('admin_identity') && pointer == File.expand_path(pointer) &&
+             File.basename(pointer) == '.git' && !below_group?(checkout) && checkout != @group &&
+             File.file?(pointer) && !File.symlink?(pointer) &&
+             File.binread(pointer, 4097).strip == "gitdir: #{admin}" &&
+             directory_identity(record.fetch('common_dir')) == record.fetch('common_identity') &&
+             registrations(allow_locked: true, target: checkout).any? { |entry| entry.fetch('common_dir') == record.fetch('common_dir') } &&
+             git(['git', '-C', checkout, 'rev-parse', '--absolute-git-dir']).strip == admin &&
+             File.realpath(File.expand_path(git(['git', '-C', checkout, 'rev-parse', '--git-common-dir']).strip, checkout)) == record.fetch('common_dir') &&
+             directory_identity(admin) == identity
+        raise Error, "archive worktree administration remains or its replacement is unverified: #{admin}"
+      end
+    rescue Errno::ENOENT, Errno::ENOTDIR => e
+      raise Error, "archive worktree administration replacement is unavailable: #{e.message}"
     end
 
     def inventory_digest(inventory)

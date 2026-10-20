@@ -2183,6 +2183,31 @@ module DevSession
       end
     end
 
+    # Candidate recovery may finish a local-first journal after all checkout
+    # removal is recorded. The ordinary archive executor still owns retirement.
+    def with_verified_removed_archive(slug, expected_journal)
+      with_creation_lock(slug) do
+        with_slug_lock(slug) do
+          reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
+          journal = load_archive_journal(slug, operation_id: expected_journal.fetch('operation_id'))
+          cleanup = ArchiveCleanup.new(self, slug)
+          sidecar = cleanup.load(journal:, operation_id: expected_journal.fetch('operation_id'))
+          journal ||= cleanup.completed_journal(sidecar) if sidecar
+          unless journal == expected_journal && journal.fetch('schema') == 4 &&
+                 !archive_phase_before?(journal, 'tracking_archived') && !path_exists?(work_dir(slug))
+            raise Error, "archive recovery requires an unchanged moved archive: #{slug}"
+          end
+          unless sidecar && sidecar.fetch('schema') == 3 &&
+                 sidecar.fetch('inventory').values_at('worktrees', 'containers').flatten.all? { |record| record.fetch('removed') }
+            raise Error, "archive recovery requires recorded checkout removal: #{slug}"
+          end
+          verify_archived_tracking_tree!(slug, journal)
+          cleanup.revalidate!(sidecar, journal:)
+          yield
+        end
+      end
+    end
+
     def revive(input, as_is:, allow_abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'revive', operation_id:) do
