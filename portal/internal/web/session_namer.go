@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,20 +28,43 @@ type ephemeralTurnClient interface {
 	RunEphemeralTurn(context.Context, codex.EphemeralTurnOptions) (codex.EphemeralTurnResult, error)
 }
 
-// normalSessionNamer takes only the owned naming socket and immutable catalog.
-// It creates no
-// App Server and imports no thread/team policy or normal controller settings.
-func normalSessionNamer(socket, catalog string, store *lifecycleOperationStore) func(context.Context, string) (string, error) {
-	return func(ctx context.Context, input string) (string, error) {
-		client := codex.NewWithOptions(socket, codex.ClientOptions{ClientInfo: codex.ClientInfo{Name: "dev-workspace-session-namer", Title: "Session Naming", Version: "0.1.0"}})
-		defer client.Close()
-		return modelSessionName(ctx, input, client, store, catalog)
+// The private child keeps its immutable naming catalog. Each new ephemeral
+// thread follows the accepted explicit provider or the current workspace default,
+// independently of the native process's global provider configuration.
+func (s *Server) normalSessionName(ctx context.Context, input, selected string) (string, error) {
+	provider, err := s.sessionNamingProvider(selected)
+	if err != nil {
+		return "", err
 	}
+	client := codex.NewWithOptions(s.config.NamingSocket, codex.ClientOptions{ClientInfo: codex.ClientInfo{Name: "dev-workspace-session-namer", Title: "Session Naming", Version: "0.1.0"}})
+	defer client.Close()
+	return modelSessionName(ctx, input, provider, client, s.operationStore, s.config.NamingModelCatalogFile)
+}
+
+func (s *Server) sessionNamingProvider(selected string) (string, error) {
+	catalog, state, err := s.providerState()
+	if errors.Is(err, os.ErrNotExist) && selected == "" {
+		// Generic portals without a provider catalog retain the native default.
+		if s.requireProviderAdmission() != nil {
+			return "", codex.ErrEphemeralSettings
+		}
+		return "", nil
+	}
+	if err != nil {
+		return "", codex.ErrEphemeralSettings
+	}
+	if selected == "" {
+		selected = state.Active
+	}
+	if _, err := catalog.Find(selected); err != nil {
+		return "", codex.ErrEphemeralSettings
+	}
+	return selected, nil
 }
 
 // The worker already owns the ten-second whole budget and two-call semaphore.
 // This adapter never restarts that budget and never selects its own fallback.
-func modelSessionName(ctx context.Context, input string, client ephemeralTurnClient, store *lifecycleOperationStore, catalog string) (string, error) {
+func modelSessionName(ctx context.Context, input, provider string, client ephemeralTurnClient, store *lifecycleOperationStore, catalog string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -86,7 +110,7 @@ func modelSessionName(ctx context.Context, input string, client ephemeralTurnCli
 		return "", codex.ErrEphemeralIsolation
 	}
 	result, err := client.RunEphemeralTurn(ctx, codex.EphemeralTurnOptions{
-		Directory: directory, InstructionFile: filepath.Join(private, "instructions.txt"), ModelCatalogFile: catalog, Model: "gpt-6-luna", Effort: "low", Instructions: sessionNamingInstructions,
+		Directory: directory, InstructionFile: filepath.Join(private, "instructions.txt"), ModelCatalogFile: catalog, ModelProvider: provider, Model: "gpt-6-luna", Effort: "low", Instructions: sessionNamingInstructions,
 		Input: input, OutputSchema: json.RawMessage(sessionNamingSchema),
 	})
 	if ctx.Err() != nil {

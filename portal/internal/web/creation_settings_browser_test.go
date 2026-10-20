@@ -77,7 +77,7 @@ func creationSettingsTestServer(t *testing.T) *Server {
 	}}
 	providerTestCatalog(t, server, "http://127.0.0.1:1")
 	// Admission is real; naming is held so no native session is created.
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	}

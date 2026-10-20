@@ -24,7 +24,7 @@ func TestSessionPreparationNamingFailureKeepsRequestAndUploads(t *testing.T) {
 			server := newTestServer(t)
 			defer server.Close()
 			if mode != "unavailable" {
-				server.config.SessionNamer = func(context.Context, string) (string, error) {
+				server.config.SessionNamer = func(context.Context, string, string) (string, error) {
 					switch mode {
 					case "utility_error":
 						return "", errors.New("remote sensitive diagnostic")
@@ -134,7 +134,7 @@ func TestSessionPreparationNamingRetryUsesOriginalRequest(t *testing.T) {
 	id := preparationTestID(203)
 	postPreparation(t, server, id, "original request", "", nil)
 	record := awaitPreparation(t, server, id)
-	server.config.SessionNamer = func(_ context.Context, prompt string) (string, error) {
+	server.config.SessionNamer = func(_ context.Context, prompt string, _ string) (string, error) {
 		if prompt != "original request" {
 			t.Errorf("prompt changed: %q", prompt)
 		}
