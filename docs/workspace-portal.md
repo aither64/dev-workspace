@@ -845,8 +845,8 @@ The portal's Team assignment API sends as `lead` only. A member can report to
 thread identity; browser input cannot claim to be a member.
 
 The installed workspace policy supplies starting teams such as Solo (`solo`),
-Full team (`delegated`), Lead-designed team (`lead_designed`), and Lead and
-reviewer (`lead_reviewed`). Their role
+Full team (`delegated`, two implementers), Lead-designed team (`lead_designed`),
+and Lead and reviewer (`lead_reviewed`). Their role
 lists and exact lead model and reasoning effort appear on the new-session
 screen. Solo has only the lead, which investigates, designs and edits
 application code without automatic specialists. Full team has `lead`,
@@ -857,6 +857,12 @@ application implementation. Catalog prompts own these mode-specific policies.
 Lead and reviewer has `lead` and `reviewer0`; the lead owns investigation,
 design and application implementation, while the retained reviewer performs
 independent final review.
+The Full-team family uses `delegated` and `delegated_3` through `delegated_6`.
+Their names show the actual implementer count, for example **Full team (6
+implementers)**. They contain five through nine members including the lead.
+Names are a presentation of the installed catalog; retained creation snapshots
+and existing rosters keep their saved names, settings and instructions.
+
 The selected team and its member settings are saved with the creation receipt.
 Member threads are created before the lead receives the initial request. A
 failed creation can be retried with that saved selection.

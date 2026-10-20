@@ -2251,7 +2251,7 @@ func TestCatalogPresetUsesExplicitSiteSettingsAndArchitectAddress(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preset.Name != "Full team" || preset.LeadModel != "gpt-6-sol" || preset.LeadEffort != "high" ||
+	if preset.Name != "Full team (1 implementer)" || preset.LeadModel != "gpt-6-sol" || preset.LeadEffort != "high" ||
 		preset.LeadInstructions != "Coordinate this team." ||
 		len(preset.Members) != 3 || preset.Members[0].Address != "architect0" ||
 		preset.Members[0].Model != "gpt-6-sol" || preset.Members[0].Effort != "xhigh" ||
@@ -3235,5 +3235,68 @@ func TestFullExecutionAccessOverridesRetainedRoleSandboxes(t *testing.T) {
 	policy, err := service.MemberTurnPolicy("one", "root-one", before.Members[0])
 	if err != nil || policy.Sandbox != "read-only" || policy.ApprovalPolicy != "" {
 		t.Fatalf("legacy policy changed: %#v, %v", policy, err)
+	}
+}
+
+func TestFullTeamFamilyNamesCountsAddressesAndCreationJournal(t *testing.T) {
+	for count := 2; count <= 6; count++ {
+		id := "delegated"
+		if count > 2 {
+			id = fmt.Sprintf("delegated_%d", count)
+		}
+		roles := map[string]agentteams.Role{
+			"team_lead":   {Model: "gpt-6.1-sol", Effort: "xhigh", Purpose: "lead", Instructions: strings.Repeat("l", 4096)},
+			"designer":    {Model: "gpt-6-astra", Effort: "xhigh", Behavior: "designer", Purpose: "design", Access: "workspace_write", Instructions: "Design."},
+			"implementer": {Model: "gpt-6.1-sol", Effort: "xhigh", Behavior: "implementer", Purpose: "implementation", Access: "workspace_write", Instructions: strings.Repeat("i", 4096)},
+			"reviewer":    {Model: "gpt-6.1-sol", Effort: "xhigh", Behavior: "reviewer", Purpose: "review", Access: "read_only", Instructions: "Review."},
+		}
+		team := agentteams.Team{Description: "Full team", TeamDigest: strings.Repeat("b", 64), Roles: roles, InitialMemberCounts: map[string]int{"implementer": count}}
+		catalog := agentteams.Catalog{CatalogDigest: strings.Repeat("a", 64), Teams: map[string]agentteams.Team{id: team}}
+		preset, err := FindCatalogPreset(catalog, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if preset.Name != fmt.Sprintf("Full team (%d implementers)", count) || preset.MemberCount() != count+3 {
+			t.Fatalf("projection: %#v", preset)
+		}
+		want := []string{"architect0"}
+		for i := 0; i < count; i++ {
+			want = append(want, fmt.Sprintf("implementer%d", i))
+		}
+		want = append(want, "reviewer0")
+		for i, address := range want {
+			if preset.Members[i].Address != address || preset.Members[i].Effort != "xhigh" {
+				t.Fatalf("member: %#v", preset.Members[i])
+			}
+		}
+		if err := preset.ValidateCreationSize(); err != nil {
+			t.Fatal(err)
+		}
+		journal := map[string]any{"schema": 3, "slug": "example", "goal_sha256": strings.Repeat("c", 64), "run_codex": true, "state": "creating", "tmux_identity": strings.Repeat("d", 64), "model": preset.LeadModel, "effort": preset.LeadEffort, "direct_team": preset}
+		data, err := json.Marshal(journal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data)+1 > agentteams.MaxCreationJournalBytes {
+			t.Fatal("largest family exceeds creation journal bound")
+		}
+		if _, err := agentteams.DecodeCreationJournal(append(data, '\n'), "example"); err != nil {
+			t.Fatal(err)
+		}
+		// Suffixes are presentation-family hints, never the source of member counts.
+		catalog.Teams = map[string]agentteams.Team{"delegated_99": team, "unrelated": team}
+		projected, err := PresetsFromCatalog(catalog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if projected[0].Name != preset.Name || projected[1].Name != "Unrelated" {
+			t.Fatalf("family/fallback names: %#v", projected)
+		}
+		team.InitialMemberCounts = nil
+		catalog.Teams = map[string]agentteams.Team{"delegated": team}
+		older, err := FindCatalogPreset(catalog, "delegated")
+		if err != nil || older.Name != "Full team (1 implementer)" || older.MemberCount() != 4 {
+			t.Fatalf("older count: %#v %v", older, err)
+		}
 	}
 }

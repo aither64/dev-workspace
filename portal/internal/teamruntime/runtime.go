@@ -33,6 +33,8 @@ const (
 	maxRosterBytes = 256 * 1024
 )
 
+var fullTeamIDPattern = regexp.MustCompile(`^delegated(?:_[0-9]+)?$`)
+
 var rolePattern = regexp.MustCompile(`^[a-z][a-z0-9]{0,31}$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var projectUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -409,6 +411,17 @@ func PresetsFromCatalog(catalog agentteams.Catalog) ([]Preset, error) {
 			return nil, err
 		}
 		name := map[string]string{"solo": "Solo", "delegated": "Full team", "lead_designed": "Lead-designed team", "lead_reviewed": "Lead and reviewer"}[id]
+		if fullTeamIDPattern.MatchString(id) {
+			count := team.InitialMemberCount("implementer")
+			if _, exists := team.Roles["implementer"]; !exists {
+				count = 0
+			}
+			noun := "implementers"
+			if count == 1 {
+				noun = "implementer"
+			}
+			name = fmt.Sprintf("Full team (%d %s)", count, noun)
+		}
 		if name == "" {
 			name = strings.ReplaceAll(id, "_", " ")
 			name = strings.ToUpper(name[:1]) + name[1:]
