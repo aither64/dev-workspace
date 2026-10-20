@@ -93,7 +93,7 @@ func namingTestWait(t *testing.T, path string) []byte {
 }
 
 func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
-	for _, mode := range []string{"hold", "bad version", "exit", "missing native"} {
+	for _, mode := range []string{"hold", "bad version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			home := t.TempDir()
@@ -129,8 +129,26 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// The same host command used by ordinary native launch owns all
+			// provider configuration; the naming owner forwards its JSON argv.
+			exported := `{"argv":["-c","model_provider=\"primary\"","-c","model_providers.alternate.base_url=\"http://fixture.invalid\""]}`
+			hostScript := "#!/bin/sh\n[ \"$*\" = 'provider native-args fixture' ] || exit 2\nprintf '%s' '" + exported + "'\n"
+			switch mode {
+			case "provider failure":
+				hostScript = "#!/bin/sh\nexit 1\n"
+			case "invalid provider export":
+				hostScript = "#!/bin/sh\nprintf '{}'\n"
+			case "oversized provider export":
+				hostScript = "#!/bin/sh\nhead -c 262145 /dev/zero\n"
+			}
+			if err := os.MkdirAll(filepath.Join(root, "bin"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "bin/workspace-host"), []byte(hostScript), 0700); err != nil {
+				t.Fatal(err)
+			}
 			t.Setenv("NAMING_RUNTIME_TEST_CHILD", childMode)
-			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), log.New(io.Discard, "", 0))
+			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", log.New(io.Discard, "", 0))
 			if mode == "missing native" {
 				if owner != nil {
 					t.Fatal("adopted nonexistent native")
@@ -153,6 +171,9 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				args := strings.Join(evidence.Args, "\n")
 				if !strings.Contains(args, "model_catalog_json="+strconv.Quote(catalog)) || !strings.Contains(args, "app-server\n--strict-config\n--listen\nunix://"+owner.socket) {
 					t.Fatal("startup argv differs", args)
+				}
+				if !strings.Contains(args, "model_provider=\"primary\"") || !strings.Contains(args, "model_providers.alternate.base_url=\"http://fixture.invalid\"") {
+					t.Fatal("host provider definitions were not forwarded")
 				}
 				if evidence.Cwd != filepath.Join(owner.directory, "cwd") || evidence.Home != home || evidence.Remote != "1" || evidence.Provider != "synthetic-provider" {
 					t.Fatal("child inherited incorrect trusted environment", evidence)
@@ -184,9 +205,9 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if _, err := os.Stat(owner.directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("owned lifetime directory retained", err)
 			}
-			if mode == "bad version" {
+			if mode == "bad version" || strings.Contains(mode, "provider") {
 				if _, err := os.Stat(count); !errors.Is(err, os.ErrNotExist) {
-					t.Fatal("wrong-version child started")
+					t.Fatal("failed prerequisite started native child")
 				}
 			} else {
 				data, err := os.ReadFile(count)
@@ -241,7 +262,7 @@ func TestNamingRuntimeLeaderExitKillsResidualGroup(t *testing.T) {
 
 func TestNamingRuntimeMissingSelection(t *testing.T) {
 	t.Setenv("DEV_WORKSPACE_CODEX_HOME", "")
-	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), log.New(io.Discard, "", 0)); owner != nil {
+	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", log.New(io.Discard, "", 0)); owner != nil {
 		owner.Close()
 		t.Fatal("missing package/home acquired child")
 	}
@@ -274,6 +295,8 @@ func TestNamingRuntimeConstructorFailureClosesOwnedLifetime(t *testing.T) {
 }
 
 func TestNamingRuntimeHTTPExitKeepsChildForWorkerCleanup(t *testing.T) {
+	// This generic portal fixture has no registered workspace/provider state.
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", filepath.Join(t.TempDir(), "unconfigured.json"))
 	for _, mode := range []string{"signal context", "HTTP listener failure"} {
 		t.Run(mode, func(t *testing.T) {
 			childCtx, stopChild := context.WithCancel(context.Background())
@@ -295,7 +318,7 @@ func TestNamingRuntimeHTTPExitKeepsChildForWorkerCleanup(t *testing.T) {
 			entered, cleanup := make(chan struct{}), make(chan bool, 1)
 			application, err := portalweb.New(portalweb.Config{
 				Workspace: t.TempDir(), UserStateRoot: t.TempDir(), BaseURL: "https://workspace.example.test", DevSession: "/missing/dev-session", HostProfile: profile, Logger: log.New(io.Discard, "", 0),
-				SessionNamer: func(ctx context.Context, _ string) (string, error) {
+				SessionNamer: func(ctx context.Context, _ string, _ string) (string, error) {
 					close(entered)
 					<-ctx.Done()
 					cleanup <- syscall.Kill(evidence.PID, 0) == nil
