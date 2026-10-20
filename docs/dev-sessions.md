@@ -809,7 +809,7 @@ nix run .#workspace-host -- recover-archive \
 The candidate must match `--source` and the selected runtime contract. It checks
 the selected Codex executable's version and generated protocol contract,
 including compatible 0.160.0 installations, without changing that executable.
-Recovery accepts only an existing `tracking_committed` archive journal without
+Legacy recovery accepts an existing `tracking_committed` archive journal without
 a cleanup sidecar and keeps the selected profile unchanged. Under the journal's
 normal locks, it verifies the committed tracking, an active idle or already
 archived retained root, and the exact retained set. It reconciles the retained
@@ -818,6 +818,17 @@ and submission checks, then proves every member archived before the selected
 package's lifecycle executor finishes the journal. It cannot force an archive,
 replace or recreate a member, change the recorded mode, or recover another
 lifecycle operation. A retry rechecks work completed before an interruption.
+
+For a schema-4 journal with a schema-3 cleanup sidecar, candidate recovery also
+supports tracking that has already moved to `archive/`, with every checkout and
+container removal recorded. It verifies the sealed cleanup and tracking before
+running the candidate's ordinary archive executor against the saved operation.
+The selected profile, Codex and generation authority stay unchanged. This allows
+recovery from Git administration-name reuse without disturbing the newer
+worktree that owns that internal name. See the
+[cleanup identity rules](session-archive-recovery.md#retrying-an-interrupted-operation).
+The same command retries a completed schema-3 receipt left after journal removal;
+it refuses an incomplete receipt whose journal is missing.
 
 The journal binds the exact projected archive tree and retained Codex thread;
 retry refuses changed lifecycle, manifest, artifacts, or conversation identity

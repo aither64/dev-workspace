@@ -3,6 +3,73 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_archive_retry_accepts_reused_git_admin_name_without_touching_live_worktree
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
+      admin = File.realpath(git_capture_success('git', '-C', checkout, 'rev-parse', '--absolute-git-dir').strip)
+      # Keep the unlinked original inode allocated so Git's replacement has a
+      # distinct identity even on filesystems that immediately recycle inodes.
+      File.open(admin, File::RDONLY) do
+        runner.define_singleton_method(:retire_session_runtime!) { |*| raise DevSession::Error, 'pause after removal' }
+        assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+        journal = runner.send(:load_archive_journal, slug)
+        assert_equal(4, journal.fetch('schema'))
+        refute(File.exist?(checkout))
+        live = File.join(workspace, 'worktrees', 'other-session', 'sample')
+        assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '--detach', live, 'master')
+        assert_equal(admin, git_capture_success('git', '-C', live, 'rev-parse', '--absolute-git-dir').strip)
+        File.binwrite(File.join(live, 'unsaved'), "live bytes\x00\xff".b)
+        before = [File.binread(File.join(live, '.git')), File.binread(File.join(live, 'unsaved')),
+                  git_capture_success('git', '-C', live, 'status', '--porcelain'),
+                  git_capture_success('git', '-C', live, 'rev-parse', 'HEAD'), File.stat(admin).ino]
+        runner.with_verified_removed_archive(slug, journal) { assert(true) }
+        runner.singleton_class.remove_method(:retire_session_runtime!)
+        cleanup = DevSession::ArchiveCleanup.new(runner, slug)
+        cleanup.define_singleton_method(:discard_completed!) { |*, **| raise DevSession::Error, 'pause after journal removal' }
+        with_archive_cleanup_instance(cleanup) do
+          error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+          assert_includes(error.message, 'pause after journal removal')
+        end
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        completed = cleanup.completed_journal(cleanup.load)
+        runner.with_verified_removed_archive(slug, completed) { assert(true) }
+        cleanup.singleton_class.remove_method(:discard_completed!)
+        runner.archive(slug, as_is: true)
+        refute(File.exist?(cleanup.path))
+        assert_equal(before, [File.binread(File.join(live, '.git')), File.binread(File.join(live, 'unsaved')),
+                              git_capture_success('git', '-C', live, 'status', '--porcelain'),
+                              git_capture_success('git', '-C', live, 'rev-parse', 'HEAD'), File.stat(admin).ino])
+      end
+    end
+  end
+
+  def test_removed_archive_recovery_refuses_remaining_checkout_or_unverified_replacement
+    with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
+      admin = git_capture_success('git', '-C', checkout, 'rev-parse', '--absolute-git-dir').strip
+      File.open(admin, File::RDONLY) do
+        runner.define_singleton_method(:retire_session_runtime!) { |*| raise DevSession::Error, 'pause after removal' }
+        assert_raises(DevSession::Error) { runner.archive(slug, as_is: true) }
+        journal = runner.send(:load_archive_journal, slug)
+        live = File.join(workspace, 'worktrees', 'other-session', 'sample')
+        assert_git_success('git', "--git-dir=#{common}", 'worktree', 'add', '--detach', live, 'master')
+        pointer = File.binread(File.join(live, '.git'))
+        File.write(File.join(live, '.git'), 'broken pointer')
+        assert_raises(DevSession::Error) { runner.with_verified_removed_archive(slug, journal) { flunk('invalid replacement accepted') } }
+        File.binwrite(File.join(live, '.git'), pointer)
+        cleanup = DevSession::ArchiveCleanup.new(runner, slug)
+        sidecar = cleanup.load(journal:)
+        sidecar.fetch('inventory').fetch('worktrees').first['removed'] = false
+        # Progress is excluded from the sealed inventory digest.
+        cleanup.send(:write, sidecar)
+        error = assert_raises(DevSession::Error) { runner.with_verified_removed_archive(slug, journal) { flunk('unfinished removal accepted') } }
+        assert_includes(error.message, 'recorded checkout removal')
+        assert_equal(journal, runner.send(:load_archive_journal, slug))
+        assert_equal(pointer, File.binread(File.join(live, '.git')))
+      end
+    end
+  end
+
   def test_explicit_local_archive_without_tracking_history_retries_sync_and_revives
     [false, true].product([false, true]).each do |partial, sync_before_revive|
       with_workspace do |workspace|
