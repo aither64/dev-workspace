@@ -182,6 +182,13 @@ their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
+Artifacts appear as compact file rows grouped by directory. Each row shows the
+filename; hover over it to see its label and relative path. On desktop, navigation
+and preview scroll independently. The selected file, open directories and
+navigation position survive status refreshes. **Copy content** copies raw text or
+Markdown. Image previews cannot be copied as text. Invalid UTF-8 uses replacement
+characters, matching the text preview.
+
 Downloads use `GET /api/sessions/<slug>/file/download` and
 `GET /api/workspace/file/download` with the same query parameters and eligibility
 checks as their preview endpoints. They return an attachment with an

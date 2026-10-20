@@ -182,11 +182,11 @@
       </section>
 
       <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel" aria-labelledby="session-tab-artifacts">
-        <div class="artifact-list" role="list" aria-label="Session artifacts">
+        <nav class="artifact-list" aria-label="Session artifacts">
           {{template "artifact-list" .}}
-        </div>
+        </nav>
         <div class="artifact-view">
-          <div class="section-heading"><h2 id="artifact-title">Artifacts</h2><a id="artifact-download" class="button-link" href="#" download hidden>Download</a></div>
+          <div class="section-heading"><h2 id="artifact-title">Artifacts</h2><div class="artifact-actions"><button id="artifact-copy" class="quiet icon-button" type="button" title="Copy content" aria-label="Copy content" disabled>⧉</button><a id="artifact-download" class="button-link icon-button" href="#" title="Download artifact" aria-label="Download artifact" download hidden>↓</a></div></div>
           <div id="artifact-preview" class="document"><p class="empty">Choose an artifact to preview it.</p></div>
         </div>
       </section>
