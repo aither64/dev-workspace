@@ -113,6 +113,8 @@ class WorkspaceHostTest < Minitest::Test
       raise DevWorkspaceHost::Error, 'injected lifecycle interruption' if fail_recovery_executor
 
       File.unlink(recovery_journal)
+      sidecar = recovery_journal.sub(/\.archive\.json\z/, '.archive-cleanup.json')
+      File.unlink(sidecar) if File.exist?(sidecar)
     end
   end
 
@@ -151,6 +153,69 @@ class WorkspaceHostTest < Minitest::Test
       refute(File.exist?(paths.fetch(:creation)))
       assert_equal(0, recover_archive(host, paths))
       assert(host.events.any? { |event| event.first == :archive_executor })
+    end
+  end
+
+  def test_recover_removed_modern_archive_uses_candidate_executor_with_selected_generation
+    %w[tracking_archived tracking_saved thread_retired runtime_retired archived].each do |phase|
+      with_recovery_host do |host, paths|
+        journal = JSON.parse(File.read(paths.fetch(:journal)))
+        journal['schema'] = 4
+        journal['phase'] = phase
+        File.write(paths.fetch(:journal), JSON.generate(journal))
+        sidecar = paths.fetch(:journal).sub(/\.archive\.json\z/, '.archive-cleanup.json')
+        File.write(sidecar, '{}') # Runner owns strict sidecar proof, separately tested.
+        executor = File.join(paths.fetch(:candidate), 'libexec/workspace-portal/dev-session')
+        FileUtils.mkdir_p(File.dirname(executor))
+        File.write(executor, "#!/bin/sh\nexit 0\n")
+        File.chmod(0o755, executor)
+        token = host.send(:profile_link_token)
+        assert_equal(0, recover_archive(host, paths), phase)
+        execution = host.events.find { |event| event.first == :archive_executor }
+        assert_equal(executor, execution.fetch(2))
+        arguments = execution.fetch(3)
+        assert_equal(paths.fetch(:predecessor), arguments.fetch(arguments.index('--expected-host-generation') + 1))
+        assert_equal(File.join(paths.fetch(:candidate), 'bin/workspace-portal'), arguments.fetch(arguments.index('--portal-command') + 1))
+        assert_equal(token, host.send(:profile_link_token))
+        refute(host.events.any? { |event| %i[archive_preflight archive_team profile_set configured consumers_restarted].include?(event.first) })
+        refute(File.exist?(sidecar))
+      end
+    end
+  end
+
+  def test_recover_modern_archive_accepts_only_completed_sidecar_after_journal_removal
+    with_recovery_host do |host, paths|
+      host.send(:load_archive_recovery_executor!)
+      entry = host.send(:registry).find('example-workspace')
+      runner = DevSession::Runner.new(workspace: entry.fetch('root'), require_runtime: false)
+      cleanup = DevSession::ArchiveCleanup.new(runner, paths.fetch(:slug))
+      original = JSON.parse(File.read(paths.fetch(:journal)))
+      archive = File.dirname(paths.fetch(:manifest))
+      stat = File.stat(archive)
+      inventory = {'worktrees' => [], 'containers' => [], 'proofs' => [], 'registered_heads' => {},
+                   'tracking_identity' => {'dev' => stat.dev, 'ino' => stat.ino}, 'source_sha256' => 'd' * 64}
+      sidecar = original.slice(*DevSession::ArchiveCleanup::BINDING_KEYS).merge(
+        'schema' => 3, 'sealed' => true, 'inventory' => inventory,
+        'inventory_sha256' => cleanup.send(:inventory_digest, inventory), 'completed' => false
+      )
+      cleanup.send(:write, sidecar, create: true)
+      File.unlink(paths.fetch(:journal))
+      assert_equal(1, recover_archive(host, paths))
+      refute(host.events.any? { |event| event.first == :archive_executor })
+      sidecar['completed'] = true
+      cleanup.send(:write, sidecar)
+      host.define_singleton_method(:system_env_interactive!) do |environment, command, *arguments|
+        events << [:archive_executor, environment, command, arguments]
+        File.unlink(cleanup.path)
+      end
+      executor = File.join(paths.fetch(:candidate), 'libexec/workspace-portal/dev-session')
+      FileUtils.mkdir_p(File.dirname(executor))
+      File.write(executor, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, executor)
+      assert_equal(0, recover_archive(host, paths), host.instance_variable_get(:@err).string)
+      assert_equal(executor, host.events.find { |event| event.first == :archive_executor }.fetch(2))
+      refute(File.exist?(cleanup.path))
+      assert_equal(paths.fetch(:predecessor), File.realpath(host.instance_variable_get(:@profile)))
     end
   end
 
