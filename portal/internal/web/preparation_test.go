@@ -30,12 +30,47 @@ func preparationTestID(number int) string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012d", number)
 }
 
+func TestSessionPreparationNamingReceivesAcceptedProvider(t *testing.T) {
+	for _, selected := range []string{"", "openai", "pool"} {
+		t.Run("provider="+selected, func(t *testing.T) {
+			server := newTestServer(t)
+			defer server.Close()
+			providerTestCatalog(t, server, "http://127.0.0.1:1")
+			got := make(chan string, 1)
+			server.config.SessionNamer = func(_ context.Context, input, provider string) (string, error) {
+				if input != "Repair naming provider routing" {
+					t.Error("accepted naming input changed")
+				}
+				got <- provider
+				return "", errors.New("stop before reservation")
+			}
+			id := preparationTestID(1)
+			response := postPreparation(t, server, id, "Repair naming provider routing", "", url.Values{"provider": {selected}})
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("admission=%d %s", response.Code, response.Body.String())
+			}
+			record := awaitPreparation(t, server, id)
+			if record.State != "failed" || record.Slug != "" || record.Snapshot.Input.Provider != selected {
+				t.Fatalf("provider intent or stopped state changed: %#v", record)
+			}
+			select {
+			case provider := <-got:
+				if provider != selected {
+					t.Fatalf("naming provider=%q, accepted=%q", provider, selected)
+				}
+			default:
+				t.Fatal("accepted request never reached naming")
+			}
+		})
+	}
+}
+
 func TestSessionPreparationBrowserNotificationPreference(t *testing.T) {
 	for _, value := range []string{"true", "false", ""} {
 		t.Run("preference="+value, func(t *testing.T) {
 			server := newTestServer(t)
 			defer server.Close()
-			server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+			server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 				<-ctx.Done()
 				return "", ctx.Err()
 			}
@@ -171,15 +206,15 @@ func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 		{output: "```json\n{\"name\":\"one-two-three\"}\n```", outcome: "invalid_output"},
 		{err: errors.New("utility unavailable"), outcome: "utility_error"},
 	} {
-		server.config.SessionNamer = func(context.Context, string) (string, error) { return test.output, test.err }
-		name, outcome, err := server.namePreparation(context.Background(), "Příliš short prompt")
+		server.config.SessionNamer = func(context.Context, string, string) (string, error) { return test.output, test.err }
+		name, outcome, err := server.namePreparation(context.Background(), "Příliš short prompt", "")
 		if !errors.Is(err, errSessionNaming) || name != "" || outcome != test.outcome {
 			t.Fatalf("failure=%q %q %v", name, outcome, err)
 		}
 	}
 	entered, release := make(chan time.Time, 3), make(chan struct{})
 	var active, peak atomic.Int32
-	server.config.SessionNamer = func(ctx context.Context, prompt string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, prompt string, _ string) (string, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok || time.Until(deadline) > 10*time.Second || len(prompt) > 8192 {
 			t.Error("unbounded adapter request")
@@ -201,7 +236,7 @@ func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, err := server.namePreparation(context.Background(), strings.Repeat("a", 8191)+"ž"); err != nil {
+			if _, _, err := server.namePreparation(context.Background(), strings.Repeat("a", 8191)+"ž", ""); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -223,11 +258,11 @@ func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 	if peak.Load() != 2 {
 		t.Fatalf("concurrent adapter calls=%d", peak.Load())
 	}
-	server.config.SessionNamer = func(context.Context, string) (string, error) {
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
 		t.Fatal("attachment-only prompt invoked adapter")
 		return "", nil
 	}
-	if name, outcome, err := server.namePreparation(context.Background(), " \n "); err != nil || name != "session" || outcome != "attachment_only" {
+	if name, outcome, err := server.namePreparation(context.Background(), " \n ", ""); err != nil || name != "session" || outcome != "attachment_only" {
 		t.Fatal(name, outcome, err)
 	}
 }
@@ -237,12 +272,12 @@ func TestSessionNameTimeoutIncludesSemaphoreQueue(t *testing.T) {
 	defer server.Close()
 	server.namingSlots <- struct{}{}
 	server.namingSlots <- struct{}{}
-	server.config.SessionNamer = func(context.Context, string) (string, error) {
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
 		t.Fatal("queued timeout invoked adapter")
 		return "", nil
 	}
 	started := time.Now()
-	name, outcome, err := server.namePreparation(context.Background(), "queued naming prompt")
+	name, outcome, err := server.namePreparation(context.Background(), "queued naming prompt", "")
 	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "timeout" {
 		t.Fatal(name, outcome, err)
 	}
@@ -305,7 +340,7 @@ func TestSessionPreparationPreIntentFailureDoesNotClaimUploads(t *testing.T) {
 		return syncPreparationDirectory(directory)
 	}
 	var calls atomic.Int32
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		calls.Add(1)
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -367,7 +402,7 @@ func TestSessionPreparationUploadAdmissionIntentRecoveryAndReplay(t *testing.T) 
 	defer server.Close()
 	scope, file := preparationReadyFile(t, server)
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, prompt string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, prompt string, _ string) (string, error) {
 		close(entered)
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -463,7 +498,7 @@ func TestSessionPreparationFiftyFilesRecoveryAndCompaction(t *testing.T) {
 		t.Fatalf("51-file admission=%d %s", response.Code, response.Body.String())
 	}
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		close(entered)
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -517,7 +552,7 @@ func TestSessionPreparationFiftyFilesRecoveryAndCompaction(t *testing.T) {
 			t.Fatalf("changed input=%d %s", conflict.Code, conflict.Body.String())
 		}
 	}
-	restarted.config.SessionNamer = func(context.Context, string) (string, error) { return `{"name":"fifty-file-recovery"}`, nil }
+	restarted.config.SessionNamer = func(context.Context, string, string) (string, error) { return `{"name":"fifty-file-recovery"}`, nil }
 	retry := postCreation(t, restarted, "/api/session-creations/"+id+"/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receiptID), "application/json")
 	if retry.Code != 202 {
 		t.Fatalf("retry=%d %s", retry.Code, retry.Body.String())
@@ -551,7 +586,7 @@ func TestSessionPreparationFiftyFilesRecoveryAndCompaction(t *testing.T) {
 func TestSessionPreparationCatalogRejectionIsBeforeAcceptance(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) { <-ctx.Done(); return "", ctx.Err() }
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) { <-ctx.Done(); return "", ctx.Err() }
 	server.installedTeams = &agentteams.Installed{Managed: true, Catalog: &agentteams.Catalog{
 		CatalogDigest: strings.Repeat("b", 64), Teams: map[string]agentteams.Team{"solo": {Description: "A lead", TeamDigest: strings.Repeat("c", 64),
 			Roles: map[string]agentteams.Role{"team_lead": {Model: "model-1", Effort: "high", Purpose: "lead", Instructions: "Lead instructions."}}}}}}
@@ -613,7 +648,7 @@ func TestSessionPreparationAdmissionReplaysBeforeCatalogAndNaming(t *testing.T) 
 	server := newTestServer(t)
 	defer server.Close()
 	entered, release := make(chan struct{}, 1), make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, prompt string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, prompt string, _ string) (string, error) {
 		if prompt != " \nOriginal prompt\n " {
 			t.Errorf("raw naming prompt=%q", prompt)
 		}
@@ -685,7 +720,7 @@ func TestSessionPreparationAdmissionReplaysBeforeCatalogAndNaming(t *testing.T) 
 func TestSessionPreparationDistinctIDsCollideWithoutRenaming(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
-	server.config.SessionNamer = func(context.Context, string) (string, error) { return `{"name":"same-prompt-work"}`, nil }
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) { return `{"name":"same-prompt-work"}`, nil }
 	var wg sync.WaitGroup
 	for number := 1; number <= 2; number++ {
 		wg.Add(1)
@@ -718,7 +753,7 @@ func TestSessionPreparationDistinctIDsCollideWithoutRenaming(t *testing.T) {
 func TestSessionPreparationShutdownPausesWithoutFallback(t *testing.T) {
 	server := newTestServer(t)
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		close(entered)
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -748,7 +783,10 @@ func TestSessionPreparationSavedBaseAndRetryAttempt(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
 	var calls atomic.Int32
-	server.config.SessionNamer = func(context.Context, string) (string, error) { calls.Add(1); return `{"name":"locked-name-work"}`, nil }
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		calls.Add(1)
+		return `{"name":"locked-name-work"}`, nil
+	}
 	lock, err := session.LockCreation(server.config.AuthorityDir, "2026-10-03-locked-name-work")
 	if err != nil {
 		t.Fatal(err)
@@ -781,7 +819,7 @@ func TestSessionPreparationGenerationChangeCannotReserve(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
 	entered, release := make(chan struct{}), make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		close(entered)
 		select {
 		case <-release:
@@ -1122,7 +1160,7 @@ func TestSessionPreparationGETSnapshotDoesNotAcceptDelayedIntent(t *testing.T) {
 	}
 	var calls atomic.Int32
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		calls.Add(1)
 		close(entered)
 		<-ctx.Done()
@@ -1228,7 +1266,7 @@ func TestSessionPreparationPublishedAdmissionConfirmationDispatchesOnce(t *testi
 			var fault atomic.Bool
 			fault.Store(true)
 			var calls atomic.Int32
-			server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+			server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 				calls.Add(1)
 				select {
 				case <-release:
@@ -1313,7 +1351,7 @@ func TestSessionPreparationPublishedRetryKeepsAttemptAndLaunch(t *testing.T) {
 		return syncPreparationDirectory(directory)
 	}
 	var calls atomic.Int32
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		calls.Add(1)
 		select {
 		case <-release:
@@ -1365,7 +1403,10 @@ func TestSessionPreparationStoppedWorkerNeedsExplicitRetryAfterConfirmation(t *t
 			var fault atomic.Bool
 			fault.Store(true)
 			var calls atomic.Int32
-			server.config.SessionNamer = func(context.Context, string) (string, error) { calls.Add(1); return `{"name":"one-two-three"}`, nil }
+			server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+				calls.Add(1)
+				return `{"name":"one-two-three"}`, nil
+			}
 			var lock *session.RuntimeLock
 			if boundary == "failed" {
 				var err error
@@ -1497,7 +1538,10 @@ func TestSessionPreparationPendingConfirmationRejectsSupersededGeneration(t *tes
 		return syncPreparationDirectory(directory)
 	}
 	var calls atomic.Int32
-	server.config.SessionNamer = func(context.Context, string) (string, error) { calls.Add(1); return `{"name":"one-two-three"}`, nil }
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		calls.Add(1)
+		return `{"name":"one-two-three"}`, nil
+	}
 	assertPreparationUnconfirmed(t, postPreparation(t, server, id, "prompt", "", nil), id)
 	fault.Store(false)
 	if err := os.Remove(server.config.HostProfile); err != nil {
@@ -1550,7 +1594,7 @@ func TestSessionPreparationAcceptingUploadConfirmationRetainsBeforeCollection(t 
 	}
 	var calls atomic.Int32
 	entered := make(chan struct{})
-	server.config.SessionNamer = func(ctx context.Context, _ string) (string, error) {
+	server.config.SessionNamer = func(ctx context.Context, _ string, _ string) (string, error) {
 		calls.Add(1)
 		close(entered)
 		<-ctx.Done()

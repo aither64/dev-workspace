@@ -186,9 +186,24 @@ The portal starts this child once, with its existing host-selected Codex home
 and account/provider environment, strict config loading and native remote
 control disabled for the child. It copies no credentials and does not change
 ordinary remote enrollment. Startup runs in an empty private cwd; global user
-policy remains trusted. A failed or exited child is not respawned or replaced
+policy remains trusted. The child imports the registered workspace's provider
+definitions through the same `workspace-host provider native-args` projection
+used by ordinary native launches. This includes providers defined only in the
+host catalog, with their existing token-file authentication. The fixed model
+catalog override is applied after those arguments. A failed export stops naming
+startup without falling back to global provider configuration.
+A failed or exited child is not respawned or replaced
 by the ordinary socket. Restart the portal through the existing service/package
 procedure to create another lifetime.
+
+Each naming call uses the provider saved with the accepted request. If the request
+inherits the workspace default, the portal resolves that default when the call
+starts. It validates the provider against the current catalog and passes its ID
+to the ephemeral thread; the native process's global default cannot override it.
+The helper checks the server's provider response before sending the naming prompt.
+Invalid routing or an unavailable selected provider stops naming without trying
+another provider. A portal without a configured provider catalog retains the
+native default when the request has no explicit selection.
 
 On shutdown, the portal stops admissions and cancels/waits its workers while
 the child remains available for helper cleanup. It then terminates and joins
@@ -225,8 +240,9 @@ rows older than ten days at startup; this is not a guaranteed erasure deadline.
 Accepted preparation requests and normal session history retain their existing
 persistence contracts. Portal operational logs contain outcome and duration,
 without prompt text or model output.
-Changing authentication, provider configuration, managed policy or the fixed
-resource requires restarting the naming child through the portal procedure.
+Changing authentication, provider connection configuration, managed policy or the
+fixed resource requires restarting the naming child through the portal procedure.
+Changing the workspace's active provider requires no naming-child restart.
 
 Generated names describe the subject and intended work, with a preference for
 two or three words. Conversational openings are omitted. For example, a request

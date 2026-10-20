@@ -80,7 +80,7 @@ func namingPrompt(raw string) string {
 	return raw[:cut]
 }
 
-func (s *Server) namePreparation(ctx context.Context, raw string) (string, string, error) {
+func (s *Server) namePreparation(ctx context.Context, raw, provider string) (string, string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return "session", "attachment_only", nil
 	}
@@ -99,7 +99,7 @@ func (s *Server) namePreparation(ctx context.Context, raw string) (string, strin
 			s.config.Logger.Printf("session naming duration_ms=%d outcome=timeout category=queue", time.Since(started).Milliseconds())
 			return "", "timeout", errSessionNaming
 		}
-		output, err := s.config.SessionNamer(budget, namingPrompt(raw))
+		output, err := s.config.SessionNamer(budget, namingPrompt(raw), provider)
 		if ctx.Err() != nil {
 			return "", "", ctx.Err()
 		}
