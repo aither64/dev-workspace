@@ -3659,7 +3659,7 @@ func (s *Server) presentTranscript(transcript *codex.Transcript) {
 		entry := &transcript.Entries[index]
 		if entry.Text != "" &&
 			(entry.Kind == "agentMessage" || entry.Kind == "reasoning" || entry.Kind == "plan") {
-			entry.HTML = string(s.renderTextMarkdown(entry.Text))
+			entry.HTML = string(s.renderTextMarkdown(codex.CitationMarkdown(*entry)))
 		}
 	}
 }
