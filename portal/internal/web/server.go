@@ -449,6 +449,7 @@ func New(config Config) (*Server, error) {
 		},
 		"timeAgo":         timeAgo,
 		"workflowSummary": workflowSummary,
+		"artifactTree":    artifactTree,
 	}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, err
@@ -1769,7 +1770,7 @@ func (s *Server) artifactPreview(w http.ResponseWriter, r *http.Request, summary
 	text := strings.ToValidUTF8(string(data), "�")
 	if kind == "markdown" {
 		s.writeJSON(w, http.StatusOK, map[string]string{
-			"kind": "markdown", "html": string(s.renderTextMarkdown(text)),
+			"kind": "markdown", "html": string(s.renderTextMarkdown(text)), "text": text,
 		})
 		return
 	}

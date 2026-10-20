@@ -49,5 +49,9 @@
 {{end}}
 
 {{define "artifact-list"}}
-          {{range .Artifacts}}<button type="button" class="artifact-select quiet" data-artifact-path="{{.Path}}" data-artifact-label="{{.Label}}">{{.Label}}</button>{{end}}
+ {{range artifactTree .Artifacts}}{{template "artifact-node" .}}{{end}}
+{{end}}
+{{define "artifact-node"}}
+ {{if .Artifact}}<button type="button" class="artifact-select quiet" data-artifact-path="{{.Artifact.Path}}" data-artifact-label="{{.Artifact.Label}}" title="{{.Artifact.Label}} · {{.Artifact.Path}}"><span>{{.Name}}</span></button>
+ {{else}}<details class="artifact-directory" data-artifact-directory="{{.Directory}}" open><summary title="{{.Directory}}">{{.Name}}</summary><div>{{range .Children}}{{template "artifact-node" .}}{{end}}</div></details>{{end}}
 {{end}}

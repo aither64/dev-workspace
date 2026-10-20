@@ -35,7 +35,7 @@
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
     }),
-    artifactPreview: (path) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`),
+    artifactPreview: (path, options) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`, options),
     archive: (mode, targetId, receiptId) => request(apiPath(slug, "archive"), {
       method: "POST", body: JSON.stringify({mode, targetId, ...(receiptId ? {receiptId} : {})}),
     }),
@@ -3193,11 +3193,22 @@
   const artifactPreview = document.getElementById("artifact-preview");
   const artifactTitle = document.getElementById("artifact-title");
   const artifactDownload = document.getElementById("artifact-download");
-  let selectedArtifactPath = "";
+  const artifactCopy = document.getElementById("artifact-copy");
+  let selectedArtifactPath = "", artifactGeneration = 0, artifactRead = null, artifactText = null;
+  artifactCopy?.addEventListener("click", async () => {
+    if (artifactText === null) return;
+    const generation = artifactGeneration;
+    try { await navigator.clipboard.writeText(artifactText); if (generation === artifactGeneration) artifactCopy.title = "Content copied"; }
+    catch (_) { if (generation === artifactGeneration) artifactCopy.title = "Unable to copy content. Download the file instead."; }
+  });
   const showArtifact = async (button) => {
     const path = button.dataset.artifactPath;
     if (!path || !artifactPreview) return;
     selectedArtifactPath = path;
+    const generation = ++artifactGeneration;
+    artifactRead?.abort(); artifactRead = new AbortController();
+    artifactText = null;
+    if (artifactCopy) { artifactCopy.disabled = true; artifactCopy.title = "Copy content"; }
     artifactButtons().forEach((candidate) => candidate.classList.toggle("active", candidate === button));
     artifactTitle.textContent = button.dataset.artifactLabel || path;
     artifactDownload.href = `/artifacts/${encodeURIComponent(slug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
@@ -3208,8 +3219,10 @@
     loading.textContent = "Loading artifact…";
     artifactPreview.append(loading);
     try {
-      const result = await client.artifactPreview(path);
-      if (selectedArtifactPath !== path) return;
+      const result = await client.artifactPreview(path, {signal: artifactRead.signal});
+      if (generation !== artifactGeneration) return;
+      artifactText = typeof result.text === "string" && result.kind !== "image" ? result.text : null;
+      if (artifactCopy) artifactCopy.disabled = artifactText === null;
       artifactPreview.replaceChildren();
       if (result.kind === "markdown") {
         artifactPreview.innerHTML = result.html || "";
@@ -3225,7 +3238,7 @@
         artifactPreview.append(pre);
       }
     } catch (error) {
-      if (selectedArtifactPath !== path) return;
+      if (generation !== artifactGeneration) return;
       const notice = document.createElement("p");
       notice.className = "notice error";
       notice.textContent = `Unable to preview artifact: ${error.message}`;
@@ -3332,7 +3345,13 @@
         lastRepositoriesHTML = payload.repositoriesHTML;
       }
       if (payload.artifactsHTML !== lastArtifactsHTML) {
+        const artifactScroll = artifactList.scrollTop;
+        const directoryState = new Map(Array.from(artifactList.querySelectorAll("[data-artifact-directory]"), node => [node.dataset.artifactDirectory, node.open]));
         artifactList.innerHTML = payload.artifactsHTML;
+        artifactList.querySelectorAll("[data-artifact-directory]").forEach(node => {
+          if (directoryState.has(node.dataset.artifactDirectory)) node.open = directoryState.get(node.dataset.artifactDirectory);
+        });
+        artifactList.scrollTop = artifactScroll;
         lastArtifactsHTML = payload.artifactsHTML;
         const selected = artifactButtons().find((button) => button.dataset.artifactPath === selectedArtifactPath);
         if (selected) {
@@ -3340,6 +3359,8 @@
           artifactTitle.textContent = selected.dataset.artifactLabel || selectedArtifactPath;
         } else if (selectedArtifactPath) {
           selectedArtifactPath = "";
+          ++artifactGeneration; artifactRead?.abort(); artifactText = null;
+          if (artifactCopy) artifactCopy.disabled = true;
           artifactTitle.textContent = "Artifacts";
           artifactDownload.hidden = true;
           artifactPreview.textContent = "Choose an artifact to preview it.";
