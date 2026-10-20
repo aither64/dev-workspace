@@ -1,7 +1,9 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -188,4 +190,25 @@ func TestWorkspaceSourceRequiresExactGitRoot(t *testing.T) {
 	}
 	runWebGit(t, "-C", parent, "add", "--", filepath.Join(filepath.Base(s.config.Workspace), "AGENTS.md"))
 	readWorkspaceSource(t, s, "AGENTS.md", 404)
+}
+
+func TestWorkspaceDownloadUsesSharedEligibility(t *testing.T) {
+	s := newTestServer(t)
+	runWebGit(t, "-C", s.config.Workspace, "init")
+	raw := []byte{0, 255, 'x', '\r', '\n'}
+	if err := os.WriteFile(filepath.Join(s.config.Workspace, "source.bin"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/workspace/file/download?path=source.bin", nil))
+	if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), raw) {
+		t.Fatalf("shared bytes: %d %q", response.Code, response.Body.Bytes())
+	}
+	for _, path := range []string{"work/example/plan.md", "../escape", ".git/config"} {
+		response = httptest.NewRecorder()
+		s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/workspace/file/download?path="+url.QueryEscape(path), nil))
+		if response.Code != 400 {
+			t.Fatalf("unsafe shared path %s: %d", path, response.Code)
+		}
+	}
 }

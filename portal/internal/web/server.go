@@ -458,6 +458,7 @@ func New(config Config) (*Server, error) {
 	policy.AllowAttrs("title").OnElements("a")
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
+	policy.AllowAttrs("target").Matching(regexp.MustCompile(`^_blank$`)).OnElements("a")
 	operationContext, cancelOperations := context.WithCancel(context.Background())
 	operationStore, err := newLifecycleOperationStore(workspace, config.UserStateRoot)
 	if err != nil {
@@ -776,7 +777,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.sourcePage(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/workspace-files":
 		s.workspaceSourcePage(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/api/workspace/file":
+	case r.Method == http.MethodGet && (r.URL.Path == "/api/workspace/file" || r.URL.Path == "/api/workspace/file/download"):
 		s.workspaceSourceFile(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, s.config.Workspace+"/"):
 		s.sourceRedirect(w, r)
@@ -1871,7 +1872,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 			return nil, false
 		}
 	}
-	if len(parts) == 3 && parts[1] != "queue" && !(parts[1] == "thread" && parts[2] == "page") &&
+	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "thread" && parts[2] == "page") &&
 		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
 		return nil, false
 	}
@@ -1928,7 +1929,7 @@ func (s *Server) sessionAPIForSummary(
 		s.recoveryAPI(w, r, summary, parts[1])
 		return
 	}
-	if len(parts) == 2 && parts[1] == "file" {
+	if (len(parts) == 2 || (len(parts) == 3 && parts[2] == "download")) && parts[1] == "file" {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
 			s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "File viewing is read-only."})

@@ -1,12 +1,14 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"math"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -60,7 +62,17 @@ func ValidWorkspaceSourcePath(path string) bool {
 	return true
 }
 
+const MaxSourceDownloadBytes = 10 * 1024 * 1024
+
+var ErrSourceDownloadLimit = errors.New("file exceeds the 10 MiB download limit")
+
 func (r ReviewReader) WorkspaceSource(ctx context.Context, path string) (SourceFile, error) {
+	return r.WorkspaceSourceContent(ctx, path, false)
+}
+
+// Download mode uses exactly the same eligibility and resolution as previews.
+// Its Text contains the original bytes and must only be served as an attachment.
+func (r ReviewReader) WorkspaceSourceContent(ctx context.Context, path string, download bool) (SourceFile, error) {
 	result := SourceFile{Path: path, Source: SourceWorkspace}
 	if !ValidWorkspaceSourcePath(path) {
 		return result, errors.New("invalid shared workspace path")
@@ -69,7 +81,7 @@ func (r ReviewReader) WorkspaceSource(ctx context.Context, path string) (SourceF
 		return result, err
 	}
 	var err error
-	result.Content, err = r.workingSource(ctx, "", path)
+	result.Content, err = r.workingSourceContent(ctx, "", path, download)
 	return result, err
 }
 
@@ -88,6 +100,10 @@ func (r ReviewReader) workspaceSourceRoot(ctx context.Context) error {
 // workspace files beneath the session's actual tracking root. The artifact
 // source values are retained for existing viewer clients.
 func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summary, path string) (SourceFile, error) {
+	return r.TrackingSourceContent(ctx, summary, path, false)
+}
+
+func (r ReviewReader) TrackingSourceContent(ctx context.Context, summary *session.Summary, path string, download bool) (SourceFile, error) {
 	result := SourceFile{Path: path, Source: SourceArtifact}
 	if summary.Archived {
 		result.Source = SourceArchivedArtifact
@@ -95,7 +111,7 @@ func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summa
 	file, info, err := session.OpenArtifact(summary, path, math.MaxInt64)
 	if err == nil {
 		defer file.Close()
-		result.Content, err = ReadSourcePreview(file, info.Size())
+		result.Content, err = readSourceContent(file, info.Size(), download)
 		return result, err
 	}
 	if summary.Workspace != r.Workspace || !session.ValidSlug(summary.Slug) ||
@@ -105,13 +121,17 @@ func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summa
 	if err := r.workspaceSourceRoot(ctx); err != nil {
 		return result, err
 	}
-	result.Content, err = r.workingSource(ctx, "", filepath.Join(summary.Root, summary.Slug, path))
+	result.Content, err = r.workingSourceContent(ctx, "", filepath.Join(summary.Root, summary.Slug, path), download)
 	return result, err
 }
 
 // Source revalidates repository ownership on each request. Browser input selects
 // only a literal path; the session registration supplies the repository and ref.
 func (r ReviewReader) Source(ctx context.Context, slug string, item session.Repository, archived bool, path string) (SourceFile, error) {
+	return r.SourceContent(ctx, slug, item, archived, path, false)
+}
+
+func (r ReviewReader) SourceContent(ctx context.Context, slug string, item session.Repository, archived bool, path string, download bool) (SourceFile, error) {
 	result := SourceFile{Path: path, Repository: item.Name, Source: SourceWorktree}
 	if !ValidSourcePath(path) {
 		return result, errors.New("invalid source path")
@@ -133,15 +153,34 @@ func (r ReviewReader) Source(ctx context.Context, slug string, item session.Repo
 			!regularGitMode(fields[0]) || !gitObjectPattern.MatchString(fields[2]) {
 			return result, errors.New("file is absent from the recorded final commit")
 		}
-		result.Content, err = r.blob(ctx, repo.Directory, fields[2], fields[0])
+		if download {
+			sizeBytes, sizeErr := r.git(ctx, repo.Directory, 1024, "cat-file", "-s", fields[2])
+			if sizeErr != nil {
+				return result, sizeErr
+			}
+			size, sizeErr := strconv.ParseInt(strings.TrimSpace(string(sizeBytes)), 10, 64)
+			if sizeErr != nil || size < 0 {
+				return result, errors.New("invalid Git blob size")
+			}
+			if size > MaxSourceDownloadBytes {
+				return result, ErrSourceDownloadLimit
+			}
+			data, readErr := r.git(ctx, repo.Directory, MaxSourceDownloadBytes+1, "cat-file", "blob", fields[2])
+			if readErr != nil {
+				return result, readErr
+			}
+			result.Content, err = readSourceContent(bytes.NewReader(data), int64(len(data)), true)
+		} else {
+			result.Content, err = r.blob(ctx, repo.Directory, fields[2], fields[0])
+		}
 		return result, err
 	}
 
-	result.Content, err = r.workingSource(ctx, filepath.Join("worktrees", slug, item.Name), path)
+	result.Content, err = r.workingSourceContent(ctx, filepath.Join("worktrees", slug, item.Name), path, download)
 	return result, err
 }
 
-func (r ReviewReader) workingSource(ctx context.Context, directory, path string) (ReviewBlob, error) {
+func (r ReviewReader) workingSourceContent(ctx context.Context, directory, path string, download bool) (ReviewBlob, error) {
 	out, err := r.git(ctx, filepath.Join(r.Workspace, directory), 64*1024, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path)
 	if err != nil {
 		return ReviewBlob{}, err
@@ -186,7 +225,7 @@ func (r ReviewReader) workingSource(ctx context.Context, directory, path string)
 		return ReviewBlob{}, err
 	}
 	defer file.Close()
-	return ReadSourcePreview(file, info.Size())
+	return readSourceContent(file, info.Size(), download)
 }
 
 func regularGitMode(mode string) bool { return mode == "100644" || mode == "100755" }
@@ -209,4 +248,21 @@ func ReadSourcePreview(reader io.Reader, size int64) (ReviewBlob, error) {
 		return blob, nil
 	}
 	return previewText(data, blob), nil
+}
+
+func readSourceContent(reader io.Reader, size int64, download bool) (ReviewBlob, error) {
+	if !download {
+		return ReadSourcePreview(reader, size)
+	}
+	if size > MaxSourceDownloadBytes {
+		return ReviewBlob{}, ErrSourceDownloadLimit
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, MaxSourceDownloadBytes+1))
+	if err != nil {
+		return ReviewBlob{}, err
+	}
+	if len(data) > MaxSourceDownloadBytes {
+		return ReviewBlob{}, ErrSourceDownloadLimit
+	}
+	return ReviewBlob{Kind: "file", Bytes: int64(len(data)), Text: string(data)}, nil
 }
