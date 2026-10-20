@@ -30,3 +30,38 @@ func TestCitationMarkdownPresentation(t *testing.T) {
 		t.Fatal("unsafe source URL rendered")
 	}
 }
+
+func TestCitationsComposeWithDecoratedUserMarkdownAndTeamPresentation(t *testing.T) {
+	s := newTestServer(t)
+	token := "\ue200cite\ue202ref\ue201"
+	prefix := "Příliš 🐈 **answer** "
+	canonical := prefix + token + "\n\n`" + token + "`"
+	display := "# User heading\n\n" + token
+	empty := ""
+	agent := codex.TranscriptEntry{Kind: "agentMessage", TurnStatus: "completed", Text: canonical, ClientUserMessageDigest: "unchanged-digest", CitationsPending: true,
+		Citations: []codex.CitationSpan{{Start: len(prefix), End: len(prefix) + len(token)}}}
+	user := codex.TranscriptEntry{Kind: "userMessage", Text: "attachment envelope", DisplayText: &display, Citations: agent.Citations, Attachments: []codex.Attachment{{ID: "file", Name: "file.txt"}}}
+	transcript := codex.Transcript{Entries: []codex.TranscriptEntry{agent, user, {Kind: "userMessage", Text: "Team assignment from lead to implementer0:\n\nWork."}, {Kind: "userMessage", Text: "hidden envelope", DisplayText: &empty}}}
+	s.presentTranscript(&transcript)
+	if !strings.Contains(transcript.Entries[0].HTML, "[source pending]") {
+		t.Fatal("pending citation disappeared")
+	}
+	if !strings.Contains(transcript.Entries[1].HTML, "<h1>User heading</h1>") || !strings.Contains(transcript.Entries[1].HTML, token) || strings.Contains(transcript.Entries[1].HTML, "attachment envelope") {
+		t.Fatalf("user citation/display handling: %s", transcript.Entries[1].HTML)
+	}
+	if transcript.Entries[2].Communication == nil || transcript.Entries[2].Communication.To != "implementer0" || transcript.Entries[3].HTML != "" {
+		t.Fatal("team/empty user display changed")
+	}
+	// A late source update must render from original UTF-8 offsets even after the
+	// message is retained outside the newest page. Neither canonical text changes.
+	transcript.Entries[0].CitationsPending = false
+	transcript.Entries[0].Citations[0].Sources = []codex.CitationSource{{URL: "https://example.test/source", Title: `Český "title" <script>`, Number: 1}}
+	s.presentTranscript(&transcript)
+	got := transcript.Entries[0]
+	if got.Text != canonical || got.ClientUserMessageDigest != "unchanged-digest" || !strings.Contains(got.HTML, `href="https://example.test/source"`) || !strings.Contains(got.HTML, `title="Český &#34;title&#34; &lt;script&gt;"`) || strings.Contains(got.HTML, "<script>") || strings.Count(got.HTML, token) != 1 {
+		t.Fatalf("citation composition: %#v", got)
+	}
+	if transcript.Entries[1].Text != "attachment envelope" || *transcript.Entries[1].DisplayText != display || len(transcript.Entries[1].Attachments) != 1 {
+		t.Fatal("user canonical/attachments changed")
+	}
+}

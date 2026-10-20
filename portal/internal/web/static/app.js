@@ -1,5 +1,6 @@
 (async () => {
   let refreshPolicy = null;
+  let sharedTranscriptPresentation = null, sharedTranscriptVisible = null;
   const apiPath = (slug, operation) => `/api/sessions/${encodeURIComponent(slug)}/${operation}`;
   const createRequest = (fetchRequest) => async (path, options = {}) => {
     const response = await fetchRequest(path, {
@@ -307,7 +308,11 @@
     const queryTab = new URLSearchParams(search).get("tab");
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
+  const transcriptEntryPresentation = entry => sharedTranscriptPresentation?.(entry) || {
+    kind: entry?.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry?.kind) ? "agent" : entry?.kind === "error" ? "error" : "event", team: false,
+  };
   const transcriptEntryVisible = (entry, filter) => {
+    if (sharedTranscriptVisible) return sharedTranscriptVisible(entry, filter);
     if (filter === "all" || entry?.kind === "error") return true;
     const messageKinds = new Set(["userMessage", "agentMessage", "reasoning", "plan"]);
     if (filter === "messages") return messageKinds.has(entry?.kind);
@@ -1183,7 +1188,9 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=18");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=19");
+  sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
+  sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");
@@ -3738,7 +3745,7 @@
     onChange: () => { if (optionalQuestionPanel) optionalQuestions.renderPinned(optionalQuestionPanel); },
     onPanelEmpty: () => document.getElementById("message-form")?.elements.message.focus({preventScroll: true}),
   });
-  const transcriptViews = new Map(["all", "messages", "activity"].map((filter) => [filter, {
+  const transcriptViews = new Map(["all", "messages", "team", "activity"].map((filter) => [filter, {
     disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
   }]));
   let planRenderGeneration = 0;
@@ -4294,7 +4301,8 @@
     if (time.title !== timestamp.title) time.title = timestamp.title;
   };
   const appendMessage = (entry, index, entries, disclosureStates) => {
-    const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
+    const presentation = transcriptEntryPresentation(entry);
+    const kind = presentation.kind;
     const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
     const details = entry.details || "";
     const html = entry.html || "";
@@ -4327,6 +4335,10 @@
       wrapMarkdownTables(element);
     } else {
       element.textContent = text;
+    }
+    if (presentation.team) {
+      const label = document.createElement("div"); label.className = "message-team-label";
+      label.textContent = presentation.label; element.prepend(label);
     }
     const questionControls = optionalQuestions?.inline(entry);
     if (questionControls) element.append(questionControls);
@@ -4495,8 +4507,7 @@
     repairHistoryButton.hidden = !historyNoticeState.warning;
     repairHistoryButton.disabled = Boolean(historyRead);
     historyStatus.textContent = historyNoticeState.warning ? historyError :
-      historyNoticeState.loading ? "Loading earlier messages…" :
-        pagingUnavailable ? "Older history is unavailable on this server." : "";
+      historyNoticeState.loading ? "Loading earlier messages…" : "";
     historyControls.hidden = !historyStatus.textContent && repairHistoryButton.hidden;
   };
   const observePageReceipts = (entries, threadID) => {

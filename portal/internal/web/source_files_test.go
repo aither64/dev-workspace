@@ -513,3 +513,35 @@ func TestSourceDownloadsReuseEligibilityAndPreserveBytes(t *testing.T) {
 	request("/api/sessions/example/file/download"+sourceQuery(".git/config"), 400)
 	request("/api/sessions/example/file/download?artifact=plan.md", 200)
 }
+
+func TestUserMarkdownUsesDecoratedTextWithoutChangingCanonicalInput(t *testing.T) {
+	s := newTestServer(t)
+	display := "# Display heading\n\n- item\n\n```sh\necho ok\n```\n\n[unsafe](javascript:alert(1))\n<script>alert(1)</script>"
+	original := "Canonical attachment envelope"
+	transcript := codex.Transcript{Entries: []codex.TranscriptEntry{{Kind: "userMessage", Text: original, DisplayText: &display}}}
+	s.presentTranscript(&transcript)
+	entry := transcript.Entries[0]
+	if entry.Text != original || entry.DisplayText == nil || *entry.DisplayText != display {
+		t.Fatal("canonical/decorated input changed")
+	}
+	for _, markup := range []string{"<h1>Display heading</h1>", "<ul>", "<pre><code"} {
+		if !strings.Contains(entry.HTML, markup) {
+			t.Fatalf("missing Markdown %s: %s", markup, entry.HTML)
+		}
+	}
+	if strings.Contains(entry.HTML, "javascript:") || strings.Contains(entry.HTML, "<script>") {
+		t.Fatalf("unsafe user HTML: %s", entry.HTML)
+	}
+	for _, text := range []string{"Team assignment from lead to implementer0:\n\nDo work.", "quoted Team assignment from lead to implementer0:\nDo work.", "Team assignment from <unsafe> to lead:\nDo work."} {
+		transcript.Entries = []codex.TranscriptEntry{{Kind: "userMessage", Text: text}}
+		s.presentTranscript(&transcript)
+		team := transcript.Entries[0].Communication
+		if strings.HasPrefix(text, "Team assignment from lead") {
+			if team == nil || team.From != "lead" || team.To != "implementer0" {
+				t.Fatalf("missing envelope: %#v", team)
+			}
+		} else if team != nil {
+			t.Fatalf("ambiguous envelope classified: %#v", team)
+		}
+	}
+}

@@ -94,7 +94,6 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
     await page.evaluate(() => {
       const log = document.getElementById("transcript");
       log.scrollTop = 260;
-      window.pagingViewport = log.getBoundingClientRect().top;
     });
     await page.waitForTimeout(50);
     assert.equal(olderReads, 0, "filter and resize restoration must not load history");
@@ -109,8 +108,16 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
       "native wheel scrolling must cross the top threshold");
     await expect(page.locator("#history-status")).toHaveText("Loading earlier messages…");
     assert.equal(await page.locator("#history-controls").evaluate(node => getComputedStyle(node).justifyContent), "center");
-    assert.equal(await page.locator("#transcript").evaluate(node => node.getBoundingClientRect().top),
-      await page.evaluate(() => window.pagingViewport), "loading status must not move the transcript");
+    const historyLayout = await page.evaluate(() => {
+      const notice = document.getElementById("history-controls"), log = document.getElementById("transcript");
+      const noticeBox = notice.getBoundingClientRect(), logBox = log.getBoundingClientRect();
+      return {position: getComputedStyle(notice).position, noticeHeight: noticeBox.height,
+        noticeBottom: noticeBox.bottom, transcriptTop: logBox.top, transcriptHeight: logBox.height};
+    });
+    assert.equal(historyLayout.position, "static", JSON.stringify(historyLayout));
+    assert(historyLayout.noticeHeight > 0 && historyLayout.transcriptHeight > 0, JSON.stringify(historyLayout));
+    assert(historyLayout.noticeBottom <= historyLayout.transcriptTop + 1,
+      "history loading must occupy normal layout space above, without covering the transcript: " + JSON.stringify(historyLayout));
     await page.mouse.wheel(0, -120);
     assert.equal(olderReads, 1, "one in-flight older read is allowed");
     await page.locator("#transcript").evaluate(node => new Promise(resolve => {
@@ -125,17 +132,20 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
       const log = document.getElementById("transcript");
       const anchor = [...log.querySelectorAll(".message")].find(node =>
         node.getBoundingClientRect().bottom > log.getBoundingClientRect().top);
-      window.pagingAnchor = {node: anchor, top: anchor.getBoundingClientRect().top};
+      window.pagingAnchor = {node: anchor,
+        offset: anchor.getBoundingClientRect().top - log.getBoundingClientRect().top};
     });
     await page.waitForTimeout(50);
-    assert.equal(await page.evaluate(() => window.pagingAnchor.node.getBoundingClientRect().top),
-      await page.evaluate(() => window.pagingAnchor.top), "held loading must preserve the anchor");
+    assert.equal(await page.evaluate(() => window.pagingAnchor.node.getBoundingClientRect().top -
+      document.getElementById("transcript").getBoundingClientRect().top),
+      await page.evaluate(() => window.pagingAnchor.offset), "held loading must preserve the within-transcript anchor");
     releaseFirstOlder();
     holdFirstOlder = false;
     await expect(page.locator("#transcript .message")).toHaveCount(200);
     const anchorShift = await page.evaluate(() => ({
       same: [...document.querySelectorAll("#transcript .message")].some(node => node === window.pagingAnchor.node),
-      shift: Math.abs(window.pagingAnchor.node.getBoundingClientRect().top - window.pagingAnchor.top),
+      shift: Math.abs(window.pagingAnchor.node.getBoundingClientRect().top -
+        document.getElementById("transcript").getBoundingClientRect().top - window.pagingAnchor.offset),
     }));
     assert.equal(anchorShift.same, true);
     assert(anchorShift.shift < 8, `older page moved the scroll anchor by ${anchorShift.shift}px`);
@@ -151,12 +161,15 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
       const log = document.getElementById("transcript");
       const anchor = [...log.querySelectorAll(".message")].find(node =>
         node.getBoundingClientRect().bottom > log.getBoundingClientRect().top);
-      window.retryAnchor = {node: anchor, top: anchor.getBoundingClientRect().top};
+      window.retryAnchor = {node: anchor,
+        offset: anchor.getBoundingClientRect().top - log.getBoundingClientRect().top};
     });
     releaseSecondError();
     await expect(page.locator("#history-status")).toContainText("Earlier messages could not be loaded");
+    assert(await page.evaluate(() => window.retryAnchor.node.isConnected), "error must retain the same message node");
     assert((await page.evaluate(() => Math.abs(window.retryAnchor.node.getBoundingClientRect().top -
-      window.retryAnchor.top))) < 8, "error status moved the scroll anchor");
+      document.getElementById("transcript").getBoundingClientRect().top - window.retryAnchor.offset))) < 8,
+      "error status moved the within-transcript scroll anchor");
     await expect(page.locator("#repair-history")).toBeVisible();
     await page.mouse.wheel(0, -120);
     assert.equal(olderReads, 2, "failure must pause automatic reads");
@@ -169,8 +182,10 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
     await page.locator("#repair-history").click();
     await expect(page.locator("#transcript .message")).toHaveCount(301);
     assert.equal(olderReads, 3, "Retry must repeat the failed older cursor");
+    assert(await page.evaluate(() => window.retryAnchor.node.isConnected), "retry must retain the same message node");
     assert((await page.evaluate(() => Math.abs(window.retryAnchor.node.getBoundingClientRect().top -
-      window.retryAnchor.top))) < 8, "retry prepend moved the scroll anchor");
+      document.getElementById("transcript").getBoundingClientRect().top - window.retryAnchor.offset))) < 8,
+      "retry prepend moved the within-transcript scroll anchor");
     await expect(page.locator("#repair-history")).toBeHidden();
     await page.evaluate(() => { document.getElementById("transcript").scrollTop = 0; });
     await page.mouse.wheel(0, -120);

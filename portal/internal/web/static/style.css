@@ -255,8 +255,8 @@ a.icon-button { display: inline-flex; align-items: center; justify-content: cent
 .chat-heading h2 { margin: 0; font-size: 1rem; }
 .conversation-connection { flex: none; font-size: .8rem; margin: .5rem 0 0; }
 .conversation-connection button { margin-left: .5rem; padding: .3rem .5rem; }
-.transcript-history { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
-.history-controls { position: absolute; z-index: 1; top: .2rem; left: 0; right: 0; display: flex; align-items: center; justify-content: center; gap: .65rem; padding: .45rem 0; color: var(--muted); font-size: .8rem; pointer-events: none; }
+.transcript-history { position: relative; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.history-controls { position: static; flex-shrink: 0; display: flex; align-items: center; justify-content: center; gap: .65rem; padding: .45rem 0; color: var(--muted); font-size: .8rem; pointer-events: none; }
 .history-controls[hidden], .lane-status[hidden] { display: none; }
 .history-controls button { padding: .35rem .6rem; font-size: .8rem; pointer-events: auto; }
 .lane-status { margin: .25rem 0; color: var(--warning); font-size: .8rem; }
@@ -270,7 +270,7 @@ a.icon-button { display: inline-flex; align-items: center; justify-content: cent
 .chat-heading { display: flex; align-items: center; gap: .5rem; }
 .chat-heading .transcript-filters { margin-left: .5rem; margin-right: 0; }
 .transcript { flex: 1; overflow-y: auto; min-height: 0; padding: 1.2rem .3rem; overscroll-behavior: contain; overflow-anchor: none; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: .7rem; }
-.transcript-history .transcript { padding-top: 3rem; }
+.transcript-history .transcript { padding-top: .5rem; }
 .message p:first-child { margin-top: 0; }
 .message p:last-child { margin-bottom: 0; }
 .message pre { overflow-x: auto; white-space: pre-wrap; }
@@ -557,3 +557,6 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
 .provider-operation details { font-size: .85rem; }
 .provider-operation code { overflow-wrap: anywhere; white-space: normal; }
 @media (max-width: 480px) { .provider-operation dl { grid-template-columns: 1fr; } .provider-operation dd { margin-bottom: .35rem; } }
+
+.message.team { background: #22223c; border-color: #8f83ce; color: var(--text); }
+.message-team-label { color: #c4b7ff; font-size: .75rem; font-weight: 600; margin-bottom: .4rem; }

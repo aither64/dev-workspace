@@ -185,7 +185,8 @@ const baseURL = process.argv[2];
       await expect(save).toBeDisabled(); await close.click(); await assertLayout();
     }
     await page.setViewportSize({width: 1280, height: 720});
-    await page.getByRole("tab", {name: "Team"}).click();
+    await page.getByRole("tablist", {name: "Session sections", exact: true})
+      .getByRole("tab", {name: "Team", exact: true}).click();
     const row = page.locator('[data-team-stats="architect0"]');
     await expect(row.locator('[data-team-metric="sent"]')).toHaveText("37");
     await expect(row.locator('[data-team-metric="received"]')).toHaveText("12");

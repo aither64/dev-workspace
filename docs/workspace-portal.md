@@ -106,9 +106,7 @@ source viewer in a new tab. The viewer shows line numbers and syntax highlightin
 **Copy content** copies the complete UTF-8 preview without line numbers.
 **Download** saves the original bytes, including binary files and files whose
 preview is omitted, up to 10 MiB. Larger files cannot be downloaded through this
-endpoint. A link
-
-ending in `:10`, `:10:5` or `#L10` selects line 10. Clicking a line number updates
+endpoint. A link ending in `:10`, `:10:5` or `#L10` selects line 10. Clicking a line number updates
 the address; **Copy link** copies that address. Links without a line reference
 open the beginning of the file.
 
@@ -349,20 +347,29 @@ confirmed pair.
 
 Browser refresh timings come from codex-web's `conversation/assets/refresh.js`.
 That policy contains resource intervals, deadlines, retry backoff and notice
-delays. Background refreshes keep the last values visible. Initial transcript loading
-appears after 750 ms and manual older-history loading after 250 ms. Routine index
+delays. Background refreshes keep the last values visible. Initial transcript
+loading appears after 750 ms and manual older-history loading after 250 ms. Routine index
 status loading is silent, and membership is published before optional repository,
-activity and cluster enrichment. The additive `runningClustersKnown` display flag distinguishes unknown counts
-from measured zero; older assets keep the integer `runningClusters` fallback.
+activity and cluster enrichment. The additive `runningClustersKnown` display flag
+distinguishes unknown counts from measured zero; older assets keep the integer `runningClusters` fallback.
 An absent flag retains legacy numeric behavior. Unknown counts do not grant
-controls or generate notifications. Refresh
-failures appear after 30 continuous visible seconds; returning to a hidden tab
+controls or generate notifications. Refresh failures appear after 30 continuous visible seconds; returning to a hidden tab
 or restoring a page starts a fresh grace period. Access errors and failures of
 user actions appear immediately.
 
 Index snapshot warnings use the same grace period as failed HTTP refreshes,
 including when the server successfully returns its last known state. Repeated
 warnings do not restart the grace period. A healthy snapshot clears the warning.
+
+User messages use the same sanitized Markdown renderer as assistant messages.
+Attachment decoration runs before presentation, so generated file-reference
+envelopes do not appear in the rendered message. Canonical message text and
+receipt digests stay unchanged. Team assignments and reports have a distinct color
+and identify the sender and recipient when available. **Messages** hides team
+traffic; **Team** shows it;
+**All** includes it; **Activity** shows other activity. Errors remain visible in
+every view. Communication labels are presentation hints; they do not authenticate
+identities or grant access.
 
 Message times come from recorded item timing when available. While metadata
 loads, the portal keeps an exact time already observed for that entry. For a
@@ -383,6 +390,8 @@ confirmation retires the receipt normally. Sending revised wording creates a sep
 does not resolve the earlier one. Browser storage must save a dismissal before
 the portal hides it.
 
+Successful legacy history fallback is silent. History notices and manual retry
+controls occupy normal layout space above the transcript.
 Automatic history repair retries with capped backoff without loading banners.
 A manual older-page failure offers Retry for that page. Expired cursors trigger
 reconnection and a check of retained history. Servers without paging keep the
