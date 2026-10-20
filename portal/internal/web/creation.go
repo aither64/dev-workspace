@@ -49,7 +49,11 @@ func (s *Server) withCreationMutation(w http.ResponseWriter, r *http.Request, mu
 	defer cancel()
 	unlock, err := s.lockTransitionContext(ctx)
 	if err != nil {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Workspace runtime is changing. Retry shortly."})
+		message := "Workspace runtime is temporarily unavailable. Retry shortly."
+		if errors.Is(err, context.DeadlineExceeded) {
+			message = "Workspace settings are being updated. Retry shortly."
+		}
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": message})
 		return
 	}
 	defer unlock()

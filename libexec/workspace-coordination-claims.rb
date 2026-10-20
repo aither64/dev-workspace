@@ -157,6 +157,17 @@ module WorkspaceCoordination
     end
 
     def create_resource_claim(owner, input, resources, wait:)
+      # The collector rechecks held resources while owning this guard. A new
+      # grant must not race the gap between that check and worktree removal.
+      result = store.lock('preparation', mode: File::LOCK_SH, nonblock: true) do
+        create_resource_claim_ready(owner, input, resources, wait: wait, grant: true)
+      end
+      return result if result
+      raise Error.new('retained preparation waits for payload collection', 75) unless wait
+      create_resource_claim_ready(owner, input, resources, wait: true, grant: false)
+    end
+
+    def create_resource_claim_ready(owner, input, resources, wait:, grant:)
       request = WorkspaceCoordination.canonical(input)
       store.lock do
         ledger, value = store.read, store.claims
@@ -172,7 +183,7 @@ module WorkspaceCoordination
           'state' => 'waiting', 'revision' => 1, 'sequence' => value['claims'].length + 1,
           'createdAt' => now, 'updatedAt' => now, 'notificationPending' => false}
         value['claims'][item['id']] = item
-        blocked = claim_blocked?(ledger, value, item)
+        blocked = !grant || claim_blocked?(ledger, value, item)
         raise Error.new('retained preparation waits for resource ownership', 75) if blocked && !wait
         item['state'] = 'held' unless blocked
         store.admission_capacity!(ledger, extra: blocked && owner['thread'] ? MAX_RESULT + 64 : 0)
@@ -226,6 +237,10 @@ module WorkspaceCoordination
     # Session admission surrounds this call. Ownership is persisted first;
     # delivery uses the existing durable outbox and can never grant resources.
     def tick_claims(owner)
+      store.lock('preparation', mode: File::LOCK_SH, nonblock: true) { tick_claims_ready(owner) }
+    end
+
+    def tick_claims_ready(owner)
       current_generation!
       store.claims['claims'].values.select { |item| item['ownerId'] == owner['id'] && item['state'] == 'waiting' }.sort_by { |item| item['sequence'] }.each do |saved|
         resources = claim_resources_for(owner, saved['request'])

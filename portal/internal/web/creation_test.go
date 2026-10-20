@@ -26,6 +26,52 @@ type creationTestCodex struct {
 	release <-chan struct{}
 }
 
+func TestCreationAdmissionSharesGenerationWithPayloadCollection(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	collector, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Close()
+	if err := unix.Flock(int(collector.Fd()), unix.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = path
+	response := postPreparation(t, server, preparationTestID(211), "Work while maintenance runs", "concurrent-session", nil)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("collection refused session creation: %d %s", response.Code, response.Body.String())
+	}
+	if record := awaitPreparation(t, server, preparationTestID(211)); record.Slug != "2026-10-03-concurrent-session" || record.Handoff == nil {
+		t.Fatal("collection blocked session handoff")
+	}
+}
+
+func TestCreationAdmissionDistinguishesRuntimeUpdateFromUnavailableLock(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "transition.lock")
+	transition, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transition.Close()
+	if err := unix.Flock(int(transition.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	server.config.TransitionLock = path
+	response := postPreparation(t, server, preparationTestID(212), "New work", "updated-session", nil)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "settings are being updated") {
+		t.Fatalf("update refusal=%d %s", response.Code, response.Body.String())
+	}
+	server.config.TransitionLock = path + ".missing"
+	response = postPreparation(t, server, preparationTestID(212), "New work", "updated-session", nil)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "runtime is temporarily unavailable") {
+		t.Fatalf("unavailable lock=%d %s", response.Code, response.Body.String())
+	}
+}
+
 func (client *creationTestCodex) ListModels(ctx context.Context) ([]codex.Model, error) {
 	if client.entered != nil {
 		select {

@@ -136,14 +136,14 @@ module WorkspaceCoordination
       @root = File.join(File.expand_path(state), 'coordination')
     end
 
-    def lock(name = 'ledger', nonblock: false)
+    def lock(name = 'ledger', nonblock: false, mode: File::LOCK_EX)
       FileUtils.mkdir_p(root, mode: 0o700)
       stat = File.lstat(root)
       raise Error.new('coordination directory has unsafe identity', 5) unless stat.directory? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
       path = File.join(root, "#{name}.lock")
       raise Error.new('coordination lock is a symlink', 5) if File.symlink?(path)
       File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
-        return false unless file.flock(File::LOCK_EX | (nonblock ? File::LOCK_NB : 0))
+        return false unless file.flock(mode | (nonblock ? File::LOCK_NB : 0))
         yield
       end
     end
@@ -1356,6 +1356,10 @@ module WorkspaceCoordination
 
     def claim(owner_id: nil)
       current_generation!
+      store.lock('preparation', mode: File::LOCK_SH, nonblock: true) { claim_ready(owner_id: owner_id) } || []
+    end
+
+    def claim_ready(owner_id:)
       store.transaction do |data|
         next [] if data['suspended']
         active = data['jobs'].values.select { |job| CLAIMED.include?(job['state']) }

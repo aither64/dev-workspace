@@ -3,6 +3,7 @@
 require 'minitest/autorun'
 require 'tmpdir'
 require 'stringio'
+require 'timeout'
 require_relative '../libexec/workspace-coordination-execution'
 require_relative 'support/coordination_fixture'
 load File.expand_path('../libexec/workspace-host', __dir__)
@@ -42,6 +43,32 @@ class CoordinationClaimsTest < Minitest::Test
     assert_equal [item], @engine.status(person['slug'])['claims']
     %w[sources commands attempts].each { |name| refute File.exist?(File.join(@engine.store.root, name)) }
     assert_raises(WorkspaceCoordination::Error) { acquire(person, argv: ['true']) }
+  end
+
+  def test_new_claim_cannot_enter_during_payload_collection
+    person = owner('collection-admission')
+    item = nil
+    @engine.store.lock('preparation') do
+      item = Timeout.timeout(1) { acquire(person) }
+      assert_equal 'waiting', item['state']
+      assert_empty @engine.store.held_claim_resources
+    end
+    @engine.tick_claims(person)
+    assert_equal 'held', @engine.store.claims['claims'][item['id']]['state']
+  end
+
+  def test_queued_grants_wait_for_collection_without_blocking_the_scheduler
+    first, second = owner('collection-holder'), owner('collection-waiter')
+    held, waiting = acquire(first), acquire(second)
+    @engine.change_claim(first, held['id'], 'release')
+    @engine.store.lock('preparation') do
+      Timeout.timeout(1) { @engine.tick_claims(second) }
+      assert_equal 'waiting', @engine.store.claims['claims'][waiting['id']]['state']
+      assert_empty @engine.store.read['outbox']
+    end
+    @engine.tick_claims(second)
+    assert_equal 'held', @engine.store.claims['claims'][waiting['id']]['state']
+    assert_equal 1, @engine.store.read['outbox'].length
   end
 
   def test_fifo_grants_and_durable_notification_follow_explicit_release

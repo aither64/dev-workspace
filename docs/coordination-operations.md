@@ -233,7 +233,9 @@ by ordinary Nix GC.
 
 `retention.json` is separate schema-1 bookkeeping for leases and interrupted
 worktree removal. Existing ledger, snapshot and artifact formats are unchanged.
-The profile transition guard excludes new preparations and package switches;
+Collection shares generation admission with session creation. A separate payload
+guard excludes new preparations, and package switches retain exclusive generation
+admission. Routine collection does not prevent creating sessions;
 legacy in-flight preparation commands also postpone collection. Deletion runs
 outside ledger transactions. A changed ledger stops the current sweep, and
 interrupted worktree removal resumes from its recorded exact path/common Git

@@ -216,14 +216,16 @@ module DevWorkspaceHost
 
     def coordination_prepare(engine, owner, request)
       with_current_generation_lock(mode: File::LOCK_SH) do
-        engine.current_generation!
-        repository = case request.fetch('kind')
-        when 'merge' then request.fetch('repository')
-        when 'machine_activate' then engine.catalog.machine(request.fetch('target')).fetch('configurationRepository')
-        when 'profile_activate' then 'workspace'
-        else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
+        engine.store.lock('preparation', mode: File::LOCK_SH) do
+          engine.current_generation!
+          repository = case request.fetch('kind')
+          when 'merge' then request.fetch('repository')
+          when 'machine_activate' then engine.catalog.machine(request.fetch('target')).fetch('configurationRepository')
+          when 'profile_activate' then 'workspace'
+          else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
+          end
+          engine.with_repository_claim(owner, repository) { coordination_prepare_owned(engine, owner, request) }
         end
-        engine.with_repository_claim(owner, repository) { coordination_prepare_owned(engine, owner, request) }
       end
     end
 
@@ -289,14 +291,16 @@ module DevWorkspaceHost
       end.parse!(argv)
       raise WorkspaceCoordination::Error, 'unexpected coordination gc arguments' unless argv.empty?
       entry = registry.entries.first || raise(WorkspaceCoordination::Error, 'no registered workspace')
-      with_current_generation_lock do
-        result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply])
-        if options[:json]
-          @out.puts JSON.generate(result)
-        else
-          @out.puts "#{result['mode']}: #{result['actions'].length} collectible payloads/roots; #{result['removed'].length} removed"
-          result['actions'].each { |item| @out.puts "#{item['kind']}: #{item['path']}" }
-          @out.puts 'Ledger changed; the next sweep will revalidate remaining work.' if result['retry']
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        coordination_store.lock('preparation') do
+          result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply])
+          if options[:json]
+            @out.puts JSON.generate(result)
+          else
+            @out.puts "#{result['mode']}: #{result['actions'].length} collectible payloads/roots; #{result['removed'].length} removed"
+            result['actions'].each { |item| @out.puts "#{item['kind']}: #{item['path']}" }
+            @out.puts 'Ledger changed; the next sweep will revalidate remaining work.' if result['retry']
+          end
         end
       end
     end
@@ -377,17 +381,7 @@ module DevWorkspaceHost
           request = coordination_input(options.fetch(:request))
           WorkspaceCoordination.keys!(request, %w[schema requestId kind evidence])
           raise WorkspaceCoordination::Error, 'candidate prepares only profile activation' unless request['kind'] == 'profile_activate'
-          retained = engine.retain_commit(path, head)
-          # Artifact provenance uses the retained exact source, not a mutable
-          # caller checkout. Its complete identity must equal the built source.
-          raise WorkspaceCoordination::Error.new('candidate retained source differs', 3) unless coordination_source_identity(retained) == prepared['sourceIdentity']
-          prepared['source'] = retained
-          prepared['coverage'] = engine.coverage(retained, 'workspace', head)
-          artifact = engine.save_artifact(prepared)
-          engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
-          operation = {'preparedArtifact' => artifact['id'], 'candidatePackage' => artifact['candidatePackage'],
-            'expectedProfileToken' => token, 'coverage' => artifact['coverage']}
-          @out.puts JSON.generate(engine.prepare_snapshot(owner, 'profile_activate', operation, request['evidence']))
+          @out.puts JSON.generate(prepare_candidate_snapshot(engine, owner, path, head, prepared, request))
         else
           job = engine.store.read['jobs'][options[:job]]
           unless job && job['ownerId'] == owner['id'] && job['reservationId'] == reservation['id'] &&
@@ -408,6 +402,22 @@ module DevWorkspaceHost
       end
     ensure
       @candidate_recovery = nil
+    end
+
+    def prepare_candidate_snapshot(engine, owner, path, head, prepared, request)
+      engine.store.lock('preparation', mode: File::LOCK_SH) do
+        retained = engine.retain_commit(path, head)
+        # Artifact provenance uses the retained exact source, not a mutable
+        # caller checkout. Its complete identity must equal the built source.
+        raise WorkspaceCoordination::Error.new('candidate retained source differs', 3) unless coordination_source_identity(retained) == prepared['sourceIdentity']
+        prepared['source'] = retained
+        prepared['coverage'] = engine.coverage(retained, 'workspace', head)
+        artifact = engine.save_artifact(prepared)
+        engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
+        operation = {'preparedArtifact' => artifact['id'], 'candidatePackage' => artifact['candidatePackage'],
+          'expectedProfileToken' => prepared.fetch('profileToken'), 'coverage' => artifact['coverage']}
+        engine.prepare_snapshot(owner, 'profile_activate', operation, request['evidence'])
+      end
     end
 
     def claim_workflow_selected?
@@ -454,6 +464,10 @@ module DevWorkspaceHost
     end
 
     def prepare_profile_command(argv)
+      coordination_store.lock('preparation', mode: File::LOCK_SH) { prepare_profile_artifact(argv) }
+    end
+
+    def prepare_profile_artifact(argv)
       argv = argv.reject { |argument| argument == '--json' }
       prepared = prepare_profile(argv)
       entry = registry.select(cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])

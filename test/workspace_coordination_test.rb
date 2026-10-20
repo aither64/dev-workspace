@@ -13,6 +13,108 @@ class WorkspaceCoordinationTest < Minitest::Test
   include CoordinationCapacityFixture
   include CoordinationFixture
 
+  def test_collection_shares_generation_with_sessions_but_excludes_preparation_and_switches
+    host = DevWorkspaceHost::Host.new(env: {'HOME' => @tmp, 'DEV_WORKSPACES_STATE' => @state,
+      'DEV_WORKSPACES_PROFILE' => @profile, 'DEV_WORKSPACES_CONFIG' => File.join(@tmp, 'registry.json')},
+      out: StringIO.new, err: StringIO.new)
+    package, engine, entry = @package, @engine, @entry
+    host.define_singleton_method(:package_root) { package }
+    host.define_singleton_method(:registry) { Struct.new(:entries).new([entry]) }
+    host.define_singleton_method(:coordination_engine) { |_entry| engine }
+    preparing, release_preparation, collecting, release_collection = 4.times.map { Queue.new }
+    host.define_singleton_method(:coordination_prepare_owned) do |*_args|
+      preparing << true
+      release_preparation.pop
+    end
+    collector = Object.new
+    collector.define_singleton_method(:call) do |apply:|
+      collecting << true
+      release_collection.pop
+      {'mode' => apply ? 'apply' : 'dry-run', 'actions' => [], 'removed' => [], 'preserved' => []}
+    end
+    original_collector = WorkspaceCoordination::Collector.method(:new)
+    WorkspaceCoordination::Collector.define_singleton_method(:new) { |_engine| collector }
+    begin
+      preparation = Thread.new { host.send(:coordination_prepare, engine, {}, {'kind' => 'merge', 'repository' => 'code'}) }
+      Timeout.timeout(5) { preparing.pop }
+      collection = Thread.new { host.send(:coordination_collect_command, ['--apply', '--json']) }
+      # Collection cannot begin until an already-admitted preparation finishes.
+      assert_raises(Timeout::Error) { Timeout.timeout(0.1) { collecting.pop } }
+      release_preparation << true
+      Timeout.timeout(5) { preparation.value; collecting.pop }
+      path = File.join(@state, 'transition.lock')
+      File.open(path, File::RDWR) do |session|
+        assert session.flock(File::LOCK_SH | File::LOCK_NB), 'session creation must remain available during collection'
+      end
+      File.open(path, File::RDWR) do |activation|
+        refute activation.flock(File::LOCK_EX | File::LOCK_NB), 'package activation must still wait for collection'
+      end
+      refute engine.store.lock('preparation', mode: File::LOCK_SH, nonblock: true) { true },
+        'new payload preparation must still wait for collection'
+      release_collection << true
+      Timeout.timeout(5) { collection.value }
+    ensure
+      [preparation, collection].compact.each { |thread| thread.kill.join if thread.alive? }
+      WorkspaceCoordination::Collector.define_singleton_method(:new, original_collector)
+    end
+  end
+
+  def test_admitted_collection_excludes_candidate_publication_and_retained_job_grants
+    configure_machine
+    @catalog['repositories']['workspace'] = @catalog['repositories'].fetch('code').dup
+    install_catalog
+    @engine = engine
+    first, second = owner('collected-candidate'), owner('retained-grant')
+    checkout = feature(first)
+    head = git('-C', checkout, 'rev-parse', 'HEAD').strip
+    snapshot = @engine.prepare_merge(first, 'code', evidence(first))
+    finished = @engine.mutate(first, 'submit', request('kind' => 'merge', 'dependsOn' => [],
+      'approvalId' => approval(first, snapshot), 'reservationId' => nil, 'snapshot' => snapshot))
+    @engine.mutate(first, 'cancel', request('expectedRevision' => finished['revision'], 'reason' => 'finished fixture'), job_id: finished['id'])
+    queued = submit_merge(second)
+    host = DevWorkspaceHost::Host.new(env: {'HOME' => @tmp, 'DEV_WORKSPACES_STATE' => @state,
+      'DEV_WORKSPACES_PROFILE' => @profile}, out: StringIO.new, err: StringIO.new)
+    prepared = {'schema' => 1, 'kind' => 'profile', 'candidatePackage' => @package,
+      'profileToken' => DevWorkspaceProfileIdentity.token(@profile),
+      'sourceIdentity' => host.send(:coordination_source_identity, checkout)}
+    removing, finish_removal, publishing = 3.times.map { Queue.new }
+    paused = false
+    original_capture = @engine.method(:capture)
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      if !paused && args.include?('worktree') && args.include?('remove')
+        paused = true
+        removing << true
+        finish_removal.pop
+      end
+      original_capture.call(*args, **options)
+    end
+    original_retain = @engine.method(:retain_commit)
+    @engine.define_singleton_method(:retain_commit) do |*args, **options|
+      publishing << true
+      original_retain.call(*args, **options)
+    end
+    collector = WorkspaceCoordination::Collector.new(@engine)
+    collection = Thread.new { @engine.store.lock('preparation') { collector.call(apply: true) } }
+    Timeout.timeout(5) { removing.pop }
+    # Removal has passed its final resource check and is paused at Git itself.
+    assert_empty Timeout.timeout(1) { @engine.claim(owner_id: second['id']) }
+    assert_nil @engine.store.read['jobs'].fetch(queued['id'])['attempt']
+    candidate = Thread.new do
+      host.send(:prepare_candidate_snapshot, @engine, first, checkout, head, prepared, {'evidence' => evidence(first)})
+    end
+    assert_raises(Timeout::Error) { Timeout.timeout(0.1) { publishing.pop } }
+    finish_removal << true
+    result = Timeout.timeout(5) { collection.value }
+    assert_equal 2, result['removed'].count { |item| item['kind'] == 'worktree' }
+    fresh = Timeout.timeout(5) { candidate.value }
+    artifact = @engine.artifact!(fresh.dig('operation', 'preparedArtifact'))
+    assert File.directory?(artifact['source'])
+    assert_equal head, git('-C', artifact['source'], 'rev-parse', 'HEAD').strip
+    assert_equal queued['id'], @engine.claim(owner_id: second['id']).first['id']
+  ensure
+    [collection, candidate].compact.each { |thread| thread.kill.join if thread.alive? }
+  end
+
   def test_sensitive_owner_prepares_local_evidence_without_tracking_commit
     first = owner('sensitive')
     manifest_path = File.join(@workspace, 'work', 'sensitive', 'portal.yml')

@@ -69,8 +69,9 @@ module WorkspaceCoordination
     end
   end
 
-  # Caller holds the existing exclusive profile-transition guard. Old and new
-  # preparation commands already hold its shared side. Workers may finish, but
+  # Caller shares generation admission and exclusively holds the payload
+  # preparation guard. Session creation can proceed during a sweep; package
+  # switches and payload preparation remain excluded. Workers may finish, but
   # their claims remain roots and a changed ledger stops the current sweep.
   class Collector
     SOURCE = /\A[0-9a-f]{40}\z/
