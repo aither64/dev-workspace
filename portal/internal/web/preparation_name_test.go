@@ -83,6 +83,37 @@ func TestSessionPreparationNamingFailureKeepsRequestAndUploads(t *testing.T) {
 	}
 }
 
+func TestSessionPreparationProductionNamingFailureStillCreatesWithOriginalRequest(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.NamingSocket = filepath.Join(t.TempDir(), "missing.sock")
+	server.config.SessionNamer = server.normalSessionName
+	scope, file := preparationReadyFile(t, server)
+	prompt := "Preserve the complete request and accepted file."
+	extra := url.Values{"uploadScope": {scope.ID}, "attachmentIds": {file.ID}}
+	id := preparationTestID(210)
+	if response := postPreparation(t, server, id, prompt, "", extra); response.Code != http.StatusAccepted {
+		t.Fatal(response.Body.String())
+	}
+	record := awaitPreparation(t, server, id)
+	if record.Base != "development-session" || record.Slug != "2026-10-03-development-session" || record.Handoff == nil || record.NamingOutcome != "utility_error" {
+		t.Fatalf("naming failure prevented handoff: %#v", record)
+	}
+	if record.Snapshot.Input.RawPrompt != prompt || !reflect.DeepEqual(record.Snapshot.Input.Attachments, []string{file.ID}) {
+		t.Fatal("fallback changed the request or accepted files")
+	}
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		t.Error("exact retry repeated naming")
+		return "", errors.New("unavailable")
+	}
+	if replay := postPreparation(t, server, id, prompt, "", extra); replay.Code != http.StatusAccepted {
+		t.Fatal(replay.Body.String())
+	}
+	if current := awaitPreparation(t, server, id); current.Slug != record.Slug || current.ReceiptID != record.ReceiptID {
+		t.Fatal("retry replaced the accepted session")
+	}
+}
+
 func TestSessionPreparationCustomNameCollisionAndLostResponse(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

@@ -17,6 +17,7 @@ import (
 var generatedSessionName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+){1,5}$`)
 
 var errSessionNaming = errors.New("Automatic naming failed. Retry naming or enter a custom name.")
+var errSessionNamingFallback = errors.New("automatic naming unavailable; use a neutral name")
 
 // The adapter supplies exactly one JSON object. It owns model selection and
 // isolation; no caller may derive utility settings from a development team.
@@ -97,7 +98,7 @@ func (s *Server) namePreparation(ctx context.Context, raw, provider string) (str
 				return "", "", ctx.Err()
 			}
 			s.config.Logger.Printf("session naming duration_ms=%d outcome=timeout category=queue", time.Since(started).Milliseconds())
-			return "", "timeout", errSessionNaming
+			return "development-session", "timeout", nil
 		}
 		output, err := s.config.SessionNamer(budget, namingPrompt(raw), provider)
 		if ctx.Err() != nil {
@@ -105,9 +106,15 @@ func (s *Server) namePreparation(ctx context.Context, raw, provider string) (str
 		}
 		if budget.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
 			outcome, category = "timeout", "deadline"
+			if errors.Is(err, errSessionNamingFallback) {
+				result = "development-session"
+			}
 		} else if err != nil {
 			outcome = "utility_error"
 			category = sessionNamingErrorCategory(err)
+			if errors.Is(err, errSessionNamingFallback) {
+				result = "development-session"
+			}
 		} else {
 			result, err = parseSessionName(output)
 			if err != nil {

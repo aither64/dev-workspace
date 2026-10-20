@@ -145,8 +145,12 @@ complete creation workflow described in the README.
 The portal owns one naming-only Codex App Server for its service lifetime.
 The text-only adapter uses that private socket; ordinary conversations keep
 their existing App Server and dynamic catalog. An injected adapter remains
-available for tests. Startup, readiness or runtime failure stops preparation before reserving a
-slug. The request and accepted files remain saved for retry or a custom name.
+available for tests. When the naming utility is unavailable or fails, production
+creation continues with the neutral name `development-session` and ordinary
+collision suffixes. The original request, files, provider and execution settings
+are preserved. Naming outcomes remain diagnostic; a model failure does not prevent
+starting work. Explicit cancellation still stops preparation. Supply a custom
+name before creation when a particular session slug is required.
 The adapter receives at most 8192 raw UTF-8 bytes and
 returns one JSON object containing only `name`. A generated name must contain
 two to six lowercase ASCII alphanumeric words separated by hyphens and fit

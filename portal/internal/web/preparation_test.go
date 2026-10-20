@@ -278,7 +278,7 @@ func TestSessionNameTimeoutIncludesSemaphoreQueue(t *testing.T) {
 	}
 	started := time.Now()
 	name, outcome, err := server.namePreparation(context.Background(), "queued naming prompt", "")
-	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "timeout" {
+	if err != nil || name != "development-session" || outcome != "timeout" {
 		t.Fatal(name, outcome, err)
 	}
 	if elapsed := time.Since(started); elapsed < 9*time.Second || elapsed > 12*time.Second {

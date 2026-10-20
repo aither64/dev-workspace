@@ -367,14 +367,22 @@ pkgs.testers.runNixOSTest {
             assert restored == {"model": "gpt-5.5", "reasoningEffort": "high"}, restored
             proof("explicit-fork", "alternate")
 
-        with subtest("failed naming renders a selectable, copyable error and retries the same request"):
+        with subtest("failed naming creates usable sessions with distinct fallback names"):
             user("touch /tmp/creation-model/bad-name")
-            browser("admit", "naming-error", auto=True, provider="alternate")
-            browser("failed", "naming-error")
-            user("rm /tmp/creation-model/bad-name")
-            browser("retry", "naming-error", error=True)
+            browser("create", "naming-error", auto=True, provider="alternate", attachment=True)
             proof("naming-error", "alternate")
-            naming_proof("naming-error", "alternate", attempts=2)
+            naming_proof("naming-error", "alternate")
+            first = checkpoint("naming-error")
+            assert first["slug"].endswith("-development-session"), first
+            initial = [entry for entry in first["transcript"]["entries"] if first["marker"] in entry.get("text", "")]
+            assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
+            browser("create", "naming-collision", auto=True)
+            proof("naming-collision", "primary")
+            naming_proof("naming-collision", "primary")
+            second = checkpoint("naming-collision")
+            assert second["slug"].startswith(first["slug"] + "-"), second
+            assert first["threadId"] != second["threadId"], (first, second)
+            user("rm /tmp/creation-model/bad-name")
 
         # Transport faults forward only real native responses. The application
         # binaries, protocol and ordinary service endpoints remain unchanged.

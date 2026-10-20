@@ -36,9 +36,19 @@ func (s *Server) normalSessionName(ctx context.Context, input, selected string) 
 	if err != nil {
 		return "", err
 	}
+	if s.config.NamingSocket == "" || s.config.NamingModelCatalogFile == "" {
+		return "", errors.Join(errSessionNamingFallback, codex.ErrEphemeralServer)
+	}
 	client := codex.NewWithOptions(s.config.NamingSocket, codex.ClientOptions{ClientInfo: codex.ClientInfo{Name: "dev-workspace-session-namer", Title: "Session Naming", Version: "0.1.0"}})
 	defer client.Close()
-	return modelSessionName(ctx, input, provider, client, s.operationStore, s.config.NamingModelCatalogFile)
+	name, err := modelSessionName(ctx, input, provider, client, s.operationStore, s.config.NamingModelCatalogFile)
+	if err == nil {
+		_, err = parseSessionName(name)
+	}
+	if err != nil {
+		return "", errors.Join(errSessionNamingFallback, err)
+	}
+	return name, err
 }
 
 func (s *Server) sessionNamingProvider(selected string) (string, error) {

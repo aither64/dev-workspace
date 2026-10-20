@@ -487,7 +487,7 @@ func New(config Config) (*Server, error) {
 		installedTeams:     installedTeams,
 		namingSlots:        make(chan struct{}, 2),
 	}
-	if config.SessionNamer == nil && config.NamingSocket != "" && config.NamingModelCatalogFile != "" {
+	if config.SessionNamer == nil && (config.NamingSocket != "" || config.NamingModelCatalogFile != "") {
 		server.config.SessionNamer = server.normalSessionName
 	}
 	if err := server.loadPreparations(); err != nil {

@@ -317,7 +317,8 @@ func serve(args []string) error {
 	defer stop()
 	naming := startNamingRuntime(options.packageRoot, options.unixSocket, options.workspaceName, logger)
 	defer naming.Close()
-	var namingSocket, namingCatalog string
+	var namingSocket string
+	namingCatalog := filepath.Join(options.packageRoot, "share/workspace-portal/codex-models.json")
 	if naming != nil {
 		namingSocket, namingCatalog = naming.socket, naming.catalog
 	}
