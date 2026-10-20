@@ -349,8 +349,13 @@ confirmed pair.
 
 Browser refresh timings come from codex-web's `conversation/assets/refresh.js`.
 That policy contains resource intervals, deadlines, retry backoff and notice
-delays. Background refreshes keep the last values visible. Initial loading
-appears after 750 ms and manual older-history loading after 250 ms. Refresh
+delays. Background refreshes keep the last values visible. Initial transcript loading
+appears after 750 ms and manual older-history loading after 250 ms. Routine index
+status loading is silent, and membership is published before optional repository,
+activity and cluster enrichment. The additive `runningClustersKnown` display flag distinguishes unknown counts
+from measured zero; older assets keep the integer `runningClusters` fallback.
+An absent flag retains legacy numeric behavior. Unknown counts do not grant
+controls or generate notifications. Refresh
 failures appear after 30 continuous visible seconds; returning to a hidden tab
 or restoring a page starts a fresh grace period. Access errors and failures of
 user actions appear immediately.

@@ -191,7 +191,11 @@ func (s *Server) refreshDisplaySnapshots(ctx context.Context, full bool) (result
 		}
 	}
 	if full {
-		result := s.computeIndexStatusWithPending(ctx, pending, nil)
+		result := s.computeIndexStatusPublishing(ctx, pending, nil, func(membership cachedIndexStatus) {
+			s.indexStatusMu.Lock()
+			s.indexStatusCache = membership
+			s.indexStatusMu.Unlock()
+		})
 		if err := ctx.Err(); err != nil {
 			return err
 		}

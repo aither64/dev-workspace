@@ -109,15 +109,16 @@ type cachedRepositories struct {
 }
 
 type indexSessionStatus struct {
-	Sensitive           bool      `json:"sensitive,omitempty"`
-	ObservationIdentity string    `json:"observationIdentity"`
-	Slug                string    `json:"slug"`
-	UpdatedAt           time.Time `json:"updatedAt"`
-	Archived            bool      `json:"archived"`
-	RepositoryCount     int       `json:"repositoryCount"`
-	RunningClusters     int       `json:"runningClusters"`
-	ClusterNotice       string    `json:"clusterNotice,omitempty"`
-	PendingLifecycle    string    `json:"pendingLifecycle,omitempty"`
+	Sensitive            bool      `json:"sensitive,omitempty"`
+	ObservationIdentity  string    `json:"observationIdentity"`
+	Slug                 string    `json:"slug"`
+	UpdatedAt            time.Time `json:"updatedAt"`
+	Archived             bool      `json:"archived"`
+	RepositoryCount      int       `json:"repositoryCount"`
+	RunningClusters      int       `json:"runningClusters"`
+	RunningClustersKnown bool      `json:"runningClustersKnown"`
+	ClusterNotice        string    `json:"clusterNotice,omitempty"`
+	PendingLifecycle     string    `json:"pendingLifecycle,omitempty"`
 }
 
 type cachedIndexStatus struct {
@@ -979,9 +980,7 @@ func (s *Server) indexStatus(w http.ResponseWriter, r *http.Request) {
 	s.indexStatusMu.Unlock()
 	operations, _ := s.lifecycleOperations()
 	loading := result.created.IsZero() && result.warning == ""
-	if loading {
-		result.warning = "Session status is loading."
-	}
+
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": result.statuses, "generatedAt": result.created,
@@ -1002,6 +1001,10 @@ func (s *Server) computeIndexStatus(ctx context.Context) cachedIndexStatus {
 }
 
 func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[string]session.LifecycleProgress, pendingErr error) cachedIndexStatus {
+	return s.computeIndexStatusPublishing(ctx, pending, pendingErr, nil)
+}
+
+func (s *Server) computeIndexStatusPublishing(ctx context.Context, pending map[string]session.LifecycleProgress, pendingErr error, publish func(cachedIndexStatus)) cachedIndexStatus {
 	result := cachedIndexStatus{}
 	summaries, err := s.listSessionsWithPending(pending, pendingErr)
 	operations, _ := s.lifecycleOperations()
@@ -1013,6 +1016,28 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 	if err != nil {
 		s.config.Logger.Printf("list sessions for index status: %v", err)
 		result.warning = "Some session status is unavailable."
+	}
+	// Publish membership before any optional Git, activity or cluster inspection.
+	// Counts stay integers for old assets; only same-identity measured cache is known.
+	if publish != nil {
+		minimal := cachedIndexStatus{authoritative: result.authoritative, warning: result.warning, created: time.Now().UTC()}
+		s.indexStatusMu.Lock()
+		previous := cloneIndexStatus(s.indexStatusCache)
+		s.indexStatusMu.Unlock()
+		for _, summary := range summaries {
+			item := indexSessionStatus{Slug: summary.Slug, Sensitive: summary.Sensitive, UpdatedAt: summary.UpdatedAt,
+				Archived: summary.Archived, ObservationIdentity: summary.ObservationIdentity, RepositoryCount: len(summary.Repositories), PendingLifecycle: pending[summary.Slug].Operation}
+			for _, old := range previous.statuses {
+				if old.Slug == item.Slug && old.ObservationIdentity == item.ObservationIdentity {
+					item.RunningClusters, item.RunningClustersKnown, item.ClusterNotice = old.RunningClusters, old.RunningClustersKnown, old.ClusterNotice
+					if old.UpdatedAt.After(item.UpdatedAt) {
+						item.UpdatedAt = old.UpdatedAt
+					}
+				}
+			}
+			minimal.statuses = append(minimal.statuses, item)
+		}
+		publish(minimal)
 	}
 	discovered, discoveryErr := s.discoverRepositories(ctx, false)
 	if discoveryErr != nil {
@@ -1088,10 +1113,13 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 			}
 		}
 	}
-	clustersBySlug := make(map[string]int)
+	clustersBySlug := make(map[string]*int)
 	clusterNotices := make(map[string]string)
 	for item := range clusterResults {
-		clustersBySlug[item.slug] = item.count
+		if item.err == nil {
+			count := item.count
+			clustersBySlug[item.slug] = &count
+		}
 		clusterNotices[item.slug] = item.notice
 		if item.err != nil {
 			s.config.Logger.Printf("inspect clusters for %s: %v", item.slug, item.err)
@@ -1101,6 +1129,10 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 		}
 	}
 	for _, summary := range summaries {
+		if !s.clusters.MayExist(summary.Slug) || summary.Archived {
+			count := 0
+			clustersBySlug[summary.Slug] = &count
+		}
 		updated := summary.UpdatedAt
 		if !summary.Archived && summary.Codex.ThreadID != "" {
 			expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
@@ -1116,8 +1148,8 @@ func (s *Server) computeIndexStatusWithPending(ctx context.Context, pending map[
 		}
 		result.statuses = append(result.statuses, indexSessionStatus{
 			Slug: summary.Slug, Sensitive: summary.Sensitive, UpdatedAt: updated, Archived: summary.Archived, ObservationIdentity: summary.ObservationIdentity,
-			RepositoryCount: len(summary.Repositories),
-			RunningClusters: clustersBySlug[summary.Slug], ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pendingKind,
+			RepositoryCount:      len(summary.Repositories),
+			RunningClustersKnown: clustersBySlug[summary.Slug] != nil, RunningClusters: indexClusterCount(clustersBySlug[summary.Slug]), ClusterNotice: clusterNotices[summary.Slug], PendingLifecycle: pendingKind,
 		})
 	}
 	return result
@@ -3753,4 +3785,11 @@ func timeAgo(value time.Time) string {
 		return fmt.Sprintf("%dh ago", int(duration.Hours()))
 	}
 	return fmt.Sprintf("%dd ago", int(duration.Hours()/24))
+}
+
+func indexClusterCount(count *int) int {
+	if count == nil {
+		return 0
+	}
+	return *count
 }
