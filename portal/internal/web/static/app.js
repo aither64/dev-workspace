@@ -1177,7 +1177,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=15");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=16");
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
   const sidebarMenu = document.getElementById("sidebar-menu");
@@ -3859,9 +3859,10 @@
         }
         const dismiss = document.createElement("button");
         dismiss.type = "button";
-        dismiss.className = "quiet";
-        dismiss.textContent = "Dismiss";
-        dismiss.title = "Hide this warning. The message may still be delivered.";
+        dismiss.className = "message-receipt-close";
+        dismiss.textContent = "×";
+        dismiss.setAttribute("aria-label", "Dismiss message notification");
+        dismiss.title = entry.state === "accepted" ? "Hide this notification" : "Hide this warning. The message may still be delivered.";
         dismiss.disabled = inFlightMessageIDs.has(entry.id);
         dismiss.addEventListener("click", () => {
           const current = pendingMessages.get(entry.id);
@@ -3874,8 +3875,8 @@
           pendingMessages.set(entry.id, dismissed);
           renderMessageReceipts();
         });
-        actions.append(dismiss);
-        item.append(actions);
+        item.append(dismiss);
+        if (actions.childElementCount) item.append(actions);
       }
       container.append(item);
     }
