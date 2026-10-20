@@ -131,7 +131,8 @@
         {{end}}
         </div>
         {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
-        <form id="message-form" class="chat-form">
+        <p id="message-submission-status" class="notice warning" role="status" hidden></p>
+          <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
           <div id="message-uploads"></div>
           <div class="chat-actions"><div class="composer-actions"><span id="message-upload-controls"></span><button id="message-send" type="submit"{{if not .Session.Interactive}} disabled{{end}}>Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span></div><div class="composer-controls"><div class="composer-settings"><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet icon-button" title="Edit Codex settings" aria-label="Edit Codex settings" aria-haspopup="dialog" aria-controls="codex-settings-dialog" disabled><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div><button id="interrupt" type="button" class="danger"{{if or (not .Session.Interactive) .Session.ExecutionHeld}} disabled{{end}}>Interrupt</button></div></div>
@@ -259,7 +260,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=49" defer></script>
+  <script src="/static/app.js?v=50" defer></script>
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/session-attention.js" defer></script>

@@ -176,7 +176,7 @@ const digest = text => createHash("sha256").update(text).digest("hex");
     await page.locator("#message-form").evaluate(form => form.requestSubmit());
     const receipt = page.locator(".message-receipt").filter({hasText: "Ordinary follow-up"});
     await expect(receipt).toContainText("Sent to Codex");
-    await expect(receipt.getByRole("button", {name: "Dismiss message notification"})).toHaveText("×");
+    await expect(receipt.getByRole("button", {name: "Dismiss message", exact: true})).toHaveText("×");
     thread.entries.push(ordinaryReply); await refresh();
     await expect(receipt).toHaveCount(0);
     await expect(page.locator("#codex-status")).toHaveText("active");

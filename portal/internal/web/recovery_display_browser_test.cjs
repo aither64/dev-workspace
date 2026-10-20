@@ -132,10 +132,10 @@ const baseURL = process.argv[2];
         window.restoreStorage = Storage.prototype.setItem;
         Storage.prototype.setItem = () => { throw new Error("Storage unavailable"); };
       });
-      await receipt("Attachment retry").getByRole("button", {name: "Dismiss message notification", exact: true}).click();
+      await receipt("Attachment retry").getByRole("button", {name: "Dismiss message", exact: true}).click();
       await expect(receipt("Attachment retry")).toBeVisible();
       await page.evaluate(() => { Storage.prototype.setItem = window.restoreStorage; });
-      await receipt("Attachment retry").getByRole("button", {name: "Dismiss message notification", exact: true}).click();
+      await receipt("Attachment retry").getByRole("button", {name: "Dismiss message", exact: true}).click();
       await expect(receipt("Attachment retry")).toHaveCount(0);
       assert.equal(await page.evaluate(savedID => JSON.parse(sessionStorage.getItem(
         `workspace-portal.send-attempt.example.thread-1.${savedID}`,

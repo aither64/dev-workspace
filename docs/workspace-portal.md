@@ -386,8 +386,12 @@ receipt. **Retry original** retries the receipt's saved text and attachments
 with its original attempt ID, independently of the composer draft. A changed
 draft remains intact. The small **×** at the upper right hides the receipt across
 reloads while keeping its retry identity; delivery can still complete. Transcript
-confirmation retires the receipt normally. Sending revised wording creates a separate attempt and
-does not resolve the earlier one. Browser storage must save a dismissal before
+confirmation retires the receipt normally. Delivery failures appear beside the
+composer without a browser alert. A lost response preserves the input, attachments
+and original retry identity. Once the transcript or an accepted receipt confirms
+delivery, a later HTTP failure does not change that confirmed state. The warning
+clears when the original submission is accepted or confirmed in the transcript. Sending
+revised wording creates a separate attempt and does not resolve the earlier one. Browser storage must save a dismissal before
 the portal hides it.
 
 Successful legacy history fallback is silent. History notices and manual retry
