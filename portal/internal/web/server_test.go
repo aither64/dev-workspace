@@ -863,6 +863,26 @@ func TestIndexStatusUsesOneBoundedRefreshForConcurrentRequests(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// Initial HTML and published membership stay usable while enrichment blocks.
+	started := time.Now()
+	initial := httptest.NewRecorder()
+	handler.ServeHTTP(initial, httptest.NewRequest(http.MethodGet, "/", nil))
+	if time.Since(started) > time.Second || !strings.Contains(initial.Body.String(), `data-session-slug="example"`) {
+		t.Fatal("initial membership blocked behind enrichment")
+	}
+	membership := httptest.NewRecorder()
+	handler.ServeHTTP(membership, httptest.NewRequest(http.MethodGet, "/api/index-status?progress=1", nil))
+	var minimal struct {
+		Sessions      []indexSessionStatus `json:"sessions"`
+		Authoritative bool                 `json:"authoritative"`
+	}
+	if err := json.Unmarshal(membership.Body.Bytes(), &minimal); err != nil {
+		t.Fatal(err)
+	}
+	if !minimal.Authoritative || len(minimal.Sessions) != 1 || minimal.Sessions[0].Slug != "example" || minimal.Sessions[0].RunningClustersKnown || minimal.Sessions[0].RunningClusters != 0 {
+		t.Fatalf("membership missing or unknown clusters asserted: %s", membership.Body.String())
+	}
+	t.Logf("blocked optional activity: initial list served in %s; activity calls=1", time.Since(started))
 	// Both cold responses must return while native enrichment is still blocked.
 	for range 2 {
 		select {

@@ -223,6 +223,12 @@
   const messageReceiptLabel = (entry) => entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
       "Outcome unknown.";
+  const indexClusterPresentation = item => {
+    const known = item.runningClustersKnown !== false && Number.isInteger(item.runningClusters);
+    let text = known ? `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}` : "";
+    if (item.clusterNotice) text = known && item.runningClusters ? `${text} · Status updating` : "Cluster status updating";
+    return {text, title: item.clusterNotice || "", hidden: (!known || item.runningClusters === 0) && !item.clusterNotice};
+  };
   const createIndexSnapshotNotice = (notice) => {
     let loading = false;
     return (payload) => {
@@ -1166,7 +1172,7 @@
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
-      indexStatusOrder, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
+      indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
@@ -1614,7 +1620,7 @@
     if (!warning) return;
     warning.textContent = indexFailure?.warning ? indexFailure.error.message :
       progressFailure?.warning ? `Operation status is temporarily unavailable: ${progressFailure.error.message}` :
-        indexFailure?.loading ? "Session status is loading." : "";
+        "";
     warning.hidden = !warning.textContent;
   };
   const indexNotice = conversationAssets.createRefreshNotice({render: state => {indexFailure = state; renderIndexWarning();}});
@@ -1877,11 +1883,10 @@
         if (repositories) updateText(repositories, `${item.repositoryCount} ${item.repositoryCount === 1 ? "repository" : "repositories"}`);
         const clusters = card.querySelector("[data-session-clusters]");
         if (clusters) {
-          let text = `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}`;
-          if (item.clusterNotice) text = item.runningClusters ? `${text} · Status updating` : "Cluster status updating";
-          updateText(clusters, text);
-          clusters.title = item.clusterNotice || "";
-          clusters.hidden = item.runningClusters === 0 && !item.clusterNotice;
+          const state = indexClusterPresentation(item);
+          updateText(clusters, state.text);
+          clusters.title = state.title;
+          clusters.hidden = state.hidden;
         }
         const sensitiveBadge = card.querySelector("[data-session-sensitive]");
         if (sensitiveBadge) sensitiveBadge.hidden = !item.sensitive;
