@@ -2477,6 +2477,8 @@
   const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       if (modelSelect.closest("form")?.id === "new-session-form") return;
+      const managed = modelSelect.closest('[data-direct-team-form][data-action="add"]');
+      if (managed?.dataset.teamDirty === "true" || managed?.dataset.teamSubmitting) return;
       if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
       if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
       if (modelSelect.id === "team-model") { teamSettingsController?.render(); return; }
@@ -2522,6 +2524,7 @@
     const groups = new Map();
     for (const select of root.querySelectorAll("[data-model-select]")) {
       const form = select.closest("form");
+      if (form?.dataset.action === "add" && selectModelCatalogs.has(select)) continue;
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
       const provider = destination ? creationProviderValue(form) : "";
@@ -2535,7 +2538,7 @@
         if (!modelCatalogs.has(url)) modelCatalogs.set(url, request(url).catch(error => {modelCatalogs.delete(url); throw error;}));
         const available = await modelCatalogs.get(url);
         for (const {select, creation, destination} of entries) {
-          if (selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true") continue;
+          if (selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true" || select.closest("form")?.dataset.teamSubmitting) continue;
           selectModelCatalogs.set(select, available);
           if (!destination) models = available;
           const saved = select.value;
@@ -2573,6 +2576,8 @@
 
   const bindModelSelects = (root = document) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
+      if (modelSelect.dataset.modelBound) return;
+      modelSelect.dataset.modelBound = "true";
       modelSelect.addEventListener("change", () => {
         if (modelSelect.id === "codex-model") { liveSettingsController?.modelChanged(); return; }
         if (modelSelect.id === "team-model") { teamSettingsController?.modelChanged(); return; }
@@ -2596,7 +2601,7 @@
   });
   const updateAddMemberEligibility = () => {
     const form = document.querySelector('[data-direct-team-form][data-action="add"]');
-    if (!form || !models.length) return;
+    if (!form) return;
     const model = models.find(candidate => candidate.model === form.elements.model.value);
     const supported = model?.supportedReasoningEfforts?.some(option => option.reasoningEffort === form.elements.effort.value);
     const submit = form.querySelector('[type="submit"]');
@@ -2737,20 +2742,36 @@
     if (!form) return;
     event.preventDefault();
     const action = form.dataset.action;
-    if (!interactive) return;
+    if (!interactive || form.dataset.teamSubmitting) return;
+    if (action === "add") {
+      const selectedModel = models.find(model => model.model === form.elements.model.value);
+      if (!selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === form.elements.effort.value)) {
+        updateAddMemberEligibility(); return;
+      }
+    }
     const status = form.querySelector("[role=status]");
     const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
     const value = name => form.elements[name]?.value?.trim() || "";
     const body = {action, model: value("model"), reasoningEffort: value("effort")};
     if (action === "preset") body.preset = value("preset");
-    if (action === "add") body.role = value("role");
+    if (action === "add") { body.role = value("role"); form.dataset.teamDirty = "true"; }
     form.dataset.teamSubmitting = "true";
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
       await directTeamRequest(body);
       if (status) status.textContent = "Saved.";
-      setTimeout(() => location.reload(), 250);
+      if (action === "add") {
+        // Keep the exact captured selection and its populated options for the
+        // next addition; a reload used to expose a transient default effort.
+        form.elements.role.value = body.role;
+        form.elements.model.value = body.model;
+        form.elements.effort.value = body.reasoningEffort;
+        delete form.dataset.teamSubmitting;
+        controls.forEach(control => { control.disabled = false; });
+        updateAddMemberEligibility();
+        void refreshSessionDetails();
+      } else setTimeout(() => location.reload(), 250);
     } catch (error) {
       delete form.dataset.teamSubmitting;
       form.dataset.teamDirty = "true";
@@ -3373,10 +3394,12 @@
       }
       if (teamGeneration === teamSettingsGeneration && typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
-        const editingTeam = teamStatus?.querySelector("[data-direct-team-form]:focus-within, [data-direct-team-form][data-team-dirty], [data-direct-team-form][data-team-submitting]");
+        const editingTeam = teamStatus?.querySelector('[data-direct-team-form]:not([data-action="add"]):focus-within, [data-direct-team-form]:not([data-action="add"])[data-team-dirty], [data-direct-team-form]:not([data-action="add"])[data-team-submitting]');
         if (teamStatus && !editingTeam) {
           const removedOpen = teamStatus.querySelector(".removed-members")?.open || false;
+          const addForm = teamStatus.querySelector('[data-direct-team-form][data-action="add"]');
           teamStatus.innerHTML = payload.teamHTML;
+          if (addForm) teamStatus.querySelector('[data-direct-team-form][data-action="add"]')?.replaceWith(addForm);
           lastTeamHTML = payload.teamHTML;
           const removed = teamStatus.querySelector(".removed-members");
           if (removed) removed.open = removedOpen;
