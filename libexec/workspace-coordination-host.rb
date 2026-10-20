@@ -84,6 +84,7 @@ module DevWorkspaceHost
     def coordination_session_command(entry, argv)
       action = argv.shift
       slug = argv.shift
+      return coordination_claim(entry, action, slug, argv) if WorkspaceCoordinationClaimsHost::CLAIM_ACTIONS.include?(action)
       raise WorkspaceCoordination::Error, 'coordination requires an exact session slug and --as-is' unless slug && slug.match?(WorkspaceCoordination::PART)
       id = argv.shift if %w[refresh cancel finish reconcile integration-status integration-resume integration-pause integration-ack integration-cancel].include?(action)
       options = {}
@@ -132,7 +133,11 @@ module DevWorkspaceHost
           prepare: ->(fields) { coordination_prepare(engine, owner, fields) }, diagnostics: @err)
         verify_background_recipient!(owner, explicit: options[:to_session_lead]) if options[:background]
         result = case action
-        when 'integrate' then driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait], background: options[:background])
+        when 'integrate'
+          if claim_workflow_selected? && !(request && request['requestId'].is_a?(String) && request['requestId'].match?(WorkspaceCoordination::UUID) && File.file?(driver.path(request['requestId'])))
+            raise WorkspaceCoordination::Error, 'new work uses coordination acquire; existing integrations remain resumable'
+          end
+          driver.start(request || raise(WorkspaceCoordination::Error, 'integration requires a request'), wait: !options[:no_wait], background: options[:background])
         when 'integration-status' then driver.status(id)
         when 'integration-pause' then driver.pause(id)
         when 'integration-ack'
@@ -163,6 +168,31 @@ module DevWorkspaceHost
         @out.puts JSON.generate(engine.reconcile_job(owner, id))
         return
       end
+      if claim_workflow_selected? && %w[prepare approve reserve submit submit-batch].include?(action)
+        retained = request && engine.store.read['receipts'].key?(request['requestId'])
+        if action == 'prepare'
+          binding = request && request.delete('legacyJobId')
+          previous = binding && engine.store.read['jobs'][binding]
+          operation = previous && previous.dig('snapshot', 'operation')
+          same_scope = previous && previous['kind'] == request['kind'] &&
+            (request['kind'] == 'merge' ? operation['repository'] == request['repository'] : request['kind'] == 'profile_activate' || operation['target'] == request['target'])
+          retained ||= same_scope && previous['ownerId'] == engine.owner(slug)['id']
+        elsif action == 'approve' && !retained && request
+          # A refreshed snapshot needs a fresh approval before it can replace
+          # the retained job's snapshot. It cannot be submitted as a new job.
+          owner = engine.owner(slug)
+          saved = engine.prepared_snapshot!(owner, request['reviewedSnapshot'])
+          operation = saved.fetch('snapshot').fetch('operation')
+          retained = engine.store.read['jobs'].values.any? do |job|
+            previous = job.fetch('snapshot').fetch('operation')
+            job['ownerId'] == owner['id'] && job['kind'] == saved['kind'] &&
+              !WorkspaceCoordination::TERMINAL.include?(job['state']) &&
+              (saved['kind'] == 'merge' ? previous.slice('repository', 'target') == operation.slice('repository', 'target') :
+                saved['kind'] == 'profile_activate' || previous['target'] == operation['target'])
+          end
+        end
+        raise WorkspaceCoordination::Error, 'new work uses coordination acquire; retained operations keep their original recovery interface' unless retained
+      end
       if action == 'prepare'
         raise WorkspaceCoordination::Error, 'prepare requires a request' unless request
         owner = nil
@@ -187,22 +217,32 @@ module DevWorkspaceHost
     def coordination_prepare(engine, owner, request)
       with_current_generation_lock(mode: File::LOCK_SH) do
         engine.current_generation!
-        case request.fetch('kind')
-        when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
-        when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
-        when 'profile_activate'
-          path, _common, _identity, registration = engine.repository(owner, 'workspace')
-          head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
-          source = engine.retain_commit(path, head)
-          artifact = prepare_profile(['--source', source])
-          artifact['coverage'] = engine.coverage(source, 'workspace', head)
-          artifact = engine.save_artifact(artifact)
-          engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
-          operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
-            'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
-          engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
+        repository = case request.fetch('kind')
+        when 'merge' then request.fetch('repository')
+        when 'machine_activate' then engine.catalog.machine(request.fetch('target')).fetch('configurationRepository')
+        when 'profile_activate' then 'workspace'
         else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
         end
+        engine.with_repository_claim(owner, repository) { coordination_prepare_owned(engine, owner, request) }
+      end
+    end
+
+    def coordination_prepare_owned(engine, owner, request)
+      case request.fetch('kind')
+      when 'merge' then engine.prepare_merge(owner, request.fetch('repository'), request.fetch('evidence'))
+      when 'machine_activate' then engine.prepare_machine(owner, request.fetch('target'), request.fetch('evidence'))
+      when 'profile_activate'
+        path, _common, _identity, registration = engine.repository(owner, 'workspace')
+        head = engine.capture('git', '-C', path, 'rev-parse', "#{registration.fetch('branch')}^{commit}").strip
+        source = engine.retain_commit(path, head)
+        artifact = prepare_profile(['--source', source])
+        artifact['coverage'] = engine.coverage(source, 'workspace', head)
+        artifact = engine.save_artifact(artifact)
+        engine.retain_root(artifact.fetch('id'), 'profile', artifact.fetch('candidatePackage'))
+        operation = {'preparedArtifact' => artifact.fetch('id'), 'candidatePackage' => artifact.fetch('candidatePackage'),
+          'expectedProfileToken' => artifact.fetch('profileToken'), 'coverage' => artifact.fetch('coverage')}
+        engine.prepare_snapshot(owner, 'profile_activate', operation, request.fetch('evidence'))
+      else raise WorkspaceCoordination::Error, 'unsupported preparation kind'
       end
     rescue DevWorkspaceHost::Error => error
       raise WorkspaceCoordination::Error, WorkspaceCoordination.diagnostic(error.message)
@@ -370,6 +410,10 @@ module DevWorkspaceHost
       @candidate_recovery = nil
     end
 
+    def claim_workflow_selected?
+      File.file?(File.join(package_root, 'share/dev-workspace/claim-contract.json'))
+    end
+
     def coordination_host_command(argv)
       if %w[candidate-prepare candidate-reconcile].include?(argv.first)
         return coordination_candidate_command(argv)
@@ -402,7 +446,8 @@ module DevWorkspaceHost
       data = coordination_store.read
       machine = coordination_catalog.data['profileMachine']
       machine = coordination_catalog.machine(machine)['id'] if machine
-      if data['jobs'].values.any? { |job| job['kind'] == 'profile_activate' && WorkspaceCoordination::CLAIMED.include?(job['state']) } ||
+      if !coordination_store.held_claim_resources.empty? ||
+         data['jobs'].values.any? { |job| job['kind'] == 'profile_activate' && WorkspaceCoordination::CLAIMED.include?(job['state']) } ||
          data['reservations'].values.any? { |item| item['machine'] == machine && !%w[requested released].include?(item['state']) }
         raise WorkspaceCoordination::Error.new('registration waits for the machine review reservation', 4)
       end
@@ -420,6 +465,13 @@ module DevWorkspaceHost
 
     def require_coordination_profile_claim!(candidate)
       machine = coordination_catalog.data['profileMachine']
+      if (claim = @env['DEV_WORKSPACE_CLAIM_ID'])
+        canonical = machine && coordination_catalog.machine(machine)['id']
+        raise WorkspaceCoordination::Error, 'profile activation requires a configured physical machine' unless canonical
+        entry = registry.select(cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
+        coordination_engine(entry).profile_claim!(claim, canonical)
+        return
+      end
       return unless machine || File.exist?(File.join(coordination_store.root, 'ledger.json'))
       attempt = @coordination_attempt || @env['DEV_WORKSPACE_COORDINATION_ATTEMPT']
       unless attempt && attempt.match?(WorkspaceCoordination::UUID)
@@ -584,7 +636,6 @@ module DevWorkspaceHost
             engine = coordination_engine(entry)
             engine.reconcile_attempts
             engine.store.read['owners'].values.select { |owner| owner['workspace'] == entry['root'] && !owner['fence'] }.each do |owner|
-              next if owner['bootstrap']
               coordinate_owner(entry, engine, owner)
             rescue WorkspaceCoordination::Error => e
               @err.puts "coordinator owner #{owner['slug']}: #{e.message}"
@@ -608,6 +659,15 @@ module DevWorkspaceHost
     end
 
     def coordinate_owner(entry, engine, owner)
+      claim_work = engine.store.claims['claims'].values.any? { |item| item['ownerId'] == owner['id'] && (item['state'] == 'waiting' || item['notificationPending']) }
+      if claim_work
+        with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
+          current = engine.claim_owner(owner['slug'])
+          raise WorkspaceCoordination::Error.new('resource owner changed', 4) unless current['id'] == owner['id']
+          engine.tick_claims(owner)
+        end
+      end
+      return if owner['bootstrap']
       jobs = engine.store.read['jobs'].values.select { |job| job['ownerId'] == owner['id'] && !WorkspaceCoordination::TERMINAL.include?(job['state']) }
       background = engine.store.integration_journals.any? { |run| run['ownerId'] == owner['id'] && run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' }
       unless jobs.empty? && !background

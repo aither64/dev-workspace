@@ -3,6 +3,67 @@
 require_relative 'suspension_test'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_claim_profile_switch_keeps_ownership_and_recovers_forward
+    with_ready_coordination_session do |host, entry, slug, _path, _journal, _manifest_path, _engine|
+      predecessor = host.candidate
+      paths_root = File.dirname(predecessor)
+      host.candidate = make_package(paths_root, 'claim-candidate')
+      catalog = {'schema' => 1, 'repositories' => {'configuration' => {'remote' => 'git@github.com:example/configuration.git'}},
+        'profileMachine' => 'example:host', 'adapters' => {'fixture' => {'protocol' => 1, 'command' => RbConfig.ruby}},
+        'machines' => {'host' => {'id' => 'example:host', 'aliases' => [], 'adapter' => 'fixture', 'configurationRepository' => 'configuration', 'selector' => 'host'}}}
+      [predecessor, host.candidate].each do |package|
+        share = File.join(package, 'share/dev-workspace')
+        File.write(File.join(share, 'coordination.json'), JSON.generate(catalog))
+        File.write(File.join(share, 'coordination-contract.json'), JSON.generate(WorkspaceCoordination::CONTRACT))
+        File.write(File.join(share, 'claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
+      end
+      host.instance_variable_set(:@coordination_catalog, WorkspaceCoordination::Catalog.new(predecessor))
+      host.define_singleton_method(:coordination_engine) do |selected|
+        runtime = instance_runtime(selected)
+        WorkspaceCoordination::Engine.new(state: @state, package: package_root, profile: @profile,
+          workspace: selected['root'], entry: selected.merge('socket' => runtime[:codex], 'portalUrl' => 'https://workspace.example.test'), env: @env.to_h, fixtures: true)
+      end
+      engine = host.send(:coordination_engine, entry)
+      person = engine.claim_owner(slug)
+      operation = engine.acquire_claim(person, {'schema' => 1, 'requestId' => SecureRandom.uuid,
+        'repositories' => [], 'machines' => ['host'], 'label' => 'profile fixture'})
+      env = host.instance_variable_get(:@env)
+      source = File.join(paths_root, 'source')
+      assert_equal 1, host.run('workspace-host', ['switch', '--source', source])
+      assert_empty engine.store.read['jobs']
+      env.merge!('DEV_WORKSPACE_CLAIM_ID' => operation['id'], 'DEV_WORKSPACE_NAME' => entry['name'],
+        'DEV_SESSION_SLUG' => 'wrong-session', 'DEV_SESSION_WORKSPACE' => entry['root'])
+      source = File.join(paths_root, 'source')
+      assert_equal 4, host.run('workspace-host', ['switch', '--source', source])
+      assert_equal predecessor, File.realpath(host.instance_variable_get(:@profile))
+      env['DEV_SESSION_SLUG'] = slug
+      host.fail_activation = true
+      assert_equal 1, host.run('workspace-host', ['switch', '--source', source])
+      assert_equal host.candidate, File.realpath(host.instance_variable_get(:@profile))
+      refute_nil host.send(:pending_codex_update)
+      assert_equal 'held', engine.store.claims['claims'][operation['id']]['state']
+      assert_equal 0, host.run('workspace-host', ['switch', '--source', source]), host.instance_variable_get(:@err).string
+      assert_nil host.send(:pending_codex_update)
+      assert_equal host.candidate, File.realpath(host.instance_variable_get(:@profile))
+      waiting = engine.acquire_claim(person, {'schema' => 1, 'requestId' => SecureRandom.uuid,
+        'repositories' => [], 'machines' => ['host'], 'label' => 'wait during suspension'})
+      assert_equal 'waiting', waiting['state']
+      assert_equal 0, host.run('workspace-host', ['suspend'])
+      assert engine.store.read['suspended']
+      assert_raises(WorkspaceCoordination::Error) { engine.tick_claims(person) }
+      assert_equal 'waiting', engine.store.claims['claims'][waiting['id']]['state']
+      assert_equal 'held', engine.store.claims['claims'][operation['id']]['state']
+      assert_equal 0, host.run('workspace-host', ['resume']), host.instance_variable_get(:@err).string
+      refute engine.store.read['suspended']
+      assert_equal 'held', engine.store.claims['claims'][operation['id']]['state']
+      assert_equal 'released', engine.change_claim(person, operation['id'], 'release')['state']
+      engine.tick_claims(person)
+      assert_equal 'held', engine.store.claims['claims'][waiting['id']]['state']
+      engine.change_claim(person, waiting['id'], 'release')
+      assert_empty engine.store.held_claim_resources
+    end
+  end
+
   def with_reporting_transition_host
     with_transition_host do |host, paths|
       [host.candidate, make_package(paths.fetch(:root), 'package-two')].each do |package|
@@ -284,7 +345,7 @@ class WorkspaceHostTest < Minitest::Test
       end
       assert_equal 0, host.run('workspace-host', ['coordination', 'guide'])
       output = host.instance_variable_get(:@out).string
-      assert_includes output, '# Coordinated workspace operations'
+      assert_includes output, '# Resource claims and session notifications'
       assert_includes output, '# Coordination operations and recovery'
       assert_includes output, host.candidate
       refute File.exist?(File.join(host.send(:registry).entries.first['root'], 'docs/coordination.md'))

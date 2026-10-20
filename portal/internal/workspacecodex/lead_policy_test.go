@@ -11,7 +11,7 @@ func TestLeadPolicyBindsSessionWithoutReplacingFrozenRoleInstructions(t *testing
 	const roleInstructions = "Coordinate the assigned work."
 	policy := LeadThreadPolicy(slug, workspace, roleInstructions)
 	for _, expected := range []string{slug, workspace, "dev-session current", roleInstructions,
-		"DEV_SESSION_SLUG", "DEV_SESSION_WORKSPACE", "workspace-host coordination guide", "keep the turn open"} {
+		"DEV_SESSION_SLUG", "DEV_SESSION_WORKSPACE", "workspace-host coordination guide", "explicitly release ownership", "queued claims notify the session"} {
 		if !strings.Contains(policy.DeveloperInstructions, expected) {
 			t.Errorf("lead policy missing %q", expected)
 		}

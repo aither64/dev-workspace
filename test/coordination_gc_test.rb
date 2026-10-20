@@ -210,6 +210,33 @@ class CoordinationGcTest < Minitest::Test
     refute File.symlink?(root)
   end
 
+  def test_held_repository_claim_preserves_collectible_and_interrupted_payloads
+    person, snapshot = prepare('claimed-collection')
+    cancel(person, submit(person, snapshot))
+    claim = @engine.acquire_claim(person, request('repositories' => ['code'], 'machines' => [], 'label' => 'ordinary Git mutation'))
+    assert_empty collect(apply: true)['removed']
+    assert File.directory?(source(snapshot))
+    @engine.change_claim(person, claim['id'], 'release')
+    capture = @engine.method(:capture)
+    interrupted = false
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      result = capture.call(*args, **options)
+      if !interrupted && args.include?('remove')
+        interrupted = true
+        raise WorkspaceCoordination::Error, 'fixture interruption after deletion'
+      end
+      result
+    end
+    assert_raises(WorkspaceCoordination::Error) { collect(apply: true) }
+    claim = @engine.acquire_claim(person, request('repositories' => ['code'], 'machines' => [], 'label' => 'inspect interrupted collection'))
+    assert_empty collect(apply: true)['removed']
+    refute_empty WorkspaceCoordination::Retention.new(@engine.store).read['pending']
+    @engine.change_claim(person, claim['id'], 'release')
+    collect(apply: true)
+    assert_empty WorkspaceCoordination::Retention.new(@engine.store).read['pending']
+    refute File.exist?(source(snapshot))
+  end
+
   def test_interruption_after_git_removal_resumes_without_losing_history
     person, snapshot = prepare('interrupted')
     cancel(person, submit(person, snapshot))

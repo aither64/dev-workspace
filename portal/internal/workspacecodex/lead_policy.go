@@ -45,8 +45,8 @@ func LeadThreadPolicy(slug, workspace, roleInstructions string) codex.ThreadPoli
 			"means stop rather than claiming another session. A missing shell environment "+
 			"marker alone does not negate this thread-bound identity. Before merging or deploying, "+
 			"read the selected package's instructions with workspace-host coordination guide. "+
-			"Use its queue and machine review reservation when the configured catalog covers the operation; "+
-			"keep resource waits interruptible and keep the turn open.\n\n%s",
+			"Acquire repository or machine claims for catalog-covered mutations, execute and verify your own commands, then explicitly release ownership. "+
+			"Keep resource waits interruptible; queued claims notify the session when granted.\n\n%s",
 			slug, workspace, instructions)
 	}
 	return codex.ThreadPolicy{DeveloperInstructions: session.SensitiveInstructions(workspace, slug) + instructions}

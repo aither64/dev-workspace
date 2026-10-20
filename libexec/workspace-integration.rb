@@ -355,6 +355,11 @@ module WorkspaceCoordination
     end
 
     def refresh(value, item)
+      return refresh_owned(value, item) unless File.file?(File.join(engine.package, 'share/dev-workspace/claim-contract.json'))
+      engine.with_repository_claim(owner, item['repository'], admission: @admission) { refresh_owned(value, item) }
+    end
+
+    def refresh_owned(value, item)
       path, _, _, registration = engine.repository(owner, item['repository'])
       engine.capture('git', '-C', path, 'fetch', 'origin', item['target'])
       target = engine.remote_head(path, item['target'])
@@ -667,6 +672,11 @@ module WorkspaceCoordination
     end
 
     def record_completion(value)
+      return record_completion_owned(value) unless File.file?(File.join(engine.package, 'share/dev-workspace/claim-contract.json'))
+      engine.with_repository_claim(owner, 'workspace', admission: @admission) { record_completion_owned(value) }
+    end
+
+    def record_completion_owned(value)
       return if value['steps'].dig('tracking-commit', 'result')
       admit do
         verify_tracking_binding

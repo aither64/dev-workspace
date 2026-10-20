@@ -34,6 +34,8 @@ let
       || lib.elem relative [
         "docs/coordination.md"
         "docs/coordination-operations.md"
+        "docs/integration.md"
+        "docs/coordination-legacy.md"
       ]
       || relative == "portal/internal/session/runtime-contract.json";
   };
@@ -42,6 +44,7 @@ let
     workspace_coordination = 2;
     auto_archive = 1;
     workspace_host = 1;
+    coordination_claims = 1;
     coordination_admission = 1;
     coordination_gc = 1;
     integration = 1;

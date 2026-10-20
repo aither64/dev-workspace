@@ -88,7 +88,7 @@
     const expanded = new Set([...panel.querySelectorAll("details[data-coordination-key][open]")].map(detail => detail.dataset.coordinationKey));
     const focused = document.activeElement?.closest?.("details[data-coordination-key]")?.dataset.coordinationKey;
     const content = document.createDocumentFragment();
-    const owners = new Map(), reservations = new Map(), held = new Map(), jobs = [], integrations = [], requests = [], alerts = [];
+    const owners = new Map(), reservations = new Map(), held = new Map(), jobs = [], claims = [], integrations = [], requests = [], alerts = [];
     let limited = false;
     for (const workspace of payload.workspaces) {
       for (const owner of workspace.owners) {
@@ -113,6 +113,7 @@
         if (!["requested", "released"].includes(item.state) && !held.has(item.machine)) held.set(item.machine, {...item, id: item.machine, foreign: true});
       }
       jobs.push(...workspace.jobs.filter(own));
+      claims.push(...(workspace.claims || []).filter(own));
       integrations.push(...(workspace.integrations || []).filter(own));
       const notices = workspace.notifications.filter(own).filter(event => event.state !== "delivered");
       if (notices.length) alerts.push(`${notices.length} agent ${notices.length === 1 ? "notification is" : "notifications are"} awaiting delivery or confirmation.`);
@@ -162,7 +163,9 @@
       const title = node("div", "", "coordination-machine-heading"); title.append(node("h3", shortName(item)), badge(item.state));
       card.append(title);
       const owner = node("p"); owner.append(node("span", "Held by ", "muted"), ownerLink(item, true)); card.append(owner);
-      card.append(node("p", item.state === "deployed_review"
+      card.append(node("p", item.mode === "claim"
+        ? "Reserved until the owning session explicitly releases this machine."
+        : item.state === "deployed_review"
         ? "Other sessions cannot redeploy this machine while review, feedback and integration are pending."
         : item.state === "blocked_recovery" ? "The owning session must resolve deployment recovery before another session can deploy."
         : "Other sessions wait until the owning session finishes its deployment work."));
@@ -175,6 +178,17 @@
       const pending = section("Requested reservations", requests.length);
       for (const item of requests) {
         const row = node("p", `${shortName(item)}: ${stateLabel(item.state)}. `); row.append(ownerLink(item)); pending.append(row);
+      }
+    }
+    if (claims.length) {
+      const claimSection = section("Resource claims", claims.length);
+      for (const item of claims) {
+        const row = node("article", "", "coordination-machine");
+        const title = node("p"); title.append(node("strong", item.label), node("span", ": "),
+          node("span", item.state === "held" ? "Held until released" : item.state === "waiting" ? "Waiting for resources" : stateLabel(item.state)));
+        const owner = node("p"); owner.append(ownerLink(item));
+        row.append(title, owner, node("p", [...item.repositories, ...item.machines].join(", ")),
+          details(`claim:${item.id}`, item)); claimSection.append(row);
       }
     }
     const target = job => job.kind === "merge" ? `${job.source?.repository || "Repository"} → ${(job.source?.target || "default branch").replace(/^refs\/heads\//, "")}`

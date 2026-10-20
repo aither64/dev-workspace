@@ -1,5 +1,14 @@
 # Coordination operations and recovery
 
+For resource ownership, use the [claim guide](coordination.md) to acquire,
+inspect, release or cancel a request. Claims survive disconnection and remain
+held until explicitly released. Inspect remaining local and remote work before
+releasing after interruption. Existing snapshot-based operations keep the
+procedures below and the [retained workflow guide](coordination-legacy.md).
+
+The remaining sections describe legacy executor recovery. They do not start new
+automatic workflows under a runtime with resource claims.
+
 Read [the coordination contract](coordination.md) before operating its ledger.
 The selected package installs both guides. Run `workspace-host coordination guide`
 to read them from any checkout, including an unmerged deploy-first rollout.

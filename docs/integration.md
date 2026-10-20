@@ -1,5 +1,8 @@
 # Coordinated integration
 
+This driver continues retained integration runs. New operations use the
+[resource claim service](coordination.md); sessions own their integration steps.
+
 The integration driver prepares approved operations, admits their dependency
 graph together, monitors results and records completion. Background mode lets the owning
 session remain idle while approved operations continue. It uses the coordinator's

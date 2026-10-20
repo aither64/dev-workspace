@@ -345,10 +345,11 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
-    for name in workspace-coordination workspace-coordination-gc workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration-background workspace-integration-handoff workspace-integration; do
+    for name in workspace-coordination-claims workspace-coordination-claims-host workspace-coordination workspace-coordination-gc workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration-background workspace-integration-handoff workspace-integration; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
     ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"
+    ln -s ../workspace-coordination-claims.rb "$out/libexec/workspace-portal/workspace-coordination-claims.rb"
     ln -s ../workspace-coordination-command.rb "$out/libexec/workspace-portal/workspace-coordination-command.rb"
     ln -s ../workspace-coordination-timing.rb "$out/libexec/workspace-portal/workspace-coordination-timing.rb"
     install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
@@ -400,6 +401,9 @@ buildGoModule {
     install -Dm644 ${integrationCatalog} "$out/share/dev-workspace/integration.json"
     install -Dm644 ${src}/nix/integration-contract.json "$out/share/dev-workspace/integration-contract.json"
     install -Dm644 ${coordinationCatalog} "$out/share/dev-workspace/coordination.json"
+    install -Dm644 ${src}/nix/claim-contract.json "$out/share/dev-workspace/claim-contract.json"
+    install -Dm644 ${src}/docs/coordination-legacy.md "$out/share/dev-workspace/coordination-legacy.md"
+    install -Dm644 ${src}/docs/integration.md "$out/share/dev-workspace/integration.md"
     install -Dm644 ${src}/nix/coordination-contract.json "$out/share/dev-workspace/coordination-contract.json"
     install -Dm644 ${src}/docs/coordination.md "$out/share/dev-workspace/coordination.md"
     install -Dm644 ${src}/docs/coordination-operations.md "$out/share/dev-workspace/coordination-operations.md"
@@ -483,7 +487,7 @@ buildGoModule {
     test -f "$out/share/dev-workspace/extensions.json"
     test -f "$out/share/dev-workspace/package.json"
     (cd "$TMPDIR/workspace"; "$out/bin/workspace-host" coordination guide) > "$TMPDIR/installed-coordination-guide"
-    grep -Fq '# Coordinated workspace operations' "$TMPDIR/installed-coordination-guide"
+    grep -Fq '# Resource claims and session notifications' "$TMPDIR/installed-coordination-guide"
     grep -Fq '# Coordination operations and recovery' "$TMPDIR/installed-coordination-guide"
     test -x "$out/bin/workspace-portal"
     cmp ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"

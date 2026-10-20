@@ -15,6 +15,7 @@ require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-codex-providers'
 require_relative 'workspace-coordination-host'
+require_relative 'workspace-coordination-claims-host'
 
 module DevWorkspaceHost
   NAME = /\A[a-z0-9][a-z0-9-]{0,62}\z/
@@ -367,6 +368,7 @@ module DevWorkspaceHost
   class Host
     include CodexProviderHost
     include WorkspaceCoordinationHost
+    include WorkspaceCoordinationClaimsHost
     def initialize(env: ENV, input: $stdin, out: $stdout, err: $stderr)
       @env = env
       @input = input
@@ -613,7 +615,8 @@ module DevWorkspaceHost
 
     def switch(argv, from_candidate: false)
       prepared = prepare_profile(argv, from_candidate:)
-      if coordination_catalog.data['profileMachine']
+      if coordination_catalog.data['profileMachine'] && !@env['DEV_WORKSPACE_CLAIM_ID']
+        raise Error, 'profile activation requires a held machine claim through coordination acquire' if claim_workflow_selected?
         return coordinated_profile_switch(prepared, from_candidate:)
       end
       activation = nil
@@ -754,7 +757,7 @@ module DevWorkspaceHost
       wait_for_codex_sockets
       verify_registration_semantics!(candidate_plans, candidate_codex)
       with_transition_lock do
-        require_coordination_profile_claim!(candidate) if @coordination_attempt
+        require_coordination_profile_claim!(candidate) if @coordination_attempt || @env['DEV_WORKSPACE_CLAIM_ID']
         unless profile_link_token == activation.fetch('profileToken') && File.realpath(@profile) == candidate &&
                (pending_codex_update.nil? || pending_codex_update == activation.fetch('pending'))
           raise Error, 'workspace activation completion was superseded; retain the selected generation recovery'

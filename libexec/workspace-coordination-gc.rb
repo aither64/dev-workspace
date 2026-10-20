@@ -436,7 +436,7 @@ module WorkspaceCoordination
               head = @engine.capture('git', '-C', path, 'rev-parse', 'HEAD').strip
               raise Error, 'interrupted integration checkout HEAD changed' unless head == action['head']
             end
-            if @ledger['jobs'].values.any? { |job| CLAIMED.include?(job['state']) && job['resources'].include?("git:#{common}") }
+            if git_resource_busy?(common)
               raise Error, 'Git resource is busy'
             end
             @actions << action
@@ -448,7 +448,7 @@ module WorkspaceCoordination
           end
           common = @engine.capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
           verify_integration_repository(action, common) if action['integration']
-          if @ledger['jobs'].values.any? { |job| CLAIMED.include?(job['state']) && job['resources'].include?("git:#{common}") }
+          if git_resource_busy?(common)
             protect_payload(action)
             @skipped << {'path' => path, 'reason' => 'Git resource is busy'}
             next
@@ -560,7 +560,14 @@ module WorkspaceCoordination
       end
     end
 
+    def git_resource_busy?(common)
+      resource = "git:#{File.realpath(common)}"
+      @store.held_claim_resources.include?(resource) ||
+        @ledger['jobs'].values.any? { |job| CLAIMED.include?(job['state']) && job['resources'].include?(resource) }
+    end
+
     def remove_worktree(action)
+      raise Error, 'Git resource is busy' if git_resource_busy?(action.fetch('common'))
       path = action.fetch('path')
       key = path.delete_prefix(@sources + '/')
       if action['integration']

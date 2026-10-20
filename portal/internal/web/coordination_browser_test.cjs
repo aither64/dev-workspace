@@ -286,3 +286,22 @@ test('background runs show automatic waiting and action reasons without changing
   assert.match(h.panel.textContent, /Canceled before any operation was submitted/);
   assert.equal(h.badge.hidden, true);
 });
+
+
+test('resource claims show held ownership and waiting requests without command results', async () => {
+  const h = harness(true), data = payload([]);
+  data.workspaces[0].owners = [{id: 'claim-owner', slug: 'holder', observationIdentity: 'incarnation-a', portalUrl: 'https://workspace.test/holder/'}];
+  data.workspaces[0].claims = [
+    {id: 'held', ownerId: 'claim-owner', state: 'held', label: 'Reviewed deployment', repositories: [], machines: ['fixture:machine']},
+    {id: 'waiting', ownerId: 'claim-owner', state: 'waiting', label: 'Publish feature', repositories: ['project'], machines: []},
+  ];
+  data.workspaces[0].reservations = [{id: 'held', ownerId: 'claim-owner', machine: 'fixture:machine', state: 'held', mode: 'claim'}];
+  await h.respond(data);
+  assert.match(h.panel.textContent, /Resource claims/);
+  assert.match(h.panel.textContent, /Held until released/);
+  assert.match(h.panel.textContent, /Waiting for resources/);
+  assert.match(h.panel.textContent, /Publish feature/);
+  assert.match(h.panel.textContent, /explicitly releases/);
+  assert.doesNotMatch(h.panel.textContent, /Run session command|Exited successfully/);
+  assert.equal(h.warning.hidden, true);
+});

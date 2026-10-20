@@ -1366,6 +1366,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     # Exercise the actual child activation claim guard, rather than mocking
     # the entire candidate invocation and missing the recovery reservation.
     host = DevWorkspaceHost::Host.allocate
+    host.instance_variable_set(:@env, {})
     engine = @engine
     host.define_singleton_method(:coordination_store) { engine.store }
     host.define_singleton_method(:coordination_catalog) { engine.catalog }

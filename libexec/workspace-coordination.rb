@@ -177,6 +177,7 @@ module WorkspaceCoordination
           Timing.new(root).publish(previous_states, data)
           wake
         end
+        sync_claims_lifecycle(data)
         result
       end
     end
@@ -433,6 +434,7 @@ module WorkspaceCoordination
         proofs = 2 * MAX_RESULT + bytes.call(unowned)
         growth += MAX_RESULT + 3 * proofs + MAX_RESULT + 256 + 1024
       end
+      future_events.concat(claim_notification_events(data))
       background = integration_journals.count { |run| run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' }
       growth + envelopes + background * (2 * MAX_RESULT + 128) + (future_events.uniq - data['outbox'].keys).length * (MAX_RESULT + 64)
     end
@@ -457,7 +459,8 @@ module WorkspaceCoordination
       jobs = data['jobs'].values.select { |job| ids.include?(job['ownerId']) && !TERMINAL.include?(job['state']) }
       reservations = data['reservations'].values.select { |item| ids.include?(item['ownerId']) && item['state'] != 'released' }
       deliveries = data['outbox'].values.select { |item| ids.include?(item['ownerId']) && item['state'] != 'delivered' }
-      jobs.map { |item| "operation #{item['id']} (#{item['state']})" } +
+      resource_blocks = claims['claims'].values.select { |item| ids.include?(item['ownerId']) && CLAIM_ACTIVE.include?(item['state']) }.map { |item| "resource claim #{item['id']} (#{item['state']})" }
+      resource_blocks + jobs.map { |item| "operation #{item['id']} (#{item['state']})" } +
         reservations.map { |item| "machine #{item['machine']} (#{item['state']})" } +
         deliveries.map { |item| "notification #{item['id']} (#{item['state']})" } +
         integration_journals.filter_map { |run| "background integration #{run['id']} (#{run.dig('continuation', 'state')})" if ids.include?(run['ownerId']) && run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' } +
@@ -535,6 +538,7 @@ module WorkspaceCoordination
     end
 
     def require_idle_owners!(data, ids)
+      claim_lifecycle_idle!(ids)
       active = data['jobs'].values.find { |job| ids.include?(job['ownerId']) && CLAIMED.include?(job['state']) }
       raise Error.new("lifecycle waits for coordinated operation #{active['id']}", 5) if active
       uncertain = data['reservations'].values.any? do |reservation|
@@ -666,6 +670,7 @@ module WorkspaceCoordination
     end
 
     def require_compatible!(package)
+      require_claim_capability!(package)
       return unless File.exist?(File.join(root, 'ledger.json'))
       data = read
       path = File.join(package, 'share/dev-workspace/coordination-contract.json')
@@ -1354,7 +1359,7 @@ module WorkspaceCoordination
       store.transaction do |data|
         next [] if data['suspended']
         active = data['jobs'].values.select { |job| CLAIMED.include?(job['state']) }
-        busy = active.flat_map { |job| job.fetch('resources') }
+        busy = Engine.normalized_resources(active.flat_map { |job| job.fetch('resources') }) + store.held_claim_resources
         # Unknown effects keep their resource claims, but stopped mutation
         # workers must not consume unrelated execution capacity forever.
         slots = [4 - active.count { |job| job['state'] != 'reconciling' }, 0].max
@@ -1383,6 +1388,10 @@ module WorkspaceCoordination
               next
             end
           end
+          if !(Engine.normalized_resources(job['resources']) & store.held_claim_resources).empty?
+            transition(data, job, 'waiting_resource', {'code' => 'resource_claim_held'})
+            next
+          end
           job['readySequence'] ||= store.sequence(data)
           blocker = active.find { |item| !(item['resources'] & job['resources']).empty? }
           if blocker
@@ -1393,11 +1402,11 @@ module WorkspaceCoordination
         end
         claimed = []
         candidates.select { |job| job['state'] == 'ready' }.sort_by { |job| [job['readySequence'], job['id']] }.each do |job|
-          next if slots.zero? || !(job['resources'] & busy).empty?
+          next if slots.zero? || !(Engine.normalized_resources(job['resources']) & busy).empty?
           unless (!owner_id || job['ownerId'] == owner_id) && data['owners'][job['ownerId']]['workspace'] == workspace
             # Another owner's admission runs under its own outer locks. Preserve
             # its earlier place for shared resources without claiming for it.
-            busy.concat(job['resources'])
+            busy.concat(Engine.normalized_resources(job['resources']))
             next
           end
           attempt = SecureRandom.uuid
@@ -1416,7 +1425,7 @@ module WorkspaceCoordination
           end
           job['attempt'] = attempt
           transition(data, job, 'claimed')
-          busy.concat(job['resources'])
+          busy.concat(Engine.normalized_resources(job['resources']))
           slots -= 1
           claimed << Marshal.load(Marshal.dump(job))
         end
@@ -1435,6 +1444,18 @@ module WorkspaceCoordination
        'reservations' => data['reservations'].values.select { |item| ids.include?(item['ownerId']) },
        'notifications' => data['outbox'].values.select { |event| ids.include?(event['ownerId']) }.map { |event| event.reject { |key, _| %w[text options].include?(key) } },
        'foreignReservations' => data['reservations'].values.reject { |item| ids.include?(item['ownerId']) || item['state'] == 'released' }.map { |item| item.slice('machine', 'state').merge('portalUrl' => data['owners'][item['ownerId']]['portalUrl']) }}
+      claim_state = store.claims['claims'].values
+      result['claims'] = claim_state.select { |item| ids.include?(item['ownerId']) }
+      claim_state.select { |item| item['state'] == 'held' }.each do |item|
+        item['resources'].grep(/^machine:/).each do |resource|
+          machine = resource.delete_prefix('machine:')
+          if ids.include?(item['ownerId'])
+            result['reservations'] << item.slice('id', 'ownerId', 'state', 'revision', 'sequence', 'createdAt', 'updatedAt').merge('machine' => machine, 'mode' => 'claim', 'history' => [])
+          else
+            result['foreignReservations'] << {'machine' => machine, 'state' => 'held', 'portalUrl' => data['owners'].fetch(item['ownerId'])['portalUrl']}
+          end
+        end
+      end
       if portal
         timing = Timing.new(store.root)
         dates = timing.read
@@ -1445,7 +1466,7 @@ module WorkspaceCoordination
         # A session pane must not attribute retained jobs to a recreated slug.
         if slug
           ids.select! { |id| observations.key?(id) }
-          %w[owners jobs reservations notifications integrations].each { |kind| result[kind].select! { |item| ids.include?(kind == 'owners' ? item['id'] : item['ownerId']) } }
+          %w[owners jobs reservations notifications integrations claims].each { |kind| result[kind].select! { |item| ids.include?(kind == 'owners' ? item['id'] : item['ownerId']) } }
         end
         result['owners'].each { |owner| owner['observationIdentity'] = observations[owner['id']] }
         machine_details = lambda do |item|
@@ -1453,7 +1474,7 @@ module WorkspaceCoordination
           item.slice('id', 'ownerId', 'machine', 'state', 'revision', 'mode').merge(
             'shortName' => name || item['machine'].split(':').last,
             'deployments' => item.fetch('history', []).length,
-            'timestamps' => timing.matching(dates, 'reservations', item))
+            'timestamps' => item['mode'] == 'claim' ? {'createdAt' => item['createdAt'], 'heldAt' => item['createdAt'], 'stateChangedAt' => item['updatedAt']} : timing.matching(dates, 'reservations', item))
         end
         held = result['reservations'].reject { |item| %w[requested released].include?(item['state']) }.group_by { |item| item['ownerId'] }
         result['reservationHolders'] = []
@@ -1465,7 +1486,12 @@ module WorkspaceCoordination
               'machines' => held.fetch(owner['id']).sort_by { |item| item['machine'] }.map { |item| machine_details.call(item) })
           end
         end
-        result['counts'] = result.slice('owners', 'jobs', 'reservations', 'notifications', 'integrations', 'foreignReservations').transform_values(&:length)
+        result['counts'] = result.slice('owners', 'jobs', 'reservations', 'notifications', 'integrations', 'foreignReservations', 'claims').transform_values(&:length)
+        result['claims'] = result['claims'].sort_by { |item| [CLAIM_ACTIVE.include?(item['state']) ? 0 : 1, -item['sequence']] }.first(128).map do |item|
+          item.slice('id', 'ownerId', 'state', 'revision', 'sequence', 'createdAt', 'updatedAt').merge(
+            'label' => item['request']['label'], 'repositories' => item['request']['repositories'].first(8),
+            'machines' => item['request']['machines'].first(8))
+        end
         result['owners'] = result['owners'].first(128)
         result['jobs'] = result['jobs'].sort_by { |job| [TERMINAL.include?(job['state']) ? 1 : 0, -job['sequence']] }.first(128).map do |job|
           job.slice('id', 'ownerId', 'kind', 'state', 'reason', 'revision', 'sequence', 'readySequence', 'dependsOn', 'reservationId').merge(
@@ -1482,3 +1508,5 @@ module WorkspaceCoordination
     end
   end
 end
+
+require_relative 'workspace-coordination-claims'

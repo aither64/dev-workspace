@@ -132,6 +132,64 @@ class IntegrationTest < Minitest::Test
     assert_equal 1, @engine.claim(owner_id: first['id']).length
   end
 
+  def test_retained_tracking_claim_covers_workspace_without_feature_registration
+    first, other = owner('tracking-owner'), owner('claim-holder')
+    git('init', '--initial-branch=master', @workspace)
+    git('-C', @workspace, 'remote', 'add', 'origin', @remote)
+    @catalog['repositories']['workspace'] = {'remote' => @remote}
+    install_catalog
+    @engine = engine
+    File.write(File.join(@package, 'share/dev-workspace/claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
+    held = @engine.acquire_claim(other, request('repositories' => ['code'], 'machines' => [], 'label' => 'same canonical remote'))
+    integration = driver(first, tracking: true)
+    called = false
+    integration.define_singleton_method(:record_completion_owned) { |_value| called = true }
+    assert_raises(WorkspaceCoordination::Error) { integration.record_completion({}) }
+    refute called
+    @engine.change_claim(other, held['id'], 'release')
+    integration.record_completion({})
+    assert called
+    assert_empty @engine.store.held_claim_resources
+  end
+
+  def test_retained_refresh_cannot_mutate_before_foreign_repository_claim_releases
+    first, other = owner('retained'), owner('claim-holder')
+    payload = integration_request(first)
+    integration = driver(first)
+    integration.start(payload, wait: false)
+    id = integration.read(payload['requestId'])['jobs']['merge:code']
+    @engine.store.transaction { |data| @engine.transition(data, data['jobs'].fetch(id), 'needs_refresh') }
+    upstream = File.join(@tmp, 'seed')
+    File.write(File.join(upstream, 'upstream'), 'new target baseline')
+    git('-C', upstream, 'add', 'upstream')
+    git('-C', upstream, 'commit', '-m', 'fixture new baseline')
+    git('-C', upstream, 'push', 'origin', 'master')
+    File.write(File.join(@package, 'share/dev-workspace/claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
+    held = @engine.acquire_claim(other, request('repositories' => ['code'], 'machines' => [], 'label' => 'ordinary Git work'))
+    before = git('-C', @bare, 'show-ref')
+    capture = @engine.method(:capture)
+    mutations = []
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      mutations << args if %w[fetch checkout worktree rebase update-ref push].any? { |word| args.include?(word) }
+      capture.call(*args, **options)
+    end
+    error = assert_raises(WorkspaceCoordination::Error) { integration.resume(payload['requestId']) }
+    assert_equal 75, error.code
+    assert_empty mutations
+    assert_equal before, git('-C', @bare, 'show-ref')
+    @engine.change_claim(other, held['id'], 'release')
+    # Stop after entering the now-owned fetch; the ordinary full refresh has
+    # separate certification tests and requires its canonical feature layout.
+    @engine.define_singleton_method(:capture) do |*args, **options|
+      throw :owned_fetch if args.include?('fetch')
+      capture.call(*args, **options)
+    end
+    reached = false
+    catch(:owned_fetch) { integration.resume(payload['requestId']); reached = true }
+    refute reached
+    assert_empty @engine.store.held_claim_resources
+  end
+
   def test_refresh_reply_loss_recovers_snapshot_and_original_mutation
     first = owner('lost-refresh-reply')
     payload = integration_request(first)
@@ -693,6 +751,7 @@ class IntegrationTest < Minitest::Test
     @engine.define_singleton_method(:repository) { |_owner, _name| [seed, nil, nil, {'branch' => 'master'}] }
     @engine.define_singleton_method(:retain_commit) { |_path, _head| seed }
     host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.define_singleton_method(:claim_workflow_selected?) { false }
     host.define_singleton_method(:with_current_generation_lock) { |**_options, &block| block.call }
     attempts = 0
     host.define_singleton_method(:prepare_profile) do |_argv|
@@ -939,6 +998,7 @@ class IntegrationTest < Minitest::Test
     host.instance_variable_set(:@out, StringIO.new)
     host.instance_variable_set(:@err, StringIO.new)
     engine = @engine
+    host.define_singleton_method(:package_root) { engine.package }
     host.define_singleton_method(:coordination_engine) { |_entry| engine }
     host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
     host
