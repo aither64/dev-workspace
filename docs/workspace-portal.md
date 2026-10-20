@@ -42,9 +42,17 @@ private-state recovery.
 ## Optional Codex questions
 
 Optional questions appear in their original Codex message and in a panel below
-the scrolling output. The message box remains available. Click an option to send
-it immediately, or type a response and choose **Send answer**. Both views show
-the same draft, delivery status and accepted answer.
+the scrolling output. The message box remains available. Options appear as radio
+lists, initially selecting the recommendation or first option. Select one and
+optionally add text, or choose **Other** to write your own answer. Select **Send answer** to submit. Both views show the same selection,
+text, delivery status and accepted answer.
+
+The panel starts as a narrow bar showing the number of pending questions. Click
+it to expand one question at a time. Use the numbered question buttons or arrows
+to navigate without sending or losing drafts;
+**Send answer** sends the current answer and advances. Collapse hides the panel
+without dismissing questions or losing drafts. New questions update the count
+without opening the panel or moving focus. Reloading starts collapsed.
 
 **Dismiss** removes a question from the pinned panel without sending anything.
 The panel also clears when the turn ends or an ordinary follow-up is accepted,
@@ -345,9 +353,9 @@ available estimates immediately.
 An unconfirmed send keeps its message in the composer and shows an outcome
 receipt. **Retry original** retries the receipt's saved text and attachments
 with its original attempt ID, independently of the composer draft. A changed
-draft remains intact. **Dismiss** hides the receipt across reloads while keeping
-its retry identity; delivery can still complete. Transcript confirmation retires
-the receipt normally. Sending revised wording creates a separate attempt and
+draft remains intact. The small **×** at the upper right hides the receipt across
+reloads while keeping its retry identity; delivery can still complete. Transcript
+confirmation retires the receipt normally. Sending revised wording creates a separate attempt and
 does not resolve the earlier one. Browser storage must save a dismissal before
 the portal hides it.
 
