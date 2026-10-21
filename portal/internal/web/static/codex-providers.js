@@ -1,61 +1,78 @@
 // Preview state is independent of the active sidebar limits reader.
-export function createProviderPreview({request, onChange, session = "", now = Date.now, freshnessMs = 30000}) {
+export function createProviderPreview({request, onChange, session = "", now = Date.now, freshnessMs = 30000, deadlineMs = 10000}) {
   let catalog = null, selected = "", snapshot = null, failed = false, loading = false;
-  let stopped = false, revision = 0;
-  const cache = new Map(), pending = new Map();
+  let stopped = false, paused = false, generation = 0, revision = 0, catalogRead = null, previewRead = null;
+  const cache = new Map();
   const state = () => ({catalog, selected, snapshot, failed, loading});
-  const changed = () => { if (!stopped) onChange(state()); };
-  const refreshPreview = async (force = false) => {
-    const id = selected, generation = revision;
-    if (!id || stopped) return;
+  const changed = () => { if (!stopped && !paused) onChange(state()); };
+  const begin = () => {
+    const abort = new AbortController(), ticket = generation;
+    const timer = setTimeout(() => abort.abort(), deadlineMs);
+    return {signal: abort.signal, cancel: () => {clearTimeout(timer); abort.abort();},
+      current: () => !stopped && !paused && ticket === generation,
+      finish: () => clearTimeout(timer), promise: null};
+  };
+  const retire = () => {
+    ++generation; ++revision;
+    catalogRead?.cancel(); previewRead?.cancel();
+    catalogRead = null; previewRead = null; loading = false;
+  };
+  const refreshPreview = (force = false) => {
+    const id = selected, selection = revision;
+    if (!id || stopped || paused) return Promise.resolve();
     const saved = cache.get(id);
     if (!force && saved && now() - saved.at < freshnessMs) {
-      snapshot = saved.value; failed = false; loading = false; changed(); return;
+      snapshot = saved.value; failed = false; loading = false; changed(); return Promise.resolve();
     }
-    loading = true; changed();
-    let read = pending.get(id);
-    if (!read) {
-      read = request(`/api/codex-limits?provider=${encodeURIComponent(id)}`).then(value => {
+    if (previewRead?.current()) return previewRead.promise;
+    const read = begin(); previewRead = read; loading = true; changed();
+    read.promise = (async () => {
+      try {
+        const value = await request(`/api/codex-limits?provider=${encodeURIComponent(id)}`, {signal: read.signal});
+        if (!read.current() || read.signal.aborted || selection !== revision || selected !== id) return;
         if (value.provider?.id !== id) throw new Error("Provider limits identity changed.");
-        cache.set(id, {at: now(), value}); return value;
-      }).finally(() => pending.delete(id));
-      pending.set(id, read);
-    }
-    try {
-      const value = await read;
-      if (stopped || selected !== id || revision !== generation) return;
-      snapshot = value; failed = false;
-    } catch (_) {
-      if (stopped || selected !== id || revision !== generation) return;
-      snapshot = saved?.value || null; failed = true;
-    } finally {
-      if (!stopped && selected === id && revision === generation) { loading = false; changed(); }
-    }
+        cache.set(id, {at: now(), value}); snapshot = value; failed = false;
+      } catch (_) {
+        if (read.current() && selection === revision && selected === id) {snapshot = saved?.value || null; failed = true;}
+      } finally {
+        read.finish();
+        if (previewRead === read && read.current()) {previewRead = null; loading = false; changed();}
+      }
+    })();
+    return read.promise;
   };
   const select = id => {
     if (!catalog?.providers.some(provider => provider.id === id)) return;
+    previewRead?.cancel(); previewRead = null;
     selected = id; revision++; snapshot = cache.get(id)?.value || null; failed = false;
     changed(); void refreshPreview();
   };
-  const refresh = async () => {
-    try {
-      const scope = session;
-      const next = await request(`/api/codex-providers${scope ? `?session=${encodeURIComponent(scope)}` : ""}`);
-      if (stopped) return;
-      if (scope !== session) return;
-      if (!Array.isArray(next.providers) || !next.providers.some(provider => provider.id === next.active)) throw new Error("Invalid provider catalog");
-      const wasActive = catalog?.active;
-      catalog = next;
-      if (!catalog.providers.some(provider => provider.id === selected)) select(catalog.active);
-      else changed();
-      if (wasActive && wasActive !== catalog.active) { cache.clear(); revision++; snapshot = null; changed(); }
-      await refreshPreview();
-    } catch (_) { if (!stopped) { failed = true; changed(); } }
+  const refresh = () => {
+    if (stopped || paused) return Promise.resolve();
+    if (catalogRead?.current()) return catalogRead.promise;
+    const read = begin(), scope = session; catalogRead = read;
+    read.promise = (async () => {
+      try {
+        const next = await request(`/api/codex-providers${scope ? `?session=${encodeURIComponent(scope)}` : ""}`, {signal: read.signal});
+        if (!read.current() || read.signal.aborted || scope !== session) return;
+        if (!Array.isArray(next.providers) || !next.providers.some(provider => provider.id === next.active)) throw new Error("Invalid provider catalog");
+        const wasActive = catalog?.active;
+        catalog = next;
+        if (wasActive && wasActive !== catalog.active) {cache.clear(); revision++; previewRead?.cancel(); previewRead = null; snapshot = null;}
+        if (!catalog.providers.some(provider => provider.id === selected)) select(catalog.active);
+        else changed();
+        await refreshPreview();
+      } catch (_) { if (read.current()) {failed = true; changed();} }
+      finally {read.finish(); if (catalogRead === read && read.current()) catalogRead = null;}
+    })();
+    return read.promise;
   };
   return {state, select, refresh, refreshPreview,
-    setSession(value) {session = value || ""; catalog = null; selected = ""; revision++; snapshot = null; changed(); return refresh();},
-    invalidate() {cache.clear(); revision++; snapshot = null;},
-    stop() {stopped = true; revision++;}};
+    setSession(value) {retire(); session = value || ""; catalog = null; selected = ""; snapshot = null; changed(); return refresh();},
+    invalidate() {retire(); cache.clear(); snapshot = null;},
+    pause() {paused = true; retire();},
+    resume() {if (!paused || stopped) return Promise.resolve(); paused = false; return refresh();},
+    stop() {stopped = true; retire();}};
 }
 
 const stages = {accepted:"Request accepted",preparing:"Preparing the switch","waiting-package":"Waiting for the workspace package update","waiting-creation":"Waiting for session creation","starting-provider-check":"Starting the provider check","checking-provider":"Checking provider authentication and models","locking-sessions":"Waiting for session access","capturing-settings":"Saving thread settings",quiescing:"Pausing terminal clients",pausing:"Pausing work",closing:"Closing threads",reopening:"Applying the provider",resuming:"Restoring work","resuming-work":"Resuming work","restoring-terminals":"Restoring terminal clients",complete:"Threads restored"};

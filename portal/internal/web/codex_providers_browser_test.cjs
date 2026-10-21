@@ -9,6 +9,21 @@ const moduleURL = pathToFileURL(__dirname + "/static/codex-providers.js");
 const catalog = {active:"openai",providers:[{id:"openai",label:"Subscription"},{id:"pool",label:"Pool"}]};
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test("20 one-second ticks coalesce catalog reads; pause retires old success/error/finally", async () => {
+  const {createProviderPreview}=await import(moduleURL);
+  for(const failOld of [false,true]) {
+    const reads=[];const preview=createProviderPreview({onChange:()=>{},request:(url,options)=>new Promise((resolve,reject)=>reads.push({url,signal:options.signal,resolve,reject}))});
+    const old=preview.refresh();for(let i=0;i<20;i++)void preview.refresh();assert.equal(reads.length,1);
+    preview.pause();assert(reads[0].signal.aborted);await preview.refresh();assert.equal(reads.length,1);
+    const fresh=preview.resume();assert.equal(reads.length,2);
+    if(failOld)reads[0].reject(Error("old"));else reads[0].resolve({...catalog,active:"pool"});await old;
+    assert.equal(preview.refresh(),fresh);assert.equal(preview.state().catalog,null);
+    reads[1].resolve(catalog);await tick();assert.equal(reads.length,3);
+    reads[2].resolve({provider:{id:"openai"},windows:[]});await fresh;
+    assert.equal(preview.state().catalog.active,"openai");assert.equal(preview.state().failed,false);preview.stop();
+  }
+});
+
 test("preview selection makes only reads and ignores an earlier provider response", async () => {
   const {createProviderPreview} = await import(moduleURL);
   const reads = new Map(), calls = [];
@@ -93,7 +108,7 @@ async function popup(backend) {
   let poll;
   const context = {dialog,...helpers,slug:"",providers:null,providerBusy:false,providerAttempt:null,observedActiveProvider:"",
     limitsSnapshot:null,limitsLeaving:false,limits:{invalidate(){},refresh:async()=>{}},renderAccountDetails(){},
-    crypto:{randomUUID},document:{hidden:false,createElement:control,dispatchEvent(){}},CustomEvent:class {},
+    crypto:{randomUUID},document:{addEventListener(){},hidden:false,createElement:control,dispatchEvent(){}},CustomEvent:class {},
     setInterval:fn => {poll=fn;return 1;},clearInterval(){},addEventListener(){},
     request:async (url,options) => {
       if (url === "/api/codex-providers") return {...catalog,operation:backend.operation ? {...backend.operation} : null};
@@ -170,7 +185,7 @@ test("sidebar follows its session after a default switch while the dialog previe
   const context = {createCodexLimitsReader,slug:"page-session",observedActiveProvider:"openai",
     limits:null,limitsSnapshot:null,notice:{failure(){},success(){},begin(){}},
     refreshPolicy:{limitsMs:0,limitsDeadlineMs:1000,retryInitialMs:0},
-    document:{hidden:false,dispatchEvent:event=>events.push(event.type)},CustomEvent:class {constructor(type){this.type=type;}},
+    document:{addEventListener(){},hidden:false,dispatchEvent:event=>events.push(event.type)},CustomEvent:class {constructor(type){this.type=type;}},
     // The preview is deliberately a different scope and must not supply the
     // page-session identity when its effective provider changes.
     providers:{refresh:()=>{throw new Error("workspace preview was used for the page session");}},
@@ -196,7 +211,7 @@ test("plan and fork creation load destination catalogs independently of the sour
   const fork={id:"fork-form",dataset:{},elements:{}};
   const planModel=makeSelect(plan),sourceModel=makeSelect(source),forkModel=makeSelect(fork),calls=[];
   const context={creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
-    document:{querySelectorAll:()=>[sourceModel,planModel,forkModel],createElement:()=>({})},
+    document:{addEventListener(){},querySelectorAll:()=>[sourceModel,planModel,forkModel],createElement:()=>({})},
     request:async url=>{calls.push(url);return [{model:url.includes("provider=openai")?"daybreak":url.includes("session=source")?"source-model":"default-model",displayName:"Fixture",isDefault:true}];},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){}};
   const text=readFileSync(__dirname+"/static/app.js","utf8");
@@ -229,7 +244,7 @@ test("restoring a plan provider reloads its catalog and discards the outstanding
   let releaseDefault;
   const calls=[];
   const context={creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
-    document:{querySelectorAll:()=>[model],createElement:()=>({})},
+    document:{addEventListener(){},querySelectorAll:()=>[model],createElement:()=>({})},
     request:url=>{calls.push(url);return url==="/api/models"?new Promise(resolve=>{releaseDefault=resolve;}):Promise.resolve([{model:"daybreak",isDefault:true}]);},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){},
     restoreDraftSelect:(select,value)=>{if(select)select.value=value;},restoreManagedCatalogRecovery:()=>null,updateCreationProviderHelp(){}};
@@ -287,13 +302,13 @@ async function creationProviders({locked=false, fail=false}={}) {
   let resolve,reject;const reads=new Promise((yes,no)=>{resolve=yes;reject=no;});
   const reloads=[];
   let nextCatalog={...catalog,default:"openai"},readCount=0;
-  const context={document:{querySelectorAll:()=>[form],createElement:()=>({})},request:()=>readCount++?Promise.resolve(nextCatalog):reads,
+  const context={document:{addEventListener(){},querySelectorAll:()=>[form],createElement:()=>({})},request:()=>readCount++?Promise.resolve(nextCatalog):reads,
     queueMicrotask,loadModels:async f=>reloads.push(f),modelCatalogs:{clear(){}},
     restoreDraftSelect:(target,value)=>{target.value=value;}};
   const start=source.indexOf("  const creationProviderValue = "),end=source.indexOf('  if (body.hasAttribute("data-index"))',start);
   const api=vm.runInNewContext(source.slice(start,end)+'\n({value:()=>creationProviderValue(form),refresh:()=>refreshCreationProvider(form)})',{...context,form});
   const changeStart=source.indexOf('  document.querySelectorAll("[data-creation-provider]").forEach'),changeEnd=source.indexOf("  let collaborationModes",changeStart);
-  vm.runInNewContext(source.slice(start,source.indexOf("  for (const form",start))+source.slice(changeStart,changeEnd),{...context,document:{querySelectorAll:()=>[select]}});
+  vm.runInNewContext(source.slice(start,source.indexOf("  for (const form",start))+source.slice(changeStart,changeEnd),{...context,document:{addEventListener(){},querySelectorAll:()=>[select]}});
   if(fail)reject(new Error("offline"));else resolve({...catalog,default:"openai"});
   await tick();
   return {select,form,help,reloads,value:api.value,changeDefault:async id=>{nextCatalog={...catalog,default:id,active:id};await api.refresh();},change:value=>{select.value=value;listeners.get("select-change")();},reset:async()=>{listeners.get("reset")();await tick();}};
@@ -343,7 +358,7 @@ test("opening a fork refreshes the default independently of the pinned source", 
   const end=source.indexOf('  forkDialog?.querySelector',start);
   let open,shown=false,refreshed=false;
   vm.runInNewContext(source.slice(start,end),{
-    document:{getElementById:()=>({addEventListener:(_,handler)=>{open=handler;}})},
+    document:{addEventListener(){},getElementById:()=>({addEventListener:(_,handler)=>{open=handler;}})},
     forkForm:ui.form,forkDialog:{showModal(){shown=true;}},
     refreshCreationProvider:form=>{assert.equal(form,ui.form);refreshed=true;return ui.changeDefault("pool");},
   });
