@@ -24,6 +24,8 @@ type notificationService struct {
 	client webpush.HTTPClient
 }
 
+var errNotificationRegistrationExists = errors.New("This browser still has a notification registration. Choose Disable again before enabling notifications.")
+
 func (s *Server) initNotifications() {
 	if !s.config.ObserveActivity {
 		return
@@ -188,7 +190,30 @@ func (n *notificationService) sendNext(ctx context.Context, now time.Time) {
 	if browser.Disabled || validatePushSubscription(browser.Subscription, browser.ExpiresAt, now) != nil {
 		return
 	}
-	data, _ := json.Marshal(delivery.Event)
+	// Observation may wait on dependencies. Revalidate its copied transport job
+	// against current registration/mute/outbox state immediately before sending.
+	n.store.mu.Lock()
+	current, found := n.store.state.Outbox[key]
+	registered, registeredNow := n.store.state.Browsers[delivery.Browser]
+	presence := n.store.presence[notificationDeliveryKey(delivery.Browser, delivery.Event.Slug)]
+	baseline := n.store.state.Sessions[delivery.Event.Slug]
+	sendingAt := time.Now()
+	eligible := !n.store.failed && !n.disabled() && found && current.Event.ID == delivery.Event.ID &&
+		current.Event.Revision == delivery.Event.Revision && current.Browser == delivery.Browser && registeredNow && !registered.Disabled &&
+		registered.Origin == browser.Origin && registered.Subscription.Endpoint == browser.Subscription.Endpoint &&
+		validatePushSubscription(registered.Subscription, registered.ExpiresAt, sendingAt) == nil &&
+		delivery.Event.ExpiresAt > sendingAt.UnixMilli() && (presence.Identity != delivery.Event.Identity || !presence.Until.After(sendingAt)) &&
+		(delivery.Event.Kind == "test" || baseline.Eligible && baseline.Event != nil && baseline.Event.ID == delivery.Event.ID &&
+			baseline.Identity == delivery.Event.Identity && notificationEnabled(&n.store.state, delivery.Event.Slug, delivery.Event.Identity))
+	if eligible {
+		browser = registered
+	}
+	n.store.mu.Unlock()
+	if !eligible {
+		return
+	}
+	// registrationId belongs only to this transport attempt, never event identity.
+	data := notificationPayload(delivery)
 	requestCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	response, err := webpush.SendNotificationWithContext(requestCtx, data, &browser.Subscription, &webpush.Options{
 		HTTPClient: n.client, Subscriber: n.server.config.BaseURL, VAPIDPrivateKey: private, VAPIDPublicKey: public,
@@ -204,7 +229,7 @@ func (n *notificationService) sendNext(ctx context.Context, now time.Time) {
 	defer n.store.mu.Unlock()
 	_ = n.store.change(func(state *notificationState) error {
 		current, found := state.Outbox[key]
-		if !found || current.Event.ID != delivery.Event.ID {
+		if !found || current.Event.ID != delivery.Event.ID || current.Event.Revision != delivery.Event.Revision || current.Browser != delivery.Browser {
 			return nil
 		}
 		b, found := state.Browsers[delivery.Browser]
@@ -237,6 +262,15 @@ func (n *notificationService) sendNext(ctx context.Context, now time.Time) {
 		state.Browsers[b.ID] = b
 		return nil
 	})
+}
+
+// The registration epoch is transport-only; persisted events keep their shape.
+func notificationPayload(delivery notificationDelivery) []byte {
+	data, _ := json.Marshal(struct {
+		attentionEvent
+		RegistrationID string `json:"registrationId"`
+	}{delivery.Event, delivery.Browser})
+	return data
 }
 
 func attentionRelevant(event attentionEvent, observation attentionObservation) bool {
@@ -314,7 +348,7 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 		if found && browser.Origin == origin {
 			result = browser.Result
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"version": 1, "publicKey": n.store.state.PublicKey, "registered": registered, "result": result, "available": !n.disabled()})
+		s.writeJSON(w, http.StatusOK, map[string]any{"version": 1, "deliveryEpoch": 1, "publicKey": n.store.state.PublicKey, "registered": registered, "result": result, "available": !n.disabled()})
 		return
 	}
 	if r.URL.Path == "/api/browser-notifications/disable" {
@@ -367,6 +401,7 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 		RegistrationID string               `json:"registrationId"`
 		Subscription   webpush.Subscription `json:"subscription"`
 		ExpirationTime *int64               `json:"expirationTime"`
+		RequireFresh   bool                 `json:"requireFresh"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	if !s.decodeJSON(w, r, &input) {
@@ -391,6 +426,9 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 				if browser.Subscription.Endpoint == input.Subscription.Endpoint {
 					if browser.Origin != origin {
 						return errors.New("This subscription belongs to another portal origin.")
+					}
+					if input.RequireFresh {
+						return errNotificationRegistrationExists
 					}
 					outputID = id
 				}
@@ -422,6 +460,10 @@ func (s *Server) browserNotificationsAPI(w http.ResponseWriter, r *http.Request)
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errNotificationRegistrationExists) {
+			s.writeError(w, r, http.StatusConflict, err.Error())
+			return
+		}
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}

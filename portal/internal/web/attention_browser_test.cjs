@@ -26,8 +26,8 @@ function workerHarness() {
   const sound = {value: true, failed: false};
   let status = {fresh: true, enabled: true, identity, event: event(), revision: 1}, inaccessible = false;
   const context = {URL, AbortController, setTimeout, clearTimeout, Date,
-    importScripts: value => assert.equal(value, '/static/session-attention-store.js?v=3'),
-    workspaceAttentionStore: {readSound: async () => {soundReads++; if (sound.failed) throw Error("sound read canary"); return sound.value;}, update: async (key, change) => {
+    importScripts: value => assert.equal(value, '/static/session-attention-store.js?v=4'),
+    workspaceAttentionStore: {readDeliveryGate: async () => null, readSound: async () => {soundReads++; if (sound.failed) throw Error("sound read canary"); return sound.value;}, update: async (key, change) => {
       const record = change(records.get(key) || {identity: key, seen: [], revision: 0, event: null}); records.set(key, record); return record;
     }},
     fetch: async (url, options) => { calls.push({url, options}); return {ok: !inaccessible, status: inaccessible ? 401 : 200, json: async () => status}; },
@@ -93,10 +93,10 @@ test('browser permission is only requested after explicit enable click', async (
   let prompts = 0;
   const storage = new Map();
   const panel = {querySelector: selector => controls[selector.slice(19, -1)]};
-  const context = {document: {querySelectorAll: selector => [panel.querySelector(selector)].filter(Boolean), getElementById: () => null}, navigator: {serviceWorker: {getRegistration: async () => null}},
+  const context = {document: {querySelectorAll: selector => [panel.querySelector(selector)].filter(Boolean), getElementById: () => null}, navigator: {locks:{request:async(_name,work)=>work()},serviceWorker: {getRegistration: async () => null}},
     Notification: {permission: 'default', requestPermission: async () => { prompts++; return 'denied'; }},
     isSecureContext: true, PushManager: function() {}, AbortController, setTimeout, clearTimeout,
-    localStorage: {getItem: key => storage.get(key) || null},
+    localStorage: {getItem: key => storage.get(key) || null}, workspaceAttentionStore:testStoreHarness().store, crypto:require('node:crypto').webcrypto,
     fetch: async () => ({ok: true, json: async () => ({available: true, registered: false})}),
   };
   vm.runInNewContext(source('browser-notifications.js'), context);
@@ -212,7 +212,14 @@ test('50 attention documents stop hidden HTTP and storage work and retire old re
 const browserId = 'd'.repeat(64), browserKey = 'workspace-browser-notifications.v1', cleanupKey = `${browserKey}.cleanup`;
 const endpoint = 'https://fcm.googleapis.com/private-endpoint?exact=value';
 const endpointDigest = require('node:crypto').createHash('sha256').update(endpoint).digest('hex');
+function notificationLocks(state) {
+  return state.actionLocks ||= {request(_name, work) {
+    const next = (state.actionTail || Promise.resolve()).then(work);
+    state.actionTail = next.catch(()=>{}); return next;
+  }};
+}
 async function notificationHarness(state, storage = new Map()) {
+  const gateStorage = state.gateStorage ||= testStoreHarness();
   const controls = Object.fromEntries(['status', 'enable', 'disable', 'test'].map(name => [name, {disabled: false, addEventListener(type, callback) {this[type] = callback;}}]));
   const menu = Object.fromEntries(['delivery', 'menu-error'].map(name => [name, {disabled: true, textContent: '', addEventListener(type, callback) {this[type] = callback;}}]));
   const calls = [], listeners = {};
@@ -227,7 +234,7 @@ async function notificationHarness(state, storage = new Map()) {
     }};
   const registration = {pushManager: {getSubscription: async () => {if (state.subscriptionRead) return state.subscriptionRead(subscription); if (state.lookupFailure) throw Error('lookup unavailable'); return state.subscribed ? subscription : null;},
     subscribe: async () => {state.subscribed = true; return subscription;}}};
-  registration.active = {state: 'activated'};
+  registration.active = {state:'activated',postMessage(_message,ports){ports[0].reply({version:1,deliveryEpoch:state.oldWorker?undefined:1});}};
   registration.update = async () => {};
   const service = lifecycleTarget({controller: registration.active, getRegistration: async () => registration,
     register: async () => {state.onWorkerRegister?.(); return registration;}, ready: Promise.resolve(registration)});
@@ -236,7 +243,8 @@ async function notificationHarness(state, storage = new Map()) {
   const context = {document: {visibilityState: 'visible', addEventListener: (name, callback) => listeners[name] = callback,
     querySelectorAll: selector => [controls[selector.slice(19, -1)] || menu[selector.slice(19, -1)]].filter(Boolean), getElementById: () => null},
     addEventListener: (name, callback) => listeners[name] = callback,
-    navigator: {serviceWorker: service},
+    navigator: {serviceWorker: service,locks:state.noLocks?undefined:notificationLocks(state)}, workspaceAttentionStore:gateStorage.store,
+    MessageChannel:function(){this.port1={close(){}};this.port2={reply:value=>queueMicrotask(()=>this.port1.onmessage({data:value}))};},
     Notification: {permission: 'granted', requestPermission: async () => {state.permissionCalls = (state.permissionCalls || 0) + 1; return 'granted';}},
     PushManager: function() {}, isSecureContext: true, AbortController, setTimeout, clearTimeout, atob, Uint8Array, TextEncoder,
     crypto: require('node:crypto').webcrypto,
@@ -244,7 +252,7 @@ async function notificationHarness(state, storage = new Map()) {
     fetch: async (url, options = {}) => {
       const body = options.body && JSON.parse(options.body); calls.push({url, body, savedId: storage.get(browserKey)});
       if (url.endsWith('/register')) {
-        if (state.registerResponse) return state.registerResponse();
+        if (state.registerResponse) return state.registerResponse(body);
         state.registered = true;
         if (state.serverRecords) {
           state.serverRecords.set(state.replacementId, body.subscription.endpoint);
@@ -273,13 +281,13 @@ async function notificationHarness(state, storage = new Map()) {
       }
       const queriedId = new URL(url, 'https://workspace.example').searchParams.get('registrationId');
       if (queriedId !== null && state.readResponse) return state.readResponse(queriedId);
-      return {ok: true, json: async () => ({available: true, publicKey: 'Ag', registered: state.serverRecords ? state.serverRecords.has(queriedId) : state.registered && queriedId === browserId})};
+      return {ok: true, json: async () => ({available: true, deliveryEpoch:state.oldServer?undefined:1, publicKey: 'Ag', registered: state.serverRecords ? state.serverRecords.has(queriedId) : state.registered && queriedId === browserId})};
     },
   };
   vm.runInNewContext(source('browser-notifications.js'), context);
-  for (let i = 0; i < 30; i++) await Promise.resolve();
-  const flush = async () => {for (let i = 0; i < 50; i++) await Promise.resolve();};
-  return {controls, menu, calls, storage, listeners, context, registration, flush};
+  for (let i = 0; i < 100; i++) await Promise.resolve();
+  const flush = async () => {for (let i = 0; i < 300; i++) await Promise.resolve();};
+  return {controls, menu, calls, storage, listeners, context, registration, flush,gateStorage};
 }
 
 test('lost registration reply, saved ID or changed key disable without registering again', async () => {
@@ -376,18 +384,17 @@ test('uncertain local absence retains its selector and Disable control across re
 test('stale saved ID and lost replacement reply retain both deletion obligations and outbox truth', async () => {
   for (const failSelector of [null, 'registrationId', 'endpointDigest']) {
     const replacementId = 'e'.repeat(64);
-    const state = {subscribed: false, registered: true, loseRegisterReply: true, replacementId, failSelector,
-      serverRecords: new Map([[browserId, 'https://fcm.googleapis.com/old-endpoint']]), outbox: new Set([browserId])};
+    const state = {subscribed: true, registered: true, replacementId, failSelector,
+      serverRecords: new Map([[browserId, 'https://fcm.googleapis.com/old-endpoint'],[replacementId,endpoint]]), outbox: new Set([browserId,replacementId])};
     const h = await notificationHarness(state, new Map([[browserKey, browserId]]));
-    await h.controls.enable.click();
-    assert.equal(h.storage.get(browserKey), browserId, 'lost reply leaves a stale saved ID');
+    assert.equal(h.storage.get(browserKey), browserId, 'retained lost reply leaves a stale saved ID');
     assert.equal(state.subscribed, true); assert.equal(state.serverRecords.size, 2); assert.equal(state.outbox.size, 2);
     await h.controls.disable.click();
     assert.equal(state.subscribed, false, 'one failed deletion cannot block local unsubscribe');
     const deletions = h.calls.filter(call => call.url.endsWith('/disable'));
     assert.equal(deletions.length, 2, 'fixed current digest plus saved ID bound');
     assert.deepEqual(deletions.map(call => Object.keys(call.body)[0]).sort(), ['endpointDigest', 'registrationId']);
-    assert.equal(h.calls.filter(call => call.url.endsWith('/register')).length, 1, 'Disable does not register');
+    assert.equal(h.calls.filter(call => call.url.endsWith('/register')).length, 0, 'Disable does not register');
     if (failSelector) {
       const remaining = failSelector === 'registrationId' ? browserId : replacementId;
       assert.deepEqual([...state.serverRecords.keys()], [remaining]); assert.deepEqual([...state.outbox], [remaining]);
@@ -420,19 +427,19 @@ test('successful replacement retires the old ID before overwrite or retains both
     const retirement = h.calls.find(call => call.url.endsWith('/disable'));
     assert.deepEqual(retirement.body, {registrationId: browserId});
     assert.equal(retirement.savedId, browserId, 'old ID was not overwritten before its deletion');
-    assert.equal(state.subscribed, true, 'Enable does not automatically unsubscribe');
+    assert.equal(state.subscribed, !failure, 'uncertain old cleanup blocks subscription creation');
     if (failure) {
       assert.equal(h.storage.get(browserKey), browserId, 'unknown deletion must retain the old ID');
-      assert.deepEqual(JSON.parse(h.storage.get(cleanupKey)), {endpointDigest});
+      assert.deepEqual(JSON.parse(h.storage.get(cleanupKey)), {registrationId:browserId});
       assert.equal(h.controls.status.textContent, 'Disabling is incomplete. Retry Disable.');
       assert.equal(h.controls.disable.disabled, false); assert.equal(h.controls.enable.disabled, true);
-      assert.equal(state.serverRecords.has(replacementId), true); assert.equal(state.outbox.has(replacementId), true);
+      assert.equal(state.serverRecords.has(replacementId), false); assert.equal(state.outbox.has(replacementId), false);
       assert.equal(state.serverRecords.has(browserId), failure === 'failed');
       const reloaded = await notificationHarness(state, h.storage);
       assert.equal(reloaded.calls.some(call => call.body), false, 'reload preserves obligations without deletion');
       state.failSelector = null;
       await reloaded.controls.disable.click();
-      assert.equal(reloaded.calls.filter(call => call.url.endsWith('/disable')).length, 2);
+      assert.equal(reloaded.calls.filter(call => call.url.endsWith('/disable')).length, 1);
       assert.match(reloaded.controls.status.textContent, /^Disabled on this browser/);
     } else {
       assert.equal(h.storage.get(browserKey), replacementId);
@@ -480,7 +487,7 @@ function testStoreHarness() {
     const req = {}; queueMicrotask(() => {req.result = database; req.onsuccess();}); return req;
   }}, Date, setTimeout, clearTimeout};
   vm.runInNewContext(source('session-attention-store.js'), context);
-  return {store: context.workspaceAttentionStore, records, state, versions};
+  return {store: context.workspaceAttentionStore, records, state, versions,reload(){vm.runInNewContext(source('session-attention-store.js'),context);return context.workspaceAttentionStore;}};
 }
 const testDescriptor = (revision = 100, digit = 'c') => ({identity: `test-${'d'.repeat(64)}`, id: digit.repeat(64), revision, expiresAt: Date.now() + 60000});
 const testPayload = descriptor => ({...descriptor, version: 1, kind: 'test', slug: '', route: '/'});
@@ -518,7 +525,7 @@ test('test receipts distinguish receipt, display resolution/rejection and browse
     release(); await work;
     const outcome = h.storage.records.get(descriptor.identity).testOutcome;
     assert.equal(outcome.received, true); assert.equal(outcome.display, 'resolved'); assert.equal(outcome.browserRecord, record);
-    assert.deepEqual(JSON.parse(JSON.stringify(h.capabilities())), {version: 1});
+    assert.deepEqual(JSON.parse(JSON.stringify(h.capabilities())), {version:1,deliveryEpoch:1});
   }
   for (const name of ['NotAllowedError', 'private-error-canary']) {
     const h = displayHarness(), descriptor = testDescriptor(); h.state.failure = {name, message: 'secret message canary'};
@@ -570,7 +577,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   const state = {descriptor: testDescriptor(now), registered: !options.off, subscribed: !options.off, available: options.available ?? true, workerVersion: options.workerVersion ?? 1, update: options.update, noReply: options.noReply};
   const subscription = {endpoint, options: {}, toJSON: () => ({endpoint, keys: {p256dh: 'public', auth: 'auth'}}), unsubscribe: async () => {state.subscribed = false; return true;}};
   const registration = lifecycleTarget({update: async () => {state.updateChecks = (state.updateChecks || 0) + 1; if (state.update) await state.update();},
-    active: lifecycleTarget({state: 'activated', postMessage(_message, ports) {state.probes = (state.probes || 0) + 1; if (!state.noReply) ports[0].reply({version: state.workerVersion});}}),
+    active: lifecycleTarget({state: 'activated', postMessage(_message, ports) {state.probes = (state.probes || 0) + 1; if (!state.noReply) ports[0].reply({version: state.workerVersion,deliveryEpoch:1});}}),
     pushManager: {getSubscription: async () => state.subscribed ? subscription : null,
       subscribe: async () => {state.subscribes = (state.subscribes || 0) + 1; state.subscribed = true; return subscription;}}});
   if (options.waitingWorker) registration.waiting = lifecycleTarget({state: 'installed'});
@@ -579,7 +586,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   const addServiceListener = service.addEventListener;
   service.addEventListener = (name, callback) => {addServiceListener(name, callback); listeners[name] = event => service.dispatch(name, event);};
   const context = {document: {visibilityState: 'visible', getElementById: () => ({querySelector: selector => controls[selector.slice(19, -1) || 'status']}),
-    addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: service}, addEventListener: (name, callback) => listeners[name] = callback,
+    addEventListener: (name, callback) => listeners[name] = callback}, navigator: {serviceWorker: service,locks:notificationLocks(state)}, addEventListener: (name, callback) => listeners[name] = callback,
     Date: class extends Date {static now() {return now;}}, Notification: {permission: options.permission || 'granted', requestPermission: async () => {state.permissions = (state.permissions || 0) + 1; if (state.permissionReply) return state.permissionReply(); return 'granted';}, prototype: options.noSilent ? {} : {silent: false}}, PushManager: function() {}, isSecureContext: options.unsupported ? false : true,
     workspaceAttentionStore: options.oldStore ? {} : storage.store, AbortController, Uint8Array, TextEncoder, atob, crypto: require('node:crypto').webcrypto,
     MessageChannel: function() {this.port1 = {close() {}}; this.port2 = {reply: value => queueMicrotask(() => this.port1.onmessage({data: value}))};},
@@ -589,7 +596,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
       if (url.endsWith('/test') && state.testReply) return state.testReply();
       if (url.endsWith('/disable')) state.registered = false;
       if (url.endsWith('/register')) {state.registered = true; return {ok: true, json: async () => ({registrationId: browserId})};}
-      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: state.available, registered: state.registered, publicKey: 'Ag', result: 'provider_accepted'}};},
+      return {ok: true, json: async () => url.endsWith('/test') ? {ok: true, test: options.oldServer ? null : state.descriptor} : {available: state.available, deliveryEpoch:1, registered: state.registered, publicKey: 'Ag', result: 'provider_accepted'}};},
   };
   context.document.querySelectorAll = selector => {
     const name = selector.slice(19, -1);
@@ -597,7 +604,7 @@ async function feedbackHarness(storage = testStoreHarness(), options = {}) {
   };
   context.document.getElementById = name => name === 'sidebar-menu' ? {addEventListener: (_name, callback) => listeners.menutoggle = callback} : null;
   vm.runInNewContext(source('browser-notifications.js'), context);
-  const flush = async () => {for (let i = 0; i < 80; i++) await Promise.resolve();};
+  const flush = async () => {for (let i = 0; i < 300; i++) await Promise.resolve();};
   await flush();
   return {controls: options.menuOnly ? menuControls : controls, menuControls, storage, state, timers, calls, context, listeners, registration, service, async advance(ms) {now += ms;
     const ready = [...timers].filter(([,timer]) => timer.at <= now); for (const [id,timer] of ready) {timers.delete(id); timer.callback(); await flush();}}, flush};
@@ -636,7 +643,9 @@ test('test wait survives reopen, stops at pagehide/expiry/disable and treats old
   await reopened.controls.disable.click();
   assert.equal(h.storage.records.get(h.state.descriptor.identity).testPending, undefined);
   for (const options of [{oldServer: true}, {oldStore: true}]) {
-    const old = await feedbackHarness(testStoreHarness(), options); await old.controls.test.click();
+    const old = await feedbackHarness(testStoreHarness(), options);
+    if (options.oldStore) {assert.equal(old.controls.test.disabled,true); continue;}
+    await old.controls.test.click();
     assert.match(old.controls['test-status'].textContent, /matching test result is unavailable/);
     assert.equal(old.timers.size, 0);
   }
@@ -1166,7 +1175,7 @@ test('menu-only owner reads status on load/open without permission, subscription
   assert.equal(h.timers.size, 0, 'menu does not resume panel Test polling');
   storage.state.failed = true;
   h.listeners.menutoggle({newState: 'open'}); await h.flush();
-  assert.equal(h.controls['menu-error'].textContent, 'Could not read the sound setting.');
+  assert.equal(h.controls['menu-error'].textContent, 'Could not check notifications.');
   assert.equal(h.controls.sound.disabled, true);
 });
 
@@ -1407,7 +1416,7 @@ test('compact projection cannot enable from pending, contradictory, stale or ret
 test('compact notices use domain priority and clear only on that domain current success, without parsing detailed text', async () => {
   const h = await feedbackHarness(testStoreHarness(), {menu: true});
   h.storage.state.failed = true; h.listeners.menutoggle({newState: 'open'}); await h.flush();
-  assert.equal(h.menuControls['menu-error'].textContent, 'Could not read the sound setting.');
+  assert.equal(h.menuControls['menu-error'].textContent, 'Could not check notifications.');
   h.listeners.storage({key: browserKey, newValue: null}); await h.flush();
   assert.equal(h.menuControls['menu-error'].textContent, 'Notification setup needs attention.');
   h.storage.state.failed = false; h.menuControls.sound.checked = false; await h.menuControls.sound.change();
@@ -1417,8 +1426,8 @@ test('compact notices use domain priority and clear only on that domain current 
   assert.equal(clean.menuControls['menu-error'].textContent, 'Could not save the sound setting.');
   clean.controls.status.textContent = 'arbitrary backend/private status';
   clean.listeners.controllerchange(); await clean.flush();
-  assert.equal(clean.menuControls['menu-error'].textContent, 'Could not save the sound setting.', 'delivery refresh alone cannot clear sound error');
-  clean.storage.state.commitFailure = false;
+  assert.equal(clean.menuControls['menu-error'].textContent, 'Could not check notifications.', 'unreadable delivery gate takes priority over sound error');
+  clean.storage.state.commitFailure = false; clean.listeners.controllerchange(); await clean.flush();
   clean.listeners['session-section-change']({detail: 'settings'}); await clean.flush();
   assert.equal(clean.menuControls['menu-error'].textContent, '');
   const worker = await feedbackHarness(testStoreHarness(), {menu: true, waitingWorker: true});
@@ -1487,3 +1496,145 @@ for (const method of ['getSubscription', 'subscribe']) {
     assert.equal(toggle.disabled, true); assert.equal(h.menuControls['menu-error'].textContent, 'Could not update notifications.');
   });
 }
+
+test('delivery gate commits CAS epochs in the existing v1 store and survives attention pruning', async () => {
+  const h=testStoreHarness(), token='action-one';
+  assert.equal(await h.store.readDeliveryGate(),null);
+  await h.store.writeDeliveryGate({enabled:false,actionToken:token,registrationId:''},null);
+  const enabled=await h.store.writeDeliveryGate({enabled:true,actionToken:token,registrationId:browserId},token);
+  assert.equal(enabled.enabled,true);
+  assert.equal(await h.store.writeDeliveryGate({enabled:false,actionToken:'stale',registrationId:''},null),null);
+  await h.store.writeDeliveryGate({enabled:false,actionToken:'action-two',registrationId:''});
+  assert.equal(await h.store.writeDeliveryGate({enabled:true,actionToken:token,registrationId:browserId},token),null);
+  assert.equal((await h.store.readDeliveryGate()).enabled,false);
+  await assert.rejects(h.store.update('browser-notification-delivery'),/Reserved/);
+  await h.store.writeSound(false);
+  for(let i=0;i<520;i++) h.records.set(`old-${i}`,{identity:`old-${i}`,at:i});
+  await h.store.update(identity);
+  assert.equal((await h.store.readDeliveryGate()).actionToken,'action-two');
+  assert.equal((await h.reload().readDeliveryGate()).actionToken,'action-two','fresh context reads durable managed state');
+  assert.equal(await h.store.readSound(),false);
+  assert.deepEqual(h.versions,[1,1], 'reload reopens the existing database version without an upgrade');
+  h.records.delete('browser-notification-delivery');
+  await assert.rejects(h.store.readDeliveryGate(),/cannot save notification settings/,'managed context cannot return to legacy');
+  await h.store.writeDeliveryGate({enabled:false,actionToken:'recovered',registrationId:''});
+  h.state.holdCommit=true;
+  const write=h.store.writeDeliveryGate({enabled:false,actionToken:'pending',registrationId:''});
+  let settled=false; void write.then(()=>{settled=true;});
+  for(let i=0;i<20;i++) await Promise.resolve();
+  assert.equal(settled,false); h.state.holdCommit=false; h.state.completion(); await write;
+});
+
+test('managed worker drops off, old and missing epochs before every fallback and Test branch', async () => {
+  const old=browserId, fresh='e'.repeat(64);
+  const payloads=[event(),{...event(),expiresAt:1},testPayload(testDescriptor()),{version:99},null];
+  for(const enabled of [false,true]) for(const payload of payloads) for(const epoch of [undefined,old]) {
+    const h=workerHarness();
+    h.context.workspaceAttentionStore.readDeliveryGate=async()=>({enabled,actionToken:'new',registrationId:fresh});
+    await h.push(payload && {...payload,registrationId:epoch});
+    assert.equal(h.notifications.length,0); assert.equal(h.calls.length,0); assert.equal(h.soundReads(),0);
+  }
+  const h=workerHarness(); let gate={enabled:true,actionToken:'one',registrationId:old};
+  h.context.workspaceAttentionStore.readDeliveryGate=async()=>gate;
+  await h.push({...event(),registrationId:old}); assert.equal(h.notifications.length,1);
+  gate={enabled:false,actionToken:'off',registrationId:''};
+  await h.push({...event(),registrationId:old});
+  gate={enabled:true,actionToken:'two',registrationId:fresh};
+  await h.push({...event(),registrationId:old}); assert.equal(h.notifications.length,1);
+  h.inaccessible(); await h.push({...event(),registrationId:fresh});
+  assert.equal(h.notifications.length,2); assert.equal(h.notifications.at(-1).title,'Workspace update','current epoch keeps neutral fallbacks');
+});
+
+test('managed worker rechecks Disable after status and sound awaits and fails closed on gate errors', async () => {
+  for(const stage of ['status','sound']) {
+    const h=workerHarness(); let gate={enabled:true,actionToken:'one',registrationId:browserId}, release;
+    h.context.workspaceAttentionStore.readDeliveryGate=async()=>gate;
+    if(stage==='status') h.context.fetch=()=>new Promise(resolve=>{release=()=>resolve({status:503,ok:false});});
+    else h.context.workspaceAttentionStore.readSound=()=>new Promise(resolve=>{release=()=>resolve(true);});
+    const work=h.push({...event(),registrationId:browserId});
+    for(let i=0;i<30&&!release;i++) await Promise.resolve(); assert.equal(typeof release,'function');
+    gate={enabled:false,actionToken:'off',registrationId:''}; release(); await work;
+    assert.equal(h.notifications.length,0);
+  }
+  const h=workerHarness(); h.context.workspaceAttentionStore.readDeliveryGate=async()=>{throw Error('private gate canary');};
+  await h.push({...event(),registrationId:browserId}); assert.equal(h.notifications.length,0);
+  const storage=testStoreHarness(), t=displayHarness(storage);
+  await storage.store.writeDeliveryGate({enabled:true,actionToken:'active',registrationId:browserId});
+  let release;
+  storage.store.readSound=()=>new Promise(resolve=>{release=()=>resolve(true);});
+  const work=t.push({...testDescriptor(),registrationId:browserId});
+  for(let i=0;i<100&&!release;i++) await Promise.resolve();
+  await storage.store.writeDeliveryGate({enabled:false,actionToken:'off',registrationId:''}); release(); await work;
+  assert.equal(t.shown.length,0,'Test has the same final display fence');
+});
+
+test('protected Enable rejects old server, old controlling worker and missing Web Locks', async () => {
+  for(const option of ['oldServer','oldWorker','noLocks']) {
+    const h=await notificationHarness({[option]:true,subscribed:false,registered:false});
+    await h.controls.enable.click();
+    assert.match(h.controls.status.textContent,/Notification protection is unavailable/);
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,0);
+    assert.equal(h.storage.has(browserKey),false);
+    assert.equal(h.menu.delivery.checked,false);
+  }
+});
+
+test('continuous enabled registration retains its epoch and pending outbox', async () => {
+  const gateStorage=testStoreHarness();
+  await gateStorage.store.writeDeliveryGate({enabled:true,actionToken:'continuous',registrationId:browserId});
+  const state={gateStorage,subscribed:true,registered:true,outbox:new Set([browserId])};
+  const h=await notificationHarness(state,new Map([[browserKey,browserId]]));
+  await h.controls.enable.click();
+  assert.match(h.controls.status.textContent,/^Enabled/);
+  assert.equal(h.calls.some(c=>c.url.endsWith('/disable')),false);
+  assert.equal(Object.hasOwn(h.calls.find(c=>c.url.endsWith('/register')).body,'requireFresh'),false);
+  assert.equal((await gateStorage.store.readDeliveryGate()).actionToken,'continuous');
+  assert.equal(state.outbox.has(browserId),true);
+});
+
+test('fresh Enable cannot adopt a late old registration and bounds cleanup retries', async () => {
+  for(const repeated of [false,true]) {
+    let attempts=0;
+    const state={subscribed:true,registered:false,registerResponse:async body=>{
+      assert.equal(body.requireFresh,true); attempts++;
+      return repeated||attempts===1 ? {ok:false,status:409,json:async()=>({error:'existing endpoint'})} :
+        {ok:true,json:async()=>({registrationId:browserId})};
+    }};
+    const h=await notificationHarness(state);
+    await h.controls.enable.click();
+    assert.equal(attempts,2); assert.equal(h.calls.filter(c=>c.url.endsWith('/disable')).length,2);
+    const gate=await h.gateStorage.store.readDeliveryGate();
+    assert.equal(gate.enabled,!repeated); assert.equal(h.storage.has(browserKey),!repeated);
+  }
+});
+
+test('Disable fences a delayed old Enable across tabs before local storage or unsubscribe side effects', async () => {
+  for(const stage of ['permission','registration']) {
+    const state={subscribed:stage==='registration',registered:false}; const local=new Map();
+    const first=await notificationHarness(state,local); let release;
+    if(stage==='permission') first.context.Notification.requestPermission=()=>new Promise(resolve=>{release=()=>resolve('granted');});
+    else state.registerResponse=()=>new Promise(resolve=>{release=()=>{state.registered=true;resolve({ok:true,json:async()=>({registrationId:browserId})});};});
+    const enabling=first.controls.enable.click(); await first.flush();
+    for(let i=0;i<100&&!release;i++) await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(typeof release,'function',stage);
+    const second=await notificationHarness(state,local);
+    const disabling=second.controls.disable.click(); await second.flush();
+    assert.equal((await state.gateStorage.store.readDeliveryGate()).enabled,false);
+    release(); await Promise.all([enabling,disabling]);
+    assert.equal(local.has(browserKey),false); assert.equal(state.subscribed,false);
+    assert.equal((await state.gateStorage.store.readDeliveryGate()).enabled,false);
+    assert.doesNotMatch(first.controls.status.textContent,/^Enabled/);
+    assert.match(second.controls.status.textContent,/^Disabled/);
+    if(stage==='permission') assert.equal(first.calls.some(c=>c.url.endsWith('/register')),false);
+  }
+});
+
+test('Disable storage failure still cleans both transports but stays incomplete and retryable', async () => {
+  const h=await notificationHarness({subscribed:true,registered:true},new Map([[browserKey,browserId]]));
+  h.gateStorage.state.commitFailure=true;
+  await h.controls.disable.click();
+  assert.equal(h.storage.has(browserKey),false); assert.equal(h.calls.filter(c=>c.url.endsWith('/disable')).length,2);
+  assert.match(h.controls.status.textContent,/blocking could not be saved/); assert.equal(h.controls.disable.disabled,false);
+  h.gateStorage.state.commitFailure=false; await h.controls.disable.click();
+  assert.match(h.controls.status.textContent,/^Disabled/);
+});

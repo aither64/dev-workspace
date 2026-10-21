@@ -230,7 +230,7 @@ async function checkWorkerUpgrade(browser, engine) {
     const queued = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/test" && response.request().method() === "POST");
     await controls.locator("[data-notification-test]").click();
     const descriptor = (await (await queued).json()).test;
-    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
+    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, registrationId:descriptor.identity.slice(5), version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
     await expect(controls.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
     assert.equal(await successor.evaluate(() => Object.hasOwn(self.fixtureSoundDisplays[0], "silent")), false);
     await expect(sound).toBeEnabled(); await expect(sound).toBeChecked();
@@ -240,12 +240,12 @@ async function checkWorkerUpgrade(browser, engine) {
     const queuedSilent = controls.waitForResponse(response => new URL(response.url()).pathname === "/api/browser-notifications/test" && response.request().method() === "POST");
     await controls.locator("[data-notification-test]").click();
     const silentDescriptor = (await (await queuedSilent).json()).test;
-    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), silentDescriptor);
+    await successor.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, registrationId:descriptor.identity.slice(5), version: 1, kind: "test", slug: "", route: "/"})})), silentDescriptor);
     await expect(controls.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
     assert.equal(await successor.evaluate(() => self.fixtureSoundDisplays.at(-1).silent), true);
     const sessionPayload = await controls.evaluate(async () => {
       const status = await (await fetch("/api/sessions/example/attention")).json();
-      return {version: 1, identity: status.identity, id: "b".repeat(64), revision: 1, slug: "example", kind: "input",
+      return {version: 1, registrationId:(await workspaceAttentionStore.readDeliveryGate()).registrationId, identity: status.identity, id: "b".repeat(64), revision: 1, slug: "example", kind: "input",
         member: "implementer0", route: "/example/?member=implementer0#codex", expiresAt: Date.now() + 60000};
     });
     await successor.evaluate(payload => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify(payload)})), sessionPayload);
@@ -410,7 +410,7 @@ async function checkWorkerUpgrade(browser, engine) {
         const descriptor = (await (await queued).json()).test;
         await expect(page.locator("#browser-notifications [data-notification-status]")).toContainText("A test notification will be sent in 10 seconds.");
         await page.close(); assert.equal(context.pages().length, 0);
-        await worker.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
+        await worker.evaluate(descriptor => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify({...descriptor, registrationId:descriptor.identity.slice(5), version: 1, kind: "test", slug: "", route: "/"})})), descriptor);
         await expect.poll(() => worker.evaluate(async descriptor => {
           const outcome = (await workspaceAttentionStore.read(descriptor.identity))?.testOutcome;
           return workspaceAttentionStore.testMatches(outcome, descriptor) && outcome.display;
@@ -419,7 +419,7 @@ async function checkWorkerUpgrade(browser, engine) {
         await expect(testReopened.locator("[data-notification-test-status]")).toContainText("browser accepted the display request");
         await expect(testReopened.locator("[data-notification-test-status]")).toContainText("unconfirmed");
         await testReopened.close();
-        const payload = {version: 1, identity: await worker.evaluate(async () => (await (await fetch("/api/sessions/example/attention")).json()).identity), id: "b".repeat(64), revision: 1, slug: "example", kind: "input", member: "implementer0", route: "/example/?member=implementer0#codex", expiresAt: Date.now() + 60000};
+        const payload = {version: 1, registrationId:await worker.evaluate(async()=>(await workspaceAttentionStore.readDeliveryGate()).registrationId), identity: await worker.evaluate(async () => (await (await fetch("/api/sessions/example/attention")).json()).identity), id: "b".repeat(64), revision: 1, slug: "example", kind: "input", member: "implementer0", route: "/example/?member=implementer0#codex", expiresAt: Date.now() + 60000};
         assert.equal(context.pages().length, 0);
         await worker.evaluate(payload => self.dispatchEvent(new PushEvent("push", {data: JSON.stringify(payload)})), payload);
         await expect.poll(() => worker.evaluate(() => self.fixtureDisplays.length)).toBe(2);
@@ -432,6 +432,19 @@ async function checkWorkerUpgrade(browser, engine) {
         await reopenedDelivery.click();
         await expect(reopenedDelivery).toBeEnabled(); await expect(reopenedDelivery).not.toBeChecked();
         await expect(reopened.locator("#browser-notifications [data-notification-status]")).toContainText("Disabled on this browser");
+        const beforeOff = await worker.evaluate(()=>self.fixtureDisplays.length);
+        await worker.evaluate(payload=>display(payload),payload);
+        assert.equal(await worker.evaluate(()=>self.fixtureDisplays.length),beforeOff,"off epoch has no neutral popup");
+        await reopenedDelivery.click();
+        await expect(reopenedDelivery).toBeEnabled(); await expect(reopenedDelivery).toBeChecked();
+        const freshId=await reopened.evaluate(async()=>(await workspaceAttentionStore.readDeliveryGate()).registrationId);
+        assert.notEqual(freshId,payload.registrationId,"reenabling establishes a fresh transport epoch");
+        await worker.evaluate(payload=>display(payload),payload);
+        assert.equal(await worker.evaluate(()=>self.fixtureDisplays.length),beforeOff,"old provider delivery stays dropped after reenable");
+        await worker.evaluate(payload=>self.dispatchEvent(new PushEvent("push",{data:JSON.stringify(payload)})),{...payload,registrationId:freshId});
+        await expect.poll(()=>worker.evaluate(()=>self.fixtureDisplays.length)).toBe(beforeOff+1);
+        await reopenedDelivery.click();
+        await expect(reopenedDelivery).toBeEnabled(); await expect(reopenedDelivery).not.toBeChecked();
       }
       assert.deepEqual(errors, [], `${engine.name()} loaded real notification UI without script errors`);
       console.log(`${engine.name()}: real template, CSP, permission separation and worker route passed${engine === chromium ? "; registered worker received synthetic push with zero tabs" : ""}`);

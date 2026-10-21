@@ -89,7 +89,7 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 			t.Fatalf("compact menu contains detailed controls or help: %s", removed)
 		}
 	}
-	if strings.Count(index.Body.String(), `src="/static/browser-notifications.js?v=5" defer`) != 1 {
+	if strings.Count(index.Body.String(), `src="/static/browser-notifications.js?v=6" defer`) != 1 {
 		t.Fatal("index must initialize one notification owner")
 	}
 	page := httptest.NewRecorder()
@@ -97,13 +97,13 @@ func TestNotificationsPageIsSeparateFromIndex(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("notification page: %d: %s", page.Code, page.Body.String())
 	}
-	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled`, `data-notification-sound-status role="status"`, `src="/static/browser-notifications.js?v=5" defer`, `href="/"`} {
+	for _, required := range []string{`id="browser-notifications"`, "data-notification-enable", "data-notification-test", "data-notification-disable", `type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled`, `data-notification-sound-status role="status"`, `src="/static/browser-notifications.js?v=6" defer`, `href="/"`} {
 		if !strings.Contains(page.Body.String(), required) {
 			t.Fatalf("notification page lacks %s", required)
 		}
 	}
-	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) < 0 ||
-		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=3"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=5"`) {
+	if strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=4"`) < 0 ||
+		strings.Index(page.Body.String(), `src="/static/session-attention-store.js?v=4"`) > strings.Index(page.Body.String(), `src="/static/browser-notifications.js?v=6"`) {
 		t.Fatal("notification page must initialize the shared store before the client")
 	}
 }
@@ -412,6 +412,7 @@ func TestNotificationsDisableRejectsInvalidSelectorsAndOrigins(t *testing.T) {
 }
 
 type mockPushClient struct {
+	before  func()
 	code    int
 	err     error
 	calls   int
@@ -420,6 +421,9 @@ type mockPushClient struct {
 
 func (m *mockPushClient) Do(r *http.Request) (*http.Response, error) {
 	m.calls++
+	if m.before != nil {
+		m.before()
+	}
 	m.headers = r.Header.Clone()
 	if m.err != nil {
 		return nil, m.err
@@ -603,5 +607,145 @@ func TestNotificationsObserverOutboxWithoutBrowserConnections(t *testing.T) {
 	summary.Archived = true
 	if n.server.observeAttention(*summary, now).Eligible {
 		t.Fatal("archived session eligible")
+	}
+}
+
+func TestNotificationsFreshEpochDoesNotReplayDisabledPeriod(t *testing.T) {
+	n := testNotifications(t)
+	subscription := testPushSubscription(t)
+	body, _ := json.Marshal(map[string]any{"subscription": subscription})
+	register := func(fresh bool) string {
+		t.Helper()
+		input := body
+		if fresh {
+			input, _ = json.Marshal(map[string]any{"subscription": subscription, "requireFresh": true})
+		}
+		w := notificationRequest(n, http.MethodPost, "/api/browser-notifications/register", string(input))
+		if w.Code != http.StatusOK {
+			t.Fatalf("register status %d", w.Code)
+		}
+		var reply struct {
+			RegistrationID string `json:"registrationId"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
+			t.Fatal(err)
+		}
+		return reply.RegistrationID
+	}
+	old := register(false)
+	w := notificationRequest(n, http.MethodGet, "/api/browser-notifications?registrationId="+old, "")
+	var capability struct {
+		DeliveryEpoch int `json:"deliveryEpoch"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &capability)
+	if capability.DeliveryEpoch != 1 {
+		t.Fatal("missing negotiated epoch capability")
+	}
+	notificationRequest(n, http.MethodPost, "/api/browser-notifications/test", `{"registrationId":"`+old+`"}`)
+	if register(false) != old || len(n.store.state.Outbox) != 1 {
+		t.Fatal("continuous registration reset pending delivery")
+	}
+	freshBody, _ := json.Marshal(map[string]any{"subscription": subscription, "requireFresh": true})
+	w = notificationRequest(n, http.MethodPost, "/api/browser-notifications/register", string(freshBody))
+	if w.Code != http.StatusConflict || len(n.store.state.Browsers) != 1 || len(n.store.state.Outbox) != 1 {
+		t.Fatal("fresh activation adopted an existing endpoint")
+	}
+	other := strings.Repeat("e", 64)
+	otherSub := subscription
+	otherSub.Endpoint += "-other"
+	now := time.Now()
+	observation := attentionFixture()
+	observation.Lead.LatestTurnStatus = "inProgress"
+	observation.Lead.CurrentState = "working"
+	observations := map[string]attentionObservation{observation.Slug: observation}
+	n.store.mu.Lock()
+	err := n.store.change(func(state *notificationState) error {
+		state.Browsers[other] = browserRegistration{ID: other, Origin: "https://workspace.example", Subscription: otherSub}
+		reconcileNotificationState(state, observations, false, now)
+		return nil
+	})
+	n.store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := notificationRequest(n, http.MethodPost, "/api/browser-notifications/disable", `{"registrationId":"`+old+`"}`); w.Code != http.StatusOK {
+		t.Fatal(w.Code)
+	}
+	observation.Lead.LatestTurnStatus = "completed"
+	observation.Lead.CurrentState = "idle"
+	observations[observation.Slug] = observation
+	n.store.mu.Lock()
+	err = n.store.change(func(state *notificationState) error {
+		reconcileNotificationState(state, observations, false, now.Add(time.Second))
+		return nil
+	})
+	n.store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(n.store.state.Outbox) != 1 || n.store.state.Outbox[notificationDeliveryKey(other, observation.Slug)].Browser != other {
+		t.Fatal("off period affected other browser or retained disabled work")
+	}
+	fresh := register(true)
+	if fresh == old || len(n.store.state.Outbox) != 1 {
+		t.Fatal("reenable replayed a historical event")
+	}
+	n.store.mu.Lock()
+	err = n.store.change(func(state *notificationState) error {
+		reconcileNotificationState(state, observations, false, now.Add(2*time.Second))
+		observation.Lead.CurrentTurnID = "next"
+		observation.Lead.LatestTurnStatus = "inProgress"
+		observation.Lead.CurrentState = "working"
+		observations[observation.Slug] = observation
+		reconcileNotificationState(state, observations, false, now.Add(3*time.Second))
+		observation.Lead.LatestTurnStatus = "completed"
+		observation.Lead.CurrentState = "idle"
+		observations[observation.Slug] = observation
+		reconcileNotificationState(state, observations, false, now.Add(4*time.Second))
+		return nil
+	})
+	n.store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := n.store.state.Outbox[notificationDeliveryKey(fresh, observation.Slug)]
+	if delivery.Browser != fresh || len(n.store.state.Outbox) != 2 {
+		t.Fatal("future event did not reach both current registrations")
+	}
+	var payload map[string]any
+	json.Unmarshal(notificationPayload(delivery), &payload)
+	if payload["registrationId"] != fresh || payload["id"] != delivery.Event.ID || payload["version"] != float64(1) {
+		t.Fatal("transport epoch changed event contract")
+	}
+	persisted, _ := json.Marshal(n.store.state)
+	if n.store.state.Schema != 1 || strings.Contains(string(persisted), `"registrationId"`) {
+		t.Fatal("transport epoch leaked into persisted state")
+	}
+}
+
+func TestNotificationsDisableDuringProviderSendCannotRecreateRegistrationOrJob(t *testing.T) {
+	for _, code := range []int{201, 503} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			n := testNotifications(t)
+			sub := testPushSubscription(t)
+			body, _ := json.Marshal(map[string]any{"subscription": sub})
+			w := notificationRequest(n, http.MethodPost, "/api/browser-notifications/register", string(body))
+			var reply struct {
+				RegistrationID string `json:"registrationId"`
+			}
+			json.Unmarshal(w.Body.Bytes(), &reply)
+			notificationRequest(n, http.MethodPost, "/api/browser-notifications/test", `{"registrationId":"`+reply.RegistrationID+`"}`)
+			client := &mockPushClient{code: code, before: func() {
+				w := notificationRequest(n, http.MethodPost, "/api/browser-notifications/disable", `{"registrationId":"`+reply.RegistrationID+`"}`)
+				if w.Code != http.StatusOK {
+					t.Fatal(w.Code)
+				}
+			}}
+			n.client = client
+			n.sendNext(context.Background(), time.Now().Add(11*time.Second))
+			if client.calls != 1 || len(n.store.state.Browsers) != 0 || len(n.store.state.Outbox) != 0 {
+				t.Fatal("provider completion resurrected disabled delivery")
+			}
+		})
 	}
 }
