@@ -1407,6 +1407,28 @@ new namespaces must not run together.
 
 ## Development
 
+The optional `TestFirefoxTabs` uses ordinary Firefox and Geckodriver against a
+disposable HTTPS fixture. Supply exact `FIREFOX_BINARY` and `GECKODRIVER_BINARY`
+store paths, Node and a headful display; Xvfb is suitable for an isolated run.
+Set `PORTAL_FIREFOX_TABS_TEST=1`, then run:
+
+```sh
+nix develop --no-update-lock-file -c go -C portal test -mod=readonly \
+  ./internal/web -run '^TestFirefoxTabs$' -count=1 -v
+```
+
+The runner creates 50 native tabs and records actual document visibility through
+foreground switches. It requires a native background discard and restoration,
+35 seconds of foreground updates, zero hidden read/stream traffic after
+cancellation, timely pending invalidation and recovery without reload. A lost
+submission response retains the draft; retry uses its original identity and
+produces one fixture acceptance record written with fsync. The fixture uses a
+stand-in for the native Codex/model backend, so this does not establish native
+Codex or production performance. Firefox chrome-context access is confined to its disposable profile and native
+discard operation. Driver/browser/display compatibility must be verified when
+this optional test runs; syntax and compilation alone do not prove acceptance.
+The runner closes only its owned browser/driver and removes its temporary profile.
+
 Run the quick checks with:
 
 ```sh
