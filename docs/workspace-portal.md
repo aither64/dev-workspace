@@ -389,6 +389,16 @@ keep the existing refresh behavior.
 Team status unavailable marks stale peer-activity observations. A successful
 HTTP response clears it only when the returned observations are fresh.
 
+Instrumented non-streaming read responses include `X-Portal-Read` for correlation
+and numeric `Server-Timing` stages. Timings cover the measured lookup, verification and details dependencies;
+nested stages overlap. Limits-cache waits are measured separately. Admission and
+native connection/write waits remain unmeasured. Slow or failed reads emit at most
+one `portal_read` log record per second across the portal. These records contain
+fixed lane/stage names, durations, status and cancellation category, without
+session or native identifiers, paths, queries, request/response contents or error
+text. Response timing ends when headers are written; the log total includes the
+handler's completion. These diagnostics do not change authority or time budgets.
+
 Index snapshot warnings use the same grace period as failed HTTP refreshes,
 including when the server successfully returns its last known state. Repeated
 warnings do not restart the grace period. A healthy snapshot clears the warning.

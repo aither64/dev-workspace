@@ -226,6 +226,7 @@ type Server struct {
 	conversation           http.Handler
 	trustedOrigins         []string
 	installedTeams         *agentteams.Installed
+	readDiagnostics        readDiagnosticState
 }
 
 type hostProfileIdentity struct {
@@ -721,7 +722,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
-	return s.securityHeaders(guarded)
+	return s.securityHeaders(s.observeReads(guarded))
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
@@ -1333,24 +1334,34 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 
 // sessionDetails refreshes the existing sections without replacing the conversation.
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	stage := readStage(r.Context(), "lifecycle")
 	pendingLifecycle, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
+	stage()
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Unable to verify session lifecycle: " + err.Error()})
 		return
 	}
+	stage = readStage(r.Context(), "interactivity")
 	s.normalizeInteractivity(r.Context(), summary)
+	stage()
 	var warning string
 	if !summary.Archived {
+		stage = readStage(r.Context(), "repo_validate")
 		repositories, err := s.activeRepositories(r.Context(), summary)
+		stage()
 		if err != nil {
 			s.config.Logger.Printf("refresh repositories for %s: %v", summary.Slug, err)
 			warning = "Some live worktrees could not be verified: " + err.Error()
 		}
 		summary.Repositories = repositories
 	}
-	data := pageData{Session: summary, Repositories: s.repositories(r.Context(), summary), RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary), AgentTeams: s.agentTeamsPage()}
+	stage = readStage(r.Context(), "repo_status")
+	statuses := s.repositories(r.Context(), summary)
+	stage()
+	data := pageData{Session: summary, Repositories: statuses, RepositoryWarning: warning, Artifacts: session.AvailableArtifacts(summary), AgentTeams: s.agentTeamsPage()}
 	data.TeamPresets = s.directTeamPresets()
 	readyMembers := make([]string, 0)
+	stage = readStage(r.Context(), "team")
 	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
 		s.config.Logger.Printf("refresh team roster for %s: %v", summary.Slug, rosterErr)
 		data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
@@ -1370,6 +1381,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	}
 	data.TeamRoles = teamRoles(data.TeamPresets)
 	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
+	stage()
 	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render repositories"})
@@ -1385,7 +1397,9 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	}
 	if !summary.Archived && s.clusters.MayExist(summary.Slug) {
 		var inspectErr error
+		stage = readStage(r.Context(), "cluster")
 		data.Clusters, inspectErr = s.clusters.InspectContext(r.Context(), summary.Slug)
+		stage()
 		if inspectErr != nil {
 			s.config.Logger.Printf("refresh clusters for %s: %v", summary.Slug, inspectErr)
 		}
@@ -1928,7 +1942,9 @@ func legacyConversationPath(parts []string, method string) string {
 }
 
 func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, parts []string) {
+	stage := readStage(r.Context(), "lookup")
 	summary, err := session.Find(s.config.Workspace, parts[0])
+	stage()
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -3430,7 +3446,11 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
 	verifyContext, verifyCancel := context.WithTimeout(parent, 3*time.Second)
 	defer verifyCancel()
-	if err := s.config.VerifyThread(verifyContext, persisted.ThreadID, expectedCwd); err != nil {
+	stage := readStage(parent, "native_verify")
+	err := s.config.VerifyThread(verifyContext, persisted.ThreadID, expectedCwd)
+	stage()
+	readDependencyError(parent, err)
+	if err != nil {
 		return
 	}
 	// A persisted thread with configured endpoint provenance and App Server cwd is
@@ -3458,12 +3478,20 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	}
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
-	if err := authority.VerifyTmux(ctx, s.config.Tmux); err != nil {
+	stage = readStage(parent, "runtime_verify")
+	err = authority.VerifyTmux(ctx, s.config.Tmux)
+	stage()
+	readDependencyError(parent, err)
+	if err != nil {
 		return
 	}
-	if err := s.config.VerifyThread(
+	stage = readStage(parent, "native_verify")
+	err = s.config.VerifyThread(
 		ctx, authority.CodexThreadID, expectedCwd,
-	); err != nil {
+	)
+	stage()
+	readDependencyError(parent, err)
+	if err != nil {
 		return
 	}
 	summary.Tmux = session.Tmux{
@@ -3538,6 +3566,7 @@ func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *s
 func (s *Server) resolveConversation(
 	ctx context.Context, request conversation.ResolveRequest,
 ) (conversation.Target, error) {
+	defer readStage(ctx, "resolve")()
 	slug, address, valid := parseTeamConversationID(request.ID)
 	if !valid {
 		return conversation.Target{}, errors.New("invalid session identity")

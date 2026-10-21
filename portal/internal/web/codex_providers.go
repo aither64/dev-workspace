@@ -301,6 +301,7 @@ func (s *Server) loadProviderLimits(ctx context.Context, id string) (codexLimits
 		}
 		if !complete || time.Since(call.result.UpdatedAt) < 30*time.Second {
 			s.codexLimitsMu.Unlock()
+			defer readStage(ctx, "limits_cache_wait")()
 			select {
 			case <-call.done:
 				return call.result, call.err
