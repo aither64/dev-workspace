@@ -15,6 +15,21 @@ to read them from any checkout, including an unmerged deploy-first rollout.
 Status reads do not reconcile, schedule or mutate anything. Use session commands
 for exact owned operations; keep all recovery evidence and roots.
 
+## Repository identity refusals
+
+If acquisition refuses a repository identity, check the current session's
+registration, `repos/<project>.git` and its single canonical SSH origin. Duplicate
+names, unsafe projects and disagreement between `github`, origin or a configured
+catalog remote require correction before a new request. Preserve an explicit
+`main` default branch. Do not add a catalog entry merely to enable a normally
+registered repository.
+
+A queued mapping-change refusal leaves its original request waiting. Cancel it
+and acquire a fresh request after reconciling the registration and clone. An
+exact retry of a released request returns that receipt even if the clone was
+removed. Package-compatibility refusals retain ownership: select a compatible
+forward package instead of deleting claim records.
+
 ## Agent waiting
 
 Prepare and verify work independently. Request a machine only near the first

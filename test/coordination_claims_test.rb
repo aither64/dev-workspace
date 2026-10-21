@@ -520,4 +520,181 @@ class CoordinationClaimsTest < Minitest::Test
   end
 
 
+  def dynamic_repository(person, name: 'client', project: name, remote: 'git@github.com:example/client.git', github: nil)
+    path = File.join(@workspace, 'repos', "#{project}.git")
+    git('clone', '--bare', @bare, path) unless File.exist?(path)
+    git('-C', path, 'remote', 'set-url', 'origin', remote)
+    manifest_path = File.join(@workspace, 'work', person['slug'], 'portal.yml')
+    manifest = YAML.safe_load(File.read(manifest_path))
+    registration = {'name' => name, 'project' => project, 'branch' => person['slug'], 'default_branch' => 'main'}
+    registration['github'] = github if github
+    manifest['repositories'] << registration
+    File.write(manifest_path, YAML.dump(manifest))
+    path
+  end
+
+  def test_uncatalogued_registration_retains_main_and_canonical_resource_identity
+    person = owner('dynamic-main')
+    path = dynamic_repository(person, github: 'example/client')
+    identity = @engine.repository_identity(person, 'client')
+    assert_equal 'main', identity.registration['default_branch']
+    assert_equal path, identity.path
+    item = acquire(person, repositories: ['client'])
+    assert_equal ["git:#{File.realpath(path)}", 'repository:github.com/example/client'], item['resources']
+    assert_equal 'held', item['state']
+    @catalog['repositories']['client'] = {'remote' => 'ssh://git@github.com/example/client.git', 'defaultTarget' => 'refs/heads/master'}
+    install_catalog
+    assert_equal 'main', engine.repository(person, 'client').last['default_branch']
+  end
+
+  def test_dynamic_aliases_and_separate_clones_contend_by_both_canonical_keys
+    first, second, third, fourth = owner('dynamic-first'), owner('dynamic-second'), owner('dynamic-third'), owner('dynamic-fourth')
+    path = dynamic_repository(first)
+    File.symlink(path, File.join(@workspace, 'repos/alias.git'))
+    dynamic_repository(second, name: 'alias', remote: 'ssh://git@github.com/EXAMPLE/CLIENT.git')
+    dynamic_repository(third, name: 'separate', remote: 'git@github.com:example/client.git')
+    dynamic_repository(fourth, name: 'disjoint', remote: 'git@github.com:example/other.git')
+    held = acquire(first, repositories: ['client'])
+    alias_claim = acquire(second, repositories: ['alias'])
+    separate = acquire(third, repositories: ['separate'])
+    assert_equal held['resources'], alias_claim['resources']
+    refute_equal held['resources'], separate['resources']
+    assert_equal %w[waiting waiting held], [alias_claim, separate, acquire(fourth, repositories: ['disjoint'])].map { |claim| claim['state'] }
+    @engine.change_claim(first, held['id'], 'release')
+    @engine.tick_claims(third)
+    assert_equal 'waiting', @engine.store.claims['claims'][separate['id']]['state']
+    @engine.tick_claims(second)
+    assert_equal 'held', @engine.store.claims['claims'][alias_claim['id']]['state']
+  end
+
+  def test_dynamic_registration_and_origin_errors_are_actionable_without_remote_secrets
+    person = owner('dynamic-errors')
+    path = dynamic_repository(person)
+    manifest_path = File.join(@workspace, 'work', person['slug'], 'portal.yml')
+    original = YAML.safe_load(File.read(manifest_path))
+    invalid = [original['repositories'].last.merge('project' => '../outside'), original['repositories'].last.merge('default_branch' => 'bad..branch'),
+      original['repositories'].last.merge('github' => 'different/project'), original['repositories'].last.merge('project' => 'workspace')]
+    invalid.each do |entry|
+      File.write(manifest_path, YAML.dump(original.merge('repositories' => [entry])))
+      assert_raises(WorkspaceCoordination::Error) { acquire(person, repositories: ['client']) }
+    end
+    File.write(manifest_path, YAML.dump(original.merge('repositories' => original['repositories'] + [original['repositories'].last.dup])))
+    assert_match(/duplicate repository names/, assert_raises(WorkspaceCoordination::Error) { acquire(person, repositories: ['client']) }.message)
+    File.write(manifest_path, YAML.dump(original))
+    git('-C', path, 'remote', 'set-url', 'origin', 'https://secret-user:secret-canary@example.test/private.git')
+    error = assert_raises(WorkspaceCoordination::Error) { acquire(person, repositories: ['client']) }
+    refute_match(/secret-canary|secret-user/, error.message)
+    git('-C', path, 'remote', 'set-url', 'origin', 'git@github.com:example/client.git')
+    @catalog['repositories']['client'] = {'remote' => 'git@github.com:example/conflict.git'}
+    install_catalog
+    assert_match(/catalog remote.*differs/, assert_raises(WorkspaceCoordination::Error) { engine.acquire_claim(person, request('repositories'=>['client'],'machines'=>[],'label'=>'fixture')) }.message)
+  end
+
+  def test_exact_dynamic_retry_survives_terminal_state_and_removed_clone
+    person = owner('dynamic-retry')
+    path = dynamic_repository(person)
+    held = acquire(person, repositories: ['client'])
+    released = @engine.change_claim(person, held['id'], 'release')
+    FileUtils.remove_entry(path)
+    assert_equal released, @engine.acquire_claim(person, released['request'])
+    assert_raises(WorkspaceCoordination::Error) { @engine.acquire_claim(person, released['request'].merge('label'=>'changed')) }
+    assert_raises(WorkspaceCoordination::Error) { acquire(person, repositories: ['client']) }
+  end
+
+  def test_queued_dynamic_mapping_drift_never_rewrites_frozen_resources
+    first, second = owner('dynamic-held'), owner('dynamic-waiting')
+    dynamic_repository(first)
+    path = dynamic_repository(second, name: 'second', remote: 'git@github.com:example/client.git')
+    held, waiting = acquire(first, repositories:['client']), acquire(second, repositories:['second'])
+    @engine.change_claim(first, held['id'], 'release')
+    git('-C', path, 'remote', 'set-url', 'origin', 'git@github.com:example/replacement.git')
+    assert_match(/queued resource mappings changed/, assert_raises(WorkspaceCoordination::Error) { @engine.tick_claims(second) }.message)
+    current = @engine.store.claims['claims'][waiting['id']]
+    assert_equal 'waiting', current['state']
+    assert_equal waiting['resources'], current['resources']
+  end
+
+  def test_dynamic_admission_rechecks_local_proof_and_runs_no_git_under_ledger_mutex
+    person = owner('dynamic-proof')
+    dynamic_repository(person)
+    manifest = File.join(@workspace, 'work', person['slug'], 'portal.yml')
+    @engine.define_singleton_method(:create_resource_claim) do |owner, input, resources, **options|
+      File.write(manifest, File.read(manifest) + "\n# concurrent manifest change\n")
+      super(owner, input, resources, **options)
+    end
+    assert_match(/identity changed/, assert_raises(WorkspaceCoordination::Error) { acquire(person, repositories:['client']) }.message)
+    assert_empty @engine.store.claims['claims']
+    @engine = engine
+    locked = false
+    original_lock = @engine.store.method(:lock)
+    @engine.store.define_singleton_method(:lock) do |name='ledger', **options, &block|
+      original_lock.call(name, **options) do
+        previous = locked
+        locked = true if name == 'ledger'
+        begin; block.call; ensure; locked = previous; end
+      end
+    end
+    original_run = WorkspaceCoordination::Command.method(:run)
+    WorkspaceCoordination::Command.define_singleton_method(:run) do |*args, **options|
+      raise 'external command inside ledger mutex' if locked
+      original_run.call(*args, **options)
+    end
+    begin
+      item = acquire(person, repositories:['client'])
+      assert_equal 'held', item['state']
+    ensure
+      WorkspaceCoordination::Command.define_singleton_method(:run, original_run)
+    end
+  end
+
+  def test_dynamic_candidate_capability_covers_held_waiting_and_common_identity
+    first, second = owner('candidate-held'), owner('candidate-waiting')
+    path = dynamic_repository(first)
+    dynamic_repository(second, name:'second', remote:'git@github.com:example/client.git')
+    held, waiting = acquire(first,repositories:['client']), acquire(second,repositories:['second'])
+    @catalog['repositories'] = {}
+    install_catalog
+    contract = File.join(@package,'share/dev-workspace/repository-claim-contract.json')
+    assert_match(/registered repository claims/, assert_raises(WorkspaceCoordination::Error) { @engine.store.require_claim_capability!(@package) }.message)
+    File.write(contract,JSON.generate(WorkspaceCoordination::REPOSITORY_CLAIM_CONTRACT))
+    @engine.store.require_claim_capability!(@package)
+    # An older candidate with explicit matching mappings remains compatible.
+    @catalog['repositories'] = {'client'=>{'remote'=>'git@github.com:example/client.git'},'second'=>{'remote'=>'ssh://git@github.com/example/client.git'}}
+    install_catalog
+    File.unlink(contract)
+    @engine.store.require_claim_capability!(@package)
+    second_mapping = @catalog['repositories'].delete('second')
+    install_catalog
+    assert_match(/registered repository claims/, assert_raises(WorkspaceCoordination::Error) { @engine.store.require_claim_capability!(@package) }.message)
+    @catalog['repositories']['second'] = second_mapping
+    @catalog['repositories']['second']['remote']='git@github.com:example/remapped.git'
+    install_catalog
+    assert_raises(WorkspaceCoordination::Error) { @engine.store.require_claim_capability!(@package) }
+    @catalog['repositories']={}
+    install_catalog
+    File.write(contract,JSON.generate(WorkspaceCoordination::REPOSITORY_CLAIM_CONTRACT))
+    replacement = path + '.old'
+    File.rename(path,replacement)
+    File.symlink(replacement,path)
+    assert_match(/repository identity/, assert_raises(WorkspaceCoordination::Error) { @engine.store.require_claim_capability!(@package) }.message)
+    @engine.change_claim(first,held['id'],'release')
+    @engine.change_claim(second,waiting['id'],'cancel')
+    File.unlink(contract)
+    @engine.store.require_claim_capability!(@package)
+  end
+
+  def test_candidate_preserves_internal_workspace_tracking_claim_without_registration
+    person = owner('internal-workspace')
+    git('init', '--initial-branch=master', @workspace)
+    git('-C', @workspace, 'remote', 'add', 'origin', 'git@github.com:example/workspace.git')
+    @catalog['repositories'] = {'workspace'=>{'remote'=>'git@github.com:example/workspace.git'}}
+    install_catalog
+    @engine = engine
+    @engine.with_repository_claim(person,'workspace') do
+      assert_equal 1,@engine.store.claims['claims'].length
+      @engine.store.require_claim_capability!(@package)
+    end
+    assert_equal 'released',@engine.store.claims['claims'].values.first['state']
+  end
+
 end

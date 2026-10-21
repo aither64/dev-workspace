@@ -20,8 +20,13 @@ Use a schema-1 request with a fresh lowercase UUID `requestId`:
 }
 ```
 
-Repositories must be registered to the session and present in the installed
-catalog. Machines accept configured names, IDs or aliases. Supply at least one
+Repositories must be registered to the session. Their canonical clones live in
+`repos/<project>.git`; the reserved `workspace` registration uses the workspace
+Git root. The coordinator validates the real common Git directory and canonical
+SSH origin. A registration's optional `github` identity and any configured catalog
+remote must agree with that origin. Repository names must be unambiguous.
+Registering a repository does not require a catalog update or package rebuild.
+Machines still require configured names, IDs or aliases. Supply at least one
 resource. The complete request fits 16 KiB; labels fit 512 bytes. Keep credentials
 out of labels and requests.
 
@@ -39,8 +44,14 @@ notification to the session's retained conversation. Read authoritative status
 before acting on a notice. A notice supplies no merge or deployment approval.
 Threadless sessions can use the local CLI but have no notification destination.
 
-An exact request-ID retry returns its existing claim, including after release.
-Changed input or another owner refuses. Use a fresh ID for intentional new
+Aliases sharing a common Git directory and separate clones sharing a canonical
+remote contend for the same repository. An explicit registered `default_branch`,
+including `main`, remains authoritative; catalog defaults do not replace it.
+Claims select resources, carry no target branch and grant no merge approval.
+Queued requests retain their original resource keys and refuse changed mappings.
+
+An exact request-ID retry returns its existing claim, including after release
+or removal of the clone. Changed input or another owner refuses. Use a fresh ID for intentional new
 ownership. A second claim does not implicitly reuse resources held by the same
 owner. Request the complete set initially or use separate disjoint claims.
 
@@ -134,8 +145,15 @@ notification arrives later.
 
 Packages advertise `share/dev-workspace/claim-contract.json`. Once claim records
 exist, selecting a package without that capability refuses. Compatible selection
-preserves live repository/machine mappings. Recovery selects a compatible forward
-package; never delete records to bypass this check.
+preserves live repository/machine mappings. The separate
+`share/dev-workspace/repository-claim-contract.json` advertises support for
+registered repositories outside the catalog. Every held or waiting repository
+claim must retain its registered identity and common Git directory. A candidate
+without that capability needs an explicit matching catalog entry for each active
+repository; otherwise selection refuses. Released and canceled history does not
+require the new capability. Machine mappings keep their existing catalog checks.
+Recovery selects a compatible forward package; never delete records to bypass
+this check.
 
 New work uses `acquire`. Existing snapshots, jobs, integration journals,
 reservations and uncertain effects retain their formats, recovery payloads and

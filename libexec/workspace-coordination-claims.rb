@@ -3,6 +3,7 @@
 # Cooperative resource ownership only. Sessions execute and verify their work.
 module WorkspaceCoordination
   CLAIM_CONTRACT = {'schema' => 1, 'recordSchema' => 1}.freeze
+  REPOSITORY_CLAIM_CONTRACT = {'schema' => 1, 'registeredRepositories' => true}.freeze
   CLAIM_ACTIVE = %w[waiting held].freeze
 
   class Store
@@ -81,8 +82,19 @@ module WorkspaceCoordination
           raise Error.new('target package changes a claimed physical machine', 5) unless item['resources'].include?("machine:#{catalog.machine(target)['id']}")
         end
         item['request']['repositories'].each do |name|
-          remote = WorkspaceCoordination.remote_identity(catalog.repository(name).fetch('remote'))
-          raise Error.new('target package changes a claimed repository', 5) unless item['resources'].include?("repository:#{remote}")
+          owner = read.fetch('owners').fetch(item['ownerId'])
+          identity = RepositoryIdentity.new(owner, name, catalog: catalog, internal_workspace: true)
+          unless (identity.resources - item['resources']).empty?
+            raise Error.new('target package changes a claimed repository identity; recover forward', 5)
+          end
+          unless catalog.data.fetch('repositories').key?(name)
+            dynamic = File.join(package, 'share/dev-workspace/repository-claim-contract.json')
+            unless File.file?(dynamic) && WorkspaceCoordination.parse(File.binread(dynamic)) == REPOSITORY_CLAIM_CONTRACT
+              raise Error.new('target package cannot preserve registered repository claims; recover forward with a compatible package', 5)
+            end
+          end
+        rescue Error => error
+          raise Error.new("target package cannot preserve active repository identity: #{error.message}; recover forward", 5)
         end
       end
     end
@@ -112,10 +124,11 @@ module WorkspaceCoordination
       owner(slug, bootstrap: manifest.dig('codex', 'thread_id').nil?)
     end
 
-    def claim_resources_for(owner, request)
+    def claim_resources_for(owner, request, proofs: [])
       resources = request['repositories'].flat_map do |name|
-        _path, common, identity, = repository(owner, name)
-        ["git:#{common}", "repository:#{identity}"]
+        identity = repository_identity(owner, name)
+        proofs << identity
+        identity.resources
       end
       resources.concat(request['machines'].map { |name| "machine:#{catalog.machine(name).fetch('id')}" }).sort.uniq
     end
@@ -153,31 +166,47 @@ module WorkspaceCoordination
     def acquire_claim(owner, input, wait: true)
       current_generation!
       store.validate_claim_request!(input)
-      create_resource_claim(owner, input, claim_resources_for(owner, input), wait: wait)
+      # Exact retries must work after release or clone removal. Repeat this
+      # check in the admission transaction to cover concurrent identical calls.
+      saved = store.lock do
+        ledger, value = store.read, store.claims
+        claim_owner_live!(owner, ledger)
+        existing_claim(value, owner, input)
+      end
+      return saved if saved
+      proofs = []
+      resources = claim_resources_for(owner, input, proofs: proofs)
+      create_resource_claim(owner, input, resources, wait: wait, proofs: proofs)
     end
 
-    def create_resource_claim(owner, input, resources, wait:)
+    def create_resource_claim(owner, input, resources, wait:, proofs: [])
       # The collector rechecks held resources while owning this guard. A new
       # grant must not race the gap between that check and worktree removal.
       result = store.lock('preparation', mode: File::LOCK_SH, nonblock: true) do
-        create_resource_claim_ready(owner, input, resources, wait: wait, grant: true)
+        create_resource_claim_ready(owner, input, resources, wait: wait, grant: true, proofs: proofs)
       end
       return result if result
       raise Error.new('retained preparation waits for payload collection', 75) unless wait
-      create_resource_claim_ready(owner, input, resources, wait: true, grant: false)
+      create_resource_claim_ready(owner, input, resources, wait: true, grant: false, proofs: proofs)
     end
 
-    def create_resource_claim_ready(owner, input, resources, wait:, grant:)
+    def existing_claim(value, owner, input)
+      saved = value['claims'][input['requestId']]
+      return unless saved
+      unless saved['ownerId'] == owner['id'] && saved['request'] == WorkspaceCoordination.canonical(input)
+        raise Error.new('claim requestId reused with changed input or owner', 4)
+      end
+      saved
+    end
+
+    def create_resource_claim_ready(owner, input, resources, wait:, grant:, proofs: [])
       request = WorkspaceCoordination.canonical(input)
       store.lock do
         ledger, value = store.read, store.claims
         claim_owner_live!(owner, ledger)
-        if (saved = value['claims'][request['requestId']])
-          unless saved['ownerId'] == owner['id'] && saved['request'] == request
-            raise Error.new('claim requestId reused with changed input or owner', 4)
-          end
-          next saved
-        end
+        saved = existing_claim(value, owner, request)
+        next saved if saved
+        proofs.each(&:recheck!)
         now = Time.now.utc.iso8601
         item = {'id' => request['requestId'], 'ownerId' => owner['id'], 'request' => request, 'resources' => resources,
           'state' => 'waiting', 'revision' => 1, 'sequence' => value['claims'].length + 1,
@@ -243,12 +272,14 @@ module WorkspaceCoordination
     def tick_claims_ready(owner)
       current_generation!
       store.claims['claims'].values.select { |item| item['ownerId'] == owner['id'] && item['state'] == 'waiting' }.sort_by { |item| item['sequence'] }.each do |saved|
-        resources = claim_resources_for(owner, saved['request'])
+        proofs = []
+        resources = claim_resources_for(owner, saved['request'], proofs: proofs)
         store.lock do
           ledger, value = store.read, store.claims
           claim_owner_live!(owner, ledger)
           item = claim_owned!(value, owner, saved['id'])
           next unless item['state'] == 'waiting'
+          proofs.each(&:recheck!)
           raise Error.new('queued resource mappings changed; cancel and acquire again', 3) unless resources == item['resources']
           next if claim_blocked?(ledger, value, item)
           item.merge!('state' => 'held', 'notificationPending' => true, 'updatedAt' => Time.now.utc.iso8601)
