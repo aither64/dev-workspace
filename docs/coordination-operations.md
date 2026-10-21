@@ -2,8 +2,12 @@
 
 For resource ownership, use the [claim guide](coordination.md) to acquire,
 inspect, release or cancel a request. Claims survive disconnection and remain
-held until explicitly released. Inspect remaining local and remote work before
-releasing after interruption. Existing snapshot-based operations keep the
+held until explicitly released. After interruption, reconcile remaining local
+and remote effects. Release a repository claim after its safe merge critical
+section; retain every deployed physical machine under the
+[machine retention rule](coordination.md#machine-retention) until integration,
+user acceptance and explicit machine release direction are all established.
+Existing snapshot-based operations keep the
 procedures below and the [retained workflow guide](coordination-legacy.md).
 
 The remaining sections describe legacy executor recovery. They do not start new
@@ -82,8 +86,11 @@ use a fresh job to hide the original uncertainty.
 
 Archive and deletion hold notifications and cancel queued operations before
 cleanup. Coordination receipts bind each ordinary lifecycle journal to exact
-owner incarnations. Archive completion releases that owner's machine
+owner incarnations. Legacy archive completion releases that owner's machine
 reservations in the same ledger transaction that records lifecycle completion.
+This implementation behavior grants no permission to archive or bypass the
+machine retention rule. Retain deployed ownership until its integration lineage,
+user acceptance and explicit machine-specific release direction are established.
 The reservation stays held during failed or interrupted cleanup. Retrying a
 completed archive receipt can release a hold retained by a predecessor executor;
 the exact owner binding must still match. Deployment history and recovery

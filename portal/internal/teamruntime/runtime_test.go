@@ -2358,6 +2358,11 @@ func TestMemberPolicyBindsSessionAndRetainsInstructions(t *testing.T) {
 		!strings.HasSuffix(policy.DeveloperInstructions, member.Instructions) {
 		t.Fatalf("member policy = %#v", policy)
 	}
+	for _, required := range []string{"Retain every deployed physical machine", "user accepts the resulting UI/behavior", "user explicitly directs its release", "before CI, records or cleanup"} {
+		if !strings.Contains(policy.DeveloperInstructions, required) {
+			t.Errorf("member policy missing %q", required)
+		}
+	}
 	legacy := Member{Role: "reviewer", Address: "reviewer0", Behavior: "reviewer", Access: "read_only"}
 	legacyPolicy, err := memberPolicy("/srv/workspace", "2026-09-24-example", legacy)
 	if err != nil || !strings.HasSuffix(legacyPolicy.DeveloperInstructions, legacyBehaviorInstructions["reviewer"]) {

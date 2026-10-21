@@ -108,9 +108,9 @@ dev-session coordination cancel-claim SESSION --as-is --id CLAIM_UUID --json
 
 Release settles a held claim. Cancellation settles a waiting request. Both are
 owner-only and idempotent; cancellation cannot release held resources. Machine
-ownership can remain held during human review, feedback and repeated deployment.
-Release requires no integration proof and grants no merge approval. Session
-completion still follows its normal exact-head integration requirements.
+ownership follows the retention rule below through human review, feedback and
+repeated deployment. Release grants no merge approval. Session completion still
+follows its normal exact-head integration requirements.
 
 For workspace profile activation, hold a claim covering the configured profile
 machine and run ordinary `workspace-host switch --source PATH` with
@@ -119,13 +119,47 @@ machine and run ordinary `workspace-host switch --source PATH` with
 transition locks. Package compatibility, activation journals and forward recovery
 remain workspace-host responsibilities.
 
+## Machine retention
+
+Retain every deployed physical machine until all three conditions are met:
+
+1. Its deployed feature lineage is integrated into the approved remote default
+   branches, including deployed dependencies.
+2. The user accepts the resulting UI or behavior on that machine.
+3. The user explicitly directs release of that machine.
+
+Idle time, review, feedback, redeployment, disconnects and turn completion do not
+permit release. Review, CI and source completion do not establish user acceptance;
+record the accepted environment and result. Default-branch integration needs its
+own explicit approval. Deployment approval supplies neither merge approval nor
+release direction. Missing evidence keeps the machine held.
+
+Use existing rollout and review receipts for exact system/profile store paths,
+complete source/input graphs, canonical repository/target mapping and machine
+aliases, exact deployed and final intended feature heads, and fresh remote
+ancestry evidence. Retain reviewed old/new base/head ranges, range-diff or
+patch-equivalence evidence and migration lineage when history changes. Do not
+describe a nonancestor deployed commit as literally merged. An independently
+proven equivalent successor can establish integrated feature lineage; a
+substantive successor requires redeployment and renewed user acceptance. Ordinary
+session completion still requires every registered exact final feature head.
+
+Before release, inspect authoritative status for the exact claim owned by this
+session, reconcile known command effects, verify all three conditions, release
+that claim and verify its resulting state. The cooperative owner-only, idempotent
+release API does not enforce this human workflow. Do not introduce release
+receipts, edit claim records or infer acceptance to bypass a missing condition.
+Keep short repository merge claims separate from machine ownership.
+
 ## Interruption and lifecycle
 
 Claims survive idle agents, disconnections and service restart. They have no
 automatic expiry. The coordinator does not observe command execution or infer
 completion. After interruption, inspect the original local and remote work,
-stop anything still mutating the resources, then explicitly release. Do not
-release ownership merely because SSH or a client process exited.
+stop anything still mutating the resources and reconcile effects. Release a
+repository merge claim once its critical section is safe. A deployed machine
+remains held until all machine-retention conditions are met. SSH or a client
+process exiting does not permit release.
 
 Held claims block lifecycle cleanup until their owner releases them. Lifecycle
 fencing cancels waiting requests. Suspension retains ownership and waiting
@@ -166,3 +200,8 @@ its exact `legacyJobId`; this does not permit submitting an independent new job.
 Use the [retained workflow guide](coordination-legacy.md),
 [integration guide](integration.md) and [operations guide](coordination-operations.md)
 for those records.
+
+Legacy automatic reservation release during lifecycle completion is implementation
+behavior, not permission to archive, delete or release a deployed machine before
+the retention conditions above. Existing journals and recovery contracts remain;
+finishing work or preparing a handoff grants no lifecycle authorization.
