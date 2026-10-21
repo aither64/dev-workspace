@@ -51,7 +51,10 @@ func (s *Server) codexLimits(w http.ResponseWriter, r *http.Request) {
 		}
 		provider = view.Active
 	}
+	stage := readStage(r.Context(), "limits_dependency")
 	result, err := s.loadProviderLimits(r.Context(), provider)
+	stage()
+	readDependencyError(r.Context(), err)
 	if err != nil {
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Limits unavailable"})
 		return
@@ -68,6 +71,7 @@ func (s *Server) loadCodexLimits(requestContext context.Context) (codexLimitsSna
 	}
 	if call := s.codexLimitsWait; call != nil {
 		s.codexLimitsMu.Unlock()
+		defer readStage(requestContext, "limits_cache_wait")()
 		select {
 		case <-call.done:
 			return call.result, call.err
