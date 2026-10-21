@@ -4504,7 +4504,20 @@ func TestMemberConversationUsesOnlyReadySessionMember(t *testing.T) {
 	if _, ok := target.Client.(conversation.TranscriptPageReader); !ok {
 		t.Fatal("member conversation lost bounded transcript paging")
 	}
-	memberClient := target.Client.(memberPagedConversationClient).memberConversationClient
+	var memberClient memberConversationClient
+	switch wrapped := target.Client.(type) {
+	case memberPagedConversationClient:
+		memberClient = wrapped.memberConversationClient
+	case memberPagedPendingConversationClient:
+		memberClient = wrapped.memberConversationClient
+	default:
+		t.Fatalf("unexpected member adapter %T", target.Client)
+	}
+	_, nativeRevisions := server.config.Codex.(pendingRevisionProvider)
+	_, wrappedRevisions := target.Client.(pendingRevisionProvider)
+	if nativeRevisions != wrappedRevisions {
+		t.Fatal("member adapter changed optional pending capability")
+	}
 	probe := &memberPageProbe{Client: memberClient.Client}
 	pagedClient := memberPagedConversationClient{memberConversationClient: memberClient}
 	pagedClient.Client = probe

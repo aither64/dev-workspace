@@ -3645,6 +3645,14 @@ func (s *Server) resolveConversation(
 		if _, ok := s.config.Codex.(conversation.TranscriptPageReader); ok {
 			conversationClient = memberPagedConversationClient{memberClient}
 		}
+		if revisions, ok := s.config.Codex.(pendingRevisionProvider); ok {
+			forward := pendingRevisionForwarder{revisions}
+			if paged, ok := conversationClient.(memberPagedConversationClient); ok {
+				conversationClient = memberPagedPendingConversationClient{paged, forward}
+			} else {
+				conversationClient = memberPendingConversationClient{memberClient, forward}
+			}
+		}
 	}
 	held := s.recoveryHeld(slug, threadID)
 	if (interactive && held) || (!interactive && settingsReady) {
@@ -3658,6 +3666,14 @@ func (s *Server) resolveConversation(
 			conversationClient = recoveryPagedConversationClient{coldClient}
 		} else {
 			conversationClient = coldClient
+		}
+		if revisions, ok := coldClient.Client.(pendingRevisionProvider); ok {
+			forward := pendingRevisionForwarder{revisions}
+			if paged, ok := conversationClient.(recoveryPagedConversationClient); ok {
+				conversationClient = recoveryPagedPendingConversationClient{paged, forward}
+			} else {
+				conversationClient = recoveryPendingConversationClient{coldClient, forward}
+			}
 		}
 	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)

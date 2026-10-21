@@ -176,6 +176,39 @@ test('retained focused document refuses replaced directory or changed root', asy
   }
 });
 
+test('50 attention documents stop hidden HTTP and storage work and retire old results on resume', async () => {
+  const documents=[];
+  for(let index=0;index<50;index++) {
+    const listeners={},reads=[],timers=new Map();let timerID=0,stores=0;
+    const document={body:{dataset:{session:'example',sessionObservation:identity,rootThreadId:'thread-1'}},title:'example',visibilityState:index?'hidden':'visible',hidden:index!==0,
+      hasFocus:()=>false,getElementById:()=>null,addEventListener:(name,fn)=>{listeners[name]=fn;}};
+    const context={document,window:{addEventListener:(name,fn)=>{listeners[name]=fn;}},navigator:{},AbortController,
+      setTimeout:(fn,delay)=>{timers.set(++timerID,{fn,delay});return timerID;},clearTimeout:id=>timers.delete(id),
+      workspaceAttentionStore:{update:async(key,change=value=>value)=>{stores++;return change({seen:[],revision:0});}},
+      fetch:(url,options)=>new Promise((resolve,reject)=>reads.push({url,options,resolve,reject}))};
+    vm.runInNewContext(source('session-attention.js'),context);
+    documents.push({document,listeners,reads,timers,stores:()=>stores});
+  }
+  const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
+  const active=documents[0];assert.equal(active.reads.length,1);
+  for(const h of documents.slice(1)) {h.listeners.focus();h.listeners.pageshow();assert.equal(h.reads.length,0);assert.equal(h.stores(),0);}
+  active.document.visibilityState='hidden';active.document.hidden=true;active.listeners.visibilitychange();
+  assert(active.reads[0].options.signal.aborted);
+  active.document.visibilityState='visible';active.document.hidden=false;active.listeners.visibilitychange();active.listeners.focus();
+  assert.equal(active.reads.length,2,'fresh read does not wait for aborted transport');
+  active.reads[0].resolve({ok:true,json:async()=>({version:1,identity,rootThread:'thread-1',revision:999,event:event()})});await flush();
+  assert.equal(active.stores(),0,'old body cannot write storage');
+  active.listeners.focus();assert.equal(active.reads.length,2,'old finally cannot clear successor');
+  active.reads[1].resolve({ok:true,json:async()=>({version:1,identity,rootThread:'thread-1',revision:1,event:event()})});await flush();
+  assert.equal(active.stores(),1);assert.equal(active.reads.length,3);
+  active.reads[2].resolve({ok:true,json:async()=>({reservationHolders:[]})});await flush();
+  assert.equal(active.document.title,'? example');
+  active.document.visibilityState='hidden';active.document.hidden=true;active.listeners.visibilitychange();
+  for(const h of documents) {h.listeners.focus();for(const timer of h.timers.values())if(timer.delay===5000)timer.fn();}
+  assert.equal(active.reads.length,3);assert.equal(active.document.title,'? example','cached markers survive hiding');
+  assert.equal(documents.reduce((total,h)=>total+h.reads.length,0),3);
+});
+
 const browserId = 'd'.repeat(64), browserKey = 'workspace-browser-notifications.v1', cleanupKey = `${browserKey}.cleanup`;
 const endpoint = 'https://fcm.googleapis.com/private-endpoint?exact=value';
 const endpointDigest = require('node:crypto').createHash('sha256').update(endpoint).digest('hex');

@@ -378,6 +378,17 @@ controls or generate notifications. Refresh failures appear after 30 continuous 
 or restoring a page starts a fresh grace period. Access errors and failures of
 user actions appear immediately.
 
+Hidden conversation tabs pause transcript, request, queue, timing, details, team
+and provider reads. Returning to a tab starts fresh reads even if an old request
+has not settled. Late results cannot replace the current view. Provider catalog
+refreshes share one in-flight read. With typed pending invalidation, ordinary
+transcript updates respect a 15-second interval after a successful pending read;
+new questions, local responses and reconnection force a refresh. Older servers
+keep the existing refresh behavior.
+
+Team status unavailable marks stale peer-activity observations. A successful
+HTTP response clears it only when the returned observations are fresh.
+
 Index snapshot warnings use the same grace period as failed HTTP refreshes,
 including when the server successfully returns its last known state. Repeated
 warnings do not restart the grace period. A healthy snapshot clears the warning.

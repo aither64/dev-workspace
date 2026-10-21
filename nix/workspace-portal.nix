@@ -320,6 +320,7 @@ buildGoModule {
       --coverage-only ${codexWebSrc}/codex/client.go
     go test ./...
     node --check internal/web/static/app.js
+    node --test internal/web/read_cycle_browser_test.cjs
     node --check internal/web/static/session-attention-store.js
     node --check internal/web/static/session-attention.js
     node --check internal/web/static/browser-notifications.js

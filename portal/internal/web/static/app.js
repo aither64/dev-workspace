@@ -7,7 +7,16 @@
       ...options,
       headers: {"Content-Type": "application/json", ...(options.headers || {})},
     });
-    const data = await response.json().catch(() => ({}));
+    options.signal?.throwIfAborted();
+    if (response.ok && (response.status === 204 || response.status === 205 || options.method === "HEAD")) return {};
+    let data;
+    try { data = await response.json(); }
+    catch (error) {
+      options.signal?.throwIfAborted();
+      if (response.ok || error.name !== "SyntaxError") throw error;
+      data = {};
+    }
+    options.signal?.throwIfAborted();
     if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; throw error; }
     return data;
   };
@@ -508,13 +517,18 @@
       get paused() { return paused; },
       begin(timeout = refreshPolicy?.readDeadlineMs || 10_000) {
         const abort = new AbortController(), ticket = generation;
-        const timer = setTimeout(() => abort.abort(), timeout);
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          abort.abort(new DOMException("The request timed out. Try again.", "TimeoutError"));
+        }, timeout);
         reads.add(abort);
         if (paused) abort.abort();
         return {signal: abort.signal, isCurrent: () => !paused && generation === ticket,
+          error: error => timedOut ? abort.signal.reason : error,
           finish() { clearTimeout(timer); reads.delete(abort); }};
       },
-      pause() { paused = true; ++generation; for (const abort of reads) abort.abort(); },
+      pause() { paused = true; ++generation; for (const abort of reads) abort.abort(); reads.clear(); },
       resume() { paused = false; },
     };
   };
@@ -1034,7 +1048,7 @@
         if (!force && now() - lastSuccessAt < (options.freshnessMs || 0)) return Promise.resolve();
         clearTimeout(retryTimer); retryTimer = null;
         const read = {generation, abort: new AbortController(), promise: null};
-        const timeout = setTimeout(() => read.abort.abort(), options.deadlineMs || 10_000);
+        const timeout = setTimeout(() => read.abort.abort(new DOMException("The request timed out. Try again.", "TimeoutError")), options.deadlineMs || 10_000);
         pending = read; options.onStart?.();
         read.promise = (async () => {
           try {
@@ -1047,7 +1061,8 @@
             snapshot = value; lastSuccessAt = now(); retryDelay = options.retryInitialMs || 2000;
             render(snapshot, false);
           } catch (error) {
-            if (read.generation !== generation) return;
+            if (read.generation !== generation || pending !== read) return;
+            error = read.abort.signal.aborted ? read.abort.signal.reason : error;
             render(snapshot, true, error);
             if (options.retryInitialMs && options.isVisible?.() !== false && error.status !== 401 && error.status !== 403) {
               retryTimer = setTimeout(() => { retryTimer = null; void reader.refresh(true); }, retryDelay);
@@ -1055,17 +1070,18 @@
             }
           } finally {
             clearTimeout(timeout);
-            if (pending === read) pending = null;
+            if (pending !== read) return;
+            pending = null;
             if (rerun) { rerun = false; void reader.refresh(true); }
           }
         })();
         return read.promise;
       },
       invalidate({clearSnapshot = false} = {}) {
-        ++generation; lastSuccessAt = -Infinity;
+        ++generation; pending?.abort.abort(); pending = null; rerun = false; lastSuccessAt = -Infinity;
         if (clearSnapshot) {snapshot = null; render(null, false);}
       },
-      pause() { ++generation; pending?.abort.abort(); clearTimeout(retryTimer); retryTimer = null; },
+      pause() { ++generation; pending?.abort.abort(); pending = null; rerun = false; lastSuccessAt = -Infinity; clearTimeout(retryTimer); retryTimer = null; },
     };
     return reader;
   };
@@ -1192,7 +1208,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=20");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=22");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -1261,7 +1277,7 @@
       const read = reads.begin(refreshPolicy.archivalDeadlineMs);
       try {
         const payload = await request("/api/auto-archive", {signal: read.signal});
-        if (!read.isCurrent()) return;
+        if (!read.isCurrent() || read.signal.aborted) return;
         const presentation = workspaceArchivePresentation(payload);
         summary = `${presentation.summary} Last scan: ${payload.last_scan?.checked_at ? activityAge(payload.last_scan.checked_at) : "not recorded"}.`;
         notice.success();
@@ -1529,7 +1545,7 @@
     resetAction = createResetCreditAction({request, store, withLock,
       confirm: message => globalThis.confirm(message), randomUUID: () => crypto.randomUUID(),
       refresh: async () => {limits.invalidate(); await limits.refresh(true);}, onChange: renderAccountDetails});
-    const {createProviderPreview, renderProviderOperation} = await import("/static/codex-providers.js?v=4");
+    const {createProviderPreview, renderProviderOperation} = await import("/static/codex-providers.js?v=5");
     const providerControls = dialog.querySelector("[data-provider-controls]");
     const providerSelect = dialog.querySelector("[data-provider-select]");
     const providerScope = dialog.querySelector("[data-provider-scope]");
@@ -1603,8 +1619,16 @@
     inheritProvider.addEventListener("click", () => {void providerMutation("switch",true);});
     recoverProvider.addEventListener("click", () => {void providerMutation("recover");});
     dismissProvider.addEventListener("click", () => {void providerMutation("dismiss");});
-    void providers.refresh();
-    const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !limitsLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 1000);
+    let providerLeaving = false;
+    const refreshVisibleProviders = () => {
+      if (document.hidden || providerLeaving) providers.pause();
+      else void providers.resume();
+    };
+    document.addEventListener("visibilitychange", refreshVisibleProviders);
+    globalThis.addEventListener("pagehide", () => {providerLeaving = true; refreshVisibleProviders();});
+    globalThis.addEventListener("pageshow", () => {providerLeaving = false; refreshVisibleProviders();});
+    if (document.hidden) providers.pause(); else void providers.refresh();
+    const providerPoll = globalThis.setInterval(() => {if (!document.hidden && !providerLeaving && (dialog.open || ["waiting", "applying"].includes(providers.state().catalog?.operation?.phase))) void providers.refresh();}, 1000);
     globalThis.addEventListener("pagehide", event => {if (!event.persisted) {globalThis.clearInterval(providerPoll); providers.stop();}});
     globalThis.addEventListener("storage", event => {
       if (event.key === resetStorageKey || event.key === null) resetAction.reload();
@@ -2256,7 +2280,7 @@
   let settingsWriteGeneration = 0;
   let liveSettingsController = null, teamSettingsController = null;
   let teamSettingsTarget = null, teamSettingsGeneration = 0, teamSettingsReadGeneration = 0;
-  let teamLeadSettingsInFlight = false;
+  let teamLeadSettingsRead = null;
   const teamSelects = Array.from(document.querySelectorAll("[data-team-select]"));
 
   const updateTeamDescription = (teamSelect) => {
@@ -3278,7 +3302,7 @@
       selectedFile = file; fileMode = ["markdown", "image"].includes(file.preview?.kind) ? "preview" : "raw";
       fileMessage(""); read.finish(); await renderSelectedFile();
     } catch (error) {
-      if (read.isCurrent() && path === selectedPath && filesActive()) fileMessage(error.message, true);
+      if (read.isCurrent() && path === selectedPath && filesActive()) fileMessage(read.error(error).message, true);
     } finally { read.finish(); if (fileRead === read) fileRead = null; }
   };
   const selectFile = path => {
@@ -3303,7 +3327,7 @@
     catch (_) { if (file === selectedFile && epoch === fileRenderEpoch && filesActive()) fileMessage("Unable to copy the content. Download the file instead.", true); }
   });
   const refreshFiles = async () => {
-    if (!artifactList || filesReads.paused || !filesActive() || filesRead) return;
+    if (!artifactList || filesReads.paused || !filesActive() || filesRead?.isCurrent()) return;
     const read = filesReads.begin(refreshPolicy.detailsDeadlineMs);
     filesRead = read;
     filesStatus.hidden = false; filesStatus.classList.remove("error"); filesStatus.textContent = "Loading files…";
@@ -3345,7 +3369,7 @@
       if (tab) tab.querySelector(".rail-label").textContent = `Files (${payload.files.length})`;
     } catch (error) {
       if (!read.isCurrent()) return;
-      filesStatus.hidden = false; filesStatus.classList.add("error"); filesStatus.textContent = error.message;
+      filesStatus.hidden = false; filesStatus.classList.add("error"); filesStatus.textContent = read.error(error).message;
     } finally { read.finish(); if (filesRead === read) filesRead = null; }
   };
   const pauseFiles = () => { filesReads.pause(); fileReads.pause(); if (fileNeedsRender) ++fileRenderEpoch; };
@@ -3362,6 +3386,7 @@
 
   const pageReads = createReadScope();
   let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {}, resumeHistory = () => {};
+  let pauseConversationReads = () => {}, resumeConversationReads = () => {};
   let repositoryReview = null;
   let repositoryReviewLoading = null;
   const loadRepositoryReview = async () => {
@@ -3390,7 +3415,7 @@
   if (document.getElementById("repositories")?.classList.contains("active")) void loadRepositoryReview();
 
   let detailsTimer = null;
-  let detailsRunning = false;
+  let detailsRead = null;
   let lastRepositoriesHTML = "";
   let lastClustersHTML = "";
   let lastTeamHTML = "";
@@ -3414,15 +3439,15 @@
     warning.hidden = !state.warning;
   }});
   const refreshSessionDetails = async () => {
-    if (detailsRunning || pageReads.paused || document.hidden || !artifactList) return;
+    if (detailsRead?.isCurrent() || pageReads.paused || document.hidden || !artifactList) return;
     if (detailsTimer !== null) clearTimeout(detailsTimer);
-    detailsRunning = true;
     const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
+    detailsRead = read;
     const teamGeneration = teamSettingsGeneration;
     const warning = document.getElementById("session-details-warning");
     try {
       const payload = await client.details({signal: read.signal});
-      if (!read.isCurrent()) return;
+      if (!read.isCurrent() || read.signal.aborted) return;
       if (reconcileCompletedArchive(payload)) return;
       refreshLifecycleTarget(payload.currentTarget);
       applyRecoveryStatus(payload.recovery, payload.interactive);
@@ -3440,7 +3465,7 @@
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;
-        if (!read.isCurrent()) return;
+        if (!read.isCurrent() || read.signal.aborted) return;
         if (repositoryReview) {
           repositoryReview.updateHTML(payload.repositoriesHTML);
         } else {
@@ -3500,22 +3525,26 @@
       detailsNotice.success();
     } catch (error) {
       if (!read.isCurrent()) return;
-      detailsNotice.failure(error);
+      detailsNotice.failure(read.error(error));
     } finally {
-      read.finish(); detailsRunning = false;
+      read.finish();
+      if (detailsRead !== read || !read.isCurrent()) return;
+      detailsRead = null;
       if (!pageReads.paused) detailsTimer = setTimeout(refreshSessionDetails, refreshPolicy.detailsMs);
     }
   };
   const suspendPageReads = (leaving = false) => {
     pageLeaving ||= leaving;
-    pageReads.pause(); clearTimeout(detailsTimer); detailsTimer = null;
+    pageReads.pause(); pauseFiles(); clearTimeout(detailsTimer); detailsTimer = null;
+    pauseConversationReads();
     teamStatsReceivedAt = 0;
     repositoryReview?.suspend(); pauseTiming();
   };
   const resumePageReads = () => {
     if (document.hidden || pageLeaving) return;
     const wasPaused = pageReads.paused;
-    pageReads.resume();
+    pageReads.resume(); resumeFiles();
+    if (wasPaused) resumeConversationReads();
     if (wasPaused) { resumeTiming(); repositoryReview?.resume(); }
     resumeHistory();
     void refreshSessionDetails();
@@ -3535,20 +3564,20 @@
   addEventListener("pagehide", () => suspendPageReads(true));
   addEventListener("pageshow", () => { pageLeaving = false; resumePageReads(); });
   sessionTabs.forEach(tab => tab.addEventListener("click", refreshSessionDetails));
-  let teamStatsInFlight = false;
+  let teamStatsRead = null;
   let teamStatsPayload = null, teamStatsReceivedAt = 0, teamStatsFailed = false;
   let updateTeamWork = () => {};
   const refreshTeamStats = async () => {
     const panel = document.getElementById("team");
     const visibleTeam = panel?.classList.contains("active");
     const hasMembers = document.querySelector('#codex-member option:not([value="lead"])');
-    if (!slug || document.hidden || pageReads.paused || teamStatsInFlight ||
+    if (!slug || document.hidden || pageReads.paused || teamStatsRead?.isCurrent() ||
         !visibleTeam && (!interactive || executionHeld || !hasMembers)) return;
-    teamStatsInFlight = true;
     const read = pageReads.begin();
+    teamStatsRead = read;
     try {
       const payload = await request(`/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal});
-      if (!read.isCurrent()) return;
+      if (!read.isCurrent() || read.signal.aborted) return;
       teamStatsPayload = payload; teamStatsReceivedAt = Date.now(); teamStatsFailed = false;
       const rows = new Map((payload.members || []).map(row => [row.address, row]));
       panel.querySelectorAll("[data-team-stats]").forEach(element => {
@@ -3566,7 +3595,7 @@
         teamStatsFailed = true;
         panel?.querySelectorAll('[data-team-metric="activity"]').forEach(cell => { cell.textContent = "Update unavailable"; });
       }
-    } finally { read.finish(); teamStatsInFlight = false; updateTeamWork(); }
+    } finally { read.finish(); if (teamStatsRead === read && read.isCurrent()) { teamStatsRead = null; updateTeamWork(); } }
   };
   document.querySelector('[data-session-tab="team"]')?.addEventListener("click", () => { void refreshTeamStats(); });
   setInterval(() => { void refreshTeamStats(); }, 5000);
@@ -3904,7 +3933,7 @@
   const refreshActivity = (force = false) => {
     if (executionHeld || !client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
-    if (activityRead) return activityRead;
+    if (activityRead?.isCurrent()) return activityRead.promise;
     const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
     const elapsed = Date.now() - lastActivityReadAt;
     if (!force && elapsed < interval) {
@@ -3913,15 +3942,17 @@
     }
     lastActivityReadAt = Date.now();
     const read = pageReads.begin();
-    activityRead = client.activity({signal: read.signal}).then(snapshot => {
-      if (!read.isCurrent()) return;
+    activityRead = read;
+    read.promise = client.activity({signal: read.signal}).then(snapshot => {
+      if (!read.isCurrent() || read.signal.aborted) return;
       activitySnapshot = snapshot; activityAvailable = true; timingClock.received();
     }).catch(() => { if (read.isCurrent()) { activityAvailable = false; timingClock.failed(); } }).finally(() => {
-      read.finish(); activityRead = null;
+      read.finish(); if (activityRead !== read || !read.isCurrent()) return;
+      activityRead = null;
       if (!pageReads.paused) updateCodexWork();
       scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs);
     });
-    return activityRead;
+    return read.promise;
   };
   pauseTiming = () => { timingClock.pause(); updateCodexWaitingIndicator(); clearTimeout(activityTimer); activityTimer = null; };
   resumeTiming = () => { timingClock.resume(); updateCodexWaitingIndicator(); void refreshActivity(true); };
@@ -4671,22 +4702,24 @@
     const threadID = currentThreadId;
     const readVersion = transcriptHistory.repairVersion;
     const read = pageReads.begin(refreshPolicy.transcriptDeadlineMs);
-    historyRead = true;
+    historyRead = read;
+    clearTimeout(historyRetryTimer); historyRetryTimer = null;
     historyNotice.begin({manual});
-    historyError = "";
-    historyFailure = null;
     renderHistoryControls();
     try {
       const page = await conversationAssets.readTranscriptPage(client, {
         cursor, signal: read.signal, expectedThreadId: threadID,
       });
-      if (!read.isCurrent() || threadID !== currentThreadId ||
+      if (historyRead !== read || !read.isCurrent() || threadID !== currentThreadId ||
           readVersion !== transcriptHistory.repairVersion) return;
-      renderThread(page, () => read.isCurrent() && threadID === currentThreadId, kind);
+      read.signal.throwIfAborted();
+      historyError = ""; historyFailure = null;
+      renderThread(page, () => historyRead === read && read.isCurrent() && threadID === currentThreadId, kind);
       historyRetryDelay = refreshPolicy.retryInitialMs; historyNotice.success();
     } catch (error) {
-      if (!read.isCurrent() || threadID !== currentThreadId ||
+      if (historyRead !== read || !read.isCurrent() || threadID !== currentThreadId ||
           readVersion !== transcriptHistory.repairVersion) return;
+      error = read.error(error);
       if (error.code === "transcript_cursor_expired" || error.code === "transcript_reset_required") {
         transcriptHistory.invalidateCursor();
         historyError = "History changed. Reconnecting…";
@@ -4708,6 +4741,7 @@
       }
     } finally {
       read.finish();
+      if (historyRead !== read || !read.isCurrent()) return;
       historyRead = null;
       historyNotice.cancel();
       renderHistoryControls();
@@ -4719,12 +4753,10 @@
     (!historyFailure || historyFailure.kind === "repair") && (!historyError || historyFailure?.kind === "repair") &&
     !pageReads.paused && !document.hidden && !pagingUnavailable;
   const scheduleHistoryRepair = (delay = transcriptHistory?.gap ? refreshPolicy.historyPageMs : refreshPolicy.retryInitialMs) => {
-    if (!canRepairHistory() || historyRetryTimer !== null) return;
+    if (!canRepairHistory() || historyRead || historyRetryTimer !== null) return;
     historyRetryTimer = setTimeout(() => {
       historyRetryTimer = null;
-      if (!canRepairHistory()) return;
-      if (historyRead) scheduleHistoryRepair(100);
-      else void runHistoryRead("repair");
+      if (canRepairHistory() && !historyRead) void runHistoryRead("repair");
     }, delay);
   };
   resumeHistory = () => scheduleHistoryRepair(historyFailure ? historyRetryDelay : refreshPolicy.historyPageMs);
@@ -4800,6 +4832,7 @@
     } finally {
       respondingPrompts.delete(key);
       pendingSignature = null; renderPendingEntries(currentPrompts);
+      void refreshPending(true);
       controls.forEach(control => { control.disabled = false; });
       if (controls.includes(activeElement)) composerView.restoreFocus(activeElement, activeElement.closest(".question-approval"));
     }
@@ -4867,7 +4900,7 @@
       if (!wizardState.snooze || wizardState.snooze.token !== entry.token) {
         wizardState.snooze = createPromptSnooze(entry.token, () => {
           if (!entry.token) throw new Error("Reload this page to update the question controls.");
-          return client.snooze(entry.id, entry.token);
+          return client.snooze(entry.id, entry.token).then(value => { void refreshPending(true); return value; });
         });
       }
       const snoozeState = wizardState.snooze;
@@ -5135,29 +5168,44 @@
     if (state.loading) pendingStatus.querySelector("span").textContent = "Loading requests…";
     pendingRetry.hidden = !state.warning;
   }});
-  let pendingRead = null, pendingRetryTimer = null, pendingRetryDelay = refreshPolicy.retryInitialMs;
+  let pendingRead = null, pendingRerun = false, pendingSuccessAt = -Infinity, pendingDueTimer = null;
+  let pendingRetryTimer = null, pendingRetryDelay = refreshPolicy.retryInitialMs;
   const refreshPending = (force = false, manual = false) => {
     if (!interactive || !client.pending || pageReads.paused || document.hidden) return Promise.resolve();
-    if (pendingRead) return pendingRead;
+    if (pendingRead?.isCurrent()) { if (force) pendingRerun = true; return pendingRead.promise; }
+    const due = 15_000 - (Date.now() - pendingSuccessAt);
+    if (!force && sync?.pendingInvalidationSupported && due > 0) {
+      if (pendingDueTimer === null) pendingDueTimer = setTimeout(() => { pendingDueTimer = null; void refreshPending(); }, due);
+      return Promise.resolve();
+    }
+    clearTimeout(pendingDueTimer); pendingDueTimer = null;
     if (pendingRetryTimer !== null && !force) return Promise.resolve();
     if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
     pendingRetryTimer = null;
     const read = pageReads.begin(refreshPolicy.pendingDeadlineMs);
     pendingNotice.begin({manual});
-    pendingRead = client.pending({signal: read.signal}).then((entries) => {
-      if (!read.isCurrent()) return;
+    pendingRead = read;
+    read.promise = client.pending({signal: read.signal}).then((entries) => {
+      if (!read.isCurrent() || read.signal.aborted) return;
       if (!Array.isArray(entries)) throw new Error("Invalid request list");
       renderPendingEntries(entries);
+      pendingSuccessAt = Date.now();
       pendingNotice.success();
       pendingRetryDelay = refreshPolicy.retryInitialMs;
     }).catch(error => {
       if (!read.isCurrent()) return;
+      // A failed invalidation must retry on backoff, even after a recent success.
+      pendingSuccessAt = -Infinity;
       pendingStatus.querySelector("span").textContent = "Requests could not be refreshed. Previously shown questions remain available.";
-      pendingNotice.failure(error);
+      pendingNotice.failure(read.error(error));
       pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
       pendingRetryDelay = Math.min(refreshPolicy.retryMaxMs, pendingRetryDelay * 2);
-    }).finally(() => { read.finish(); pendingRead = null; });
-    return pendingRead;
+    }).finally(() => {
+      read.finish(); if (pendingRead !== read || !read.isCurrent()) return;
+      pendingRead = null;
+      if (pendingRerun) { pendingRerun = false; void refreshPending(true); }
+    });
+    return read.promise;
   };
   pendingRetry?.addEventListener("click", () => { void refreshPending(true, true); });
 
@@ -5208,17 +5256,21 @@
     if (state.loading) queueStatus.querySelector("span").textContent = "Checking queued messages…";
     queueRetry.hidden = !state.warning;
   }});
-  let queueRead = null, queueRetryTimer = null, queueRetryDelay = refreshPolicy.retryInitialMs;
+  let queueRead = null, queueRerun = false, queueRetryTimer = null, queueRetryDelay = refreshPolicy.retryInitialMs;
   const refreshQueue = (force = false, manual = false) => {
     if (!interactive || !client.reconcileQueue || pageReads.paused || document.hidden) return Promise.resolve();
-    if (queueRead) return queueRead;
+    if (queueRead?.isCurrent()) { if (force) queueRerun = true; return queueRead.promise; }
     if (queueRetryTimer !== null && !force) return Promise.resolve();
     if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
     queueRetryTimer = null;
     const read = pageReads.begin(refreshPolicy.queueDeadlineMs);
     queueNotice.begin({manual});
-    queueRead = (executionHeld ? Promise.resolve() : client.reconcileQueue({signal: read.signal})).then(() => client.queue({signal: read.signal})).then((entries) => {
-      if (!read.isCurrent()) return;
+    queueRead = read;
+    read.promise = (executionHeld ? Promise.resolve() : client.reconcileQueue({signal: read.signal})).then(() => {
+      if (!read.isCurrent() || read.signal.aborted) return;
+      return client.queue({signal: read.signal});
+    }).then((entries) => {
+      if (!read.isCurrent() || read.signal.aborted) return;
       if (!Array.isArray(entries)) throw new Error("Invalid queue");
       renderQueue(entries);
       queueNotice.success();
@@ -5226,13 +5278,30 @@
     }).catch(error => {
       if (!read.isCurrent()) return;
       queueStatus.querySelector("span").textContent = "Queued messages could not be refreshed. The last result may be out of date.";
-      queueNotice.failure(error);
+      queueNotice.failure(read.error(error));
       queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
       queueRetryDelay = Math.min(refreshPolicy.retryMaxMs, queueRetryDelay * 2);
-    }).finally(() => { read.finish(); queueRead = null; });
-    return queueRead;
+    }).finally(() => {
+      read.finish(); if (queueRead !== read || !read.isCurrent()) return;
+      queueRead = null;
+      if (queueRerun) { queueRerun = false; void refreshQueue(true); }
+    });
+    return read.promise;
   };
   queueRetry?.addEventListener("click", () => { void refreshQueue(true, true); });
+
+  pauseConversationReads = () => {
+    clearTimeout(pendingRetryTimer); pendingRetryTimer = null;
+    clearTimeout(pendingDueTimer); pendingDueTimer = null;
+    clearTimeout(queueRetryTimer); queueRetryTimer = null;
+    clearTimeout(historyRetryTimer); historyRetryTimer = null;
+    historyRead?.finish();
+    historyRead = null;
+    pendingRerun = false; queueRerun = false;
+    pendingNotice.cancel(); queueNotice.cancel(); detailsNotice.cancel(); historyNotice.cancel();
+  };
+  resumeConversationReads = () => { void refreshPending(true); void refreshQueue(true); };
+  if (pageReads.paused) pauseConversationReads();
 
   function scheduleRefresh(delay = 200) {
     sync?.scheduleRefresh(delay);
@@ -5743,14 +5812,14 @@
     });
   };
   const refreshTeamLeadSettings = async () => {
-    if (teamLeadSettingsInFlight || !document.getElementById("team")?.classList.contains("active") || pageReads.paused || document.hidden) return;
-    teamLeadSettingsInFlight = true;
+    if (teamLeadSettingsRead?.isCurrent() || !document.getElementById("team")?.classList.contains("active") || pageReads.paused || document.hidden) return;
     const read = pageReads.begin(), generation = teamSettingsGeneration;
+    teamLeadSettingsRead = read;
     try {
       const observed = await teamConversation("lead").thread({signal: read.signal});
-      if (read.isCurrent() && generation === teamSettingsGeneration) showTeamSettings("lead", observed.model, observed.reasoningEffort);
+      if (read.isCurrent() && !read.signal.aborted && generation === teamSettingsGeneration) showTeamSettings("lead", observed.model, observed.reasoningEffort);
     } catch (_) { /* Retain the last confirmed values when refresh is unavailable. */ }
-    finally { read.finish(); teamLeadSettingsInFlight = false; }
+    finally { read.finish(); if (teamLeadSettingsRead === read && read.isCurrent()) teamLeadSettingsRead = null; }
   };
   teamSettingsController = createSettingsPopup({prefix: "team",
     editable: () => Boolean(teamSettingsTarget), targetClient: () => teamSettingsTarget?.client,
@@ -5880,6 +5949,7 @@
       if (wasActive !== threadActive) void refreshQueue(true);
       scheduleHistoryRepair();
     },
+    onPendingInvalidation: () => { void refreshPending(true); },
     onStateChange: state => {
       conversationAssets.renderConnectionStatus(
         document.getElementById("conversation-connection"), state, () => sync.retry(),
