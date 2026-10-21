@@ -803,6 +803,123 @@ module WorkspaceCoordination
     end
   end
 
+  # A local identity proof crosses the ledger transaction boundary. Git commands
+  # run only during resolution; admission rechecks bounded local files instead.
+  class RepositoryIdentity
+    attr_reader :path, :common, :identity, :registration
+
+    def self.registration(owner, name, internal_workspace: false)
+      root = File.join(owner.fetch('workspace'), 'work', owner.fetch('slug'))
+      manifest_path = File.join(root, 'portal.yml')
+      payload = File.binread(manifest_path, MAX_REQUEST + 1)
+      raise Error.new('repository registration exceeds its size bound', 4) if payload.bytesize > MAX_REQUEST
+      manifest = YAML.safe_load(payload, permitted_classes: [], aliases: false)
+      entries = manifest.is_a?(Hash) && manifest['repositories']
+      unless manifest.is_a?(Hash) && manifest['slug'] == owner['slug'] && entries.is_a?(Array) &&
+             entries.all? { |item| item.is_a?(Hash) && %w[name project].all? { |key| item[key].is_a?(String) && item[key].match?(PART) } }
+        raise Error.new('invalid repository registration; check session repository names and projects', 4)
+      end
+      if entries.map { |item| item['name'] }.uniq.length != entries.length
+        raise Error.new('ambiguous repository registration; remove duplicate repository names', 4)
+      end
+      stat = File.stat(root)
+      retained = WorkspaceCoordination.digest([owner.fetch('workspace'), owner.fetch('workspaceName'), owner.fetch('slug'), stat.dev, stat.ino,
+        owner['thread'], WorkspaceCoordination.creation_identity(manifest)])
+      raise Error.new('repository registration belongs to a changed session incarnation', 4) unless retained == owner['identity']
+      reg = entries.find { |item| item['name'] == name }
+      return nil if !reg && internal_workspace && name == 'workspace'
+      raise Error.new("repository is not registered to this session: #{name}", 4) unless reg
+      unless (name == 'workspace') == (reg['project'] == 'workspace') && reg['default_branch'].is_a?(String) &&
+             !reg['default_branch'].empty? && reg['default_branch'].bytesize <= 1024 && !reg['default_branch'].match?(/[[:cntrl:]]/) &&
+             (!reg.key?('github') || reg['github'].is_a?(String) && reg['github'].match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}))
+        raise Error.new("invalid repository registration for #{name}; check project, default_branch and github", 4)
+      end
+      reg
+    rescue Errno::ENOENT, Psych::Exception, TypeError, KeyError
+      raise Error.new('repository registration is unavailable or invalid; check the current session manifest', 4)
+    end
+
+    def initialize(owner, name, catalog:, env: ENV, fixtures: false, internal_workspace: false)
+      @owner, @name, @env, @fixtures = owner, name, env.to_h, fixtures
+      @registration = self.class.registration(owner, name, internal_workspace:)
+      @path = name == 'workspace' ? owner.fetch('workspace') : File.join(owner.fetch('workspace'), 'repos', "#{registration.fetch('project')}.git")
+      @common = File.realpath(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip)
+      @real_path = File.realpath(path)
+      @proof = local_proof
+      if name == 'workspace'
+        unless File.realpath(git('rev-parse', '--show-toplevel').strip) == File.realpath(owner.fetch('workspace'))
+          raise Error.new('registered workspace must be its canonical Git root', 4)
+        end
+      elsif git('rev-parse', '--is-bare-repository').strip != 'true' || common != @real_path
+        raise Error.new("registered repository #{name} needs its canonical bare clone in repos/<project>.git", 4)
+      end
+      if registration
+        branch = registration.fetch('default_branch')
+        git('check-ref-format', "refs/heads/#{branch}")
+        raise Error.new("invalid registered default_branch for #{name}", 4) if branch == 'HEAD' || branch.start_with?('-')
+      end
+      # Includes and global configuration cannot replace the canonical clone's
+      # direct origin. Its exact local config is covered by the admission proof.
+      origins = git('config', '--local', '--no-includes', '--get-all', 'remote.origin.url').lines.map(&:strip)
+      raise Error.new("registered repository #{name} needs exactly one canonical SSH origin", 4) unless origins.length == 1
+      @identity = WorkspaceCoordination.remote_identity(origins.first, fixtures:)
+      if registration && registration['github'] && identity != "github.com/#{registration['github'].downcase.delete_suffix('.git')}"
+        raise Error.new("registered github identity for #{name} differs from its canonical origin", 4)
+      end
+      configured = catalog.data.fetch('repositories')[name]
+      if configured && identity != WorkspaceCoordination.remote_identity(configured.fetch('remote'), fixtures:)
+        raise Error.new("coordination catalog remote for #{name} differs from its registered canonical origin", 4)
+      end
+      unless File.realpath(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip) == common
+        raise Error.new('repository mapping changed during resolution; try again', 3)
+      end
+      recheck!
+    rescue SystemCallError
+      raise Error.new("canonical clone for registered repository #{name} is unavailable; check repos/<project>.git", 4)
+    end
+
+    def values
+      [path, common, identity, registration]
+    end
+
+    def resources
+      ["git:#{common}", "repository:#{identity}"]
+    end
+
+    def recheck!
+      raise Error.new('repository registration or local Git identity changed; try again', 3) unless local_proof == @proof
+    rescue SystemCallError
+      raise Error.new('repository registration or local Git identity changed; try again', 3)
+    end
+
+    private
+
+    def git(*args)
+      # Read only local metadata, never fetch or invoke a credential helper.
+      output, _error, status, overflow = Command.run(['git', '-C', path, *args], env: @env, limit: MAX_REQUEST)
+      unless status.success? && !overflow
+        raise Error.new("could not verify registered repository #{@name}; check its canonical clone, origin and default_branch", 4)
+      end
+      output
+    end
+
+    def local_proof
+      paths = [File.join(@owner.fetch('workspace'), 'work', @owner.fetch('slug'), 'portal.yml'), File.join(common, 'config')]
+      paths << File.join(path, '.git') if @name == 'workspace'
+      files = paths.map do |file|
+        stat = File.stat(file)
+        if stat.directory?
+          [File.realpath(file), stat.dev, stat.ino]
+        else
+          bytes = File.binread(file, MAX_REQUEST + 1)
+          raise Error.new('repository identity metadata exceeds its size bound', 4) if bytes.bytesize > MAX_REQUEST
+          [File.realpath(file), stat.dev, stat.ino, stat.size, stat.mtime, stat.ctime, Digest::SHA256.hexdigest(bytes)]
+        end
+      end
+      [File.realpath(path), File.realpath(common), files]
+    end
+  end
+
   class Engine
     def validate_obligations!(owner, values)
       raise Error, 'integration obligations must be a unique list' unless values.is_a?(Array) && values.uniq == values
@@ -1001,10 +1118,7 @@ module WorkspaceCoordination
     end
 
     def registration(owner, name)
-      manifest = YAML.safe_load(File.binread(File.join(owner.fetch('workspace'), 'work', owner.fetch('slug'), 'portal.yml')), permitted_classes: [], aliases: false)
-      value = manifest.fetch('repositories').find { |item| item.fetch('name') == name }
-      raise Error.new("repository is not registered to this session: #{name}", 4) unless value
-      value
+      RepositoryIdentity.registration(owner, name)
     end
 
     def existing_bootstrap_owner(slug, id)
@@ -1029,16 +1143,12 @@ module WorkspaceCoordination
       raise Error.new("retained bootstrap owner cannot be verified: #{e.message}", 4)
     end
 
+    def repository_identity(owner, name)
+      RepositoryIdentity.new(owner, name, catalog: catalog, env: @env, fixtures: @fixtures)
+    end
+
     def repository(owner, name)
-      reg = registration(owner, name)
-      root = owner.fetch('workspace')
-      path = name == 'workspace' ? root : File.join(root, 'repos', "#{reg.fetch('project')}.git")
-      common = capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
-      remote = capture('git', '-C', path, 'remote', 'get-url', 'origin').strip
-      identity = WorkspaceCoordination.remote_identity(remote, fixtures: @fixtures)
-      configured = WorkspaceCoordination.remote_identity(catalog.repository(name).fetch('remote'), fixtures: @fixtures)
-      raise Error.new('registered repository remote differs from configured canonical remote', 4) unless identity == configured
-      [path, File.realpath(common), identity, reg]
+      repository_identity(owner, name).values
     end
 
     def snapshot(owner, value, kind)

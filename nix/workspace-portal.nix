@@ -403,6 +403,7 @@ buildGoModule {
     install -Dm644 ${src}/nix/integration-contract.json "$out/share/dev-workspace/integration-contract.json"
     install -Dm644 ${coordinationCatalog} "$out/share/dev-workspace/coordination.json"
     install -Dm644 ${src}/nix/claim-contract.json "$out/share/dev-workspace/claim-contract.json"
+    install -Dm644 ${src}/nix/repository-claim-contract.json "$out/share/dev-workspace/repository-claim-contract.json"
     install -Dm644 ${src}/docs/coordination-legacy.md "$out/share/dev-workspace/coordination-legacy.md"
     install -Dm644 ${src}/docs/integration.md "$out/share/dev-workspace/integration.md"
     install -Dm644 ${src}/nix/coordination-contract.json "$out/share/dev-workspace/coordination-contract.json"
