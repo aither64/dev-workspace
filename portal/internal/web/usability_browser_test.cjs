@@ -22,7 +22,11 @@ const baseURL = process.argv[2];
         {id: "reset-3", title: "Unknown fixture reset", resetType: "unknown", status: "available", expiresAt: null},
       ]}});
     // Every account read and mutation is intercepted. This fixture never uses a live reset.
-    await context.route("**/api/codex-limits", route => route.fulfill({json: snapshot()}));
+    let mockedSessionLimits = false;
+    await context.route(url => url.pathname === "/api/codex-limits", async route => {
+      await route.fulfill({json: snapshot()});
+      if (new URL(route.request().url()).searchParams.get("session") === "example") mockedSessionLimits = true;
+    });
     await context.route("**/api/codex-limits/reset", route => {
       attempts.push(route.request().postDataJSON());
       if (!consumed) {
@@ -32,6 +36,7 @@ const baseURL = process.argv[2];
       return route.fulfill({json: {outcome: "alreadyRedeemed"}});
     });
     await page.goto(baseURL + "/example/");
+    await expect.poll(() => mockedSessionLimits).toBe(true);
     await expect(page.locator(".limits-account-summary")).toContainText("13 credits");
     await expect(page.locator(".limits-account-summary")).toContainText("3 banked resets");
     const summaryLayout = await page.locator("[data-limits-content]").evaluate(content => {
