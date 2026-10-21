@@ -5,7 +5,7 @@
 require_relative 'coordination_claims_test'
 
 class CoordinationClaimsTest
-  def test_overcommit_session_owns_trust_checkouts_merge_and_push_while_claim_is_held
+  def test_overcommit_preparation_and_repairs_stay_outside_merge_claims
     overcommit = ENV['COORDINATION_OVERCOMMIT']
     skip 'explicit disposable Overcommit installation required' unless overcommit
     version, error, status = Open3.capture3(overcommit, '--version')
@@ -64,8 +64,7 @@ class CoordinationClaimsTest
     git('-C', feature, 'commit', '-am', 'fixture feature hooks')
     head = git('-C', feature, 'rev-parse', 'HEAD').strip
     original_base = git('-C', @bare, 'rev-parse', 'master').strip
-    claim = acquire(person)
-    assert_equal 'held', claim['state']
+    assert_empty @engine.store.held_claim_resources
     outputs = {}
     # These are ordinary session tools, never coordinator-executed commands.
     run = lambda do |cwd, argv|
@@ -89,20 +88,41 @@ class CoordinationClaimsTest
     hook_types.each { |type| assert_equal 'succeeded', run.call(feature, [overcommit, '--sign', type.tr('_', '-')])['state'] }
     assert_equal 'succeeded', run.call(feature, ['git', 'checkout', person['slug']])['state']
     assert_equal original_base, git('-C', @bare, 'rev-parse', 'master').strip
+    assert_empty @engine.store.held_claim_resources
+    merge_blocker = File.join(@bare, 'fail_post_merge')
+    File.write(merge_blocker, 'deliberate fixture hook failure')
+    claim = acquire(person)
+    assert_equal 'held', claim['state']
+    assert_equal original_base, git('--git-dir', @remote, 'rev-parse', 'master').strip
+    # Git returns zero even when its post-merge hook fails. The session must
+    # inspect hook diagnostics before deciding whether publication is safe.
+    assert_equal 'succeeded', run.call(target, ['git', 'merge', '--ff-only', head])['state']
+    assert_includes outputs['last'], 'fixture deliberate failure'
+    assert_equal head, git('-C', target, 'rev-parse', 'HEAD').strip
+    assert_equal original_base, git('--git-dir', @remote, 'rev-parse', 'master').strip
+    @engine.change_claim(person, claim['id'], 'release')
+    File.unlink(merge_blocker)
+    assert_equal 'succeeded', run.call(target, ['git', 'hook', 'run', 'post-merge', '--', '0'])['state']
+    assert_empty @engine.store.held_claim_resources
     blocker = File.join(@bare, 'fail_pre_push')
     File.write(blocker, 'deliberate fixture hook failure')
-    result = run.call(target, ['sh', '-c', 'git merge --ff-only "$1" && git push origin "$1:refs/heads/master"', 'fixture', head])
+    claim = acquire(person)
+    result = run.call(target, ['git', 'push', 'origin', "#{head}:refs/heads/master"])
     assert_equal 'failed', result['state']
     assert_includes outputs['last'], 'fixture deliberate failure'
     assert_equal original_base, git('--git-dir', @remote, 'rev-parse', 'master').strip
     assert_equal head, git('-C', target, 'rev-parse', 'HEAD').strip
+    @engine.change_claim(person, claim['id'], 'release')
     File.unlink(blocker)
+    assert_empty @engine.store.held_claim_resources
+    claim = acquire(person)
+    assert_equal original_base, git('--git-dir', @remote, 'rev-parse', 'master').strip
     assert_equal 'succeeded', run.call(target, ['git', 'push', 'origin', "#{head}:refs/heads/master"])['state']
     assert_equal head, git('--git-dir', @remote, 'rev-parse', 'master').strip
-    calls = File.readlines(File.join(@bare, 'probe.log'), chomp: true)
-    assert_equal %w[post_checkout post_checkout post_checkout post_merge pre_push pre_push], calls
-    assert_equal 'held', @engine.store.claims['claims'][claim['id']]['state']
     @engine.change_claim(person, claim['id'], 'release')
+    calls = File.readlines(File.join(@bare, 'probe.log'), chomp: true)
+    assert_equal %w[post_checkout post_checkout post_checkout post_merge post_merge pre_push pre_push], calls
+    assert_empty @engine.store.held_claim_resources
     refute File.exist?(File.join(@engine.store.root, 'sources'))
   end
 end

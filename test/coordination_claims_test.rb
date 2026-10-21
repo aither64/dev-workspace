@@ -45,6 +45,143 @@ class CoordinationClaimsTest < Minitest::Test
     assert_raises(WorkspaceCoordination::Error) { acquire(person, argv: ['true']) }
   end
 
+  def test_feature_commits_rebases_and_publication_continue_during_merge_ownership
+    first, second = owner('merge-ready'), owner('independent-feature')
+    first_tree, second_tree = feature(first), feature(second)
+    target = File.join(@tmp, 'merge-target')
+    git('-C', @bare, 'worktree', 'add', '--detach', target, @base)
+    assert_empty @engine.store.held_claim_resources
+
+    held, waiting = acquire(first), acquire(second)
+    assert_equal %w[held waiting], [held, waiting].map { |item| item['state'] }
+    File.write(File.join(second_tree, 'dependency'), 'independent update')
+    git('-C', second_tree, 'add', 'dependency')
+    git('-C', second_tree, 'commit', '-m', 'fixture dependency update')
+    git('-C', second_tree, 'push', 'origin', second['slug'])
+    published = git('-C', second_tree, 'rev-parse', 'HEAD').strip
+
+    first_head = git('-C', first_tree, 'rev-parse', 'HEAD').strip
+    git('-C', target, 'merge', '--ff-only', first_head)
+    git('-C', target, 'push', 'origin', 'HEAD:refs/heads/master')
+    assert_equal first_head, git('-C', @remote, 'rev-parse', 'master').strip
+
+    # Feature publication and reconciliation need no grant, even while another
+    # session still verifies its merge under ownership of this common Git dir.
+    git('-C', second_tree, 'fetch', 'origin', 'master')
+    git('-C', second_tree, 'rebase', 'FETCH_HEAD')
+    git('-C', second_tree, 'push', "--force-with-lease=refs/heads/#{second['slug']}:#{published}", 'origin', second['slug'])
+    second_head = git('-C', second_tree, 'rev-parse', 'HEAD').strip
+    assert_equal second_head, git('-C', @remote, 'rev-parse', second['slug']).strip
+    assert_equal 'waiting', @engine.store.claims['claims'][waiting['id']]['state']
+    @engine.change_claim(first, held['id'], 'release')
+    @engine.tick_claims(second)
+    assert_equal 'held', @engine.store.claims['claims'][waiting['id']]['state']
+    @engine.change_claim(second, waiting['id'], 'release')
+  end
+
+  def test_slow_preparation_and_post_push_checks_do_not_hold_merge_ownership
+    first, second = owner('checking-feature'), owner('ready-feature')
+    first_tree, second_tree = feature(first), feature(second)
+    target = File.join(@tmp, 'ready-target')
+    stale_target = File.join(@tmp, 'stale-target')
+    git('-C', @bare, 'worktree', 'add', '--detach', target, @base)
+    git('-C', @bare, 'worktree', 'add', '--detach', stale_target, @base)
+    entered, proceed = Queue.new, Queue.new
+    checker = Thread.new do
+      entered << :preparation
+      proceed.pop
+      git('-C', first_tree, 'fetch', 'origin', 'master')
+      git('-C', first_tree, 'rebase', 'FETCH_HEAD')
+      git('-C', first_tree, 'push', 'origin', first['slug'])
+      entered << :published
+    end
+    begin
+      Timeout.timeout(5) do
+        assert_equal :preparation, entered.pop
+        assert_empty @engine.store.held_claim_resources
+        held = acquire(second)
+        head = git('-C', second_tree, 'rev-parse', 'HEAD').strip
+        git('-C', target, 'merge', '--ff-only', head)
+        git('-C', target, 'push', 'origin', 'HEAD:refs/heads/master')
+        assert_equal head, git('-C', @remote, 'rev-parse', 'master').strip
+        @engine.change_claim(second, held['id'], 'release')
+        # The first session is still paused in slow preparation. Post-push
+        # checks and checkout cleanup run after the second session released.
+        assert checker.alive?
+        assert_empty @engine.store.held_claim_resources
+        git('-C', @bare, 'worktree', 'remove', target)
+        # Preparation became stale while another integration finished. A short
+        # preflight detects that and releases before the blocked rebase resumes.
+        stale_claim = acquire(first)
+        remote_head = git('-C', @remote, 'rev-parse', 'master').strip
+        refute_equal @base, remote_head
+        assert_equal @base, git('-C', stale_target, 'rev-parse', 'HEAD').strip
+        @engine.change_claim(first, stale_claim['id'], 'release')
+        assert_empty @engine.store.held_claim_resources
+        git('-C', @bare, 'worktree', 'remove', stale_target)
+        proceed << :continue
+        assert_equal :published, entered.pop
+        checker.value
+        assert_empty @engine.store.held_claim_resources
+      end
+    ensure
+      checker.kill if checker.alive?
+      checker.join
+    end
+  end
+
+  def test_shared_checkout_tracking_writer_is_excluded_only_during_merge
+    first, second = owner('shared-merge'), owner('parallel-feature')
+    first_tree, second_tree = feature(first), feature(second)
+    shared = File.join(@tmp, 'shared-master')
+    git('clone', @remote, shared)
+    git('-C', shared, 'fetch', @bare, first['slug'])
+    git('-C', shared, 'config', 'user.name', 'Fixture')
+    git('-C', shared, 'config', 'user.email', 'fixture@example.test')
+    path = File.join(shared, '.git', 'dev-session-tracking.lock')
+    writer = nil
+    attempted = Queue.new
+    held = acquire(first)
+    begin
+      File.open(path, 'w') do |merge_lock|
+        assert merge_lock.flock(File::LOCK_EX | File::LOCK_NB)
+        writer = Thread.new do
+          File.open(path, 'r+') do |tracking_lock|
+            busy = !tracking_lock.flock(File::LOCK_EX | File::LOCK_NB)
+            attempted << busy
+            tracking_lock.flock(File::LOCK_EX)
+            File.write(File.join(shared, 'tracking'), 'independent session records')
+            git('-C', shared, 'add', 'tracking')
+            git('-C', shared, 'commit', '-m', 'fixture tracking checkpoint')
+          end
+        end
+        assert Timeout.timeout(5) { attempted.pop }
+        git('-C', second_tree, 'push', 'origin', second['slug'])
+        assert_equal @base, git('-C', shared, 'rev-parse', 'HEAD').strip
+        head = git('-C', first_tree, 'rev-parse', 'HEAD').strip
+        git('-C', shared, 'merge', '--ff-only', head)
+        git('-C', shared, 'push', 'origin', 'HEAD:refs/heads/master')
+        assert_equal head, git('-C', @remote, 'rev-parse', 'master').strip
+      end
+      @engine.change_claim(first, held['id'], 'release')
+      Timeout.timeout(5) { writer.value }
+      assert File.file?(File.join(shared, 'tracking'))
+      # A busy tracking writer must not cause waiting inside merge ownership.
+      File.open(path, 'r+') do |tracking_lock|
+        tracking_lock.flock(File::LOCK_EX)
+        retry_claim = acquire(first)
+        File.open(path, 'r+') do |merge_lock|
+          refute merge_lock.flock(File::LOCK_EX | File::LOCK_NB)
+        end
+        @engine.change_claim(first, retry_claim['id'], 'release')
+        assert_empty @engine.store.held_claim_resources
+      end
+    ensure
+      writer.kill if writer&.alive?
+      writer&.join
+    end
+  end
+
   def test_new_claim_cannot_enter_during_payload_collection
     person = owner('collection-admission')
     item = nil

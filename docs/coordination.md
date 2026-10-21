@@ -1,9 +1,10 @@
 # Resource claims and session notifications
 
-The coordinator gives sessions exclusive ownership of repository and machine
-resources. Sessions run their own commands, manage environments and hook trust,
-verify results and release ownership. The coordinator records owners and waiters
-and notifies a waiting session when its claim is granted.
+The coordinator serializes integration into shared branches and reserves machines
+for deployment. Sessions develop independently in their own worktrees. Repository
+claims are short merge locks; machine claims are deployment reservations. Sessions
+run commands, verify effects and explicitly release ownership. Queued requests
+notify their waiting session when granted.
 
 ## Acquire resources
 
@@ -13,7 +14,7 @@ Use a schema-1 request with a fresh lowercase UUID `requestId`:
 {
   "schema": 1,
   "requestId": "11111111-1111-4111-8111-111111111111",
-  "label": "Publish reviewed feature",
+  "label": "Merge approved feature into master",
   "repositories": ["project"],
   "machines": []
 }
@@ -45,23 +46,49 @@ owner. Request the complete set initially or use separate disjoint claims.
 
 ## Execute and release
 
-After acquiring resources, use ordinary project tools in the session's worktrees.
-Enter its development environment and run required hooks normally. The coordinator
-creates no checkout, installs no dependencies and never signs configuration.
-Repository ownership covers the canonical remote and common Git directory, so
-participating linked worktrees serialize changes to shared Git and hook trust.
-Machine aliases share one physical resource.
+Independent feature work needs no repository claim. This includes edits, commits,
+rebases, dependency updates, feature-branch pushes, hook preparation, builds,
+tests, review and waiting for approval. A merge waiter can continue such work in
+its own worktree. Git retains its ordinary file and ref locks.
 
-This is cooperative locking. Git and deployment tools do not intercept arbitrary
-commands to enforce a claim. Every participating session must acquire resources
-before their shared mutations, including changes to hook trust. Keep required
-project checks and user approval gates in the session workflow. Build and copy
-large artifacts before taking machine ownership when the tool supports that
-separation. Shared tracking commits also retain their ordinary
-`dev-session-tracking.lock` exclusion.
+Prepare the reviewed feature, clean target checkout, environment and hook trust
+before requesting a merge lock. Obtain integration approval first. Acquire only
+the repository being integrated, immediately before these steps:
 
-Verify effects using the tool's own logs and state. For example, Git can exit zero
-after a failing post-merge hook. A claim certifies exclusive ownership only.
+1. Recheck the exact feature head, clean target checkout and current remote target.
+2. Perform the approved fast-forward merge and required hooks.
+3. Push normally and prove the resulting remote ref.
+4. Release immediately, before CI monitoring, records, artifact registration or
+   disposable checkout cleanup.
+
+If the target moved, release and reconcile outside the claim. If a hook fails or
+needs intervention, stop commands and inspect effects before release, then repair
+and verify outside ownership. Git can exit zero after a failing post-merge hook;
+inspect hook results before pushing. A rejected push or interrupted command needs
+an actual ref check. Retain ownership for an uncertain shared mutation only while
+actively reconciling its effects. Do not wait for operator input with a known-safe
+repository held. Never hold merge locks during development, tests or review, and
+do not reserve several repositories for a sequential integration batch.
+
+Linked worktrees share Git configuration. Repository tools own configuration and
+plugin trust; the coordinator never signs, changes trust or runs commands. A trust
+mismatch returns to preparation and does not justify a development-wide claim.
+Required hooks and signature checks remain enabled.
+
+Machine reservations are separate: build and copy artifacts before ownership when
+supported, then acquire only the physical machine near activation. Keep its
+reservation through deployment, live review and feedback. Do not bundle repository
+claims into a deployment reservation.
+
+This is cooperative locking. Tools do not intercept arbitrary commands. The claim
+certifies exclusive integration or deployment ownership, not command success.
+Shared tracking writes use their short `dev-session-tracking.lock`; they do not
+need a durable repository claim for independent session bookkeeping. Integration
+from that same shared checkout takes the repository claim first, then tries the
+tracking lock without waiting. If it is busy, release the claim and retry after
+the writer finishes. Hold both only across the final target check, merge/hooks,
+push and remote proof. Preserve unrelated dirty paths and index entries in the
+shared checkout; disposable targets must be clean.
 
 ```sh
 dev-session coordination release SESSION --as-is --id CLAIM_UUID --json

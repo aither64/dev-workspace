@@ -11,10 +11,15 @@ func TestLeadPolicyBindsSessionWithoutReplacingFrozenRoleInstructions(t *testing
 	const roleInstructions = "Coordinate the assigned work."
 	policy := LeadThreadPolicy(slug, workspace, roleInstructions)
 	for _, expected := range []string{slug, workspace, "dev-session current", roleInstructions,
-		"DEV_SESSION_SLUG", "DEV_SESSION_WORKSPACE", "workspace-host coordination guide", "explicitly release ownership", "queued claims notify the session"} {
+		"DEV_SESSION_SLUG", "DEV_SESSION_WORKSPACE", "workspace-host coordination guide", "explicitly release ownership", "queued claims notify the session",
+		"Independent feature work needs no repository claim", "push feature branches", "only after integration approval and preparation are complete",
+		"before CI, records or cleanup", "Never hold a repository claim while waiting", "separate machine reservations"} {
 		if !strings.Contains(policy.DeveloperInstructions, expected) {
 			t.Errorf("lead policy missing %q", expected)
 		}
+	}
+	if strings.Contains(policy.DeveloperInstructions, "claims for catalog-covered mutations") {
+		t.Fatal("technical binding still requires claims for independent development")
 	}
 	_, retained, found := strings.Cut(policy.DeveloperInstructions, "\n\n")
 	if !found || retained != roleInstructions {
