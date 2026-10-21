@@ -33,6 +33,8 @@ const checkSidebarMenu = async page => {
       const page = await browser.newPage({ignoreHTTPSErrors: true});
       const errors = [], notices = [];
       let details = 0, activity = 0, failActivity = false, holdDetails = false, releaseDetails;
+      let staleRepliesConstructed = 0, staleRepliesFulfilled = 0;
+      let recoveryRepliesConstructed = 0, recoveryReplyFulfilled = null;
       let recoveryOverride = null;
       let recoveryNoticeID = "notice-one", noticeDismissed = false, failDismissal = false, staleNoticeRead = false;
       let dismissals = 0, continuationRequests = 0;
@@ -64,11 +66,21 @@ const checkSidebarMenu = async page => {
             return route.abort("failed").catch(() => {});
           }
           if (recoveryOverride) {
+            const state = recoveryOverride, staleReply = staleNoticeRead && state === "waiting";
+            const noticeId = recoveryNoticeID, dismissed = noticeDismissed;
             const response = await route.fetch(), payload = await response.json();
-            return route.fulfill({response, json: {...payload,
-              interactive: recoveryOverride !== "stopped", recovery: {state: recoveryOverride,
-                ...(recoveryOverride === "waiting" ? {noticeId: recoveryNoticeID,
-                  noticeDismissed: noticeDismissed && !staleNoticeRead} : {})}}});
+            const recoveryReplyID = ++recoveryRepliesConstructed;
+            payload.repositoriesHTML += `<span hidden data-fixture-recovery-reply="${recoveryReplyID}"></span>`;
+            const staleReplyID = staleReply ? ++staleRepliesConstructed : 0;
+            if (staleReply) assert(dismissed, "stale reply must contradict a completed dismissal");
+            await route.fulfill({response, json: {...payload,
+              ...(staleReply ? {repositoriesHTML: payload.repositoriesHTML +
+                `<span hidden data-fixture-stale-notice-reply="${staleReplyID}"></span>`} : {}),
+              interactive: state !== "stopped", recovery: {state,
+                ...(state === "waiting" ? {noticeId, noticeDismissed: dismissed && !staleReply} : {})}}});
+            recoveryReplyFulfilled = {id: recoveryReplyID, state, noticeId, dismissed, staleReply};
+            if (staleReply) staleRepliesFulfilled = staleReplyID;
+            return;
           }
         }
         if (operation === "activity") {
@@ -111,17 +123,31 @@ const checkSidebarMenu = async page => {
       await composer.evaluate(element => { window.recoveryComposer = element; });
       for (const state of ["stopped", "recovering", "waiting", "active"]) {
         recoveryOverride = state;
+        const beforeStateRefresh = details, beforeStateReply = recoveryRepliesConstructed;
         await expect.poll(async () => {
           await page.evaluate(() => dispatchEvent(new Event("focus")));
-          return page.locator("#session-recovery").isVisible();
-        }).toBe(state !== "active");
+          const reply = recoveryReplyFulfilled;
+          return {started: details > beforeStateRefresh,
+            applied: reply?.id > beforeStateReply && reply.state === state && await page.locator(
+              `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1,
+            visible: await page.locator("#session-recovery").isVisible()};
+        }).toEqual({started: true, applied: true, visible: state !== "active"});
+        expect(details).toBeGreaterThan(beforeStateRefresh);
         if (state === "waiting") await expect(page.locator("#session-continue")).toBeVisible();
         if (state === "stopped") await expect(page.locator("#message-send")).toBeDisabled();
         await expect(composer).toHaveValue("Keep this unsent recovery draft");
         assert(await composer.evaluate(element => element === window.recoveryComposer), "recovery replaced composer");
       }
       recoveryOverride = "waiting";
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      const beforeWaitingRefresh = details, beforeWaitingReply = recoveryRepliesConstructed;
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        const reply = recoveryReplyFulfilled;
+        return details > beforeWaitingRefresh && reply?.id > beforeWaitingReply && reply.state === "waiting" &&
+          reply.noticeId === recoveryNoticeID && !reply.dismissed && !reply.staleReply && await page.locator(
+            `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1;
+      }).toBe(true);
+      expect(details).toBeGreaterThan(beforeWaitingRefresh);
       const dismiss = page.getByRole("button", {name: "Dismiss restored-session notice", exact: true});
       await expect(dismiss).toBeVisible();
       const sendsBeforeDismissal = continuationRequests;
@@ -142,24 +168,54 @@ const checkSidebarMenu = async page => {
       await expect(composer).toHaveValue("Keep this unsent recovery draft");
       assert(await composer.evaluate(element => element === window.recoveryComposer));
       staleNoticeRead = true;
-      const beforeStaleRefresh = details;
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
-      await expect.poll(() => details).toBeGreaterThan(beforeStaleRefresh);
+      const beforeStaleRefresh = details, beforeStaleReply = staleRepliesConstructed;
+      await expect.poll(async () => {
+        if (details <= beforeStaleRefresh) await page.evaluate(() => dispatchEvent(new Event("focus")));
+        const replyID = staleRepliesFulfilled;
+        return {started: details > beforeStaleRefresh, constructed: staleRepliesConstructed > beforeStaleReply,
+          fulfilled: replyID > beforeStaleReply,
+          consumed: replyID > beforeStaleReply && await page.locator(
+            `#repositories [data-fixture-stale-notice-reply="${replyID}"]`).count() === 1};
+      }).toEqual({started: true, constructed: true, fulfilled: true, consumed: true});
+      expect(details).toBeGreaterThan(beforeStaleRefresh);
       await expect(page.locator("#session-recovery")).toBeHidden();
       staleNoticeRead = false;
       await page.reload();
-      const beforeReloadRefresh = details;
-      await expect.poll(() => details).toBeGreaterThan(beforeReloadRefresh);
+      const beforeReloadRefresh = details, beforeReloadReply = recoveryRepliesConstructed, reloadedNoticeID = recoveryNoticeID;
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        const reply = recoveryReplyFulfilled;
+        return details > beforeReloadRefresh && reply?.id > beforeReloadReply && reply.state === "waiting" &&
+          reply.noticeId === reloadedNoticeID && reply.dismissed && !reply.staleReply && await page.locator(
+            `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1;
+      }).toBe(true);
+      expect(details).toBeGreaterThan(beforeReloadRefresh);
       await expect(page.locator("#session-recovery")).toBeHidden();
       recoveryNoticeID = "notice-two"; noticeDismissed = false;
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      const beforeNewNoticeRefresh = details, beforeNewNoticeReply = recoveryRepliesConstructed;
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        const reply = recoveryReplyFulfilled;
+        return details > beforeNewNoticeRefresh && reply?.id > beforeNewNoticeReply && reply.state === "waiting" &&
+          reply.noticeId === "notice-two" && !reply.dismissed && !reply.staleReply && await page.locator(
+            `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1;
+      }).toBe(true);
+      expect(details).toBeGreaterThan(beforeNewNoticeRefresh);
       await expect(dismiss).toBeVisible();
       await dismiss.click();
       await expect(page.locator("#session-recovery")).toBeHidden();
       assert.equal(dismissals, 3);
       assert.equal(continuationRequests, sendsBeforeDismissal, "dismissal never sends a message or continues work");
       recoveryOverride = "failed";
-      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      const beforeFailedRefresh = details, beforeFailedReply = recoveryRepliesConstructed;
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        const reply = recoveryReplyFulfilled;
+        return details > beforeFailedRefresh && reply?.id > beforeFailedReply && reply.state === "failed" &&
+          reply.noticeId === recoveryNoticeID && await page.locator(
+            `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1;
+      }).toBe(true);
+      expect(details).toBeGreaterThan(beforeFailedRefresh);
       await expect(page.locator("#session-recovery")).toBeVisible();
       await expect(dismiss).toBeHidden();
       await page.setViewportSize({width: 1280, height: 720});
