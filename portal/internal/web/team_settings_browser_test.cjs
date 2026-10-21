@@ -10,6 +10,7 @@ const baseURL = process.argv[2];
     const errors = [];
     const saved = [];
     const savedSettings = [];
+    let modelCatalogReads = 0;
     let serverPair = {model: "model-1", reasoningEffort: "medium"};
     let memberPair = {model: "model-1", reasoningEffort: "medium"};
     let fixtureTeamHTML = "";
@@ -24,12 +25,16 @@ const baseURL = process.argv[2];
     let holdSettingsWrite = false, releaseSettingsWrite = () => {};
     const writeFailure = "Fixture write failure: " + "diagnostic-".repeat(80);
     page.on("pageerror", error => errors.push(error.message));
-    await page.route("**/api/models", route => route.fulfill({json: [
+    await page.route(url => url.pathname === "/api/models" && url.searchParams.get("session") === "example" &&
+      url.searchParams.size === 1, route => {
+      modelCatalogReads++;
+      return route.fulfill({json: [
       {model: "model-1", displayName: "gpt-6.1-sol", isDefault: true,
         defaultReasoningEffort: "medium", supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "high"}]},
       {model: "model-2", displayName: "gpt-6-astra", defaultReasoningEffort: "medium",
         supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "high"}]},
-    ]}));
+      ]});
+    });
     await page.route("**/api/collaboration-modes", route => route.fulfill({json: [
       {mode: "default", name: "Default"}, {mode: "plan", name: "Plan"},
     ]}));
@@ -138,6 +143,8 @@ const baseURL = process.argv[2];
       await expect(edit).toBeEnabled(); await expect(dialog).toBeHidden();
       await assertLayout();
       await edit.click(); await expect(liveModel).toHaveValue("model-1");
+      await expect.poll(() => modelCatalogReads).toBeGreaterThan(0);
+      await expect(liveModel.locator('option[value="model-2"]')).toHaveText("gpt-6-astra");
       await expect(save).toBeDisabled();
       await liveModel.selectOption("model-2"); await liveEffort.selectOption("high");
       await expect(save).toBeEnabled(); await assertLayout();
