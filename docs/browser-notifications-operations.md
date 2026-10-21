@@ -69,6 +69,25 @@ attention and reservation markers intact. If cleanup is incomplete, use
 **Notification settings** to retry Disable. The menu shows a brief notice and a
 mixed checkbox.
 
+Browser Disable commits its durable off gate before server cleanup or local
+unsubscribe. Provider-queued pushes carry their registration ID and are dropped
+by a capable worker while off or after a fresh activation replaces that ID.
+Disable does not queue events for replay. A new Enable accepts only future events;
+continuous idempotent registration preserves its current ID and pending outbox.
+Gate-storage failure still permits cleanup but cannot confirm durable blocking.
+
+The existing version-1 IndexedDB store has a reserved gate containing `identity`,
+`enabled`, `actionToken`, `registrationId` and the fixed `at` retention rank.
+Its transaction-commit compare-and-set and origin-scoped Web Lock fence delayed
+Enable/Disable results and destructive side effects across updated tabs. The
+server's GET and the actual controlling worker advertise `deliveryEpoch: 1`.
+Only after that server capability is known does fresh registration send
+`requireFresh: true`; an existing endpoint returns HTTP 409 instead of adopting
+its ID. Enable performs bounded cleanup and retries once. Old strict JSON
+decoders never receive this optional precondition from updated controls.
+Unsupported server/controller/storage/locking leaves setup incomplete. Preserve
+the gate during forward recovery; deleting it would discard the off fence.
+
 The browser-local **Play sound** setting uses the existing attention database.
 Checked leaves `silent` out of the display options; unchecked sets
 `silent: true` for Test, session and fallback notifications. Storage reads and
@@ -142,7 +161,9 @@ To disable delivery without stopping sessions, create the owner-only file
 running sender notices it on its next two-second pass, cancels unsent work and
 retains keys, registrations and preferences. Settings reports that delivery is
 disabled. Remove that marker to recover; events observed while disabled do not
-replay. A push already accepted by its provider may still display.
+replay. A push already accepted by its provider may still display under this
+server-only marker; it does not change a browser's local gate. Use browser Disable
+for the browser's permanent old-epoch drop policy.
 
 For a package defect, use a corrected successor package through the supported
 forward-only workspace selection policy. Keep private state and version-1

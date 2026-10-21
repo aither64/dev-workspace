@@ -3,6 +3,8 @@
 (() => {
   "use strict";
   const soundIdentity = "browser-notification-sound";
+  const deliveryIdentity = "browser-notification-delivery";
+  let deliveryManaged = false;
   let opening;
   const open = () => opening ||= new Promise((resolve, reject) => {
     const request = indexedDB.open("workspace-session-attention", 1);
@@ -11,7 +13,7 @@
     request.onerror = () => { opening = null; reject(new Error("Attention storage is unavailable.")); };
   });
   const update = async (identity, change = value => value) => {
-    if (identity === soundIdentity) throw new Error("Reserved attention identity.");
+    if ([soundIdentity, deliveryIdentity].includes(identity)) throw new Error("Reserved attention identity.");
     const db = await open();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sessions", "readwrite"), store = tx.objectStore("sessions");
@@ -24,7 +26,7 @@
         result.seen = [...new Set(result.seen || [])].slice(-32);
         store.put(result);
         const all = store.getAll();
-        all.onsuccess = () => all.result.filter(item => item.identity !== soundIdentity).sort((a,b) => b.at-a.at).slice(512).forEach(item => store.delete(item.identity));
+        all.onsuccess = () => all.result.filter(item => ![soundIdentity, deliveryIdentity].includes(item.identity)).sort((a,b) => b.at-a.at).slice(512).forEach(item => store.delete(item.identity));
       };
       tx.oncomplete = () => resolve(result);
       tx.onerror = tx.onabort = () => reject(new Error("Attention storage is unavailable."));
@@ -79,6 +81,49 @@
   });
   const readSound = () => sound(false);
   const writeSound = playSound => typeof playSound === "boolean" ? sound(true, playSound) : Promise.reject(new Error("Invalid sound preference."));
+  // One reserved v1 record fences transport epochs, independently of attention.
+  // A write with expectedToken is a compare-and-set, committed in the same tx.
+  const validGate = value => value && value.identity === deliveryIdentity &&
+    Object.keys(value).length === 5 && value.at === Number.MAX_SAFE_INTEGER &&
+    typeof value.enabled === "boolean" && typeof value.actionToken === "string" &&
+    value.actionToken.length > 0 && value.actionToken.length <= 128 &&
+    typeof value.registrationId === "string" && (value.enabled ? /^[0-9a-f]{64}$/.test(value.registrationId) : value.registrationId === "");
+  const deliveryGate = (next, expectedToken) => new Promise((resolve, reject) => {
+    let tx, finished = false, result;
+    const finish = error => {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      if (error) reject(new Error("This browser cannot save notification settings."));
+      else {if (result?.identity === deliveryIdentity) deliveryManaged = true; resolve(result);}
+    };
+    const timer = setTimeout(() => {finish(true); try {tx?.abort();} catch (_) {}}, 750);
+    open().then(db => {
+      if (finished) return;
+      try {
+        tx = db.transaction("sessions", next ? "readwrite" : "readonly");
+        tx.oncomplete = () => finish(false);
+        tx.onerror = tx.onabort = () => finish(true);
+        const store = tx.objectStore("sessions"), request = store.get(deliveryIdentity);
+        request.onerror = () => finish(true);
+        request.onsuccess = () => {
+          const prior = request.result;
+          if (!next) {
+            if (prior === undefined && !deliveryManaged) result = null; // Legacy installation.
+            else if (prior === undefined) finish(true); // Unexpected loss cannot unmanage this context.
+            else if (validGate(prior)) result = prior;
+            else finish(true);
+            return;
+          }
+          if (expectedToken !== undefined && (expectedToken === null ? prior !== undefined : !validGate(prior) || prior.actionToken !== expectedToken)) {result = null; return;}
+          result = {...next, identity: deliveryIdentity, at: Number.MAX_SAFE_INTEGER};
+          if (!validGate(result)) {finish(true); try {tx.abort();} catch (_) {} return;}
+          store.put(result);
+        };
+      } catch (_) {finish(true);}
+    }, () => finish(true));
+  });
+  const readDeliveryGate = () => deliveryGate();
+  const writeDeliveryGate = (value, expectedToken) => deliveryGate(value, expectedToken);
   const testDescriptor = value => value && typeof value.id === "string" && /^[0-9a-f]{64}$/.test(value.id) &&
     typeof value.identity === "string" && /^test-[0-9a-f]{64}$/.test(value.identity) &&
     Number.isSafeInteger(value.revision) && value.revision > 0 && Number.isSafeInteger(value.expiresAt) && value.expiresAt > 0 ?
@@ -102,5 +147,5 @@
       return value;
     });
   };
-  globalThis.workspaceAttentionStore = {update, read, readSound, writeSound, testDescriptor, testMatches, testError, saveTest};
+  globalThis.workspaceAttentionStore = {update, read, readSound, writeSound, readDeliveryGate, writeDeliveryGate, testDescriptor, testMatches, testError, saveTest};
 })();

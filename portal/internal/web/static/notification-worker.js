@@ -1,5 +1,5 @@
 "use strict";
-importScripts("/static/session-attention-store.js?v=3");
+importScripts("/static/session-attention-store.js?v=4");
 
 const reason = kind => ({input: "Your answer is needed", approval: "Approval needed", done: "Response finished", test: "Browser notification test"})[kind];
 const safeRoute = value => {
@@ -26,13 +26,18 @@ async function boundedTestRead(promise, fallback) {
   catch (_) { return fallback; }
   finally { clearTimeout(timer); }
 }
-async function show(title, options) {
+const deliveryGate = () => boundedTestRead(Promise.resolve().then(() => workspaceAttentionStore.readDeliveryGate()), false);
+const gateAccepts = (gate, payload) => gate === null || Boolean(gate && gate.enabled && payload?.registrationId === gate.registrationId);
+async function show(title, options, payload, initialGate) {
   // Read at the display attempt, after status/receipt work, so a newly saved
   // visual-only choice also applies to delivery already waiting in this worker.
   const playSound = await boundedTestRead(Promise.resolve().then(() => workspaceAttentionStore.readSound()), false);
-  return self.registration.showNotification(title, {...options, ...(playSound === true ? {} : {silent: true})});
+  const gate = await deliveryGate();
+  if (!gateAccepts(gate, payload) || (initialGate && (!gate || gate.actionToken !== initialGate.actionToken))) return false;
+  await self.registration.showNotification(title, {...options, ...(playSound === true ? {} : {silent: true})});
+  return true;
 }
-async function displayTest(payload) {
+async function displayTest(payload, gate) {
   const descriptor = workspaceAttentionStore.testDescriptor?.(payload);
   const save = async outcome => {
     if (!descriptor) return;
@@ -49,8 +54,8 @@ async function displayTest(payload) {
       Number.isSafeInteger(item.data.testRevision) && item.data.testRevision < payload.revision).slice(0, 32).forEach(item => item.close());
   } catch (_) {}
   try {
-    await show("Workspace", {body: reason("test"), tag, renotify: false,
-      data: {route: "/", testIdentity: payload.identity, testRevision: payload.revision}});
+    if (!await show("Workspace", {body: reason("test"), tag, renotify: false,
+      data: {route: "/", testIdentity: payload.identity, testRevision: payload.revision}}, payload, gate)) return;
   } catch (error) {
     await save({received: true, display: "rejected", error: workspaceAttentionStore.testError?.(error) || "UnknownError", browserRecord: "unavailable"});
     return;
@@ -62,18 +67,21 @@ async function displayTest(payload) {
 }
 
 async function display(payload) {
+  // Reject old epochs before every branch, including invalid/Test/fallback data.
+  const gate = await deliveryGate();
+  if (!gateAccepts(gate, payload)) return;
   if (!valid(payload)) {
-    await show("Workspace update", {body: "Open the workspace to check its current status.", tag: "workspace-update", renotify: false, data: {route: "/"}});
+    await show("Workspace update", {body: "Open the workspace to check its current status.", tag: "workspace-update", renotify: false, data: {route: "/"}}, payload, gate);
     return;
   }
   if (payload.kind === "test" && /^test-[0-9a-f]{64}$/.test(payload.identity)) {
-    await displayTest(payload);
+    await displayTest(payload, gate);
     return;
   }
   let record, trusted = payload.kind === "test";
   try {
     record = await workspaceAttentionStore.update(payload.identity, value => {
-      if (payload.revision > value.revision) { value.revision = payload.revision; value.event = payload; }
+      if (payload.revision > value.revision) { const {registrationId, ...event} = payload; value.revision = payload.revision; value.event = event; }
       return value;
     });
     if (payload.kind !== "test") {
@@ -81,7 +89,7 @@ async function display(payload) {
       try {
         const response = await fetch(`/api/sessions/${encodeURIComponent(payload.slug)}/attention`, {credentials: "same-origin", cache: "no-store", signal: controller.signal});
         if (response.status === 404 || response.status === 403 || response.status === 401) {
-          await show("Workspace update", {body: "Open the workspace to check its current status.", tag: `session-${payload.identity}`, renotify: false, data: {route: "/"}});
+          await show("Workspace update", {body: "Open the workspace to check its current status.", tag: `session-${payload.identity}`, renotify: false, data: {route: "/"}}, payload, gate);
           return;
         }
         const status = response.ok ? await response.json() : null;
@@ -90,14 +98,13 @@ async function display(payload) {
       } finally { clearTimeout(deadline); }
     }
   } catch (_) { trusted = false; }
-  // Attempt visible display for every delivered push. Duplicate,
-  // reordered or unverifiable delivery replaces the same entry with neutral copy.
+  // A still-enabled current epoch retains neutral delivery fallbacks.
   const current = record?.event || payload;
-  await show(current.slug || "Workspace", {
+  if (!await show(current.slug || "Workspace", {
     body: trusted ? `${current.member && current.member !== "lead" ? `${current.member}: ` : ""}${reason(current.kind)}` : "Session update available",
     tag: `session-${payload.identity}`, renotify: false,
     data: {route: safeRoute(current.route)?.pathname + (safeRoute(current.route)?.search || "") + (safeRoute(current.route)?.hash || ""), identity: payload.identity},
-  });
+  }, payload, gate)) return;
   const windows = await self.clients.matchAll({type: "window", includeUncontrolled: true});
   windows.forEach(client => client.postMessage({type: "session-attention-update", identity: payload.identity}));
 }
@@ -126,7 +133,7 @@ self.addEventListener("notificationclick", event => {
 });
 self.addEventListener("message", event => {
   if (event.data?.type === "notification-test-capabilities") {
-    event.ports?.[0]?.postMessage({version: 1});
+    event.ports?.[0]?.postMessage({version: 1, deliveryEpoch: 1});
     return;
   }
   if (event.data?.type !== "session-attention-ack" || !/^[0-9a-f]{64}$/.test(event.data.identity)) return;
