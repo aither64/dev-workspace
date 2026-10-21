@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=8">
-  <link rel="stylesheet" href="/static/style.css?v=20">
+  <link rel="stylesheet" href="/static/style.css?v=21">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -26,7 +26,7 @@
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-reservations" class="tab" href="#reservations" role="tab" aria-selected="false" aria-controls="reservations" data-session-tab="reservations" title="Reservations" aria-label="Reservations"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Reservations</span></a>
-        <a id="session-tab-artifacts" class="tab" href="#artifacts" role="tab" aria-selected="false" aria-controls="artifacts" data-session-tab="artifacts" title="Artifacts" aria-label="Artifacts"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Artifacts ({{len .Artifacts}})</span></a>
+        <a id="session-tab-files" class="tab" href="#files" role="tab" aria-selected="false" aria-controls="files" data-session-tab="files" title="Files" aria-label="Files"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Files</span></a>
         <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Settings" aria-label="Settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Settings</span></a>
       </nav>
     {{end}}
@@ -183,14 +183,10 @@
         {{template "clusters" .}}
       </section>
 
-      <section id="artifacts" class="tab-panel artifacts-panel" role="tabpanel" aria-labelledby="session-tab-artifacts">
-        <nav class="artifact-list" aria-label="Session artifacts">
-          {{template "artifact-list" .}}
-        </nav>
-        <div class="artifact-view">
-          <div class="section-heading"><h2 id="artifact-title">Artifacts</h2><div class="artifact-actions"><button id="artifact-copy" class="quiet icon-button" type="button" title="Copy content" aria-label="Copy content" disabled>⧉</button><a id="artifact-download" class="button-link icon-button" href="#" title="Download artifact" aria-label="Download artifact" download hidden>↓</a></div></div>
-          <div id="artifact-preview" class="document"><p class="empty">Choose an artifact to preview it.</p></div>
-        </div>
+      <section id="files" class="tab-panel files-panel" role="tabpanel" aria-labelledby="session-tab-files">
+        <div class="section-heading"><h2>Files</h2><button id="files-refresh" type="button" class="quiet">Refresh</button></div>
+        <p id="files-status" class="notice" role="status" hidden></p>
+        <nav id="session-files" class="artifact-list" aria-label="Session files"></nav>
       </section>
     </section>
     {{end}}
@@ -260,7 +256,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=50" defer></script>
+  <script src="/static/app.js?v=51" defer></script>
   <script src="/static/session-attention-store.js?v=3" defer></script>
   <script src="/static/browser-notifications.js?v=5" defer></script>
   <script src="/static/session-attention.js" defer></script>

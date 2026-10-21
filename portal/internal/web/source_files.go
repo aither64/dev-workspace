@@ -227,6 +227,20 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 	s.serveSourceContent(w, result, download)
 }
 
+func (s *Server) trackingFiles(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	files, err := s.reviews().reader.TrackingFiles(r.Context(), summary)
+	if err != nil {
+		message := "Session files could not be listed. Refresh to try again."
+		if errors.Is(err, repository.ErrReviewLimit) {
+			message = "The file list is too large to display (limit: 5,000 files or 4 MiB)."
+		}
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": message})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
 func (s *Server) sourceUnavailable(w http.ResponseWriter) {
 	s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the session, is tracked or not ignored by Git, or is a published artifact."})
 }

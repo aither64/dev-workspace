@@ -1297,7 +1297,6 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, err)
 	}
 
-	data.Artifacts = session.AvailableArtifacts(summary)
 	if receipt, ok := s.currentCreation(slug); ok && receipt.State == "conflict" {
 		if data.Error != "" {
 			data.Error += " "
@@ -1969,6 +1968,10 @@ func (s *Server) sessionAPIForSummary(
 			return
 		}
 		s.sourceFile(w, r, summary)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "files" && r.Method == http.MethodGet {
+		s.trackingFiles(w, r, summary)
 		return
 	}
 	if s.repositoryReviewAPI(w, r, summary, parts) {

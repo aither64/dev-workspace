@@ -37,12 +37,15 @@ func TestQuestionBrowser(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, directory, "active")
-	artifactPath := filepath.Join(directory, "reports", "deep", "499.md")
-	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(artifactPath, []byte("# Original artifact bytes\r\n"), 0o644); err != nil {
-		t.Fatal(err)
+	runWebGit(t, "init", "--initial-branch=master", server.config.Workspace)
+	for i := 0; i < 500; i++ {
+		path := filepath.Join(directory, "reports", "deep", fmt.Sprintf("%03d.md", i))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("# Original artifact bytes\r\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	writeWebRuntimeAuthority(t, server, "example")
 	events := make(chan struct{}, 1)
@@ -110,19 +113,6 @@ func TestQuestionBrowser(t *testing.T) {
 			return
 		}
 
-		if r.URL.Path == "/fixture/artifact-tree" {
-			artifacts := make([]session.Artifact, 500)
-			for i := range artifacts {
-				artifacts[i] = session.Artifact{Path: fmt.Sprintf("reports/deep/%03d.md", i), Label: fmt.Sprintf("Report %d", i)}
-			}
-			if r.URL.Query().Get("remove") == "1" {
-				artifacts = artifacts[:499]
-			}
-			if err := server.templates.ExecuteTemplate(w, "artifact-list", pageData{Artifacts: artifacts}); err != nil {
-				t.Error(err)
-			}
-			return
-		}
 		if r.URL.Path == "/fixture/presentation" {
 			transcript := codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "default", Entries: []codex.TranscriptEntry{
 				{Kind: "userMessage", ItemID: "user", Text: "# User heading\n\n- item\n\n[Plan](" + filepath.Join(server.config.Workspace, "work", "example", "plan.md") + ":1)"},

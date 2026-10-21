@@ -227,8 +227,10 @@ func TestSourceTrackingFilesDoNotRequireArtifactPublication(t *testing.T) {
 	readSource(t, s, "?artifact=missing.md", 404)
 	readSource(t, s, "?artifact=reports", 404)
 	readSource(t, s, "?artifact=.git/config", 404)
-	// Opening a direct source link does not publish the file to artifact APIs.
-	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=design.md", "", 404)
+	// A retained own-workspace prefix is a publication alias when its literal
+	// nested file is absent; direct source links do not publish unrelated files.
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=design.md", "", 200)
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=reports/new%20space%20%C5%BE.md", "", 404)
 	if err := os.Symlink("design.md", filepath.Join(tracking, "link.md")); err != nil {
 		t.Fatal(err)
 	}
@@ -360,10 +362,12 @@ func TestSourceFilesUseArchivedFinalCommitAndCuratedArtifacts(t *testing.T) {
 	base := strings.TrimSpace(webGitOutput(t, "--git-dir="+bare, "rev-parse", head+"^"))
 	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/heads/feature", base)
 	download := httptest.NewRecorder()
- s.Handler().ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/sessions/example/file/download"+sourceQuery("file"), nil))
- if download.Code != 200 || download.Body.String() != "after\n" { t.Fatalf("archived raw download: %d %q", download.Code, download.Body.String()) }
- file := readSource(t, s, sourceQuery("file"), 200)
- if file.Source != "archive" || file.Revision != head || file.Content.Text != "after\n" {
+	s.Handler().ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/sessions/example/file/download"+sourceQuery("file"), nil))
+	if download.Code != 200 || download.Body.String() != "after\n" {
+		t.Fatalf("archived raw download: %d %q", download.Code, download.Body.String())
+	}
+	file := readSource(t, s, sourceQuery("file"), 200)
+	if file.Source != "archive" || file.Revision != head || file.Content.Text != "after\n" {
 		t.Fatalf("archived file = %#v", file)
 	}
 	if readSource(t, s, sourceQuery("nested/route.nix"), 200).Content.Text != "# nested route\n" {
@@ -543,5 +547,182 @@ func TestUserMarkdownUsesDecoratedTextWithoutChangingCanonicalInput(t *testing.T
 		} else if team != nil {
 			t.Fatalf("ambiguous envelope classified: %#v", team)
 		}
+	}
+}
+
+func TestTrackingFilesListUsesExistingSourceEligibility(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	root := s.config.Workspace
+	runWebGit(t, "init", "--initial-branch=master", root)
+	tracking := filepath.Join(root, "work", "example")
+	write := func(name, content string) {
+		t.Helper()
+		path := filepath.Join(tracking, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("tracked.sh", "#!/bin/sh\r\necho passive\r\n")
+	runWebGit(t, "-C", root, "add", "--", "work/example/tracked.sh")
+	write(".gitignore", "*.sh\n*.secret\n")
+	write("ignored.sh", "unpublished")
+	write("registered.sh", "registered original\r\n")
+	write("notes/a space.py", "print('passive')\n")
+	write("global.secret", "unpublished")
+	write("design.md", "# First label\n")
+	excludes := filepath.Join(t.TempDir(), "excludes")
+	if err := os.WriteFile(excludes, []byte("*.excluded\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runWebGit(t, "-C", root, "config", "core.excludesFile", excludes)
+	write("private.excluded", "unpublished")
+	manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts:\n" +
+		"  - label: First label\n    path: design.md\n" +
+		"  - label: Alias label\n    path: work/example/design.md\n" +
+		"  - label: Published script\n    path: registered.sh\n"
+	write("portal.yml", manifest)
+	if err := os.Symlink("design.md", filepath.Join(tracking, "link.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(tracking, "pipe.txt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	response := reviewRequest(t, s, "GET", "/api/sessions/example/files", "", 200)
+	encoded, _ := json.Marshal(response["files"])
+	var listed []repository.TrackingFile
+	if err := json.Unmarshal(encoded, &listed); err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]repository.TrackingFile{}
+	for _, row := range listed {
+		if _, duplicate := rows[row.Path]; duplicate {
+			t.Fatalf("duplicate row %q", row.Path)
+		}
+		rows[row.Path] = row
+		readSource(t, s, "?"+url.Values{"artifact": {row.Path}}.Encode(), 200)
+	}
+	for _, path := range []string{"tracked.sh", "registered.sh", "notes/a space.py", "design.md"} {
+		if _, ok := rows[path]; !ok {
+			t.Fatalf("eligible file missing: %q (%s)", path, encoded)
+		}
+	}
+	for _, path := range []string{"ignored.sh", "global.secret", "private.excluded", "link.md", "pipe.txt", "work/example/design.md"} {
+		if _, ok := rows[path]; ok {
+			t.Fatalf("ineligible/duplicate file listed: %q", path)
+		}
+	}
+	if rows["design.md"].Label != "First label" || !rows["registered.sh"].Registered || rows["tracked.sh"].Registered {
+		t.Fatal("registration projection changed")
+	}
+	// Scripts remain unavailable through legacy rich preview, but the ordinary
+	// viewer and original-byte download accept the existing publication.
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=registered.sh", "", 415)
+	raw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(raw, httptest.NewRequest("GET", "/api/sessions/example/file/download?artifact=registered.sh", nil))
+	if raw.Code != 200 || raw.Body.String() != "registered original\r\n" || raw.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("passive script download: %d", raw.Code)
+	}
+}
+
+func TestTrackingFilesAliasKeepsLiteralNestedIdentity(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	tracking := filepath.Join(s.config.Workspace, "work", "example")
+	for _, path := range []string{"design.md", "work/example/design.md"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(tracking, path)), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tracking, path), []byte(path), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts:\n  - label: Short\n    path: design.md\n  - label: Nested\n    path: work/example/design.md\n"
+	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"design.md", "work/example/design.md"} {
+		file := readSource(t, s, "?"+url.Values{"artifact": {path}}.Encode(), 200)
+		if file.Path != path || file.Content.Text != path {
+			t.Fatalf("literal alias %q resolved elsewhere: %#v", path, file)
+		}
+	}
+	if err := os.Remove(filepath.Join(tracking, "work/example/design.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tracking, "design.md"), filepath.Join(tracking, "work/example/design.md")); err != nil {
+		t.Fatal(err)
+	}
+	readSource(t, s, "?artifact=work/example/design.md", 404)
+}
+
+func TestTrackingFilesRegisteredFallbackAndArchiveAlias(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	tracking := filepath.Join(s.config.Workspace, "work", "example")
+	manifest := "schema: 1\nslug: example\nrepositories: []\nartifacts:\n  - label: Script\n    path: work/example/view.sh\n"
+	for name, content := range map[string]string{"portal.yml": manifest, "view.sh": "<script>passive</script>\r\n", "unregistered.py": "unpublished"} {
+		if err := os.WriteFile(filepath.Join(tracking, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func() {
+		t.Helper()
+		result := reviewRequest(t, s, "GET", "/api/sessions/example/files", "", 200)
+		encoded, _ := json.Marshal(result["files"])
+		var rows []repository.TrackingFile
+		if err := json.Unmarshal(encoded, &rows); err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 3 {
+			t.Fatalf("no-Git files: %s", encoded)
+		}
+		for _, row := range rows {
+			readSource(t, s, "?"+url.Values{"artifact": {row.Path}}.Encode(), 200)
+		}
+		readSource(t, s, "?artifact=work/example/view.sh", 200)
+		readSource(t, s, "?artifact=archive/example/view.sh", 200)
+		readSource(t, s, "?artifact=unregistered.py", 404)
+	}
+	check()
+	writeWebTrackingFiles(t, tracking, "complete")
+	if err := os.WriteFile(filepath.Join(tracking, "portal.yml"), []byte(manifest+"finalized_at: '2026-10-18T10:00:00Z'\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(s.config.Workspace, "archive", "example")
+	if err := os.MkdirAll(filepath.Dir(archive), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tracking, archive); err != nil {
+		t.Fatal(err)
+	}
+	check()
+}
+
+func TestTrackingFilesRefusesOversizedWholeResult(t *testing.T) {
+	for _, outputBound := range []bool{false, true} {
+		t.Run(fmt.Sprint("output-", outputBound), func(t *testing.T) {
+			s, _, _, _ := reviewWebFixture(t)
+			root := s.config.Workspace
+			runWebGit(t, "init", "--initial-branch=master", root)
+			var index strings.Builder
+			count, prefix := 5001, ""
+			if outputBound {
+				count, prefix = 4500, strings.Repeat("long/", 200)
+			}
+			for i := 0; i < count; i++ {
+				fmt.Fprintf(&index, "100644 %s\twork/example/%s%04d.txt\n", strings.Repeat("a", 40), prefix, i)
+			}
+			cmd := exec.Command("git", "-C", root, "update-index", "--index-info")
+			cmd.Stdin = strings.NewReader(index.String())
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("index: %v %s", err, output)
+			}
+			response := httptest.NewRecorder()
+			s.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/api/sessions/example/files", nil))
+			if response.Code != 503 || !strings.Contains(response.Body.String(), "The file list is too large to display (limit: 5,000 files or 4 MiB).") || strings.Contains(response.Body.String(), `"files"`) {
+				t.Fatalf("bounded whole result: %d %s", response.Code, response.Body.String())
+			}
+		})
 	}
 }

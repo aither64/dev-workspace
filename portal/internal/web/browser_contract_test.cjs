@@ -397,6 +397,7 @@ assert.equal(indexStatusFreshForPage("2026-09-09T10:00:00Z", "2026-09-09T10:00:0
 assert.equal(activityAge("2026-09-09T09:59:30Z", Date.parse("2026-09-09T10:00:00Z")), "just now");
 assert.equal(activityAge("2026-09-09T09:55:00Z", Date.parse("2026-09-09T10:00:00Z")), "5m ago");
 assert.equal(sessionTabFromHash("#repositories", ["codex", "repositories"], "codex"), "repositories");
+assert.equal(sessionTabFromHash("#artifacts", ["codex", "files"], "codex"), "files");
 assert.equal(sessionTabFromHash("#nested-tab", ["codex", "repositories"], "codex"), "codex");
 assert.equal(sessionTabFromHash("#%E0%A4%A", ["codex"], "codex"), "codex");
 for (const [location, expected] of [

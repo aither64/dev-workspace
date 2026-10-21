@@ -1602,16 +1602,14 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 		`href="#handoff"`, `data-session-tab="handoff"`,
 		`href="#repositories"`, `data-session-tab="repositories"`,
 		`href="#clusters"`, `data-session-tab="clusters"`,
-		`id="codex" class="tab-panel chat-panel active"`, `href="#artifacts"`,
-		`data-session-tab="artifacts"`,
-		`data-artifact-path="plan.md"`, `data-artifact-path="state.md"`,
-		`data-artifact-path="report.md"`,
+		`id="codex" class="tab-panel chat-panel active"`, `href="#files"`,
+		`data-session-tab="files"`, `id="session-files"`, `id="files-refresh"`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("session page lacks %s", marker)
 		}
 	}
-	for _, marker := range []string{`data-session-tab="plan"`, `data-session-tab="state"`, `id="plan"`, `id="state"`} {
+	for _, marker := range []string{`data-artifact-path=`, `id="artifact-preview"`, `data-session-tab="plan"`, `data-session-tab="state"`, `id="plan"`, `id="state"`} {
 		if strings.Contains(body, marker) {
 			t.Fatalf("session page retained separate tracking tab %s", marker)
 		}

@@ -140,11 +140,15 @@ repository. Artifact paths are relative to the session tracking folder, such as
 `design.md` or `reports/result.json`. Opening a source link does not add the file
 to the artifact list or grant access through artifact preview/download endpoints.
 
-Repeated artifact paths are allowed. The portal shows one link per normalized
-relative path, using the first declaration's label and position. For example,
-`report.json` and `./report.json` refer to the same artifact. Every declaration
-must still have a nonempty label and a safe relative path. Browsing and validation
-leave the manifest unchanged.
+Repeated artifact paths are allowed. The portal shows one row per canonical
+session-relative path and retains the first declaration's label. `report.json`
+and `./report.json` refer to the same artifact. Older declarations and URLs
+starting with this session's `work/<slug>/` or `archive/<slug>/` prefix also
+resolve to the session-relative file only when the literal nested file is missing
+and the session-relative file exists.
+An existing literal nested file takes precedence; other access errors do not
+fall back. Every declaration still needs a nonempty label and safe relative
+path. Reading leaves the manifest unchanged.
 
 Use `dev-session artifact add SLUG report.json --label "Report" --as-is` to
 register a file or update its caption. The command validates the complete
@@ -180,12 +184,20 @@ their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
-Artifacts appear as compact file rows grouped by directory. Each row shows the
-filename; hover over it to see its label and relative path. On desktop, navigation
-and preview scroll independently. The selected file, open directories and
-navigation position survive status refreshes. **Copy content** copies raw text or
-Markdown. Image previews cannot be copied as text. Invalid UTF-8 uses replacement
-characters, matching the text preview.
+**Files** shows a directory tree of eligible files beneath the session's tracking
+folder. It loads when first opened; **Refresh** updates it. `#artifacts` opens
+Files too. Each file appears once, with its filename as the link. Registered
+files also show their label and a **Registered** marker. The tab shows a count
+only after a successful listing. Files open the source viewer in a new tab,
+keeping the conversation and draft in place. Scripts and HTML-like text appear
+as passive source, without execution.
+
+The list is limited to 5,000 files or 4 MiB of Git listing output. An oversized
+or failed refresh leaves the last successful tree in place and displays an
+error. Open directories and scroll position survive a successful refresh.
+`GET /api/sessions/<slug>/files` returns session-relative `path`, optional `label`
+and `registered` metadata; it reads no file contents and does not register files.
+Opening or downloading a file rechecks its existing source eligibility.
 
 Downloads use `GET /api/sessions/<slug>/file/download` and
 `GET /api/workspace/file/download` with the same query parameters and eligibility

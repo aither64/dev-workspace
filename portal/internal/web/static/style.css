@@ -560,3 +560,9 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
 
 .message.team { background: #22223c; border-color: #8f83ce; color: var(--text); }
 .message-team-label { color: #c4b7ff; font-size: .75rem; font-weight: 600; margin-bottom: .4rem; }
+
+.files-panel .artifact-list { max-height: none; width: 100%; overflow: auto; }
+.session-file { display: flex; align-items: baseline; gap: .65rem; padding: .35rem .45rem; min-width: 0; }
+.session-file > a { overflow-wrap: anywhere; }
+.session-file > .muted { font-size: .8rem; }
+.session-file > .badge { flex-shrink: 0; }

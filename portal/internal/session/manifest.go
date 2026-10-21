@@ -105,11 +105,12 @@ func AvailableArtifacts(summary *Summary) []Artifact {
 		seen[filepath.Clean(artifact.Path)] = struct{}{}
 	}
 	for _, artifact := range summary.Artifacts {
-		clean := filepath.Clean(artifact.Path)
+		clean := ArtifactRelativePath(summary, artifact.Path)
 		if _, ok := seen[clean]; ok {
 			continue
 		}
 		seen[clean] = struct{}{}
+		artifact.Path = clean
 		artifacts = append(artifacts, artifact)
 	}
 	return artifacts
@@ -755,11 +756,38 @@ func NormalizeArtifactPath(value string) (string, bool) {
 		!strings.HasPrefix(clean, ".."+string(filepath.Separator))
 }
 
+// ArtifactRelativePath preserves literal nested files. Older declarations that
+// included their own workspace tracking prefix are aliases only when the literal
+// file is absent and the confined suffix exists. Other failures never fall back.
+func ArtifactRelativePath(summary *Summary, value string) string {
+	clean, ok := NormalizeArtifactPath(value)
+	if !ok {
+		return value
+	}
+	open := func(path string) error {
+		file, _, err := OpenRegularFile(summary.Workspace, filepath.Join(summary.Root, summary.Slug, path))
+		if file != nil {
+			file.Close()
+		}
+		return err
+	}
+	if !errors.Is(open(clean), fs.ErrNotExist) {
+		return clean
+	}
+	for _, root := range []string{"work", "archive"} {
+		if suffix, found := strings.CutPrefix(clean, root+"/"+summary.Slug+"/"); found && open(suffix) == nil {
+			return suffix
+		}
+	}
+	return clean
+}
+
 func OpenArtifact(summary *Summary, artifactPath string, maxSize int64) (*os.File, os.FileInfo, error) {
 	clean, ok := NormalizeArtifactPath(artifactPath)
 	if !ok {
 		return nil, nil, fs.ErrPermission
 	}
+	clean = ArtifactRelativePath(summary, clean)
 	allowed := false
 	for _, artifact := range AvailableArtifacts(summary) {
 		if filepath.Clean(artifact.Path) == clean {

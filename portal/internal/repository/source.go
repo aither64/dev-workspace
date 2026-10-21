@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -103,6 +105,108 @@ func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summa
 	return r.TrackingSourceContent(ctx, summary, path, false)
 }
 
+type TrackingFile struct {
+	Path       string `json:"path"`
+	Label      string `json:"label,omitempty"`
+	Registered bool   `json:"registered"`
+}
+
+// TrackingFiles enumerates metadata only. Opening a row still revalidates through
+// TrackingSourceContent; listing never publishes files into the artifact catalog.
+func (r ReviewReader) TrackingFiles(ctx context.Context, summary *session.Summary) ([]TrackingFile, error) {
+	if summary.Workspace != r.Workspace || !session.ValidSlug(summary.Slug) ||
+		(summary.Root != "work" && summary.Root != "archive") {
+		return nil, errors.New("invalid session tracking root")
+	}
+	files := make(map[string]TrackingFile)
+	for _, item := range session.AvailableArtifacts(summary) {
+		if !ValidSourcePath(item.Path) {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		file, _, err := session.OpenRegularFile(r.Workspace, filepath.Join(summary.Root, summary.Slug, item.Path))
+		if err != nil {
+			continue
+		}
+		file.Close()
+		files[item.Path] = TrackingFile{Path: item.Path, Label: item.Label,
+			Registered: item.Path != "plan.md" && item.Path != "state.md"}
+	}
+	// Explicit publication works without a workspace Git repository, as does its
+	// existing source reader. Ordinary discovery still requires a verified root.
+	_, gitErr := os.Lstat(filepath.Join(r.Workspace, ".git"))
+	if !errors.Is(gitErr, os.ErrNotExist) {
+		if err := r.workspaceSourceRoot(ctx); err != nil {
+			return nil, err
+		}
+		prefix := filepath.ToSlash(filepath.Join(summary.Root, summary.Slug)) + "/"
+		tracked, err := r.git(ctx, r.Workspace, maxReviewOutput, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", strings.TrimSuffix(prefix, "/"))
+		if err != nil {
+			return nil, err
+		}
+		candidates := make(map[string]struct{})
+		for _, entry := range strings.Split(strings.TrimSuffix(string(tracked), "\x00"), "\x00") {
+			if entry == "" {
+				continue
+			}
+			metadata, path, ok := strings.Cut(entry, "\t")
+			fields := strings.Fields(metadata)
+			if !ok || len(fields) != 3 {
+				return nil, errors.New("invalid tracked file listing")
+			}
+			if regularGitMode(fields[0]) {
+				candidates[path] = struct{}{}
+			}
+		}
+		args, err := r.sourceExcludesArgs(ctx, r.Workspace)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", strings.TrimSuffix(prefix, "/"))
+		untracked, err := r.git(ctx, r.Workspace, maxReviewOutput, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range strings.Split(strings.TrimSuffix(string(untracked), "\x00"), "\x00") {
+			if path != "" {
+				candidates[path] = struct{}{}
+			}
+		}
+		if len(tracked)+len(untracked) > maxReviewOutput || len(candidates) > maxReviewFiles {
+			return nil, ErrReviewLimit
+		}
+		for path := range candidates {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			relative, ok := strings.CutPrefix(path, prefix)
+			if !ok || !ValidSourcePath(relative) {
+				continue
+			}
+			if _, found := files[relative]; found {
+				continue
+			}
+			file, _, err := session.OpenRegularFile(r.Workspace, path)
+			if err != nil {
+				continue
+			}
+			file.Close()
+			files[relative] = TrackingFile{Path: relative}
+		}
+	}
+	if len(files) > maxReviewFiles {
+		return nil, ErrReviewLimit
+	}
+	result := make([]TrackingFile, 0, len(files))
+	for _, item := range files {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
+}
+
 func (r ReviewReader) TrackingSourceContent(ctx context.Context, summary *session.Summary, path string, download bool) (SourceFile, error) {
 	result := SourceFile{Path: path, Source: SourceArtifact}
 	if summary.Archived {
@@ -111,6 +215,7 @@ func (r ReviewReader) TrackingSourceContent(ctx context.Context, summary *sessio
 	file, info, err := session.OpenArtifact(summary, path, math.MaxInt64)
 	if err == nil {
 		defer file.Close()
+		result.Path = session.ArtifactRelativePath(summary, path)
 		result.Content, err = readSourceContent(file, info.Size(), download)
 		return result, err
 	}
@@ -123,6 +228,23 @@ func (r ReviewReader) TrackingSourceContent(ctx context.Context, summary *sessio
 	}
 	result.Content, err = r.workingSourceContent(ctx, "", filepath.Join(summary.Root, summary.Slug, path), download)
 	return result, err
+}
+
+// Git source reads use the operator's effective excludes file without enabling
+// unrelated operator configuration for repository commands.
+func (r ReviewReader) sourceExcludesArgs(ctx context.Context, directory string) ([]string, error) {
+	excludes, err := r.runGit(ctx, directory, 8192, true, "config", "--null", "--path", "--get", "core.excludesFile")
+	if err == nil {
+		if !strings.HasSuffix(string(excludes), "\x00") {
+			return nil, errors.New("invalid Git excludes file setting")
+		}
+		return []string{"-c", "core.excludesFile=" + strings.TrimSuffix(string(excludes), "\x00")}, nil
+	}
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // Source revalidates repository ownership on each request. Browser input selects
@@ -188,18 +310,9 @@ func (r ReviewReader) workingSourceContent(ctx context.Context, directory, path 
 	if len(out) == 0 {
 		// Read only the effective ignore-file setting with the operator's
 		// configuration. Do not enable that configuration for repository reads.
-		excludes, configErr := r.runGit(ctx, filepath.Join(r.Workspace, directory), 8192, true, "config", "--null", "--path", "--get", "core.excludesFile")
-		args := []string{}
-		if configErr == nil {
-			if !strings.HasSuffix(string(excludes), "\x00") {
-				return ReviewBlob{}, errors.New("invalid Git excludes file setting")
-			}
-			args = append(args, "-c", "core.excludesFile="+strings.TrimSuffix(string(excludes), "\x00"))
-		} else {
-			var exitError *exec.ExitError
-			if !errors.As(configErr, &exitError) || exitError.ExitCode() != 1 {
-				return ReviewBlob{}, configErr
-			}
+		args, configErr := r.sourceExcludesArgs(ctx, filepath.Join(r.Workspace, directory))
+		if configErr != nil {
+			return ReviewBlob{}, configErr
 		}
 		args = append(args, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", path)
 		out, err = r.git(ctx, filepath.Join(r.Workspace, directory), 64*1024, args...)

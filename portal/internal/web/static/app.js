@@ -36,6 +36,7 @@
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
     }),
+    files: (options) => request(apiPath(slug, "files"), options),
     artifactPreview: (path, options) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`, options),
     archive: (mode, targetId, receiptId) => request(apiPath(slug, "archive"), {
       method: "POST", body: JSON.stringify({mode, targetId, ...(receiptId ? {receiptId} : {})}),
@@ -302,10 +303,12 @@
     } catch (_error) {
       return fallback;
     }
+    if (target === "artifacts" && panelIDs.includes("files")) target = "files";
     return panelIDs.includes(target) ? target : fallback;
   };
   const sessionTabFromLocation = ({hash, search}, panelIDs, fallback) => {
-    const queryTab = new URLSearchParams(search).get("tab");
+    let queryTab = new URLSearchParams(search).get("tab");
+    if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
   const transcriptEntryPresentation = entry => sharedTranscriptPresentation?.(entry) || {
@@ -3221,70 +3224,70 @@
     }
   });
 
-  const artifactList = document.querySelector(".artifact-list");
-  const artifactButtons = () => Array.from(artifactList?.querySelectorAll("[data-artifact-path]") || []);
-  const artifactPreview = document.getElementById("artifact-preview");
-  const artifactTitle = document.getElementById("artifact-title");
-  const artifactDownload = document.getElementById("artifact-download");
-  const artifactCopy = document.getElementById("artifact-copy");
-  let selectedArtifactPath = "", artifactGeneration = 0, artifactRead = null, artifactText = null;
-  artifactCopy?.addEventListener("click", async () => {
-    if (artifactText === null) return;
-    const generation = artifactGeneration;
-    try { await navigator.clipboard.writeText(artifactText); if (generation === artifactGeneration) artifactCopy.title = "Content copied"; }
-    catch (_) { if (generation === artifactGeneration) artifactCopy.title = "Unable to copy content. Download the file instead."; }
-  });
-  const showArtifact = async (button) => {
-    const path = button.dataset.artifactPath;
-    if (!path || !artifactPreview) return;
-    selectedArtifactPath = path;
-    const generation = ++artifactGeneration;
-    artifactRead?.abort(); artifactRead = new AbortController();
-    artifactText = null;
-    if (artifactCopy) { artifactCopy.disabled = true; artifactCopy.title = "Copy content"; }
-    artifactButtons().forEach((candidate) => candidate.classList.toggle("active", candidate === button));
-    artifactTitle.textContent = button.dataset.artifactLabel || path;
-    artifactDownload.href = `/artifacts/${encodeURIComponent(slug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
-    artifactDownload.hidden = false;
-    artifactPreview.replaceChildren();
-    const loading = document.createElement("p");
-    loading.className = "empty";
-    loading.textContent = "Loading artifact…";
-    artifactPreview.append(loading);
+  const artifactList = document.getElementById("session-files");
+  const filesStatus = document.getElementById("files-status");
+  const filesRefresh = document.getElementById("files-refresh");
+  const filesReads = createReadScope();
+  let filesLoaded = false, filesRead = null;
+  const refreshFiles = async () => {
+    if (!artifactList || filesReads.paused || document.hidden || filesRead) return;
+    const read = filesReads.begin(refreshPolicy.detailsDeadlineMs);
+    filesRead = read;
+    filesStatus.hidden = false; filesStatus.classList.remove("error");
+    filesStatus.textContent = "Loading files…";
     try {
-      const result = await client.artifactPreview(path, {signal: artifactRead.signal});
-      if (generation !== artifactGeneration) return;
-      artifactText = typeof result.text === "string" && result.kind !== "image" ? result.text : null;
-      if (artifactCopy) artifactCopy.disabled = artifactText === null;
-      artifactPreview.replaceChildren();
-      if (result.kind === "markdown") {
-        artifactPreview.innerHTML = result.html || "";
-        wrapMarkdownTables(artifactPreview);
-      } else if (result.kind === "image") {
-        const image = document.createElement("img");
-        image.src = result.url;
-        image.alt = button.dataset.artifactLabel || path;
-        artifactPreview.append(image);
-      } else {
-        const pre = document.createElement("pre");
-        pre.textContent = result.text || "";
-        artifactPreview.append(pre);
+      const payload = await client.files({signal: read.signal});
+      if (!read.isCurrent() || read.signal.aborted) return;
+      if (!Array.isArray(payload.files)) throw new Error("The file list response is invalid.");
+      const open = new Map(Array.from(artifactList.querySelectorAll("[data-file-directory]"), node => [node.dataset.fileDirectory, node.open]));
+      const panel = document.getElementById("files"), top = panel.scrollTop;
+      const tree = document.createDocumentFragment(), directories = new Map([["", tree]]);
+      for (const file of payload.files) {
+        const parts = file.path.split("/"); let parent = tree, directory = "";
+        for (const part of parts.slice(0, -1)) {
+          directory = directory ? `${directory}/${part}` : part;
+          if (!directories.has(directory)) {
+            const details = document.createElement("details"); details.className = "artifact-directory";
+            details.dataset.fileDirectory = directory; details.open = open.get(directory) ?? true;
+            const summary = document.createElement("summary"); summary.textContent = part; summary.title = directory;
+            const children = document.createElement("div"); details.append(summary, children); parent.append(details);
+            directories.set(directory, children);
+          }
+          parent = directories.get(directory);
+        }
+        const row = document.createElement("div"); row.className = "session-file";
+        const link = document.createElement("a"); link.textContent = parts.at(-1);
+        link.href = `/files/${encodeURIComponent(slug)}?artifact=${encodeURIComponent(file.path)}`;
+        link.target = "_blank"; link.rel = "noopener noreferrer";
+        link.title = [file.label, file.path].filter(Boolean).join(" · "); row.append(link);
+        if (file.label && file.registered) {
+          const label = document.createElement("span"); label.className = "muted";
+          label.textContent = file.label; row.append(label);
+        }
+        if (file.registered) {
+          const marker = document.createElement("span"); marker.className = "badge";
+          marker.textContent = "Registered"; row.append(marker);
+        }
+        parent.append(row);
       }
+      artifactList.replaceChildren(tree); panel.scrollTop = top;
+      filesLoaded = true; filesStatus.hidden = payload.files.length > 0;
+      filesStatus.textContent = payload.files.length ? "" : "No files are available.";
+      const tab = document.querySelector('[data-session-tab="files"]');
+      if (tab) tab.querySelector(".rail-label").textContent = `Files (${payload.files.length})`;
     } catch (error) {
-      if (generation !== artifactGeneration) return;
-      const notice = document.createElement("p");
-      notice.className = "notice error";
-      notice.textContent = `Unable to preview artifact: ${error.message}`;
-      artifactPreview.replaceChildren(notice);
+      if (!read.isCurrent()) return;
+      filesStatus.hidden = false; filesStatus.classList.add("error");
+      filesStatus.textContent = error.message;
+    } finally {
+      read.finish(); if (filesRead === read) filesRead = null;
     }
   };
-  artifactList?.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-artifact-path]");
-    if (button) showArtifact(button);
+  filesRefresh?.addEventListener("click", () => { void refreshFiles(); });
+  document.addEventListener("session-section-change", event => {
+    if (event.detail === "files" && !filesLoaded) void refreshFiles();
   });
-  document.querySelector('[data-session-tab="artifacts"]')?.addEventListener("click", () => {
-    if (!selectedArtifactPath && artifactButtons()[0]) showArtifact(artifactButtons()[0]);
-  });
+  if (document.getElementById("files")?.classList.contains("active")) void refreshFiles();
 
   const pageReads = createReadScope();
   let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {}, resumeHistory = () => {};
@@ -3318,7 +3321,6 @@
   let detailsTimer = null;
   let detailsRunning = false;
   let lastRepositoriesHTML = "";
-  let lastArtifactsHTML = "";
   let lastClustersHTML = "";
   let lastTeamHTML = "";
   const clusterControls = new Map();
@@ -3377,28 +3379,6 @@
         }
         lastRepositoriesHTML = payload.repositoriesHTML;
       }
-      if (payload.artifactsHTML !== lastArtifactsHTML) {
-        const artifactScroll = artifactList.scrollTop;
-        const directoryState = new Map(Array.from(artifactList.querySelectorAll("[data-artifact-directory]"), node => [node.dataset.artifactDirectory, node.open]));
-        artifactList.innerHTML = payload.artifactsHTML;
-        artifactList.querySelectorAll("[data-artifact-directory]").forEach(node => {
-          if (directoryState.has(node.dataset.artifactDirectory)) node.open = directoryState.get(node.dataset.artifactDirectory);
-        });
-        artifactList.scrollTop = artifactScroll;
-        lastArtifactsHTML = payload.artifactsHTML;
-        const selected = artifactButtons().find((button) => button.dataset.artifactPath === selectedArtifactPath);
-        if (selected) {
-          selected.classList.add("active");
-          artifactTitle.textContent = selected.dataset.artifactLabel || selectedArtifactPath;
-        } else if (selectedArtifactPath) {
-          selectedArtifactPath = "";
-          ++artifactGeneration; artifactRead?.abort(); artifactText = null;
-          if (artifactCopy) artifactCopy.disabled = true;
-          artifactTitle.textContent = "Artifacts";
-          artifactDownload.hidden = true;
-          artifactPreview.textContent = "Choose an artifact to preview it.";
-        }
-      }
       if (teamGeneration === teamSettingsGeneration && typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
         const editingTeam = teamStatus?.querySelector('[data-direct-team-form]:not([data-action="add"]):focus-within, [data-direct-team-form]:not([data-action="add"])[data-team-dirty], [data-direct-team-form]:not([data-action="add"])[data-team-submitting]');
@@ -3435,7 +3415,7 @@
         }
       }
       for (const [section, label, count] of [
-        ["repositories", "Repositories", payload.repositoryCount], ["artifacts", "Artifacts", payload.artifactCount],
+        ["repositories", "Repositories", payload.repositoryCount],
         ["clusters", "Clusters", payload.clusterCount],
       ]) {
         const tab = document.querySelector(`[data-session-tab="${section}"]`);
