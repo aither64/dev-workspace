@@ -91,14 +91,14 @@ const checkSidebarMenu = async page => {
       await page.setViewportSize({width: 420, height: 720});
       await checkSidebarMenu(page);
       await page.setViewportSize({width: 1280, height: 720});
-      // Use the real artifact control and its download attribute.
-      assert.equal(await page.locator("#artifact-download").getAttribute("download"), "");
+      // Native download links must not retire the conversation read cycle.
       await page.evaluate(() => {
-        const link = document.getElementById("artifact-download");
-        link.href = "/fixture/download"; link.hidden = false;
+        const link = document.createElement("a");
+        link.id = "fixture-download"; link.href = "/fixture/download"; link.download = "";
+        document.body.append(link);
       });
       const downloaded = page.waitForEvent("download");
-      await page.locator("#artifact-download").evaluate(link => link.click());
+      await page.locator("#fixture-download").evaluate(link => link.click());
       await (await downloaded).delete();
       const beforeDownload = details;
       await page.evaluate(() => dispatchEvent(new Event("focus")));

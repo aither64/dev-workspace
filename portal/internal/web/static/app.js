@@ -36,6 +36,8 @@
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
     }),
+    files: (options) => request(apiPath(slug, "files"), options),
+    file: (path, options) => request(`${apiPath(slug, "file")}?artifact=${encodeURIComponent(path)}`, options),
     artifactPreview: (path, options) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`, options),
     archive: (mode, targetId, receiptId) => request(apiPath(slug, "archive"), {
       method: "POST", body: JSON.stringify({mode, targetId, ...(receiptId ? {receiptId} : {})}),
@@ -302,10 +304,12 @@
     } catch (_error) {
       return fallback;
     }
+    if (target === "artifacts" && panelIDs.includes("files")) target = "files";
     return panelIDs.includes(target) ? target : fallback;
   };
   const sessionTabFromLocation = ({hash, search}, panelIDs, fallback) => {
-    const queryTab = new URLSearchParams(search).get("tab");
+    let queryTab = new URLSearchParams(search).get("tab");
+    if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
   const transcriptEntryPresentation = entry => sharedTranscriptPresentation?.(entry) || {
@@ -3221,70 +3225,140 @@
     }
   });
 
-  const artifactList = document.querySelector(".artifact-list");
-  const artifactButtons = () => Array.from(artifactList?.querySelectorAll("[data-artifact-path]") || []);
-  const artifactPreview = document.getElementById("artifact-preview");
-  const artifactTitle = document.getElementById("artifact-title");
-  const artifactDownload = document.getElementById("artifact-download");
-  const artifactCopy = document.getElementById("artifact-copy");
-  let selectedArtifactPath = "", artifactGeneration = 0, artifactRead = null, artifactText = null;
-  artifactCopy?.addEventListener("click", async () => {
-    if (artifactText === null) return;
-    const generation = artifactGeneration;
-    try { await navigator.clipboard.writeText(artifactText); if (generation === artifactGeneration) artifactCopy.title = "Content copied"; }
-    catch (_) { if (generation === artifactGeneration) artifactCopy.title = "Unable to copy content. Download the file instead."; }
-  });
-  const showArtifact = async (button) => {
-    const path = button.dataset.artifactPath;
-    if (!path || !artifactPreview) return;
-    selectedArtifactPath = path;
-    const generation = ++artifactGeneration;
-    artifactRead?.abort(); artifactRead = new AbortController();
-    artifactText = null;
-    if (artifactCopy) { artifactCopy.disabled = true; artifactCopy.title = "Copy content"; }
-    artifactButtons().forEach((candidate) => candidate.classList.toggle("active", candidate === button));
-    artifactTitle.textContent = button.dataset.artifactLabel || path;
-    artifactDownload.href = `/artifacts/${encodeURIComponent(slug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
-    artifactDownload.hidden = false;
-    artifactPreview.replaceChildren();
-    const loading = document.createElement("p");
-    loading.className = "empty";
-    loading.textContent = "Loading artifact…";
-    artifactPreview.append(loading);
-    try {
-      const result = await client.artifactPreview(path, {signal: artifactRead.signal});
-      if (generation !== artifactGeneration) return;
-      artifactText = typeof result.text === "string" && result.kind !== "image" ? result.text : null;
-      if (artifactCopy) artifactCopy.disabled = artifactText === null;
-      artifactPreview.replaceChildren();
-      if (result.kind === "markdown") {
-        artifactPreview.innerHTML = result.html || "";
-        wrapMarkdownTables(artifactPreview);
-      } else if (result.kind === "image") {
-        const image = document.createElement("img");
-        image.src = result.url;
-        image.alt = button.dataset.artifactLabel || path;
-        artifactPreview.append(image);
-      } else {
-        const pre = document.createElement("pre");
-        pre.textContent = result.text || "";
-        artifactPreview.append(pre);
-      }
-    } catch (error) {
-      if (generation !== artifactGeneration) return;
-      const notice = document.createElement("p");
-      notice.className = "notice error";
-      notice.textContent = `Unable to preview artifact: ${error.message}`;
-      artifactPreview.replaceChildren(notice);
-    }
+  const artifactList = document.getElementById("session-files");
+  const filesStatus = document.getElementById("files-status");
+  const filesRefresh = document.getElementById("files-refresh");
+  const fileContent = document.getElementById("files-content");
+  const fileTitle = document.getElementById("files-title");
+  const fileNotice = document.getElementById("files-content-status");
+  const fileToggle = document.getElementById("files-mode");
+  const fileCopy = document.getElementById("files-copy");
+  const fileDownload = document.getElementById("files-download");
+  const filesReads = createReadScope(), fileReads = createReadScope();
+  let filesLoaded = false, filesRead = null, fileRead = null;
+  let selectedPath = "", selectedFile = null, fileMode = "raw", fileRenderer = null, fileRenderEpoch = 0, fileNeedsRender = false;
+  const filesActive = () => !document.hidden && document.getElementById("files")?.classList.contains("active");
+  const fileMessage = (message, error = false) => {
+    fileNotice.textContent = message; fileNotice.hidden = !message; fileNotice.classList.toggle("error", error);
   };
-  artifactList?.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-artifact-path]");
-    if (button) showArtifact(button);
+  const fileText = () => selectedFile && !selectedFile.content.binary && !selectedFile.content.limited && typeof selectedFile.content.text === "string" ? selectedFile.content.text : null;
+  const updateFileControls = () => {
+    fileCopy.disabled = fileText() === null;
+    fileToggle.hidden = !["markdown", "image"].includes(selectedFile?.preview?.kind);
+    fileToggle.title = fileToggle.ariaLabel = fileMode === "preview" ? "Show raw" : "Show preview";
+    fileToggle.textContent = fileMode === "preview" ? "‹›" : "◉";
+    fileDownload.hidden = !selectedFile;
+    if (selectedFile) fileDownload.href = `${apiPath(slug, "file")}/download?artifact=${encodeURIComponent(selectedPath)}`;
+    else fileDownload.removeAttribute("href");
+  };
+  const renderSelectedFile = async () => {
+    if (!selectedFile || !filesActive()) { fileNeedsRender = true; return; }
+    const epoch = ++fileRenderEpoch, file = selectedFile;
+    const current = () => epoch === fileRenderEpoch && file === selectedFile && !fileReads.paused && filesActive();
+    fileRenderer?.destroy(); fileRenderer = null; fileContent.replaceChildren(); fileNeedsRender = true;
+    updateFileControls();
+    try {
+      const {renderSourceFileContent} = await import("/static/source-file.js?v=3");
+      if (!current()) return;
+      const renderer = await renderSourceFileContent({parent: fileContent, file, mode: fileMode,
+        nonce: document.querySelector('meta[name="style-nonce"]')?.content || "", isCurrent: current,
+        lineURL: (_side, line) => `/files/${encodeURIComponent(slug)}?artifact=${encodeURIComponent(file.path)}#L${line}`});
+      if (!current()) { renderer.destroy(); return; }
+      fileRenderer = renderer; fileNeedsRender = false;
+    } catch (error) { if (current()) { fileNeedsRender = false; fileMessage(error.message || "Unable to display this file.", true); } }
+  };
+  const loadSelectedFile = async () => {
+    if (!selectedPath || selectedFile || !filesActive() || fileReads.paused || fileRead?.isCurrent()) return;
+    const read = fileReads.begin(refreshPolicy.detailsDeadlineMs), path = selectedPath;
+    fileRead = read; fileMessage("Loading file…");
+    try {
+      const file = await client.file(path, {signal: read.signal});
+      if (!read.isCurrent() || read.signal.aborted || path !== selectedPath || !filesActive()) return;
+      if (file.path !== path || !file.content) throw new Error("The file response is invalid.");
+      selectedFile = file; fileMode = ["markdown", "image"].includes(file.preview?.kind) ? "preview" : "raw";
+      fileMessage(""); read.finish(); await renderSelectedFile();
+    } catch (error) {
+      if (read.isCurrent() && path === selectedPath && filesActive()) fileMessage(error.message, true);
+    } finally { read.finish(); if (fileRead === read) fileRead = null; }
+  };
+  const selectFile = path => {
+    if (selectedPath === path && selectedFile) return;
+    fileReads.pause(); if (filesActive()) fileReads.resume(); fileRead = null;
+    ++fileRenderEpoch; fileRenderer?.destroy(); fileRenderer = null;
+    selectedPath = path; selectedFile = null; fileNeedsRender = false;
+    fileTitle.textContent = path || "Select a file"; fileContent.replaceChildren();
+    fileMessage(""); updateFileControls();
+    for (const link of artifactList.querySelectorAll("[data-file-path]")) {
+      if (link.dataset.filePath === path) link.setAttribute("aria-current", "true"); else link.removeAttribute("aria-current");
+    }
+    if (path) void loadSelectedFile();
+  };
+  fileToggle?.addEventListener("click", () => {
+    fileMode = fileMode === "preview" ? "raw" : "preview"; fileMessage(""); void renderSelectedFile();
   });
-  document.querySelector('[data-session-tab="artifacts"]')?.addEventListener("click", () => {
-    if (!selectedArtifactPath && artifactButtons()[0]) showArtifact(artifactButtons()[0]);
+  fileCopy?.addEventListener("click", async () => {
+    const text = fileText(), file = selectedFile, epoch = fileRenderEpoch;
+    if (text === null) return;
+    try { await navigator.clipboard.writeText(text); if (file === selectedFile && epoch === fileRenderEpoch && filesActive()) fileMessage("Content copied."); }
+    catch (_) { if (file === selectedFile && epoch === fileRenderEpoch && filesActive()) fileMessage("Unable to copy the content. Download the file instead.", true); }
   });
+  const refreshFiles = async () => {
+    if (!artifactList || filesReads.paused || !filesActive() || filesRead) return;
+    const read = filesReads.begin(refreshPolicy.detailsDeadlineMs);
+    filesRead = read;
+    filesStatus.hidden = false; filesStatus.classList.remove("error"); filesStatus.textContent = "Loading files…";
+    try {
+      const payload = await client.files({signal: read.signal});
+      if (!read.isCurrent() || read.signal.aborted) return;
+      if (!Array.isArray(payload.files)) throw new Error("The file list response is invalid.");
+      const open = new Map(Array.from(artifactList.querySelectorAll("[data-file-directory]"), node => [node.dataset.fileDirectory, node.open]));
+      const top = artifactList.scrollTop, left = artifactList.scrollLeft;
+      const tree = document.createDocumentFragment(), directories = new Map([["", tree]]);
+      for (const file of payload.files) {
+        const parts = file.path.split("/"); let parent = tree, directory = "";
+        for (const part of parts.slice(0, -1)) {
+          directory = directory ? `${directory}/${part}` : part;
+          if (!directories.has(directory)) {
+            const details = document.createElement("details"); details.className = "artifact-directory";
+            details.dataset.fileDirectory = directory; details.open = open.get(directory) ?? true;
+            const summary = document.createElement("summary"); summary.textContent = part; summary.title = directory;
+            const children = document.createElement("div"); details.append(summary, children); parent.append(details);
+            directories.set(directory, children);
+          }
+          parent = directories.get(directory);
+        }
+        const row = document.createElement("div"); row.className = "session-file";
+        const link = document.createElement("a"); link.textContent = parts.at(-1); link.dataset.filePath = file.path;
+        link.href = `/files/${encodeURIComponent(slug)}?artifact=${encodeURIComponent(file.path)}`; link.title = file.path;
+        if (file.path === selectedPath) link.setAttribute("aria-current", "true");
+        link.addEventListener("click", event => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.defaultPrevented) return;
+          event.preventDefault(); selectFile(file.path);
+        });
+        row.append(link); parent.append(row);
+      }
+      artifactList.replaceChildren(tree); artifactList.scrollTop = top; artifactList.scrollLeft = left;
+      if (selectedPath && !payload.files.some(file => file.path === selectedPath)) selectFile("");
+      filesLoaded = true; filesStatus.hidden = payload.files.length > 0;
+      filesStatus.textContent = payload.files.length ? "" : "No files are available.";
+      const tab = document.querySelector('[data-session-tab="files"]');
+      if (tab) tab.querySelector(".rail-label").textContent = `Files (${payload.files.length})`;
+    } catch (error) {
+      if (!read.isCurrent()) return;
+      filesStatus.hidden = false; filesStatus.classList.add("error"); filesStatus.textContent = error.message;
+    } finally { read.finish(); if (filesRead === read) filesRead = null; }
+  };
+  const pauseFiles = () => { filesReads.pause(); fileReads.pause(); if (fileNeedsRender) ++fileRenderEpoch; };
+  const resumeFiles = () => {
+    if (!filesActive()) return;
+    filesReads.resume(); fileReads.resume();
+    if (!filesLoaded) void refreshFiles();
+    if (selectedPath && !selectedFile) void loadSelectedFile();
+    else if (selectedFile && fileNeedsRender) void renderSelectedFile();
+  };
+  filesRefresh?.addEventListener("click", () => { void refreshFiles(); });
+  document.addEventListener("session-section-change", event => { if (event.detail === "files") resumeFiles(); else pauseFiles(); });
+  if (artifactList) { updateFileControls(); resumeFiles(); }
 
   const pageReads = createReadScope();
   let pageLeaving = false, pauseTiming = () => {}, resumeTiming = () => {}, resumeHistory = () => {};
@@ -3318,7 +3392,6 @@
   let detailsTimer = null;
   let detailsRunning = false;
   let lastRepositoriesHTML = "";
-  let lastArtifactsHTML = "";
   let lastClustersHTML = "";
   let lastTeamHTML = "";
   const clusterControls = new Map();
@@ -3377,28 +3450,6 @@
         }
         lastRepositoriesHTML = payload.repositoriesHTML;
       }
-      if (payload.artifactsHTML !== lastArtifactsHTML) {
-        const artifactScroll = artifactList.scrollTop;
-        const directoryState = new Map(Array.from(artifactList.querySelectorAll("[data-artifact-directory]"), node => [node.dataset.artifactDirectory, node.open]));
-        artifactList.innerHTML = payload.artifactsHTML;
-        artifactList.querySelectorAll("[data-artifact-directory]").forEach(node => {
-          if (directoryState.has(node.dataset.artifactDirectory)) node.open = directoryState.get(node.dataset.artifactDirectory);
-        });
-        artifactList.scrollTop = artifactScroll;
-        lastArtifactsHTML = payload.artifactsHTML;
-        const selected = artifactButtons().find((button) => button.dataset.artifactPath === selectedArtifactPath);
-        if (selected) {
-          selected.classList.add("active");
-          artifactTitle.textContent = selected.dataset.artifactLabel || selectedArtifactPath;
-        } else if (selectedArtifactPath) {
-          selectedArtifactPath = "";
-          ++artifactGeneration; artifactRead?.abort(); artifactText = null;
-          if (artifactCopy) artifactCopy.disabled = true;
-          artifactTitle.textContent = "Artifacts";
-          artifactDownload.hidden = true;
-          artifactPreview.textContent = "Choose an artifact to preview it.";
-        }
-      }
       if (teamGeneration === teamSettingsGeneration && typeof payload.teamHTML === "string" && payload.teamHTML !== lastTeamHTML) {
         const teamStatus = document.getElementById("team-member-status");
         const editingTeam = teamStatus?.querySelector('[data-direct-team-form]:not([data-action="add"]):focus-within, [data-direct-team-form]:not([data-action="add"])[data-team-dirty], [data-direct-team-form]:not([data-action="add"])[data-team-submitting]');
@@ -3435,7 +3486,7 @@
         }
       }
       for (const [section, label, count] of [
-        ["repositories", "Repositories", payload.repositoryCount], ["artifacts", "Artifacts", payload.artifactCount],
+        ["repositories", "Repositories", payload.repositoryCount],
         ["clusters", "Clusters", payload.clusterCount],
       ]) {
         const tab = document.querySelector(`[data-session-tab="${section}"]`);

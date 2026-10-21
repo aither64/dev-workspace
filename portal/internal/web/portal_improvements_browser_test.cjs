@@ -11,22 +11,35 @@ const fs = require("node:fs/promises");
     const page = await context.newPage(), errors = [], dialogs = [], sends = [], additions = [];
     page.on("pageerror", error => errors.push(error.message));
     page.on("dialog", dialog => { dialogs.push(dialog.message()); void dialog.dismiss(); });
-    let removed = false, detailsReads = 0, previewVersion = 0, releasePreview, releaseAdd, turns = 0;
+    let filesReads = 0, fileReads = 0, failFiles = false, omittedFile = "", holdFile = false, releaseFile, oldFileDelivered = false, releaseAdd, turns = 0;
     let loseResponse = true, showReceipt = false, observedEntry = null, releaseObserved = null;
     const transcript = await (await context.request.get(baseURL + "/fixture/presentation")).json();
-    const fullTree = await (await context.request.get(baseURL + "/fixture/artifact-tree")).text();
-    const smallerTree = await (await context.request.get(baseURL + "/fixture/artifact-tree?remove=1")).text();
     const teamHTML = (await (await context.request.get(baseURL + "/fixture/team")).text()).replace('<div id="team-role-defaults" hidden>', '<div id="team-role-defaults" hidden><span data-role="implementer" data-model="model-1" data-effort="high"></span>');
     await page.route("**/api/models**", route => route.fulfill({json: [{model: "model-1", displayName: "Fixture model", isDefault: true, defaultReasoningEffort: "low", supportedReasoningEfforts: [{reasoningEffort: "low"}, {reasoningEffort: "high"}]}]}));
     await page.route("**/api/collaboration-modes", route => route.fulfill({json: [{mode:"default", name:"Default"}]}));
     await page.route("**/api/sessions/example/**", async route => {
       const url = new URL(route.request().url()), operation = url.pathname.split("/").at(-1);
       if (["thread", "page"].includes(operation)) return route.fulfill({json: {...transcript, ...(showReceipt ? {entries: [...transcript.entries, observedEntry]} : {})}});
-      if (operation === "details") { detailsReads++; return route.fulfill({json: {artifactsHTML: (removed ? smallerTree : fullTree)+`<!--refresh ${detailsReads}-->`, artifactCount: removed ? 499 : 500, repositoriesHTML:"", teamHTML}}); }
-      if (operation === "artifact-preview") {
-        const version = ++previewVersion;
-        if (url.searchParams.get("path").endsWith("499.md") && version === 2) await new Promise(resolve => {releasePreview = resolve;});
-        return route.fulfill({json: {kind:"markdown", text: `# Raw ${version}\n`, html:`<h1>Rendered ${version}</h1>`}});
+      if (operation === "details") return route.fulfill({json: {repositoriesHTML:"", teamHTML}});
+      if (operation === "files") {
+        filesReads++;
+        if (failFiles) return route.fulfill({status:503, json:{error:"Session files could not be listed. Refresh to try again."}});
+        if (omittedFile) {
+          const response=await route.fetch(), payload=await response.json();
+          return route.fulfill({json:{files:payload.files.filter(file=>file.path!==omittedFile)}});
+        }
+        return route.continue();
+      }
+      if (operation === "file") {
+        fileReads++;
+        if (holdFile && url.searchParams.get("artifact") === "reports/deep/001.md") {
+          holdFile=false;
+          const response=await route.fetch();
+          await new Promise(resolve=>{releaseFile=resolve;});
+          await route.fulfill({response}).catch(()=>{}); oldFileDelivered=true;
+          return;
+        }
+        return route.continue();
       }
       if (operation === "team" && route.request().method() === "POST") {
         additions.push(route.request().postDataJSON());
@@ -110,54 +123,99 @@ const fs = require("node:fs/promises");
     await expect(page.locator("#message-receipts")).not.toContainText("Outcome unknown");
     await expect(page.locator("#message-submission-status")).toBeHidden();
 
-    await page.getByRole("tab", {name:/Artifacts/}).click();
-    await expect(page.locator('[data-artifact-path]')).toHaveCount(500);
-    const bottom = page.locator('[data-artifact-path="reports/deep/499.md"]');
-    await bottom.click(); await expect.poll(() => Boolean(releasePreview)).toBe(true);
-    await page.locator('[data-artifact-path="reports/deep/000.md"]').click();
+    assert.equal(filesReads, 0, "Unopened Files tab must not enumerate files");
+    await input.fill("Draft retained while browsing files");
+    await page.evaluate(() => {location.hash = "artifacts";});
+    await expect(page.locator("#files")).toBeVisible();
+    const listed=await (await context.request.get(baseURL+"/api/sessions/example/files")).json();
+    await expect(page.locator(".session-file")).toHaveCount(listed.files.length);
+    assert.equal(filesReads,1);assert.equal(fileReads,0,"Listing must not read content before selection");
+    const bottom=page.locator('.session-file a[href$="reports%2Fdeep%2F499.md"]');
+    await expect(bottom).toHaveText("499.md");
+    assert.equal(await bottom.getAttribute("target"),null);
+    await expect(bottom.locator("..")).not.toContainText("Registered");
+    await expect(bottom.locator("..")).not.toContainText("Report 499");
+    const pagesBefore=context.pages().length;
     await bottom.click();
-    await expect(page.locator("#artifact-preview h1")).toHaveText("Rendered 4");
-    releasePreview(); await expect(page.locator("#artifact-preview h1")).toHaveText("Rendered 4");
-    await page.locator("#artifact-copy").click();
-    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "# Raw 4\n");
-    const [artifactDownload] = await Promise.all([page.waitForEvent("download"), page.locator("#artifact-download").click()]);
-    assert.equal(artifactDownload.url(), baseURL + "/artifacts/example/reports/deep/499.md");
-    assert.equal(artifactDownload.suggestedFilename(), "499.md");
-    assert.equal(await artifactDownload.failure(), null, `Artifact download failed: ${artifactDownload.url()}`);
-    assert.equal(await fs.readFile(await artifactDownload.path(), "utf8"), "# Original artifact bytes\r\n");
-    await page.locator('[data-artifact-directory="reports/deep"]').evaluate(node => {node.open = false;});
-    await page.locator('[data-artifact-directory="reports/deep"]').evaluate(node => {node.open = true;});
-    // Collapsing the only file directory can clamp navigation to zero. Set up
-    // the position whose retention across status refresh is under test.
+    await expect(page.locator("#files-title")).toHaveText("reports/deep/499.md");
+    await expect(page.locator("#files-content h1")).toHaveText("Original artifact bytes");
+    assert.equal(context.pages().length,pagesBefore,"A plain file click must select inline");
+    await expect(page.locator("#files-mode")).toHaveAttribute("aria-label","Show raw");
+    const fetchedBeforeToggle=fileReads;
+    await page.locator("#files-mode").click();
+    await expect(page.locator("#files-content .cm-editor")).toBeVisible();
+    await expect(page.locator("#files-mode")).toHaveAttribute("aria-label","Show preview");
+    await page.locator("#files-copy").click();
+    assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),"# Original artifact bytes\r\n");
+    assert.equal(fileReads,fetchedBeforeToggle,"Raw/Preview must reuse fetched bytes");
+    const [artifactDownload]=await Promise.all([page.waitForEvent("download"),page.locator("#files-download").click()]);
+    assert.equal(artifactDownload.url(),baseURL+"/api/sessions/example/file/download?artifact=reports%2Fdeep%2F499.md");
+    assert.equal(artifactDownload.suggestedFilename(),"499.md");
+    assert.equal(await fs.readFile(await artifactDownload.path(),"utf8"),"# Original artifact bytes\r\n");
+    const [fileViewer]=await Promise.all([context.waitForEvent("page"),bottom.click({button:"middle"})]);
+    await fileViewer.waitForLoadState();
+    await expect(fileViewer.locator("#source-file-copy-content")).toBeEnabled();
+    await fileViewer.close();await page.bringToFront();
+    await expect(input).toHaveValue("Draft retained while browsing files");
+
+    await page.locator('.session-file a[href$="preview.png"]').click();
+    await expect(page.locator("#files-content img")).toBeVisible();
+    await expect.poll(()=>page.locator("#files-content img").evaluate(image=>image.complete&&image.naturalWidth===1)).toBe(true);
+    await expect(page.locator("#files-copy")).toBeDisabled();
+    await page.locator('.session-file a[href$="passive.svg"]').click();
+    await expect(page.locator("#files-content .cm-editor")).toBeVisible();
+    await expect(page.locator("#files-mode")).toBeHidden();
+    await expect(page.locator("#files-content svg")).toHaveCount(0);
+    assert.equal(await page.evaluate(()=>window.passiveFileExecuted),undefined);
+
+    holdFile=true;
+    await page.locator('.session-file a[href$="reports%2Fdeep%2F001.md"]').click();
+    await expect.poll(()=>Boolean(releaseFile)).toBe(true);
+    await bottom.click();await expect(page.locator("#files-title")).toHaveText("reports/deep/499.md");
+    await expect(page.locator("#files-content h1")).toHaveText("Original artifact bytes");
+    releaseFile();await expect.poll(()=>oldFileDelivered).toBe(true);
+    await expect(page.locator('#session-files a[aria-current]')).toHaveText("499.md");
+    await expect(page.locator("#files-download")).toHaveAttribute("href",/499.md$/);
+
+    await page.locator('.session-file a[href$="long.md"]').click();
+    await expect(page.locator("#files-content h2")).toHaveCount(100);
+    const directory=page.locator('[data-file-directory="reports/deep"]');
+    await directory.evaluate(node=>{node.open=false;});await directory.evaluate(node=>{node.open=true;});
     await bottom.scrollIntoViewIfNeeded();
-    const panePositions = () => page.evaluate(() => {
-      const nav = document.querySelector(".artifact-list"), preview = document.querySelector(".artifact-view");
-      return {nav:nav.scrollTop, navHeight:nav.clientHeight, navContent:nav.scrollHeight,
-        preview:preview.scrollTop, panel:document.getElementById("artifacts").scrollTop, page:scrollY};
+    await page.locator(".files-view").evaluate(node=>{node.scrollTop=200;});
+    const scrollBefore=await page.locator("#session-files").evaluate(node=>node.scrollTop);
+    const contentScrollBefore=await page.locator(".files-view").evaluate(node=>node.scrollTop);
+    assert(scrollBefore>0&&contentScrollBefore>0,"Both panes must scroll independently");
+    const directoriesBefore=await page.locator("[data-file-directory]").evaluateAll(nodes=>nodes.map(node=>[node.dataset.fileDirectory,node.open]));
+    const selectionBefore=await page.locator("#files-content h2").first().evaluate(node=>{
+      window.retainedFileBody=node.closest(".source-file-body");
+      const range=document.createRange();range.selectNodeContents(node);
+      const selection=getSelection();selection.removeAllRanges();selection.addRange(range);return selection.toString();
     });
-    const beforeScroll = await panePositions();
-    assert(beforeScroll.navContent > beforeScroll.navHeight, JSON.stringify(beforeScroll));
-    await page.locator(".artifact-list").evaluate(node => {node.scrollTop -= 64;});
-    const afterScroll = await panePositions(), scrollBefore = afterScroll.nav;
-    assert(scrollBefore > 0 && scrollBefore < beforeScroll.nav, JSON.stringify({beforeScroll, afterScroll}));
-    for (const key of ["preview", "panel", "page"]) assert.equal(afterScroll[key], beforeScroll[key], JSON.stringify({beforeScroll, afterScroll}));
-    const directoriesBefore = await page.locator("[data-artifact-directory]").evaluateAll(nodes => nodes.map(node => [node.dataset.artifactDirectory, node.open]));
-    const reads = detailsReads; await page.evaluate(() => dispatchEvent(new Event("focus")));
-    await expect.poll(() => detailsReads).toBeGreaterThan(reads);
-    await expect.poll(() => page.locator(".artifact-list").evaluate(node => Number(/<!--refresh (\d+)-->/.exec(node.innerHTML)?.[1] || 0))).toBeGreaterThan(reads);
-    const afterRefresh = await panePositions();
-    assert.equal(afterRefresh.nav, scrollBefore, JSON.stringify({afterScroll, afterRefresh}));
-    for (const key of ["preview", "panel", "page"]) assert.equal(afterRefresh[key], afterScroll[key], JSON.stringify({afterScroll, afterRefresh}));
-    assert.deepEqual(await page.locator("[data-artifact-directory]").evaluateAll(nodes => nodes.map(node => [node.dataset.artifactDirectory, node.open])), directoriesBefore);
-    await expect(bottom).toHaveClass(/active/);
-    const geometry = await page.evaluate(() => ({nav:getComputedStyle(document.querySelector('.artifact-list')).overflowY, preview:getComputedStyle(document.querySelector('.artifact-view')).overflowY}));
-    assert.equal(geometry.nav, "auto"); assert.equal(geometry.preview, "auto");
-    removed = true; await page.evaluate(() => dispatchEvent(new Event("focus")));
-    await expect(page.locator('[data-artifact-path]')).toHaveCount(499);
-    await expect(page.locator("#artifact-download")).toBeHidden(); await expect(page.locator("#artifact-copy")).toBeDisabled();
-    await page.setViewportSize({width:390, height:844});
-    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-    await page.setViewportSize({width:1440, height:850});
+    await page.locator("#files-refresh").evaluate(node=>node.click());
+    await expect.poll(()=>filesReads).toBe(2);await expect(page.locator("#files-status")).toBeHidden();
+    assert.equal(await page.locator("#session-files").evaluate(node=>node.scrollTop),scrollBefore);
+    assert.equal(await page.locator(".files-view").evaluate(node=>node.scrollTop),contentScrollBefore);
+    assert.equal(await page.evaluate(()=>getSelection().toString()),selectionBefore);
+    assert(await page.evaluate(()=>document.querySelector("#files-content .source-file-body")===window.retainedFileBody));
+    await expect(page.locator('#session-files a[aria-current]')).toHaveText("long.md");
+    assert.deepEqual(await page.locator("[data-file-directory]").evaluateAll(nodes=>nodes.map(node=>[node.dataset.fileDirectory,node.open])),directoriesBefore);
+    failFiles=true;await page.locator("#files-refresh").evaluate(node=>node.click());
+    await expect(page.locator("#files-status")).toContainText("Session files could not be listed");
+    await expect(page.locator(".session-file")).toHaveCount(listed.files.length);
+    await expect(page.locator("#files-title")).toHaveText("long.md");
+    failFiles=false;await page.locator("#files-refresh").evaluate(node=>node.click());
+    await expect(page.locator("#files-status")).toBeHidden();
+    await page.setViewportSize({width:390,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    const treeBox=await page.locator("#session-files").boundingBox(),viewBox=await page.locator(".files-view").boundingBox();
+    assert(viewBox.y>=treeBox.y+treeBox.height,"Narrow Files panes must stack");
+    await page.setViewportSize({width:1440,height:850});
+    omittedFile="long.md";await page.locator("#files-refresh").evaluate(node=>node.click());
+    await expect(page.locator("#files-title")).toHaveText("Select a file");
+    await expect(page.locator("#files-copy")).toBeDisabled();await expect(page.locator("#files-download")).toBeHidden();
+    await expect(page.locator("#files-content")).toBeEmpty();
+    await expect(input).toHaveValue("Draft retained while browsing files");
 
     await page.locator('[data-session-tab="team"]').click();
     const form = page.locator('[data-direct-team-form][data-action="add"]');

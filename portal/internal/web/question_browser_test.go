@@ -1,12 +1,14 @@
 package web
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
@@ -37,12 +39,28 @@ func TestQuestionBrowser(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, directory, "active")
-	artifactPath := filepath.Join(directory, "reports", "deep", "499.md")
-	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
-		t.Fatal(err)
+	runWebGit(t, "init", "--initial-branch=master", server.config.Workspace)
+	for i := 0; i < 500; i++ {
+		path := filepath.Join(directory, "reports", "deep", fmt.Sprintf("%03d.md", i))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("# Original artifact bytes\r\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.WriteFile(artifactPath, []byte("# Original artifact bytes\r\n"), 0o644); err != nil {
-		t.Fatal(err)
+	image, imageErr := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=")
+	if imageErr != nil {
+		t.Fatal(imageErr)
+	}
+	for name, data := range map[string][]byte{
+		"preview.png": image,
+		"passive.svg": []byte(`<svg xmlns="http://www.w3.org/2000/svg" onload="window.passiveFileExecuted=true"></svg>`),
+		"long.md":     []byte(strings.Repeat("## Scrollable preview\n\nOriginal long file bytes.\n\n", 100)),
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	writeWebRuntimeAuthority(t, server, "example")
 	events := make(chan struct{}, 1)
@@ -110,19 +128,6 @@ func TestQuestionBrowser(t *testing.T) {
 			return
 		}
 
-		if r.URL.Path == "/fixture/artifact-tree" {
-			artifacts := make([]session.Artifact, 500)
-			for i := range artifacts {
-				artifacts[i] = session.Artifact{Path: fmt.Sprintf("reports/deep/%03d.md", i), Label: fmt.Sprintf("Report %d", i)}
-			}
-			if r.URL.Query().Get("remove") == "1" {
-				artifacts = artifacts[:499]
-			}
-			if err := server.templates.ExecuteTemplate(w, "artifact-list", pageData{Artifacts: artifacts}); err != nil {
-				t.Error(err)
-			}
-			return
-		}
 		if r.URL.Path == "/fixture/presentation" {
 			transcript := codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "default", Entries: []codex.TranscriptEntry{
 				{Kind: "userMessage", ItemID: "user", Text: "# User heading\n\n- item\n\n[Plan](" + filepath.Join(server.config.Workspace, "work", "example", "plan.md") + ":1)"},

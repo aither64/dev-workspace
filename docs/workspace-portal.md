@@ -118,49 +118,45 @@ and displays its revision. A link is a live reference, so later edits can move
 the referenced line. The viewer reports a missing line instead of selecting a
 different one.
 
-Untracked eligibility follows Git's standard excludes, including repository
-ignore files, local exclusions and the configured global ignore file.
+For repository links, untracked eligibility follows Git's standard excludes,
+including repository ignore files, local exclusions and the configured global
+ignore file.
 
 Shared workspace links show current contents of tracked and non-ignored
 untracked files. They can open documentation, the root
 `AGENTS.md`, scripts and notes without a session registration. The configured
 workspace must be the Git repository root. Files under `work/`, `archive/`,
 `worktrees/` and `repos/` are excluded from this shared reader so session files
-keep their session lookup and repository registration checks.
+keep their session lookup and repository checks.
 
-Session tracking links can open tracked and non-ignored untracked files beneath
-the session's tracking folder without artifact registration. Their links
-continue to work when tracking moves into `archive/`, provided the retained file
-is still eligible at its new path. Untracked project files are unavailable after
-their worktree is removed; the source viewer does not save them.
+Session tracking links can open every regular file beneath the session's
+`work/<slug>/` folder, including Git-ignored and unregistered files. Save files
+there directly; no Git repository, worktree or live Codex connection is required.
+After archival, the reader uses the preserved `archive/<slug>/` folder. The same
+session-relative URLs continue to open the retained files after archive and
+revive. Untracked project files outside this folder are unavailable after their
+worktree is removed; the source viewer does not save them.
 
-The built-in `plan.md` and `state.md`, and artifacts declared in `portal.yml`,
-retain explicit access even when Git ignores them or the workspace has no Git
-repository. Artifact paths are relative to the session tracking folder, such as
-`design.md` or `reports/result.json`. Opening a source link does not add the file
-to the artifact list or grant access through artifact preview/download endpoints.
+Paths are relative to the session tracking folder, such as `design.md` or
+`reports/result.json`. Existing artifact declarations and links remain supported
+without rewriting `portal.yml`. Labels are not displayed in Files and do not
+control file access. Retained manifests still validate their captions and paths;
+`name` remains a fallback when `label` is absent or blank. Repeated declarations
+do not create duplicate file rows or expand the accessible root.
 
-Repeated artifact paths are allowed. The portal shows one link per normalized
-relative path, using the first declaration's label and position. For example,
-`report.json` and `./report.json` refer to the same artifact. Every declaration
-must still have a nonempty label and a safe relative path. Browsing and validation
-leave the manifest unchanged.
+Older declarations and URLs starting with this session's `work/<slug>/` or
+`archive/<slug>/` prefix resolve to the session-relative file only when the
+literal nested file is missing and the session-relative file exists. An existing
+literal nested file takes precedence; other access errors do not fall back.
+Git metadata, symlinks, directories as files, special files and paths outside the
+session root are unavailable, including through old preview or download routes.
 
-Use `dev-session artifact add SLUG report.json --label "Report" --as-is` to
-register a file or update its caption. The command validates the complete
-manifest and replaces it atomically under the session locks. It refuses pending
-creation or lifecycle operations and detects a concurrent edit before replacement.
-It preserves repository and conversation metadata and does not create a session.
-
-Artifact readers also accept `name` as a caption when `label` is absent or blank.
-A nonempty `label` takes precedence. Writers use only `label`. Both spellings
-retain the same string and path validation; an alias cannot authorize files
-outside the tracking directory.
-
-Git-ignored untracked files require explicit artifact publication. Git metadata,
-symlinks, special files and files outside the authorized roots are unavailable.
-Text previews are limited to 512 KiB and 12,000 lines. Markdown files
-appear as source; binary files receive a notice instead of a text preview.
+Text previews are limited to 512 KiB and 12,000 lines. Complete Markdown can use
+a sanitized rendered preview, and PNG, JPEG, GIF and WebP images use their checked
+media type. Raw shows the original text. SVG, HTML and scripts remain passive
+source; they are never executed or embedded as active pages. Binary or limited
+content shows a preview-unavailable notice while retaining Download within its
+separate size limit.
 
 The viewer route is `/files/<slug>?repository=<id>&path=<relative-path>#L10`,
 or `/files/<slug>?artifact=<relative-path>#L10` for a session tracking file. The
@@ -170,7 +166,11 @@ returns `path`, `repository` when applicable, `source`, the archived `revision`
 when applicable, and a `content` object with the existing review preview fields.
 Source values are `worktree`, `archive`, `artifact` and `archived-artifact`.
 The `artifact` and `archived-artifact` values identify session tracking files,
-including those opened without publication.
+including unregistered files. Session responses can also include an optional
+`preview` object: `{kind: "markdown", html: "..."}` for sanitized Markdown, or
+`{kind: "image", url: "/artifact-previews/<slug>/<path>"}` for a supported raster
+image. The original `content` remains unchanged. Missing preview metadata falls
+back to raw source. Preview and image URLs use the same confined session root.
 Shared files use `/workspace-files?path=<relative-path>#L10` and
 `GET /api/workspace/file?path=<relative-path>`. This endpoint returns the same
 preview fields with `source: "workspace"` and no repository or revision. It
@@ -180,12 +180,33 @@ their current shared files rather than a historical version.
 Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
-Artifacts appear as compact file rows grouped by directory. Each row shows the
-filename; hover over it to see its label and relative path. On desktop, navigation
-and preview scroll independently. The selected file, open directories and
-navigation position survive status refreshes. **Copy content** copies raw text or
-Markdown. Image previews cannot be copied as text. Invalid UTF-8 uses replacement
-characters, matching the text preview.
+**Files** has a directory tree on the left and the selected file on the right.
+On narrow screens the panes stack. Each regular session file appears once under
+its filename, without registration labels or badges. The tree loads on first
+open; **Refresh** updates it. `#artifacts` opens Files too. Ordinary conversation
+refreshes do not scan the folder or reload the tree. The tab shows a count only
+after a successful listing.
+
+A plain click opens the file inline and keeps the conversation draft. Filename
+links retain a real standalone viewer URL, so modifier-click, middle-click and
+the browser's Open link in new tab action still work. Markdown and supported
+images open in Preview; other text opens in Raw. The icon controls have tooltips
+and accessible names for Raw/Preview, Copy and Download. Switching Raw/Preview
+uses the already fetched content. Copy uses the complete original text, including
+its line endings, and is unavailable for binary or limited previews. Download
+remains a real link to the original bytes.
+
+The panes scroll independently. Refresh preserves open directories, scroll
+positions and the selected path when it is still present. A removed selection
+clears its actions. Loading and errors stay in the file pane; an older selection's
+late response cannot replace the current file or its controls.
+
+`GET /api/sessions/<slug>/files` returns `{files: [{path: "..."}]}` with sorted
+session-relative paths. It enumerates metadata without reading file contents or
+consulting Git. The whole result is limited to 5,000 files or 4 MiB. An oversized
+or failed refresh keeps the last successful tree and reports the error rather
+than publishing a partial list. Opening, previewing or downloading a file checks
+the same confined session root again.
 
 Downloads use `GET /api/sessions/<slug>/file/download` and
 `GET /api/workspace/file/download` with the same query parameters and eligibility
