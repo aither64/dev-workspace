@@ -26,6 +26,7 @@ module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
   AGENT_TEAM_BINDING_PATTERN = /\Av1\.[A-Za-z0-9_-]+\.([0-9a-f]{64})\z/
   BLANK_ARTIFACT_CAPTION = /\A\p{Space}*\z/
+  ARTIFACT_REGISTRATION_NOTICE = 'File registration is no longer needed. Session files appear automatically in Files.'
 
   # JSON accepts duplicate object keys by default and keeps the last value.
   # Durable managed-creation authorities must reject that ambiguity at every
@@ -226,7 +227,8 @@ module DevSession
       dev-session worktree remove <name-or-slug> <name> [--as-is] [--force]
       dev-session worktree capture-comparison <name-or-slug> <name> [--as-is]
         [--base SHA --head SHA]
-      dev-session artifact add <name-or-slug> <path> --label TEXT [--as-is]
+      dev-session artifact add <name-or-slug> <path> [--label TEXT] [--as-is]
+        Deprecated: session files appear automatically in Files.
       dev-session team list <name-or-slug> [--as-is]
 	  dev-session team preset <name-or-slug> <package-team-id> [--as-is]
         [--model MODEL] [--effort EFFORT]
@@ -2586,58 +2588,8 @@ module DevSession
       value
     end
 
-    def artifact_add(input, path, label:, as_is:, expected_owner: nil)
-      slug = build_slug(input, as_is:)
-      unless path.is_a?(String) && label.is_a?(String) && !label.match?(BLANK_ARTIFACT_CAPTION)
-        raise Error, 'artifact requires a path and nonempty label'
-      end
-      clean = Pathname.new(path).cleanpath.to_s
-      if %w[plan.md state.md].include?(clean)
-        raise Error, 'plan.md and state.md are built-in artifacts'
-      end
-
-      with_creation_lock(slug) do
-        with_slug_lock(slug) do
-          select_tmux_for_slug!(slug)
-          reject_conflicting_lifecycle_journal!(slug)
-          validate_work_directory!(slug)
-          source = read_bounded_file(portal_file(slug), 'portal manifest', max_size: PORTAL_MANIFEST_MAX_SIZE)
-          manifest = load_portal_manifest(portal_file(slug), required: true)
-          require_ordinary_manifest_ready!(slug, manifest)
-          if expected_owner
-            unless expected_owner.is_a?(String) && expected_owner.match?(WorkspaceCoordination::UUID)
-              raise Error, 'artifact expected owner must be an exact coordination UUID'
-            end
-            retained = coordination_store.read['owners'][expected_owner]
-            stat = File.lstat(work_dir(slug))
-            identity = retained && WorkspaceCoordination.digest([workspace, retained['workspaceName'], slug,
-              stat.dev, stat.ino, manifest.dig('codex', 'thread_id'), WorkspaceCoordination.creation_identity(manifest)])
-            unless retained && retained['workspace'] == workspace && retained['slug'] == slug &&
-                   !retained['fence'] && retained['identity'] == identity
-              raise Error, 'artifact registration belongs to another session incarnation'
-            end
-          end
-          journal_path = creation_journal_file(slug)
-          if path_exists?(journal_path)
-            journal = read_private_json_object(
-              journal_path, 'creation journal', max_size: 64 * 1024, mode: 0o600
-            )
-            unless manifest.dig('creation', 'state') == 'ready' &&
-                   valid_stored_creation_journal?(journal, slug, manifest)
-              raise Error, "session creation is unfinished or invalid: #{slug}; retry dev-session start"
-            end
-          end
-          artifacts = manifest['artifacts'] ||= []
-          existing = artifacts.find { |item| Pathname.new(item.fetch('path')).cleanpath.to_s == clean }
-          if existing
-            existing['label'] = label
-          else
-            artifacts << { 'label' => label, 'path' => path }
-          end
-          write_portal_manifest(slug, manifest, expected_contents: source)
-        end
-      end
-      @out.puts "Registered artifact #{path}"
+    def artifact_add(input, path, label: nil, as_is:, expected_owner: nil)
+      @out.puts ARTIFACT_REGISTRATION_NOTICE
     end
 
     def worktree_add(input, project, as_is:, name:, branch:, base:, fetch:)
@@ -9388,6 +9340,11 @@ module DevSession
       command = @argv.shift
       raise Error, USAGE unless command
 
+      if command == 'artifact'
+        run_artifact
+        return 0
+      end
+
       @provider_read_only = %w[current list url validate quiesce].include?(command) ||
                             (command == 'tracking-sync' && @argv.include?('--status')) ||
                             (command == 'team' && @argv.first == 'list')
@@ -9470,8 +9427,6 @@ module DevSession
         run_url
       when 'worktree'
         run_worktree
-      when 'artifact'
-        run_artifact
       when 'team'
         run_team
       else
@@ -10130,9 +10085,8 @@ module DevSession
         parser.on('--expected-owner UUID') { |value| opts[:expected_owner] = value }
       end.parse!(@argv)
       require_arity!(2, @argv, 'artifact add')
-      raise Error, 'artifact add requires --label' unless opts[:label]
 
-      runner.artifact_add(@argv.fetch(0), @argv.fetch(1), **opts)
+      @out.puts ARTIFACT_REGISTRATION_NOTICE
     end
 
     def run_worktree

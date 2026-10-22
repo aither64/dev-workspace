@@ -69,7 +69,7 @@ the repository being integrated, immediately before these steps:
 1. Recheck the exact feature head, clean target checkout and current remote target.
 2. Perform the approved fast-forward merge and required hooks.
 3. Push normally and prove the resulting remote ref.
-4. Release immediately, before CI monitoring, records, artifact registration or
+4. Release immediately, before CI monitoring, record updates, handoff or
    disposable checkout cleanup.
 
 If the target moved, release and reconcile outside the claim. If a hook fails or

@@ -233,17 +233,17 @@ without generating another commit.
 Status includes phase, exact heads, job states, queue time, verification/preparation
 time and active administration time. Detailed timings live in the private journal.
 The session's compact integration summary and result record operation completion;
-the driver's final status also covers tracking publication. Records use the normal
-artifact writer and owned-path tracking commit, preserving unrelated shared files
-and index entries. Informational notification delivery does not gate integration
+the driver's final status also covers tracking publication. Records use the
+owned-path tracking commit, preserving unrelated shared files and index entries.
+Informational notification delivery does not gate integration
 completion or machine release; pending events remain visible and retry through
 the coordinator independently. Feature refs and sessions remain retained.
 Each run writes its summary, result and equivalence receipts beneath
 `work/SESSION/integration/RUN_UUID/`. These short writes require session admission
 and the original tracking incarnation, including when resuming finalization.
 Sensitive sessions retain these records locally and do not make a tracking commit.
-Artifact registration passes `--expected-owner UUID`; the ordinary manifest writer
-checks that incarnation under its own session lock before changing the catalog.
+File registration is unnecessary; the deprecated artifact add command only prints
+a notice and performs no mutation.
 
 Scheduling still verifies native thread ownership synchronously. Slow metadata
 requests can delay scheduler ticks even though notification delivery is separate.

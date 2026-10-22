@@ -24,10 +24,11 @@ link new material from the project's README or documentation index. Add a short
 pointer in repository instructions when agents would otherwise miss that entry
 point.
 
-Register useful session artifacts with
-`dev-session artifact add SLUG PATH --label "Caption" --as-is`. Use the validated
-atomic writer instead of editing `portal.yml` by hand; it preserves session
-identity and repository scope while updating the artifact catalog.
+Save useful session files beneath `work/<slug>/` and link them from the session
+records. They appear automatically in Files, including Git-ignored and
+unregistered regular files. After archival, Files uses the preserved
+`archive/<slug>/` root with the same session-relative URLs. File registration is
+unnecessary; `dev-session artifact add` only prints a notice and changes no files.
 
 For a sensitive session, keep its plan, state, notes, review evidence and handoff
 artifacts under its excluded tracking directory. Maintain them without tracking
