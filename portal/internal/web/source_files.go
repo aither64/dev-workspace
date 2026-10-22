@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"io"
 	"mime"
@@ -198,7 +199,7 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 	var result repository.SourceFile
 	if artifact := query.Get("artifact"); artifact != "" {
 		var err error
-		result, err = s.reviews().reader.TrackingSourceContent(r.Context(), summary, artifact, download)
+		result, err = s.trackingSourceContent(r.Context(), summary, artifact, download)
 		if s.sourceDownloadError(w, err) {
 			return
 		}
@@ -227,6 +228,52 @@ func (s *Server) sourceFile(w http.ResponseWriter, r *http.Request, summary *ses
 	s.serveSourceContent(w, result, download)
 }
 
+// The same confined opener serves the ordinary viewer and all legacy adapters.
+func (s *Server) trackingSourceContent(ctx context.Context, summary *session.Summary, path string, download bool) (repository.SourceFile, error) {
+	result, err := s.reviews().reader.TrackingSourceContent(ctx, summary, path, download)
+	if err != nil || download {
+		return result, err
+	}
+	if strings.EqualFold(filepath.Ext(result.Path), ".md") && !result.Content.Binary && !result.Content.Limited {
+		result.Preview = &repository.SourcePreview{Kind: "markdown", HTML: string(s.renderTextMarkdown(result.Content.Text))}
+	} else if _, image := artifactImageType(result.Path); image {
+		file, info, canonical, openErr := session.OpenTrackingFile(summary, result.Path)
+		if openErr != nil {
+			return result, openErr
+		}
+		defer file.Close()
+		if info.Size() <= repository.MaxSourceDownloadBytes {
+			if _, matches := sniffArtifactImage(file, canonical); matches {
+				result.Preview = &repository.SourcePreview{Kind: "image", URL: artifactImageURL(summary.Slug, canonical)}
+			}
+		}
+	}
+	return result, ctx.Err()
+}
+
+func artifactImageURL(slug, path string) string {
+	return "/artifact-previews/" + url.PathEscape(slug) + "/" + strings.ReplaceAll(url.PathEscape(path), "%2F", "/")
+}
+
+func artifactImageType(path string) (string, bool) {
+	types := map[string]string{".gif": "image/gif", ".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+	value, ok := types[strings.ToLower(filepath.Ext(path))]
+	return value, ok
+}
+
+func sniffArtifactImage(file io.Reader, path string) (string, bool) {
+	expected, allowed := artifactImageType(path)
+	if !allowed {
+		return "", false
+	}
+	var head [512]byte
+	count, err := file.Read(head[:])
+	if err != nil && err != io.EOF {
+		return "", false
+	}
+	return expected, count > 0 && http.DetectContentType(head[:count]) == expected
+}
+
 func (s *Server) trackingFiles(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
 	files, err := s.reviews().reader.TrackingFiles(r.Context(), summary)
 	if err != nil {
@@ -242,7 +289,7 @@ func (s *Server) trackingFiles(w http.ResponseWriter, r *http.Request, summary *
 }
 
 func (s *Server) sourceUnavailable(w http.ResponseWriter) {
-	s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the session, is tracked or not ignored by Git, or is a published artifact."})
+	s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This file is unavailable. Check that it exists in the session or registered repository."})
 }
 
 // Reject malformed legacy paths before ServeMux can clean or redirect them.

@@ -5,11 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -30,11 +27,19 @@ const (
 )
 
 type SourceFile struct {
-	Path       string     `json:"path"`
-	Repository string     `json:"repository,omitempty"`
-	Source     SourceKind `json:"source"`
-	Revision   string     `json:"revision,omitempty"`
-	Content    ReviewBlob `json:"content"`
+	Path       string         `json:"path"`
+	Repository string         `json:"repository,omitempty"`
+	Source     SourceKind     `json:"source"`
+	Revision   string         `json:"revision,omitempty"`
+	Content    ReviewBlob     `json:"content"`
+	Preview    *SourcePreview `json:"preview,omitempty"`
+}
+
+// SourcePreview is optional presentation metadata; Content retains original bytes.
+type SourcePreview struct {
+	Kind string `json:"kind"`
+	HTML string `json:"html,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 func ValidSourcePath(path string) bool {
@@ -98,9 +103,8 @@ func (r ReviewReader) workspaceSourceRoot(ctx context.Context) error {
 	return nil
 }
 
-// TrackingSource preserves explicit artifact access and also admits ordinary
-// workspace files beneath the session's actual tracking root. The artifact
-// source values are retained for existing viewer clients.
+// TrackingSource reads only the selected session's current tracking root.
+// Artifact source values remain compatible with existing viewer clients.
 func (r ReviewReader) TrackingSource(ctx context.Context, summary *session.Summary, path string) (SourceFile, error) {
 	return r.TrackingSourceContent(ctx, summary, path, false)
 }
@@ -111,122 +115,47 @@ type TrackingFile struct {
 	Registered bool   `json:"registered"`
 }
 
-// TrackingFiles enumerates metadata only. Opening a row still revalidates through
-// TrackingSourceContent; listing never publishes files into the artifact catalog.
+// TrackingFiles enumerates metadata only, independently of Git and registration.
+// Every content request reopens the selected file through the same confinement.
 func (r ReviewReader) TrackingFiles(ctx context.Context, summary *session.Summary) ([]TrackingFile, error) {
-	if summary.Workspace != r.Workspace || !session.ValidSlug(summary.Slug) ||
-		(summary.Root != "work" && summary.Root != "archive") {
+	if summary == nil || summary.Workspace != r.Workspace {
 		return nil, errors.New("invalid session tracking root")
 	}
-	files := make(map[string]TrackingFile)
-	for _, item := range session.AvailableArtifacts(summary) {
-		if !ValidSourcePath(item.Path) {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		file, _, err := session.OpenRegularFile(r.Workspace, filepath.Join(summary.Root, summary.Slug, item.Path))
-		if err != nil {
-			continue
-		}
-		file.Close()
-		files[item.Path] = TrackingFile{Path: item.Path, Label: item.Label,
-			Registered: item.Path != "plan.md" && item.Path != "state.md"}
-	}
-	// Explicit publication works without a workspace Git repository, as does its
-	// existing source reader. Ordinary discovery still requires a verified root.
-	_, gitErr := os.Lstat(filepath.Join(r.Workspace, ".git"))
-	if !errors.Is(gitErr, os.ErrNotExist) {
-		if err := r.workspaceSourceRoot(ctx); err != nil {
-			return nil, err
-		}
-		prefix := filepath.ToSlash(filepath.Join(summary.Root, summary.Slug)) + "/"
-		tracked, err := r.git(ctx, r.Workspace, maxReviewOutput, "--literal-pathspecs", "ls-files", "--stage", "-z", "--", strings.TrimSuffix(prefix, "/"))
-		if err != nil {
-			return nil, err
-		}
-		candidates := make(map[string]struct{})
-		for _, entry := range strings.Split(strings.TrimSuffix(string(tracked), "\x00"), "\x00") {
-			if entry == "" {
-				continue
-			}
-			metadata, path, ok := strings.Cut(entry, "\t")
-			fields := strings.Fields(metadata)
-			if !ok || len(fields) != 3 {
-				return nil, errors.New("invalid tracked file listing")
-			}
-			if regularGitMode(fields[0]) {
-				candidates[path] = struct{}{}
-			}
-		}
-		args, err := r.sourceExcludesArgs(ctx, r.Workspace)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", strings.TrimSuffix(prefix, "/"))
-		untracked, err := r.git(ctx, r.Workspace, maxReviewOutput, args...)
-		if err != nil {
-			return nil, err
-		}
-		for _, path := range strings.Split(strings.TrimSuffix(string(untracked), "\x00"), "\x00") {
-			if path != "" {
-				candidates[path] = struct{}{}
-			}
-		}
-		if len(tracked)+len(untracked) > maxReviewOutput || len(candidates) > maxReviewFiles {
-			return nil, ErrReviewLimit
-		}
-		for path := range candidates {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			relative, ok := strings.CutPrefix(path, prefix)
-			if !ok || !ValidSourcePath(relative) {
-				continue
-			}
-			if _, found := files[relative]; found {
-				continue
-			}
-			file, _, err := session.OpenRegularFile(r.Workspace, path)
-			if err != nil {
-				continue
-			}
-			file.Close()
-			files[relative] = TrackingFile{Path: relative}
-		}
-	}
-	if len(files) > maxReviewFiles {
+	paths, err := session.ListTrackingFiles(ctx, summary, maxReviewFiles, maxReviewOutput)
+	if errors.Is(err, session.ErrTrackingFilesLimit) {
 		return nil, ErrReviewLimit
 	}
-	result := make([]TrackingFile, 0, len(files))
-	for _, item := range files {
-		result = append(result, item)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	result := make([]TrackingFile, 0, len(paths))
+	for _, path := range paths {
+		result = append(result, TrackingFile{Path: path})
+	}
 	return result, nil
 }
 
 func (r ReviewReader) TrackingSourceContent(ctx context.Context, summary *session.Summary, path string, download bool) (SourceFile, error) {
 	result := SourceFile{Path: path, Source: SourceArtifact}
-	if summary.Archived {
+	if summary != nil && summary.Archived {
 		result.Source = SourceArchivedArtifact
 	}
-	file, info, err := session.OpenArtifact(summary, path, math.MaxInt64)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if summary == nil || summary.Workspace != r.Workspace {
+		return result, errors.New("invalid session tracking root")
+	}
+	file, info, canonical, err := session.OpenTrackingFile(summary, path)
+	if err != nil {
+		return result, err
+	}
+	defer file.Close()
+	result.Path = canonical
+	result.Content, err = readSourceContent(file, info.Size(), download)
 	if err == nil {
-		defer file.Close()
-		result.Path = session.ArtifactRelativePath(summary, path)
-		result.Content, err = readSourceContent(file, info.Size(), download)
-		return result, err
+		err = ctx.Err()
 	}
-	if summary.Workspace != r.Workspace || !session.ValidSlug(summary.Slug) ||
-		(summary.Root != "work" && summary.Root != "archive") || !ValidSourcePath(path) {
-		return result, errors.New("invalid session source path")
-	}
-	if err := r.workspaceSourceRoot(ctx); err != nil {
-		return result, err
-	}
-	result.Content, err = r.workingSourceContent(ctx, "", filepath.Join(summary.Root, summary.Slug, path), download)
 	return result, err
 }
 

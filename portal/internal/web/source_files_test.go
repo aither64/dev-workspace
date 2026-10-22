@@ -223,14 +223,14 @@ func TestSourceTrackingFilesDoNotRequireArtifactPublication(t *testing.T) {
 			t.Fatalf("tracking source %q = %#v", path, file)
 		}
 	}
-	readSource(t, s, "?artifact=private.secret", 404)
+	readSource(t, s, "?artifact=private.secret", 200)
 	readSource(t, s, "?artifact=missing.md", 404)
 	readSource(t, s, "?artifact=reports", 404)
 	readSource(t, s, "?artifact=.git/config", 404)
-	// A retained own-workspace prefix is a publication alias when its literal
-	// nested file is absent; direct source links do not publish unrelated files.
+	// A retained own-workspace prefix aliases a missing literal nested file.
+	// Both source and legacy preview routes read unregistered session files.
 	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=design.md", "", 200)
-	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=reports/new%20space%20%C5%BE.md", "", 404)
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=reports/new%20space%20%C5%BE.md", "", 200)
 	if err := os.Symlink("design.md", filepath.Join(tracking, "link.md")); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestSourceTrackingFilesDoNotRequireArtifactPublication(t *testing.T) {
 	}
 	readSource(t, s, "?artifact=link.md", 404)
 	readSource(t, s, "?artifact=fifo", 404)
-	// Explicit publication continues to authorize ignored artifacts.
+	// Legacy publication metadata remains readable but does not govern access.
 	manifest += "  - label: Published report\n    path: private.secret\n"
 	write("portal.yml", manifest)
 	readSource(t, s, "?artifact=private.secret", 200)
@@ -286,8 +286,8 @@ func TestSourceFilesRespectConfiguredGlobalExcludes(t *testing.T) {
 	}
 	readSource(t, s, sourceQuery("private.env"), 404)
 	readWorkspaceSource(t, s, "private.env", 404)
-	readSource(t, s, "?artifact=private.env", 404)
-	// Existing index/publication authorization remains independent of excludes.
+	readSource(t, s, "?artifact=private.env", 200)
+	// Repository/workspace index eligibility stays independent of session files.
 	runWebGit(t, "-C", worktree, "add", "--force", "private.env")
 	runWebGit(t, "-C", root, "add", "--force", "private.env")
 	readSource(t, s, sourceQuery("private.env"), 200)
@@ -325,7 +325,7 @@ func TestSourceFilesUseArchivedFinalCommitAndCuratedArtifacts(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tracking, "private.md"), []byte("not published"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	readSource(t, s, "?artifact=private.md", 404)
+	readSource(t, s, "?artifact=private.md", 200)
 	manifest, err := os.ReadFile(filepath.Join(tracking, "portal.yml"))
 	if err != nil {
 		t.Fatal(err)
@@ -422,6 +422,10 @@ func TestSourceArtifactsFollowCatalogPathContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		query := "?" + url.Values{"artifact": {path}}.Encode()
+		if strings.Contains(path, ".git/") || strings.Contains(path, "\\") {
+			readSource(t, s, query, 404)
+			continue
+		}
 		if got := readSource(t, s, query, 200); got.Content.Text != "# Published artifact\n" || got.Path != filepath.Clean(path) {
 			t.Fatalf("artifact %q: %#v", path, got)
 		}
@@ -550,7 +554,7 @@ func TestUserMarkdownUsesDecoratedTextWithoutChangingCanonicalInput(t *testing.T
 	}
 }
 
-func TestTrackingFilesListUsesExistingSourceEligibility(t *testing.T) {
+func TestTrackingFilesListIncludesIgnoredAndUnregistered(t *testing.T) {
 	s, _, _, _ := reviewWebFixture(t)
 	root := s.config.Workspace
 	runWebGit(t, "init", "--initial-branch=master", root)
@@ -604,22 +608,23 @@ func TestTrackingFilesListUsesExistingSourceEligibility(t *testing.T) {
 		rows[row.Path] = row
 		readSource(t, s, "?"+url.Values{"artifact": {row.Path}}.Encode(), 200)
 	}
-	for _, path := range []string{"tracked.sh", "registered.sh", "notes/a space.py", "design.md"} {
+	for _, path := range []string{"tracked.sh", "registered.sh", "notes/a space.py", "design.md", "ignored.sh", "global.secret", "private.excluded"} {
 		if _, ok := rows[path]; !ok {
 			t.Fatalf("eligible file missing: %q (%s)", path, encoded)
 		}
 	}
-	for _, path := range []string{"ignored.sh", "global.secret", "private.excluded", "link.md", "pipe.txt", "work/example/design.md"} {
+	for _, path := range []string{"link.md", "pipe.txt", "work/example/design.md"} {
 		if _, ok := rows[path]; ok {
 			t.Fatalf("ineligible/duplicate file listed: %q", path)
 		}
 	}
-	if rows["design.md"].Label != "First label" || !rows["registered.sh"].Registered || rows["tracked.sh"].Registered {
-		t.Fatal("registration projection changed")
+	for _, row := range listed {
+		if row.Label != "" || row.Registered {
+			t.Fatal("listing projected obsolete registration metadata")
+		}
 	}
-	// Scripts remain unavailable through legacy rich preview, but the ordinary
-	// viewer and original-byte download accept the existing publication.
-	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=registered.sh", "", 415)
+	// Scripts remain passive text in both the legacy preview and source viewer.
+	reviewRequest(t, s, "GET", "/api/sessions/example/artifact-preview?path=registered.sh", "", 200)
 	raw := httptest.NewRecorder()
 	s.Handler().ServeHTTP(raw, httptest.NewRequest("GET", "/api/sessions/example/file/download?artifact=registered.sh", nil))
 	if raw.Code != 200 || raw.Body.String() != "registered original\r\n" || raw.Header().Get("Content-Type") != "application/octet-stream" {
@@ -674,7 +679,7 @@ func TestTrackingFilesRegisteredFallbackAndArchiveAlias(t *testing.T) {
 		if err := json.Unmarshal(encoded, &rows); err != nil {
 			t.Fatal(err)
 		}
-		if len(rows) != 3 {
+		if len(rows) != 5 {
 			t.Fatalf("no-Git files: %s", encoded)
 		}
 		for _, row := range rows {
@@ -682,7 +687,7 @@ func TestTrackingFilesRegisteredFallbackAndArchiveAlias(t *testing.T) {
 		}
 		readSource(t, s, "?artifact=work/example/view.sh", 200)
 		readSource(t, s, "?artifact=archive/example/view.sh", 200)
-		readSource(t, s, "?artifact=unregistered.py", 404)
+		readSource(t, s, "?artifact=unregistered.py", 200)
 	}
 	check()
 	writeWebTrackingFiles(t, tracking, "complete")
@@ -705,18 +710,18 @@ func TestTrackingFilesRefusesOversizedWholeResult(t *testing.T) {
 			s, _, _, _ := reviewWebFixture(t)
 			root := s.config.Workspace
 			runWebGit(t, "init", "--initial-branch=master", root)
-			var index strings.Builder
 			count, prefix := 5001, ""
 			if outputBound {
 				count, prefix = 4500, strings.Repeat("long/", 200)
 			}
-			for i := 0; i < count; i++ {
-				fmt.Fprintf(&index, "100644 %s\twork/example/%s%04d.txt\n", strings.Repeat("a", 40), prefix, i)
+			directory := filepath.Join(root, "work", "example", prefix)
+			if err := os.MkdirAll(directory, 0755); err != nil {
+				t.Fatal(err)
 			}
-			cmd := exec.Command("git", "-C", root, "update-index", "--index-info")
-			cmd.Stdin = strings.NewReader(index.String())
-			if output, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("index: %v %s", err, output)
+			for i := 0; i < count; i++ {
+				if err := os.WriteFile(filepath.Join(directory, fmt.Sprintf("%04d.txt", i)), nil, 0644); err != nil {
+					t.Fatal(err)
+				}
 			}
 			response := httptest.NewRecorder()
 			s.Handler().ServeHTTP(response, httptest.NewRequest("GET", "/api/sessions/example/files", nil))

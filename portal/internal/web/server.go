@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -1737,24 +1738,6 @@ func (s *Server) artifactImage(w http.ResponseWriter, r *http.Request) {
 	s.serveArtifactFile(w, r, remainder, true)
 }
 
-func artifactContentType(path string) (string, string, bool) {
-	extension := strings.ToLower(filepath.Ext(path))
-	types := map[string]struct {
-		kind        string
-		contentType string
-	}{
-		".gif": {"image", "image/gif"}, ".jpeg": {"image", "image/jpeg"},
-		".jpg": {"image", "image/jpeg"}, ".png": {"image", "image/png"},
-		".webp": {"image", "image/webp"}, ".json": {"text", "application/json"},
-		".log":  {"text", "text/plain; charset=utf-8"},
-		".md":   {"markdown", "text/markdown; charset=utf-8"},
-		".txt":  {"text", "text/plain; charset=utf-8"},
-		".yaml": {"text", "application/yaml"}, ".yml": {"text", "application/yaml"},
-	}
-	presentation, ok := types[extension]
-	return presentation.kind, presentation.contentType, ok
-}
-
 func (s *Server) serveArtifactFile(w http.ResponseWriter, r *http.Request, remainder string, imageOnly bool) {
 	parts := strings.SplitN(remainder, "/", 2)
 	if len(parts) != 2 {
@@ -1766,60 +1749,67 @@ func (s *Server) serveArtifactFile(w http.ResponseWriter, r *http.Request, remai
 		http.NotFound(w, r)
 		return
 	}
-	file, info, err := session.OpenArtifact(summary, parts[1], 10*1024*1024)
+	if !imageOnly {
+		result, err := s.trackingSourceContent(r.Context(), summary, parts[1], true)
+		if s.sourceDownloadError(w, err) {
+			return
+		}
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.serveSourceContent(w, result, true)
+		return
+	}
+	file, info, canonical, err := session.OpenTrackingFile(summary, parts[1])
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer file.Close()
-	kind, contentType, allowed := artifactContentType(parts[1])
-	if !allowed || (imageOnly && kind != "image") {
+	if info.Size() > repository.MaxSourceDownloadBytes {
+		s.sourceDownloadError(w, repository.ErrSourceDownloadLimit)
+		return
+	}
+	contentType, allowed := sniffArtifactImage(file, canonical)
+	if !allowed {
 		http.Error(w, "artifact type is not available", http.StatusUnsupportedMediaType)
 		return
 	}
-	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
-	w.Header().Set("Content-Type", contentType)
-	disposition := "attachment"
-	if imageOnly {
-		disposition = "inline"
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		http.NotFound(w, r)
+		return
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=%q", disposition, info.Name()))
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": filepath.Base(canonical)}))
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 }
 
 func (s *Server) artifactPreview(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
-	path := strings.TrimSpace(r.URL.Query().Get("path"))
-	kind, _, allowed := artifactContentType(path)
-	if !allowed {
-		s.writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "artifact type is not available"})
-		return
-	}
-	file, _, err := session.OpenArtifact(summary, path, 10*1024*1024)
+	path := r.URL.Query().Get("path")
+	result, err := s.trackingSourceContent(r.Context(), summary, path, false)
 	if err != nil {
 		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "artifact is not available"})
 		return
 	}
-	defer file.Close()
-	if kind == "image" {
-		s.writeJSON(w, http.StatusOK, map[string]string{
-			"kind": "image", "url": "/artifact-previews/" +
-				url.PathEscape(summary.Slug) + "/" + strings.ReplaceAll(url.PathEscape(path), "%2F", "/"),
-		})
+	if result.Preview != nil {
+		preview := map[string]string{"kind": result.Preview.Kind}
+		if result.Preview.Kind == "image" {
+			preview["url"] = result.Preview.URL
+		} else {
+			preview["html"] = result.Preview.HTML
+			preview["text"] = result.Content.Text
+		}
+		s.writeJSON(w, http.StatusOK, preview)
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(file, 10*1024*1024+1))
-	if err != nil || len(data) > 10*1024*1024 {
-		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to read artifact"})
+	if result.Content.Binary || result.Content.Limited {
+		s.writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "artifact type is not available"})
 		return
 	}
-	text := strings.ToValidUTF8(string(data), "�")
-	if kind == "markdown" {
-		s.writeJSON(w, http.StatusOK, map[string]string{
-			"kind": "markdown", "html": string(s.renderTextMarkdown(text)), "text": text,
-		})
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"kind": "text", "text": text})
+	s.writeJSON(w, http.StatusOK, map[string]string{"kind": "text", "text": result.Content.Text})
 }
 
 func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {

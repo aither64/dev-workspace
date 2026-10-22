@@ -494,8 +494,8 @@ func TestArtifactsUseAPassiveAllowlistAndDownloadDisposition(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/artifacts/example/report"+extension, nil)
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, request)
-			if response.Code != http.StatusUnsupportedMediaType {
-				t.Fatalf("status = %d", response.Code)
+			if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" || !strings.HasPrefix(response.Header().Get("Content-Disposition"), "attachment;") {
+				t.Fatalf("passive attachment = %d %v", response.Code, response.Header())
 			}
 		})
 	}
@@ -572,6 +572,9 @@ func TestArtifactPreviewRendersSanitizedMarkdownAndEscapedText(t *testing.T) {
 func TestArtifactImagePreviewIsInlineAndStillConfined(t *testing.T) {
 	server := newTestServer(t)
 	writeArtifactSession(t, server.config.Workspace, "image.png")
+	if err := os.WriteFile(filepath.Join(server.config.Workspace, "work", "example", "image.png"), []byte("\x89PNG\r\n\x1a\nfixture"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(
 		http.MethodGet, "/api/sessions/example/artifact-preview?path=image.png", nil,
