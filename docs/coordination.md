@@ -88,8 +88,9 @@ Required hooks and signature checks remain enabled.
 
 Machine reservations are separate: build and copy artifacts before ownership when
 supported, then acquire only the physical machine near activation. Keep its
-reservation through deployment, live review and feedback. Do not bundle repository
-claims into a deployment reservation.
+reservation until deployment verification and integration are complete under the
+release rule below. Do not bundle repository claims into a deployment
+reservation.
 
 This is cooperative locking. Tools do not intercept arbitrary commands. The claim
 certifies exclusive integration or deployment ownership, not command success.
@@ -108,9 +109,9 @@ dev-session coordination cancel-claim SESSION --as-is --id CLAIM_UUID --json
 
 Release settles a held claim. Cancellation settles a waiting request. Both are
 owner-only and idempotent; cancellation cannot release held resources. Machine
-ownership follows the retention rule below through human review, feedback and
-repeated deployment. Release grants no merge approval. Session completion still
-follows its normal exact-head integration requirements.
+ownership follows the deployment and integration rule below. Release grants no
+merge approval. Session completion still follows its normal exact-head
+integration requirements.
 
 For workspace profile activation, hold a claim covering the configured profile
 machine and run ordinary `workspace-host switch --source PATH` with
@@ -121,18 +122,19 @@ remain workspace-host responsibilities.
 
 ## Machine retention
 
-Retain every deployed physical machine until all three conditions are met:
+Promptly release each deployed physical machine once both conditions are met:
 
-1. Its deployed feature lineage is integrated into the approved remote default
-   branches, including deployed dependencies.
-2. The user accepts the resulting UI or behavior on that machine.
-3. The user explicitly directs release of that machine.
+1. Deployment and its effects have been verified, with no unfinished or uncertain
+   command effects.
+2. Its complete deployed feature lineage is integrated into the approved remote
+   default branches, including deployed dependencies.
 
-Idle time, review, feedback, redeployment, disconnects and turn completion do not
-permit release. Review, CI and source completion do not establish user acceptance;
-record the accepted environment and result. Default-branch integration needs its
-own explicit approval. Deployment approval supplies neither merge approval nor
-release direction. Missing evidence keeps the machine held.
+The owning agent runs the normal release command without waiting for separate
+UI acceptance or release direction. No background worker or timer is involved.
+Failed or uncertain deployment and missing integration evidence keep the machine
+held. Idle time and turn completion do not establish either condition.
+Default-branch integration still needs separate explicit approval. A later
+deployment requires fresh machine ownership.
 
 Use existing rollout and review receipts for exact system/profile store paths,
 complete source/input graphs, canonical repository/target mapping and machine
@@ -141,15 +143,17 @@ ancestry evidence. Retain reviewed old/new base/head ranges, range-diff or
 patch-equivalence evidence and migration lineage when history changes. Do not
 describe a nonancestor deployed commit as literally merged. An independently
 proven equivalent successor can establish integrated feature lineage; a
-substantive successor requires redeployment and renewed user acceptance. Ordinary
-session completion still requires every registered exact final feature head.
+substantive successor requires a new verified deployment. Ordinary session
+completion still requires every registered exact final feature head.
 
 Before release, inspect authoritative status for the exact claim owned by this
-session, reconcile known command effects, verify all three conditions, release
-that claim and verify its resulting state. The cooperative owner-only, idempotent
-release API does not enforce this human workflow. Do not introduce release
-receipts, edit claim records or infer acceptance to bypass a missing condition.
-Keep short repository merge claims separate from machine ownership.
+session, reconcile unfinished or uncertain command effects, verify deployment
+and integrated lineage, release that claim and verify its resulting state. The
+cooperative owner-only, idempotent release API does not enforce these
+prerequisites. Do not introduce release receipts or edit claim records to bypass
+a missing condition. Keep short repository merge claims separate from machine
+ownership. Release does not archive, delete, stop or clean a session; each
+lifecycle action retains its separate authorization boundary.
 
 ## Interruption and lifecycle
 

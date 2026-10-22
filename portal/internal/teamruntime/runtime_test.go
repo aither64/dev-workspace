@@ -2358,15 +2358,27 @@ func TestMemberPolicyBindsSessionAndRetainsInstructions(t *testing.T) {
 		!strings.HasSuffix(policy.DeveloperInstructions, member.Instructions) {
 		t.Fatalf("member policy = %#v", policy)
 	}
-	for _, required := range []string{"Retain every deployed physical machine", "user accepts the resulting UI/behavior", "user explicitly directs its release", "before CI, records or cleanup"} {
-		if !strings.Contains(policy.DeveloperInstructions, required) {
-			t.Errorf("member policy missing %q", required)
-		}
-	}
+
 	legacy := Member{Role: "reviewer", Address: "reviewer0", Behavior: "reviewer", Access: "read_only"}
 	legacyPolicy, err := memberPolicy("/srv/workspace", "2026-09-24-example", legacy)
 	if err != nil || !strings.HasSuffix(legacyPolicy.DeveloperInstructions, legacyBehaviorInstructions["reviewer"]) {
 		t.Fatalf("legacy member instructions = %#v, %v", legacyPolicy, err)
+	}
+	for _, text := range []string{policy.DeveloperInstructions, legacyPolicy.DeveloperInstructions} {
+		for _, required := range []string{"Promptly release every deployed physical machine", "deployment and its effects are verified",
+			"complete deployed feature lineage is integrated into approved remote defaults", "Do not wait for separate UI acceptance or release direction",
+			"exact claim owned by this session", "reconcile unfinished or uncertain command effects", "verify its resulting state",
+			"Integration needs separate explicit approval", "does not authorize archiving, deleting, stopping or cleaning a session",
+			"before CI, records or cleanup"} {
+			if !strings.Contains(text, required) {
+				t.Errorf("member policy missing %q", required)
+			}
+		}
+		for _, obsolete := range []string{"user accepts the resulting UI/behavior", "user explicitly directs its release", "verify all three conditions"} {
+			if strings.Contains(text, obsolete) {
+				t.Errorf("member policy retained obsolete gate %q", obsolete)
+			}
+		}
 	}
 	for _, invalid := range []string{"", "bad\x00prompt", string([]byte{0xff})} {
 		member.Instructions = invalid

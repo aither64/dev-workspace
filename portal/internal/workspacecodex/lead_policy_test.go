@@ -45,19 +45,21 @@ func TestFallbackLeadDelegatesExecutionAndDistinguishesMissingMembers(t *testing
 	}
 }
 
-func TestCoordinationPolicyRequiresDeployedMachineIntegrationAcceptanceAndRelease(t *testing.T) {
+func TestCoordinationPolicyReleasesVerifiedDeploymentAfterIntegration(t *testing.T) {
 	for _, role := range []string{"", "Retain this saved role exactly."} {
 		policy := LeadThreadPolicy("2026-10-21-example", "/workspace", role)
 		for _, required := range []string{
-			"Retain every deployed physical machine", "deployed feature lineage is integrated into approved remote defaults",
-			"user accepts the resulting UI/behavior on that machine", "user explicitly directs its release",
-			"Idle time, review, feedback, redeployment, disconnects and turn completion never authorize release",
-			"missing evidence keeps the machine held", "Integration needs separate explicit approval",
-			"exact system/profile store paths", "complete source/input graphs", "repository/target and machine aliases",
-			"fresh remote ancestry evidence", "reviewed old/new base/head ranges", "equivalence and migration evidence",
-			"do not call a nonancestor deployed commit literally merged", "substantive successor needs redeployment and renewed user acceptance",
-			"Record the accepted environment/result", "review or CI is not user acceptance",
-			"exact claim owned by this session", "verify all three conditions", "verify its resulting state",
+			"Promptly release every deployed physical machine", "deployment and its effects are verified",
+			"complete deployed feature lineage is integrated into approved remote defaults",
+			"Do not wait for separate UI acceptance or release direction",
+			"Failed or uncertain deployment, unfinished command effects or missing integration evidence keep the machine held",
+			"Integration needs separate explicit approval", "exact system/profile store paths", "complete source/input graphs",
+			"repository/target and machine aliases", "fresh remote ancestry evidence", "reviewed old/new base/head ranges",
+			"equivalence and migration evidence", "do not call a nonancestor deployed commit literally merged",
+			"substantive successor needs a new verified deployment", "exact claim owned by this session",
+			"reconcile unfinished or uncertain command effects", "verify deployment and integrated lineage",
+			"release that claim and verify its resulting state", "later deployment requires fresh machine ownership",
+			"does not authorize archiving, deleting, stopping or cleaning a session",
 			"Legacy automatic lifecycle release is implementation behavior", "original recovery contracts",
 			"Independent feature work needs no repository claim", "before CI, records or cleanup",
 		} {
@@ -65,6 +67,13 @@ func TestCoordinationPolicyRequiresDeployedMachineIntegrationAcceptanceAndReleas
 				t.Errorf("generated policy missing %q", required)
 			}
 		}
+		for _, obsolete := range []string{"user accepts the resulting UI/behavior", "user explicitly directs its release",
+			"renewed user acceptance", "verify all three conditions"} {
+			if strings.Contains(policy.DeveloperInstructions, obsolete) {
+				t.Errorf("obsolete human gate %q", obsolete)
+			}
+		}
+
 		if role != "" && !strings.HasSuffix(policy.DeveloperInstructions, "\n\n"+role) {
 			t.Fatal("technical policy rewrote saved role")
 		}

@@ -36,13 +36,13 @@ const CoordinationInstructions = "Before merging or deploying, read the selected
 	"Keep its critical section to the fresh target check, merge with required hooks, push and remote verification; explicitly release ownership before CI, records or cleanup. " +
 	"Shared workspace master integration also takes dev-session-tracking.lock after the claim; if that lock is busy, release the claim instead of waiting. " +
 	"If preparation is stale or needs intervention, stop commands, inspect effects and release before repairing outside the claim. Reconcile uncertain mutations before release. " +
-	"Never hold a repository claim while waiting for approval, review or tests. Use separate machine reservations for deployment and live review, with builds and copies prepared beforehand. " +
-	"Retain every deployed physical machine until its deployed feature lineage is integrated into approved remote defaults, the user accepts the resulting UI/behavior on that machine, and the user explicitly directs its release. " +
-	"Idle time, review, feedback, redeployment, disconnects and turn completion never authorize release; missing evidence keeps the machine held. Integration needs separate explicit approval. " +
+	"Never hold a repository claim while waiting for approval, review or tests. Use separate machine reservations for deployment and verification, with builds and copies prepared beforehand. " +
+	"Promptly release every deployed physical machine once deployment and its effects are verified and its complete deployed feature lineage is integrated into approved remote defaults. " +
+	"Do not wait for separate UI acceptance or release direction. Failed or uncertain deployment, unfinished command effects or missing integration evidence keep the machine held. Integration needs separate explicit approval. " +
 	"Keep exact system/profile store paths, complete source/input graphs, repository/target and machine aliases, deployed/final heads and fresh remote ancestry evidence in existing rollout/review receipts. " +
-	"For refreshed history, retain reviewed old/new base/head ranges, equivalence and migration evidence; do not call a nonancestor deployed commit literally merged. An independently proven equivalent successor can establish integrated lineage; a substantive successor needs redeployment and renewed user acceptance. " +
-	"Record the accepted environment/result; review or CI is not user acceptance. Before release, inspect authoritative status for the exact claim owned by this session, reconcile known command effects, verify all three conditions, release that claim and verify its resulting state. " +
-	"Legacy automatic lifecycle release is implementation behavior, not permission to archive, delete or release a machine. Preserve original recovery contracts and ordinary exact-final-head completion rules. " +
+	"For refreshed history, retain reviewed old/new base/head ranges, equivalence and migration evidence; do not call a nonancestor deployed commit literally merged. An independently proven equivalent successor can establish integrated lineage; a substantive successor needs a new verified deployment. " +
+	"Before release, inspect authoritative status for the exact claim owned by this session, reconcile unfinished or uncertain command effects, verify deployment and integrated lineage, release that claim and verify its resulting state. A later deployment requires fresh machine ownership. " +
+	"Releasing a machine does not authorize archiving, deleting, stopping or cleaning a session. Legacy automatic lifecycle release is implementation behavior, not lifecycle permission. Preserve original recovery contracts and ordinary exact-final-head completion rules. " +
 	"Keep resource waits interruptible; queued claims notify the session when granted."
 
 // LeadThreadPolicy applies only to the normal root conversation. A catalog
