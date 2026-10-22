@@ -207,6 +207,7 @@ function historyLane({gap = true, citationsPending = false} = {}) {
     },
     scheduleRefresh: () => effects.push("refresh"),
     filesReads: {pause() {}, resume() {}}, filesLoaded: true,
+    pauseFiles() {}, resumeFiles() {},
     pageLeaving: false, detailsTimer: null, teamStatsReceivedAt: 0, repositoryReview: null,
     pauseTiming() {}, resumeTiming() {}, refreshSessionDetails() {}, refreshTeamStats() {},
     pendingRetryTimer: null, pendingDueTimer: null, queueRetryTimer: null, pendingRerun: false, queueRerun: false,

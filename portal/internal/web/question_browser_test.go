@@ -1,12 +1,14 @@
 package web
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
@@ -44,6 +46,19 @@ func TestQuestionBrowser(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(path, []byte("# Original artifact bytes\r\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	image, imageErr := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=")
+	if imageErr != nil {
+		t.Fatal(imageErr)
+	}
+	for name, data := range map[string][]byte{
+		"preview.png": image,
+		"passive.svg": []byte(`<svg xmlns="http://www.w3.org/2000/svg" onload="window.passiveFileExecuted=true"></svg>`),
+		"long.md":     []byte(strings.Repeat("## Scrollable preview\n\nOriginal long file bytes.\n\n", 100)),
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0644); err != nil {
 			t.Fatal(err)
 		}
 	}

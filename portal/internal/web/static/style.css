@@ -561,8 +561,26 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
 .message.team { background: #22223c; border-color: #8f83ce; color: var(--text); }
 .message-team-label { color: #c4b7ff; font-size: .75rem; font-weight: 600; margin-bottom: .4rem; }
 
-.files-panel .artifact-list { max-height: none; width: 100%; overflow: auto; }
+.files-panel.active { display: flex; flex-direction: column; overflow: hidden; }
+.files-layout { display: grid; grid-template-columns: minmax(12rem, 28%) minmax(0, 1fr); gap: 1rem; flex: 1; min-height: 0; }
+.files-panel .artifact-list { max-height: none; overflow: auto; min-height: 0; }
+.files-view { min-width: 0; min-height: 0; overflow: auto; }
+.files-heading { display: flex; gap: .75rem; justify-content: space-between; align-items: flex-start; }
+.files-heading h3 { min-width: 0; overflow-wrap: anywhere; font: 600 .95rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+.session-file a[aria-current] { color: var(--accent-2); background: #142b23; border-radius: .2rem; }
+.file-content { min-width: 0; }
+.file-content .cm-scroller { overflow: auto; }
+.file-content .cm-editor { min-height: 8rem; }
+.source-file-body { min-width: 0; }
+.source-file-markdown { padding: .75rem; overflow-wrap: anywhere; }
+.source-file-markdown pre { overflow: auto; }
+.source-file-markdown img, .source-file-image img { display: block; max-width: 100%; height: auto; }
+.source-file-image { padding: .75rem; }
+@media (max-width: 650px) {
+ .files-panel.active { overflow: auto; }
+ .files-layout { grid-template-columns: minmax(0, 1fr); flex: none; }
+ .files-panel .artifact-list { max-height: 30dvh; }
+ .files-view { max-height: 60dvh; }
+}
 .session-file { display: flex; align-items: baseline; gap: .65rem; padding: .35rem .45rem; min-width: 0; }
 .session-file > a { overflow-wrap: anywhere; }
-.session-file > .muted { font-size: .8rem; }
-.session-file > .badge { flex-shrink: 0; }

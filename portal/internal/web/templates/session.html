@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=8">
-  <link rel="stylesheet" href="/static/style.css?v=21">
+  <link rel="stylesheet" href="/static/style.css?v=22">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -186,7 +186,21 @@
       <section id="files" class="tab-panel files-panel" role="tabpanel" aria-labelledby="session-tab-files">
         <div class="section-heading"><h2>Files</h2><button id="files-refresh" type="button" class="quiet">Refresh</button></div>
         <p id="files-status" class="notice" role="status" hidden></p>
-        <nav id="session-files" class="artifact-list" aria-label="Session files"></nav>
+        <div class="files-layout">
+          <nav id="session-files" class="artifact-list" aria-label="Session files"></nav>
+          <section class="files-view" aria-labelledby="files-title">
+            <header class="files-heading">
+              <h3 id="files-title">Select a file</h3>
+              <div class="source-file-actions">
+                <button id="files-mode" type="button" class="quiet icon-button" title="Show preview" aria-label="Show preview" hidden>◉</button>
+                <button id="files-copy" type="button" class="quiet icon-button" title="Copy content" aria-label="Copy content" disabled>⧉</button>
+                <a id="files-download" class="button-link icon-button" title="Download file" aria-label="Download file" download hidden>↓</a>
+              </div>
+            </header>
+            <p id="files-content-status" class="notice" role="status" hidden></p>
+            <div id="files-content" class="file-content"></div>
+          </section>
+        </div>
       </section>
     </section>
     {{end}}
@@ -256,7 +270,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=55" defer></script>
+  <script src="/static/app.js?v=56" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=2" defer></script>

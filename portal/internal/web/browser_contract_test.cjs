@@ -1021,6 +1021,14 @@ const automaticClient = createSessionClient(
   "example", createRequest(automaticFetch), compatibilityConversation(automaticFetch),
 );
 
+// File selection uses the original path and caller-owned cancellation scope.
+const fileSignal = new AbortController().signal;
+let selectedFileRequest;
+const fileClient = createSessionClient("example", async (path, options) => { selectedFileRequest = {path, options}; return {}; });
+await fileClient.file("ignored/report #%.md", {signal: fileSignal});
+assert.equal(selectedFileRequest.path, "/api/sessions/example/file?artifact=ignored%2Freport%20%23%25.md");
+assert.equal(selectedFileRequest.options.signal, fileSignal);
+
 if (!unitOnly) {
   let rejectOldSnooze, snoozeCalls = 0;
   const oldSnooze = createPromptSnooze("offer-A", () => new Promise((_resolve, reject) => { rejectOldSnooze = reject; }));
