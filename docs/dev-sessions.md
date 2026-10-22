@@ -323,14 +323,16 @@ creation markers retain their meaning.
 
 Keep the current summary easy to scan. Summarize superseded checkpoints and link
 detailed commands, failures, and review evidence. Link project documentation
-from the session instead of copying it. Register useful session files as portal
-artifacts with `dev-session artifact add SLUG PATH --label "Caption" --as-is`.
-Use this validated command instead of editing the artifact YAML by hand.
-Completed creation receipts remain available for retries and do not block
-artifact registration. Registration validates a retained receipt against the
-ready manifest; incomplete or invalid creation state still refuses the update.
-Repository documents stay in their
-repositories and can be linked from the plan or state.
+from the session instead of copying it. Save session files beneath `work/<slug>/`
+and link them from the plan or state. Regular files appear automatically in
+Files, including Git-ignored and unregistered files. Archived sessions use their
+preserved `archive/<slug>/` root with the same session-relative URLs. Repository
+documents stay in their repositories and can be linked from the plan or state.
+
+`dev-session artifact add` is deprecated. It accepts the old arguments and
+options, prints a notice and exits successfully without changing a manifest,
+label, receipt or session file. It does not require `--label` or a running
+conversation. Existing artifact declarations remain readable.
 
 Before review, reconcile the documentation with the final code, tests, and
 observed deployment behavior. Include relevant documentation paths in the review

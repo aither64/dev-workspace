@@ -151,6 +151,14 @@ literal nested file takes precedence; other access errors do not fall back.
 Git metadata, symlinks, directories as files, special files and paths outside the
 session root are unavailable, including through old preview or download routes.
 
+`dev-session artifact add` is deprecated. It accepts its old arguments and
+options, including `--expected-owner`, and prints:
+
+> File registration is no longer needed. Session files appear automatically in Files.
+
+It exits successfully without opening or changing the manifest, its labels,
+receipts or session files. It does not require `--label` or a running conversation.
+
 Text previews are limited to 512 KiB and 12,000 lines. Complete Markdown can use
 a sanitized rendered preview, and PNG, JPEG, GIF and WebP images use their checked
 media type. Raw shows the original text. SVG, HTML and scripts remain passive
@@ -703,7 +711,7 @@ display reconciliation; it does not complete or replace any operation receipt.
 Archive, revive, delete and Keep open use target identity version 2. The target
 contains the canonical workspace, slug, tracking location (`work` or `archive`),
 tracking directory device/inode and retained root conversation, including an
-explicit absent root. Adding artifacts, changing settings or atomically writing
+explicit absent root. Saving session files, changing settings or atomically writing
 `portal.yml` leaves the target stable. Replacing the directory or root, or moving
 tracking between lifecycle locations, changes it.
 
