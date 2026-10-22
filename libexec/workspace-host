@@ -2772,6 +2772,7 @@ module DevWorkspaceHost
     # that ignores them cannot safely restore sessions or reconcile retries.
     def require_compatible_session_recovery!(package)
       require_compatible_archive_recovery!(package)
+      require_compatible_turn_retries!(package)
       state = %w[session-recovery submissions].flat_map do |name|
         Dir.glob(File.join(@state, name, '**', '*.json'))
       end
@@ -2784,6 +2785,18 @@ module DevWorkspaceHost
       raise Error, 'target workspace package cannot preserve session execution holds and durable submission receipts'
     rescue SystemCallError
       raise Error, 'target workspace package has no readable session recovery contract'
+    end
+
+    def require_compatible_turn_retries!(package)
+      return if Dir.glob(File.join(@state, 'turn-retries', '**', '*.json')).empty?
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path), 'turn retry contract', 64 * 1024)
+      return if contract['turnRetryStateSchema'] == RUNTIME_CONTRACT.fetch('turnRetryStateSchema')
+
+      raise Error, 'target workspace package cannot preserve automatic turn retry state; recover forward with a compatible package'
+    rescue SystemCallError
+      raise Error, 'target workspace package has no readable turn retry contract'
     end
 
     def require_compatible_archive_recovery!(package)

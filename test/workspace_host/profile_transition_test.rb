@@ -3,6 +3,29 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_retry_records_require_a_compatible_forward_package
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'retry-contract')
+      contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      record = File.join(host.instance_variable_get(:@state), 'turn-retries', 'workspace', 'session', 'thread.json')
+      host.send(:require_compatible_session_recovery!, candidate)
+      FileUtils.mkdir_p(File.dirname(record), mode: 0o700)
+      File.write(record, '{}', perm: 0o600)
+      error = assert_raises(DevWorkspaceHost::Error) do
+        host.send(:require_compatible_session_recovery!, candidate)
+      end
+      assert_includes(error.message, 'automatic turn retry state')
+      contract = JSON.parse(File.read(contract_path))
+      contract['turnRetryStateSchema'] = 1
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:require_compatible_session_recovery!, candidate)
+      contract['turnRetryStateSchema'] = 2
+      File.write(contract_path, JSON.generate(contract))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      assert(File.exist?(record), 'transition inspection removed retained retry state')
+    end
+  end
+
   def test_archive_recovery_and_tracking_receipts_require_capable_packages
     with_transition_host do |host, paths|
       package = make_package(paths.fetch(:root), 'archive-contract')
