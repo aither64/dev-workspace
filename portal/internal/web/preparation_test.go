@@ -216,7 +216,7 @@ func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 	var active, peak atomic.Int32
 	server.config.SessionNamer = func(ctx context.Context, prompt string, _ string) (string, error) {
 		deadline, ok := ctx.Deadline()
-		if !ok || time.Until(deadline) > 10*time.Second || len(prompt) > 8192 {
+		if !ok || time.Until(deadline) > 30*time.Second || len(prompt) > 8192 {
 			t.Error("unbounded adapter request")
 		}
 		count := active.Add(1)
@@ -262,7 +262,7 @@ func TestSessionNameAdapterFailureAndWorkspaceConcurrency(t *testing.T) {
 		t.Fatal("attachment-only prompt invoked adapter")
 		return "", nil
 	}
-	if name, outcome, err := server.namePreparation(context.Background(), " \n ", ""); err != nil || name != "session" || outcome != "attachment_only" {
+	if name, outcome, err := server.namePreparation(context.Background(), " \n ", ""); !errors.Is(err, errSessionNaming) || name != "" || outcome != "invalid_output" {
 		t.Fatal(name, outcome, err)
 	}
 }
@@ -278,10 +278,10 @@ func TestSessionNameTimeoutIncludesSemaphoreQueue(t *testing.T) {
 	}
 	started := time.Now()
 	name, outcome, err := server.namePreparation(context.Background(), "queued naming prompt", "")
-	if err != nil || name != "development-session" || outcome != "timeout" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "timeout" {
 		t.Fatal(name, outcome, err)
 	}
-	if elapsed := time.Since(started); elapsed < 9*time.Second || elapsed > 12*time.Second {
+	if elapsed := time.Since(started); elapsed < 29*time.Second || elapsed > 32*time.Second {
 		t.Fatalf("queue budget=%s", elapsed)
 	}
 }

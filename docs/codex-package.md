@@ -155,7 +155,7 @@ question rejection and ephemeral teardown evidence. Include the startup
 catalog path/origin, local-only child launch and actual managed-service
 start/loss/stop/forced-exit checks with ordinary-daemon continuity. The real
 positive naming canary must use this same child profile and obtain a valid model
-result within the ten-second budget. Missing prerequisites or unsupported
+result within the thirty-second budget. Missing prerequisites or unsupported
 behavior block release. Naming errors must stop preparation before reservation
 and preserve the request for retry or a custom name.
 

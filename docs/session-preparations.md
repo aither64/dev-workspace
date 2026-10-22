@@ -145,18 +145,17 @@ complete creation workflow described in the README.
 The portal owns one naming-only Codex App Server for its service lifetime.
 The text-only adapter uses that private socket; ordinary conversations keep
 their existing App Server and dynamic catalog. An injected adapter remains
-available for tests. When the naming utility is unavailable or fails, production
-creation continues with the neutral name `development-session` and ordinary
-collision suffixes. The original request, files, provider and execution settings
-are preserved. Naming outcomes remain diagnostic; a model failure does not prevent
-starting work. Explicit cancellation still stops preparation. Supply a custom
-name before creation when a particular session slug is required.
+available for tests. When automatic recovery fails or the naming utility is
+unavailable, preparation stops before selecting a base or reserving a session.
+The accepted request, files, provider and execution settings remain saved for
+retry or manual name selection. No generic or heuristic name is substituted.
 The adapter receives at most 8192 raw UTF-8 bytes and
 returns one JSON object containing only `name`. A generated name must contain
 two to six lowercase ASCII alphanumeric words separated by hyphens and fit
-within 48 bytes. The adapter must honor cancellation and the ten-second deadline,
-including queue time. No more than two adapter calls run concurrently per
-workspace. Attachment names, paths and contents are excluded.
+within 48 bytes. One 30-second deadline starts before queue admission and covers
+queue time, native retries, fresh utility calls, backoff and cleanup. No more
+than two naming operations run concurrently per workspace; each holds its slot
+through retries and cleanup. Attachment names, paths and contents are excluded.
 
 The adapter calls codex-web's public `RunEphemeralTurn` with exactly
 `gpt-6-luna`/`low`, fixed instructions and a bounded name schema. Each call uses
@@ -170,6 +169,20 @@ fixed text also supplies the compact-file prompt; it does not disable compaction
 The call supplies no attachments or team policy.
 The worker retains ownership of the whole deadline and concurrency limit.
 Scratch state is removed after the call; durable session state is untouched.
+
+An owned native `willRetry` warning keeps the same call running within its
+original deadline. A terminal transient error permits at most one fresh utility
+call, and only when codex-web's `CanRetryEphemeralTurn` confirms both settled
+execution and successful cleanup. A generic server-error category is insufficient.
+The fresh call waits 200 ms with cancellation support and requires at least one
+second for inference plus 250 ms for cleanup afterward. The deadline and
+cancellation are checked again after backoff. Invalid output, permanent or
+unknown errors, uncertain ownership and failed cleanup stop automatic recovery.
+The provider is resolved once per naming operation and stays fixed across both
+calls, even if the workspace default changes. Model, effort, instructions,
+schema and bounded input also stay fixed; each call uses fresh private scratch
+state. An explicit **Retry naming** starts a new preparation attempt using the
+saved request rather than automatically repeating the whole preparation.
 
 The child uses the package's pinned native Codex executable and naming-only Luna
 model catalog at `share/workspace-portal/codex-models.json`. The catalog retains the original Luna metadata with its tool mode set to
@@ -256,7 +269,9 @@ for workspace session attention markers and browser notifications can receive
 Without an adapter, or after an error, timeout or invalid output, preparation
 stops without selecting a base or creating a session. **Retry naming** makes
 another attempt using the saved request. **Use name and continue** accepts a
-custom short name. Attachment-only prompts skip naming and use `session`.
+custom short name. Attachment-only prompts skip the model and offer manual name
+selection before reservation. An attachment-only request with a custom name
+continues normally.
 Operational logs contain duration, outcome and a fixed helper error category,
 without prompt text, model output or remote diagnostics.
 

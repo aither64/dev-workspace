@@ -283,7 +283,7 @@ func TestSessionNamingUnconfiguredProviderCompatibility(t *testing.T) {
 	}
 }
 
-func TestSessionNamingUtilityUnavailableOwnedSocketUsesNeutralName(t *testing.T) {
+func TestSessionNamingUtilityUnavailableOwnedSocketStopsNaming(t *testing.T) {
 	original := newTestServer(t)
 	defer original.Close()
 	config := original.config
@@ -298,7 +298,7 @@ func TestSessionNamingUtilityUnavailableOwnedSocketUsesNeutralName(t *testing.T)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	name, outcome, err := server.namePreparation(ctx, "Fix runtime session names", "")
-	if err != nil || name != "development-session" || outcome != "utility_error" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q error=%v", name, outcome, err)
 	}
 	if server.config.CodexSocket != original.config.CodexSocket || server.config.NamingSocket == server.config.CodexSocket {
@@ -318,7 +318,7 @@ func TestSessionNamingUnavailableRuntimeNeverUsesConversationSocket(t *testing.T
 	}
 	defer server.Close()
 	name, outcome, err := server.namePreparation(context.Background(), "Work during a naming outage", "")
-	if err != nil || name != "development-session" || outcome != "utility_error" {
+	if !errors.Is(err, errSessionNaming) || name != "" || outcome != "utility_error" {
 		t.Fatalf("name=%q outcome=%q error=%v", name, outcome, err)
 	}
 	if server.config.CodexSocket != original.config.CodexSocket || server.config.NamingSocket != "" {
