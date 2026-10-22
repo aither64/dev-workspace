@@ -1608,14 +1608,15 @@ test('fresh Enable cannot adopt a late old registration and bounds cleanup retri
   }
 });
 
-test('Disable fences a delayed old Enable across tabs before local storage or unsubscribe side effects', async () => {
+test('Disable fences a delayed old Enable across tabs before local storage or unsubscribe side effects', {timeout: 5000}, async () => {
   for(const stage of ['permission','registration']) {
     const state={subscribed:stage==='registration',registered:false}; const local=new Map();
-    const first=await notificationHarness(state,local); let release;
-    if(stage==='permission') first.context.Notification.requestPermission=()=>new Promise(resolve=>{release=()=>resolve('granted');});
-    else state.registerResponse=()=>new Promise(resolve=>{release=()=>{state.registered=true;resolve({ok:true,json:async()=>({registrationId:browserId})});};});
+    const first=await notificationHarness(state,local); let release, markReached;
+    const stageReached=new Promise(resolve=>{markReached=resolve;});
+    if(stage==='permission') first.context.Notification.requestPermission=()=>new Promise(resolve=>{release=()=>resolve('granted');markReached();});
+    else state.registerResponse=()=>new Promise(resolve=>{release=()=>{state.registered=true;resolve({ok:true,json:async()=>({registrationId:browserId})});};markReached();});
     const enabling=first.controls.enable.click(); await first.flush();
-    for(let i=0;i<100&&!release;i++) await new Promise(resolve=>setImmediate(resolve));
+    await Promise.race([stageReached,enabling]);
     assert.equal(typeof release,'function',stage);
     const second=await notificationHarness(state,local);
     const disabling=second.controls.disable.click(); await second.flush();
