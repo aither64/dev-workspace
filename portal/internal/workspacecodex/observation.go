@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -182,6 +183,20 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 		result.Blockers = append(result.Blockers, message)
 		result.Diagnostics = append(result.Diagnostics, ObservationDiagnostic{Code: code, Category: "busy", Message: message})
 	}
+	var retryWork any
+	if c.RecoveryRoot != "" && c.workspace != "" {
+		scope, err := c.RetryScope(ctx, threadID)
+		if err == nil {
+			retry, readErr := c.RetryStore().Load(scope)
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+				return ThreadObservation{}, observationFailure("retry_unverified", "Automatic retry state cannot be verified.")
+			}
+			if readErr == nil && retry.Owned() {
+				busy("automatic_retry", "Codex has pending automatic retry work.")
+				retryWork = []any{retry.Phase, retry.Handled, retry.DeadlineMS}
+			}
+		}
+	}
 	if turn != nil && turn.Status == "inProgress" {
 		busy("active_turn", "Codex has an active turn.")
 	}
@@ -253,7 +268,7 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 	}
 	sort.Slice(requests, func(i, j int) bool { return fmt.Sprint(requests[i]) < fmt.Sprint(requests[j]) })
 	sort.Slice(queueIDs, func(i, j int) bool { return fmt.Sprint(queueIDs[i]) < fmt.Sprint(queueIDs[j]) })
-	result.ActivityToken = ObservationToken([]any{1, threadID, projectID, turn, requests, queueIDs, "submissions_resolved"})
+	result.ActivityToken = ObservationToken([]any{1, threadID, projectID, turn, requests, queueIDs, "submissions_resolved", retryWork})
 	if turn != nil && turn.StartedAt != nil && turn.CompletedAt != nil {
 		result.LastActivityAt = turn.CompletedAt
 	}

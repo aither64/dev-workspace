@@ -66,6 +66,54 @@ func newCodexClientWithHistory(socket, workspace string, history codex.HistoryRe
 		SubmissionLedgerPath: ledgerPath, LegacySubmissionLedgerPath: legacyPath,
 	})
 	client.RecoveryRoot = stateRoot
+	if executable, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(executable); err == nil {
+			if installed, err := agentteams.LoadInstalled(filepath.Dir(filepath.Dir(real))); err == nil {
+				client.RetryCatalog = installed.Catalog
+			}
+		}
+	}
+	client.RetryPolicyResolver = func(ctx context.Context, thread string) (codex.ThreadPolicy, error) {
+		metadata, err := client.ReadThreadMetadata(ctx, thread, false)
+		if err != nil {
+			return codex.ThreadPolicy{}, err
+		}
+		slug := filepath.Base(metadata.Cwd)
+		if !session.ValidSlug(slug) || metadata.Cwd != filepath.Join(workspace, "work", slug) {
+			return codex.ThreadPolicy{}, errors.New("managed admission has an unexpected session directory")
+		}
+		summary, err := session.Find(workspace, slug)
+		if err != nil || summary.Archived {
+			return codex.ThreadPolicy{}, errors.New("managed admission session is unavailable")
+		}
+		store, err := teamruntime.NewStore(stateRoot, workspace)
+		if err != nil {
+			return codex.ThreadPolicy{}, err
+		}
+		var roster *teamruntime.Roster
+		if summary.Codex.ThreadID != "" {
+			roster, err = store.Load(slug, summary.Codex.ThreadID)
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return codex.ThreadPolicy{}, err
+		}
+		if summary.Codex.ThreadID == thread || summary.Codex.ThreadID == "" {
+			instructions := ""
+			if roster != nil {
+				instructions = roster.LeadInstructions
+			}
+			return workspacecodex.LeadThreadPolicy(slug, workspace, instructions), nil
+		}
+		if roster != nil {
+			for _, member := range roster.Members {
+				if member.Thread == thread && member.State == "ready" && member.RetireIntent == "" {
+					service := teamruntime.Service{Store: store, Client: client, Workspace: workspace, Catalog: client.RetryCatalog}
+					return service.MemberTurnPolicy(slug, summary.Codex.ThreadID, member)
+				}
+			}
+		}
+		return codex.ThreadPolicy{}, errors.New("managed admission is outside the retained team")
+	}
 	return client
 }
 
@@ -325,6 +373,9 @@ func serve(args []string) error {
 	history := codex.NewHistoryPool(options.codexSocket)
 	defer history.Close()
 	codexClient := newCodexClientWithHistory(options.codexSocket, options.workspace, history, options.userStateRoot)
+	if installed, loadErr := agentteams.LoadInstalled(options.packageRoot); loadErr == nil {
+		codexClient.RetryCatalog = installed.Catalog
+	}
 	defer codexClient.Close()
 	application, err := portalweb.New(portalweb.Config{
 		ObserveActivity: true,
@@ -539,6 +590,7 @@ func teamCommand(args []string) error {
 		}
 	}
 	client := newCodexClient(*socket, *workspace, *stateRoot)
+	client.RetryCatalog = teamCatalog
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()

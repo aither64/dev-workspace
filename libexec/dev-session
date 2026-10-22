@@ -1782,6 +1782,7 @@ module DevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug)
           session = ensure_managed_session!(slug)
+          recovery_state!(slug, session.codex_thread_id, 'cancel-retries') if session.codex_thread_id
           close_session!(slug, session)
           recovery_state!(slug, session.codex_thread_id, 'stop') if session.codex_thread_id
         end
@@ -1979,6 +1980,10 @@ module DevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
+          unless automatic
+            retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
+            recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
+          end
           journal = load_archive_journal(slug, operation_id:)
           cleanup = ArchiveCleanup.new(self, slug)
           sidecar = cleanup.load(journal:, operation_id:)
@@ -2363,6 +2368,8 @@ module DevSession
           coordination_store.require_lifecycle_capacity!(workspace, slug, 'delete') unless load_removal_journal(slug)
           ensure_retirement_identity!(slug, cleanup_session(slug))
           removal = prepare_removal!(slug, force:, operation_id:)
+          retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
+          recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
           coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id'))
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')

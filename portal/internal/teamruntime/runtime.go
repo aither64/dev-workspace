@@ -1523,6 +1523,9 @@ func (service Service) removeLocked(ctx context.Context, slug, rootThreadID, add
 		if member.State == "removed" {
 			return service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member, false)
 		}
+		if err := service.cancelAutomaticRetry(ctx, member.Thread); err != nil {
+			return err
+		}
 		if member.RetireIntent == "replace" {
 			return errors.New("member replacement is pending; finish recovery before removal")
 		}
@@ -2115,6 +2118,18 @@ func (service Service) ReviveAll(ctx context.Context, slug, rootThreadID string)
 
 // Configure changes the settings retained for the member's next assignment.
 // App Server applies model and effort when that next idle turn starts.
+func (service Service) cancelAutomaticRetry(ctx context.Context, thread string) error {
+	if thread == "" {
+		return nil
+	}
+	if client, ok := service.Client.(interface {
+		CancelAutomaticRetry(context.Context, string, string) error
+	}); ok {
+		return client.CancelAutomaticRetry(ctx, thread, "settings_changed")
+	}
+	return nil
+}
+
 func (service Service) Configure(ctx context.Context, slug, rootThreadID, address, model, effort string) (*Roster, error) {
 	if address == "lead" {
 		return nil, errors.New("configure lead through the conversation controls")
@@ -2124,6 +2139,17 @@ func (service Service) Configure(ctx context.Context, slug, rootThreadID, addres
 	}
 	var result *Roster
 	err := service.Store.withOperationLock(ctx, slug, func() error {
+		roster, loadErr := service.Store.Load(slug, rootThreadID)
+		if loadErr != nil {
+			return loadErr
+		}
+		for _, member := range roster.Members {
+			if member.Address == address {
+				if err := service.cancelAutomaticRetry(ctx, member.Thread); err != nil {
+					return err
+				}
+			}
+		}
 		var err error
 		result, err = service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
 			for index := range roster.Members {
@@ -2171,6 +2197,9 @@ func (service Service) UpdateAccess(ctx context.Context, slug, rootThreadID, add
 		if member.Access == access {
 			result = roster
 			return nil
+		}
+		if err := service.cancelAutomaticRetry(ctx, member.Thread); err != nil {
+			return err
 		}
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
 		if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {

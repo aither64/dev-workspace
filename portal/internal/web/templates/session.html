@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
-  <link rel="stylesheet" href="/codex/assets/conversation.css?v=8">
+  <link rel="stylesheet" href="/codex/assets/conversation.css?v=9">
   <link rel="stylesheet" href="/static/style.css?v=22">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
@@ -105,6 +105,7 @@
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><label class="member-selector"><span>Member</span><select id="codex-member"><option value="lead">lead</option>{{range .ReadyMembers}}<option value="{{.Address}}"{{if eq .Address $.SelectedMember}} selected{{end}}>{{.Address}}</option>{{end}}</select></label><span id="codex-status" class="badge">Connecting</span></div>
         <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
+        <div id="automatic-turn-retry" hidden></div>
         <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
         <div class="transcript-history">
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>

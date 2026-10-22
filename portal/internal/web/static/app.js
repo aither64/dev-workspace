@@ -1208,7 +1208,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=22");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=23");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -2753,6 +2753,10 @@
     ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
   const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "");
+  const retryRoot = document.getElementById("automatic-turn-retry");
+  if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryControls) {
+    conversationAssets.mountRetryControls(retryRoot, {client: conversation});
+  }
   document.getElementById("codex-member")?.addEventListener("change", (event) => {
     const target = new URL(location.href);
     const member = event.target.value;

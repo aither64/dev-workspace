@@ -28,6 +28,8 @@ compatibility removal procedures.
 The [Codex provider guide](docs/codex-providers.md) covers limits previews,
 session selection, automatic pause/resume, workspace defaults, catalog
 configuration and interrupted-switch recovery.
+The [automatic retry recovery guide](docs/turn-retry-recovery.md) describes
+failed-turn enrollment, settings proof, durable retry state and forward recovery.
 The [coordination guide](docs/coordination.md) covers short merge locks, machine reservations, waiting-session
 notifications and [operations/recovery](docs/coordination-operations.md).
 The [integration guide](docs/integration.md) covers retained resumable operation batches,

@@ -179,6 +179,11 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		}
 	}
 	if action == "scoped-prepare" {
+		for _, slug := range slugs {
+			if err := client.RetryStore().CancelSession(ctx, slug, roots[slug], socket, client.RetryBackend()); err != nil {
+				return err
+			}
+		}
 		inventory, err := buildProviderInventoryScope(ctx, client, workspace, stateRoot, socket, profile, scope)
 		if err != nil {
 			return err
@@ -371,6 +376,9 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 			// state. Do not replay goal/set: that could reactivate completed
 			// work after an uncertain response. Non-goal work uses a receipt.
 			if intent.Active && !intent.GoalOwned && !intent.GoalActive {
+				if err := client.ConfirmRetryBinding(ctx, thread.ID, thread.Settings.Policy); err != nil {
+					return err
+				}
 				if _, err := client.Send(ctx, thread.ID, "Continue the work interrupted by the provider switch. Check the last tool results before retrying any action. Ask again for any unanswered question or approval.", intent.Continuation, "provider-switch:"+operation); err != nil {
 					return err
 				}

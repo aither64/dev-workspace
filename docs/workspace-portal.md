@@ -466,6 +466,62 @@ retries metadata reads with backoff. Activity reads have a five-second budget
 while active and a thirty-second budget while idle; focus and reconnection prompt
 a fresh read.
 
+## Automatic turn retries
+
+Auto retry is enabled by default for managed lead conversations and ready team
+members. The checkbox belongs to the selected conversation and persists across
+portal restarts. Native child threads are excluded. Only new failures after
+enrollment qualify; installing the feature or enabling the checkbox does not
+restart an already-failed task.
+
+A terminal capacity error retries after 15, 30, 60, 120, 240 and 300 seconds,
+then every 300 seconds until cancelled. Each interval adds up to 10% positive
+jitter, limited to three seconds and a total interval of 300 seconds. A native
+cybersecurity turn error retries immediately, with at most 30 possible automatic
+submissions per conversation in five minutes. Exhaustion leaves the turn failed
+for manual action; expiration of the window does not rearm it.
+
+The retry starts a visible continuation in the saved conversation:
+
+> Continue the interrupted task from the saved conversation. Inspect the current state before repeating actions.
+
+It preserves the failed turn and its results. It does not replay the original
+request or tool calls. Retries require proof of the original model, effort,
+provider, mode and authorized execution binding. Missing proof leaves the task
+for manual continuation. Queue work and recovery holds take precedence.
+
+The native thread must remain loaded, with the exact failed turn still current
+and no active work or pending requests. Codex 0.163.0 can report `systemError`
+after a terminal failure until another turn starts. Retry accepts this loaded
+status as well as `idle`; the status alone does not make a failure eligible.
+The server still verifies the error code, settings, queue, submission ledger
+and managed admission. It never resumes a cold thread or clears native error
+state to make a retry possible.
+
+Cancel retry stops the current chain and leaves Auto retry enabled. Turning the
+checkbox off also cancels the chain. New input, settings changes, Interrupt and
+session Stop cancel pending retries. A cancellation after dispatch keeps checking
+whether that request started; it cannot undo an accepted continuation. Use the existing
+Interrupt control to interrupt a running turn.
+
+The server schedules work while the browser is closed. The controls display its
+phase, attempt, quota and deadline; the browser never submits a timed retry.
+Transport errors, native intermediate retries, ordinary assistant refusals and
+unrecognized failure codes do not start an automatic chain. The
+[recovery guide](turn-retry-recovery.md) documents persistence, admission,
+settings provenance and compatible package recovery.
+
+The execution guarantee applies to managed portal, CLI and retained-team writers
+that share the runtime's admission locks. A managed manual send or queue admission
+that wins the lock cancels or supersedes the pending retry. If automatic dispatch
+owns the lock, manual input waits until dispatch and receipt handling finish. An
+unknown automatic outcome keeps new input held until exact reconciliation. Explicit
+manual input can still steer active work. In Codex 0.163.0, public `turn/start` can
+implicitly steer an active regular turn and apply persistent settings. It has no
+atomic compare-and-start operation. Independent direct native writers bypass the
+managed locks and remain outside this guarantee. An observed settings or input
+mismatch leaves the failure for manual continuation.
+
 ## Session recovery after runtime loss
 
 The portal restores access to previously running sessions when tmux runtime

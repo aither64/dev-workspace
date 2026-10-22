@@ -32,7 +32,7 @@ func (c *Client) allowImplicitResume(thread string) bool {
 
 // Direct team assignments also cross the cold boundary. The message must be
 // durable before loading its recipient, including when native work is queued.
-func (c *Client) SendWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, error) {
+func (c *Client) sendWithRecovery(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, error) {
 	if c.RecoveryRoot == "" || c.workspace == "" {
 		return c.Client.SendWithOptions(ctx, thread, text, id, action, options)
 	}

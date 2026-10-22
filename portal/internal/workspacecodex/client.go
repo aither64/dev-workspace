@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -28,6 +29,11 @@ type Client struct {
 	workspace, socket    string
 	submissionLedgerPath string
 	archiveProof         func(context.Context, string, string, string) (ArchiveState, error)
+	// Set only by the trusted composition, never browser input. Returning a
+	// scope also proves exact root/retained-team ownership for admission.
+	RetryPolicyResolver     func(context.Context, string) (codex.ThreadPolicy, error)
+	RetryCatalog            *agentteams.Catalog
+	retryCommonInstructions string
 }
 
 func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Client {
@@ -39,6 +45,7 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 		HiddenGrace: 60 * time.Second, VisibleCountdown: 60 * time.Second,
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
+	client.retryCommonInstructions = options.DeveloperInstructions
 	options.AllowImplicitResume = client.allowImplicitResume
 	options.LifecycleRequestSettings = client.providerRequestSettings
 	client.submissionLedgerPath = options.SubmissionLedgerPath

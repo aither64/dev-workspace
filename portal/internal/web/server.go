@@ -36,6 +36,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/microcosm-cc/bluemonday"
@@ -532,6 +533,7 @@ func New(config Config) (*Server, error) {
 	go server.runDisplayRefreshes()
 	server.startUploadCollector()
 	server.startRecovery()
+	server.startTurnRetries()
 	server.startActivityMonitor()
 	server.startProviderWatchRecovery()
 	server.startNotifications()
@@ -1908,7 +1910,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 			return nil, false
 		}
 	}
-	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "thread" && parts[2] == "page") &&
+	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel")) && !(parts[1] == "thread" && parts[2] == "page") &&
 		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
 		return nil, false
 	}
@@ -1919,7 +1921,7 @@ func legacyConversationPath(parts []string, method string) string {
 	if len(parts) == 2 {
 		allowed := map[string]map[string]bool{
 			http.MethodGet: {
-				"activity": true, "events": true, "pending": true, "queue": true, "thread": true,
+				"activity": true, "events": true, "pending": true, "queue": true, "thread": true, "retry": true,
 			},
 			http.MethodPost: {
 				"interrupt": true, "message": true, "message-ack": true,
@@ -1929,6 +1931,9 @@ func legacyConversationPath(parts []string, method string) string {
 		if allowed[method][parts[1]] {
 			return "/codex/conversations/" + strings.Join(parts, "/")
 		}
+	}
+	if len(parts) == 3 && parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel") && method == http.MethodPost {
+		return "/codex/conversations/" + strings.Join(parts, "/")
 	}
 	if len(parts) == 3 && parts[1] == "queue" &&
 		(method == http.MethodDelete ||
@@ -3624,7 +3629,7 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, errors.New("session state changed")
 		}
 		s.normalizeInteractivity(ctx, summary)
-		if !(request.Operation == "settings" && !summary.Interactive && summary.RecoveryReady) {
+		if !((request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry")) && !summary.Interactive && summary.RecoveryReady) {
 			if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
 				return conversation.Target{}, err
 			}
@@ -3632,7 +3637,7 @@ func (s *Server) resolveConversation(
 	}
 	interactive := summary.Interactive
 	settingsReady := summary.RecoveryReady && !summary.Archived
-	if request.Mutation && !interactive && !(settingsReady && request.Operation == "settings") {
+	if request.Mutation && !interactive && !(settingsReady && (request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry"))) {
 		return conversation.Target{}, errors.New("session is not ready for browser changes")
 	}
 	if request.Operation == "events" && !interactive {
@@ -3648,6 +3653,17 @@ func (s *Server) resolveConversation(
 	}
 	conversationClient := conversation.Client(s.config.Codex)
 	threadID := summary.Codex.ThreadID
+	if address == "" && request.Operation == "automatic-retry" {
+		service, err := s.teamService(summary.Slug)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		unlock, err := service.Store.LockOperation(ctx, slug)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		releases = append(releases, unlock)
+	}
 	if address != "" {
 		service, serviceErr := s.teamService(summary.Slug)
 		if serviceErr != nil {
@@ -3716,12 +3732,28 @@ func (s *Server) resolveConversation(
 		attachments = backend
 	}
 	var once sync.Once
+	if request.Mutation && request.Operation != "automatic-retry" && !strings.HasPrefix(request.Operation, "retry") {
+		if client, ok := s.config.Codex.(interface {
+			CancelAutomaticRetry(context.Context, string, string) error
+		}); ok {
+			if err := client.CancelAutomaticRetry(ctx, threadID, "manual_input"); err != nil {
+				return conversation.Target{}, err
+			}
+		}
+	}
+	var retries conversation.RetryProvider
+	if client, ok := s.config.Codex.(turnRetryClient); ok && client.RetryAvailable() && !summary.Archived && settingsReady {
+		scope := turnretry.Scope{Workspace: s.config.Workspace, Slug: slug, Root: summary.Codex.ThreadID, Thread: threadID, Socket: s.config.CodexSocket}
+		retries = retryProvider{server: s, client: client, scope: scope}
+		capabilities.Retry = true
+	}
 	failed = false
 	return conversation.Target{
 		Attachments:  attachments,
 		ModelCatalog: func(ctx context.Context) ([]codex.Model, error) { return s.modelsForSession(ctx, slug, "") },
 		Client:       conversationClient, ThreadID: threadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(request.ID),
+		Retry:             retries,
 		PresentTranscript: s.presentTranscript,
 		Activity:          s.activityProvider(),
 		Release:           func() { once.Do(release) },

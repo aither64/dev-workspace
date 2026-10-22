@@ -41,6 +41,7 @@ func TestCoordinationNotificationRetainsSettingsAndDeduplicatesNativeDelivery(t 
 					switch request["method"] {
 					case "thread/read":
 						metadata := threadCommandFreshMetadata(thread, cwd, rollout)
+						metadata["modelProvider"] = "notification-fixture"
 						metadata["model"], metadata["reasoningEffort"] = "retained-model", "xhigh"
 						result = map[string]any{"thread": metadata}
 					case "thread/resume":
