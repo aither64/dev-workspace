@@ -98,7 +98,7 @@ const baseURL = process.argv[2];
       await message.fill("Original request");
       await page.locator("#message-send").click();
       await expect(receipt("Original request")).toContainText("Outcome unknown.");
-      await expect(message).toHaveValue("Original request");
+      await expect(message).toBeEmpty(); // Original intent lives in its recoverable receipt.
       await message.fill("Revised request");
       await page.locator("#message-send").click();
       await expect(message).toBeEmpty();

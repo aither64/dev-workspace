@@ -431,18 +431,23 @@ grouping use the same observation. Returning to a hidden page starts a fresh
 grace period. Older servers without the metadata-loading signal display
 available estimates immediately.
 
-An unconfirmed send keeps its message in the composer and shows an outcome
-receipt. **Retry original** retries the receipt's saved text and attachments
-with its original attempt ID, independently of the composer draft. A changed
-draft remains intact. The small **×** at the upper right hides the receipt across
-reloads while keeping its retry identity; delivery can still complete. Transcript
-confirmation retires the receipt normally. Delivery failures appear beside the
-composer without a browser alert. A lost response preserves the input, attachments
-and original retry identity. Once the transcript or an accepted receipt confirms
-delivery, a later HTTP failure does not change that confirmed state. The warning
-clears when the original submission is accepted or confirmed in the transcript. Sending
-revised wording creates a separate attempt and does not resolve the earlier one. Browser storage must save a dismissal before
-the portal hides it.
+Sending saves the original message and attachment IDs in a recoverable browser
+record, then clears that draft so you can type the next message. The receipt
+shows **Sending…** while the request is pending. **Send** and **Queue next** wait
+for that request to finish; typing and adding attachments remain available. A
+lost response leaves the original receipt marked **Outcome unknown.**
+**Retry original** checks or retries its saved text and attachments with the
+same ID, independently of the new draft. A late response or transcript
+acknowledgment never clears a newer draft, even if its text is identical. After
+acceptance, sending the same text again creates a new message. The small **×**
+hides a receipt across reloads while retaining its recovery identity. Browser
+storage must save a dismissal before the portal hides it.
+
+Once the transcript or an accepted receipt confirms delivery, a later HTTP
+failure does not change that confirmed state. The warning clears when the
+original submission is accepted or confirmed in the transcript. Sending revised
+wording creates a separate attempt and does not resolve the earlier one.
+Delivery failures appear beside the composer without a browser alert.
 
 Successful legacy history fallback is silent. History notices and manual retry
 controls occupy normal layout space above the transcript.
@@ -454,7 +459,7 @@ existing legacy behavior.
 Requests, queued messages, activity timing, session details and index status
 refresh separately from the transcript. A slow queue reconciliation does not
 delay the first conversation page. Failed refreshes retain their last result;
-request and queue warnings offer Retry after the shared grace period. Transcript receipt and upload clearing require positive
+request and queue warnings offer Retry after the shared grace period. Transcript receipt retirement requires positive
 server evidence across all retained pages, including automatically loaded older
 messages. While the server checks conversation metadata, the mode buttons retain
 the conversation's last confirmed selection and remain usable. Before the first
@@ -1501,7 +1506,7 @@ The runner creates 50 native tabs and records actual document visibility through
 foreground switches. It requires a native background discard and restoration,
 35 seconds of foreground updates, zero hidden read/stream traffic after
 cancellation, timely pending invalidation and recovery without reload. A lost
-submission response retains the draft; retry uses its original identity and
+submission response retains its recoverable browser record; retry uses its original identity and
 produces one fixture acceptance record written with fsync. The fixture uses a
 stand-in for the native Codex/model backend, so this does not establish native
 Codex or production performance. Firefox chrome-context access is confined to its disposable profile and native

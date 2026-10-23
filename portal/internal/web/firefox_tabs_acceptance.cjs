@@ -256,9 +256,10 @@ function assertBackgroundUnchanged(before, after, active) {
     beforeSendControls=await readSendControls();
     await click("css selector","#message-send");
     await until(()=>execute('return Array.from(document.querySelectorAll("button")).some(button=>button.textContent.trim()==="Retry original");'),"lost-response durable receipt");
-    assert.equal(await execute('return document.querySelector("#message-form textarea").value;'),"Disposable draft retained across native tab switches");
+    assert.equal(await execute('return document.querySelector("#message-form textarea").value;'), "");
     await click("xpath","//button[normalize-space()='Retry original']");
-    await until(()=>execute('return document.querySelector("#message-form textarea").value === "";'),"accepted original retry");
+    await until(async()=>{const value=await fixture("/fixture/firefox/status");return value.sendAttempts===2;},"accepted original retry");
+    assert.equal(await execute('return document.querySelector("#message-form textarea").value;'), "");
     const final=await fixture("/fixture/firefox/status");assert.equal(final.dispatches,1);assert.equal(final.journalEntries,1);assert.equal(final.sendAttempts,2);
     console.log(JSON.stringify({fixture:"portal-firefox-tabs-v1",browser:created.capabilities.browserVersion,tabs:50,nativeDiscard:true,restored:true,foregroundMs:35000,
       questionLatencyMs,visibility:visibleLog,counts:final.counts,dispatches:final.dispatches,journalEntries:final.journalEntries,sendAttempts:final.sendAttempts}));

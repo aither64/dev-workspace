@@ -2,7 +2,10 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +22,104 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
+
+// The controlled page fixture owns these two synthetic conversations. Preserve
+// the shared contract fake's strict single-thread verification in other tests.
+type questionBrowserCodex struct {
+	browserContractCodex
+	// The real member resolver requires the team interface. Its unused lifecycle
+	// methods remain unavailable: an unexpected call hits this nil tripwire.
+	teamruntime.Client
+}
+
+var _ conversation.Client = (*questionBrowserCodex)(nil)
+var _ teamruntime.Client = (*questionBrowserCodex)(nil)
+
+func (client *questionBrowserCodex) VerifyThread(ctx context.Context, threadID, cwd string) error {
+	if threadID == "member-thread" {
+		return nil
+	}
+	return client.browserContractCodex.VerifyThread(ctx, threadID, cwd)
+}
+
+func (client *questionBrowserCodex) ReadThread(ctx context.Context, threadID string) (codex.Transcript, error) {
+	if err := client.VerifyThread(ctx, threadID, ""); err != nil {
+		return codex.Transcript{}, err
+	}
+	transcript, err := client.browserContractCodex.ReadThread(ctx, threadID)
+	transcript.ThreadID = threadID
+	return transcript, err
+}
+
+func (client *questionBrowserCodex) Interrupt(ctx context.Context, threadID string) error {
+	return client.browserContractCodex.Interrupt(ctx, threadID)
+}
+
+func TestQuestionBrowserUploadScopes(t *testing.T) {
+	server := newTestServer(t)
+	prepareInteractiveConversation(t, server, "example")
+	client := &questionBrowserCodex{browserContractCodex: browserContractCodex{emptyPrompts: true}}
+	server.config.Codex = client
+	server.uploadStore.MinFreeBytes = 0
+	store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", true, func(roster *teamruntime.Roster) error {
+		roster.Members = []teamruntime.Member{{Address: "implementer0", Role: "implementer", Thread: "member-thread", Model: "gpt-6.1-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write", State: "ready", AddedAt: time.Now().UTC()}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Origin", server.config.BaseURL)
+		request.Header.Set("Upload-Offset", "0")
+		checksum := sha256.Sum256([]byte(body))
+		request.Header.Set("Upload-Checksum", hex.EncodeToString(checksum[:]))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	for _, scope := range []string{"s-example", "s-example~implementer0"} {
+		t.Run(scope, func(t *testing.T) {
+			path := "/uploads/" + scope
+			response := call("GET", path, "")
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"limits"`) {
+				t.Fatalf("upload readiness: %d %s", response.Code, response.Body.String())
+			}
+			response = call("POST", path, `{"clientId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"fixture.txt","size":7}`)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("create: %d %s", response.Code, response.Body.String())
+			}
+			var file conversation.Upload
+			if err := json.Unmarshal(response.Body.Bytes(), &file); err != nil {
+				t.Fatal(err)
+			}
+			path += "/" + file.ID
+			for _, step := range []struct{ method, path, body string }{{"PATCH", path, "content"}, {"POST", path, ""}, {"GET", path + "/content", ""}} {
+				response = call(step.method, step.path, step.body)
+				if response.Code != http.StatusOK {
+					t.Fatalf("%s %s: %d %s", step.method, step.path, response.Code, response.Body.String())
+				}
+			}
+			if response.Body.String() != "content" {
+				t.Fatal("upload readback changed", response.Body.String())
+			}
+			other := "s-example~implementer0"
+			if scope == other {
+				other = "s-example"
+			}
+			if response := call("GET", "/uploads/"+other+"/"+file.ID+"/content", ""); response.Code != http.StatusNotFound {
+				t.Fatalf("file crossed conversation scope: %d", response.Code)
+			}
+		})
+	}
+	if client.sendCount != 0 || client.interrupt {
+		t.Fatal("upload fixture dispatched conversation input")
+	}
+}
 
 // Run with PORTAL_BROWSER_TEST=1 and Nix-provided Node, Playwright modules and
 // PLAYWRIGHT_BROWSERS_PATH. The browser controls API responses, while the actual
@@ -66,9 +167,9 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	writeWebRuntimeAuthority(t, server, "example")
 	events := make(chan struct{}, 1)
-	server.config.Codex = &browserContractCodex{emptyPrompts: true, events: events, transcript: codex.Transcript{
+	server.config.Codex = &questionBrowserCodex{browserContractCodex: browserContractCodex{emptyPrompts: true, events: events, transcript: codex.Transcript{
 		ThreadID: "thread-1", Status: "active", CollaborationMode: "plan",
-	}}
+	}}}
 	httpServer := httptest.NewUnstartedServer(nil)
 	server.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
 	server.trustedOrigins = []string{server.config.BaseURL}
@@ -166,9 +267,9 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs"} {
+	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs", "composer_handoff_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
-			if script == "retry_activity_browser_test.cjs" {
+			if script == "retry_activity_browser_test.cjs" || script == "composer_handoff_browser_test.cjs" {
 				store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
 				if err != nil {
 					t.Fatal(err)

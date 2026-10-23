@@ -1307,6 +1307,7 @@
   }
   let composerUploads = null;
   let composerUploadReady = true;
+  let messageDispatchInFlight = false;
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
   const limitsPanel = document.getElementById("codex-limits-panel");
@@ -4065,7 +4066,7 @@
           retry.type = "button";
           retry.className = "quiet";
           retry.textContent = "Retry original";
-          retry.disabled = !interactive || executionHeld || liveSettingsSaving || inFlightMessageIDs.has(entry.id);
+          retry.disabled = !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || inFlightMessageIDs.has(entry.id);
           retry.addEventListener("click", () => { void retryMessageReceipt(entry.id); });
           actions.append(retry);
         }
@@ -4119,12 +4120,6 @@
       }
       if (deleteSendAttempt(sendAttemptStorage, slug, threadID, attempt.id)) {
         pendingMessages.delete(attempt.id);
-        const composer = document.getElementById("message-form")?.elements.message;
-        if (composer && composer.value.trim() === attempt.message && composerUploads?.ready() &&
-            conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
-          composer.value = "";
-          composerUploads.clear();
-        }
       } else removedAll = false;
     }
     renderMessageReceipts();
@@ -4317,8 +4312,8 @@
     renderMessageReceipts();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving; }
-    if (queueButton) queueButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving;
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving || messageDispatchInFlight; }
+    if (queueButton) queueButton.disabled = !interactive || !composerUploadReady || liveSettingsSaving || messageDispatchInFlight;
     if (queueButton) queueButton.hidden = !threadActive;
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive);
@@ -5405,21 +5400,19 @@
   };
 
   const retryMessageReceipt = async (id) => {
-    if (!interactive || executionHeld || liveSettingsSaving || inFlightMessageIDs.has(id)) return;
+    if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || inFlightMessageIDs.has(id)) return;
     const attempt = pendingMessages.get(id);
     if (!attempt || attempt.state !== "unknown" || attempt.context) return;
     const threadID = currentThreadId;
+    const sendingClient = client;
+    messageDispatchInFlight = true;
     inFlightMessageIDs.add(id);
     pendingMessages.set(id, {...attempt, dismissed: false, state: "sending"});
     renderMessageReceipts();
+    updateMessageActions();
     try {
-      const receipt = await client.message(attempt.message, id, true, attempt.attachmentIds || []);
+      const receipt = await sendingClient.message(attempt.message, id, true, attempt.attachmentIds || []);
       acceptMessageReceipt(attempt, receipt, threadID);
-      if (threadID === currentThreadId && form?.elements.message.value.trim() === attempt.message &&
-          composerUploads?.ready() && conversationAssets.sameAttachments(composerUploads.ids(), attempt.attachmentIds)) {
-        form.elements.message.value = "";
-        composerUploads.clear();
-      }
     } catch (error) {
       if (threadID === currentThreadId) {
         markMessageOutcomeUnknown(id);
@@ -5427,7 +5420,9 @@
       }
     } finally {
       inFlightMessageIDs.delete(id);
+      messageDispatchInFlight = false;
       renderMessageReceipts();
+      updateMessageActions();
       scheduleRefresh(0);
       acknowledgeTranscriptMessages();
     }
@@ -5476,6 +5471,8 @@
   const form = document.getElementById("message-form");
   if (form) {
     const textarea = form.elements.message;
+    let draftGeneration = 0;
+    textarea.addEventListener("input", () => { ++draftGeneration; });
     composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
       basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
       controlsRoot: document.getElementById("message-upload-controls"),
@@ -5487,17 +5484,21 @@
     let queueAttemptStorage = null;
     try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
     const submitMessage = async (queue) => {
-      if (!interactive || liveSettingsSaving || form.dataset.submitting) return;
+      if (!interactive || liveSettingsSaving || messageDispatchInFlight) return;
       const threadID = currentThreadId;
+      const sendingClient = client, uploads = composerUploads;
+      const generation = draftGeneration, draft = textarea.value;
       const action = queue ? "queue" : "send";
-      const message = textarea.value.trim();
+      const message = draft.trim();
       if (!message && !composerUploads.count()) return;
       let attachments, submittingAttemptID = null;
       try { attachments = composerUploads.ids(); } catch (error) { showSubmissionFailure(error, submissionIdentity(threadID, null, action)); return; }
       form.dataset.submitting = "true";
-      composerUploads.lock(true);
-      const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
+      messageDispatchInFlight = true;
+      uploads.lock(true);
+      const controls = queue ? Array.from(form.querySelectorAll("button, input, select, textarea")) : [];
       controls.forEach((control) => { control.disabled = true; });
+      updateMessageActions();
       try {
         if (queue) {
           let queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, currentThreadId);
@@ -5524,13 +5525,17 @@
           if (sendAttempts === null) {
             throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
           }
-          let attempt = matchingSendAttempt(sendAttempts, message, "", attachments);
+          // Accepted/observed content can be a new explicit user intent. Only
+          // unresolved content reuses its immutable recovery identity.
+          let attempt = matchingSendAttempt(sendAttempts.filter(candidate =>
+            !["accepted", "observed"].includes(candidate.state) &&
+            !["accepted", "observed"].includes(pendingMessages.get(candidate.id)?.state)), message, "", attachments);
           const retry = Boolean(attempt);
           if (!attempt) {
             attempt = {id: crypto.randomUUID(), message, steered: threadActive, context: "", ...(attachments.length ? {attachmentIds: attachments} : {})};
-            if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt)) {
-              throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
-            }
+          }
+          if (!storeSendAttempt(sendAttemptStorage, slug, threadID, attempt)) {
+            throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
           }
           const id = attempt.id;
           submittingAttemptID = id;
@@ -5539,19 +5544,27 @@
           pendingMessages.set(id, {...attempt, dismissed: false, state: attempt.state || "sending"});
           renderMessageReceipts();
           try {
-            acceptMessageReceipt(attempt, await client.message(message, id, retry, attachments), threadID);
+            // Ownership transfers once, before HTTP. Detachment persists and
+            // reads back the empty selection; failure retains text and IDs.
+            if (threadID !== currentThreadId || generation !== draftGeneration || textarea.value !== draft ||
+                !conversationAssets.sameAttachments(uploads.ids(), attachments)) throw new Error("The message draft changed before submission.");
+            uploads.clear();
+            textarea.value = "";
+            ++draftGeneration;
+            uploads.lock(false);
+            followTranscript();
+            acceptMessageReceipt(attempt, await sendingClient.message(message, id, retry, attachments), threadID);
           } finally {
             inFlightMessageIDs.delete(id);
             scheduleRefresh(0);
           }
         }
-        if (threadID === currentThreadId && textarea.value.trim() === message &&
+        if (queue && threadID === currentThreadId && generation === draftGeneration && textarea.value === draft &&
             composerUploads.ready() && conversationAssets.sameAttachments(composerUploads.ids(), attachments)) {
           textarea.value = "";
           composerUploads.clear();
         }
-        if (!queue) followTranscript();
-        else {
+        if (queue) {
           void refreshQueue(true);
           queuePanel.scrollIntoView({block: "nearest"});
         }
@@ -5563,11 +5576,12 @@
       }
       finally {
         delete form.dataset.submitting;
+        messageDispatchInFlight = false;
         controls.forEach((control) => { control.disabled = false; });
-        composerUploads.lock(false);
+        uploads.lock(false);
         applyCurrentSettings();
         updateMessageActions();
-        textarea.focus();
+        if (queue && threadID === currentThreadId) textarea.focus();
       }
     };
     textarea.addEventListener("keydown", (event) => {
