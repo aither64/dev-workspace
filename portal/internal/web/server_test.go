@@ -4148,7 +4148,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
-	for _, name := range []string{"uploads.js", "sync.js", "refresh.js", "questions.js", "citations.js", "retry.js"} {
+	for _, name := range []string{"uploads.js", "sync.js", "refresh.js", "questions.js", "citations.js", "retry.js", "retry_activity.js"} {
 		dependency, err := http.Get(httpServer.URL + "/codex/assets/" + name)
 		if err != nil {
 			t.Fatal(err)

@@ -343,8 +343,8 @@
       details: String(entry.details || "").trim(),
     };
   };
-  const captureTranscriptViewState = (container) => ({
-    disclosures: captureTranscriptDisclosureState(container),
+  const captureTranscriptViewState = (container, messageList = container) => ({
+    disclosures: captureTranscriptDisclosureState(messageList),
     follow: shouldFollowTranscript(container),
     scrollTop: container.scrollTop,
   });
@@ -375,11 +375,11 @@
     });
     return changed;
   };
-  const refreshLegacyTranscriptView = (container, view, follow, render) => {
-    const disclosures = captureTranscriptDisclosureState(container);
+  const refreshLegacyTranscriptView = (container, view, follow, render, messageList = container) => {
+    const disclosures = captureTranscriptDisclosureState(messageList);
     const previousTop = container.scrollTop;
     const viewportTop = container.getBoundingClientRect?.().top;
-    const entries = () => [...container.querySelectorAll("[data-transcript-entry-key]")];
+    const entries = () => [...messageList.querySelectorAll("[data-transcript-entry-key]")];
     const anchor = !follow && Number.isFinite(viewportTop) ? entries().find((element) =>
       element.getBoundingClientRect?.().bottom > viewportTop) : null;
     const anchorKey = anchor?.dataset.transcriptEntryKey;
@@ -2754,8 +2754,76 @@
   }) : null;
   const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "");
   const retryRoot = document.getElementById("automatic-turn-retry");
-  if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryControls) {
-    conversationAssets.mountRetryControls(retryRoot, {client: conversation});
+  if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryActivity) {
+    conversationAssets.mountRetryActivity(retryRoot, {client: conversation, conversationKey: conversationID});
+  }
+  const retryPolicyPanel = document.getElementById("session-retry-policy");
+  if (retryPolicyPanel) {
+    const capacity = document.getElementById("retry-capacity");
+    const cybersecurity = document.getElementById("retry-cybersecurity");
+    const feedback = document.getElementById("session-retry-policy-status");
+    const path = apiPath(slug, "retry-policy");
+    let saved = null, busy = false, generation = 0, pending = null;
+    const readOnly = body.dataset.archived === "true" || body.dataset.lifecycle !== "active";
+    const valid = value => value && typeof value.revision === "string" && value.revision.length > 0 &&
+      value.revision.length <= 256 && typeof value.capacity === "boolean" && typeof value.cybersecurity === "boolean";
+    const render = () => {
+      capacity.checked = saved?.capacity === true;
+      cybersecurity.checked = saved?.cybersecurity === true;
+      capacity.disabled = cybersecurity.disabled = readOnly || busy || !saved;
+    };
+    const refreshPolicy = async (message = "") => {
+      if (busy) return;
+      pending?.abort();
+      const controller = new AbortController(), current = ++generation;
+      pending = controller;
+      try {
+        const value = await request(path, {signal: controller.signal});
+        if (current !== generation) return;
+        if (!valid(value)) throw new Error("Automatic retry settings are unavailable.");
+        saved = value; retryPolicyPanel.hidden = false; feedback.textContent = message; render();
+      } catch (error) {
+        if (current !== generation || controller.signal.aborted) return;
+        saved = null;
+        // No optional policy capability means no interactive replacement for
+        // the old per-thread control. Manual delivery is independent of it.
+        if (error.status === 404 || error.status === 403) retryPolicyPanel.hidden = true;
+        else { retryPolicyPanel.hidden = false; feedback.textContent = "Automatic retry settings are unavailable."; }
+        render();
+      } finally {
+        if (current === generation) pending = null;
+      }
+    };
+    const changePolicy = async () => {
+      if (busy || !saved || readOnly) { render(); return; }
+      const choice = {capacity: capacity.checked, cybersecurity: cybersecurity.checked, expectedRevision: saved.revision};
+      busy = true; ++generation; pending?.abort(); pending = null;
+      render(); feedback.textContent = "Saving retry settings…";
+      let message = "Retry settings saved.";
+      try {
+        const value = await request(path, {method: "POST", body: JSON.stringify(choice)});
+        if (!valid(value)) throw new Error("Automatic retry settings are unavailable.");
+        saved = value; feedback.textContent = message;
+      } catch (error) {
+        saved = null;
+        message = error.status === 409 ? "Retry settings changed elsewhere. Current settings have been reloaded." :
+          "Could not confirm the change. Current retry settings have been reloaded.";
+      } finally {
+        busy = false; render();
+      }
+      // Observe an uncertain reply; never repeat the preference write.
+      if (!saved) await refreshPolicy(message);
+    };
+    capacity.addEventListener("change", () => { void changePolicy(); });
+    cybersecurity.addEventListener("change", () => { void changePolicy(); });
+    document.addEventListener("session-section-change", event => {
+      if (event.detail === "settings") void refreshPolicy();
+    });
+    addEventListener("focus", () => {
+      if (document.getElementById("settings")?.classList.contains("active")) void refreshPolicy();
+    });
+    addEventListener("pagehide", () => { ++generation; pending?.abort(); });
+    if (document.getElementById("settings")?.classList.contains("active")) void refreshPolicy();
   }
   document.getElementById("codex-member")?.addEventListener("change", (event) => {
     const target = new URL(location.href);
@@ -3796,9 +3864,10 @@
     if (pendingLifecycle) failLifecycle(pendingLifecycle, error.message);
   });
   const transcript = document.getElementById("transcript");
+  const transcriptEntriesRoot = document.getElementById("transcript-entries");
   const pending = document.getElementById("pending");
   const status = document.getElementById("codex-status");
-  if (!transcript) return;
+  if (!transcript || !transcriptEntriesRoot) return;
 
   const composerView = document.getElementById("message-form") ? createComposerView(
     document.getElementById("plan-actions"), document.getElementById("message-form"), pending,
@@ -4233,6 +4302,7 @@
     scrollbarLastTop = historyScrollTop();
   });
   transcriptResize.observe(transcript);
+  if (retryRoot) transcriptResize.observe(retryRoot);
   document.addEventListener("session-section-change", (event) => {
     if (event.detail !== "codex") return;
     resetHistoryNavigation();
@@ -4444,7 +4514,7 @@
   };
 
   const renderTranscriptEntries = (entries, disclosureStates) => {
-    transcript.replaceChildren();
+    transcriptEntriesRoot.replaceChildren();
     const visibleEntries = transcriptEntriesForFilter(entries, transcriptFilter);
     let dateKey = "";
     entries.forEach((entry, index) => {
@@ -4455,9 +4525,9 @@
           const separator = document.createElement("div");
           separator.className = "transcript-date";
           separator.textContent = timestamp.dateLabel;
-          transcript.append(separator);
+          transcriptEntriesRoot.append(separator);
         }
-        transcript.append(appendMessage(entry, index, entries, disclosureStates));
+        transcriptEntriesRoot.append(appendMessage(entry, index, entries, disclosureStates));
       }
     });
     if (!visibleEntries.length) {
@@ -4465,17 +4535,17 @@
       empty.className = "empty";
       empty.textContent = transcriptFilter === "all" ? "No conversation entries yet." :
         `No ${transcriptFilter} in this conversation.`;
-      transcript.append(empty);
+      transcriptEntriesRoot.append(empty);
     }
   };
 
   const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
     resetHistoryNavigation();
-    const oldNodes = new Map([...transcript.children].filter((node) => node.dataset.transcriptEntryKey)
+    const oldNodes = new Map([...transcriptEntriesRoot.children].filter((node) => node.dataset.transcriptEntryKey)
       .map((node) => [node.dataset.transcriptEntryKey, node]));
-    const oldDates = new Map([...transcript.children].filter((node) => node.dataset.transcriptDateKey)
+    const oldDates = new Map([...transcriptEntriesRoot.children].filter((node) => node.dataset.transcriptDateKey)
       .map((node) => [node.dataset.transcriptDateKey, node]));
-    const anchor = !follow ? [...transcript.children].find((node) =>
+    const anchor = !follow ? [...transcriptEntriesRoot.children].find((node) =>
       node.getBoundingClientRect().bottom > transcript.getBoundingClientRect().top) : null;
     const anchorTop = anchor?.getBoundingClientRect().top;
     const anchorKey = anchor?.dataset.transcriptEntryKey;
@@ -4514,16 +4584,16 @@
       desired.push(node);
     }
     if (!desired.length) {
-      const empty = transcript.querySelector(".empty") || document.createElement("p");
+      const empty = transcriptEntriesRoot.querySelector(".empty") || document.createElement("p");
       empty.className = "empty";
       empty.textContent = transcriptFilter === "all" ? "No conversation entries yet." :
         `No ${transcriptFilter} in this conversation.`;
       desired.push(empty);
     }
     const keep = new Set(desired);
-    for (const node of [...transcript.children]) if (!keep.has(node)) node.remove();
+    for (const node of [...transcriptEntriesRoot.children]) if (!keep.has(node)) node.remove();
     desired.forEach((node, index) => {
-      if (transcript.children[index] !== node) transcript.insertBefore(node, transcript.children[index] || null);
+      if (transcriptEntriesRoot.children[index] !== node) transcriptEntriesRoot.insertBefore(node, transcriptEntriesRoot.children[index] || null);
     });
     const currentAnchor = anchor?.isConnected ? anchor : desired.find((node) =>
       (anchorKey && node.dataset.transcriptEntryKey === anchorKey) ||
@@ -4539,7 +4609,7 @@
   const saveTranscriptView = () => {
     const view = transcriptViews.get(transcriptFilter);
     if (!view) return;
-    Object.assign(view, captureTranscriptViewState(transcript), {follow: view.follow, initialized: true});
+    Object.assign(view, captureTranscriptViewState(transcript, transcriptEntriesRoot), {follow: view.follow, initialized: true});
   };
 
   const transcriptTimestamps = createTranscriptTimestampPresentation({
@@ -4634,7 +4704,7 @@
     }
     if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
     else refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
-      renderTranscriptEntries(transcriptEntries, disclosures));
+      renderTranscriptEntries(transcriptEntries, disclosures), transcriptEntriesRoot);
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
     const newOutput = document.getElementById("new-output");
