@@ -16,7 +16,7 @@ function fixture() {
   const uploads = {values:["new-upload"], ids() {return this.values;}, ready:()=>true, clear() {this.values=[];}};
   const context = vm.createContext({
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
-    executionHeld:false, liveSettingsSaving:false, form, composerUploads:uploads, pendingMessages,
+    executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
     inFlightMessageIDs:new Set(), sendAttemptStorage:{}, pageReads:{paused:false}, transcriptEntries:[],
     document:{getElementById:id=>id==="message-submission-status" ? status : form},
     conversationAssets:{sameAttachments:(a=[],b=[])=>JSON.stringify(a)===JSON.stringify(b)},
@@ -96,5 +96,15 @@ function fixture() {
   await f.context.test.retryMessageReceipt(f.attempt.id);
   assert(f.status.hidden); assert.equal(f.form.elements.message.value,f.attempt.message);
   assert.deepEqual(f.uploads.values,["new-upload"]);
+  // Even identical new text/attachments are never late-cleared by a receipt
+  // or transcript acknowledgment from a previous explicit handoff.
+  f=fixture(); f.form.elements.message.value=f.attempt.message;
+  f.uploads.values=[...f.attempt.attachmentIds];
+  await f.context.test.retryMessageReceipt(f.attempt.id);
+  assert.equal(f.form.elements.message.value,f.attempt.message);
+  assert.deepEqual(f.uploads.values,f.attempt.attachmentIds);
+  await f.observe();
+  assert.equal(f.form.elements.message.value,f.attempt.message);
+  assert.deepEqual(f.uploads.values,f.attempt.attachmentIds);
   console.log("Submission notices follow exact attempt proof and retain unrelated drafts/records.");
 })().catch(error=>{console.error(error);process.exitCode=1;});
