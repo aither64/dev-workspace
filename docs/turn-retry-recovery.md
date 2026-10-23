@@ -38,9 +38,9 @@ The admission lock is shared by portal, CLI and direct team mutations. Lock
 ordering is package transition, session runtime, roster operation when needed,
 conversation mutex, then per-thread admission. Atomic state writes and native
 queue/submission-ledger operations occur inside that admission fence. They do
-not acquire an outer roster or conversation lock. No timer sleeps under these
-locks. Two scheduler workers serve retained roots and ready team members
-without requiring a browser connection.
+not acquire an outer roster or conversation lock. The retry scheduler does not
+sleep while holding these locks. Two scheduler workers serve retained roots and
+ready team members without requiring a browser connection.
 
 First enrollment reads a conservative terminal baseline. A failure already
 present at that boundary is consumed. A proven active turn can qualify when it
@@ -115,6 +115,14 @@ and steering intent. It does not rewrite earlier retry snapshots or admit a
 submitting or queue-owned attempt as new work. Exact receipt recovery runs
 before plan freshness and ordinary activity checks. Every other unresolved
 submission still receives the ordinary checks.
+
+Browser mutations wait for a temporary exclusive session-runtime lock within
+their existing request deadline. After acquiring the lock, the server checks
+the current package, lifecycle, provider and conversation authority again. A
+timeout or changed authority refuses admission without sending input or changing
+settings. Lifecycle commands retain their existing immediate lock refusal
+behavior. Recover an uncertain response using the original browser submission
+identity.
 
 Automatic dispatch reserves room for accepted-result bookkeeping before sending.
 If an already accepted result cannot retain another eligibility snapshot,

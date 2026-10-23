@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -46,6 +47,12 @@ func LockRuntimeShared(directory, slug string) (*RuntimeLock, error) {
 	return lockRuntime(directory, slug, ".lock", unix.LOCK_SH)
 }
 
+// LockRuntimeSharedContext lets HTTP callers wait for a legitimate exclusive
+// operation within their request budget. Lifecycle callers remain fail-fast.
+func LockRuntimeSharedContext(ctx context.Context, directory, slug string) (*RuntimeLock, error) {
+	return lockRuntimeContext(ctx, directory, slug, ".lock", unix.LOCK_SH)
+}
+
 // LockCreation and LockRuntimeExclusive use the CLI's creation-then-session
 // lock order when reserving a destination that does not yet have an authority.
 func LockCreation(directory, slug string) (*RuntimeLock, error) {
@@ -57,6 +64,10 @@ func LockRuntimeExclusive(directory, slug string) (*RuntimeLock, error) {
 }
 
 func lockRuntime(directory, slug, suffix string, mode int) (*RuntimeLock, error) {
+	return lockRuntimeContext(nil, directory, slug, suffix, mode)
+}
+
+func lockRuntimeContext(ctx context.Context, directory, slug, suffix string, mode int) (*RuntimeLock, error) {
 	if directory == "" || !ValidSlug(slug) {
 		return nil, errors.New("runtime locking is not configured")
 	}
@@ -70,11 +81,32 @@ func lockRuntime(directory, slug, suffix string, mode int) (*RuntimeLock, error)
 	if err != nil {
 		return nil, fmt.Errorf("open runtime session lock: %w", err)
 	}
-	if err := unix.Flock(int(session.Fd()), mode|unix.LOCK_NB); err != nil {
-		session.Close()
-		return nil, fmt.Errorf("session is changing: %w", err)
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			session.Close()
+			return nil, ctx.Err()
+		}
+		err := unix.Flock(int(session.Fd()), mode|unix.LOCK_NB)
+		if err == nil {
+			if ctx != nil && ctx.Err() != nil {
+				session.Close()
+				return nil, ctx.Err()
+			}
+			return &RuntimeLock{session: session}, nil
+		}
+		if ctx == nil || !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			session.Close()
+			return nil, fmt.Errorf("session is changing: %w", err)
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			session.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return &RuntimeLock{session: session}, nil
 }
 
 func openAuthorityDirectory(directory string) (int, error) {

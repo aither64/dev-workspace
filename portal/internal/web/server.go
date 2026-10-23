@@ -2027,6 +2027,9 @@ func (s *Server) sessionAPIForSummary(
 		return
 	}
 	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		r = r.WithContext(ctx)
 		var planBody *implementPlanRequest
 		if len(parts) == 2 && parts[1] == "implement-plan" {
 			body, ok := s.decodeImplementPlanRequest(w, r)
@@ -2035,12 +2038,20 @@ func (s *Server) sessionAPIForSummary(
 			}
 			planBody = &body
 		}
-		lock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+		lock, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, summary.Slug)
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		defer lock.Close()
+		if err := s.requireCurrentHostProfile(); err != nil {
+			s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		if receipt, ok := s.currentCreation(summary.Slug); ok && receipt.blocksSession() {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session initialization has not finished"})
+			return
+		}
 		owner, journalErr := session.PendingLifecycle(s.config.Workspace, summary.Slug)
 		if journalErr != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": journalErr.Error()})
@@ -2066,7 +2077,7 @@ func (s *Server) sessionAPIForSummary(
 				return
 			}
 		}
-		if err := s.requireOrdinaryRetainedMutationExceptPrepared(r.Context(), summary, prepared); err != nil {
+		if err := s.requireOrdinaryRetainedMutationExceptPrepared(ctx, summary, prepared); err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
@@ -3655,11 +3666,23 @@ func (s *Server) resolveConversation(
 		return conversation.Target{}, errors.New("session has no verified Codex thread")
 	}
 	if request.Mutation {
-		runtimeLock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+		var runtimeLock *session.RuntimeLock
+		var err error
+		if request.Operation == "automatic-retry" {
+			runtimeLock, err = session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+		} else {
+			runtimeLock, err = session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, summary.Slug)
+		}
 		if err != nil {
 			return conversation.Target{}, fmt.Errorf("lock session runtime: %w", err)
 		}
 		releases = append(releases, func() { _ = runtimeLock.Close() })
+		if err := s.requireCurrentHostProfile(); err != nil {
+			return conversation.Target{}, err
+		}
+		if receipt, ok := s.currentCreation(slug); ok && receipt.blocksSession() {
+			return conversation.Target{}, errors.New("session initialization has not finished")
+		}
 		owner, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
 		if err != nil {
 			return conversation.Target{}, err
