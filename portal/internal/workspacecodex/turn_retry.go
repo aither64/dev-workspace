@@ -274,6 +274,9 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 			return codex.SendReceipt{}, false, nil
 		}
 	}
+	if prepared, err := c.Client.IsPreparedSendWithOptions(thread, text, id, action, options); err != nil || prepared {
+		return codex.SendReceipt{}, false, err
+	}
 	return codex.SendReceipt{}, false, errors.New("earlier submission has no managed admission proof")
 }
 

@@ -103,9 +103,18 @@ that exact identity. A new UUID is never a recovery mechanism.
 Exact delivery reconciliation runs before capturing new retry provenance or
 binding settings. An accepted original UUID returns its existing receipt without
 acquiring newer settings or causing another native send. This includes history
-recovery after browser acknowledgment. Prepared or uncertain input with missing
+recovery after browser acknowledgment. An uncertain submission with missing
 admission proof cannot be treated as new input. Keep the original UUID when
 recovering an uncertain response.
+
+Plan implementation reserves its original message identity before changing Plan
+mode to Default. An exact prepared entry in the generic submission ledger, with
+no queue attempt, can acquire its first managed admission after that explicit
+settings change. This preserves the original UUID, text, plan action, options
+and steering intent. It does not rewrite earlier retry snapshots or admit a
+submitting or queue-owned attempt as new work. Exact receipt recovery runs
+before plan freshness and ordinary activity checks. Every other unresolved
+submission still receives the ordinary checks.
 
 Automatic dispatch reserves room for accepted-result bookkeeping before sending.
 If an already accepted result cannot retain another eligibility snapshot,

@@ -64,6 +64,14 @@ func retainedObservationIdentities(roster *Roster) [][3]string {
 // It proves the current roster, project, persistence and unknown-writer state;
 // it neither adopts a discovered root nor supplies creation provenance.
 func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, identity string) (Observation, error) {
+	return service.observeRetained(ctx, slug, rootThreadID, identity, nil)
+}
+
+func (service Service) ObserveRetainedExceptPreparedRoot(ctx context.Context, slug, rootThreadID, identity string, prepared workspacecodex.PreparedSend) (Observation, error) {
+	return service.observeRetained(ctx, slug, rootThreadID, identity, &prepared)
+}
+
+func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, identity string, prepared *workspacecodex.PreparedSend) (Observation, error) {
 	if service.Store == nil || service.Client == nil {
 		return Observation{}, errors.New("retained observation runtime is unavailable")
 	}
@@ -107,7 +115,19 @@ func (service Service) ObserveRetained(ctx context.Context, slug, rootThreadID, 
 			default:
 				return errors.New("retained archival state is unknown")
 			}
-			observation, err := observer.ObserveThreadIdentity(ctx, thread, cwd, project, state)
+			var observation workspacecodex.ThreadObservation
+			var err error
+			if address == "lead" && prepared != nil {
+				exact, ok := service.Client.(interface {
+					ObserveThreadIdentityExceptPreparedSend(context.Context, string, string, string, workspacecodex.ArchiveState, workspacecodex.PreparedSend) (workspacecodex.ThreadObservation, error)
+				})
+				if !ok {
+					return errors.New("semantic conversation observer is unavailable")
+				}
+				observation, err = exact.ObserveThreadIdentityExceptPreparedSend(ctx, thread, cwd, project, state, *prepared)
+			} else {
+				observation, err = observer.ObserveThreadIdentity(ctx, thread, cwd, project, state)
+			}
 			if err != nil {
 				return err
 			}
