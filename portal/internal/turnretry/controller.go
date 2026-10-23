@@ -145,6 +145,9 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 			}
 			return err
 		}
+		if err := c.preflightAccepted(tx); err != nil {
+			return err
+		}
 		if err := s.ReserveUnsubmitted(c.now()); err != nil {
 			return err
 		}
@@ -208,6 +211,9 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 	if err != nil || !unsubmitted {
 		return err
 	}
+	if err := c.preflightAccepted(tx); err != nil {
+		return err
+	}
 	if err := s.Begin(c.now()); err != nil {
 		return err
 	}
@@ -218,6 +224,23 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 		return nil
 	}
 	return c.dispatch(ctx, tx, *s.Pending)
+}
+
+// Called only after exact positive never-submitted proof. Unknown intents must
+// remain reconciliation-only, including when the provenance record is full.
+func (c Controller) preflightAccepted(tx *Transaction) error {
+	err := tx.State.PreflightAccepted()
+	if err != nil {
+		if errors.Is(err, ErrSnapshotCapacity) {
+			tx.State.Handled = tx.State.Pending.Failure
+			tx.State.Phase, tx.State.Reason, tx.State.Cancelled, tx.State.DeadlineMS = "blocked", "settings_unproven", true, 0
+			if saveErr := tx.Save(); saveErr != nil {
+				return saveErr
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (c Controller) dispatch(ctx context.Context, tx *Transaction, p Pending) error {

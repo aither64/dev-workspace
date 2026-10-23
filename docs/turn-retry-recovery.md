@@ -23,10 +23,16 @@ anonymous charges and inconsistent pending identities fail closed.
 Directories use mode 0700 and records mode 0600. Writers hold a per-thread
 interprocess admission lock and replace each record atomically, syncing both
 file and directory. A record is limited to 1 MiB, each settings snapshot to
-256 KiB, and a session to 128 thread records. Up to 64 outstanding or current
-settings snapshots fit within the record limit. Admission refuses before
-submitting additional work if preserving its evidence would exceed a bound.
-It does not evict queued or uncertain submissions to make room.
+256 KiB, and a session to 128 thread records.
+
+The record holds up to 64 outstanding or current settings snapshots. To make
+room for new evidence, admission retires only the oldest positively accepted
+snapshots bound to a turn. Unbound queue entries, uncertain submissions and
+pending identities remain protected. Retiring a contributor from the current
+turn disables automatic retry for that exact turn and removes its cached
+execution proof. If that turn later fails, it requires manual continuation. If
+protected evidence fills the count or byte budget, admission refuses before
+sending.
 
 The admission lock is shared by portal, CLI and direct team mutations. Lock
 ordering is package transition, session runtime, roster operation when needed,
@@ -93,6 +99,20 @@ Automatic continuations use the existing schema-3 native submission ledger.
 The private retry record retains one UUID, action identity, source failure and
 immutable settings across restart. A lost response enters reconciliation using
 that exact identity. A new UUID is never a recovery mechanism.
+
+Exact delivery reconciliation runs before capturing new retry provenance or
+binding settings. An accepted original UUID returns its existing receipt without
+acquiring newer settings or causing another native send. This includes history
+recovery after browser acknowledgment. Prepared or uncertain input with missing
+admission proof cannot be treated as new input. Keep the original UUID when
+recovering an uncertain response.
+
+Automatic dispatch reserves room for accepted-result bookkeeping before sending.
+If an already accepted result cannot retain another eligibility snapshot,
+reconciliation saves its exact pending identity, result and quota charge in a
+blocked state that requires manual continuation. Freeing space or restarting
+does not enable automatic retry for that result. Persistence errors leave the
+durable uncertain tuple and generic receipt available for exact reconciliation.
 
 Cancel retry suppresses future continuations but leaves the preference enabled.
 Disabling also cancels the chain. New input, queue admission/start, settings

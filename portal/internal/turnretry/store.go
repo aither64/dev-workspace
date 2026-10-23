@@ -267,7 +267,7 @@ func (t *Transaction) Save() error {
 	if err != nil {
 		return err
 	}
-	if len(data) > MaxBytes {
+	if len(data)+1 > MaxBytes {
 		return errors.New("retry state exceeds 1 MiB")
 	}
 	path := t.store.path(t.scope)

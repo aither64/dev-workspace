@@ -54,6 +54,8 @@ func TestCoordinationNotificationRetainsSettingsAndDeduplicatesNativeDelivery(t 
 							turns = append(turns, map[string]any{"id": "active-turn", "status": "inProgress"})
 						}
 						result = map[string]any{"data": turns}
+					case "thread/items/list":
+						result = map[string]any{"data": []any{}, "nextCursor": nil}
 					case "turn/start", "turn/steer":
 						want := "turn/start"
 						if active {

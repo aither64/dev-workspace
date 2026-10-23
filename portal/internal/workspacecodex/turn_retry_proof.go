@@ -34,6 +34,9 @@ func (b retryBackend) Boundary(_ context.Context, scope turnretry.Scope) (string
 }
 
 func (b retryBackend) Prove(ctx context.Context, scope turnretry.Scope, state *turnretry.State, turn string) error {
+	if state.Handled == turn {
+		return turnretry.ErrMissingProof
+	}
 	if state.Proof(turn) != nil {
 		return nil
 	}
@@ -107,15 +110,13 @@ func (b retryBackend) Prove(ctx context.Context, scope turnretry.Scope, state *t
 	if err != nil {
 		return err
 	}
-	state.AddSnapshot(proof)
-	// Bound retained history to unresolved admissions and this task's inputs.
-	kept := []turnretry.Snapshot{}
-	for _, p := range state.Snapshots {
-		if p.Turn == "" || p.Turn == turn {
-			kept = append(kept, p)
+	if err := state.RetainProof(proof); err != nil {
+		if errors.Is(err, turnretry.ErrSnapshotCapacity) {
+			state.SuppressTurn(turn)
+			return turnretry.ErrMissingProof
 		}
+		return err
 	}
-	state.Snapshots = kept
 	return nil
 }
 

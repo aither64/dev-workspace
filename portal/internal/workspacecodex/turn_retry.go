@@ -170,22 +170,14 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	if tx.State.Uncertain() {
 		return errors.New("automatic submission requires reconciliation before new work")
 	}
-	// Accepted inputs belonging to an older turn cannot contribute to the
-	// current task. Retain unbound queue/uncertain inputs until exact history
-	// identifies execution; queue disappearance alone proves nothing.
+	currentTurn := ""
 	if origin != "initial" {
 		latest, err := c.latestTurn(ctx, tx.State.Scope.Thread)
 		if err != nil {
 			return err
 		}
 		if latest != nil {
-			kept := tx.State.Snapshots[:0]
-			for _, p := range tx.State.Snapshots {
-				if p.Turn == "" || p.Turn == latest.ID {
-					kept = append(kept, p)
-				}
-			}
-			tx.State.Snapshots = kept
+			currentTurn = latest.ID
 		}
 	}
 	// Enrollment precedes the managed send. Latest-state observation by the
@@ -253,8 +245,54 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	if err != nil {
 		return err
 	}
-	tx.State.AddSnapshot(snapshot)
+	if err := tx.State.AdmitSnapshot(snapshot, currentTurn); err != nil {
+		return err
+	}
 	return tx.Save()
+}
+
+// Generic delivery identity is authoritative even when bounded retry evidence
+// has been retired. Reconciliation precedes cancellation, capture and rebind;
+// accepted input must never acquire today's settings or epoch on replay.
+func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transaction, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	if err != nil || found {
+		return receipt, found, err
+	}
+	// Reconcile alone deliberately does not distinguish absent from prepared,
+	// and acknowledged accepted IDs may now exist only in native history.
+	attempted, err := c.Client.SendAttemptedWithOptions(ctx, thread, text, id, action, options)
+	if err != nil || !attempted {
+		return codex.SendReceipt{}, false, err
+	}
+	receipt, found, err = c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	if err != nil || found {
+		return receipt, found, err
+	}
+	for _, p := range tx.State.Snapshots {
+		if p.ID == id && p.TextDigest == textHash(text) {
+			return codex.SendReceipt{}, false, nil
+		}
+	}
+	return codex.SendReceipt{}, false, errors.New("earlier submission has no managed admission proof")
+}
+
+func recoverRetryReceipt(tx *turnretry.Transaction, id, text string, receipt codex.SendReceipt) error {
+	for _, p := range tx.State.Snapshots {
+		if p.ID == id {
+			if p.TextDigest != textHash(text) {
+				return errors.New("managed admission identity changed")
+			}
+			if receipt.TurnID != "" && p.Turn == "" {
+				return bindRetryReceipt(tx, id, receipt)
+			}
+			if p.Turn != "" && receipt.TurnID != "" && p.Turn != receipt.TurnID {
+				return errors.New("managed receipt identity changed")
+			}
+			return nil
+		}
+	}
+	return nil // Accepted generic receipt, deliberately retired retry evidence.
 }
 
 func (c *Client) Send(ctx context.Context, thread, text, id, action string) (codex.SendReceipt, error) {
@@ -270,6 +308,14 @@ func (c *Client) SendWithOptions(ctx context.Context, thread, text, id, action s
 		return c.sendWithRecovery(ctx, thread, text, id, action, options)
 	}
 	defer tx.Close()
+	if receipt, found, err := c.reconcileRetrySend(ctx, tx, thread, text, id, action, options); err != nil || found {
+		if err == nil {
+			if err = recoverRetryReceipt(tx, id, text, receipt); err != nil {
+				err = &codex.UnknownSendOutcomeError{Err: err}
+			}
+		}
+		return receipt, err
+	}
 	origin := "send"
 	if strings.HasPrefix(action, "team:") {
 		origin = "team"
@@ -333,6 +379,12 @@ func (c *Client) QueueWithPolicy(ctx context.Context, thread, text, id string, p
 	defer tx.Close()
 	if !reflect.DeepEqual(policy, codex.ThreadPolicy{}) && !reflect.DeepEqual(policy, current) {
 		return codex.QueueEntry{}, errors.New("managed queue policy changed")
+	}
+	if receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}); err != nil || found {
+		if err == nil {
+			err = recoverRetryReceipt(tx, id, text, receipt)
+		}
+		return codex.QueueEntry{ID: receipt.QueuedSubmissionID, ClientUserMessageID: id, Text: text}, err
 	}
 	if err := c.captureRetry(ctx, tx, current, text, id, "queue", codex.TurnOptions{ThreadPolicy: current}); err != nil {
 		return codex.QueueEntry{}, err
