@@ -2027,6 +2027,14 @@ func (s *Server) sessionAPIForSummary(
 		return
 	}
 	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		var planBody *implementPlanRequest
+		if len(parts) == 2 && parts[1] == "implement-plan" {
+			body, ok := s.decodeImplementPlanRequest(w, r)
+			if !ok {
+				return
+			}
+			planBody = &body
+		}
 		lock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -2050,12 +2058,24 @@ func (s *Server) sessionAPIForSummary(
 			return
 		}
 		s.normalizeInteractivity(r.Context(), summary)
-		if err := s.requireOrdinaryRetainedMutation(r.Context(), summary); err != nil {
+		var prepared *workspacecodex.PreparedSend
+		if planBody != nil {
+			var done bool
+			prepared, done = s.reconcilePlanDelivery(w, r, summary, *planBody)
+			if done {
+				return
+			}
+		}
+		if err := s.requireOrdinaryRetainedMutationExceptPrepared(r.Context(), summary, prepared); err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		if !summary.Interactive {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not ready for browser changes"})
+			return
+		}
+		if planBody != nil {
+			s.implementPlanRequest(w, r, summary, *planBody)
 			return
 		}
 	}
@@ -2456,39 +2476,53 @@ type implementPlanRequest struct {
 	BrowserNotificationsEnabled *bool   `json:"browserNotificationsEnabled,omitempty"`
 }
 
-func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+func (s *Server) decodeImplementPlanRequest(w http.ResponseWriter, r *http.Request) (implementPlanRequest, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
 	var payload json.RawMessage
 	if !s.decodeJSON(w, r, &payload) {
-		return
+		return implementPlanRequest{}, false
 	}
 	if err := rejectDuplicateCreationJSONKeys(payload); err != nil {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
-		return
+		return implementPlanRequest{}, false
 	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil || raw == nil {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
-		return
+		return implementPlanRequest{}, false
 	}
 	if err := validateBrowserNotificationPreference(raw); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
-		return
+		return implementPlanRequest{}, false
 	}
 	var body implementPlanRequest
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
-		return
+		return implementPlanRequest{}, false
 	}
 	if strings.TrimSpace(body.Action) == "new" {
 		for _, field := range []string{"model", "reasoningEffort", "team", "catalogDigest", "provider"} {
 			if value, ok := raw[field]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 				s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "managed creation fields must be omitted instead of null"})
-				return
+				return implementPlanRequest{}, false
 			}
 		}
+	}
+	return body, true
+}
+
+func (s *Server) implementPlan(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	body, ok := s.decodeImplementPlanRequest(w, r)
+	if !ok {
+		return
+	}
+	s.implementPlanRequest(w, r, summary, body)
+}
+
+func (s *Server) implementPlanRequest(w http.ResponseWriter, r *http.Request, summary *session.Summary, body implementPlanRequest) {
+	if strings.TrimSpace(body.Action) == "new" {
 		destination, err := creationDestination(strings.TrimSpace(body.Name), strings.TrimSpace(body.CreationDate))
 		if err != nil {
 			s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -3512,6 +3546,10 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 // observation. Busy is governed by the requested operation; unknown submissions
 // or another same-CWD identity never authorize a write.
 func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *session.Summary) error {
+	return s.requireOrdinaryRetainedMutationExceptPrepared(ctx, summary, nil)
+}
+
+func (s *Server) requireOrdinaryRetainedMutationExceptPrepared(ctx context.Context, summary *session.Summary, prepared *workspacecodex.PreparedSend) error {
 	if err := s.requireProviderAdmission(summary.Slug); err != nil {
 		return err
 	}
@@ -3540,7 +3578,12 @@ func (s *Server) requireOrdinaryRetainedMutation(ctx context.Context, summary *s
 	if err != nil {
 		return err
 	}
-	observation, err := service.ObserveRetained(ctx, summary.Slug, summary.Codex.ThreadID, identity)
+	var observation teamruntime.Observation
+	if prepared != nil {
+		observation, err = service.ObserveRetainedExceptPreparedRoot(ctx, summary.Slug, summary.Codex.ThreadID, identity, *prepared)
+	} else {
+		observation, err = service.ObserveRetained(ctx, summary.Slug, summary.Codex.ThreadID, identity)
+	}
 	if err != nil || !observation.ActivityKnown {
 		return errors.New("retained conversation or submission proof is unavailable")
 	}

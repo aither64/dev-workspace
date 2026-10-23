@@ -161,6 +161,23 @@ func (c *Client) ObserveThread(ctx context.Context, threadID, cwd string) (Threa
 // ObserveThreadIdentity is bounded and read-only. A caller with a retained team
 // must bracket this primitive with its owning project/materialization proof.
 func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, projectID string, state ArchiveState) (ThreadObservation, error) {
+	return c.observeThreadIdentity(ctx, threadID, cwd, projectID, state, c.RequireSubmissionAttemptsKnown)
+}
+
+// PreparedSend is an exact request-local delivery identity, never a wildcard
+// observation exception or permission to submit native work.
+type PreparedSend struct {
+	Text, ID, Action string
+	Options          codex.TurnOptions
+}
+
+func (c *Client) ObserveThreadIdentityExceptPreparedSend(ctx context.Context, threadID, cwd, projectID string, state ArchiveState, prepared PreparedSend) (ThreadObservation, error) {
+	return c.observeThreadIdentity(ctx, threadID, cwd, projectID, state, func(ctx context.Context, thread string) error {
+		return c.Client.RequireSubmissionAttemptsKnownExceptPreparedSend(ctx, thread, prepared.Text, prepared.ID, prepared.Action, prepared.Options)
+	})
+}
+
+func (c *Client) observeThreadIdentity(ctx context.Context, threadID, cwd, projectID string, state ArchiveState, known func(context.Context, string) error) (ThreadObservation, error) {
 	if !observationID(threadID, true) || !filepath.IsAbs(cwd) || filepath.Clean(cwd) != cwd {
 		return ThreadObservation{}, observationFailure("identity_invalid", "Conversation observation requires an exact identity and directory.")
 	}
@@ -246,7 +263,7 @@ func (c *Client) ObserveThreadIdentity(ctx context.Context, threadID, cwd, proje
 		}
 		// The public owner proves resolution but exposes no attempt snapshot.
 		// An error is unknown activity; no private ledger or error text is parsed.
-		if err := c.RequireSubmissionAttemptsKnown(ctx, threadID); err != nil {
+		if err := known(ctx, threadID); err != nil {
 			return ThreadObservation{}, observationReadFailure(err, "submission_unverified", "Conversation submissions cannot be proved resolved.")
 		}
 	} else {

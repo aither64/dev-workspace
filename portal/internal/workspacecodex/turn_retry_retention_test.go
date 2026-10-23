@@ -49,6 +49,15 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 		var result, notify any
 		failure := ""
 		switch {
+		case method == "thread/resume" && w.bound && p["developerInstructions"] != nil:
+			config, _ := p["config"].(map[string]any)
+			servers, _ := config["mcp_servers"].(map[string]any)
+			server, _ := servers["team"].(map[string]any)
+			if p["developerInstructions"] != "common lifecycle\n\n"+w.policy.DeveloperInstructions || p["sandbox"] != w.policy.Sandbox || p["approvalPolicy"] != w.policy.ApprovalPolicy || server["command"] != w.policy.MCPServer.Command {
+				w.t.Error("explicit prepared send changed authorized instructions/MCP/access", p)
+			}
+			w.resumes++
+			result = map[string]any{"thread": map[string]any{"id": w.thread}}
 		case method == "thread/items/list" && (r.hideHistory || w.items == nil):
 			result = map[string]any{"data": []any{}, "nextCursor": nil}
 		case method == "thread/read" && r.stopBeforeID != "":
@@ -242,17 +251,17 @@ func TestRetryRetentionProtectedQueueFIFOAndPreparedIdentity(t *testing.T) {
 			}
 		})
 	}
-	t.Run("prepared without admission", func(t *testing.T) {
+	t.Run("prepared first execution without admission", func(t *testing.T) {
 		r := &retryRetentionWire{}
 		w := newRetrySettingsWireWithServer(t, false, "default", r.serve)
 		if err := w.client.PrepareSendWithOptions(w.thread, "prepared", "prepared", "action", true, codex.TurnOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.client.Send(context.Background(), w.thread, "prepared", "prepared", "action"); err == nil {
-			t.Fatal("prepared identity with missing admission was treated as fresh")
+		if _, err := w.client.Send(context.Background(), w.thread, "prepared", "prepared", "action"); err != nil {
+			t.Fatal("positive exact prepared intent could not acquire first execution admission", err)
 		}
-		if r.count() != 0 {
-			t.Fatal("prepared identity replayed")
+		if r.count() != 1 {
+			t.Fatal("prepared identity did not execute exactly once")
 		}
 	})
 }
