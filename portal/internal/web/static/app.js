@@ -1208,7 +1208,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=23");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=25");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -5009,6 +5009,7 @@
         } else {
           field.rows = rows;
         }
+        conversationAssets.bindQuestionAnswerKeyboard(field, next);
         return field;
       };
       const saveDraft = () => {

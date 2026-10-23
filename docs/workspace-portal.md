@@ -47,6 +47,9 @@ lists, initially selecting the recommendation or first option. Select one and
 optionally add text, or choose **Other** to write your own answer. Select **Send answer** to submit. Both views show the same selection,
 text, delivery status and accepted answer.
 
+Press Enter in a question's text answer to use its current **Next**, **Submit
+answers** or **Send answer** action. Use Shift+Enter for a newline.
+
 The panel starts as a narrow bar showing the number of pending questions. Click
 it to expand one question at a time. Use the numbered question buttons or arrows
 to navigate without sending or losing drafts;
