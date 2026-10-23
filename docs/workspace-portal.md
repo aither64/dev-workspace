@@ -468,11 +468,18 @@ a fresh read.
 
 ## Automatic turn retries
 
-Auto retry is enabled by default for managed lead conversations and ready team
-members. The checkbox belongs to the selected conversation and persists across
-portal restarts. Native child threads are excluded. Only new failures after
-enrollment qualify; installing the feature or enabling the checkbox does not
-restart an already-failed task.
+Automatic retries are enabled by default for managed lead conversations and
+ready team members. Native child threads are excluded. Only new failures after
+enrollment qualify; installing the feature does not restart an already-failed
+task.
+
+When session retry policy is available, Settings contains separate switches for
+capacity and cybersecurity errors. Both apply to the lead and all current and
+future retained team members. The conversation notice shows the current or
+latest retry chain. Retry now accelerates a scheduled attempt; Stop retrying
+stops that chain without changing the session preferences. Dismiss hides only
+that result in this browser. The notice appears inside the conversation viewport
+and leaves no space when hidden.
 
 A terminal capacity error retries after 15, 30, 60, 120, 240 and 300 seconds,
 then every 300 seconds until cancelled. Each interval adds up to 10% positive
@@ -498,14 +505,14 @@ The server still verifies the error code, settings, queue, submission ledger
 and managed admission. It never resumes a cold thread or clears native error
 state to make a retry possible.
 
-Cancel retry stops the current chain and leaves Auto retry enabled. Turning the
-checkbox off also cancels the chain. New input, settings changes, Interrupt and
-session Stop cancel pending retries. A cancellation after dispatch keeps checking
-whether that request started; it cannot undo an accepted continuation. Use the existing
-Interrupt control to interrupt a running turn.
+New input, settings changes, Interrupt and session Stop cancel pending retries.
+A cancellation after dispatch keeps checking whether that request started; it
+cannot undo an accepted continuation. Use the existing Interrupt control to
+interrupt a running turn.
 
-The server schedules work while the browser is closed. The controls display its
-phase, attempt, quota and deadline; the browser never submits a timed retry.
+The server schedules work while the browser is closed. The optional activity
+notice displays server-reported retry counts, elapsed time and status. It marks
+partial or unavailable evidence. The browser never submits a timed retry.
 Transport errors, native intermediate retries, ordinary assistant refusals and
 unrecognized failure codes do not start an automatic chain. The
 [recovery guide](turn-retry-recovery.md) documents persistence, admission,

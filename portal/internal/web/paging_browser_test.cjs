@@ -10,7 +10,7 @@ assert.match(source, /conversationAssets\.readTranscriptPage\(client,/);
 assert.match(source, /conversationAssets\.transcriptEntryKey\(entry,/);
 assert.doesNotMatch(source, /const createTranscriptHistory\s*=/);
 assert.doesNotMatch(source, /const readTranscriptPage\s*=/);
-assert.match(source, /renderThread\(page, \(\) => read\.isCurrent\(\)/);
+assert.match(source, /renderThread\(page, \(\) => historyRead === read && read\.isCurrent\(\) && threadID === currentThreadId/);
 const historyRead = source.slice(source.indexOf("const runHistoryRead = async"),
   source.indexOf("const scheduleHistoryRepair =", source.indexOf("const runHistoryRead = async")));
 assert.match(historyRead, /const readVersion = transcriptHistory\.repairVersion/);

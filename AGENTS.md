@@ -14,6 +14,13 @@ operational work. Start from the README's documentation links. The session guide
 owns lifecycle and authoring guidance; the portal guide owns browser, extension,
 and host-deployment contracts. Keep those explanations current with the code.
 
+## Portal controls
+
+Before adding or restyling a portal control, check its existing occurrences and
+reuse the established appearance and interaction behavior. Keep repeated controls
+consistent in size, typography, colors, spacing, hover, keyboard focus and disabled
+states; reuse their existing styles or component when available.
+
 ## Development commands
 
 Use the repository's Nix environment. Run `nix flake check --print-build-logs`

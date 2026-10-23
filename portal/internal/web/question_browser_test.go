@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
@@ -164,8 +166,20 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs"} {
+	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
+			if script == "retry_activity_browser_test.cjs" {
+				store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Update(context.Background(), "example", "thread-1", true, func(roster *teamruntime.Roster) error {
+					roster.Members = []teamruntime.Member{{Address: "implementer0", Role: "implementer", Thread: "member-thread", Model: "gpt-6.1-sol", Effort: "xhigh", Behavior: "implementer", Access: "workspace_write", State: "ready", AddedAt: time.Now().UTC()}}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			command := exec.Command("node", script, httpServer.URL)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("%s: %v\n%s", script, err, output)

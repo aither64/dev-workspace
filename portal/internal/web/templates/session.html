@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
-  <link rel="stylesheet" href="/codex/assets/conversation.css?v=9">
-  <link rel="stylesheet" href="/static/style.css?v=22">
+  <link rel="stylesheet" href="/codex/assets/conversation.css?v=12">
+  <link rel="stylesheet" href="/static/style.css?v=25">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -78,6 +78,15 @@
           <dl><dt>Sensitive</dt><dd data-session-sensitivity>{{if .Session.Sensitive}}Yes{{else}}No{{end}}</dd></dl>
           <p class="muted">Sensitivity is set when the session is created.</p>
         </section>
+        {{if .Session.Codex.ThreadID}}
+        <section id="session-retry-policy" class="panel" hidden>
+          <h3>Automatic retries</h3>
+          <p id="session-retry-scope" class="muted">Applies to the lead and all current and future retained team members.</p>
+          <label class="retry-policy-switch"><span><strong>Retry capacity errors</strong><span class="muted">Retry when Codex is overloaded.</span></span><input id="retry-capacity" type="checkbox" role="switch" aria-describedby="session-retry-scope" disabled></label>
+          <label class="retry-policy-switch"><span><strong>Retry cybersecurity errors</strong><span class="muted">Up to 30 automatic retries in five minutes.</span></span><input id="retry-cybersecurity" type="checkbox" role="switch" aria-describedby="session-retry-scope" disabled></label>
+          <p id="session-retry-policy-status" class="muted" role="status" aria-live="polite"></p>
+        </section>
+        {{end}}
         <section class="panel">
           <h3>Session attention</h3>
           <p><code>?</code> means an unseen answer or approval request. <code>✓</code> means the lead finished a response and the team is idle. Visiting this session clears attention. <code>R</code> means one machine is reserved; <code>R2</code> means two. Reservations remain until released.</p>
@@ -105,11 +114,10 @@
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><label class="member-selector"><span>Member</span><select id="codex-member"><option value="lead">lead</option>{{range .ReadyMembers}}<option value="{{.Address}}"{{if eq .Address $.SelectedMember}} selected{{end}}>{{.Address}}</option>{{end}}</select></label><span id="codex-status" class="badge">Connecting</span></div>
         <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
-        <div id="automatic-turn-retry" hidden></div>
         <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
         <div class="transcript-history">
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>
-          <div id="transcript" class="transcript" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div>
+          <div id="transcript" class="transcript"><div id="transcript-entries" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div><div id="automatic-turn-retry" hidden></div></div>
         </div>
         {{if and .Session.RecoveryReady (not .PendingLifecycle)}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
         <section id="optional-questions" class="codex-question-panel" aria-label="Optional questions" hidden></section>
@@ -271,7 +279,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=56" defer></script>
+  <script src="/static/app.js?v=57" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=2" defer></script>

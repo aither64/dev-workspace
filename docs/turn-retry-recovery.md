@@ -5,6 +5,14 @@ The portal retries new managed turns that fail with the native
 [portal guide](workspace-portal.md#automatic-turn-retries) describes the controls
 and schedule. This guide covers durable state, admission and recovery.
 
+When session retry policy is available, Settings contains separate switches for
+capacity and cybersecurity errors. Both apply to the lead and all current and
+future retained team members. The conversation notice shows the current or
+latest retry chain. Retry now accelerates a scheduled attempt; Stop retrying
+stops that chain without changing the session preferences. Dismiss hides only
+that result in this browser. The notice appears inside the conversation viewport
+and leaves no space when hidden.
+
 ## Ownership and persistence
 
 Schema-1 records live at
@@ -131,7 +139,7 @@ blocked state that requires manual continuation. Freeing space or restarting
 does not enable automatic retry for that result. Persistence errors leave the
 durable uncertain tuple and generic receipt available for exact reconciliation.
 
-Cancel retry suppresses future continuations but leaves the preference enabled.
+Stop retrying suppresses future continuations but leaves the preference enabled.
 Disabling also cancels the chain. New input, queue admission/start, settings
 changes, interruption and explicit lifecycle operations cancel pending work.
 Cancellation cannot establish that an already-dispatched turn did not run.
