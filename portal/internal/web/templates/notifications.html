@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Browser notifications · {{.DisplayLabel}}</title>
-  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/style.css?v=26">
 </head>
 <body>
   <header class="topbar">
@@ -30,7 +30,7 @@
   <p data-notification-test-status role="status" hidden></p>
   <p data-notification-provider-status class="muted" hidden></p>
   <p data-notification-worker-status class="muted" role="status" hidden></p>
-  <label class="checkbox"><input type="checkbox" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled> Play sound</label>
+  <label class="settings-switch"><span><strong>Play sound</strong></span><input type="checkbox" role="switch" data-notification-sound aria-describedby="notification-sound-hint notification-sound-status" disabled></label>
   <p id="notification-sound-hint" class="muted">Turn off for visual-only notifications. Browser and system sound settings still apply.</p>
   <p id="notification-sound-status" data-notification-sound-status role="status">Checking sound preference…</p>
   <div class="notification-actions"><button type="button" data-notification-enable>Enable browser notifications</button><button type="button" data-notification-test disabled>Send test notification</button><button type="button" class="quiet" data-notification-disable disabled>Disable on this browser</button></div>

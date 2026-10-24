@@ -325,11 +325,11 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(page.locator("#auto-archive-details dl")).toContainText("Not before");
       await expect(technical.locator("pre")).toContainText("Fixture read failure");
       failArchive = false;
-      await page.getByRole("checkbox", {name: "Keep open", exact: true}).check();
-      await expect(page.getByRole("checkbox", {name: "Keep open", exact: true})).toBeEnabled();
+      await page.getByRole("switch", {name: "Keep open", exact: true}).check();
+      await expect(page.getByRole("switch", {name: "Keep open", exact: true})).toBeEnabled();
       await expect(page.locator("#auto-archive-details dl")).not.toContainText("Not before");
       await expect(technical.locator("pre")).toHaveText("");
-      const hold = page.getByRole("checkbox", {name: "Keep open", exact: true});
+      const hold = page.getByRole("switch", {name: "Keep open", exact: true});
       await expect(hold).toBeChecked();
       failHold = true;
       const [failedHoldResponse] = await Promise.all([

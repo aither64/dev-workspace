@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=12">
-  <link rel="stylesheet" href="/static/style.css?v=25">
+  <link rel="stylesheet" href="/static/style.css?v=26">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -84,13 +84,13 @@
         <section id="session-retry-policy" class="panel" hidden>
           <h3>Automatic retries</h3>
           <p id="session-retry-scope" class="muted">Applies to the lead and all current and future retained team members.</p>
-          <label class="retry-policy-switch"><span><strong>Retry capacity errors</strong><span class="muted">Retry when Codex is overloaded.</span></span><input id="retry-capacity" type="checkbox" role="switch" aria-describedby="session-retry-scope" disabled></label>
-          <label class="retry-policy-switch"><span><strong>Retry cybersecurity errors</strong><span class="muted">Up to 30 automatic retries in five minutes.</span></span><input id="retry-cybersecurity" type="checkbox" role="switch" aria-describedby="session-retry-scope" disabled></label>
+          <label class="settings-switch"><span><strong id="retry-capacity-label">Retry capacity errors</strong><span id="retry-capacity-hint" class="muted">Retry when Codex is overloaded.</span></span><input id="retry-capacity" type="checkbox" role="switch" aria-labelledby="retry-capacity-label" aria-describedby="retry-capacity-hint session-retry-scope session-retry-policy-status" disabled></label>
+          <label class="settings-switch"><span><strong id="retry-cybersecurity-label">Retry cybersecurity errors</strong><span id="retry-cybersecurity-hint" class="muted">Up to 30 automatic retries in five minutes.</span></span><input id="retry-cybersecurity" type="checkbox" role="switch" aria-labelledby="retry-cybersecurity-label" aria-describedby="retry-cybersecurity-hint session-retry-scope session-retry-policy-status" disabled></label>
           <p id="session-retry-policy-status" class="muted" role="status" aria-live="polite"></p>
         </section>
         <section id="progress-observer" class="panel">
           <h3>Progress checks</h3>
-          <label class="retry-policy-switch"><span><strong>Automatic progress checks</strong><span class="muted">Independent advice while someone is working.</span></span><input id="progress-observer-enabled" type="checkbox" role="switch" disabled></label>
+          <label class="settings-switch"><span><strong>Automatic progress checks</strong><span class="muted">Independent advice while someone is working.</span></span><input id="progress-observer-enabled" type="checkbox" role="switch" disabled></label>
           <form id="progress-observer-interval-form">
             <label>Check every (minutes)<div class="copy-row"><input id="progress-observer-interval" type="number" min="1" max="1440" step="1" value="15" required disabled><button id="progress-observer-save" type="submit" class="quiet" disabled>Save interval</button></div></label>
           </form>
@@ -102,8 +102,8 @@
         <section class="panel">
           <h3>Session attention</h3>
           <p><code>?</code> means an unseen answer or approval request. <code>✓</code> means the lead finished a response and the team is idle. Visiting this session clears attention. <code>R</code> means one machine is reserved; <code>R2</code> means two. Reservations remain until released.</p>
-          <label class="checkbox"><input id="session-notifications-enabled" type="checkbox" checked disabled> Browser notifications for this session</label>
-          <p class="muted">This setting applies to every subscribed browser. Title markers stay enabled.</p>
+          <label class="settings-switch"><span><strong>Browser notifications for this session</strong></span><input id="session-notifications-enabled" type="checkbox" role="switch" aria-describedby="session-notifications-hint" checked disabled></label>
+          <p id="session-notifications-hint" class="muted">This setting applies to every subscribed browser. Title markers stay enabled.</p>
         </section>
         {{template "browser-notifications"}}
         <section id="auto-archive-panel" class="panel">
@@ -111,8 +111,8 @@
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
           <div id="auto-archive-values" hidden></div>
           <details id="auto-archive-details" hidden><summary>Technical details</summary><pre></pre></details>
-          <label id="auto-archive-hold-label" class="checkbox"{{if .Session.Archived}} hidden{{end}}><input id="auto-archive-hold" type="checkbox" disabled> Keep open</label>
-          <p class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>
+          <label id="auto-archive-hold-label" class="settings-switch"{{if .Session.Archived}} hidden{{end}}><span><strong>Keep open</strong></span><input id="auto-archive-hold" type="checkbox" role="switch" aria-describedby="auto-archive-hold-hint auto-archive-status auto-archive-values" disabled></label>
+          <p id="auto-archive-hold-hint" class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>
         </section>
       </section>
 
