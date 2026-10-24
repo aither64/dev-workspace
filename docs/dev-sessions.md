@@ -611,7 +611,17 @@ archives their threads. The wait is bounded; a member that does not stop leaves
 the deletion journal retryable. Non-forced deletion and strict completion archival
 require every member to be idle. A forced deletion can also retire a member
 whose thread was confirmed while member creation remained unfinished; a missing
-thread identity still blocks deletion. If a non-forced attempt stops at an
+thread identity normally blocks deletion. During an unfinished direct-team
+creation, deletion can mark an unconfirmed, unbootstrapped member reservation as
+`removed` if its native start was attempted and both initial-request flags
+explicitly record that the request was neither attempted nor sent. The private
+recovery file `team.json` retains the project identity, start attempt, settings
+and removal time. The native outcome remains unknown: a thread may still appear.
+Deletion preserves the project and neither adopts nor initializes that thread.
+The deletion journal must durably reach `thread_retiring` before saving the
+removed record. An interrupted deletion resumes the same journal and preserves
+the removal time. Other missing identities still require resolution before
+deletion. If a non-forced attempt stops at an
 active turn, rerunning it with `--force` records a one-way upgrade and resumes
 the same journal. Forced deletion still requires the interactive `y/N`
 confirmation:
