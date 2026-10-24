@@ -2773,6 +2773,7 @@ module DevWorkspaceHost
     def require_compatible_session_recovery!(package)
       require_compatible_archive_recovery!(package)
       require_compatible_turn_retries!(package)
+      require_compatible_turn_retry_policy!(package)
       state = %w[session-recovery submissions].flat_map do |name|
         Dir.glob(File.join(@state, name, '**', '*.json'))
       end
@@ -2797,6 +2798,52 @@ module DevWorkspaceHost
       raise Error, 'target workspace package cannot preserve automatic turn retry state; recover forward with a compatible package'
     rescue SystemCallError
       raise Error, 'target workspace package has no readable turn retry contract'
+    end
+
+    def require_compatible_turn_retry_policy!(package)
+      return unless turn_retry_policy_state?
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'session retry policy contract', 64 * 1024)
+      policy = contract['turnRetrySessionPolicy']
+      return if policy.is_a?(Integer) && policy == RUNTIME_CONTRACT.fetch('turnRetrySessionPolicy')
+
+      raise Error, 'target workspace package cannot preserve session-wide automatic retry policy; recover forward with a compatible package'
+    rescue SystemCallError
+      raise Error, 'target workspace package has no readable session retry policy contract'
+    end
+
+    # Go owns policy validation. Even an empty or malformed committed sidecar
+    # requires support; a failed inventory must not look like absent state.
+    def turn_retry_policy_state?
+      root = File.join(@state, 'turn-retry-policy')
+      begin
+        stat = File.lstat(root)
+      rescue Errno::ENOENT
+        return false
+      end
+      unless stat.directory? && !stat.symlink?
+        raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
+      end
+
+      directories = [root]
+      until directories.empty?
+        directory = directories.pop
+        Dir.children(directory).each do |name|
+          path = File.join(directory, name)
+          entry = File.lstat(path)
+          if entry.directory?
+            directories << path
+          elsif name.end_with?('.json')
+            return true
+          elsif entry.symlink?
+            raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
+          end
+        end
+      end
+      false
+    rescue SystemCallError
+      raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
     end
 
     def require_compatible_archive_recovery!(package)
