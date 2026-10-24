@@ -63,6 +63,12 @@ func LockRuntimeExclusive(directory, slug string) (*RuntimeLock, error) {
 	return lockRuntime(directory, slug, ".lock", unix.LOCK_EX)
 }
 
+// LockRuntimeExclusiveContext lets HTTP and bootstrap callers wait for exclusive
+// runtime access within their context budget. Fail-fast callers are unchanged.
+func LockRuntimeExclusiveContext(ctx context.Context, directory, slug string) (*RuntimeLock, error) {
+	return lockRuntimeContext(ctx, directory, slug, ".lock", unix.LOCK_EX)
+}
+
 func lockRuntime(directory, slug, suffix string, mode int) (*RuntimeLock, error) {
 	return lockRuntimeContext(nil, directory, slug, suffix, mode)
 }
