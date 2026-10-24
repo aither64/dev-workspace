@@ -708,6 +708,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("/", s.route)
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.rejectLegacyRetry(w, r) {
+			return
+		}
 		if looksLikePreparationPath(r.URL) && !validPreparationPath(r.URL) {
 			http.NotFound(w, r)
 			return
@@ -1823,6 +1826,10 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	if s.creationAPI(w, r, parts) || s.earlyCreationRequest(w, r, parts) {
 		return
 	}
+	if len(parts) == 2 && parts[1] == "retry-policy" {
+		s.sessionAPIResolved(w, r, parts)
+		return
+	}
 	if conversationPath := legacyConversationPath(parts, r.Method); conversationPath != "" && s.conversation != nil {
 		decodedPath, err := url.PathUnescape(conversationPath)
 		if err != nil {
@@ -1910,7 +1917,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 			return nil, false
 		}
 	}
-	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel")) && !(parts[1] == "thread" && parts[2] == "page") &&
+	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel" || parts[2] == "activity" || parts[2] == "now" || parts[2] == "stop")) && !(parts[1] == "thread" && parts[2] == "page") &&
 		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
 		return nil, false
 	}
@@ -1933,6 +1940,9 @@ func legacyConversationPath(parts []string, method string) string {
 		}
 	}
 	if len(parts) == 3 && parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel") && method == http.MethodPost {
+		return "/codex/conversations/" + strings.Join(parts, "/")
+	}
+	if len(parts) == 3 && parts[1] == "retry" && (parts[2] == "activity" && method == http.MethodGet || (parts[2] == "now" || parts[2] == "stop") && method == http.MethodPost) {
 		return "/codex/conversations/" + strings.Join(parts, "/")
 	}
 	if len(parts) == 3 && parts[1] == "queue" &&
@@ -1960,6 +1970,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && parts[1] == "retry-policy" {
+		s.retryPolicyAPI(w, r, summary)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "attention" {
 		s.attentionAPI(w, r, summary.Slug)
 		return
@@ -3695,7 +3709,13 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, errors.New("session state changed")
 		}
 		s.normalizeInteractivity(ctx, summary)
-		if !((request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry")) && !summary.Interactive && summary.RecoveryReady) {
+		if request.Operation == "retry/stop" || request.Operation == "retry/now" {
+			// This branch has no execution method. The provider still requires an
+			// exact saved chain/revision token under admission before any write.
+			if _, _, _, err := s.retryPolicyAuthority(ctx, slug); err != nil {
+				return conversation.Target{}, err
+			}
+		} else if !((request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry")) && !summary.Interactive && summary.RecoveryReady) {
 			if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
 				return conversation.Target{}, err
 			}
@@ -3719,7 +3739,7 @@ func (s *Server) resolveConversation(
 	}
 	conversationClient := conversation.Client(s.config.Codex)
 	threadID := summary.Codex.ThreadID
-	if address == "" && request.Operation == "automatic-retry" {
+	if address == "" && (request.Operation == "automatic-retry" || request.Operation == "retry/stop" || request.Operation == "retry/now") {
 		service, err := s.teamService(summary.Slug)
 		if err != nil {
 			return conversation.Target{}, err
@@ -3789,7 +3809,7 @@ func (s *Server) resolveConversation(
 	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
 	var attachments conversation.AttachmentProvider
-	if s.uploadStore != nil {
+	if s.uploadStore != nil && !strings.HasPrefix(request.Operation, "retry") {
 		backend, err := s.sessionUploads(ctx, summary.Slug, threadID, !interactive)
 		if err != nil {
 			return conversation.Target{}, err
@@ -3808,10 +3828,15 @@ func (s *Server) resolveConversation(
 		}
 	}
 	var retries conversation.RetryProvider
+	var retryActivity conversation.RetryActivityProvider
 	if client, ok := s.config.Codex.(turnRetryClient); ok && client.RetryAvailable() && !summary.Archived && settingsReady {
 		scope := turnretry.Scope{Workspace: s.config.Workspace, Slug: slug, Root: summary.Codex.ThreadID, Thread: threadID, Socket: s.config.CodexSocket}
 		retries = retryProvider{server: s, client: client, scope: scope}
 		capabilities.Retry = true
+		if session.TurnRetrySessionPolicy() == 1 {
+			retryActivity = retryProvider{server: s, client: client, scope: scope}
+			capabilities.RetryActivity = true
+		}
 	}
 	failed = false
 	return conversation.Target{
@@ -3820,6 +3845,7 @@ func (s *Server) resolveConversation(
 		Client:       conversationClient, ThreadID: threadID, Directory: expectedCwd,
 		Capabilities: capabilities, MutationLock: s.messageLock(request.ID),
 		Retry:             retries,
+		RetryActivity:     retryActivity,
 		PresentTranscript: s.presentTranscript,
 		Activity:          s.activityProvider(),
 		Release:           func() { once.Do(release) },

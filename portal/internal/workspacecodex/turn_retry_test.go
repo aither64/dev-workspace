@@ -84,7 +84,7 @@ func TestRetryManagedSettingsIntentCancelsBeforeNativeMutation(t *testing.T) {
 			proof.Digest, _ = proof.Hash()
 			tx.State.Enroll(turnretry.Observation{})
 			tx.State.AddSnapshot(proof)
-			if err := tx.State.Observe(turnretry.Observation{Turn: "failed", Status: "failed", Code: "serverOverloaded"}, time.Now(), 0); err != nil {
+			if err := tx.State.Observe(turnretry.Observation{Turn: "failed", Status: "failed", Code: "serverOverloaded"}, time.Now(), 0, turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 				t.Fatal(err)
 			}
 			if err := tx.Save(); err != nil {

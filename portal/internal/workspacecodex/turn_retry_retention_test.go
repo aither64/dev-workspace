@@ -385,7 +385,7 @@ func TestRetryRetentionCachedProofSuppressedAndNewQueueEligible(t *testing.T) {
 			w.items = w.items[len(w.items)-1:]
 			w.writeRollout("manual")
 			w.mu.Unlock()
-			controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend()}
+			controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend()}
 			if err := controller.Step(ctx, w.scope); err != nil {
 				t.Fatal(err)
 			}
@@ -421,7 +421,7 @@ func TestRetryRetentionAggregateAndAutomaticAtCap(t *testing.T) {
 			w.status, w.loaded = "failed", "systemError"
 			w.mu.Unlock()
 			now := time.Now()
-			controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
+			controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
 			err := controller.Step(context.Background(), w.scope)
 			if count == 64 && !errors.Is(err, turnretry.ErrMissingProof) || count == 63 && err != nil {
 				t.Fatal("aggregate budget returned unexpected outcome", err)
@@ -452,7 +452,7 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 	w.status, w.loaded = "failed", "systemError"
 	w.mu.Unlock()
 	now := time.Now()
-	controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
+	controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
 	ctx := context.Background()
 	if err := controller.Step(ctx, w.scope); err != nil {
 		t.Fatal(err)

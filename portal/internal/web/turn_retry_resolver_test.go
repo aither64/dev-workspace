@@ -199,10 +199,10 @@ func TestTurnRetryResolverRecoversExactNativeLedgerBeforeOrdinaryGate(t *testing
 				tx.State.Enroll(turnretry.Observation{})
 				tx.State.AddSnapshot(p)
 				tx.State.Boundary, _ = session.ObservationIdentity(s.config.Workspace, "example", cwd, "thread-1")
-				if err := tx.State.Observe(turnretry.Observation{Turn: "failed", Status: "failed", Code: "cyberPolicy"}, time.Now(), 0); err != nil {
+				if err := tx.State.Observe(turnretry.Observation{Turn: "failed", Status: "failed", Code: "cyberPolicy"}, time.Now(), 0, turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 					t.Fatal(err)
 				}
-				if err := tx.State.Begin(time.Now()); err != nil {
+				if err := tx.State.Begin(time.Now(), turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 					t.Fatal(err)
 				}
 				pending := *tx.State.Pending

@@ -343,7 +343,7 @@ func TestRetryWarmSettingsActiveQueueProductionProof(t *testing.T) {
 				w.items = retrySettingsInput(w.turn, "old-client", old.Text)
 				w.writeRollout(w.turn)
 				w.mu.Unlock()
-				controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return time.Unix(2000000000, 0) }}
+				controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return time.Unix(2000000000, 0) }}
 				if err := controller.Step(ctx, w.scope); !errors.Is(err, turnretry.ErrMissingProof) {
 					t.Fatal("old queue acquired new-epoch authority", err)
 				}
@@ -481,10 +481,10 @@ func TestRetryWarmSettingsPreservesUncertainOldTuple(t *testing.T) {
 	snapshot.BindingDigest = tx.State.Binding.Digest
 	snapshot.Digest, _ = snapshot.Hash()
 	tx.State.AddSnapshot(snapshot)
-	if err := tx.State.Observe(turnretry.Observation{Turn: snapshot.Turn, Status: "failed", Code: "serverOverloaded"}, time.Now(), 0); err != nil {
+	if err := tx.State.Observe(turnretry.Observation{Turn: snapshot.Turn, Status: "failed", Code: "serverOverloaded"}, time.Now(), 0, turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.State.Begin(time.Now().Add(15 * time.Second)); err != nil {
+	if err := tx.State.Begin(time.Now().Add(15*time.Second), turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Save(); err != nil {

@@ -56,15 +56,18 @@ func AgentTeamRegistration() AgentTeamRegistrationContract {
 }
 
 type runtimeContract struct {
-	ClusterProvider       ClusterProviderContract       `json:"clusterProvider"`
-	AgentTeamRegistration AgentTeamRegistrationContract `json:"agentTeamRegistration"`
-	PortalServeFlags      []string                      `json:"portalServeFlags"`
-	TrackingMaxBytes      int                           `json:"trackingMaxBytes"`
-	LifecycleJournals     []LifecycleJournal            `json:"lifecycleJournals"`
-	TmuxMetadata          TmuxMetadata                  `json:"tmuxMetadata"`
+	TurnRetrySessionPolicy int                           `json:"turnRetrySessionPolicy"`
+	ClusterProvider        ClusterProviderContract       `json:"clusterProvider"`
+	AgentTeamRegistration  AgentTeamRegistrationContract `json:"agentTeamRegistration"`
+	PortalServeFlags       []string                      `json:"portalServeFlags"`
+	TrackingMaxBytes       int                           `json:"trackingMaxBytes"`
+	LifecycleJournals      []LifecycleJournal            `json:"lifecycleJournals"`
+	TmuxMetadata           TmuxMetadata                  `json:"tmuxMetadata"`
 }
 
 var sharedRuntimeContract = mustLoadRuntimeContract()
+
+func TurnRetrySessionPolicy() int { return sharedRuntimeContract.TurnRetrySessionPolicy }
 
 func mustLoadRuntimeContract() runtimeContract {
 	var contract runtimeContract
@@ -73,6 +76,9 @@ func mustLoadRuntimeContract() runtimeContract {
 	}
 	if contract.TrackingMaxBytes != TrackingMaxSize {
 		panic("workspace runtime contract has a mismatched tracking limit")
+	}
+	if contract.TurnRetrySessionPolicy != 1 {
+		panic("workspace runtime contract has an unsupported retry session policy")
 	}
 	if contract.ClusterProvider.StatusBusyExitCode != 75 || contract.ClusterProvider.ReleaseTimeoutSeconds <= 0 {
 		panic("invalid cluster provider contract")

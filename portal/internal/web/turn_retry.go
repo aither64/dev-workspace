@@ -74,42 +74,11 @@ func (p retryProvider) ReadRetry(_ context.Context, thread string) (conversation
 	}
 	return retryView(state, time.Now()), nil
 }
-func (p retryProvider) SetRetryEnabled(ctx context.Context, thread string, enabled bool) (conversation.RetryStatus, error) {
-	return p.change(ctx, thread, &enabled)
+func (p retryProvider) SetRetryEnabled(context.Context, string, bool) (conversation.RetryStatus, error) {
+	return conversation.RetryStatus{}, activityError(conversation.RetryReloadRequired)
 }
-func (p retryProvider) CancelRetry(ctx context.Context, thread string) (conversation.RetryStatus, error) {
-	return p.change(ctx, thread, nil)
-}
-func (p retryProvider) change(ctx context.Context, thread string, enabled *bool) (conversation.RetryStatus, error) {
-	if thread != p.scope.Thread {
-		return conversation.RetryStatus{}, errors.New("retry target changed")
-	}
-	tx, err := p.client.RetryStore().Lock(ctx, p.scope)
-	if err != nil {
-		return conversation.RetryStatus{}, err
-	}
-	defer tx.Close()
-	if enabled != nil {
-		o, err := p.client.RetryBackend().Observe(ctx, p.scope)
-		if err != nil {
-			return conversation.RetryStatus{}, err
-		}
-		if !tx.State.Enrolled {
-			tx.State.Enroll(o)
-		}
-		tx.State.SetEnabled(*enabled, o)
-	} else {
-		tx.State.Cancel("cancelled")
-		// Consume the current failure even when settings proof is still being
-		// gathered and no scheduled intent exists yet.
-		if o, err := p.client.RetryBackend().Observe(ctx, p.scope); err == nil && !tx.State.Uncertain() {
-			tx.State.Handled = o.Turn
-		}
-	}
-	if err := tx.Save(); err != nil {
-		return conversation.RetryStatus{}, err
-	}
-	return retryView(tx.State, time.Now()), nil
+func (p retryProvider) CancelRetry(context.Context, string) (conversation.RetryStatus, error) {
+	return conversation.RetryStatus{}, activityError(conversation.RetryReloadRequired)
 }
 
 // Retain a reservation from enqueue until completion. A slow conversation
@@ -225,6 +194,29 @@ func (s *Server) stepTurnRetry(ctx context.Context, client turnRetryClient, id s
 	if err := s.reconcileTurnRetry(ctx, client, id); err != nil {
 		return err
 	}
+	slug, _, valid := parseTeamConversationID(id)
+	if !valid {
+		return turnretry.ErrPolicyUnavailable
+	}
+	summary, err := session.Find(s.config.Workspace, slug)
+	if err != nil {
+		return err
+	}
+	policyIdentity, err := policyScope(summary)
+	if err != nil {
+		return err
+	}
+	if _, err := policyStore(client).Load(policyIdentity); errors.Is(err, os.ErrNotExist) {
+		// No SH is held here. Bootstrap takes its own bounded EX transaction.
+		bootstrap, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, err := s.transactRetryPolicy(bootstrap, client, slug, nil)
+		cancel()
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
 	// Reacquire ordinary admission in full after the reconciliation-only
 	// transaction. No permission from that transaction authorizes execution.
 	target, err := s.resolveConversation(ctx, conversation.ResolveRequest{ID: id, Operation: "automatic-retry", Method: http.MethodPost, Mutation: true})
@@ -240,7 +232,7 @@ func (s *Server) stepTurnRetry(ctx context.Context, client turnRetryClient, id s
 	if err != nil {
 		return err
 	}
-	controller := turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Random: rand.Float64}
+	controller := turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Random: rand.Float64, Policy: turnretry.SessionPolicy{Store: policyStore(client), Scope: policyIdentity}}
 	return controller.Step(ctx, scope)
 }
 

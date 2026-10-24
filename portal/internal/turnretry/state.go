@@ -241,13 +241,18 @@ func (s *State) Proof(turn string) *Snapshot {
 
 // Observe records each terminal failure once, including unsupported failures.
 // Quota exhaustion and cancel remain terminal until an independent turn.
-func (s *State) Observe(o Observation, now time.Time, random float64) error {
+func (s *State) Observe(o Observation, now time.Time, random float64, decision Decision) error {
 	clock := s.Now(now)
 	if !s.Enrolled {
 		s.Enroll(o)
 		return nil
 	}
 	if s.Uncertain() {
+		return nil
+	}
+	if s.Cancelled && s.Pending != nil {
+		// Only an independently admitted managed action may replace a stopped
+		// tuple. A stale or unsupported observation cannot erase its receipt.
 		return nil
 	}
 	if s.Pending != nil && s.Pending.ResultTurn == "" && o.Turn != s.Pending.Failure && o.Turn != "" {
@@ -274,11 +279,22 @@ func (s *State) Observe(o Observation, now time.Time, random float64) error {
 		}
 		return nil
 	}
-	s.Handled = o.Turn
 	class := Class(o.Code)
-	if class == "" || !s.Enabled {
+	if class == "" {
+		s.Handled = o.Turn
+		if s.Pending != nil && s.Pending.ResultTurn == o.Turn {
+			s.Phase, s.Reason, s.DeadlineMS, s.Cancelled = "blocked", "unsupported_failure", 0, true
+		}
 		return nil
 	}
+	if !decision.Eligible(s, o) {
+		if s.Pending != nil && s.Pending.ResultTurn == o.Turn {
+			s.Class = class
+			s.Cancelled, s.DeadlineMS, s.Reason, s.Phase, s.Handled = true, 0, "disabled", "cancelled", o.Turn
+		}
+		return nil
+	}
+	s.Handled = o.Turn
 	continuing := s.Pending != nil && s.Pending.ResultTurn == o.Turn && !s.Cancelled
 	if !continuing {
 		s.Chain, s.Attempt, s.Capacity, s.Cancelled = o.Turn, 0, 0, false
@@ -305,12 +321,12 @@ func (s *State) Observe(o Observation, now time.Time, random float64) error {
 	return nil
 }
 
-func (s *State) Begin(now time.Time) error {
+func (s *State) Begin(now time.Time, decision Decision) error {
 	clock := s.Now(now)
-	if !s.Enabled || s.Cancelled || s.Phase != "scheduled" || s.Pending == nil || clock < s.DeadlineMS {
+	if !decision.Allows(s) || s.Phase != "scheduled" || s.Pending == nil || clock < s.DeadlineMS {
 		return errors.New("retry is not due")
 	}
-	if err := s.ReserveUnsubmitted(now); err != nil {
+	if err := s.ReserveUnsubmitted(now, decision); err != nil {
 		return err
 	}
 	if s.Pending == nil {
@@ -326,7 +342,10 @@ func (s *State) Begin(now time.Time) error {
 
 // ReserveUnsubmitted requires positive proof that this exact pending ID has
 // never been sent. Its old reservation cannot authorize a later outbound call.
-func (s *State) ReserveUnsubmitted(now time.Time) error {
+func (s *State) ReserveUnsubmitted(now time.Time, decision Decision) error {
+	if !decision.Allows(s) {
+		return ErrPolicyUnavailable
+	}
 	if s.Class != "cybersecurity" {
 		return nil
 	}

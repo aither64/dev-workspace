@@ -18,7 +18,7 @@ and leaves no space when hidden.
 Schema-1 records live at
 `$DEV_WORKSPACES_STATE/turn-retries/<workspace-sha256>/<slug>/<thread-sha256>.json`.
 The canonical workspace, retained root, native thread and socket are part of
-each record's identity. Records retain the enrollment boundary, preference,
+each record's identity. Records retain the enrollment boundary, legacy preference,
 failure watermark, chain, fixed deadline, exact automatic submission identity,
 quota timestamps and bounded settings evidence. Instructions and application
 context remain private; status responses expose neither.
@@ -46,15 +46,49 @@ The admission lock is shared by portal, CLI and direct team mutations. Lock
 ordering is package transition, session runtime, roster operation when needed,
 conversation mutex, then per-thread admission. Atomic state writes and native
 queue/submission-ledger operations occur inside that admission fence. They do
-not acquire an outer roster or conversation lock. The retry scheduler does not
-sleep while holding these locks. Two scheduler workers serve retained roots and
-ready team members without requiring a browser connection.
+not acquire an outer roster or conversation lock. The retry scheduler waits for
+its next scheduled attempt outside these locks. Two scheduler workers serve
+retained roots and ready team members without requiring a browser connection.
+
+Session preferences and optional activity checkpoints live separately at
+`$DEV_WORKSPACES_STATE/turn-retry-policy/<workspace-sha256>/<slug>.json`.
+This strict schema-1 sidecar is limited to 1 MiB and 128 thread entries. Its
+identity includes the retained root and the tracking directory's device/inode
+incarnation. A mismatch preserves the record and holds automatic execution.
+The sidecar contains no prompts, settings snapshots or duplicate submission
+receipts. A short sibling `.lock` protects atomic read-modify-write checkpoints;
+native requests never run under that lock.
+
+Bootstrap reads the lead and all nonremoved retained members under the session
+runtime's exclusive lock. Any legacy per-thread opt-out disables both session
+preferences; otherwise both start on. Missing legacy records use the old
+default-on choice.
+Unreadable state or an incomplete inventory holds automation. Once saved, the
+session choices govern both classes for current and future retained members;
+the legacy per-thread preference is no longer an execution gate.
+
+Preference changes use a separate exclusive runtime transaction with a total
+30-second budget. Two matching cold observations establish each class's enable
+boundary before one complete policy write. The same active independent turn may
+qualify if it later fails; a terminal turn is consumed. Turnover or an incomplete
+read refuses the change. A request that repeats the saved choices returns the
+current revision without changing the policy, baselines or checkpoints. This
+also covers a repeated request whose reply was lost. Polling never takes
+exclusive access.
+Turning a class off saves affected chain and uncertain UUID identities before
+lazy ledger cancellation. Turning it back on cannot revive those identities.
+
+Manual Send, Queue, Implement plan and team delivery do not read or write this
+sidecar. Missing, corrupt, full or unwritable policy and activity metadata may
+hold automatic execution, but cannot add a manual-delivery refusal or prevent
+exact receipt settlement.
 
 First enrollment reads a conservative terminal baseline. A failure already
 present at that boundary is consumed. A proven active turn can qualify when it
 later fails; a completion racing enrollment is excluded. Re-enabling consumes
-the current failure as a fresh baseline. Portal restart reads the saved
-boundary and deadline rather than enrolling the same failure again.
+the current failure as a fresh baseline. An unchanged independent active turn
+remains eligible. Portal restart reads the saved boundary and deadline rather
+than enrolling the same failure again.
 
 ## Settings and execution proof
 
@@ -139,8 +173,9 @@ blocked state that requires manual continuation. Freeing space or restarting
 does not enable automatic retry for that result. Persistence errors leave the
 durable uncertain tuple and generic receipt available for exact reconciliation.
 
-Stop retrying suppresses future continuations but leaves the preference enabled.
-Disabling also cancels the chain. New input, queue admission/start, settings
+Stop retrying suppresses future continuations without changing the session
+preferences. Turning a class off also cancels its chain. New input, queue
+admission/start, settings
 changes, interruption and explicit lifecycle operations cancel pending work.
 Cancellation cannot establish that an already-dispatched turn did not run.
 Possible submissions retain their identity and quota charge until the native
@@ -152,6 +187,28 @@ reconciliation pass before ordinary mutation admission. That pass cannot send,
 resume, steer, change settings or activate queues. Fresh execution then reacquires
 the full ordinary admission checks. Other unknown submissions and cold or stopped
 execution holds continue to block new work.
+
+Stop and Retry now use exact session-incarnation, thread, chain and policy
+revision tokens. Retry now also binds the pending UUID and only shortens its
+saved deadline. It does not send input, change quota or create a new identity.
+Stop keeps its token across attempts in the same chain and saves cancellation
+before acknowledgment. Duplicate actions are harmless for their exact owning
+identity. A new chain or policy revision requires refreshed status; Retry now
+also requires a refresh when the pending UUID changes. An uncertain submission
+can reach its own receipt-only recovery and Stop before
+ordinary activity checks. This path cannot start fresh work. Old boolean and
+tokenless retry controls require a page reload.
+
+Confirmed starts count exact accepted automatic UUIDs once, after the retry
+ledger saves the receipt. Quota reservations, polling, button presses and
+refusals do not count as starts. One possibly submitted attempt is shown
+separately. The compact checkpoint keeps the current or latest chain's count,
+last confirmed UUID and timing; it is not an execution ledger. Before replacing
+an accepted pending tuple, the worker checkpoints it or holds further automatic
+progress. A missing checkpoint shows partial or unavailable evidence rather
+than inferring starts from the attempt or quota counters. Optional checkpoint
+failure cannot undo acceptance or a saved Stop. Terminal elapsed time freezes
+at its observed end; missing original timing remains unavailable.
 
 Cybersecurity quota counts possible automatic sends in the rolling five-minute
 window, including dispatches interrupted before their result was saved. Receipt
@@ -173,6 +230,18 @@ retry record exists, package selection refuses a candidate without matching
 support. This requirement applies even after cancellation because enrollment,
 opt-out and unresolved identities must survive. Existing recovery, roster,
 workspace-manifest and native submission formats retain their versions.
+
+Packages publish `turnRetrySessionPolicy: 1` alongside unchanged
+`turnRetryStateSchema: 1`. Once any `.json` file exists below
+`$DEV_WORKSPACES_STATE/turn-retry-policy`, package preparation, activation and
+candidate self-activation require that exact integer capability, even without
+legacy retry records. Ruby checks presence only. Empty, malformed, oversized
+or wrong-incarnation sidecars still require support; Go validates their payloads.
+Empty directories and lock or temporary files alone do not require the new
+capability. State-inspection failures refuse the transition. Keep policy
+sidecars with retry ledgers and receipts during supported recovery. Do not
+delete or rewrite policy to select an incompatible package. Recover forward
+with a compatible package.
 
 Recover by repeating the supported workspace switch or selecting a corrected
 newer compatible package. Keep retry records and submission receipts together.

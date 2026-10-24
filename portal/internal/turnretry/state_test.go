@@ -23,7 +23,7 @@ func proof(turn string) Snapshot {
 func observe(t *testing.T, s *State, turn, code string, now time.Time) {
 	t.Helper()
 	s.AddSnapshot(proof(turn))
-	if err := s.Observe(Observation{turn, "failed", code}, now, 0); err != nil {
+	if err := s.Observe(Observation{turn, "failed", code}, now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -63,7 +63,7 @@ func TestBackoffAcrossAcceptedChainAndRestart(t *testing.T) {
 			t.Fatalf("attempt %d: %v", i, got)
 		}
 		now = time.UnixMilli(s.DeadlineMS)
-		if err := s.Begin(now); err != nil {
+		if err := s.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Accepted(string(rune('a'+i+1)), now); err != nil {
@@ -85,12 +85,12 @@ func TestCyberPossibleSendsExhaustionAndClock(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		turn := string(rune(100 + i))
 		observe(t, &s, turn, "cyberPolicy", now)
-		if err := s.Begin(now); err != nil {
+		if err := s.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 			t.Fatal(err)
 		}
 		// A crash after Begin consumes one possible send. Reconciliation, even
 		// after a backwards wall-clock jump, cannot reserve a new slot.
-		if err := s.Observe(Observation{turn, "failed", "cyberPolicy"}, now.Add(-time.Hour), 0); err != nil {
+		if err := s.Observe(Observation{turn, "failed", "cyberPolicy"}, now.Add(-time.Hour), 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 			t.Fatal(err)
 		}
 		if s.CyberUsed(s.Now(now.Add(-time.Hour))) != i+1 {
@@ -119,7 +119,7 @@ func TestCancelDisableAndUnknownOutcome(t *testing.T) {
 	s.Enroll(Observation{})
 	observe(t, &s, "failed", "cyberPolicy", now)
 	s.Cancel("manual_input")
-	if err := s.Begin(now); err == nil {
+	if err := s.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err == nil {
 		t.Fatal("cancelled dispatch allowed")
 	}
 	observe(t, &s, "failed", "cyberPolicy", now)
@@ -127,7 +127,7 @@ func TestCancelDisableAndUnknownOutcome(t *testing.T) {
 		t.Fatal("cancel rearmed same failure")
 	}
 	observe(t, &s, "second", "cyberPolicy", now)
-	if err := s.Begin(now); err != nil {
+	if err := s.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	id := s.Pending.ID
@@ -162,7 +162,7 @@ func TestNoTextClassifierOrGuessedSettings(t *testing.T) {
 	}
 	s := New(fixtureScope())
 	s.Enroll(Observation{})
-	if err := s.Observe(Observation{"unknown-origin", "failed", "serverOverloaded"}, now, 0); err != nil {
+	if err := s.Observe(Observation{"unknown-origin", "failed", "serverOverloaded"}, now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	if s.Phase != "blocked" || s.Reason != "settings_unproven" {
@@ -262,7 +262,7 @@ func TestLifecycleCancellationPreservesUncertainIdentityAndCancelsOtherThreads(t
 	}
 	tx.State.Enroll(Observation{})
 	observe(t, &tx.State, "fail", "cyberPolicy", now)
-	if err := tx.State.Begin(now); err != nil {
+	if err := tx.State.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	id := tx.State.Pending.ID

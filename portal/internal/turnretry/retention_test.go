@@ -52,7 +52,7 @@ func TestRetentionAcceptedOnlyAtomicSuppression(t *testing.T) {
 	if err := s.InvalidateSettings("active"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Observe(Observation{"active", "failed", "cyberPolicy"}, time.Now(), 0); err != nil || s.Pending != nil {
+	if err := s.Observe(Observation{"active", "failed", "cyberPolicy"}, time.Now(), 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil || s.Pending != nil {
 		t.Fatal("settings resurrected truncated turn", err)
 	}
 }
@@ -172,7 +172,7 @@ func TestRetentionFreshAutomaticPreflightAndReceiptSaveFailure(t *testing.T) {
 	if err := tx.State.AddSnapshot(proof("failed")); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.State.Observe(Observation{"failed", "failed", "cyberPolicy"}, *now, 0); err != nil {
+	if err := tx.State.Observe(Observation{"failed", "failed", "cyberPolicy"}, *now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	originalPending := *tx.State.Pending
@@ -190,7 +190,7 @@ func TestRetentionFreshAutomaticPreflightAndReceiptSaveFailure(t *testing.T) {
 		t.Fatal("preflight consumed quota or submitted", s)
 	}
 	for i := 0; i < 2; i++ {
-		restarted := Controller{Store: c.Store, Backend: b, Clock: c.Clock}
+		restarted := Controller{Policy: Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: c.Store, Backend: b, Clock: c.Clock}
 		if err := restarted.Step(context.Background(), scope); err != nil {
 			t.Fatal(err)
 		}

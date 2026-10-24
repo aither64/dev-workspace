@@ -29,6 +29,7 @@ type Controller struct {
 	Backend Backend
 	Clock   func() time.Time
 	Random  func() float64
+	Policy  PolicyAuthority
 }
 
 func (c Controller) now() time.Time {
@@ -58,13 +59,19 @@ func (c Controller) ReconcileOnly(ctx context.Context, scope Scope) error {
 		return err
 	}
 	defer tx.Close()
+	return c.ReconcileLocked(ctx, tx)
+}
+
+// ReconcileLocked is receipt-only under an already held admission fence. It
+// never returns positive never-submitted proof as permission to dispatch.
+func (c Controller) ReconcileLocked(ctx context.Context, tx *Transaction) error {
 	if err := c.checkBoundary(ctx, tx); err != nil {
 		return err
 	}
 	if !tx.State.Uncertain() {
 		return nil
 	}
-	_, err = c.reconcile(ctx, tx)
+	_, err := c.reconcile(ctx, tx)
 	return err
 }
 
@@ -96,13 +103,20 @@ func (c Controller) reconcile(ctx context.Context, tx *Transaction) (bool, error
 		if err := s.Accepted(receipt.TurnID, c.now()); err != nil {
 			return false, err
 		}
-		return false, tx.Save()
+		if err := tx.Save(); err != nil {
+			return false, err
+		}
+		// The receipt is authoritative even when optional summary storage fails.
+		if c.Policy != nil {
+			_ = c.Policy.Checkpoint(ctx, s, nil, c.now(), false)
+		}
+		return false, nil
 	}
 	if err == nil {
 		var never bool
 		never, err = c.Backend.NeverSubmitted(ctx, s.Scope, p)
 		if err == nil && never {
-			if s.Cancelled || !s.Enabled {
+			if s.Cancelled {
 				s.Phase, s.Pending = "cancelled", nil
 			}
 			return s.Pending != nil, tx.Save()
@@ -135,6 +149,15 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 		if err != nil || !unsubmitted {
 			return err
 		}
+		decision, err := c.decision(ctx, s)
+		if err != nil {
+			return err
+		}
+		if !decision.Allows(s) {
+			s.Cancel("disabled")
+			s.Phase = "cancelled"
+			return tx.Save()
+		}
 		p := *s.Pending
 		// Positive proof permits this same ID/options to be sent. Renew its
 		// reservation at dispatch time; an old charge cannot cover a new call.
@@ -148,7 +171,7 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 		if err := c.preflightAccepted(tx); err != nil {
 			return err
 		}
-		if err := s.ReserveUnsubmitted(c.now()); err != nil {
+		if err := s.ReserveUnsubmitted(c.now(), decision); err != nil {
 			return err
 		}
 		if err := tx.Save(); err != nil {
@@ -158,6 +181,23 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 			return nil
 		}
 		return c.dispatch(ctx, tx, *s.Pending)
+	}
+	decision, err := c.decision(ctx, s)
+	if err != nil {
+		return err
+	}
+	// Do not replace an accepted Pending before its idempotent count checkpoint.
+	if err := c.Policy.Checkpoint(ctx, s, nil, c.now(), false); err != nil {
+		return err
+	}
+	if s.Pending != nil && !s.Cancelled && !decision.Allows(s) {
+		pending := s.Pending
+		s.Cancel("disabled")
+		s.Pending = pending
+		if err := tx.Save(); err != nil {
+			return err
+		}
+		_ = c.Policy.Checkpoint(ctx, s, nil, c.now(), false)
 	}
 	o, err := c.Backend.Observe(ctx, scope)
 	if err != nil {
@@ -179,7 +219,10 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 		}
 		return tx.Save()
 	}
-	if o.Status == "failed" && Class(o.Code) != "" && o.Turn != s.Handled && (o.Turn != s.Baseline || s.BaselineActive) {
+	if err := c.Policy.Checkpoint(ctx, s, &o, c.now(), false); err != nil {
+		return err
+	}
+	if o.Status == "failed" && decision.Eligible(s, o) && o.Turn != s.Handled && (o.Turn != s.Baseline || s.BaselineActive) {
 		if err := c.Backend.Prove(ctx, scope, s, o.Turn); err != nil {
 			s.Phase, s.Reason = "blocked", "settings_unproven"
 			if errors.Is(err, ErrMissingProof) {
@@ -191,13 +234,17 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 			return err
 		}
 	}
-	if err := s.Observe(o, c.now(), c.random()); err != nil {
+	previousChain := s.Chain
+	if err := s.Observe(o, c.now(), c.random(), decision); err != nil {
 		return err
 	}
 	if err := tx.Save(); err != nil {
 		return err
 	}
-	if s.Phase != "scheduled" || s.Pending == nil || !s.Enabled || s.Cancelled || s.Now(c.now()) < s.DeadlineMS {
+	if err := c.Policy.Checkpoint(ctx, s, nil, c.now(), previousChain != s.Chain); err != nil {
+		return err
+	}
+	if s.Phase != "scheduled" || s.Pending == nil || !decision.Allows(s) || s.Now(c.now()) < s.DeadlineMS {
 		return nil
 	}
 	if err := c.Backend.Check(ctx, scope, s.Pending.Snapshot); err != nil {
@@ -214,7 +261,7 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 	if err := c.preflightAccepted(tx); err != nil {
 		return err
 	}
-	if err := s.Begin(c.now()); err != nil {
+	if err := s.Begin(c.now(), decision); err != nil {
 		return err
 	}
 	if err := tx.Save(); err != nil {
@@ -224,6 +271,13 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 		return nil
 	}
 	return c.dispatch(ctx, tx, *s.Pending)
+}
+
+func (c Controller) decision(ctx context.Context, s *State) (Decision, error) {
+	if c.Policy == nil {
+		return Decision{}, ErrPolicyUnavailable
+	}
+	return c.Policy.Decide(ctx, s)
 }
 
 // Called only after exact positive never-submitted proof. Unknown intents must
@@ -249,7 +303,13 @@ func (c Controller) dispatch(ctx context.Context, tx *Transaction, p Pending) er
 		if err := tx.State.Accepted(receipt.TurnID, c.now()); err != nil {
 			return err
 		}
-		return tx.Save()
+		if err := tx.Save(); err != nil {
+			return err
+		}
+		if c.Policy != nil {
+			_ = c.Policy.Checkpoint(ctx, &tx.State, nil, c.now(), false)
+		}
+		return nil
 	}
 	var unknown *codex.UnknownSendOutcomeError
 	if errors.As(err, &unknown) {
