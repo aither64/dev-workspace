@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+LimitNOFILE=524288
 Type=simple
 ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host run-codex %i
 Restart=on-failure
