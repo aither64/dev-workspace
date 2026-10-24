@@ -16,10 +16,12 @@ function fixture() {
   const uploads = {values:["new-upload"], ids() {return this.values;}, ready:()=>true, clear() {this.values=[];}};
   const context = vm.createContext({
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
+    confirm:()=>true, crypto:{randomUUID:()=>"00000000-0000-4000-8000-000000000100"},
     executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
     inFlightMessageIDs:new Set(), sendAttemptStorage:{}, pageReads:{paused:false}, transcriptEntries:[],
     document:{getElementById:id=>id==="message-submission-status" ? status : form},
-    conversationAssets:{sameAttachments:(a=[],b=[])=>JSON.stringify(a)===JSON.stringify(b)},
+    conversationAssets:{sameAttachments:(a=[],b=[])=>JSON.stringify(a)===JSON.stringify(b),
+      submissionFailurePresentation:error=>({message:typeof error.notSent!=="boolean" ? error.message : error.notSent ? "Definitely not sent" : "Delivery remains uncertain"})},
     optionalQuestions:{ordinaryAccepted(){}}, renderMessageReceipts(){}, scheduleRefresh(){},
     storeSendAttempt:(_storage,_slug,thread,attempt)=>{if (thread==="thread") records.set(attempt.id,{...attempt}); return true;},
     loadSendAttempts:()=>[...records.values()], deleteSendAttempt:(_storage,_slug,_thread,id)=>records.delete(id),
@@ -33,7 +35,7 @@ function fixture() {
     section('  const markMessageOutcomeUnknown =', '  const recoverPlanAttempts ='),
     section('  const acknowledgeTranscriptMessages =', '  const renderPlanActions ='),
     section('  const observePageReceipts =', '  const renderThread ='),
-    'globalThis.test = {showSubmissionFailure, clearSubmissionFailure, submissionIdentity, acceptMessageReceipt, retryMessageReceipt, observePageReceipts};',
+    'globalThis.test = {showSubmissionFailure, clearSubmissionFailure, submissionIdentity, beginSubmission, acceptMessageReceipt, retryMessageReceipt, resendMessageReceipt, observePageReceipts};',
   ].join("\n"), context);
   const attempt = {id:"original", message:"Original message", state:"unknown", attachmentIds:["original-upload"]};
   pendingMessages.set(attempt.id, {...attempt}); records.set(attempt.id, {...attempt});
@@ -106,5 +108,67 @@ function fixture() {
   await f.observe();
   assert.equal(f.form.elements.message.value,f.attempt.message);
   assert.deepEqual(f.uploads.values,f.attempt.attachmentIds);
-  console.log("Submission notices follow exact attempt proof and retain unrelated drafts/records.");
+  // A newer explicit success clears the composer error, without changing the
+  // earlier uncertain receipt. An old failure cannot resurrect that banner.
+  f=fixture();
+  const oldOperation=f.context.test.beginSubmission(f.identity);
+  f.context.test.showSubmissionFailure(new Error("Old failure"),f.identity,oldOperation);
+  const revised={...f.attempt,id:"revised",message:"Reworded message"};
+  const newOperation=f.context.test.beginSubmission({...f.identity,id:revised.id});
+  f.context.test.acceptMessageReceipt(revised,{},"thread",newOperation);
+  assert(f.status.hidden); assert.equal(f.records.get(f.attempt.id).state,"unknown");
+  f.context.test.showSubmissionFailure(new Error("Late old failure"),f.identity,oldOperation);
+  assert(f.status.hidden);
+
+  // Failed browser persistence cannot establish non-delivery of an earlier
+  // uncertain send, and prevents this retry from reaching HTTP.
+  f=fixture(); f.context.storeSendAttempt=()=>false;
+  f.context.client.message=async()=>assert.fail("storage failure dispatched a retry");
+  await f.context.test.retryMessageReceipt(f.attempt.id);
+  assert.equal(f.status.textContent,"Delivery remains uncertain");
+
+  // An old queue-start completion cannot replace or hide a newer composer error.
+  for (const fails of [false,true]) {
+    f=fixture(); let runQueue,resolve,reject;
+    f.context.queueStart={dataset:{queuedSubmissionId:"queued"},addEventListener:(_event,cb)=>{runQueue=cb;}};
+    f.context.queueStartInFlight=false;
+    f.context.followTranscript=()=>{}; f.context.refreshQueue=async()=>{};
+    f.context.client.startQueue=()=>new Promise((yes,no)=>{resolve=yes;reject=no;});
+    vm.runInContext(section('  queueStart?.addEventListener("click", async () => {','  const planActions ='),f.context);
+    const old=runQueue();
+    const newer={...f.identity,id:"newer"};
+    const operation=f.context.test.beginSubmission(newer);
+    f.context.test.showSubmissionFailure(Object.assign(new Error("Newer error"),{notSent:true}),newer,operation);
+    if (fails) reject(new Error("Old queue failure")); else resolve();
+    await old;
+    assert.equal(f.status.textContent,"Definitely not sent");
+    assert(!f.status.hidden);
+  }
+
+  // Explicit replacement first checks the original, requires confirmation,
+  // retains both IDs and never touches the current draft/attachments.
+  for (const outcome of ["unknown","accepted","declined","storage-failure"]) {
+    f=fixture(); const calls=[]; let confirmations=0;
+    f.context.confirm=()=>{confirmations++; return outcome!=="declined";};
+    const originalStore=f.context.storeSendAttempt;
+    if (outcome==="storage-failure") f.context.storeSendAttempt=(...args)=>args[3].id===f.attempt.id && originalStore(...args);
+    f.context.client.message=async (...args)=>{
+      calls.push(args);
+      if (args[1]===f.attempt.id && outcome!=="accepted") throw Object.assign(new Error("Unknown"),{code:"message_delivery_unknown"});
+      return {clientUserMessageId:args[1],turnId:"accepted"};
+    };
+    await f.context.test.resendMessageReceipt(f.attempt.id);
+    assert.equal(confirmations,outcome==="accepted" ? 0 : 1);
+    assert.equal(calls.length,outcome==="unknown" ? 2 : 1);
+    if (outcome==="unknown") {
+      const replacementId=f.records.get(f.attempt.id).replacementId;
+      assert(replacementId); assert.equal(f.records.get(replacementId).state,"accepted");
+      assert.equal(calls[1][0],f.attempt.message); assert.equal(calls[1][1],replacementId);
+      assert.equal(JSON.stringify(calls[1][3]),JSON.stringify(f.attempt.attachmentIds));
+      await f.context.test.resendMessageReceipt(f.attempt.id);
+      assert.equal(calls.length,2,"repeated recovery must not create a third identity");
+    }
+    assert.equal(f.form.elements.message.value,"New draft"); assert.deepEqual(f.uploads.values,["new-upload"]);
+  }
+  console.log("Submission recovery preserves IDs and drafts, and newer success clears stale composer feedback.");
 })().catch(error=>{console.error(error);process.exitCode=1;});

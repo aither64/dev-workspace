@@ -234,7 +234,7 @@
   };
   const messageReceiptLabel = (entry) => entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
-      "Outcome unknown.";
+      entry.state === "unsent" ? "Not sent." : entry.replacementId ? "Original outcome unknown. Another copy requested." : "Outcome unknown.";
   const indexClusterPresentation = item => {
     const known = item.runningClustersKnown !== false && Number.isInteger(item.runningClusters);
     let text = known ? `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}` : "";
@@ -817,7 +817,8 @@
           id, message: value.message, steered: Boolean(value.steered), ...attemptAttachmentFields(value),
           context: value.context || "",
           ...(value.dismissed === true ? {dismissed: true} : {}),
-          ...(["accepted", "observed"].includes(value.state) ? {state: value.state} : {}),
+          ...(["accepted", "observed", "unsent"].includes(value.state) ? {state: value.state} : {}),
+          ...(typeof value.replacementId === "string" ? {replacementId: value.replacementId} : {}),
           ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
       },
@@ -825,7 +826,8 @@
         message: attempt.message, steered: Boolean(attempt.steered), ...attemptAttachmentFields(attempt),
         context: typeof attempt.context === "string" ? attempt.context : "",
         ...(attempt.dismissed === true ? {dismissed: true} : {}),
-        ...(["accepted", "observed"].includes(attempt.state) ? {state: attempt.state} : {}),
+        ...(["accepted", "observed", "unsent"].includes(attempt.state) ? {state: attempt.state} : {}),
+        ...(typeof attempt.replacementId === "string" ? {replacementId: attempt.replacementId} : {}),
         ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
       }),
     });
@@ -4061,7 +4063,7 @@
       if (!(entry.context || "") && entry.state !== "sending") {
         const actions = document.createElement("div");
         actions.className = "message-receipt-actions";
-        if (entry.state === "unknown") {
+        if (["unknown", "unsent"].includes(entry.state)) {
           const retry = document.createElement("button");
           retry.type = "button";
           retry.className = "quiet";
@@ -4069,6 +4071,15 @@
           retry.disabled = !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || inFlightMessageIDs.has(entry.id);
           retry.addEventListener("click", () => { void retryMessageReceipt(entry.id); });
           actions.append(retry);
+          if (entry.state === "unknown" && !entry.replacementId) {
+            const resend = document.createElement("button");
+            resend.type = "button";
+            resend.className = "quiet";
+            resend.textContent = "Send another copy…";
+            resend.disabled = retry.disabled;
+            resend.addEventListener("click", () => { void resendMessageReceipt(entry.id); });
+            actions.append(resend);
+          }
         }
         const dismiss = document.createElement("button");
         dismiss.type = "button";
@@ -5377,14 +5388,16 @@
     sync?.scheduleRefresh(delay);
   }
 
-  const markMessageOutcomeUnknown = (id) => {
+  const markMessageOutcomeUnknown = (id, error) => {
     const entry = pendingMessages.get(id);
     if (!entry || entry.state === "observed" || entry.state === "accepted") return;
-    pendingMessages.set(id, {...entry, state: "unknown"});
+    const updated = {...entry, state: error?.notSent === true ? "unsent" : "unknown"};
+    pendingMessages.set(id, updated);
+    storeSendAttempt(sendAttemptStorage, slug, currentThreadId, updated);
     renderMessageReceipts();
     scheduleRefresh(0);
   };
-  const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId) => {
+  const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId, operation = null) => {
     if (threadID === currentThreadId) optionalQuestions?.ordinaryAccepted();
     const current = threadID === currentThreadId ? pendingMessages.get(attempt.id) : null;
     const accepted = {
@@ -5396,16 +5409,22 @@
     // The original retry identity remains durable even when this metadata
     // update fails. Keep the known acceptance visible for this page lifetime.
     storeSendAttempt(sendAttemptStorage, slug, threadID, accepted);
-    clearSubmissionFailure(submissionIdentity(threadID, attempt.id));
+    clearSubmissionFailure(submissionIdentity(threadID, attempt.id), operation);
     renderMessageReceipts();
   };
 
   const retryMessageReceipt = async (id) => {
     if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || inFlightMessageIDs.has(id)) return;
     const attempt = pendingMessages.get(id);
-    if (!attempt || attempt.state !== "unknown" || attempt.context) return;
+    if (!attempt || !["unknown", "unsent"].includes(attempt.state) || attempt.context) return;
     const threadID = currentThreadId;
     const sendingClient = client;
+    const operation = beginSubmission(submissionIdentity(threadID, id));
+    // A reload after dispatch must not retain an earlier definitely-unsent label.
+    if (!storeSendAttempt(sendAttemptStorage, slug, threadID, {...attempt, state: "unknown"})) {
+      showSubmissionFailure(Object.assign(new Error("Browser storage is unavailable."), {notSent: attempt.state === "unsent"}), submissionIdentity(threadID, id), operation);
+      return;
+    }
     messageDispatchInFlight = true;
     inFlightMessageIDs.add(id);
     pendingMessages.set(id, {...attempt, dismissed: false, state: "sending"});
@@ -5413,11 +5432,11 @@
     updateMessageActions();
     try {
       const receipt = await sendingClient.message(attempt.message, id, true, attempt.attachmentIds || []);
-      acceptMessageReceipt(attempt, receipt, threadID);
+      acceptMessageReceipt(attempt, receipt, threadID, operation);
     } catch (error) {
       if (threadID === currentThreadId) {
-        markMessageOutcomeUnknown(id);
-        if (!["accepted", "observed"].includes(pendingMessages.get(id)?.state)) showSubmissionFailure(error, submissionIdentity(threadID, id));
+        markMessageOutcomeUnknown(id, error);
+        if (!["accepted", "observed"].includes(pendingMessages.get(id)?.state)) showSubmissionFailure(error, submissionIdentity(threadID, id), operation);
       }
     } finally {
       inFlightMessageIDs.delete(id);
@@ -5427,6 +5446,35 @@
       scheduleRefresh(0);
       acknowledgeTranscriptMessages();
     }
+  };
+
+  const resendMessageReceipt = async id => {
+    if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || inFlightMessageIDs.has(id)) return;
+    const threadID = currentThreadId;
+    const original = pendingMessages.get(id);
+    if (!original || original.state !== "unknown" || original.context || original.replacementId) return;
+    await retryMessageReceipt(id);
+    const current = pendingMessages.get(id);
+    if (threadID !== currentThreadId || !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight ||
+        !current || current.state !== "unknown" || current.replacementId) return;
+    if (!confirm("The original message may still arrive. Send another copy?")) return;
+    const replacement = {id: crypto.randomUUID(), message: original.message, state: "unsent", context: "",
+      ...(original.attachmentIds?.length ? {attachmentIds: [...original.attachmentIds]} : {})};
+    // Both identities must survive reload before the new input can be sent.
+    if (!storeSendAttempt(sendAttemptStorage, slug, threadID, replacement)) {
+      showSubmissionFailure(new Error("Browser storage is unavailable; another copy was not sent."), submissionIdentity(threadID, id));
+      return;
+    }
+    const linked = {...current, replacementId: replacement.id};
+    if (!storeSendAttempt(sendAttemptStorage, slug, threadID, linked)) {
+      deleteSendAttempt(sendAttemptStorage, slug, threadID, replacement.id);
+      showSubmissionFailure(new Error("The recovery record could not be saved; another copy was not sent."), submissionIdentity(threadID, id));
+      return;
+    }
+    pendingMessages.set(id, linked);
+    pendingMessages.set(replacement.id, replacement);
+    renderMessageReceipts();
+    await retryMessageReceipt(replacement.id);
   };
 
   const recoverPlanAttempts = (latestTurnId) => {
@@ -5456,15 +5504,20 @@
   const submissionStatus = document.getElementById("message-submission-status");
   const submissionIdentity = (threadID, id, action = "send") => ({conversationID, threadID, id, action});
   let submissionFailure = null;
-  const clearSubmissionFailure = identity => {
-    if (!submissionFailure || !identity.id ||
-        ["conversationID", "threadID", "id", "action"].some(key => submissionFailure[key] !== identity[key])) return;
+  let latestSubmission = null;
+  const beginSubmission = identity => (latestSubmission = {...identity});
+  const clearSubmissionFailure = (identity, operation = null) => {
+    if (!submissionFailure || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
+    if (operation) {
+      if (operation !== latestSubmission) return;
+    } else if (!identity.id || ["conversationID", "threadID", "id", "action"].some(key => submissionFailure[key] !== identity[key])) return;
     submissionFailure = null;
     submissionStatus.hidden = true;
     submissionStatus.textContent = "";
   };
-  const showSubmissionFailure = (error, identity) => {
+  const showSubmissionFailure = (error, identity, operation = null) => {
     if (!submissionStatus || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
+    if (operation && operation !== latestSubmission) return;
     submissionFailure = {...identity};
     submissionStatus.textContent = conversationAssets.submissionFailurePresentation?.(error).message || error.message || "Delivery could not be confirmed. Retry the original message to check its status.";
     submissionStatus.hidden = false;
@@ -5492,8 +5545,9 @@
       const action = queue ? "queue" : "send";
       const message = draft.trim();
       if (!message && !composerUploads.count()) return;
+      const operation = beginSubmission(submissionIdentity(threadID, null, action));
       let attachments, submittingAttemptID = null;
-      try { attachments = composerUploads.ids(); } catch (error) { showSubmissionFailure(error, submissionIdentity(threadID, null, action)); return; }
+      try { attachments = composerUploads.ids(); } catch (error) { showSubmissionFailure(error, submissionIdentity(threadID, null, action), operation); return; }
       form.dataset.submitting = "true";
       messageDispatchInFlight = true;
       uploads.lock(true);
@@ -5516,7 +5570,7 @@
           if (!deleteQueueAttempt(queueAttemptStorage, slug, currentThreadId, attempt.id)) {
             throw new Error("The queued message was accepted, but its retry record could not be cleared.");
           }
-          clearSubmissionFailure(submissionIdentity(threadID, attempt.id, action));
+          clearSubmissionFailure(submissionIdentity(threadID, attempt.id, action), operation);
         } else {
           const queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, currentThreadId);
           if (queueAttempts.some((candidate) => candidate.message === message && sameAttemptAttachments(candidate.attachmentIds, attachments))) {
@@ -5529,20 +5583,21 @@
           // Accepted/observed content can be a new explicit user intent. Only
           // unresolved content reuses its immutable recovery identity.
           let attempt = matchingSendAttempt(sendAttempts.filter(candidate =>
+            !candidate.replacementId &&
             !["accepted", "observed"].includes(candidate.state) &&
             !["accepted", "observed"].includes(pendingMessages.get(candidate.id)?.state)), message, "", attachments);
           const retry = Boolean(attempt);
           if (!attempt) {
             attempt = {id: crypto.randomUUID(), message, steered: threadActive, context: "", ...(attachments.length ? {attachmentIds: attachments} : {})};
           }
-          if (!storeSendAttempt(sendAttemptStorage, slug, threadID, attempt)) {
+          if (!storeSendAttempt(sendAttemptStorage, slug, threadID, {...attempt, state: "unknown"})) {
             throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
           }
           const id = attempt.id;
           submittingAttemptID = id;
           if (inFlightMessageIDs.has(id)) throw new Error("This message is already being retried.");
           inFlightMessageIDs.add(id);
-          pendingMessages.set(id, {...attempt, dismissed: false, state: attempt.state || "sending"});
+          pendingMessages.set(id, {...attempt, dismissed: false, state: "sending"});
           renderMessageReceipts();
           try {
             // Ownership transfers once, before HTTP. Detachment persists and
@@ -5554,7 +5609,7 @@
             ++draftGeneration;
             uploads.lock(false);
             followTranscript();
-            acceptMessageReceipt(attempt, await sendingClient.message(message, id, retry, attachments), threadID);
+            acceptMessageReceipt(attempt, await sendingClient.message(message, id, retry, attachments), threadID, operation);
           } finally {
             inFlightMessageIDs.delete(id);
             scheduleRefresh(0);
@@ -5571,9 +5626,9 @@
         }
         scheduleRefresh(0);
       } catch (error) {
-        if (!queue && threadID === currentThreadId && submittingAttemptID) markMessageOutcomeUnknown(submittingAttemptID);
+        if (!queue && threadID === currentThreadId && submittingAttemptID) markMessageOutcomeUnknown(submittingAttemptID, error);
         const knownReceipt = !queue && threadID === currentThreadId && ["accepted", "observed"].includes(pendingMessages.get(submittingAttemptID)?.state);
-        if (!knownReceipt) showSubmissionFailure(error, submissionIdentity(threadID, submittingAttemptID, action));
+        if (!knownReceipt) showSubmissionFailure(error, submissionIdentity(threadID, submittingAttemptID, action), operation);
       }
       finally {
         delete form.dataset.submitting;
@@ -5610,14 +5665,15 @@
     const queuedSubmissionId = queueStart.dataset.queuedSubmissionId;
     if (!queuedSubmissionId) return;
     const identity = submissionIdentity(currentThreadId, queuedSubmissionId, "startQueue");
+    const operation = beginSubmission(identity);
     queueStartInFlight = true;
     queueStart.disabled = true;
     try {
       await client.startQueue(queuedSubmissionId);
-      clearSubmissionFailure(identity);
+      clearSubmissionFailure(identity, operation);
       followTranscript();
     } catch (error) {
-      showSubmissionFailure(error, identity);
+      showSubmissionFailure(error, identity, operation);
     } finally {
       queueStartInFlight = false;
       await refreshQueue(true);

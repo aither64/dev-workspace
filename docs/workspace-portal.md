@@ -447,10 +447,26 @@ hides a receipt across reloads while retaining its recovery identity. Browser
 storage must save a dismissal before the portal hides it.
 
 Once the transcript or an accepted receipt confirms delivery, a later HTTP
-failure does not change that confirmed state. The warning clears when the
-original submission is accepted or confirmed in the transcript. Sending revised
-wording creates a separate attempt and does not resolve the earlier one.
-Delivery failures appear beside the composer without a browser alert.
+failure does not change that confirmed state. A successful newer send or queue
+submission clears the composer's previous error. Earlier uncertain receipts
+remain visible independently. Late responses from an older operation cannot
+restore a stale composer error. Sending revised wording creates a separate
+attempt and does not resolve the earlier one.
+
+**Not sent.** means the server established that the message was not dispatched.
+**Retry original** reuses that attempt. An **Outcome unknown.** receipt also
+offers **Send another copy…**. The portal checks the original again first; if
+delivery is still unknown, it asks you to confirm that the original might still
+arrive. The new copy has its own saved ID. Its retries reuse that ID across page
+reloads, and the original record remains available. This action leaves the
+current draft and its attachments intact. Browser storage must save both
+recovery identities before another copy can be sent.
+
+Admitted sends finish and record their receipts even if the browser disconnects,
+within the existing operation deadline and server shutdown. A lost reply can
+still leave delivery uncertain; absence from history does not make automatic
+resending safe. Delivery failures appear beside the composer without a browser
+alert, and uncertain delivery alone does not mark the service unavailable.
 
 Successful legacy history fallback is silent. History notices and manual retry
 controls occupy normal layout space above the transcript.

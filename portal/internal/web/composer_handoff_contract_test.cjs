@@ -24,6 +24,7 @@ function fixture(attachmentIds = []) {
     requireQueueAttempts: () => [], loadSendAttempts: () => [...records.values()],
     storeSendAttempt: (_store, _slug, thread, attempt) => {records.set(`${thread}/${attempt.id}`, json(attempt)); return true;},
     optionalQuestions: {ordinaryAccepted() {}}, submissionIdentity: (thread, id, action) => ({thread, id, action}),
+    beginSubmission: identity => identity,
     showSubmissionFailure: (error, identity) => failures.push({message: error.message, identity}), clearSubmissionFailure() {},
     renderMessageReceipts() {}, updateMessageActions() {}, followTranscript() {}, scheduleRefresh() {},
     applyCurrentSettings() {}, acknowledgeTranscriptMessages() {},
@@ -97,5 +98,14 @@ const helpersSameAttachments = (left = [], right = []) => JSON.stringify(left) =
   switched.accept(); await request;
   assert.equal(switched.pendingMessages.size, 0); assert.equal(switched.textarea.value, "Member draft");
   assert.equal([...switched.records.keys()].every(key => key.startsWith("thread-1/")), true);
+  const unsentRetry=fixture();
+  const retained={id:randomUUID(),message:"Original message",state:"unsent",context:""};
+  unsentRetry.records.set(`thread-1/${retained.id}`,retained);
+  unsentRetry.pendingMessages.set(retained.id,retained);
+  const retrying=unsentRetry.context.submit(false);
+  assert.equal(unsentRetry.calls[0][1],retained.id);
+  assert.equal(unsentRetry.records.get(`thread-1/${retained.id}`).state,"unknown");
+  assert.equal(unsentRetry.pendingMessages.get(retained.id).state,"sending");
+  unsentRetry.accept(); await retrying;
   console.log("Composer handoff: one HTTP dispatch, exact durable identity, early draft ownership and late-proof isolation passed.");
 })().catch(error => {console.error(error); process.exitCode = 1;});

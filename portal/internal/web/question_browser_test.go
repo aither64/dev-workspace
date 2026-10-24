@@ -267,7 +267,7 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs", "composer_handoff_browser_test.cjs", "required_question_keyboard_browser_test.cjs"} {
+	for _, script := range []string{"message_delivery_browser_test.cjs", "portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs", "composer_handoff_browser_test.cjs", "required_question_keyboard_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
 			if script == "retry_activity_browser_test.cjs" || script == "composer_handoff_browser_test.cjs" {
 				store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)
