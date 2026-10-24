@@ -48,7 +48,7 @@ const fs = require("node:fs/promises");
       }
       if (operation === "message") {
         const body = route.request().postDataJSON(); sends.push(body);
-        if (body.message === "Fail before dispatch" && !body.retry) return route.fulfill({status:502, body:"fixture before dispatch"});
+        if (body.message === "Unconfirmed gateway error" && !body.retry) return route.fulfill({status:502, body:"fixture unconfirmed gateway error"});
         if (body.message === "Observed before failure") {
           const digest = await require("node:crypto").webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(body.message));
           observedEntry = {kind:"userMessage", itemId:"observed-before-failure", text:body.message, clientUserMessageId:body.clientUserMessageId, clientUserMessageDigest:Buffer.from(digest).toString("hex")};
@@ -94,26 +94,48 @@ const fs = require("node:fs/promises");
     await popup.close(); await page.bringToFront();
 
     const input = page.locator('#message-form textarea');
+    const savedAttempt = async id => {
+      const saved = await page.evaluate(id => {
+        const key = Object.keys(sessionStorage).find(key => key.startsWith("workspace-portal.send-attempt.") && key.endsWith(`.${id}`));
+        return key ? {key, value: JSON.parse(sessionStorage.getItem(key))} : null;
+      }, id);
+      assert(saved, `The original receipt ${id} must remain saved`);
+      return saved;
+    };
     await input.fill("Keep this exact input"); await page.locator("#message-send").click();
     await expect(page.locator("#message-submission-status")).toBeVisible();
-    await expect(input).toHaveValue("Keep this exact input");
+    await expect(input).toHaveValue("");
+    await expect(page.locator("#message-receipts")).toContainText("Keep this exact input");
     await expect(page.locator("#message-receipts")).toContainText("Outcome unknown");
+    const original = await savedAttempt(sends[0].clientUserMessageId);
+    assert.equal(original.value.message, "Keep this exact input");
     await page.reload();
+    assert.equal((await savedAttempt(sends[0].clientUserMessageId)).key, original.key);
+    await input.fill("New draft while retrying");
     await page.getByRole("button", {name:"Retry original", exact:true}).click();
     await expect.poll(() => sends.length).toBe(2);
     assert.equal(sends[0].clientUserMessageId, sends[1].clientUserMessageId); assert.equal(turns, 1);
+    assert.equal(sends[1].message, "Keep this exact input");
     await expect(page.locator("#message-submission-status")).toBeHidden();
+    await expect(input).toHaveValue("New draft while retrying");
     await expect(page.getByRole("button", {name:"Dismiss message", exact:true})).toHaveText("×");
     await expect(page.getByRole("button", {name:"Dismiss message", exact:true})).toHaveAttribute("title", "Dismiss message");
     await page.getByRole("button", {name:"Dismiss message", exact:true}).click();
-    const acceptedKey = await page.evaluate(() => Object.keys(sessionStorage).find(key => key.startsWith("workspace-portal.send-attempts")));
-    // Dismissal changes presentation while retry identity remains in storage.
-    if (acceptedKey) assert(await page.evaluate(key => sessionStorage.getItem(key), acceptedKey));
-    await input.fill("Fail before dispatch"); await page.locator("#message-send").click();
-    await expect(input).toHaveValue("Fail before dispatch");
+    // Dismissal changes presentation while the exact retry identity stays saved.
+    assert.equal((await savedAttempt(sends[0].clientUserMessageId)).value.dismissed, true);
+    await input.fill("Unconfirmed gateway error"); await page.locator("#message-send").click();
+    // The untyped 502 remains uncertain after durable capture.
+    await expect(page.locator("#message-submission-status")).toBeVisible();
+    await expect(input).toHaveValue("");
+    await expect(page.locator("#message-receipts")).toContainText("Unconfirmed gateway error");
+    assert.equal((await savedAttempt(sends[2].clientUserMessageId)).value.message, "Unconfirmed gateway error");
+    await input.fill("New draft after gateway error");
     await page.getByRole("button", {name:"Retry original", exact:true}).click();
     await expect.poll(() => sends.length).toBe(4);
     assert.equal(sends[2].clientUserMessageId,sends[3].clientUserMessageId);
+    assert.equal(sends[3].message, "Unconfirmed gateway error");
+    await expect(page.locator("#message-submission-status")).toBeHidden();
+    await expect(input).toHaveValue("New draft after gateway error");
     await page.getByRole("button", {name:"Dismiss message", exact:true}).click();
     await input.fill("Observed before failure"); await page.locator("#message-send").click();
     await expect.poll(() => Boolean(releaseObserved)).toBe(true);

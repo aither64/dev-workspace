@@ -9,15 +9,15 @@ const section = (start, end) => {
   return source.slice(a, b);
 };
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function fixture() {
-  let observation;
+function fixture(options = {}) {
+  let observation; const ackResults=[];
   const status = {hidden:true, textContent:""}, records = new Map(), pendingMessages = new Map();
   const form = {elements:{message:{value:"New draft"}}};
   const uploads = {values:["new-upload"], ids() {return this.values;}, ready:()=>true, clear() {this.values=[];}};
   const context = vm.createContext({deliveryRetries: null,
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
     confirm:()=>true, crypto:{randomUUID:()=>"00000000-0000-4000-8000-000000000100"},
-    executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
+    executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, planImplementationInFlight:false, messageDispatcher:null, enqueueMessageCopy:null, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
     inFlightMessageIDs:new Set(), sendAttemptStorage:{}, pageReads:{paused:false}, transcriptEntries:[],
     document:{getElementById:id=>id==="message-submission-status" ? status : form},
     conversationAssets:{sameAttachments:(a=[],b=[])=>JSON.stringify(a)===JSON.stringify(b),
@@ -27,7 +27,7 @@ function fixture() {
     loadSendAttempts:()=>[...records.values()], deleteSendAttempt:(_storage,_slug,_thread,id)=>records.delete(id),
     markTranscriptMessagesObserved:(...args)=>(observation=helpers.markTranscriptMessagesObserved(...args)),
     sendAcknowledgementCandidates:helpers.sendAcknowledgementCandidates,
-    createTranscriptAcknowledgementScheduler:helpers.createTranscriptAcknowledgementScheduler,
+    createTranscriptAcknowledgementScheduler:options.directACK ? run=>()=>Promise.resolve(run()).then(result=>{ackResults.push(result);}) : helpers.createTranscriptAcknowledgementScheduler,
     client:{message:async()=>({steered:false}), acknowledgeMessages:async batch=>({acknowledgedClientUserMessageIds:batch.map(x=>x.clientUserMessageId)})},
   });
   vm.runInContext([
@@ -35,18 +35,18 @@ function fixture() {
     section('  const markMessageOutcomeUnknown =', '  const recoverPlanAttempts ='),
     section('  const acknowledgeTranscriptMessages =', '  const renderPlanActions ='),
     section('  const observePageReceipts =', '  const renderThread ='),
-    'globalThis.test = {showSubmissionFailure, clearSubmissionFailure, submissionIdentity, beginSubmission, acceptMessageReceipt, retryMessageReceipt, resendMessageReceipt, observePageReceipts};',
+    'globalThis.test = {showSubmissionFailure, clearSubmissionFailure, submissionIdentity, beginSubmission, acceptMessageReceipt, retryMessageReceipt, resendMessageReceipt, observePageReceipts, acknowledgeTranscriptMessages};',
   ].join("\n"), context);
   const attempt = {id:"original", message:"Original message", state:"unknown", attachmentIds:["original-upload"]};
   pendingMessages.set(attempt.id, {...attempt}); records.set(attempt.id, {...attempt});
   const identity = context.test.submissionIdentity("thread", attempt.id);
   const fail = () => context.test.showSubmissionFailure(new Error("Delivery could not be confirmed."), identity);
   const entry = {kind:"userMessage",clientUserMessageId:attempt.id,text:"Canonical envelope",displayText:attempt.message,attachments:[{id:"original-upload"}],clientUserMessageDigest:createHash("sha256").update("Canonical envelope").digest("hex")};
-  const observe = async () => {
-    context.transcriptEntries=[entry]; context.test.observePageReceipts([entry],"thread");
+  const observe = async (entries = [entry]) => {
+    context.transcriptEntries=entries; context.test.observePageReceipts(entries,"thread");
     await observation; await tick(); await tick();
   };
-  return {context,status,records,pendingMessages,form,uploads,attempt,identity,fail,observe};
+  return {context,status,records,pendingMessages,form,uploads,attempt,identity,fail,observe,ackResults};
 }
 (async () => {
   // A failed same-ID retry keeps both warning and durable recovery record.
@@ -145,30 +145,57 @@ function fixture() {
     assert(!f.status.hidden);
   }
 
-  // Explicit replacement first checks the original, requires confirmation,
-  // retains both IDs and never touches the current draft/attachments.
-  for (const outcome of ["unknown","accepted","declined","storage-failure"]) {
-    f=fixture(); const calls=[]; let confirmations=0;
+  // Copy orchestration awaits reconciliation, and delegates an immutable copy
+  // only after the remaining uncertainty and duplicate warning are accepted.
+  for (const outcome of ["unknown", "accepted", "declined", "unsent"]) {
+    f=fixture(); const calls=[], copies=[]; let confirmations=0;
     f.context.confirm=()=>{confirmations++; return outcome!=="declined";};
-    const originalStore=f.context.storeSendAttempt;
-    if (outcome==="storage-failure") f.context.storeSendAttempt=(...args)=>args[3].id===f.attempt.id && originalStore(...args);
+    f.context.enqueueMessageCopy=async (...args)=>copies.push(args);
     f.context.client.message=async (...args)=>{
       calls.push(args);
-      if (args[1]===f.attempt.id && outcome!=="accepted") throw Object.assign(new Error("Unknown"),{code:"message_delivery_unknown"});
+      if (outcome==="unsent") throw Object.assign(new Error("Not sent"),{status:503,code:"message_not_sent",notSent:true});
+      if (outcome!=="accepted") throw Object.assign(new Error("Unknown"),{code:"message_delivery_unknown"});
       return {clientUserMessageId:args[1],turnId:"accepted"};
     };
     await f.context.test.resendMessageReceipt(f.attempt.id);
-    assert.equal(confirmations,outcome==="accepted" ? 0 : 1);
-    assert.equal(calls.length,outcome==="unknown" ? 2 : 1);
-    if (outcome==="unknown") {
-      const replacementId=f.records.get(f.attempt.id).replacementId;
-      assert(replacementId); assert.equal(f.records.get(replacementId).state,"accepted");
-      assert.equal(calls[1][0],f.attempt.message); assert.equal(calls[1][1],replacementId);
-      assert.equal(JSON.stringify(calls[1][3]),JSON.stringify(f.attempt.attachmentIds));
-      await f.context.test.resendMessageReceipt(f.attempt.id);
-      assert.equal(calls.length,2,"repeated recovery must not create a third identity");
-    }
+    assert.equal(confirmations,["accepted","unsent"].includes(outcome) ? 0 : 1);
+    assert.equal(calls.length,1); assert.deepEqual(copies,outcome==="unknown" ? [[f.attempt.id,true]] : []);
     assert.equal(f.form.elements.message.value,"New draft"); assert.deepEqual(f.uploads.values,["new-upload"]);
+  }
+  // Authoritative nonadmission on recovered IDs keeps the immutable retry ID.
+  f=fixture(); f.context.client.message=async()=>{throw Object.assign(new Error("Not sent"),{status:503,code:"message_not_sent",notSent:true});};
+  await f.context.test.retryMessageReceipt(f.attempt.id);
+  assert.equal(f.records.get(f.attempt.id).state,"unsent");
+  assert.equal(f.pendingMessages.get(f.attempt.id).state,"unsent");
+  f.context.client.message=async (_text,id)=>{
+    assert.equal(id,f.attempt.id); assert.equal(f.records.get(id).state,"unknown"); return {};
+  };
+  await f.context.test.retryMessageReceipt(f.attempt.id); assert(f.status.hidden);
+  // Linked observed proof is retained without an acknowledgement retry loop.
+  f=fixture({directACK:true}); let acknowledgements=0;
+  const parent={id:"parent",message:"Earlier original",state:"unknown",replacementId:f.attempt.id};
+  f.records.set(parent.id,parent); f.pendingMessages.set(parent.id,parent);
+  f.context.client.acknowledgeMessages=async batch=>{acknowledgements++; return {acknowledgedClientUserMessageIds:batch.map(x=>x.clientUserMessageId)};};
+  await f.observe(); assert.equal(acknowledgements,0); assert.equal(f.records.get(f.attempt.id).state,"observed");
+  assert.equal(f.ackResults.some(result=>result?.retry),false);
+  const parentEntry={kind:"userMessage",clientUserMessageId:parent.id,text:parent.message,clientUserMessageDigest:createHash("sha256").update(parent.message).digest("hex")};
+  await f.observe([...f.context.transcriptEntries,parentEntry]);
+  assert(!f.records.has(parent.id),"original can retire on its own positive proof");
+  assert(f.records.has(f.attempt.id));
+  f.context.test.acknowledgeTranscriptMessages(); await tick(); await tick();
+  assert.equal(acknowledgements,2); assert(!f.records.has(f.attempt.id));
+
+  // Recheck durable links after the asynchronous ACK, including failed reads.
+  for (const scenario of ["new-link","storage-unavailable"]) {
+    f=fixture({directACK:true}); let resolveAck;
+    f.context.client.acknowledgeMessages=batch=>new Promise(resolve=>{resolveAck=()=>resolve({acknowledgedClientUserMessageIds:batch.map(x=>x.clientUserMessageId)});});
+    await f.observe(); assert(resolveAck);
+    if (scenario==="new-link") f.records.set("parent",{id:"parent",message:"Original",state:"unknown",replacementId:f.attempt.id});
+    else f.context.loadSendAttempts=()=>null;
+    resolveAck(); await tick(); await tick();
+    assert(f.records.has(f.attempt.id),"post-ACK reference/read uncertainty must retain proof");
+    assert.equal(f.records.get(f.attempt.id).state,"observed");
+    if (scenario==="new-link") assert.equal(f.ackResults.some(result=>result?.retry),false);
   }
   console.log("Submission recovery preserves IDs and drafts, and newer success clears stale composer feedback.");
 })().catch(error=>{console.error(error);process.exitCode=1;});
