@@ -3,6 +3,159 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_retry_policy_presence_requires_exact_integer_capability_without_parsing_payloads
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'session-retry-policy')
+      record = retry_policy_record(host)
+      payloads = ['', '{malformed', 'x' * (1024 * 1024 + 1), JSON.generate('schema' => 1, 'workspace' => 'wrong'), JSON.generate('schema' => 2)]
+      payloads.each do |payload|
+        File.binwrite(record, payload)
+        [nil, false, true, 0, 2, '1', 1.0].each do |capability|
+          set_retry_policy_capability(candidate, capability)
+          error = assert_raises(DevWorkspaceHost::Error) do
+            host.send(:require_compatible_session_recovery!, candidate)
+          end
+          assert_includes(error.message, 'session-wide automatic retry policy')
+        end
+        set_retry_policy_capability(candidate, 1)
+        host.send(:require_compatible_session_recovery!, candidate)
+        assert_equal(payload, File.binread(record), 'capability inspection changed policy bytes')
+      end
+      refute(File.exist?(File.join(host.instance_variable_get(:@state), 'turn-retries')))
+    end
+  end
+
+  def test_retry_policy_absence_and_lock_or_temporary_files_preserve_compatibility
+    with_transition_host do |host, paths|
+      candidate = host.candidate
+      host.send(:require_compatible_session_recovery!, candidate)
+      directory = File.dirname(retry_policy_record(host, create: false))
+      FileUtils.mkdir_p(File.join(directory, 'empty'))
+      files = %w[session.json.lock session.json.tmp .session.tmp].map { |name| File.join(directory, name) }
+      files.each { |path| File.binwrite(path, 'retained temporary state') }
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      files.each { |path| assert_equal('retained temporary state', File.binread(path)) }
+    end
+  end
+
+  def test_retry_policy_inventory_errors_are_not_absence
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'policy-inspection')
+      set_retry_policy_capability(candidate, 1)
+      root = File.join(host.instance_variable_get(:@state), 'turn-retry-policy')
+      FileUtils.mkdir_p(root)
+      nested = File.dirname(retry_policy_record(host, create: false))
+      FileUtils.mkdir_p(nested)
+      original_children = Dir.method(:children)
+      [root, nested].each do |unreadable|
+        Dir.define_singleton_method(:children) do |directory|
+          raise Errno::EACCES, directory if directory == unreadable
+
+          original_children.call(directory)
+        end
+        begin
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+          assert_includes(error.message, 'cannot inspect session retry policy state')
+        ensure
+          Dir.define_singleton_method(:children, original_children)
+        end
+      end
+      FileUtils.rm_rf(root)
+      File.binwrite(root, 'not a directory')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      assert_equal('not a directory', File.binread(root))
+    end
+  end
+
+  def test_retry_policy_missing_candidate_contract_refuses_without_changing_state
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'missing-policy-contract')
+      record = retry_policy_record(host)
+      File.binwrite(record, 'private retained policy')
+      File.unlink(File.join(candidate, 'share/workspace-portal/runtime-contract.json'))
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      assert_includes(error.message, 'no readable session retry policy contract')
+      assert_equal('private retained policy', File.binread(record))
+    end
+  end
+
+  def test_retry_policy_capability_does_not_replace_the_legacy_retry_guard
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'both-retry-contracts')
+      policy = retry_policy_record(host)
+      File.binwrite(policy, '{}')
+      set_retry_policy_capability(candidate, 1)
+      legacy = File.join(host.instance_variable_get(:@state), 'turn-retries', 'workspace', 'session', 'thread.json')
+      FileUtils.mkdir_p(File.dirname(legacy))
+      File.binwrite(legacy, 'legacy retained bytes')
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      assert_includes(error.message, 'automatic turn retry state')
+      path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1)
+      File.write(path, JSON.generate(contract))
+      host.send(:require_compatible_session_recovery!, candidate)
+      set_retry_policy_capability(candidate, 2)
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      assert_includes(error.message, 'session-wide automatic retry policy')
+      assert_equal('{}', File.binread(policy))
+      assert_equal('legacy retained bytes', File.binread(legacy))
+    end
+  end
+
+  def test_retry_policy_blocks_selected_preparation_and_preserves_the_selected_profile
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      selected = File.realpath(host.instance_variable_get(:@profile))
+      configured = host.events.count { |event| event == [:configured] }
+      host.candidate = make_package(paths.fetch(:root), 'without-policy-support')
+      record = retry_policy_record(host)
+      File.binwrite(record, 'retained policy')
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_includes(host.instance_variable_get(:@err).string, 'session-wide automatic retry policy')
+      assert_equal(selected, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(configured, host.events.count { |event| event == [:configured] })
+      assert_equal('retained policy', File.binread(record))
+
+      set_retry_policy_capability(host.candidate, 1)
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(File.realpath(host.candidate), File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal('retained policy', File.binread(record), 'compatible selection changed Go-owned state')
+    end
+  end
+
+  def test_retry_policy_created_after_preparation_is_rechecked_before_selection
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      record = retry_policy_record(host)
+      File.binwrite(record, 'policy created after preparation')
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:activate_candidate, host.candidate, prepared:) }
+      assert_includes(error.message, 'session-wide automatic retry policy')
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+      assert_equal('policy created after preparation', File.binread(record))
+    end
+  end
+
+  def test_retry_policy_candidate_self_activation_cannot_bypass_the_guard
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'candidate-without-policy-support')
+      record = retry_policy_record(host)
+      File.binwrite(record, 'retained before candidate activation')
+      error_output = StringIO.new
+      environment = host.instance_variable_get(:@env).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+      activation = ActivationGuardHost.new(package: candidate, env: environment, out: StringIO.new, err: error_output)
+      assert_equal(1, activation.run('workspace-host', ['_activate']))
+      refute(activation.configured)
+      assert_includes(error_output.string, 'session-wide automatic retry policy')
+      assert_equal('retained before candidate activation', File.binread(record))
+    end
+  end
+
   def test_retry_records_require_a_compatible_forward_package
     with_transition_host do |host, paths|
       candidate = make_package(paths.fetch(:root), 'retry-contract')
@@ -894,6 +1047,20 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   private
+
+  def retry_policy_record(host, create: true)
+    workspace = host.send(:registry).entries.fetch(0).fetch('root')
+    path = File.join(host.instance_variable_get(:@state), 'turn-retry-policy', Digest::SHA256.hexdigest(workspace), '2026-10-24-policy.json')
+    FileUtils.mkdir_p(File.dirname(path), mode: 0o700) if create
+    path
+  end
+
+  def set_retry_policy_capability(package, value)
+    path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+    contract = JSON.parse(File.read(path))
+    value.nil? ? contract.delete('turnRetrySessionPolicy') : contract['turnRetrySessionPolicy'] = value
+    File.write(path, JSON.generate(contract))
+  end
 
   def recorded_cluster!(host)
     workspace = host.send(:registry).entries.fetch(0).fetch('root')

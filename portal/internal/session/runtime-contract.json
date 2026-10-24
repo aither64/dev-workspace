@@ -7,6 +7,7 @@
   "workspaceReportingPolicy": 1,
   "sessionRecoveryPolicy": 1,
   "turnRetryStateSchema": 1,
+  "turnRetrySessionPolicy": 1,
   "archiveRecoveryPolicy": 2,
   "trackingSyncPolicy": 1,
   "archiveExecutionPolicy": 1,
