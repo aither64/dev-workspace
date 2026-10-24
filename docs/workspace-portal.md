@@ -39,6 +39,11 @@ explains permission, per-session mute, event identity and delivery limits;
 [operations](browser-notifications-operations.md) covers provider egress and
 private-state recovery.
 
+Session settings use the same switches for automatic retries, session browser
+notifications, Play sound and Keep open. Click a switch's label or focus it and
+press Space to change it. These preferences save when changed; the model and
+reasoning dialog keeps its separate **Save** action.
+
 ## Optional Codex questions
 
 Optional questions appear in their original Codex message and in a panel below
@@ -424,6 +429,14 @@ traffic; **Team** shows it;
 every view. Communication labels are presentation hints; they do not authenticate
 identities or grant access.
 
+When you stop following the transcript, **New output** tracks changes to visible
+content under each filter, including streaming messages. Hidden entries,
+timestamp updates and changes inside closed details do not trigger it; changes
+to a visible summary do. Hidden updates leave an existing indicator intact.
+Each filter keeps its scroll position and unread state.
+Returning to the tail or selecting **New output** clears that view's indicator.
+Initial history and older pages do not count as new output.
+
 Message times come from recorded item timing when available. While metadata
 loads, the portal keeps an exact time already observed for that entry. For a
 new entry without an exact time, it leaves the time blank until enrichment
@@ -434,43 +447,100 @@ grouping use the same observation. Returning to a hidden page starts a fresh
 grace period. Older servers without the metadata-loading signal display
 available estimates immediately.
 
-Sending saves the original message and attachment IDs in a recoverable browser
-record, then clears that draft so you can type the next message. The receipt
-shows **Sending…** while the request is pending. **Send** and **Queue next** wait
-for that request to finish; typing and adding attachments remain available. A
-lost response leaves the original receipt marked **Outcome unknown.**
-**Retry original** checks or retries its saved text and attachments with the
-same ID, independently of the new draft. A late response or transcript
-acknowledgment never clears a newer draft, even if its text is identical. After
-acceptance, sending the same text again creates a new message. The small **×**
-hides a receipt across reloads while retaining its recovery identity. Browser
-storage must save a dismissal before the portal hides it.
+**Send**, **Steer now** and **Queue next** save the original message and
+attachment IDs before clearing that draft. **Send** stays disabled until the
+conversation handler is ready. You can then type, attach files and submit
+the next message while an earlier request is pending. This tab dispatches one
+request at a time in submission order, continuing after acceptance without
+waiting for the turn to finish. The tab can retain up to 20 outstanding
+submissions per conversation, including the active request. A full buffer or
+unavailable browser storage keeps the current draft intact and reports an error
+beside the composer.
+
+Locally saved submissions show **Waiting to send**, then **Sending…** during
+delivery. **Send** or **Steer now** starts an idle turn or steers the turn active
+when the request reaches the server. **Queue next** keeps its native queue
+delivery; accepted queued work appears under **Queued messages**. Native FIFO
+and **Start next** still apply to that queue. The local dispatch order does not
+promise a combined execution order across steers, queued turns and other clients.
+
+Reloading the same tab retains submission order. Waiting messages and uncertain
+outcomes remain paused; saved transient retries resume under the policy below.
+Use **Resume sending** for the first waiting entry or **Retry original** to check
+an uncertain outcome with its original action, ID, text and attachments. A
+buffered **Outcome unknown.** entry holds later submissions, including revised
+wording, until it is resolved or you explicitly choose another copy. Uncertain
+entries cannot be edited, replaced with the draft or discarded. An uncertain
+**Queue next** entry uses its original queue ID for retry and observation; it
+offers no copy action.
+
+When the server confirms that a message was not sent, **Not sent.** offers
+**Retry original** with the same ID, text and attachments. This also applies to
+a recovered attempt that was previously uncertain. A lost retry reply can make
+the outcome uncertain again. Older responses without this proof remain uncertain.
+
+For a transient **Not sent.** failure marked retryable, the portal retries the
+original ID, text and attachments automatically. Delays increase from 250 ms to
+five seconds. Retries wait while the page is hidden or offline, settings are
+being saved, or another submission or plan delivery is in progress. A buffered
+message can retry only at the head. An older transient receipt outside the
+buffer can retry only when the buffer is empty and idle. Unknown outcomes never
+retry automatically. Reload restores saved retryability. **Implement here**
+keeps its plan context and dedicated delivery endpoint, with the same retry
+policy and busy checks. These retries leave the current draft intact.
+
+A recognized validation rejection on this tab's fresh first request, such as an
+unavailable attachment or oversized prompt, shows **Not sent** with different
+recovery controls. **Retry unsent** uses a new ID with the receipt's text and
+original attachment IDs; you can edit that text in the receipt. To change files,
+update the text and files in the main composer, then choose
+**Replace unsent with draft** on the failed first entry. This saves a new ID with
+the current selection and original Send or Queue next action at the same position,
+then clears that draft. A failed save keeps
+the draft intact. **Discard unsent** abandons that rejected entry and releases
+the next one. The same validation error during recovery of an uncertain ID does
+not establish that its earlier request was unsent.
+
+For an uncertain Send or Steer receipt, **Send another copy…** first waits for
+reconciliation of the original ID. If delivery is still unknown, it asks you to
+confirm that the original might still arrive. If the check confirms delivery
+or proves the message was not sent, the portal uses that result without
+creating a copy. The copy gets a new saved ID and retains the original unknown
+receipt and its replacement link. It replaces the original
+at the head of the buffer; a copy of an older receipt outside the buffer joins
+the tail. Later waiting entries keep their order. Repeated recovery and reload
+reuse that saved replacement ID. Use **Retry original** to recover an uncertain
+copy. A copy still linked from its original receipt cannot create another copy.
+The draft and its attachments stay intact. The portal saves both receipts, their
+link and dispatch order before sending the copy. Inconsistent records stop
+dispatch and show an error. Older receipts outside the buffer do not automatically
+hold new submissions. Their retries and copies still allow only one request at
+a time in this tab.
+
+If delivery is confirmed but its status could not be saved in the browser,
+**Retry saving** saves that status without resending the message. Keep saved
+receipts, replacement links and dispatch order when recovering pending work;
+an older browser cannot be assumed to understand every pending dispatch state.
 
 Once the transcript or an accepted receipt confirms delivery, a later HTTP
 failure does not change that confirmed state. A successful newer send or queue
 submission clears the composer's previous error. Earlier uncertain receipts
 remain visible independently. Late responses from an older operation cannot
 restore a stale composer error. Sending revised wording creates a separate
-attempt and does not resolve the earlier one.
-
-**Not sent.** means the server established that the message was not dispatched.
-Transient **Not sent.** failures retry automatically with the original ID, text
-and attachments. Retries back off to five seconds and wait while the page is
-hidden, offline or busy with another operation. Reload restores saved transient
-retries. **Implement here** follows the same delivery and recovery rules.
-**Retry original** remains available. An **Outcome unknown.** receipt also
-offers **Send another copy…**. The portal checks the original again first; if
-delivery is still unknown, it asks you to confirm that the original might still
-arrive. The new copy has its own saved ID. Its retries reuse that ID across page
-reloads, and the original record remains available. This action leaves the
-current draft and its attachments intact. Browser storage must save both
-recovery identities before another copy can be sent.
+attempt and does not resolve the earlier one. Capturing a waiting message is not
+successful delivery and does not clear that error.
 
 Admitted sends finish and record their receipts even if the browser disconnects,
 within the existing operation deadline and server shutdown. A lost reply can
 still leave delivery uncertain; absence from history does not make automatic
 resending safe. Delivery failures appear beside the composer without a browser
 alert, and uncertain delivery alone does not mark the service unavailable.
+
+A late response or transcript acknowledgment never clears a newer draft, even
+if its text is identical. After acceptance, sending the same text again creates
+a new message. For receipts outside the dispatch buffer, the small **×** hides
+the receipt across reloads while retaining its recovery identity; browser
+storage must save that dismissal first.
 
 Successful legacy history fallback is silent. History notices and manual retry
 controls occupy normal layout space above the transcript.
@@ -482,10 +552,19 @@ existing legacy behavior.
 Requests, queued messages, activity timing, session details and index status
 refresh separately from the transcript. A slow queue reconciliation does not
 delay the first conversation page. Failed refreshes retain their last result;
-request and queue warnings offer Retry after the shared grace period. Transcript receipt retirement requires positive
-server evidence across all retained pages, including automatically loaded older
-messages. While the server checks conversation metadata, the mode buttons retain
-the conversation's last confirmed selection and remain usable. Before the first
+request and queue warnings offer Retry after the shared grace period. Routine
+queue checks stay silent during initial load, background refresh,
+reconnection or manual Retry. The last confirmed queue stays visible while a
+read is pending or fails. Before the first successful read, the portal does not
+assert that the queue is empty. The warning grace starts with the first failed
+read; access errors and manual Retry failures appear immediately. A warning
+stays visible during Retry until a successful read clears it. These read notices
+are separate from submission receipts and queue mutation errors.
+
+Transcript receipt retirement requires positive server evidence across all
+retained pages, including automatically loaded older messages. While the server
+checks conversation metadata, the mode buttons retain the conversation's last
+confirmed selection and remain usable. Before the first
 confirmation, "Checking mode…" appears after the shared initial-loading delay.
 Mode refresh failures use the shared warning grace and keep the confirmed
 selection visible. A different thread starts without a retained selection.
