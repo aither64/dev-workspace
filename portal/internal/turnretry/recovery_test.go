@@ -21,10 +21,10 @@ func savedUnsubmitted(t *testing.T, c Controller, now time.Time) Pending {
 	tx.State.Boundary = "incarnation"
 	tx.State.Enroll(Observation{})
 	tx.State.AddSnapshot(proof("failed"))
-	if err := tx.State.Observe(Observation{"failed", "failed", "cyberPolicy"}, now, 0); err != nil {
+	if err := tx.State.Observe(Observation{"failed", "failed", "cyberPolicy"}, now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.State.Begin(now); err != nil {
+	if err := tx.State.Begin(now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Save(); err != nil {
@@ -66,10 +66,10 @@ func TestControllerDelayedUnsubmittedCyberReservation(t *testing.T) {
 				tx.State.Phase = "idle"
 				turn := fmt.Sprintf("next-%d", i)
 				tx.State.AddSnapshot(proof(turn))
-				if err := tx.State.Observe(Observation{turn, "failed", "cyberPolicy"}, *now, 0); err != nil {
+				if err := tx.State.Observe(Observation{turn, "failed", "cyberPolicy"}, *now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 					t.Fatal(err)
 				}
-				if err := tx.State.Begin(*now); err != nil && i < 29 {
+				if err := tx.State.Begin(*now, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil && i < 29 {
 					t.Fatal(err)
 				}
 				if i == 29 && (tx.State.Pending != nil || tx.State.Phase != "exhausted") {
@@ -130,7 +130,7 @@ func TestControllerUnsubmittedReservationCountsOtherIDsAndClock(t *testing.T) {
 	tx, _ := c.Store.Lock(context.Background(), fixtureScope())
 	other, _ := NewID()
 	tx.State.Cyber = append(tx.State.Cyber, Charge{ID: other, AtMS: p.ChargedAtMS})
-	if err := tx.State.ReserveUnsubmitted(now.Add(-time.Minute)); err != nil {
+	if err := tx.State.ReserveUnsubmitted(now.Add(-time.Minute), Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
 		t.Fatal(err)
 	}
 	if len(tx.State.Cyber) != 2 || tx.State.Cyber[0].ID != other || tx.State.Pending.ChargedAtMS != p.ChargedAtMS {

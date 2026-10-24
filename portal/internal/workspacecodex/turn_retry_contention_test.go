@@ -158,7 +158,7 @@ func TestRetryManagedInputContendsWithController(t *testing.T) {
 					w.writeRollout(w.turn)
 					w.mu.Unlock()
 					now := time.Now()
-					controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
+					controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
 					if err := controller.Step(ctx, w.scope); err != nil {
 						t.Fatal(err)
 					}

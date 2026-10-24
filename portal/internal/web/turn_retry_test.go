@@ -87,27 +87,13 @@ func TestTurnRetryHTTPAuthorityPreferenceAndNoReadEnrollment(t *testing.T) {
 	if w := request("POST", "/api/sessions/example/retry/enabled", `{"enabled":false}`, "https://foreign.example"); w.Code != 403 {
 		t.Fatal("foreign origin accepted", w.Code)
 	}
-	if w := request("POST", "/api/sessions/example/retry/enabled", `{"enabled":false,"threadId":"foreign"}`, s.config.BaseURL); w.Code != 400 {
-		t.Fatal("browser supplied authority", w.Code, w.Body.String())
-	}
-	if w := request("POST", "/api/sessions/example/retry/enabled", `{"enabled":false}`, s.config.BaseURL); w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	state, err := client.store.Load(scope)
-	if err != nil || state.Enabled || !state.Enrolled {
-		t.Fatal("optout was not durable", state, err)
-	}
-	if w := request("POST", "/api/sessions/example/retry/enabled", `{"enabled":true}`, s.config.BaseURL); w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	state, err = client.store.Load(scope)
-	if err != nil || !state.Enabled || state.Baseline != "old-failure" || state.Pending != nil {
-		t.Fatal("reenable revived old failure", state, err)
-	}
-	for i := 0; i < 2; i++ {
-		if w := request("POST", "/api/sessions/example/retry/cancel", `{}`, s.config.BaseURL); w.Code != 200 {
-			t.Fatal(w.Code, w.Body.String())
+	for _, path := range []string{"/api/sessions/example/retry/enabled", "/codex/conversations/example/retry/enabled", "/api/sessions/example/retry/cancel", "/codex/conversations/example/retry/cancel"} {
+		if w := request("POST", path, `{}`, s.config.BaseURL); w.Code != 409 || !strings.Contains(w.Body.String(), "retry_reload_required") {
+			t.Fatal("legacy mutation accepted", w.Code, w.Body.String())
 		}
+	}
+	if _, err := client.store.Load(scope); !os.IsNotExist(err) {
+		t.Fatal("legacy mutation wrote ledger", err)
 	}
 	if w := request("GET", "/codex/conversations/example~nativechild/retry", "", ""); w.Code == 200 {
 		t.Fatal("unretained child exposed retry authority")

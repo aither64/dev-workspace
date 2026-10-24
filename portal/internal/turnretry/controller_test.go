@@ -64,7 +64,7 @@ func controllerFixture(t *testing.T) (Controller, *fakeBackend, *time.Time) {
 	t.Helper()
 	now := time.Unix(1000, 0)
 	backend := &fakeBackend{boundary: "incarnation", never: true}
-	c := Controller{Store: Store{Root: t.TempDir(), Workspace: "/workspace"}, Backend: backend, Clock: func() time.Time { return now }}
+	c := Controller{Policy: Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: Store{Root: t.TempDir(), Workspace: "/workspace"}, Backend: backend, Clock: func() time.Time { return now }}
 	return c, backend, &now
 }
 

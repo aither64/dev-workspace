@@ -44,6 +44,16 @@ func (s Store) validScope(scope Scope) bool {
 // writes. Acquire it after package/runtime/roster/conversation locks, never
 // while waiting for a timer. Native ledger locks are strictly inside it.
 func (s Store) Lock(ctx context.Context, scope Scope) (*Transaction, error) {
+	return s.lock(ctx, scope, true)
+}
+
+// Inspect takes the existing admission fence without creating a ledger. A
+// preference inventory must never enroll or rewrite ordinary delivery state.
+func (s Store) Inspect(ctx context.Context, scope Scope) (*Transaction, error) {
+	return s.lock(ctx, scope, false)
+}
+
+func (s Store) lock(ctx context.Context, scope Scope, create bool) (*Transaction, error) {
 	if !s.validScope(scope) {
 		return nil, errors.New("invalid retry scope")
 	}
@@ -82,6 +92,10 @@ func (s Store) Lock(ctx context.Context, scope Scope) (*Transaction, error) {
 	}
 	t := &Transaction{store: s, scope: scope, lock: lock}
 	t.State, err = s.Load(scope)
+	if errors.Is(err, os.ErrNotExist) && !create {
+		t.State = New(scope)
+		return t, nil
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		// Bound retained per-session records; never evict unresolved work or
 		// discard an opt-out to admit a new thread.

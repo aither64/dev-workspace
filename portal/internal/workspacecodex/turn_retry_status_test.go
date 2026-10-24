@@ -31,7 +31,7 @@ func TestRetryLoadedTerminalStatusController(t *testing.T) {
 					resumes, settings, policies := w.resumes, w.settings, w.policyUpdates
 					w.mu.Unlock()
 					now := time.Now()
-					controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
+					controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
 					if hold == "newer" {
 						tx, err := controller.Store.Lock(ctx, w.scope)
 						if err != nil {

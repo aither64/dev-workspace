@@ -476,7 +476,7 @@ a fresh read.
 
 ## Automatic turn retries
 
-Automatic retries are enabled by default for managed lead conversations and
+Automatic retries start enabled for managed lead conversations and
 ready team members. Native child threads are excluded. Only new failures after
 enrollment qualify; installing the feature does not restart an already-failed
 task.
@@ -488,6 +488,22 @@ latest retry chain. Retry now accelerates a scheduled attempt; Stop retrying
 stops that chain without changing the session preferences. Dismiss hides only
 that result in this browser. The notice appears inside the conversation viewport
 and leaves no space when hidden.
+
+On first use, an existing opt-out on the lead or any retained member turns both
+session switches off. Later changes apply to all retained members, including
+members added afterward. Enabling consumes an already-failed turn; an unchanged
+independent active turn may qualify if it fails later. Turning a switch off and
+on does not restart a stopped or uncertain chain. Preference changes wait for
+temporary session activity within a 30-second request budget; polling does not
+reserve exclusive access.
+
+Confirmed retry starts count accepted automatic submissions. A possibly
+submitted attempt appears separately. If confirmed-start evidence is incomplete,
+the count is partial or unavailable. Terminal results keep their elapsed time
+fixed. Retry preferences
+and activity metadata are optional: an unavailable record may hold automation,
+but Send, Queue, Implement plan and team delivery retain their normal admission
+and exact receipt recovery.
 
 A terminal capacity error retries after 15, 30, 60, 120, 240 and 300 seconds,
 then every 300 seconds until cancelled. Each interval adds up to 10% positive

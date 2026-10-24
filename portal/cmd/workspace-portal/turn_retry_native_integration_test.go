@@ -161,7 +161,7 @@ func TestNativeTurnRetryController(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	controller := turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Clock: func() time.Time { return now }, Random: func() float64 { return 0 }}
+	controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "native-fixture-policy", Capacity: true, Cybersecurity: true}, Store: client.RetryStore(), Backend: client.RetryBackend(), Clock: func() time.Time { return now }, Random: func() float64 { return 0 }}
 	wait("managed execution proof", func() bool {
 		stepErr := controller.Step(ctx, scope)
 		s, err := controller.Store.Load(scope)
@@ -178,7 +178,7 @@ func TestNativeTurnRetryController(t *testing.T) {
 	// automatic dispatch must never repair that cold hold. The actual client
 	// restart below occurs after native acceptance, when only reconciliation is
 	// required and no loaded-thread permission may be inferred from this test.
-	controller = turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Clock: func() time.Time { return now }, Random: func() float64 { return 0 }}
+	controller = turnretry.Controller{Policy: turnretry.Decision{Revision: "native-fixture-policy", Capacity: true, Cybersecurity: true}, Store: client.RetryStore(), Backend: client.RetryBackend(), Clock: func() time.Time { return now }, Random: func() float64 { return 0 }}
 	retained, err := controller.Store.Load(scope)
 	if err != nil || retained.Pending.ID != id || retained.DeadlineMS != deadline {
 		t.Fatal("controller restart lost the saved retry identity", err)
@@ -204,7 +204,7 @@ func TestNativeTurnRetryController(t *testing.T) {
 	})
 	// Default enrollment in another independent controller consumes this old
 	// failed turn and cannot send it. It uses separate disposable private state.
-	baseline := turnretry.Controller{Store: turnretry.Store{Root: filepath.Join(root, "baseline-state"), Workspace: workspace}, Backend: client.RetryBackend(), Clock: func() time.Time { return now }}
+	baseline := turnretry.Controller{Policy: turnretry.Decision{Revision: "native-fixture-policy", Capacity: true, Cybersecurity: true}, Store: turnretry.Store{Root: filepath.Join(root, "baseline-state"), Workspace: workspace}, Backend: client.RetryBackend(), Clock: func() time.Time { return now }}
 	if err := baseline.Step(ctx, scope); err != nil {
 		t.Fatal(err)
 	}
