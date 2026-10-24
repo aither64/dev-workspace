@@ -141,7 +141,7 @@
           <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
           <ol id="queue-list"></ol>
         </section>
-        {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status" hidden><span>Checking queued messages…</span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
+        {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status" hidden><span></span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
         {{end}}
         <div id="codex-work" class="codex-work" aria-live="polite" hidden><span id="codex-work-label">Working</span><span id="codex-work-counts"></span><time id="codex-work-elapsed"></time></div>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>

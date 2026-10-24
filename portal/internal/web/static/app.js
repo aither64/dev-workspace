@@ -5679,8 +5679,10 @@
   const queueRetry = document.getElementById("queue-retry");
   const queueNotice = conversationAssets.createRefreshNotice({render: state => {
     if (!queueStatus || !queueRetry) return;
-    queueStatus.hidden = !state.loading && !state.warning;
-    if (state.loading) queueStatus.querySelector("span").textContent = "Checking queued messages…";
+    queueStatus.hidden = !state.warning;
+    queueStatus.querySelector("span").textContent = state.warning ? state.hasValue ?
+      "Queued messages could not be refreshed. The last result may be out of date." :
+      "Queued messages could not be loaded." : "";
     queueRetry.hidden = !state.warning;
   }});
   let queueRead = null, queueRerun = false, queueRetryTimer = null, queueRetryDelay = refreshPolicy.retryInitialMs;
@@ -5693,6 +5695,7 @@
     const read = pageReads.begin(refreshPolicy.queueDeadlineMs);
     queueNotice.begin({manual});
     queueRead = read;
+    if (queueRetry) queueRetry.disabled = true;
     read.promise = (executionHeld ? Promise.resolve() : client.reconcileQueue({signal: read.signal})).then(() => {
       if (!read.isCurrent() || read.signal.aborted) return;
       return client.queue({signal: read.signal});
@@ -5704,13 +5707,13 @@
       queueRetryDelay = refreshPolicy.retryInitialMs;
     }).catch(error => {
       if (!read.isCurrent()) return;
-      queueStatus.querySelector("span").textContent = "Queued messages could not be refreshed. The last result may be out of date.";
       queueNotice.failure(read.error(error));
       queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
       queueRetryDelay = Math.min(refreshPolicy.retryMaxMs, queueRetryDelay * 2);
     }).finally(() => {
       read.finish(); if (queueRead !== read || !read.isCurrent()) return;
       queueRead = null;
+      if (queueRetry) queueRetry.disabled = false;
       if (queueRerun) { queueRerun = false; void refreshQueue(true); }
     });
     return read.promise;
