@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -928,6 +929,404 @@ func TestRetireThreadKeepsAttemptsWhenArchivedRootHasActiveCandidate(t *testing.
 			threadID, err := client.ThreadOperationAttempt(cwd)
 			if err != nil || threadID != "thread-1" {
 				t.Fatalf("retirement marker after refusal = %q, %v", threadID, err)
+			}
+		})
+	}
+}
+
+// This peer supplies real metadata and archive files to the ordinary proof.
+// Its only mutation is the exact thread/archive requested by RetireThread.
+type loadedRetirementFixture struct {
+	mu                                            sync.Mutex
+	cwd, home, root, sibling, path, archive, mode string
+	loaded                                        []string
+	reads, archives                               int
+	archived                                      bool
+	cancel                                        context.CancelFunc
+	methods                                       []string
+}
+
+func newLoadedRetirementFixture(t *testing.T, mode string, cancel context.CancelFunc) (*Client, *loadedRetirementFixture) {
+	t.Helper()
+	f := &loadedRetirementFixture{cwd: "/workspace/work/example", home: t.TempDir(), root: "11111111-1111-7111-8111-111111111111", sibling: "22222222-2222-7222-8222-222222222222", mode: mode, cancel: cancel}
+	name := "rollout-2026-10-24T00-00-00-" + f.root + ".jsonl"
+	f.path, f.archive = filepath.Join(f.home, "sessions", name), filepath.Join(f.home, "archived_sessions", name)
+	for _, path := range []string{f.path, f.archive} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if mode == "active" || strings.HasPrefix(mode, "persisted") {
+		if err := os.WriteFile(f.path, []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if mode == "persisted-missing" {
+		if err := os.Remove(f.path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if mode == "persisted-nonregular" {
+		if err := os.Remove(f.path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(f.path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.loaded = []string{f.root}
+	if strings.HasPrefix(mode, "persisted") {
+		f.loaded = []string{}
+	}
+	switch mode {
+	case "absent":
+		f.loaded = []string{}
+	case "sibling", "unreadable", "invalid-other", "structured-same-cwd", "structured-other-cwd":
+		f.loaded = []string{f.root, f.sibling}
+	case "sibling-only", "persisted-sibling":
+		f.loaded = []string{f.sibling}
+	}
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		defer connection.CloseNow()
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for {
+			request, err := readObject(connection)
+			if err != nil {
+				return nil
+			}
+			method, _ := request["method"].(string)
+			params, _ := request["params"].(map[string]any)
+			f.mu.Lock()
+			f.methods = append(f.methods, method)
+			var result any = map[string]any{}
+			var failure string
+			switch method {
+			case "thread/list":
+				if params["cwd"] != f.cwd || params["archived"] != false || params["useStateDbOnly"] != true || !reflect.DeepEqual(params["sourceKinds"], []any{"vscode"}) || !reflect.DeepEqual(params["modelProviders"], []any{}) {
+					failure = "indexed all-provider retirement scope changed"
+				}
+				result = map[string]any{"data": []any{}}
+			case "thread/loaded/list":
+				result = map[string]any{"data": f.loaded}
+				if mode == "cancel" || mode == "persisted-cancel" {
+					f.cancel()
+				}
+			case "thread/read":
+				id, _ := params["threadId"].(string)
+				if id != f.root && id != f.sibling {
+					failure = "read adopted an unknown retirement identity"
+					break
+				}
+				if id == f.root {
+					f.reads++
+				}
+				path := f.path
+				if f.archived {
+					path = f.archive
+				}
+				metadata := map[string]any{"id": id, "cwd": f.cwd, "source": "vscode", "path": path, "historyMode": "paginated", "preview": "", "ephemeral": false, "status": map[string]any{"type": "idle"}}
+				if params["excludeTurns"] != true {
+					metadata["turns"] = []any{}
+				}
+				if strings.HasPrefix(mode, "persisted") {
+					metadata["status"] = map[string]any{"type": "notLoaded"}
+				}
+				if strings.HasPrefix(mode, "persisted") && id == f.root && !f.archived && f.reads >= 2 {
+					switch mode {
+					case "persisted-nil-path":
+						metadata["path"] = nil
+					case "persisted-preview":
+						metadata["preview"] = "existing content"
+					case "persisted-ephemeral":
+						metadata["ephemeral"] = true
+					case "persisted-missing-ephemeral":
+						delete(metadata, "ephemeral")
+					case "persisted-idle":
+						metadata["status"] = map[string]any{"type": "idle"}
+					case "persisted-extra-status":
+						metadata["status"] = map[string]any{"type": "notLoaded", "extra": true}
+					case "persisted-wrong-id":
+						metadata["id"] = f.sibling
+					case "persisted-wrong-cwd":
+						metadata["cwd"] = "/workspace/work/other"
+					case "persisted-wrong-source":
+						metadata["source"] = "cli"
+					case "persisted-unreadable":
+						failure = "fixture metadata unavailable"
+					case "persisted-invalid":
+						metadata["cwd"] = 7
+					case "persisted-archived-path":
+						metadata["path"] = f.archive
+					case "persisted-drift":
+						if f.reads >= 4 {
+							metadata["projectId"] = "changed-project"
+						}
+					case "persisted-status-drift":
+						if f.reads >= 5 {
+							metadata["status"] = map[string]any{"type": "idle"}
+						}
+					case "persisted-history-drift":
+						if f.reads >= 6 {
+							metadata["preview"] = "changed history"
+						}
+					case "persisted-file-drift":
+						if f.reads == 6 {
+							if err := os.Rename(f.path, f.path+".before"); err != nil {
+								f.mu.Unlock()
+								return err
+							}
+							if err := os.WriteFile(f.path, []byte("{}\n"), 0600); err != nil {
+								f.mu.Unlock()
+								return err
+							}
+						}
+					}
+				}
+				if id == f.sibling {
+					metadata["path"] = filepath.Join(f.home, "sessions", "rollout-2026-10-24T00-00-00-"+f.sibling+".jsonl")
+					if mode == "structured-same-cwd" || mode == "structured-other-cwd" {
+						metadata["source"] = map[string]any{"subAgent": map[string]any{"threadSpawn": "agent"}}
+						if mode == "structured-other-cwd" {
+							metadata["cwd"] = "/workspace/work/other"
+						}
+					}
+					if mode == "unreadable" {
+						failure = "fixture metadata unavailable"
+					}
+					if mode == "invalid-other" {
+						delete(metadata, "source")
+					}
+				}
+				if id == f.root && f.reads >= 2 {
+					switch mode {
+					case "wrong-id":
+						metadata["id"] = f.sibling
+					case "wrong-cwd":
+						metadata["cwd"] = "/workspace/work/other"
+					case "wrong-source":
+						metadata["source"] = "cli"
+					case "invalid":
+						metadata["cwd"] = 7
+					case "nonfresh":
+						metadata["preview"] = "existing content"
+					case "drift":
+						if f.reads >= 3 {
+							metadata["projectId"] = "changed-project"
+						}
+					case "path-drift":
+						if f.reads >= 3 {
+							metadata["path"] = f.archive
+						}
+					}
+				}
+				result = map[string]any{"thread": metadata}
+			case "thread/turns/list":
+				if (mode != "active" && !strings.HasPrefix(mode, "persisted")) || params["threadId"] != f.root {
+					failure = "unexpected retirement history read"
+				}
+				result = map[string]any{"data": []any{}}
+				if mode == "active" || mode == "persisted-active-turn" {
+					result = map[string]any{"data": []any{map[string]any{"id": "active-turn", "status": "inProgress"}}}
+				}
+			case "thread/archive":
+				if params["threadId"] != f.root {
+					failure = "archive changed the retained root"
+					break
+				}
+				f.archives++
+				if mode == "archive-failure" || mode == "persisted-archive-failure" {
+					failure = "fixture archive refused"
+					break
+				}
+				header, _ := json.Marshal(map[string]any{"type": "session_meta", "payload": map[string]any{"id": f.root, "cwd": f.cwd}})
+				if err := os.WriteFile(f.archive, append(header, '\n'), 0600); err != nil {
+					f.mu.Unlock()
+					return err
+				}
+				f.archived = true
+			default:
+				f.mu.Unlock()
+				return fmt.Errorf("unexpected retirement RPC: %s", method)
+			}
+			f.mu.Unlock()
+			reply := map[string]any{"id": request["id"], "result": result}
+			if failure != "" {
+				delete(reply, "result")
+				reply["error"] = map[string]any{"code": -32000, "message": failure}
+			}
+			if err := writeObject(connection, reply); err != nil {
+				return nil
+			}
+		}
+	})
+	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "submissions.json")})
+	client.CodexHome = f.home
+	t.Cleanup(client.Close)
+	if err := client.RecordThreadOperationAttempt(f.cwd, f.root); err != nil {
+		t.Fatal(err)
+	}
+	return client, f
+}
+
+func TestRetireThreadLoadedRootAbsentFromIndex(t *testing.T) {
+	client, f := newLoadedRetirementFixture(t, "", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, f.root, f.cwd, false); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := client.ProveArchivedRootThread(ctx, f.root, f.cwd); err != nil || state != ArchiveArchived {
+		t.Fatalf("actual archive proof=%v, %v", state, err)
+	}
+	if id, err := client.ThreadOperationAttempt(f.cwd); err != nil || id != "" {
+		t.Fatal("successful archive retained retirement attempt", id, err)
+	}
+	if err := client.RecordThreadOperationAttempt(f.cwd, f.root); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RetireThread(ctx, f.root, f.cwd, false); err != nil {
+		t.Fatal("archived replay", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archives != 1 {
+		t.Fatal("archive/replay forwarded the wrong number of archives", f.archives)
+	}
+	if f.reads < 4 {
+		t.Fatal("retirement skipped exact-root, loaded, metadata or history proof", f.methods)
+	}
+}
+
+func TestRetireThreadPersistedEmptyRootAbsentFromDiscovery(t *testing.T) {
+	client, f := newLoadedRetirementFixture(t, "persisted", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, f.root, f.cwd, false); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := client.ProveArchivedRootThread(ctx, f.root, f.cwd); err != nil || state != ArchiveArchived {
+		t.Fatalf("actual archive proof=%v, %v", state, err)
+	}
+	if id, err := client.ThreadOperationAttempt(f.cwd); err != nil || id != "" {
+		t.Fatal("successful archive retained retirement attempt", id, err)
+	}
+	if err := client.RecordThreadOperationAttempt(f.cwd, f.root); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RetireThread(ctx, f.root, f.cwd, false); err != nil {
+		t.Fatal("archived replay", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archives != 1 {
+		t.Fatal("archive/replay forwarded the wrong number of archives", f.archives)
+	}
+	if f.reads < 4 {
+		t.Fatal("retirement skipped exact-root, loaded, metadata or history proof", f.methods)
+	}
+}
+
+func TestRetireThreadPersistedEmptyRootRefusesUnsafeEvidence(t *testing.T) {
+	for _, mode := range []string{"missing", "nonregular", "nil-path", "preview", "ephemeral", "missing-ephemeral", "idle", "extra-status", "wrong-id", "wrong-cwd", "wrong-source", "unreadable", "invalid", "archived-path", "drift", "status-drift", "history-drift", "file-drift", "sibling", "unresolved", "active-turn", "cancel", "archive-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, f := newLoadedRetirementFixture(t, "persisted-"+mode, cancel)
+			if mode == "unresolved" {
+				if err := client.PrepareSendWithOptions(f.root, "message", "client-1", "", false, codex.TurnOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := client.RetireThread(ctx, f.root, f.cwd, false)
+			if err == nil {
+				t.Fatal("unsafe persisted retirement accepted")
+			}
+			if mode == "cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation changed", err)
+			}
+			if id, readErr := client.ThreadOperationAttempt(f.cwd); readErr != nil || id != f.root {
+				t.Fatal("refusal cleared attempt evidence", id, readErr)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			want := 0
+			if mode == "archive-failure" {
+				want = 1
+			}
+			if f.archives != want || f.archived {
+				t.Fatal("unsafe archive effects", f.archives, f.methods, err)
+			}
+		})
+	}
+}
+
+func TestRetireThreadPersistedEmptyRootForceRetainsIdentityProof(t *testing.T) {
+	client, f := newLoadedRetirementFixture(t, "persisted-preview", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, f.root, f.cwd, true); err == nil {
+		t.Fatal("force bypassed persisted identity proof")
+	}
+	if id, err := client.ThreadOperationAttempt(f.cwd); err != nil || id != f.root {
+		t.Fatal("force refusal cleared attempt", id, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archives != 0 {
+		t.Fatal("force archived unproved root")
+	}
+}
+
+func TestRetireThreadLoadedDiscoveryExcludesStructuredSources(t *testing.T) {
+	for _, mode := range []string{"structured-same-cwd", "structured-other-cwd"} {
+		t.Run(mode, func(t *testing.T) {
+			client, f := newLoadedRetirementFixture(t, mode, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := client.RetireThread(ctx, f.root, f.cwd, false); err != nil {
+				t.Fatal(err)
+			}
+			if state, err := client.ProveArchivedRootThread(ctx, f.root, f.cwd); err != nil || state != ArchiveArchived {
+				t.Fatal("original root archive proof", state, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.archives != 1 {
+				t.Fatal("excluded structured source changed root retirement", f.archives, f.methods)
+			}
+		})
+	}
+}
+
+func TestRetireThreadLoadedDiscoveryRefusesUnsafeEvidence(t *testing.T) {
+	for _, mode := range []string{"absent", "sibling", "sibling-only", "unreadable", "invalid-other", "wrong-id", "wrong-cwd", "wrong-source", "invalid", "drift", "path-drift", "cancel", "nonfresh", "active", "archive-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, f := newLoadedRetirementFixture(t, mode, cancel)
+			err := client.RetireThread(ctx, f.root, f.cwd, false)
+			if err == nil {
+				t.Fatal("unsafe retirement accepted")
+			}
+			if mode == "cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation changed", err)
+			}
+			if id, readErr := client.ThreadOperationAttempt(f.cwd); readErr != nil || id != f.root {
+				t.Fatal("refusal cleared attempt evidence", id, readErr)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			wantArchives := 0
+			if mode == "archive-failure" {
+				wantArchives = 1
+			}
+			if f.archives != wantArchives || f.archived {
+				t.Fatal("refusal archived or skipped the intended archive failure", f.archives, f.methods, err)
+			}
+			if f.reads < 1 {
+				t.Fatal("refusal skipped actual retained-root proof", f.methods)
 			}
 		})
 	}

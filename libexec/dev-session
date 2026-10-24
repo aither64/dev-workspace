@@ -1948,6 +1948,28 @@ module DevSession
 	  @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { team(slug, action:, lifecycle: true) }
 	end
 
+    # Only the ordinary deletion owner calls this while retaining lifecycle locks.
+    def prepare_team_delete!(slug, removal, check_only:)
+      return unless @portal_command && !@portal_command.empty? && direct_team_state_present?(slug)
+
+      tracking = removal.fetch('tracking') == 'work' ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      root = manifest.dig('codex', 'thread_id')
+      unless root.is_a?(String) && root.match?(/\A[0-9A-Za-z-]+\z/)
+        raise Error, "session has no valid lead Codex thread: #{slug}"
+      end
+      command = [*@portal_command, 'team', 'prepare-delete',
+                 '--user-state-root', @workspace_state_root, '--host-profile', @host_profile,
+                 '--workspace', workspace, '--session-slug', slug,
+                 '--root-thread-id', root, '--cwd', work_dir(slug),
+                 '--deletion-operation-id', removal.fetch('operation_id')]
+      command.concat(['--socket', @codex_socket]) if @codex_socket
+      command << '--check-only' if check_only
+      @command_runner.capture(command)
+    end
+
+    private :prepare_team_delete!
+
 	def direct_team_state_present?(slug)
 	  File.lstat(direct_team_state_path(slug))
 	  true
@@ -2381,11 +2403,12 @@ module DevSession
             advance_removal!(slug, removal, 'validated')
           end
           if removal_phase_before?(removal, 'thread_retiring')
+            prepare_team_delete!(slug, removal, check_only: true)
             quiesced = quiesce_native_client!(slug, plan.session)
-            sync_team_lifecycle!(slug, 'require-idle') unless removal.fetch('force')
             advance_removal!(slug, removal, 'thread_retiring')
           end
           if removal_phase_before?(removal, 'thread_retired')
+            prepare_team_delete!(slug, removal, check_only: false)
             sync_team_lifecycle!(slug, removal.fetch('force') ? 'retire' : 'archive')
             retire_portal_thread!(slug, force: removal.fetch('force'))
             retained_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')

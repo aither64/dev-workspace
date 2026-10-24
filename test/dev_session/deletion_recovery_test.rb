@@ -51,9 +51,13 @@ class DevSessionTest < Minitest::Test
       calls = File.join(workspace, 'portal-calls')
       portal = File.join(workspace, 'portal.rb')
       File.write(portal, <<~RUBY)
+        require 'json'
         exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
         File.open(#{calls.dump}, 'a') { |file| file.puts ARGV[0, 2].join(' ') }
-        abort 'member has an active turn' if ARGV[0, 2] == ['team', 'require-idle']
+        if ARGV[0, 2] == ['team', 'prepare-delete'] && ARGV.include?('--check-only')
+          journal = JSON.parse(File.read(File.join(#{workspace.dump}, 'worktrees', '.locks', #{slug.dump} + '.removal.json')))
+          abort 'member has an active turn' unless journal.fetch('force')
+        end
         abort 'ordinary archive must stay idle-only' if ARGV[0, 2] == ['team', 'archive']
         abort 'forced root retirement lacks --force' if ARGV[0, 2] == ['thread', 'retire'] && !ARGV.include?('--force')
       RUBY
@@ -72,8 +76,82 @@ class DevSessionTest < Minitest::Test
       assert_raises(DevSession::CommandError) { runner.delete(slug, as_is: true, force: false) }
       runner.delete(slug, as_is: true, force: true)
 
-      assert_equal(['team require-idle', 'team retire', 'thread retire'], File.readlines(calls, chomp: true))
+      assert_equal(['team prepare-delete', 'team prepare-delete', 'team prepare-delete', 'team retire', 'thread retire'], File.readlines(calls, chomp: true))
       refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_delete_preparation_refusal_precedes_root_quiescence
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      portal = File.join(workspace, 'portal.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        abort 'unexpected deletion action' unless ARGV[0, 2] == ['team', 'prepare-delete'] && ARGV.include?('--check-only')
+        journal = JSON.parse(File.read(File.join(#{workspace.dump}, 'worktrees', '.locks', #{slug.dump} + '.removal.json')))
+        abort 'wrong preflight phase' unless journal.fetch('phase') == 'validated'
+        abort 'unresolved reservation fixture'
+      RUBY
+      runner = runner_for(workspace, env: {
+        DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin
+      })
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {'thread_id' => 'root-thread'}
+      runner.send(:write_portal_manifest, slug, manifest)
+      roster = runner.send(:direct_team_state_path, slug)
+      FileUtils.mkdir_p(File.dirname(roster), mode: 0o700)
+      File.write(roster, "team\n")
+      runner.define_singleton_method(:quiesce_native_client!) { |*| raise 'root quiesced before refusal' }
+
+      error = assert_raises(DevSession::CommandError) { runner.delete(slug, as_is: true, force: false) }
+      assert_includes(error.message, 'unresolved reservation fixture')
+      assert(File.exist?(File.join(workspace, 'work', slug)))
+      assert_equal("team\n", File.read(roster))
+    end
+  end
+
+  def test_delete_keeps_retiring_journal_after_uncertain_tombstone_publication
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      portal = File.join(workspace, 'portal.rb')
+      calls = File.join(workspace, 'publication-calls')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        exit 0 if ARGV[0, 2] == ['uploads', 'remove-session']
+        if ARGV[0, 2] == ['team', 'prepare-delete']
+          journal = JSON.parse(File.read(File.join(#{workspace.dump}, 'worktrees', '.locks', #{slug.dump} + '.removal.json')))
+          check = ARGV.include?('--check-only')
+          abort 'wrong helper phase' unless journal.fetch('phase') == (check ? 'validated' : 'thread_retiring')
+          unless check
+            File.open(#{calls.dump}, 'a') { |file| file.puts journal.fetch('operation_id') }
+            abort 'publication result unknown fixture'
+          end
+        else
+          abort 'retirement ran after uncertain publication'
+        end
+      RUBY
+      runner = runner_for(workspace, env: {
+        DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin
+      })
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {'thread_id' => 'root-thread'}
+      runner.send(:write_portal_manifest, slug, manifest)
+      roster = runner.send(:direct_team_state_path, slug)
+      FileUtils.mkdir_p(File.dirname(roster), mode: 0o700)
+      File.write(roster, "team\n")
+
+      2.times do
+        error = assert_raises(DevSession::CommandError) { runner.delete(slug, as_is: true, force: false) }
+        assert_includes(error.message, 'publication result unknown fixture')
+        journal = runner.send(:load_removal_journal, slug)
+        assert_equal('thread_retiring', journal.fetch('phase'))
+        assert(File.directory?(journal.fetch('recovery')))
+      end
+      operations = File.readlines(calls, chomp: true)
+      assert_equal(2, operations.length)
+      assert_equal(1, operations.uniq.length)
     end
   end
 

@@ -512,6 +512,8 @@ func teamCommand(args []string) error {
 	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
 	codexHome := flags.String("codex-home", "", "host-selected Codex home")
 	retainedOnly := flags.Bool("retained-only", false, "complete only retained member archival")
+	deletionOperationID := flags.String("deletion-operation-id", "", "owning session deletion operation")
+	checkOnly := flags.Bool("check-only", false, "validate deletion preparation without publishing")
 	authorityDir := flags.String("authority-dir", "", "host-only runtime authority directory")
 	cwd := flags.String("cwd", "", "session working directory")
 	preset := flags.String("preset", "", "team preset")
@@ -535,6 +537,12 @@ func teamCommand(args []string) error {
 	}
 	if *retainedOnly && command != "archive" {
 		return errors.New("--retained-only is only valid for team archive")
+	}
+	if command != "prepare-delete" && (*deletionOperationID != "" || *checkOnly) {
+		return errors.New("deletion preparation flags are only valid for team prepare-delete")
+	}
+	if command == "prepare-delete" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(*deletionOperationID) {
+		return errors.New("team prepare-delete requires --deletion-operation-id")
 	}
 	store, err := teamruntime.NewStore(*stateRoot, *workspace)
 	if err != nil {
@@ -671,6 +679,8 @@ func teamCommand(args []string) error {
 		result, err = service.Assign(ctx, *slug, *rootThread, *from, *to, *message, *model, *effort, *messageID)
 	case "require-idle":
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
+	case "prepare-delete":
+		err = service.PrepareDelete(ctx, *slug, *rootThread, *deletionOperationID, *checkOnly)
 	case "require-archive-ready":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
 			!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*authorityDir) ||

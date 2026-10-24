@@ -1721,28 +1721,35 @@ func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThrea
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
 	for _, member := range roster.Members {
-		if member.State == "archived" || member.State == "removed" {
-			continue
+		if err := service.requireIdleMember(ctx, member, cwd); err != nil {
+			return err
 		}
-		if member.State != "ready" || member.Thread == "" {
-			return fmt.Errorf("member %s has no confirmed idle thread", member.Address)
+	}
+	return nil
+}
+
+func (service Service) requireIdleMember(ctx context.Context, member Member, cwd string) error {
+	if member.State == "archived" || member.State == "removed" {
+		return nil
+	}
+	if member.State != "ready" || member.Thread == "" {
+		return fmt.Errorf("member %s has no confirmed idle thread", member.Address)
+	}
+	if member.RetireIntent != "" {
+		return fmt.Errorf("member %s retirement is pending", member.Address)
+	}
+	archived, err := service.archivedMemberThread(ctx, member, cwd)
+	if err != nil {
+		return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
+	}
+	if archived {
+		if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+			return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
 		}
-		if member.RetireIntent != "" {
-			return fmt.Errorf("member %s retirement is pending", member.Address)
-		}
-		archived, err := service.archivedMemberThread(ctx, member, cwd)
-		if err != nil {
-			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
-		}
-		if archived {
-			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
-				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
-			}
-			continue
-		}
-		if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
-			return fmt.Errorf("member %s is not idle: %w", member.Address, err)
-		}
+		return nil
+	}
+	if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+		return fmt.Errorf("member %s is not idle: %w", member.Address, err)
 	}
 	return nil
 }

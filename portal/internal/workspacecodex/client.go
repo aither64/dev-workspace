@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -613,20 +614,36 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		stage = "clear retired conversation attempts"
 		return c.ClearConversationAttempts(threadID, cwd)
 	}
+	loadedDiscovery := !found && (archiveState == ArchiveFresh || archiveState == ArchiveActive)
+	if loadedDiscovery {
+		candidate, found, err = c.loadedRetirementCandidate(ctx, threadID, cwd)
+		if err != nil {
+			return err
+		}
+	}
+	var persistedFile os.FileInfo
 	if !found {
-		return errors.New("the expected Codex thread is absent from active discovery")
+		stage = "prove persisted empty-preview session conversation"
+		candidate, persistedFile, err = c.persistedRetirementCandidate(ctx, threadID, cwd)
+		if err != nil {
+			return err
+		}
 	}
 	stage = "verify session conversation"
-	metadata, err := c.ReadThreadMetadata(ctx, threadID, true)
+	metadata, err := c.ReadThreadMetadata(ctx, threadID, persistedFile == nil)
 	if err != nil {
 		return err
 	}
-	if metadata.Cwd != cwd || !workspaceThread(metadata.Source) {
+	if metadata.Cwd != cwd || !workspaceThread(metadata.Source) ||
+		((loadedDiscovery || persistedFile != nil) && !reflect.DeepEqual(candidate, metadata)) {
 		return errors.New("Codex thread does not match the portal session being removed")
 	}
 	materialized, err := c.HistoryMaterialized(ctx, threadID, cwd)
 	if err != nil {
 		return err
+	}
+	if persistedFile != nil && !materialized {
+		return errors.New("persisted session conversation has no materialized history")
 	}
 	stage = "interrupt session conversation"
 	if force && materialized {
@@ -653,6 +670,16 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 		case <-ctx.Done():
 			return fmt.Errorf("wait for interrupted Codex thread: %w", ctx.Err())
 		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if persistedFile != nil {
+		stage = "verify persisted conversation submissions"
+		if err := c.RequireSubmissionAttemptsResolved(ctx, threadID); err != nil {
+			return err
+		}
+		stage = "recheck persisted empty-preview session conversation"
+		if err := c.provePersistedRetirementCandidate(ctx, candidate, cwd, persistedFile); err != nil {
+			return err
 		}
 	}
 	stage = "archive session conversation"
@@ -718,6 +745,91 @@ func (c *Client) retirementCandidate(
 		return codex.ThreadMetadata{}, false, errors.New("thread/list returned an invalid retirement candidate")
 	}
 	return candidate, true, nil
+}
+
+// Empty discovery can omit a persisted root with no preview. Only a stable,
+// materialized original vscode identity can supply the missing candidate.
+func (c *Client) persistedRetirementCandidate(ctx context.Context, threadID, cwd string) (codex.ThreadMetadata, os.FileInfo, error) {
+	metadata, err := c.ReadThreadMetadata(ctx, threadID, false)
+	if err != nil {
+		return codex.ThreadMetadata{}, nil, fmt.Errorf("read persisted retirement metadata: %w", err)
+	}
+	if err := validateArchiveMetadata(metadata, ArchivedThreadIdentity{
+		ThreadID: threadID, Cwd: cwd, SourceKind: threadSourceKind,
+	}); err != nil {
+		return codex.ThreadMetadata{}, nil, err
+	}
+	if metadata.Ephemeral == nil || *metadata.Ephemeral {
+		return codex.ThreadMetadata{}, nil, errors.New("persisted retirement root is not explicitly non-ephemeral")
+	}
+	if metadata.Preview != "" {
+		return codex.ThreadMetadata{}, nil, errors.New("persisted retirement root does not have an empty preview")
+	}
+	if len(metadata.Status) != 1 || metadata.Status["type"] != "notLoaded" {
+		return codex.ThreadMetadata{}, nil, errors.New("persisted retirement root is not positively unloaded")
+	}
+	if metadata.Path == nil {
+		return codex.ThreadMetadata{}, nil, errors.New("persisted retirement root has no rollout path")
+	}
+	file, err := os.Lstat(*metadata.Path)
+	if err != nil || !file.Mode().IsRegular() {
+		return codex.ThreadMetadata{}, nil, errors.New("persisted retirement rollout is not a materialized regular file")
+	}
+	if err := c.provePersistedRetirementCandidate(ctx, metadata, cwd, file); err != nil {
+		return codex.ThreadMetadata{}, nil, err
+	}
+	return metadata, file, nil
+}
+
+func (c *Client) provePersistedRetirementCandidate(ctx context.Context, metadata codex.ThreadMetadata, cwd string, before os.FileInfo) error {
+	state, err := ProveArchivedThread(ctx, archiveIdleMetadataReader{c.Client, metadata}, ArchivedThreadIdentity{
+		ThreadID: metadata.ID, Cwd: cwd, CodexHome: c.CodexHome, SourceKind: threadSourceKind,
+		RequireActiveFile: true,
+	})
+	if err != nil {
+		return fmt.Errorf("prove materialized retirement root: %w", err)
+	}
+	if state != ArchiveActive {
+		return errors.New("persisted retirement root is no longer positively active")
+	}
+	after, err := os.Lstat(*metadata.Path)
+	if err != nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return errors.New("persisted retirement rollout changed during proof")
+	}
+	return ctx.Err()
+}
+
+// An empty index can omit a loaded root. Exact archive proof still owns the
+// root identity; loaded metadata must prove it is the only matching thread.
+func (c *Client) loadedRetirementCandidate(ctx context.Context, threadID, cwd string) (codex.ThreadMetadata, bool, error) {
+	loaded, err := c.LoadedThreadIDs(ctx)
+	if err != nil {
+		return codex.ThreadMetadata{}, false, err
+	}
+	var candidate codex.ThreadMetadata
+	found := false
+	for _, id := range loaded {
+		metadata, err := c.ReadThreadMetadata(ctx, id, true)
+		if err != nil {
+			return codex.ThreadMetadata{}, false, err
+		}
+		if !canonicalArchivePath(metadata.Cwd) || metadata.Source == nil {
+			return codex.ThreadMetadata{}, false, errors.New("thread/read returned invalid retirement metadata")
+		}
+		if id == threadID {
+			if metadata.Cwd != cwd || !workspaceThread(metadata.Source) ||
+				(found && !reflect.DeepEqual(candidate, metadata)) {
+				return codex.ThreadMetadata{}, false, errors.New("Codex thread does not match the portal session being removed")
+			}
+			candidate, found = metadata, true
+		} else if metadata.Cwd == cwd && workspaceThread(metadata.Source) {
+			return codex.ThreadMetadata{}, false, errors.New("another Codex thread uses the portal session directory")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return codex.ThreadMetadata{}, false, err
+	}
+	return candidate, found, nil
 }
 
 func (c *Client) retirementThreadByID(
