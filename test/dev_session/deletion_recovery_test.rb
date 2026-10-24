@@ -3,6 +3,75 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_failed_creation_authority_publication_requires_typed_context
+    with_workspace do |workspace|
+      slug = '2026-06-06-authority-context'
+      authority_dir = File.join(workspace, 'authority')
+      tmux = ManagedTmux.new(slug, workspace:, socket_path: '/run/test.sock', id: '$11')
+      runner = runner_for(workspace, tmux:, authority_dir:)
+      [nil, {slug: slug}].each do |context|
+        assert_raises(DevSession::Error) do
+          runner.send(:publish_failed_creation_delete_authority!, slug, tmux.session(slug), context)
+        end
+        refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+      end
+    end
+  end
+
+  def test_failed_creation_authority_publication_does_not_change_ordinary_trust
+    %i[delete archive].each do |operation|
+      with_workspace do |workspace|
+        slug = '2026-06-06-ordinary-authority'
+        authority_dir = File.join(workspace, 'authority')
+        tmux = ManagedTmux.new(slug, workspace:, socket_path: '/run/test.sock', id: '$11')
+        runner = runner_for(workspace, tmux:, authority_dir:)
+        runner.ensure_tracking_files(slug)
+        assert_raises(DevSession::Error) do
+          operation == :delete ? runner.delete(slug, as_is: true, force: false) : runner.archive(slug, as_is: true)
+        end
+        refute(File.exist?(File.join(authority_dir, "#{slug}.json")))
+        refute(tmux.killed)
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      end
+    end
+  end
+
+  def test_delete_subordinate_start_requires_typed_validated_context
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      path = runner.send(:start_journal_file, slug)
+      bytes = JSON.generate('schema' => 1, 'slug' => slug, 'state' => 'creating', 'tmux_identity' => 'a' * 64)
+      File.write(path, bytes)
+      File.chmod(0o600, path)
+      context = {slug: slug, start_path: path, start_bytes: bytes}
+      assert_raises(DevSession::Error) do
+        runner.send(:reject_conflicting_lifecycle_journal!, slug, operation: 'delete', deletion_context: context)
+      end
+      assert_equal(bytes, File.binread(path))
+      assert_raises(DevSession::Error) { runner.send(:reject_conflicting_lifecycle_journal!, slug, operation: 'archive') }
+      runner.send(:reject_conflicting_lifecycle_journal!, slug, operation: 'start')
+      assert_equal(bytes, File.binread(path))
+    end
+  end
+
+  def test_delete_does_not_take_an_unbound_terminal_start_reservation
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      path = runner.send(:start_journal_file, slug)
+      bytes = JSON.generate('schema' => 1, 'slug' => slug, 'state' => 'creating', 'tmux_identity' => 'a' * 64)
+      File.write(path, bytes)
+      File.chmod(0o600, path)
+      runner.define_singleton_method(:quiesce_native_client!) { |*| raise 'unbound start reached native quiescence' }
+      assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: false) }
+      assert_equal(bytes, File.binread(path))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
   def test_delete_moves_direct_team_roster_to_private_recovery
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

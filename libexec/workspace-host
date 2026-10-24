@@ -432,6 +432,7 @@ module DevWorkspaceHost
       when 'run-coordinator' then run_coordinator(argv)
       when 'coordination-bootstrap' then coordination_bootstrap(argv)
       when 'recover-archive' then recover_archive(argv)
+      when 'recover-failed-creation-delete' then recover_failed_creation_delete(argv)
       when 'rollback' then with_current_generation_lock { rollback(argv) }
       when 'suspend' then with_current_generation_lock { suspend(argv) }
       when 'resume' then with_current_generation_lock { resume_services(argv) }
@@ -477,6 +478,7 @@ module DevWorkspaceHost
           workspace-host register NAME ROOT [--hostname HOST] [--alias HOST] [--replace]
           workspace-host unregister NAME
           workspace-host switch --source PATH [--from-candidate]
+          workspace-host recover-failed-creation-delete --source PATH --workspace NAME --session SLUG --request-id UUID
           workspace-host rollback
           workspace-host suspend
           workspace-host resume
@@ -880,6 +882,117 @@ module DevWorkspaceHost
         end
         @out.puts "recovered archive: #{entry.fetch('name')}/#{slug}"
       end
+    end
+
+    # A candidate can repair an eligible failed creation before the unchanged
+    # package-switch guard permits selection. Ordinary deletion owns all effects.
+    def recover_failed_creation_delete(argv)
+      options = {}
+      OptionParser.new do |opts|
+        %w[source workspace session request-id].each do |name|
+          opts.on("--#{name} VALUE") { |value| options[name] = value }
+        end
+      end.parse!(argv)
+      unless argv.empty? && options.keys.sort == %w[request-id session source workspace] &&
+             options.fetch('workspace').match?(NAME) && valid_session_identity?(options.fetch('session')) &&
+             options.fetch('request-id').match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/)
+        raise Error, 'failed-creation deletion recovery requires --source, --workspace, --session and --request-id'
+      end
+      token = profile_link_token
+      raise Error, 'failed-creation deletion recovery requires a selected predecessor profile' unless token && File.symlink?(@profile)
+
+      predecessor = File.realpath(@profile)
+      source = File.realpath(File.expand_path(options.fetch('source')))
+      source_identity = coordination_source_identity(source)
+      packages = capture!('nix', 'build', '--no-link', '--print-out-paths', source).lines.map(&:strip).reject(&:empty?).uniq
+      raise Error, 'failed-creation recovery source did not build exactly one package' unless packages.length == 1
+
+      candidate = File.realpath(packages.fetch(0))
+      unless candidate == File.realpath(package_root) && candidate != predecessor &&
+             %w[bin/workspace-host bin/workspace-portal libexec/workspace-portal/dev-session].all? { |name| File.executable?(File.join(candidate, name)) }
+        raise Error, 'failed-creation deletion recovery requires the exact unselected source package'
+      end
+      require_failed_creation_recovery_contract!(predecessor, candidate)
+      selected_codex = File.realpath(active_codex)
+      check_codex(selected_codex)
+      with_transition_lock do
+        require_failed_creation_recovery_generation!(token, predecessor, selected_codex)
+        raise Error, 'failed-creation recovery source changed during preparation' unless source_identity == coordination_source_identity(source)
+
+        require_compatible_development_cluster_helpers!(candidate)
+        require_compatible_runtime_authorities!(candidate)
+        require_compatible_session_recovery!(candidate)
+        require_compatible_provider_state!(candidate)
+        require_compatible_sensitive_sessions!(candidate)
+        coordination_store.require_compatible!(candidate)
+        entry = registry.find(options.fetch('workspace'))
+        raise Error, 'failed-creation recovery workspace is not registered' unless entry
+
+        require_provider_admission!(entry)
+        slug = options.fetch('session')
+        identity = failed_creation_delete_identity!(entry, slug, options.fetch('request-id'))
+        unless identity.fetch('completed')
+          request = ['delete', slug, '--as-is']
+          request << '--force' if identity.fetch('force') == true
+          environment, command, arguments = dev_session_invocation(
+            entry, request, transition_lock: false, package: candidate
+          )
+          # Only this public, source-bound entry hands predecessor authority to
+          # the candidate ordinary executor while owning transition exclusion.
+          arguments[arguments.index('--expected-host-generation') + 1] = predecessor
+          system_env_interactive!(environment, command, *arguments)
+        end
+        require_failed_creation_recovery_generation!(token, predecessor, selected_codex)
+        completed = failed_creation_delete_identity!(entry, slug, options.fetch('request-id'))
+        unless completed.fetch('completed') && completed.fetch('root') == identity.fetch('root') &&
+               completed.fetch('receipt') == identity.fetch('receipt') &&
+               (!identity['operation'] || (completed.fetch('operation') == identity.fetch('operation') && completed.fetch('force') == identity.fetch('force')))
+          raise Error, 'failed-creation deletion did not complete its exact ordinary removal operation'
+        end
+        @out.puts "recovered failed-creation deletion: #{entry.fetch('name')}/#{slug}"
+      end
+      # Portal reconciliation takes its own shared transition lock. The caller
+      # performs that separate exact-request operation after this entry returns.
+    end
+
+    def require_failed_creation_recovery_generation!(token, predecessor, selected_codex)
+      unless token == profile_link_token && File.symlink?(@profile) &&
+             File.realpath(@profile) == predecessor && File.realpath(active_codex) == selected_codex
+        raise Error, 'selected workspace package or Codex changed during failed-creation deletion recovery'
+      end
+    end
+
+    def require_failed_creation_recovery_contract!(predecessor, candidate)
+      old, current = [predecessor, candidate].map do |package|
+        path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+        parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'failed-creation recovery contract', 64 * 1024)
+      end
+      addition = 'turnRetrySessionPolicy'
+      unless current.eql?(RUNTIME_CONTRACT) && current[addition].is_a?(Integer) && current[addition] == 1 &&
+             (!old.key?(addition) || (old[addition].is_a?(Integer) && old[addition] == 1)) &&
+             old.reject { |key, _| key == addition }.eql?(current.reject { |key, _| key == addition }) &&
+             current.fetch('devSessionFlags').include?('--portal-command') && current['lifecycleJournals'] == LIFECYCLE_JOURNALS
+        raise Error, 'selected predecessor has an incompatible failed-creation recovery contract'
+      end
+    rescue SystemCallError => e
+      raise Error, "failed-creation recovery contract is unavailable: #{e.message}"
+    end
+
+    def failed_creation_delete_identity!(entry, slug, request_id)
+      load_archive_recovery_executor!
+      verifier = failed_creation_delete_verifier(entry)
+      verifier.with_verified_failed_creation_delete(slug, request_id:)
+    rescue DevSession::Error => e
+      raise Error, "failed-creation deletion verification failed: #{e.message}"
+    end
+
+    def failed_creation_delete_verifier(entry)
+      DevSession::Runner.new(
+        workspace: entry.fetch('root'), authority_dir: instance_runtime(entry).fetch(:authority),
+        tmux_socket: instance_runtime(entry).fetch(:tmux), codex_socket: instance_runtime(entry).fetch(:codex),
+        codex_command: active_codex, codex_version: codex_version(active_codex),
+        env: @env.to_h, require_runtime: false
+      )
     end
 
     def with_verified_archive_recovery(entry, slug, journal, runtime, environment, selected_version: nil)

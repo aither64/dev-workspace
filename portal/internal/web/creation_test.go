@@ -1436,8 +1436,11 @@ func TestCreationRetiresDeletedReadySlugBeforeAcceptingAnotherRequest(t *testing
 }
 
 func TestCreationEvidenceGapDeletionRetiresTheExactRequest(t *testing.T) {
-	for _, kind := range []string{"new", "plan", "fork"} {
+	for _, kind := range []string{"new", "plan", "fork", "direct-new-schema3"} {
 		for _, state := range []string{"paused", "failed"} {
+			if kind == "direct-new-schema3" && state != "failed" {
+				continue
+			}
 			t.Run(kind+"/"+state, func(t *testing.T) {
 				server := newTestServer(t)
 				started := time.Now().UTC().Add(-time.Minute)
@@ -1445,7 +1448,15 @@ func TestCreationEvidenceGapDeletionRetiresTheExactRequest(t *testing.T) {
 					Request:   creationRequest{Kind: kind, Slug: "2026-09-12-deleted-" + kind, Goal: "Original goal"},
 					ReceiptID: strings.Repeat("d", 64), Attempt: 1, State: state, StartedAt: started.Format(time.RFC3339Nano),
 					Validated: true, Goal: "Original goal", Model: "model-1", Effort: "high"}
-				if kind != "new" {
+				if kind == "direct-new-schema3" {
+					preset := teamruntime.Preset{ID: "delegated", Name: "Full team", Description: "A lead and reviewer thread",
+						CatalogDigest: strings.Repeat("a", 64), TeamDigest: strings.Repeat("b", 64),
+						LeadModel: receipt.Model, LeadEffort: receipt.Effort, Roles: []string{"lead", "reviewer0"},
+						Members: []teamruntime.MemberSpec{{Role: "reviewer", Address: "reviewer0", Model: receipt.Model, Effort: receipt.Effort, Behavior: "reviewer", Access: "read_only"}}}
+					receipt.Schema, receipt.Request.Kind, receipt.Request.Team = 3, "new", preset.ID
+					receipt.Request.CatalogDigest, receipt.DirectTeam = preset.CatalogDigest, &preset
+				}
+				if receipt.Request.Kind != "new" {
 					receipt.Request.Source = "source"
 					receipt.Request.SourceThreadID = "source-thread"
 					receipt.Request.SourceIdentity = strings.Repeat("f", 64)
@@ -1477,6 +1488,7 @@ func TestCreationEvidenceGapDeletionRetiresTheExactRequest(t *testing.T) {
 runner = DevSession::Runner.new(workspace: ARGV.fetch(1), env: ENV.to_h.merge('DEV_WORKSPACES_STATE' => ARGV.fetch(2), 'PATH' => ''))
 slug = ARGV.fetch(3)
 removal = runner.send(:prepare_removal!, slug, force: false)
+exit 0 if ARGV[4] == 'prepared-only'
 %w[validated thread_retiring thread_retired clusters_released worktrees_removed runtime_retired].each { |phase| runner.send(:advance_removal!, slug, removal, phase) }
 runner.send(:preserve_removed_state!, slug, removal, nil)
 runner.send(:advance_removal!, slug, removal, 'tracking_preserved')
@@ -1485,6 +1497,25 @@ runner.send(:finalize_removal!, slug, removal)
 removal['removed_at'] = '2000-01-01T00:00:00Z'
 runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
 `
+				if receipt.Schema == 3 {
+					partial := exec.Command("ruby", "-e", script, "../../../libexec/dev-session", server.config.Workspace, server.config.UserStateRoot, receipt.Request.Slug, "prepared-only")
+					if output, err := partial.CombinedOutput(); err != nil {
+						t.Fatalf("prepare incomplete deletion: %v\n%s", err, output)
+					}
+					history, err := session.CompletedRemovalHistory(server.config.Workspace, receipt.Request.Slug, server.config.UserStateRoot)
+					if err != nil || history != receipt.DeletionHistorySHA256 {
+						t.Fatal("incomplete removal changed completed history", history, err)
+					}
+					incomplete, err := New(server.config)
+					if err != nil {
+						t.Fatalf("reload valid schema-3 failed receipt: %v", err)
+					}
+					current, ok := incomplete.currentCreation(receipt.Request.Slug)
+					incomplete.Close()
+					if !ok || current.Schema != 3 || current.State != "failed" || current.ReceiptID != receipt.ReceiptID || current.Attempt != receipt.Attempt {
+						t.Fatal("incomplete removal retired or changed exact failed receipt", current)
+					}
+				}
 				command := exec.Command("ruby", "-e", script, "../../../libexec/dev-session", server.config.Workspace, server.config.UserStateRoot, receipt.Request.Slug)
 				if output, err := command.CombinedOutput(); err != nil {
 					t.Fatalf("delete fixture: %v\n%s", err, output)
@@ -1502,11 +1533,22 @@ runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
 					t.Fatal(err)
 				}
 				defer restored.Close()
-				if _, ok := restored.currentCreation(receipt.Request.Slug); !ok {
-					t.Fatal("retired during an active destination mutation")
+				if current, ok := restored.currentCreation(receipt.Request.Slug); !ok || current.Schema != receipt.Schema || current.State != state || current.ReceiptID != receipt.ReceiptID || current.Attempt != receipt.Attempt {
+					t.Fatal("retired or changed exact request during an active destination mutation", current)
 				}
 				if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
 					t.Fatal(err)
+				}
+				dispatchMarker := ""
+				if receipt.Schema == 3 {
+					directory := t.TempDir()
+					dispatchMarker = filepath.Join(directory, "creation-dispatched")
+					t.Setenv("CREATION_UNEXPECTED_DISPATCH", dispatchMarker)
+					helper := filepath.Join(directory, "dev-session")
+					if err := os.WriteFile(helper, []byte("#!/bin/sh\n: >\"$CREATION_UNEXPECTED_DISPATCH\"\nexit 1\n"), 0755); err != nil {
+						t.Fatal(err)
+					}
+					restored.config.DevSession = fixtureDevSessionCommand(t, restored.config.Workspace, helper)
 				}
 				stale := postCreation(t, restored, "/api/sessions/"+receipt.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receipt.ReceiptID), "application/json")
 				if stale.Code != http.StatusNotFound {
@@ -1530,6 +1572,11 @@ runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
 				stale = postCreation(t, restored, "/api/sessions/"+receipt.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receipt.ReceiptID), "application/json")
 				if stale.Code != http.StatusConflict {
 					t.Fatal("old retry targeted the new request")
+				}
+				if dispatchMarker != "" {
+					if _, err := os.Stat(dispatchMarker); !os.IsNotExist(err) {
+						t.Fatal("receipt reconciliation dispatched creation", err)
+					}
 				}
 			})
 		}

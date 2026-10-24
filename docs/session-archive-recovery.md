@@ -315,6 +315,81 @@ recovery reconstructs its exact final journal identity through the cleanup
 owner, revalidates the saved state and finishes the ordinary receipt cleanup.
 An incomplete receipt without its journal remains a refusal.
 
+## Deleting a failed direct creation before a package switch
+
+A failed direct creation can block package selection when the selected
+executor cannot finish its deletion. Use the candidate's public recovery entry
+only after authorizing deletion of that exact session:
+
+```sh
+/path/to/candidate/bin/workspace-host recover-failed-creation-delete \
+  --source /path/to/exact/source --workspace NAME --session SLUG \
+  --request-id UUID
+```
+
+The supplied source must build the same candidate package that runs this
+command. That candidate must differ from the selected package. During deletion,
+the command holds the package transition lock and verifies the selected profile
+token, native executable and protocol. Ordinary deletion still asks for
+confirmation, checks resource ownership and records its lifecycle journal.
+The selected profile and services stay in place.
+
+The runtime contracts must match exactly, with one exception: a candidate
+declaring `turnRetrySessionPolicy: 1` may recover a predecessor that omits this
+field. Both may also declare `1`. Any other difference blocks recovery.
+
+Recovery requires the exact failed new-session request, direct team snapshot,
+retained root and roster. The creating manifest must explicitly record both
+`initial_goal_attempted: false` and `initial_goal_sent: false`. An interrupted
+terminal-start journal belongs to this creation only when its slug and tmux
+identity match the creating CLI journal and retained runtime identity.
+Other start, fork or lifecycle conflicts remain blockers.
+
+A failed direct creation can leave its exact managed terminal before runtime
+authority is published. If authority is absent and that terminal is present,
+the ordinary deletion owner revalidates the failed-creation context, terminal
+ID, workspace, sockets, client version and original creation nonce under its
+existing locks. It publishes the ordinary authority with state `creating`,
+then applies the unchanged trust and deletion checks. It does not replace an
+existing authority, create one without a terminal, or mark creation ready.
+After interruption, the same authority remains available to ordinary recovery.
+
+The ordinary deletion owner repeats these checks under its existing locks.
+After preflight and root quiescence, it durably records `thread_retiring` and
+atomically moves the unchanged start journal to private recovery as `start.json`.
+It then performs normal member and root retirement. For a member whose start
+outcome is unknown, the preserved roster retains its project and attempted-start
+provenance. This does not prove that the native thread is absent or remove its
+project. Private recovery retains the start, creation, team and tracking records.
+
+Root retirement first proves the recorded thread's archive state. If it is
+not archived and the index has no candidate, retirement also checks loaded
+threads and their metadata. The original root must be the only thread matching
+the session directory and source policy. Missing, ambiguous or changing
+identities still block removal. When both discovery paths omit the root,
+retirement requires positive proof of the original persisted, non-ephemeral
+`vscode` root with an empty preview and exact `notLoaded` status. Its canonical
+active rollout must be a regular materialized file; metadata and file identity
+must remain stable through history, terminal-turn idle and resolved-submission
+checks. Discovery absence alone never permits archival, and force does not
+bypass this identity proof. Attempt records are cleared only after successful
+archival or positive proof that the root is already archived.
+
+After interruption, repeat the command with the same source, session and
+request ID. It validates the original removal operation and private recovery
+when tracking has moved. Missing or conflicting provenance blocks recovery.
+Completed removal evidence makes an exact replay a no-op while the failed
+receipt remains available. A missing target alone never proves completion.
+
+After the command returns and releases the transition lock, reconcile the
+original request through the selected portal's ordinary
+`GET /api/session-creations/UUID`. This status request can retire the failed
+creation receipt after proving completed deletion. Do not invoke creation retry
+or start another session. If reconciliation cannot prove completed deletion,
+stop and retain the receipt and recovery records. After it retires the receipt,
+use the normal forward package switch. Its unfinished-operation and capability
+checks still apply. A ready replacement is unaffected.
+
 ## Threadless conversation absence
 
 Threadless readiness combines fail-closed public indexed queries for unassigned

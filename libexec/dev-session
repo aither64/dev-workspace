@@ -2371,6 +2371,36 @@ module DevSession
       end
     end
 
+    # The host entry and ordinary deletion share one context reader. This
+    # observation releases the session locks before the host invokes the CLI.
+    def with_verified_failed_creation_delete(slug, request_id:)
+      validate_part!(slug, 'session slug')
+      unless request_id.is_a?(String) && request_id.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/)
+        raise Error, 'failed-creation recovery requires a canonical request UUID'
+      end
+      with_lifecycle_access(slug, 'delete', operation_id: nil) do
+        with_creation_lock(slug) do
+          with_slug_lock(slug) do
+            select_tmux_for_slug!(slug)
+            context = failed_creation_delete_context(slug, request_id:)
+            reject_conflicting_lifecycle_journal!(slug, operation: 'delete', deletion_context: context)
+            context.identity
+          end
+        end
+      end
+    end
+
+    FailedCreationDeleteContext = Struct.new(
+      :slug, :root, :receipt, :request_id, :operation, :completed, :start_path, :start_bytes, :creation_nonce, :force,
+      keyword_init: true
+    ) do
+      def identity
+        {'root' => root, 'receipt' => receipt, 'request' => request_id,
+         'operation' => operation, 'completed' => completed, 'force' => force}
+      end
+    end
+    private_constant :FailedCreationDeleteContext
+
     def delete(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'delete', operation_id:) do
@@ -2385,10 +2415,13 @@ module DevSession
       with_creation_lock(slug) do
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
-          reject_conflicting_lifecycle_journal!(slug, operation: 'delete')
+          deletion_context = failed_creation_start_context(slug)
+          reject_conflicting_lifecycle_journal!(slug, operation: 'delete', deletion_context:)
           coordination_store.require_lifecycle_idle!(workspace, slug)
           coordination_store.require_lifecycle_capacity!(workspace, slug, 'delete') unless load_removal_journal(slug)
-          ensure_retirement_identity!(slug, cleanup_session(slug))
+          session = cleanup_session(slug)
+          publish_failed_creation_delete_authority!(slug, session, deletion_context) if deletion_context
+          ensure_retirement_identity!(slug, session)
           removal = prepare_removal!(slug, force:, operation_id:)
           retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
           recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
@@ -2407,6 +2440,7 @@ module DevSession
             quiesced = quiesce_native_client!(slug, plan.session)
             advance_removal!(slug, removal, 'thread_retiring')
           end
+          transfer_failed_creation_start!(slug, removal, deletion_context) if deletion_context
           if removal_phase_before?(removal, 'thread_retired')
             prepare_team_delete!(slug, removal, check_only: false)
             sync_team_lifecycle!(slug, removal.fetch('force') ? 'retire' : 'archive')
@@ -4218,7 +4252,7 @@ module DevSession
 
     # Hash only operation identities: wall-clock correction does not change
     # which completed deletions an accepted request has already observed.
-    def completed_removal_history(slug)
+    def completed_removal_history(slug, excluding_operation: nil)
       root = removal_recovery_root_path
       return Digest::SHA256.hexdigest('') unless path_exists?(root)
 
@@ -4239,7 +4273,7 @@ module DevSession
         end
         metadata.fetch('operation_id')
       end
-      Digest::SHA256.hexdigest(operations.uniq.sort.join("\n"))
+      Digest::SHA256.hexdigest((operations.uniq - [excluding_operation]).sort.join("\n"))
     rescue JSON::ParserError, KeyError, ArgumentError => e
       raise Error, "invalid creation deletion recovery: #{e.message}"
     end
@@ -6092,6 +6126,260 @@ module DevSession
       root
     end
 
+    def failed_creation_start_context(slug)
+      removal = load_removal_journal(slug)
+      retained_creation = removal && [creation_journal_file(slug), File.join(removal.fetch('recovery'), 'creation.json')].any? do |path|
+        next false unless path_exists?(path)
+        journal = failed_creation_delete_json(path, 'deletion creation context')
+        journal['schema'] == 3 && journal['state'] == 'creating'
+      end
+      return unless path_exists?(start_journal_file(slug)) || retained_creation ||
+                    (removal && path_exists?(File.join(removal.fetch('recovery'), 'start.json')))
+
+      failed_creation_delete_context(slug)
+    end
+
+    def failed_creation_delete_json(path, label, maximum: AUTHORITY_MAX_SIZE)
+      raise Error, "#{label} is a symlink: #{path}" if File.symlink?(path)
+      read_private_json_object(path, label, max_size: maximum, mode: 0o600)
+    end
+
+    def failed_creation_delete_context(slug, request_id: nil)
+      conflicts = (LIFECYCLE_JOURNAL_NAMES.values - ['removal']) + %w[fork archive-cleanup agent-teams-migration]
+      if conflicts.any? { |name| path_exists?(File.join(File.dirname(creation_journal_file(slug)), "#{slug}.#{name}.json")) }
+        raise Error, 'conflicting session operation blocks failed-creation deletion recovery'
+      end
+      workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      portal = File.join(@workspace_state_root, 'portal', workspace_id)
+      receipt = failed_creation_delete_json(File.join(portal, 'creations', "#{slug}.json"),
+                                            'failed creation receipt', maximum: 12 * MAX_MESSAGE_BYTES + 16_384)
+      preset = receipt['directTeam']
+      validate_current_direct_portal_receipt!(receipt, {'receipt_id' => receipt['receiptId']}, slug,
+        model: receipt['model'], effort: receipt['effort'], direct_team: preset)
+      unless receipt['state'] == 'failed' && receipt['validated'] == true && receipt.dig('request', 'kind') == 'new' &&
+             receipt['receiptId'].is_a?(String) && receipt['receiptId'].match?(/\A[0-9a-f]{64}\z/) &&
+             receipt['goal'].is_a?(String) && !receipt['goal'].empty? && receipt.dig('request', 'goal') == receipt['goal']
+        raise Error, 'deletion recovery requires an exact failed direct new-session receipt'
+      end
+      directory = File.join(portal, 'session-preparations')
+      names = request_id ? ["#{request_id}.json"] : Dir.children(directory)
+      raise Error, 'too many failed-creation preparation candidates' if names.length > 512
+      records = names.filter_map do |name|
+        next unless name.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json\z/)
+        record = failed_creation_delete_json(File.join(directory, name), 'failed creation preparation',
+                                             maximum: 2 * (12 * MAX_MESSAGE_BYTES + 16_384) + 16_384)
+        next unless request_id || record['slug'] == slug
+        next if !request_id && (record['receiptId'] != receipt['receiptId'] || record['epoch'] != receipt['deletionHistorySha256'])
+        unless record['schema'] == 1 && record['workspace'] == workspace && record['slug'] == slug &&
+               record['requestId'] == name.delete_suffix('.json') && record['state'] == 'handed_off' &&
+               record['inputVersion'] == 1 && record['receiptId'] == receipt['receiptId'] &&
+               record['epoch'] == receipt['deletionHistorySha256'] && record['handoff'] == receipt['request'] &&
+               record.dig('snapshot', 'preset') == preset && record.dig('snapshot', 'goal') == receipt['goal']
+          raise Error, 'failed-creation preparation does not match the exact accepted request'
+        end
+        record
+      end
+      raise Error, 'failed-creation request identity is missing or ambiguous' unless records.length == 1
+      preparation = records.fetch(0)
+      removal = failed_creation_delete_removal(slug, epoch: receipt.fetch('deletionHistorySha256'))
+      recovery = removal && removal.fetch('recovery')
+      completed = removal && removal['phase'] == 'removed'
+      source_tracking = work_dir(slug)
+      private_tracking = recovery && File.join(recovery, 'work')
+      if path_exists?(archive_dir(slug)) || (private_tracking && path_exists?(private_tracking) && path_exists?(source_tracking))
+        raise Error, 'failed-creation tracking has a conflicting location'
+      end
+      tracking = path_exists?(source_tracking) ? source_tracking : private_tracking
+      raise Error, 'failed-creation tracking has no validated private recovery' unless tracking
+      manifest = load_portal_manifest(File.join(tracking, PORTAL_MANIFEST), required: true, expected_slug: slug)
+      creation = manifest.fetch('creation', {})
+      root = manifest.dig('codex', 'thread_id')
+      unless manifest['schema'] == 2 && !manifest.key?('forked_from') &&
+             root.is_a?(String) && root.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/) &&
+             manifest.dig('codex', 'socket_path') == @codex_socket && creation['state'] == 'creating' &&
+             creation['initial_goal_attempted'] == false && creation['initial_goal_sent'] == false &&
+             creation['goal_sha256'] == Digest::SHA256.hexdigest(receipt.fetch('goal'))
+        raise Error, 'failed-creation deletion requires the exact root and explicitly unsubmitted initial goal'
+      end
+      journal_path = failed_creation_recovery_record(creation_journal_file(slug), recovery, 'creation.json')
+      journal = failed_creation_delete_json(journal_path, 'failed creation journal')
+      journal_keys = %w[schema slug goal_sha256 run_codex state model effort direct_team tmux_identity]
+      journal_keys += %w[provider sensitive].select { |key| journal.key?(key) }
+      unless journal.keys.sort == journal_keys.sort && journal['slug'] == slug && journal['run_codex'] == true &&
+             journal['schema'] == 3 && journal['state'] == 'creating' && journal['model'] == preset['leadModel'] &&
+             journal['effort'] == preset['leadEffort'] && valid_creation_provider?(journal) &&
+             journal['tmux_identity'].is_a?(String) && journal['tmux_identity'].match?(/\A[0-9a-f]{64}\z/) &&
+             journal['direct_team'] == preset && journal['goal_sha256'] == creation['goal_sha256'] &&
+             journal.fetch('provider', nil) == receipt.fetch('request').fetch('provider', nil)
+        raise Error, 'failed-creation journal changed from the accepted request'
+      end
+      roster_path = failed_creation_recovery_record(direct_team_state_path(slug), recovery, 'team.json')
+      roster = failed_creation_delete_json(roster_path, 'failed creation roster', maximum: 256 * 1024)
+      require_failed_creation_delete_roster!(roster, slug, root, preset)
+      nonce = journal.fetch('tmux_identity')
+      if @codex_version && manifest.dig('codex', 'client_version') != @codex_version
+        raise Error, 'failed-creation root uses a different native protocol identity'
+      end
+      start_path = failed_creation_recovery_record(start_journal_file(slug), recovery, 'start.json')
+      start_bytes = nil
+      if start_path
+        start = failed_creation_delete_json(start_path, 'failed creation subordinate start')
+        unless start.keys.sort == %w[schema slug state tmux_identity] && start['schema'] == 1 &&
+               start['slug'] == slug && start['state'] == 'creating' && start['tmux_identity'] == nonce
+          raise Error, 'terminal-start reservation does not match the failed creation identity'
+        end
+        start_bytes = File.binread(start_path).freeze
+      end
+      if completed
+        unless !path_exists?(source_tracking) && !path_exists?(worktrees_dir(slug)) &&
+               (!@authority_dir || !path_exists?(authority_file(slug))) && !path_exists?(lifecycle_journal_file(slug, 'delete'))
+          raise Error, 'completed failed-creation removal still has live session state'
+        end
+      else
+        authority = @authority_dir ? load_session_authority(slug, required: false) : nil
+        if authority && (authority['tmux_identity'] != nonce || authority['codex_thread_id'] != root || authority['codex_socket_path'] != @codex_socket)
+          raise Error, 'failed-creation authority does not match the retained root and terminal identity'
+        end
+        terminal = @tmux.session(slug)
+        if terminal && (!managed_by_workspace?(terminal) || terminal.identity_token != nonce ||
+                        terminal.codex_thread_id != root || terminal.codex_socket_path != @codex_socket)
+          raise Error, 'failed-creation terminal does not match the retained root and creation identity'
+        end
+        validate_authority_session!(slug, terminal, require_creation_identity: true) if terminal && authority
+      end
+      FailedCreationDeleteContext.new(slug:, root:, receipt: receipt.fetch('receiptId'),
+        request_id: preparation.fetch('requestId'), operation: removal && removal['operation_id'],
+        completed: !!completed, start_path:, start_bytes:, creation_nonce: nonce, force: removal && removal['force']).freeze
+    end
+
+    def failed_creation_recovery_record(source, recovery, name, optional: false)
+      destination = recovery && File.join(recovery, name)
+      if path_exists?(source) && destination && path_exists?(destination)
+        raise Error, 'conflicting live and private failed-creation recovery records'
+      end
+      return source if path_exists?(source)
+      return destination if destination && path_exists?(destination)
+      return nil if optional
+
+      raise Error, "failed-creation recovery record is missing: #{name}"
+    end
+
+    def require_failed_creation_delete_roster!(roster, slug, root, preset)
+      unless roster['schema'] == 1 && roster['workspace'] == workspace && roster['slug'] == slug &&
+             roster['rootThreadId'] == root && !roster.key?('forkSource') &&
+             roster['presetId'] == preset['id'] && roster['catalogDigest'] == preset['catalogDigest'] &&
+             roster['teamDigest'] == preset['teamDigest'] && roster['leadModel'] == preset['leadModel'] &&
+             roster['leadEffort'] == preset['leadEffort'] && roster.fetch('leadInstructions', '') == preset.fetch('leadInstructions', '') &&
+             roster['members'].is_a?(Array) && roster['members'].length == preset['members'].length
+        raise Error, 'failed-creation roster does not match the retained root and accepted team'
+      end
+      expected = preset['members'].to_h { |member| [member.fetch('address'), member] }
+      addresses = []
+      roster['members'].each do |member|
+        raise Error, 'failed-creation roster has an invalid member' unless member.is_a?(Hash)
+        spec = expected[member['address']]
+        unless spec && %w[role model reasoningEffort behavior purpose access instructions].all? { |key| member.fetch(key, '') == spec.fetch(key, '') } &&
+               %w[creating ready archived removed].include?(member['state'])
+          raise Error, 'failed-creation member settings or retirement state changed'
+        end
+        addresses << member['address']
+        unless member['threadId'].is_a?(String)
+          raise Error, 'failed-creation member has an invalid thread identity'
+        end
+        next unless member['threadId'] == ''
+        unless %w[creating removed].include?(member['state']) && member['createAttempted'] == true &&
+               member.fetch('bootstrapAttempted', false) == false && member.fetch('retireIntent', '') == '' &&
+               member['projectId'].is_a?(String) && member['projectId'].match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/) &&
+               (member['state'] != 'removed' || member['removedAt'].is_a?(String))
+          raise Error, 'failed-creation member has no eligible retained unknown-start provenance'
+        end
+      end
+      raise Error, 'failed-creation roster repeats a member' unless addresses.uniq.length == addresses.length
+    end
+
+    def failed_creation_delete_removal(slug, epoch:)
+      journal = load_removal_journal(slug)
+      # The accepted epoch includes prior slug owners, never this deletion.
+      history = completed_removal_history(slug, excluding_operation: journal && journal.fetch('operation_id'))
+      if journal || path_exists?(work_dir(slug))
+        raise Error, 'failed-creation deletion history changed from the accepted request' unless history == epoch
+
+        return journal
+      end
+      root = removal_recovery_root_path
+      return nil unless path_exists?(root)
+      candidates = Dir.children(root).sort.filter_map do |name|
+        next unless name.include?("-#{slug}-")
+        directory = File.join(root, name)
+        metadata = failed_creation_delete_json(File.join(directory, 'recovery.json'), 'completed removal receipt')
+        next unless metadata['schema'] == 1 && metadata['slug'] == slug && metadata['workspace'] == workspace &&
+                    metadata['state'] == 'removed' && metadata['phase'] == 'removed' && metadata['tracking'] == 'work' &&
+                    metadata['recovery'] == directory && metadata['operation_id'].is_a?(String) && metadata['operation_id'].match?(/\A[0-9a-f]{64}\z/)
+        required = %w[schema slug workspace created_at operation_id state phase force tracking recovery removed_at]
+        allowed = required + %w[git_tracked worktrees worktrees_sealed]
+        unless (required - metadata.keys).empty? && (metadata.keys - allowed).empty? &&
+               [true, false].include?(metadata['force']) &&
+               (!metadata.key?('git_tracked') || [true, false].include?(metadata['git_tracked'])) &&
+               (!metadata.key?('worktrees') || valid_removal_worktree_inventory?(slug, metadata['worktrees'])) &&
+               (!metadata.key?('worktrees_sealed') || [true, false].include?(metadata['worktrees_sealed'])) &&
+               (!metadata['worktrees_sealed'] || metadata.key?('worktrees'))
+          raise Error, 'completed failed-creation removal has an invalid recovery receipt'
+        end
+        validate_removal_recovery!(slug, metadata)
+        Time.iso8601(metadata.fetch('created_at'))
+        Time.iso8601(metadata.fetch('removed_at'))
+        metadata
+      end
+      candidates.select! do |metadata|
+        completed_removal_history(slug, excluding_operation: metadata.fetch('operation_id')) == epoch
+      end
+      raise Error, 'completed failed-creation deletion is ambiguous' if candidates.length > 1
+      candidates.first
+    rescue ArgumentError, KeyError => e
+      raise Error, "invalid completed failed-creation removal: #{e.message}"
+    end
+
+    def publish_failed_creation_delete_authority!(slug, session, context)
+      return unless @authority_dir && session
+      return if load_session_authority(slug, required: false)
+
+      unless context.is_a?(FailedCreationDeleteContext) && context.slug == slug
+        raise Error, "refusing to retire an untrusted same-name tmux session: #{slug}"
+      end
+      current = failed_creation_delete_context(slug, request_id: context.request_id)
+      terminal = @tmux.session_by_id(session.id)
+      named = @tmux.session(slug)
+      unless current.identity == context.identity && current.creation_nonce == context.creation_nonce &&
+             current.start_bytes == context.start_bytes && !current.completed &&
+             terminal && named && terminal.id == session.id && named == terminal &&
+             terminal.name == slug && terminal.managed? && terminal.environment_slug == slug &&
+             workspace_identity?(terminal.workspace) && terminal.socket_path == @configured_tmux_socket &&
+             terminal.identity_token == current.creation_nonce && terminal.codex_thread_id == current.root &&
+             terminal.codex_socket_path == @codex_socket && valid_client_version?(@codex_version) &&
+             terminal.codex_client_version == @codex_version
+        raise Error, "refusing to retire an untrusted same-name tmux session: #{slug}"
+      end
+      return if load_session_authority(slug, required: false)
+
+      write_session_authority(slug, terminal, state: 'creating')
+    end
+
+    def transfer_failed_creation_start!(slug, removal, context)
+      raise Error, 'subordinate start requires a validated deletion context' unless context.is_a?(FailedCreationDeleteContext) && context.slug == slug
+      raise Error, 'subordinate start ownership requires durable thread_retiring' if removal_phase_before?(removal, 'thread_retiring')
+      current = failed_creation_delete_context(slug, request_id: context.request_id)
+      unless current.root == context.root && current.receipt == context.receipt &&
+             current.creation_nonce == context.creation_nonce && current.operation == removal.fetch('operation_id') &&
+             current.force == removal.fetch('force') &&
+             current.start_bytes == context.start_bytes
+        raise Error, 'failed-creation identity changed before terminal-start ownership transfer'
+      end
+      return unless current.start_path
+      return if current.start_path == File.join(removal.fetch('recovery'), 'start.json')
+
+      move_to_removal_recovery!(current.start_path, removal.fetch('recovery'), 'start.json')
+    end
+
     def removal_recovery_root_path
       workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
       File.join(@workspace_state_root, 'removed', workspace_id)
@@ -6158,13 +6446,16 @@ module DevSession
       File.join(lifecycle_journal_root, "#{slug}.#{name}.json")
     end
 
-    def reject_conflicting_lifecycle_journal!(slug, operation: nil)
+    def reject_conflicting_lifecycle_journal!(slug, operation: nil, deletion_context: nil)
       root = File.dirname(creation_journal_file(slug))
       if path_exists?(ArchiveCleanup.new(self, slug).path) && operation != 'archive'
         raise Error,
               "session archive is unfinished: #{slug}; retry dev-session archive with the original options"
       end
-      if path_exists?(start_journal_file(slug)) && !%w[start revive].include?(operation)
+      subordinate_start = operation == 'delete' && deletion_context.is_a?(FailedCreationDeleteContext) &&
+                          deletion_context.slug == slug && deletion_context.start_path == start_journal_file(slug) &&
+                          File.binread(deletion_context.start_path) == deletion_context.start_bytes
+      if path_exists?(start_journal_file(slug)) && !%w[start revive].include?(operation) && !subordinate_start
         raise Error,
               "session start is unfinished: #{slug}; retry dev-session start with the original options"
       end
@@ -7937,7 +8228,8 @@ module DevSession
       end
       return if request[:admitted]
 
-      reject_conflicting_lifecycle_journal!(slug, operation: request[:operation])
+      deletion_context = failed_creation_start_context(slug) if request[:operation] == 'delete'
+      reject_conflicting_lifecycle_journal!(slug, operation: request[:operation], deletion_context:)
       journal = lifecycle_access_journal(slug, request[:operation])
       unless journal == request[:journal] || (journal && journal == request[:operation_id])
         raise Error, 'another lifecycle operation started while waiting; retry its original request'
