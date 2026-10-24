@@ -50,9 +50,10 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
           failSecond = false;
           return json({error: "History read failed"}, 503);
         }
-        return json({threadId: "thread-1", status: "idle", latestTurnId: "turn-1",
-          entries: cursor === "older-one" ? items(101, 200) : cursor === "older-two" ? items(1, 100) :
-            smallPage ? items(201, 201) : newest,
+        const entries = cursor === "older-one" ? items(101, 200) : cursor === "older-two" ? items(1, 100) :
+          smallPage ? items(201, 201) : newest;
+        assert(entries.length <= 100, "fixture pages must respect the shipped reader's 100-entry limit");
+        return json({threadId: "thread-1", status: "idle", latestTurnId: "turn-1", entries,
           hasOlder: cursor !== "older-two", olderCursor: cursor === "older-one" ? "older-two" :
             cursor === "older-two" ? null : repairScenario ? "repair-one" : "older-one",
           collaborationMode: mode, metadataPending});
@@ -282,6 +283,56 @@ const items = (first, last) => Array.from({length: last - first + 1}, (_, index)
     await page.locator("#repair-history").click();
     await expect.poll(() => repairReads).toBe(beforeGapRepair + 1);
     await expect(page.locator("#transcript .message")).toHaveCount(299);
+    // Keep the reader paused while changes arrive in different projections.
+    concurrentGap = false; repairScenario = false; newest = items(201, 300);
+    await page.reload(); await expect(page.locator("#transcript .message")).toHaveCount(100);
+    const fresh = async () => {
+      await Promise.all([page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/thread/page")),
+        page.evaluate(() => fetch("/fixture/refresh"))]);
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    };
+    const pause = async () => page.locator("#transcript").evaluate(log => {
+      log.scrollTop = 400;
+      log.dispatchEvent(new WheelEvent("wheel", {deltaY: -1}));
+    });
+    const badge = page.locator("#new-output");
+    await pause();
+    const tool = {turnId: "turn-1", itemId: "unread-tool", kind: "commandExecution", text: "$ check", details: "closed old output"};
+    const team = {turnId: "turn-1", itemId: "unread-team", kind: "agentMessage", text: "Hidden team report",
+      communication: {kind: "team", from: "implementer0", to: "lead"}};
+    newest = [...newest.slice(2), tool, team]; await fresh(); await expect(badge).toBeHidden();
+    newest = newest.map(entry => entry.itemId === "item-300" ? {...entry, text: "Visible streaming output"} : entry);
+    await fresh(); await expect(page.locator("#transcript-entries")).toContainText("Visible streaming output");
+    await expect(badge).toBeVisible();
+    newest = newest.map(entry => entry.itemId === tool.itemId ? {...entry, details: "another hidden body"} : entry);
+    await fresh(); await expect(badge).toBeVisible();
+    await page.locator('[data-transcript-filter="activity"]').click(); await expect(badge).toBeHidden();
+    await page.locator('[data-transcript-filter="messages"]').click(); await expect(badge).toBeVisible();
+    await badge.click(); await expect(badge).toBeHidden(); await pause();
+    newest = newest.map(entry => entry.itemId === "item-300" ? {...entry, timestamp: "2026-10-24T12:34:00Z",
+      clientUserMessageDigest: "a".repeat(64), internalMetadata: "not displayed"} : entry);
+    await fresh(); await expect(badge).toBeHidden();
+    await page.locator('[data-transcript-filter="all"]').click(); await pause();
+    newest = newest.map(entry => entry.itemId === tool.itemId ? {...entry, details: "closed details changed"} : entry);
+    await fresh(); await expect(badge).toBeHidden();
+    newest = newest.map(entry => entry.itemId === tool.itemId ? {...entry, text: "$ visible summary changed"} : entry);
+    await fresh(); await expect(badge).toBeVisible();
+    await badge.click();
+    const disclosure = page.locator('.message').filter({hasText: "$ visible summary changed"}).locator("details");
+    await disclosure.locator("summary").click(); await pause();
+    newest = newest.map(entry => entry.itemId === tool.itemId ? {...entry, details: "open details changed"} : entry);
+    await fresh(); await expect(badge).toBeVisible();
+    await badge.click(); await pause();
+    await page.getByRole("tab", {name: "Settings", exact: true}).click();
+    await expect(page.locator("#codex")).not.toHaveClass(/active/);
+    newest = newest.map(entry => entry.itemId === "item-300" ? {...entry, text: "Output while section hidden"} : entry);
+    await fresh();
+    await expect(page.locator("#transcript-entries")).toContainText("Output while section hidden");
+    await expect(badge).not.toHaveAttribute("hidden");
+    await page.locator("#session-tab-codex").click();
+    await expect(page.locator("#transcript-entries")).toContainText("Output while section hidden");
+    await expect(badge).toBeVisible();
+    await badge.click(); await expect(badge).toBeHidden();
     assert(pageReads >= 5);
     assert.deepEqual(errors, []);
     console.log("automatic paging, retry, anchor, exhaustion, keyboard and independent lanes passed");

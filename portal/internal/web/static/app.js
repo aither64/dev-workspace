@@ -238,6 +238,32 @@
   const messageReceiptLabel = (entry) => entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? "Sent to Codex" : entry.state === "sending" ? "Sending…" :
       entry.state === "unsent" ? "Not sent." : entry.replacementId ? "Original outcome unknown. Another copy requested." : "Outcome unknown.";
+  // Project the rendered body, using the same renderer and disclosure state.
+  // Footer timestamps/copy payloads and closed detail bodies are not output.
+  const transcriptVisibleContent = element => {
+    const project = node => {
+      if (node.nodeType === 3) return node.textContent;
+      if (node.nodeType !== 1 || node.hidden || node.classList.contains("message-footer")) return null;
+      const children = node.tagName === "DETAILS" && !node.open ?
+        [...node.children].filter(child => child.tagName === "SUMMARY") : [...node.childNodes];
+      return [node.tagName, ["href", "src", "alt"].map(name => node.getAttribute(name)),
+        children.map(project).filter(value => value !== null)];
+    };
+    return JSON.stringify(project(element));
+  };
+  const updateTranscriptUnread = ({views, previous, entries, changed, kind, keyFor, visible, content, liveTurnID}) => {
+    if (kind === "older") return;
+    const before = new Map(previous.map((entry, index) => [keyFor(entry, index, previous), {entry, index}]));
+    for (const [filter, state] of views) {
+      if (entries.some((entry, index) => {
+        const key = keyFor(entry, index, entries), prior = before.get(key);
+        if (!changed.has(key) || !visible(entry, filter)) return false;
+        // Repair can finish a known live item; imported old rows are history.
+        if (kind === "repair" && (!prior || prior.entry.turnStatus !== "inProgress" && prior.entry.turnId !== liveTurnID)) return false;
+        return !prior || content(prior.entry, prior.index, previous, state.disclosures) !== content(entry, index, entries, state.disclosures);
+      })) state.unread = true;
+    }
+  };
   const indexClusterPresentation = item => {
     const known = item.runningClustersKnown !== false && Number.isInteger(item.runningClusters);
     let text = known ? `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}` : "";
@@ -297,6 +323,8 @@
     for (const element of container.querySelectorAll("[data-transcript-entry-key]")) {
       const disclosure = element.querySelector("details");
       if (disclosure) states.set(element.dataset.transcriptEntryKey, disclosure.open);
+      element.querySelectorAll?.("details").forEach((details, index) =>
+        states.set(`${element.dataset.transcriptEntryKey}:details:${index}`, details.open));
     }
     return states;
   };
@@ -1191,7 +1219,7 @@
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
-      loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
+      loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, transcriptVisibleContent, updateTranscriptUnread,
       markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
       createTranscriptAcknowledgementScheduler,
       createIndexSnapshotNotice, createTranscriptTimestampPresentation,
@@ -3959,7 +3987,7 @@
     onPanelEmpty: () => document.getElementById("message-form")?.elements.message.focus({preventScroll: true}),
   });
   const transcriptViews = new Map(["all", "messages", "team", "activity"].map((filter) => [filter, {
-    disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
+    disclosures: new Map(), follow: true, unread: false, initialized: false, scrollTop: 0,
   }]));
   let planRenderGeneration = 0;
   const recordSettingsWrite = () => {
@@ -4279,6 +4307,7 @@
     resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     view.follow = true;
+    view.unread = false;
     transcriptUserScroll = false;
     if (transcriptScrollTimer !== null) clearTimeout(transcriptScrollTimer);
     transcript.scrollTop = transcript.scrollHeight;
@@ -4355,7 +4384,10 @@
     view.follow = transcriptFollowOnScroll(view.follow, transcript, transcriptUserScroll || transcriptPointerDown);
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
-    if (shouldFollowTranscript(transcript)) document.getElementById("new-output").hidden = true;
+    if (view.follow && shouldFollowTranscript(transcript)) {
+      view.unread = false;
+      document.getElementById("new-output").hidden = true;
+    }
     if (upwardScrollbarDrag && position <= 200 && canReadOlderHistory()) {
       clearHistoryInput();
       startOlderHistoryRead();
@@ -4373,6 +4405,8 @@
     resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     transcript.scrollTop = view.follow ? transcript.scrollHeight : view.scrollTop;
+    if (view.follow) view.unread = false;
+    document.getElementById("new-output").hidden = !view.unread;
     scrollbarLastTop = historyScrollTop();
   });
   document.addEventListener("visibilitychange", () => { if (document.hidden) resetHistoryNavigation(); });
@@ -4521,7 +4555,7 @@
     } else time.removeAttribute("datetime");
     if (time.title !== timestamp.title) time.title = timestamp.title;
   };
-  const appendMessage = (entry, index, entries, disclosureStates) => {
+  const appendMessage = (entry, index, entries, disclosureStates, projection = false) => {
     const presentation = transcriptEntryPresentation(entry);
     const kind = presentation.kind;
     const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
@@ -4561,11 +4595,24 @@
       const label = document.createElement("div"); label.className = "message-team-label";
       label.textContent = presentation.label; element.prepend(label);
     }
-    const questionControls = optionalQuestions?.inline(entry);
-    if (questionControls) element.append(questionControls);
+    element.querySelectorAll("details").forEach((disclosure, detailIndex) => {
+      const saved = disclosureStates.get(`${entryKey}:details:${detailIndex}`);
+      if (saved !== undefined) disclosure.open = saved;
+    });
+    if (projection) {
+      for (const question of entry.questions || []) {
+        const label = document.createElement("span");
+        label.textContent = JSON.stringify([question.title, question.options]);
+        element.append(label);
+      }
+    } else {
+      const questionControls = optionalQuestions?.inline(entry);
+      if (questionControls) element.append(questionControls);
+    }
     if (entry.attachments?.length) element.append(conversationAssets.renderAttachments(entry.attachments, {onRemove: async (file) => {
       await request(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
     }}));
+    if (projection) return element;
     const timestamp = transcriptTimestamps.present(entry, index, entries);
     const time = document.createElement("time");
     time.className = "message-time";
@@ -4641,6 +4688,7 @@
         const disclosures = new Map();
         const disclosure = node?.querySelector("details");
         if (disclosure) disclosures.set(key, disclosure.open);
+        node?.querySelectorAll("details").forEach((details, index) => disclosures.set(`${key}:details:${index}`, details.open));
         node = appendMessage(entry, index, entries, disclosures);
       } else {
         updateTranscriptTimestamp(node.querySelector(".message-footer .message-time"), timestamp);
@@ -4706,12 +4754,14 @@
       });
       const view = transcriptViews.get(transcriptFilter);
       renderTranscriptEntries(transcriptEntries, view.disclosures);
-      transcript.scrollTop = !view.initialized || view.follow ? transcript.scrollHeight : view.scrollTop;
+      const follow = !view.initialized || view.follow;
+      transcript.scrollTop = follow ? transcript.scrollHeight : view.scrollTop;
       view.scrollTop = transcript.scrollTop;
       scrollbarLastTop = historyScrollTop();
       view.initialized = true;
       const newOutput = document.getElementById("new-output");
-      if (newOutput) newOutput.hidden = true;
+      if (follow && !document.hidden && transcript.clientHeight) view.unread = false;
+      if (newOutput) newOutput.hidden = !view.unread;
     });
   });
 
@@ -4748,7 +4798,8 @@
   const renderThread = (payload, isCurrent = () => true, kind = "newest") => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
     if (!isCurrent()) return;
-    if (currentThreadId && currentThreadId !== payload.threadId) {
+    const threadChanged = Boolean(currentThreadId && currentThreadId !== payload.threadId);
+    if (threadChanged) {
       resetMode();
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
       pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
@@ -4758,7 +4809,10 @@
     loadMessageReceipts();
     transcriptTimestamps.observe(payload);
     const view = transcriptViews.get(transcriptFilter);
-    const follow = !transcriptInitialized || (kind === "newest" && view.follow);
+    const readable = !pageReads.paused && !document.hidden && Boolean(transcript.clientHeight);
+    const follow = readable && (!transcriptInitialized || threadChanged || kind === "newest" && view.follow);
+    saveTranscriptView();
+    const previousEntries = transcriptEntries;
     const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(payload) :
       kind === "repair" ? transcriptHistory.applyRepair(payload) : transcriptHistory.applyNewest(payload)) :
       {changed: legacyTranscriptChanges(transcriptEntries, payload.entries || []), reset: false};
@@ -4767,14 +4821,23 @@
     if (update.reset) {
       transcriptInitialized = false;
     }
+    if (threadChanged || update.reset) {
+      for (const state of transcriptViews.values()) Object.assign(state, {unread: false, follow: true, initialized: false, disclosures: new Map(), scrollTop: 0});
+    } else if (transcriptInitialized && kind !== "older") {
+      updateTranscriptUnread({views: transcriptViews, previous: previousEntries, entries: transcriptEntries, changed: update.changed, kind,
+        keyFor: pagingHelpersAvailable ? conversationAssets.transcriptEntryKey : legacyTranscriptEntryKey,
+        visible: transcriptEntryVisible, liveTurnID: latestThreadPayload?.status === "active" ? latestThreadPayload.latestTurnId : null,
+        content: (entry, index, entries, disclosures) => transcriptVisibleContent(appendMessage(entry, index, entries, disclosures, true)),
+      });
+    }
     if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
     else refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
       renderTranscriptEntries(transcriptEntries, disclosures), transcriptEntriesRoot);
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
     const newOutput = document.getElementById("new-output");
-    if (newOutput && follow) newOutput.hidden = true;
-    else if (newOutput && kind === "newest" && transcriptInitialized && update.changed.size) newOutput.hidden = false;
+    if (follow) view.unread = false;
+    if (newOutput) newOutput.hidden = !view.unread;
     if (kind === "newest") {
       latestThreadPayload = payload;
       pagingUnavailable = !pagingHelpersAvailable || Boolean(payload.legacy);
