@@ -507,7 +507,7 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 // the same private roster and direct App Server thread operations.
 func teamCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archive-ready|require-archived|archive|retire|revive|fork")
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archive-ready|require-archive-identities|require-archived|archive|retire|revive|fork")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
@@ -691,13 +691,17 @@ func teamCommand(args []string) error {
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
 	case "prepare-delete":
 		err = service.PrepareDelete(ctx, *slug, *rootThread, *deletionOperationID, *checkOnly)
-	case "require-archive-ready":
+	case "require-archive-ready", "require-archive-identities":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
 			!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*authorityDir) ||
 			*cwd != filepath.Join(*workspace, "work", *slug) {
 			return errors.New("session archive preflight requires deployed Codex and session authority")
 		}
-		err = service.RequireArchiveReadyAll(ctx, *slug, *rootThread)
+		if command == "require-archive-identities" {
+			err = service.RequireArchiveIdentitiesAll(ctx, *slug, *rootThread)
+		} else {
+			err = service.RequireArchiveReadyAll(ctx, *slug, *rootThread)
+		}
 	case "require-archived":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
 			!canonicalAbsolutePath(*socket) ||
@@ -742,7 +746,7 @@ func teamCommand(args []string) error {
 	}
 	if result == nil {
 		roster, loadErr := store.Load(*slug, *rootThread)
-		if (command == "require-archive-ready" || command == "require-archived" || command == "archive" && *retainedOnly) && errors.Is(loadErr, os.ErrNotExist) {
+		if (command == "require-archive-ready" || command == "require-archive-identities" || command == "require-archived" || command == "archive" && *retainedOnly) && errors.Is(loadErr, os.ErrNotExist) {
 			result = map[string]any{"roster": nil}
 		} else if loadErr != nil {
 			return loadErr

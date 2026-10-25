@@ -236,6 +236,16 @@ func (client *testClient) ProveMaterializedActiveThread(_ context.Context, threa
 	}
 	return workspacecodex.ArchiveUnknown, errors.New("legacy retained member is not materialized")
 }
+func (client *testClient) ProveArchivedRootThread(ctx context.Context, id, cwd string) (workspacecodex.ArchiveState, error) {
+	metadata, err := client.ReadThreadMetadata(ctx, id, true)
+	if err != nil {
+		return workspacecodex.ArchiveUnknown, err
+	}
+	if metadata.Source != "vscode" {
+		return workspacecodex.ArchiveUnknown, errors.New("wrong root source")
+	}
+	return client.ProveArchivedThread(ctx, id, cwd, "")
+}
 func (client *testClient) RequireRootArchiveReady(ctx context.Context, threadID, cwd string) (workspacecodex.ArchiveState, error) {
 	state, err := client.ProveArchivedThread(ctx, threadID, cwd, "")
 	if err != nil {

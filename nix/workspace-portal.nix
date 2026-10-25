@@ -369,6 +369,8 @@ buildGoModule {
       "$out/libexec/workspace-auto-archive.rb"
     ln -s ../workspace-auto-archive.rb \
       "$out/libexec/workspace-portal/workspace-auto-archive.rb"
+    install -Dm644 ${src}/libexec/workspace-archive-check.rb "$out/libexec/workspace-archive-check.rb"
+    ln -s ../workspace-archive-check.rb "$out/libexec/workspace-portal/workspace-archive-check.rb"
     install -Dm644 ${src}/libexec/workspace-archive-cleanup.rb \
       "$out/libexec/workspace-archive-cleanup.rb"
     ln -s ../workspace-archive-cleanup.rb \

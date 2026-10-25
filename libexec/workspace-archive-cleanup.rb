@@ -164,7 +164,7 @@ module DevSession
       sidecar
     end
 
-    def discover(clean: true)
+    def discover(clean: true, on_unmanaged: nil)
       reject_symlink_components!(@group)
       directory_identity(@group) if exists?(@group)
       candidates = registrations(allow_locked: !clean).select { |record| below_group?(record.fetch('path')) }
@@ -176,7 +176,7 @@ module DevSession
         inspect_checkout(record, clean:)
       end
       containers = []
-      walk_containers(@group, worktrees.map { |record| absolute(record.fetch('path')) }, containers) if exists?(@group)
+      walk_containers(@group, worktrees.map { |record| absolute(record.fetch('path')) }, containers, on_unmanaged:) if exists?(@group)
       { 'worktrees' => worktrees, 'containers' => containers.sort_by { |record| record.fetch('path') } }
     end
 
@@ -609,7 +609,7 @@ module DevSession
       )
     end
 
-    def walk_containers(directory, checkouts, containers)
+    def walk_containers(directory, checkouts, containers, on_unmanaged: nil)
       return if checkouts.include?(directory)
 
       reject_symlink_components!(directory)
@@ -621,9 +621,13 @@ module DevSession
       Dir.children(directory).sort.each do |name|
         child = File.join(directory, name)
         if File.symlink?(child) || !File.directory?(child)
+          if on_unmanaged
+            on_unmanaged.call(child)
+            next
+          end
           raise Error, "archive worktree group contains unmanaged entries: #{child}"
         end
-        walk_containers(child, checkouts, containers)
+        walk_containers(child, checkouts, containers, on_unmanaged:)
       end
     end
 

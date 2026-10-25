@@ -472,6 +472,7 @@ dev-session resume api-token-rotation
 dev-session fork api-token-rotation alternate-approach
 dev-session sync api-token-rotation
 dev-session stop api-token-rotation
+dev-session archive-check api-token-rotation --json
 dev-session archive api-token-rotation
 dev-session archive api-token-rotation --abandoned
 dev-session revive api-token-rotation

@@ -33,6 +33,61 @@ func archivePreflightFixture(t *testing.T, rootArchived bool) (Service, *testCli
 	return service, client, members
 }
 
+func TestArchiveIdentitiesAllowActiveTurnsWithoutChangingRetainedState(t *testing.T) {
+	service, client, _ := archivePreflightFixture(t, false)
+	before, err := service.Store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := len(client.idleChecks)
+	client.idleError = errors.New("owned turn is still active")
+	if err := service.RequireArchiveIdentitiesAll(context.Background(), "one", "root-one"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := service.Store.Load("one", "root-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) || len(client.idleChecks) != checks || len(client.archives) != 0 || len(client.resumes) != 0 {
+		t.Fatal("identity observation changed or stopped retained work")
+	}
+}
+
+func TestArchiveIdentitiesRejectMissingWrongAndUnavailableNativeThreads(t *testing.T) {
+	for _, mode := range []string{"missing-root", "wrong-root-cwd", "wrong-root-source", "unavailable", "wrong-member-cwd", "wrong-member-project"} {
+		t.Run(mode, func(t *testing.T) {
+			service, client, members := archivePreflightFixture(t, false)
+			switch mode {
+			case "missing-root":
+				client.threads = client.threads[1:]
+			case "wrong-root-cwd":
+				client.threads[0].Cwd += "-foreign"
+			case "wrong-root-source":
+				client.threads[0].Source = "cli"
+			case "unavailable":
+				client.readError = errors.New("native endpoint unavailable")
+			default:
+				for index := range client.threads {
+					if client.threads[index].ID == members[1].Thread {
+						if mode == "wrong-member-cwd" {
+							client.threads[index].Cwd += "-foreign"
+						} else {
+							wrong := "foreign-project"
+							client.threads[index].ProjectID = &wrong
+						}
+					}
+				}
+			}
+			if err := service.RequireArchiveIdentitiesAll(context.Background(), "one", "root-one"); err == nil {
+				t.Fatal("invalid native identity passed")
+			}
+			if len(client.archives) != 0 || len(client.resumes) != 0 || len(client.deleted) != 0 {
+				t.Fatal("failed identity proof changed conversations")
+			}
+		})
+	}
+}
+
 func TestRequireArchiveReadyAllProvesActiveAndArchivedRootsWithPartialTeam(t *testing.T) {
 	for _, rootArchived := range []bool{false, true} {
 		t.Run(map[bool]string{false: "active root", true: "archived root"}[rootArchived], func(t *testing.T) {

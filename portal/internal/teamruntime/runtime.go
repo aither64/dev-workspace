@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -816,6 +817,7 @@ type Client interface {
 	LoadedThreadIDs(context.Context) ([]string, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error)
+	ProveArchivedRootThread(context.Context, string, string) (workspacecodex.ArchiveState, error)
 	RequireRootArchiveReady(context.Context, string, string) (workspacecodex.ArchiveState, error)
 	RequireArchiveThreadIdle(context.Context, string, string, workspacecodex.ArchiveState) error
 	ProveMaterializedActiveThread(context.Context, string, string) (workspacecodex.ArchiveState, error)
@@ -1650,6 +1652,49 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 		}
 		return nil
 	})
+}
+
+// RequireArchiveIdentitiesAll checks the retained native set without idle
+// requirements. It reads atomic roster snapshots and never initializes members
+// or takes the operation lock, which would create private state on observation.
+func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, rootThreadID string) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	roster, err := service.Store.Load(slug, rootThreadID)
+	missing := errors.Is(err, os.ErrNotExist)
+	if err != nil && !missing {
+		return err
+	}
+	cwd := filepath.Join(service.Store.workspace, "work", slug)
+	state, err := service.Client.ProveArchivedRootThread(ctx, rootThreadID, cwd)
+	if err != nil {
+		return fmt.Errorf("verify retained root identity: %w", err)
+	}
+	if state != workspacecodex.ArchiveActive && state != workspacecodex.ArchiveFresh && state != workspacecodex.ArchiveArchived {
+		return errors.New("retained root has no proved identity")
+	}
+	if roster != nil {
+		for _, member := range roster.Members {
+			if member.State == "removed" {
+				continue
+			}
+			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+				return fmt.Errorf("verify retained %s identity: %w", member.Address, err)
+			}
+		}
+	}
+	again, err := service.Store.Load(slug, rootThreadID)
+	if missing && errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if missing || !reflect.DeepEqual(roster, again) {
+		return errors.New("retained team changed during identity checks")
+	}
+	return nil
 }
 
 // RequireArchiveReadyAll owns the retained-set preflight for ordinary archive

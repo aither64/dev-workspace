@@ -19,6 +19,7 @@ require_relative 'workspace-coordination'
 require_relative 'workspace-provider-admission'
 require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
+require_relative 'workspace-archive-check'
 require_relative 'workspace-archive-recovery'
 require_relative 'workspace-tracking-sync'
 require_relative 'workspace-tracking-summaries'
@@ -213,6 +214,7 @@ module DevSession
       dev-session stop <name-or-slug> [--as-is]
       dev-session recover-stale <name-or-slug> [--as-is]
       dev-session archive <name-or-slug> [--as-is] [--abandoned]
+      dev-session archive-check <name-or-slug> [--as-is] [--json]
       dev-session auto-archive scan [--dry-run] [--json]
       dev-session tracking-sync [--status] [--slug SLUG] [--force] [--json]
       dev-session auto-archive enable|disable [--json]
@@ -766,6 +768,7 @@ module DevSession
     include SensitiveSessions
     include WorkspaceAutoArchive::Runner
     include ArchiveCleanup::RunnerContext
+    include ArchiveCheck
     CleanupPlan = Struct.new(:session, :entries, :unexpected, keyword_init: true)
 
     attr_reader :workspace, :today
@@ -1886,12 +1889,12 @@ module DevSession
                  '--session-slug', slug,
                  '--root-thread-id', root_thread,
                  '--cwd', work_dir(slug)]
-	  if !%w[require-archive-ready require-archived archive-retained].include?(action)
+	  if !%w[require-archive-ready require-archive-identities require-archived archive-retained].include?(action)
 		portal = File.realpath(@portal_command.first)
 		command.concat(['--package-root', File.dirname(File.dirname(portal))])
 	  end
 	  command += ['--socket', @codex_socket] if @codex_socket
-      if %w[require-archive-ready require-archived archive-retained].include?(action)
+      if %w[require-archive-ready require-archive-identities require-archived archive-retained].include?(action)
         command += ['--codex-home', @env['DEV_WORKSPACE_CODEX_HOME']] if @env['DEV_WORKSPACE_CODEX_HOME']
         command += ['--authority-dir', @authority_dir] if @authority_dir
       end
@@ -2004,15 +2007,16 @@ module DevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
-          unless automatic
-            retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
-            recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
-          end
           journal = load_archive_journal(slug, operation_id:)
           cleanup = ArchiveCleanup.new(self, slug)
           sidecar = cleanup.load(journal:, operation_id:)
           # A retry retains the policy sealed by the previous package.
           mode = (journal || sidecar).fetch('mode') if explicit && (journal || sidecar)
+          require_archive_check!(slug) if mode == 'archived' && !journal && !sidecar
+          unless automatic
+            retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
+            recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
+          end
           if automatic && mode == 'archived'
             raise Error, 'automatic archival cannot resume explicit archival'
           end
@@ -3121,9 +3125,9 @@ module DevSession
       ])
     end
 
-    def select_tmux_for_slug!(slug)
+    def select_tmux_for_slug!(slug, read_only: false)
       @tmux = @default_tmux
-      @selected_authority = load_session_authority(slug, required: false)
+      @selected_authority = load_session_authority(slug, required: false, read_only:)
       return if @selected_authority.nil?
 
       socket = @selected_authority.fetch('tmux_socket')
@@ -3136,13 +3140,14 @@ module DevSession
       @tmux = Tmux.new(runner: @command_runner, socket: socket)
     end
 
-    def ensure_authority_directory!
+    def ensure_authority_directory!(create: true)
       return nil unless @authority_dir
 
       reject_symlink_components!(@authority_dir, 'session authority directory')
       if path_exists?(@authority_dir)
         raise Error, "session authority path is not a directory: #{@authority_dir}" unless File.directory?(@authority_dir)
       else
+        return nil unless create
         FileUtils.mkdir_p(@authority_dir, mode: 0o700)
       end
       stat = File.stat(@authority_dir)
@@ -3157,13 +3162,16 @@ module DevSession
       File.join(@authority_dir, "#{slug}.json")
     end
 
-    def load_session_authority(slug, required:)
+    def load_session_authority(slug, required:, read_only: false)
       unless @authority_dir
         raise Error, 'session authority directory is not configured' if required
 
         return nil
       end
-      ensure_authority_directory!
+      unless ensure_authority_directory!(create: !read_only)
+        raise Error, 'session authority directory is missing' if required
+        return nil
+      end
       path = authority_file(slug)
       unless path_exists?(path)
         raise Error, "session authority not found: #{path}" if required
@@ -9683,12 +9691,12 @@ module DevSession
         return 0
       end
 
-      @provider_read_only = %w[current list url validate quiesce].include?(command) ||
+      @provider_read_only = %w[current list url validate quiesce archive-check].include?(command) ||
                             (command == 'tracking-sync' && @argv.include?('--status')) ||
                             (command == 'team' && @argv.first == 'list')
 
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
-        read_only = %w[current list url validate].include?(command) ||
+        read_only = %w[current list url validate archive-check].include?(command) ||
                     (command == 'tracking-sync' && @argv.include?('--status')) ||
                     (command == 'team' && @argv.first == 'list')
         with_transition_lock(File::LOCK_SH, read_only:) do
@@ -9737,6 +9745,15 @@ module DevSession
         run_stop
       when 'recover-stale'
         run_single_slug { |runner, slug, opts| runner.recover_stale(slug, as_is: opts[:as_is]) }
+      when 'archive-check'
+        opts = { as_is: false, json: false }
+        OptionParser.new do |flags|
+          flags.on('--as-is') { opts[:as_is] = true }
+          flags.on('--json') { opts[:json] = true }
+        end.parse!(@argv)
+        require_arity!(1, @argv, 'archive-check')
+        result = runner.archive_check(@argv.first, as_is: opts.fetch(:as_is))
+        @out.puts(opts.fetch(:json) ? JSON.generate(result) : result.fetch('ready') ? 'Ready to archive.' : result.fetch('blockers').map { |item| item.fetch('message') }.join("\n"))
       when 'archive'
         run_archive
       when 'auto-archive'
