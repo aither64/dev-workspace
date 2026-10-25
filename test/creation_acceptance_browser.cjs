@@ -182,6 +182,28 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
           await pause(100);
         }
       } else if (action === "failed") await terminal("failed");
+      else if (action === "name") {
+        await terminal("failed");
+        assert.equal(record.canSetName, true);
+        assert(!record.slug && !record.canonicalUrl);
+        const previous = {...record};
+        await page.goto(origin + record.url);
+        await page.locator("#creation-name-form").waitFor({state: "visible"});
+        assert.equal(await page.locator("#creation-retry").textContent(), "Retry naming");
+        await page.locator("#creation-name").fill(options.customName);
+        const [selected] = await Promise.all([
+          page.waitForResponse(r => r.request().method() === "POST" &&
+            new URL(r.url()).pathname === statusPath() + "/name"),
+          page.locator("#creation-name-submit").click(),
+        ]);
+        assert.equal(selected.status(), 202);
+        await usable();
+        assert.equal(record.receiptId, previous.receiptId);
+        assert.equal(record.requestId, previous.requestId);
+        assert.equal(record.initialRequest, previous.initialRequest);
+        assert.equal(record.preparationAttempt, previous.preparationAttempt + 1);
+        assert(record.slug.endsWith("-" + options.customName));
+      }
       else if (action === "finish") await usable();
       else if (action === "retry") {
         await terminal(["failed", "paused"]);

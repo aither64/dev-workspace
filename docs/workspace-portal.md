@@ -1401,9 +1401,11 @@ unchanged, and package updates follow the existing forward-only transition polic
 Automatic naming uses a private Codex child owned by the portal service, with a
 fixed naming-only catalog and `gpt-6-luna`/`low`. Ordinary conversations keep their
 existing socket and dynamic model catalog. Generated names use two to six words,
-preferably two or three. If naming fails,
-creation pauses with **Retry naming** and a custom-name field. The accepted
-request, files and settings remain saved. The supported naming profile,
+preferably two or three. Native retries and at most one safe fresh attempt share
+a 30-second budget, including queue time and cleanup. If naming ultimately
+fails, creation pauses before reservation with **Retry naming** and a custom-name
+field. Attachment-only requests also need a custom name. The accepted request,
+files and settings remain saved. The supported naming profile,
 shutdown ownership and native diagnostic retention are described in the
 [preparation contract](session-preparations.md#naming-and-reservation).
 

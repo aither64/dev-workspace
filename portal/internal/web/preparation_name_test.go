@@ -19,7 +19,7 @@ import (
 )
 
 func TestSessionPreparationNamingFailureKeepsRequestAndUploads(t *testing.T) {
-	for _, mode := range []string{"unavailable", "utility_error", "invalid_output", "timeout"} {
+	for _, mode := range []string{"unavailable", "utility_error", "invalid_output", "timeout", "attachment_only"} {
 		t.Run(mode, func(t *testing.T) {
 			server := newTestServer(t)
 			defer server.Close()
@@ -38,12 +38,20 @@ func TestSessionPreparationNamingFailureKeepsRequestAndUploads(t *testing.T) {
 			scope, file := preparationReadyFile(t, server)
 			id := preparationTestID(201)
 			prompt := " I'd like workspace notifications.\nKeep this request exact. "
+			outcome := mode
+			if mode == "attachment_only" {
+				prompt, outcome = " \n ", "invalid_output"
+				server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+					t.Fatal("attachment-only request invoked model")
+					return "", nil
+				}
+			}
 			extra := url.Values{"uploadScope": {scope.ID}, "attachmentIds": {file.ID}}
 			if response := postPreparation(t, server, id, prompt, "", extra); response.Code != 202 {
 				t.Fatal(response.Body.String())
 			}
 			record := awaitPreparation(t, server, id)
-			if record.State != "failed" || record.Phase != "stopped" || record.NamingOutcome != mode || record.Base != "" || record.Slug != "" || record.Handoff != nil {
+			if record.State != "failed" || record.Phase != "stopped" || record.NamingOutcome != outcome || record.Base != "" || record.Slug != "" || record.Handoff != nil {
 				t.Fatalf("unexpected failure: %#v", record)
 			}
 			if record.Error != errSessionNaming.Error() || record.Snapshot.Input.RawPrompt != prompt || !reflect.DeepEqual(record.Snapshot.Input.Attachments, []string{file.ID}) {
@@ -83,24 +91,26 @@ func TestSessionPreparationNamingFailureKeepsRequestAndUploads(t *testing.T) {
 	}
 }
 
-func TestSessionPreparationProductionNamingFailureStillCreatesWithOriginalRequest(t *testing.T) {
+func TestSessionPreparationProductionNamingFailureAllowsManualRecovery(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
 	server.config.NamingSocket = filepath.Join(t.TempDir(), "missing.sock")
+	server.config.NamingModelCatalogFile = "/trusted/models.json"
 	server.config.SessionNamer = server.normalSessionName
+	providerTestCatalog(t, server, "http://127.0.0.1:1")
 	scope, file := preparationReadyFile(t, server)
-	prompt := "Preserve the complete request and accepted file."
-	extra := url.Values{"uploadScope": {scope.ID}, "attachmentIds": {file.ID}}
+	prompt := "Please disable PHP session.upload_progress.enabled throughout the configuration. Preserve this accepted file."
+	extra := url.Values{"uploadScope": {scope.ID}, "attachmentIds": {file.ID}, "provider": {"pool"}, "model": {"model-solo"}, "effort": {"high"}}
 	id := preparationTestID(210)
 	if response := postPreparation(t, server, id, prompt, "", extra); response.Code != http.StatusAccepted {
 		t.Fatal(response.Body.String())
 	}
 	record := awaitPreparation(t, server, id)
-	if record.Base != "development-session" || record.Slug != "2026-10-03-development-session" || record.Handoff == nil || record.NamingOutcome != "utility_error" {
-		t.Fatalf("naming failure prevented handoff: %#v", record)
+	if record.State != "failed" || record.Base != "" || record.Slug != "" || record.Handoff != nil || record.NamingOutcome != "utility_error" {
+		t.Fatalf("production failure reserved a destination: %#v", record)
 	}
 	if record.Snapshot.Input.RawPrompt != prompt || !reflect.DeepEqual(record.Snapshot.Input.Attachments, []string{file.ID}) {
-		t.Fatal("fallback changed the request or accepted files")
+		t.Fatal("naming failure changed the request or accepted files")
 	}
 	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
 		t.Error("exact retry repeated naming")
@@ -110,7 +120,36 @@ func TestSessionPreparationProductionNamingFailureStillCreatesWithOriginalReques
 		t.Fatal(replay.Body.String())
 	}
 	if current := awaitPreparation(t, server, id); current.Slug != record.Slug || current.ReceiptID != record.ReceiptID {
-		t.Fatal("retry replaced the accepted session")
+		t.Fatal("replay replaced the accepted request")
+	}
+	status, _ := server.preparationStatus(id)
+	if !status.CanSetName || status.State != "failed" {
+		t.Fatalf("manual controls unavailable: %#v", status)
+	}
+	response := postCreation(t, server, "/api/session-creations/"+id+"/name", fmt.Sprintf(`{"receiptId":%q,"attempt":1,"name":"php-upload-progress-mitigation"}`, record.ReceiptID), "application/json")
+	if response.Code != http.StatusAccepted {
+		t.Fatal(response.Body.String())
+	}
+	recovered := awaitPreparation(t, server, id)
+	if recovered.Slug != "2026-10-03-php-upload-progress-mitigation" || recovered.Handoff == nil || recovered.ReceiptID != record.ReceiptID || recovered.InputDigest != record.InputDigest || recovered.SnapshotDigest != record.SnapshotDigest || !reflect.DeepEqual(recovered.Snapshot, record.Snapshot) {
+		t.Fatalf("manual recovery changed accepted request: %#v", recovered)
+	}
+}
+
+func TestSessionPreparationAttachmentOnlyCustomNameSkipsNaming(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	server.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		t.Fatal("custom attachment request invoked naming")
+		return "", nil
+	}
+	scope, file := preparationReadyFile(t, server)
+	id := preparationTestID(211)
+	if response := postPreparation(t, server, id, "", "attachment-review", url.Values{"uploadScope": {scope.ID}, "attachmentIds": {file.ID}}); response.Code != http.StatusAccepted {
+		t.Fatal(response.Body.String())
+	}
+	if record := awaitPreparation(t, server, id); record.Slug != "2026-10-03-attachment-review" || record.NamingOutcome != "custom" || record.Handoff == nil {
+		t.Fatalf("custom attachment request failed: %#v", record)
 	}
 }
 
@@ -184,7 +223,7 @@ func TestSessionPreparationNamingRetryUsesOriginalRequest(t *testing.T) {
 func TestSessionPreparationNameRequiresStoppedUnreservedAutomaticRequest(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
-	for number, mode := range []string{"running", "custom_input", "saved_model"} {
+	for number, mode := range []string{"running", "custom_input", "saved_model", "saved_attachment"} {
 		t.Run(mode, func(t *testing.T) {
 			record := fixturePreparation(t, server, number+300, "failed")
 			switch mode {
@@ -195,6 +234,9 @@ func TestSessionPreparationNameRequiresStoppedUnreservedAutomaticRequest(t *test
 				record.Snapshot.Input.CustomName = "original"
 			case "saved_model":
 				record.Base, record.NamingOutcome = "saved-model", "model"
+			case "saved_attachment":
+				// Older successful placeholders remain historical identities.
+				record.Base, record.NamingOutcome = "session", "attachment_only"
 			}
 			record.InputDigest = inputPreparationDigest(record.Snapshot.Input)
 			record.SnapshotDigest = preparationDigest(record.Snapshot)

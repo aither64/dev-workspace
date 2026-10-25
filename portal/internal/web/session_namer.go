@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
@@ -37,18 +38,55 @@ func (s *Server) normalSessionName(ctx context.Context, input, selected string) 
 		return "", err
 	}
 	if s.config.NamingSocket == "" || s.config.NamingModelCatalogFile == "" {
-		return "", errors.Join(errSessionNamingFallback, codex.ErrEphemeralServer)
+		return "", codex.ErrEphemeralServer
 	}
 	client := codex.NewWithOptions(s.config.NamingSocket, codex.ClientOptions{ClientInfo: codex.ClientInfo{Name: "dev-workspace-session-namer", Title: "Session Naming", Version: "0.1.0"}})
 	defer client.Close()
-	name, err := modelSessionName(ctx, input, provider, client, s.operationStore, s.config.NamingModelCatalogFile)
-	if err == nil {
-		_, err = parseSessionName(name)
+	return s.modelSessionNameWithRetry(ctx, input, provider, client, codex.CanRetryEphemeralTurn)
+}
+
+func (s *Server) modelSessionNameWithRetry(ctx context.Context, input, provider string, client ephemeralTurnClient, canRetry func(error) bool) (string, error) {
+	return retrySessionName(ctx, func(call context.Context) (string, error) {
+		name, err := modelSessionName(call, input, provider, client, s.operationStore, s.config.NamingModelCatalogFile)
+		if err == nil {
+			_, err = parseSessionName(name)
+		}
+		return name, err
+	}, canRetry)
+}
+
+const sessionNamingRetryBackoff = 200 * time.Millisecond
+const sessionNamingRetryMinimum = time.Second + 250*time.Millisecond
+
+// Native retry notifications stay inside one call. A fresh call is allowed only
+// after the client proves transient failure, settled execution and cleanup. The
+// caller owns the original deadline and operation slot throughout both calls.
+func retrySessionName(ctx context.Context, call func(context.Context) (string, error), canRetry func(error) bool) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	if err != nil {
-		return "", errors.Join(errSessionNamingFallback, err)
+	output, err := call(ctx)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
-	return name, err
+	deadline, bounded := ctx.Deadline()
+	if err == nil || !bounded || !canRetry(err) || time.Until(deadline) < sessionNamingRetryBackoff+sessionNamingRetryMinimum {
+		return output, err
+	}
+	timer := time.NewTimer(sessionNamingRetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-timer.C:
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if time.Until(deadline) < sessionNamingRetryMinimum {
+		return "", err
+	}
+	return call(ctx)
 }
 
 func (s *Server) sessionNamingProvider(selected string) (string, error) {
@@ -72,9 +110,9 @@ func (s *Server) sessionNamingProvider(selected string) (string, error) {
 	return selected, nil
 }
 
-// The worker already owns the ten-second whole budget and two-call semaphore.
+// The worker owns the thirty-second whole budget and two-operation semaphore.
 // This adapter never restarts that budget and never selects its own fallback.
-func modelSessionName(ctx context.Context, input, provider string, client ephemeralTurnClient, store *lifecycleOperationStore, catalog string) (string, error) {
+func modelSessionName(ctx context.Context, input, provider string, client ephemeralTurnClient, store *lifecycleOperationStore, catalog string) (output string, err error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -111,7 +149,11 @@ func modelSessionName(ctx context.Context, input, provider string, client epheme
 	}
 	// This removes only this call's application-created empty scratch state. It
 	// does not archive/delete/unload sessions or touch any Codex persistent store.
-	defer os.RemoveAll(private)
+	defer func() {
+		if os.RemoveAll(private) != nil {
+			output, err = "", codex.ErrEphemeralIsolation
+		}
+	}()
 	directory := filepath.Join(private, "cwd")
 	if os.Mkdir(directory, 0700) != nil {
 		return "", codex.ErrEphemeralIsolation
