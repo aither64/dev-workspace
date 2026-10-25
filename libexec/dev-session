@@ -2672,7 +2672,7 @@ module DevSession
       validate_part!(project, 'project')
       validate_part!(name, 'worktree name') if name
 
-      with_slug_lock(slug) do
+      with_slug_lock(slug, wait_for_readers: true) do
         select_tmux_for_slug!(slug)
         reject_conflicting_lifecycle_journal!(slug)
         branch ||= slug
@@ -8118,7 +8118,7 @@ module DevSession
       ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
-    def with_host_lock(path, description, wait: false, busy_message: nil, mode: File::LOCK_EX, on_wait: nil)
+    def with_host_lock(path, description, wait: false, wait_for_readers: false, busy_message: nil, mode: File::LOCK_EX, on_wait: nil)
       raise Error, "invalid #{description} mode" unless [File::LOCK_SH, File::LOCK_EX].include?(mode)
       reject_symlink_components!(path, description)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |file|
@@ -8130,6 +8130,12 @@ module DevSession
           raise Error, "#{description} must be a uid #{Process.euid} mode-0600 file: #{path}"
         end
         locked = file.flock(mode | File::LOCK_NB)
+        if !locked && !wait && wait_for_readers && mode == File::LOCK_EX
+          # A shared probe distinguishes portal readers from an active writer.
+          # flock releases this probe when upgrading to EX; writers remain
+          # serialized and all command validation still runs after acquisition.
+          wait = file.flock(File::LOCK_SH | File::LOCK_NB)
+        end
         if !locked && wait
           on_wait&.call
           if @tracking_sync_deadline
@@ -8287,13 +8293,14 @@ module DevSession
       end
     end
 
-    def with_slug_lock(slug, wait: false, &block)
+    def with_slug_lock(slug, wait: false, wait_for_readers: false, &block)
       authority = load_session_authority(slug, required: false) if @authority_dir
       path = session_lock_file(slug)
       with_host_lock(
         path,
         "development session lock for #{slug}",
         wait: wait || lifecycle_access_wait?(slug) || (!@lifecycle_access && authority&.fetch('state', nil) == 'creating'),
+        wait_for_readers:,
         on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|

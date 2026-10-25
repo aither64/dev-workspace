@@ -907,6 +907,10 @@ feature branch and default branch in `portal.yml`. A genuinely new branch also
 records its starting base. Reattaching an existing unknown-base branch preserves
 that omission; a missing registered branch refuses instead of creating one.
 Registration and sync never infer a historical base from present ancestry.
+Worktree registration waits for existing shared portal readers before taking
+exclusive session access. An active exclusive session command still produces a
+busy error. Waiting on readers does not reserve other sessions or change tracking
+before exclusive access is acquired.
 Removing an individual worktree or using bulk cleanup records its last commit
 before cleanup. Archival verifies the project identity and records the last
 commit of every remaining worktree, so archived pages retain trustworthy
