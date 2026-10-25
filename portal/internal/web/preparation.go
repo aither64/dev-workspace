@@ -601,24 +601,39 @@ func (s *Server) reservePreparationLocked(record *sessionPreparation) error {
 		if slug == "" {
 			slug = record.Snapshot.Input.Date + "-" + suffixedSessionName(record.Base, number)
 		}
-		creationLock, err := session.LockCreation(s.config.AuthorityDir, slug)
-		if err != nil {
-			return err
-		}
-		lock, err := session.LockRuntimeExclusive(s.config.AuthorityDir, slug)
-		if err != nil {
-			creationLock.Close()
-			return err
-		}
-		err = s.handoffPreparationLocked(record, slug)
-		lock.Close()
-		creationLock.Close()
+		err := s.reservePreparationCandidateLocked(record, slug)
 		if errors.Is(err, errPreparationOccupied) && record.Slug == "" && record.Snapshot.Input.CustomName == "" && record.NamingOutcome != "custom" {
 			continue
 		}
 		return err
 	}
 	return errors.New("session name collision limit reached")
+}
+
+func (s *Server) reservePreparationCandidateLocked(record *sessionPreparation, slug string) error {
+	// An occupied name needs no exclusive access. In particular, an existing
+	// conversation's shared browser access must not prevent automatic suffixing.
+	// A free candidate still repeats occupancy/ownership checks under both locks.
+	if record.Slug == "" {
+		occupied, err := s.destinationOccupiedLocked(slug, record.ReceiptID)
+		if err != nil {
+			return err
+		}
+		if occupied {
+			return errPreparationOccupied
+		}
+	}
+	creationLock, err := session.LockCreation(s.config.AuthorityDir, slug)
+	if err != nil {
+		return err
+	}
+	defer creationLock.Close()
+	lock, err := session.LockRuntimeExclusive(s.config.AuthorityDir, slug)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return s.handoffPreparationLocked(record, slug)
 }
 
 var errPreparationOccupied = errors.New("session name already exists")

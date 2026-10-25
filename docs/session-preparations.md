@@ -279,9 +279,13 @@ storage must be writable to submit a custom choice.
 The selected base is saved before reservation. Automatic collisions add `-2`,
 `-3` and subsequent suffixes, truncating whole words to retain the 48-byte limit.
 Custom-name collisions fail. A frozen final slug never changes on retry.
+Occupied candidates are skipped before requesting exclusive runtime access, so
+an existing session's normal browser activity does not block automatic suffixes.
 Reservation shares creation-then-session locks with the CLI and excludes
 tracking, archives, worktrees, receipts, other preparations, journals and
-runtime/team state. Lock contention and unreadable occupancy stop the attempt.
+runtime/team state. An unused candidate is checked again under those locks
+before reservation. Lock contention on an unproved candidate and unreadable
+occupancy stop the attempt.
 An unrelated CLI start or fork cannot claim a frozen portal destination.
 
 ## Durable state and uploads
