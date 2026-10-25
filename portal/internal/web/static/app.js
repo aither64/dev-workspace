@@ -58,6 +58,9 @@
       method: "POST", body: JSON.stringify({force, targetId, ...(receiptId ? {receiptId} : {})}),
     }),
     operation: () => request(apiPath(slug, "operation")),
+    cancelArchivePreparation: (receiptId) => request(`${apiPath(slug, "operation")}/cancel`, {
+      method: "POST", body: JSON.stringify({receiptId}),
+    }),
     retryOperation: (receiptId, journalId, force) => {
       const body = {receiptId, journalId};
       if (force !== undefined) body.force = force;
@@ -598,6 +601,8 @@
     archive: "Archive", delete: "Delete", revive: "Revive",
   }[kind] || "Session operation");
   const lifecyclePhaseLabel = (phase) => {
+    const preparation = {checking: "Checking", lead_fixing_blockers: "Lead fixing blockers", rechecking: "Rechecking"};
+    if (preparation[phase]) return preparation[phase];
     const label = String(phase || "starting").replaceAll("_", " ");
     return label.charAt(0).toUpperCase() + label.slice(1);
   };
@@ -610,7 +615,7 @@
     }
     if (operation.state === "running") {
       return {
-        detail: `${operation.progress?.path ? operation.progress.path + " · " : ""}Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
+        detail: `${operation.progress?.path ? operation.progress.path + " · " : ""}${["checking", "lead_fixing_blockers", "rechecking"].includes(operation.phase) && operation.error ? operation.error + " · " : ""}Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
         retry: false,
         title: `${label}: ${operation.progress?.stage || lifecyclePhaseLabel(operation.phase)}`,
         tone: "running",
@@ -1697,7 +1702,8 @@
     for (const operation of records) {
       const key = JSON.stringify([operation.slug, operation.kind, operation.receiptId || operation.options?.journalId || ""]);
       present.add(key);
-      const shape = JSON.stringify([operation.state, Boolean(operation.options?.force)]);
+      const preparing = operation.kind === "archive" && operation.state === "running" && ["checking", "lead_fixing_blockers", "rechecking"].includes(operation.phase);
+      const shape = JSON.stringify([operation.state, Boolean(operation.options?.force), preparing]);
       const elapsedStart = Date.parse(operation.startedAt || operation.updatedAt || "");
       const presentation = lifecyclePresentation(
         operation, "", Number.isFinite(elapsedStart) ? Date.now() - elapsedStart : 0,
@@ -1740,6 +1746,24 @@
         }
 
         const actions = document.createElement("div");
+        if (preparing) {
+          const cancel = document.createElement("button");
+          cancel.type = "button"; cancel.className = "quiet"; cancel.textContent = "Cancel preparation";
+          cancel.addEventListener("click", async () => {
+            cancel.disabled = true;
+            try {
+              await request(`${apiPath(entry.operation.slug, "operation")}/cancel`, {
+                method: "POST", body: JSON.stringify({receiptId: entry.operation.receiptId}),
+              });
+              await refreshIndexStatus();
+            } catch (error) {
+              cancel.disabled = false;
+              const warning = document.getElementById("index-status-warning");
+              if (warning) { warning.textContent = error.message; warning.hidden = false; }
+            }
+          });
+          actions.append(cancel);
+        }
         actions.className = "operation-item-actions";
         if (operation.state === "failed" || operation.state === "paused") {
           const retry = document.createElement("button");
@@ -3110,7 +3134,28 @@
     lifecycleDetail.textContent = presentation.detail;
     lifecycleRetry.hidden = !presentation.retry;
     lifecycleRetry.textContent = `Retry ${(operation.kind || pendingKind || "operation")}`;
+    const cancel = document.getElementById("archive-preparation-cancel");
+    if (cancel) cancel.hidden = !(operation.kind === "archive" && operation.state === "running" && ["checking", "lead_fixing_blockers", "rechecking"].includes(operation.phase));
+    const details = document.getElementById("archive-preparation-details");
+    if (details) {
+      const preparation = operation.archivePreparation;
+      details.hidden = !preparation?.check;
+      if (preparation?.check) details.querySelector("pre").textContent =
+        `Repair turns: ${preparation.round}. Consecutive turns without progress: ${preparation.noProgress}.\n` +
+        (preparation.history || []).map(round => `After ${round.round} repair turns: ${round.passedChecks} checks passed, ${round.blockerCount} blockers.`).join("\n") + "\n" +
+        `${preparation.check.passedChecks} checks passed; ${preparation.check.blockerCount} blockers.\n` +
+        preparation.check.blockers.map(blocker => blocker.message).join("\n");
+    }
   };
+  document.getElementById("archive-preparation-cancel")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const operation = await client.cancelArchivePreparation(lastLifecycleOperation.receiptId);
+      stopLifecycleTimers(); setLifecycleActionsDisabled(false); showLifecycle(operation);
+    } catch (error) { lifecycleDetail.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
   const failLifecycle = (
     kind, error, resetControls = () => {}, phase = "", failedOperation = lastLifecycleOperation,
   ) => {

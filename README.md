@@ -449,9 +449,11 @@ a normal dependency update is under 20 minutes.
 
 The separate `session-archive-lifecycle` VM check runs on every push and pull
 request. It uses the shipped browser, portal, systemd worker, CLI and native App
-Server to archive and revive disposable sessions without model turns. It checks
-dirty-file/index restoration, portal restart, worker interruption, recovery after
-checkout removal and deferred tracking synchronization. Run it after independent
+Server to archive and revive disposable sessions. A synthetic Responses service
+drives a native lead through shell-tool cleanup before shutdown, including portal
+restart and unrelated session creation during repair. The suite also checks
+committed-content restoration, preflight permissions, worker interruption, recovery
+after checkout removal and deferred tracking synchronization. Run it after independent
 review and require it before deployment. Component tests with fake commands do
 not establish that the packaged archive workflow works. Verify a disposable
 archive/revive against the selected package after deployment as well.

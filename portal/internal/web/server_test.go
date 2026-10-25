@@ -3760,7 +3760,11 @@ func TestPortalLifecycleOperationsDelegateToOneHighLevelCommand(t *testing.T) {
 			}
 			arguments := filepath.Join(t.TempDir(), "arguments")
 			helper := filepath.Join(t.TempDir(), "dev-session")
-			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"
+			ready, err := json.Marshal(archiveCheckResult{Schema: 1, Workspace: server.config.Workspace, Slug: "example", Ready: true, Total: 6, Passed: 6, Stage: 6, Blockers: []archiveBlocker{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nif [ \"$1\" = archive-check ]; then\ncat <<'READY'\n" + string(ready) + "\nREADY\nexit 0\nfi\nprintf '%s\\n' \"$@\" > \"$ARGUMENTS\"\n"
 			if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}

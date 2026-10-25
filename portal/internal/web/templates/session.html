@@ -57,7 +57,9 @@
     <section id="lifecycle-operation-status" class="operation-status notice full" role="status" aria-live="polite" hidden>
       <div><strong id="lifecycle-operation-title"></strong><span id="lifecycle-operation-detail"></span></div>
       <button id="lifecycle-operation-retry" type="button" class="quiet" hidden>Retry</button>
+      <button id="archive-preparation-cancel" type="button" class="quiet" hidden>Cancel preparation</button>
     </section>
+    <details id="archive-preparation-details" hidden><summary>Archive preparation details</summary><pre></pre></details>
     <p id="archive-last-failure" class="notice warning full" role="status" hidden><span></span> <a href="#settings">Technical details</a></p>
     {{if eq .PendingLifecycle "archive"}}<p class="notice full">Archiving is unfinished. This conversation is read-only until it finishes.</p>{{end}}
     {{if .LifecycleOnly}}

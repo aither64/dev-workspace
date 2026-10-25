@@ -17,6 +17,13 @@ pkgs.testers.runNixOSTest {
       owner = "developer";
       hostName = "workspace.example.test";
       wildcardHost = "*.workspace.example.test";
+      codexInitialProvider = "primary";
+      codexProviders = [{
+        id = "primary";
+        label = "Archive fixture";
+        baseURL = "http://127.0.0.1:2455/primary/v1";
+        tokenFile = "/home/developer/.codex/fixture.token";
+      }];
     };
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
     environment.systemPackages = [
@@ -118,11 +125,18 @@ pkgs.testers.runNixOSTest {
         assert_restored(slug, checkout)
 
     def diagnostics():
-        print(user("journalctl --user --no-pager -n 100 -u 'workspace-archive-*' -u workspace-portal@fixture"))
+        print(user("journalctl --user --no-pager -n 100 -u 'workspace-archive-*' -u workspace-portal@fixture -u workspace-codex@fixture -u archive-model"))
         print(user("find " + root + "/worktrees/.locks -maxdepth 1 -type f -name '*.archive*.json' -exec cat {} \\;"))
+        print(user("find ~/.codex/sessions -type f -name '*.jsonl' -exec tail -n 10 {} + | tail -c 16000"))
 
     with subtest("install real package and user services with private Git origins"):
         user("mkdir -p " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees")
+        user("mkdir -p ~/.codex /tmp/creation-model")
+        user("printf fixture-private-token > ~/.codex/fixture.token && chmod 0600 ~/.codex/fixture.token")
+        config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="high"\napproval_policy="never"\nsandbox_mode="danger-full-access"\n[model_providers.primary]\nname="Archive fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n'
+        user("printf %s " + shlex.quote(config) + " > ~/.codex/config.toml")
+        user("systemd-run --user --unit=archive-model ${pkgs.python3}/bin/python ${../../test/creation_model.py}")
+        machine.wait_until_succeeds("curl -fsS http://127.0.0.1:2455/primary/v1/models")
         user("git config --global user.name 'Archive fixture' && git config --global user.email fixture@example.invalid")
         user("git config --global url.file:///home/developer/origins/.insteadOf git@github.com:fixture/")
         user("mkdir ~/origins && git init --bare --initial-branch=master ~/origins/workspace.git "
@@ -145,6 +159,39 @@ pkgs.testers.runNixOSTest {
         user("systemctl --user stop workspace-tracking-sync@fixture.timer")
 
     try:
+        with subtest("preflight lead repair survives portal restart before agent shutdown"):
+            slug = "2026-10-25-lead-archive-repair"
+            user("printf ARCHIVE_PREPARATION_FIXTURE > /tmp/archive-goal")
+            user("cd " + root + " && " + cli + " start " + slug + " --as-is --no-attach "
+                 "--model gpt-5.5 --effort high --goal-file /tmp/archive-goal")
+            user("cd " + root + " && " + cli + " worktree add " + slug + " project --as-is")
+            checkout = root + "/worktrees/" + slug + "/project"
+            manifest = json.loads(user("${pkgs.ruby}/bin/ruby -ryaml -rjson -e " + shlex.quote(
+                "puts JSON.generate(YAML.safe_load(File.read(ARGV.fetch(0))))") + " " + root + "/work/" + slug + "/portal.yml"))
+            thread = manifest["codex"]["thread_id"]
+            socket = manifest["codex"]["socket_path"]
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
+                + " --cwd " + root + "/work/" + slug))
+            cache = root + "/worktrees/" + slug + "/.hook-cache"
+            user("mkdir -p " + cache + "/bin && printf generated > " + cache + "/bin/overcommit")
+            repair = "mv " + shlex.quote(cache) + " " + shlex.quote(checkout + "/.gems-archive-cache")
+            user("printf %s " + shlex.quote(repair) + " > /tmp/creation-model/archive-repair-command && touch /tmp/creation-model/hold-turn")
+            user("cd " + root + " && git add work/" + slug + " && git commit -m 'fixture: archive preparation' && git push origin master")
+            accepted = browser(slug, "archive")
+            machine.wait_until_succeeds(user_prefix + "test -f /tmp/creation-model/archive-repair-entered")
+            user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
+            assert operation(slug)["phase"] == "lead_fixing_blockers", operation(slug)
+            # Neither the lead's model turn nor its preparation owns global locks.
+            fixture("2026-10-25-unrelated-during-repair")
+            user("systemctl --user restart workspace-portal@fixture")
+            machine.wait_until_succeeds(user_prefix + "test -S /run/user/1000/dev-workspaces/fixture/portal.sock")
+            user("rm /tmp/creation-model/hold-turn")
+            completed = archived(slug, checkout)
+            assert completed["receiptId"] == accepted["receiptId"] and completed["attempt"] == accepted["attempt"], completed
+            user("test ! -e " + cache)
+            user("rm /tmp/creation-model/archive-repair-command")
+
         with subtest("browser archive discards local files and revival restores committed content"):
             slug = "2026-10-17-roundtrip"
             checkout = fixture(slug)
@@ -214,10 +261,30 @@ pkgs.testers.runNixOSTest {
             archived(slug, checkout)
             revive(slug, checkout)
 
+        with subtest("unwritable archive parent fails before stopping agents or removing checkouts"):
+            slug = "2026-10-25-preflight-permissions"
+            checkout = fixture(slug)
+            user("chmod 0500 " + root + "/archive")
+            browser(slug, "archive")
+            wait_operation(slug, "failed")
+            user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
+            user("chmod 0755 " + root + "/archive")
+            browser(slug, "retry")
+            archived(slug, checkout)
+            revive(slug, checkout)
+
         with subtest("retry after checkout removal keeps committed recovery metadata"):
             slug = "2026-10-17-recovery"
             checkout = fixture(slug)
-            user("chmod 0500 " + root + "/archive")
+            # Trigger a real filesystem failure after successful preflight,
+            # when Git starts removal. The shipped executor is unchanged.
+            race = "import ctypes,os,pathlib; lib=ctypes.CDLL(None); fd=lib.inotify_init1(0); "
+            race += "assert fd>=0; assert lib.inotify_add_watch(fd," + repr(checkout.encode()) + ",0x200)>=0; "
+            race += "pathlib.Path('/tmp/archive-removal-watch-ready').touch(); os.read(fd,4096); "
+            race += "os.chmod(" + repr(root + "/archive") + ",0o500)"
+            user("printf %s " + shlex.quote(race) + " > /tmp/archive-removal-race.py")
+            user("systemd-run --user --quiet --unit=archive-removal-race ${pkgs.python3}/bin/python /tmp/archive-removal-race.py")
+            machine.wait_until_succeeds(user_prefix + "test -f /tmp/archive-removal-watch-ready")
             accepted = browser(slug, "archive")
             wait_operation(slug, "failed")
             user("test ! -e " + checkout)

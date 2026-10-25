@@ -1,4 +1,4 @@
-"""External Responses fixture for the packaged creation acceptance only.
+"""External Responses fixture for packaged creation and archive acceptance.
 
 No portal, receipt, initializer or native App Server is replaced. Control files
 hold inference at an external boundary; requests remain observable on failure.
@@ -9,6 +9,7 @@ import json
 import pathlib
 import threading
 import time
+import urllib.parse
 
 ROOT = pathlib.Path("/tmp/creation-model")
 ROOT.mkdir(exist_ok=True)
@@ -29,13 +30,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path.endswith("/models"):
+        path = urllib.parse.urlsplit(self.path).path
+        if path.endswith("/models"):
             while (ROOT / "hold-models").exists():
                 (ROOT / "models-entered").touch()
                 time.sleep(0.05)
             self.json({"object": "list", "data": [{"id": name, "object": "model"}
                       for name in ["gpt-5.5", "gpt-6-luna"]]})
-        elif self.path.endswith("/usage"):
+        elif path.endswith("/usage"):
             self.json({})
         else:
             self.send_error(404)
@@ -54,6 +56,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         inputs = request.get("input", [])
         last_user = next((item for item in reversed(inputs)
                           if isinstance(item, dict) and item.get("role") == "user"), {})
+        repair = (ROOT / "archive-repair-command").exists() and "The user requested archival of this session." in json.dumps(last_user)
+        repair_tool = None
+        if repair and not (ROOT / "archive-repair-submitted").exists():
+            def find_shell(tools, namespace=""):
+                for tool in tools:
+                    if tool.get("type") == "namespace":
+                        found = find_shell(tool.get("tools", []), tool["name"])
+                        if found:
+                            return found
+                    if tool.get("name") in ("exec_command", "shell_command"):
+                        return tool["name"], namespace
+                return None
+            shell = find_shell(request.get("tools", []))
+            if shell:
+                name, namespace = shell
+                command = (ROOT / "archive-repair-command").read_text()
+                repair_tool = {"type": "function_call", "name": name,
+                               "call_id": "archive-repair-call",
+                               "arguments": json.dumps({"cmd" if name == "exec_command" else "command": command})}
+                if namespace:
+                    repair_tool["namespace"] = namespace
+                (ROOT / "archive-repair-submitted").touch()
+                (ROOT / "archive-repair-entered").touch()
         if naming:
             text = "invalid naming output" if (ROOT / "bad-name").exists() else json.dumps({"name": "accepted-session"})
         elif "CREATION_PLAN_REQUEST" in json.dumps(last_user):
@@ -75,7 +100,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             identity = "response-" + str(index)
             event({"type": "response.created", "response": {"id": identity}})
-            event({"type": "response.output_item.done", "item": {
+            event({"type": "response.output_item.done", "item": repair_tool or {
                 "type": "message", "role": "assistant", "id": "answer-" + identity,
                 "phase": "final_answer", "content": [{"type": "output_text", "text": text}]}})
             event({"type": "response.completed", "response": {"id": identity,

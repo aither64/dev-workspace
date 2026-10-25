@@ -12,6 +12,48 @@ sensitivity survives both moves. See [sensitive sessions](dev-sessions.md#sensit
 
 ## Explicit archival and local recovery
 
+### Readiness before shutdown
+
+Before stopping agents, explicit archival checks the session's tracking,
+repository ownership, worktree layout, native conversation identities, removal
+permissions, helpers and coordination state. Inspect the same checks without
+changing the session:
+
+```sh
+dev-session archive-check SESSION --as-is --json
+```
+
+The JSON result identifies blockers by code and path, with a total blocker count
+and validation progress. A valid check returns exit status 0 even when blockers
+remain. It does not stop agents, pause goals, capture queues, pin Git refs or
+create an archive journal. The executor repeats validation under lifecycle locks.
+File operations and checks that require stopped writers can still fail later;
+resume those operations through their existing archive journal.
+
+The portal prepares explicit archival in the background. If checks fail, it asks
+the retained lead to repair session-owned local blockers and checks again after
+the repair turn completes. The lead keeps its saved model and reasoning effort.
+Preparation continues while validation advances or the blocker count falls. It
+stops after three repair turns without progress, when the lead needs operator
+input, or when its identity or availability cannot be verified. The portal shows
+the blockers, repair count and recent check history.
+
+Use **Cancel preparation** to revoke automatic continuation before archival
+starts. An already accepted cleanup turn may finish. The browser can be closed:
+the portal owns preparation and resumes its durable record after restart. Native
+delivery retries use the original message identity. Preparation holds no lifecycle
+reservation or package lock while the lead works. Other sessions remain available.
+Portal shutdown leaves an ordinary retryable receipt for older packages; a capable
+portal can resume preparation only while its original receipt still matches.
+
+Preparation cannot authorize shared infrastructure changes, Git history rewrites
+or edits to lifecycle evidence. Existing archive journals resume directly without
+lead repair. Automatic and `--require-merged` archival keep their existing policy.
+Keep generated hook dependencies in ignored checkout-local paths such as `.gems`;
+loose files beside the checkouts block cleanup.
+
+### Shutdown and retained content
+
 Explicit archival stops the managed terminal client, pauses active goals,
 interrupts retained agents and their proven loaded native descendants, and saves
 queued prompts with their complete structured input in private `archived-prompts/`

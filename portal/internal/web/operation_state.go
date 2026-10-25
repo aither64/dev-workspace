@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -392,6 +393,11 @@ func (s *Server) captureLifecycleOperation(slug string) (lifecycleOperation, boo
 func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOperation, exists bool,
 	progress *session.LifecycleProgress, progressErr error, now time.Time,
 ) (lifecycleOperation, bool, error) {
+	if p, ok := s.archivePreparationFor(slug); exists && ok && p.matches(operation) && p.active() {
+		operation.State = "running"
+		operation.Phase = p.State
+		return operation, true, nil
+	}
 	if exists && operation.Kind == "archive" && operation.State != "complete" && s.supervisedArchives() {
 		worker, err := s.archiveWorker(s.operationContext, operation)
 		if err != nil {
@@ -473,7 +479,16 @@ func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOpera
 // Copy target data only after native/tracking proof, outside both display and
 // receipt mutexes. This response-only view never changes receipt authority.
 func (s *Server) lifecycleOperationView(slug string, operation lifecycleOperation) lifecycleOperation {
+	if p, ok := s.archivePreparationFor(slug); ok && p.matches(operation) && p.active() {
+		operation.Phase = p.State
+		if p.Check != nil && len(p.Check.Blockers) > 0 {
+			operation.Error = p.Check.Blockers[0].Message
+		}
+	}
 	operation.Progress = session.ReadArchiveProgress(s.config.Workspace, s.config.UserStateRoot, slug, operation.Options.JournalID)
+	if p, ok := s.archivePreparationFor(slug); ok && p.matches(operation) && p.active() {
+		operation.Progress = nil
+	}
 	operation.CurrentTarget = s.lifecycleSnapshot(slug)
 	if operation.State == "failed" && !operation.Options.JournalExpected {
 		if summary, err := session.Find(s.config.Workspace, slug); err == nil {
@@ -607,6 +622,15 @@ func (s *Server) removeLifecycleOperationLocked(slug string) error {
 	s.operationSnapshotMu.Lock()
 	delete(s.operationSnapshots, slug)
 	s.operationSnapshotMu.Unlock()
+	if previous.Kind == "archive" && previous.State == "complete" {
+		s.archivePrepMu.Lock()
+		if p, ok := s.archivePreparations[slug]; ok && p.ReceiptID == previous.ReceiptID {
+			if err := os.Remove(s.archivePreparationPath(slug)); err == nil || errors.Is(err, os.ErrNotExist) {
+				delete(s.archivePreparations, slug)
+			}
+		}
+		s.archivePrepMu.Unlock()
+	}
 	return nil
 }
 

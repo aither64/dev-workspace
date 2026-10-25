@@ -540,6 +540,12 @@ assert.deepEqual(transcriptErrorPresentation({
 assert.equal(formatElapsed(59_900), "59s");
 assert.equal(formatElapsed(62_000), "1m 02s");
 assert.equal(formatElapsed(3_661_000), "1h 01m");
+for (const [phase, title] of [["checking", "Checking"], ["lead_fixing_blockers", "Lead fixing blockers"], ["rechecking", "Rechecking"]]) {
+  const view = lifecyclePresentation({kind: "archive", state: "running", phase, error: "Move the hook cache."}, "", 0);
+  assert.equal(view.title, `Archive: ${title}`);
+  assert(view.detail.includes("Move the hook cache."));
+  assert.equal(view.retry, false);
+}
 assert.deepEqual(lifecyclePresentation(
   {kind: "archive", state: "running"}, "", 12_000,
 ), {

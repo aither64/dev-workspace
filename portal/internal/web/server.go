@@ -165,6 +165,8 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	archivePrepMu          sync.Mutex
+	archivePreparations    map[string]archivePreparation
 	closeCatalog           func()
 	recoveryMu             sync.Mutex
 	recoveryOperations     map[string]recoveryStatus
@@ -541,6 +543,10 @@ func New(config Config) (*Server, error) {
 		server.operationWG.Add(1)
 		go server.reconcileThreadInstructions()
 	}
+	if err := server.resumeArchivePreparations(); err != nil {
+		server.Close()
+		return nil, err
+	}
 	return server, nil
 }
 
@@ -678,6 +684,7 @@ func (s *Server) Close() {
 		s.operationMu.Lock()
 		s.closing = true
 		close(s.stopping)
+		s.parkArchivePreparations()
 		s.cancelOperations()
 		s.operationMu.Unlock()
 		s.operationWG.Wait()
@@ -1850,6 +1857,10 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && r.Method == http.MethodDelete && parts[1] == "operation" {
 		s.withPortalMutation(w, r, parts[0], func() { s.dismissLifecycleOperation(w, r, parts[0]) })
+		return
+	}
+	if len(parts) == 3 && r.Method == http.MethodPost && parts[1] == "operation" && parts[2] == "cancel" {
+		s.withPortalMutation(w, r, parts[0], func() { s.cancelArchivePreparation(w, r, parts[0]) })
 		return
 	}
 	if len(parts) == 3 && r.Method == http.MethodPost &&
@@ -3080,6 +3091,11 @@ func (s *Server) startLifecycleOperation(
 		})
 		return
 	}
+	if err := s.beginArchivePreparation(operation); err != nil {
+		s.operationMu.Unlock()
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	if err := s.replaceLifecycleOperationLocked(slug, operation); err != nil {
 		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -3090,71 +3106,92 @@ func (s *Server) startLifecycleOperation(
 	s.operationWG.Add(1)
 	s.operationMu.Unlock()
 	s.requestDisplayRefresh(true)
-	go func(started lifecycleOperation) {
-		defer s.operationWG.Done()
-		err := s.runLifecycleOperation(s.operationContext, slug, kind, args, started.Options)
-		finished := time.Now().UTC().Format(time.RFC3339Nano)
-		completed := started
-		completed.UpdatedAt = finished
-		completed.FinishedAt = finished
-		if err == nil {
-			completed.State = "complete"
-			completed.Phase = "complete"
-		} else {
-			completed.State = "failed"
-			completed.Error = boundedLifecycleError(err.Error())
-			var changed *lifecycleTargetChangedError
-			if errors.As(err, &changed) {
-				completed.ErrorCode = "target_changed"
+	go s.runLifecycleJob(operation, args)
+	s.writeJSON(w, http.StatusAccepted, operation)
+}
+
+func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
+	defer s.operationWG.Done()
+	slug, kind := started.Slug, started.Kind
+
+	err := s.runLifecycleOperation(s.operationContext, slug, kind, args, started.Options)
+	finished := time.Now().UTC().Format(time.RFC3339Nano)
+	completed := started
+	completed.UpdatedAt = finished
+	completed.FinishedAt = finished
+	if err == nil {
+		completed.State = "complete"
+		completed.Phase = "complete"
+	} else {
+		completed.State = "failed"
+		completed.Error = boundedLifecycleError(err.Error())
+		if p, ok := s.archivePreparationFor(slug); ok && p.matches(started) && p.State == "failed" {
+			completed.Phase = "checking"
+			if p.Round > 0 {
+				completed.Phase = "lead_fixing_blockers"
 			}
 		}
-		persistErr := s.withCurrentGeneration(func() error {
-			if err != nil {
-				if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
-					completed.Phase = progress.Phase
-					if completed.Options.JournalID != "" &&
-						completed.Options.JournalID == progress.JournalID {
-						if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
-							completed.applyProgressOptions(*progress)
-							s.bindLifecycleJournalTarget(&completed, *progress)
-						}
+		var changed *lifecycleTargetChangedError
+		if errors.As(err, &changed) {
+			completed.ErrorCode = "target_changed"
+		}
+	}
+	persistErr := s.withCurrentGeneration(func() error {
+		if err != nil {
+			if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
+				completed.Phase = progress.Phase
+				if completed.Options.JournalID != "" &&
+					completed.Options.JournalID == progress.JournalID {
+					if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
+						completed.applyProgressOptions(*progress)
+						s.bindLifecycleJournalTarget(&completed, *progress)
 					}
 				}
 			}
-			view := s.lifecycleOperationView(slug, completed)
-			s.operationMu.Lock()
-			defer s.operationMu.Unlock()
-			current, exists := s.operations[slug]
-			if !exists || current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
-				return nil
-			}
-			if err := s.replaceLifecycleOperationLocked(slug, completed); err != nil {
-				return err
-			}
-			s.publishLifecycleSnapshot(slug, view, time.Now().UTC())
-			return nil
-		})
-		if persistErr != nil {
-			s.config.Logger.Printf("persist completed %s operation for %s: %v", kind, slug, persistErr)
-			s.operationMu.Lock()
-			current, exists := s.operations[slug]
-			if exists && current.ReceiptID == completed.ReceiptID && current.Attempt == completed.Attempt {
-				completed.State = "failed"
-				completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
-				s.operations[slug] = completed
-				s.operationRevisions[slug]++
-				s.publishLifecycleSnapshot(slug, completed, time.Time{})
-			}
-			s.operationMu.Unlock()
 		}
+		view := s.lifecycleOperationView(slug, completed)
+		s.operationMu.Lock()
+		defer s.operationMu.Unlock()
+		if p, ok := s.archivePreparationFor(slug); ok && p.matches(completed) && (p.State == "canceled" || (s.closing && p.State == "paused")) {
+			return nil
+		}
+		current, exists := s.operations[slug]
+		if !exists || current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
+			return nil
+		}
+		if err := s.replaceLifecycleOperationLocked(slug, completed); err != nil {
+			return err
+		}
+		s.publishLifecycleSnapshot(slug, view, time.Now().UTC())
+		return nil
+	})
+	if persistErr != nil {
+		s.config.Logger.Printf("persist completed %s operation for %s: %v", kind, slug, persistErr)
+		s.operationMu.Lock()
+		current, exists := s.operations[slug]
+		if exists && current.ReceiptID == completed.ReceiptID && current.Attempt == completed.Attempt {
+			completed.State = "failed"
+			completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
+			s.operations[slug] = completed
+			s.operationRevisions[slug]++
+			s.publishLifecycleSnapshot(slug, completed, time.Time{})
+		}
+		s.operationMu.Unlock()
+	}
 
-	}(operation)
-	s.writeJSON(w, http.StatusAccepted, operation)
 }
 
 func (s *Server) runLifecycleOperation(
 	parent context.Context, slug, kind string, args []string, options lifecycleOperationOptions,
 ) error {
+	if kind == "archive" && options.Mode == "archived" && !options.JournalExpected {
+		s.operationMu.Lock()
+		op := s.operations[slug]
+		s.operationMu.Unlock()
+		if err := s.runArchivePreparation(parent, op); err != nil {
+			return err
+		}
+	}
 	if kind == "archive" && s.supervisedArchives() {
 		return s.executeLifecycleOperation(parent, 0, slug, kind, args, options)
 	}
@@ -3234,12 +3271,21 @@ func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
 		snapshot.operation.TrackingSync = status
 	}
 	snapshot.operation.Progress = session.ReadArchiveProgress(s.config.Workspace, s.config.UserStateRoot, slug, snapshot.operation.Options.JournalID)
+	var preparation *archivePreparationStatus
+	if p, ok := s.archivePreparationFor(slug); ok && p.matches(snapshot.operation) {
+		preparation = &archivePreparationStatus{State: p.State, Round: p.Round, NoProgress: p.NoProgress, Check: p.Check, History: p.History}
+		if p.active() {
+			snapshot.operation.Progress = nil
+			snapshot.operation.Phase = p.State
+		}
+	}
 	s.writeJSON(w, http.StatusOK, struct {
 		lifecycleOperation
-		StatusCheckedAt time.Time `json:"statusCheckedAt"`
-		StatusStale     bool      `json:"statusStale"`
-		StatusWarning   string    `json:"statusWarning,omitempty"`
-	}{snapshot.operation, snapshot.checkedAt, snapshot.checkedAt.IsZero() || time.Since(snapshot.checkedAt) > 15*time.Second || warning != "", warning})
+		Preparation     *archivePreparationStatus `json:"archivePreparation,omitempty"`
+		StatusCheckedAt time.Time                 `json:"statusCheckedAt"`
+		StatusStale     bool                      `json:"statusStale"`
+		StatusWarning   string                    `json:"statusWarning,omitempty"`
+	}{snapshot.operation, preparation, snapshot.checkedAt, snapshot.checkedAt.IsZero() || time.Since(snapshot.checkedAt) > 15*time.Second || warning != "", warning})
 }
 
 func (s *Server) retryLifecycleOperation(w http.ResponseWriter, r *http.Request, slug string) {
