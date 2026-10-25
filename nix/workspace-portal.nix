@@ -377,7 +377,7 @@ buildGoModule {
       "$out/libexec/workspace-archive-recovery.rb"
     ln -s ../workspace-archive-recovery.rb \
       "$out/libexec/workspace-portal/workspace-archive-recovery.rb"
-    for name in workspace-tracking-summaries; do
+    for name in workspace-tracking-summaries workspace-source-checkout; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
       ln -s "../$name.rb" "$out/libexec/workspace-portal/$name.rb"
     done

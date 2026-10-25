@@ -313,3 +313,7 @@ on active work. A live operation, held checkout, retained feature worktree or
 running process can still keep an old closure. Nix GC decides when store paths
 are reclaimable. Bulk archives included in a workspace Git input still multiply
 its size until their copies and package roots become unreferenced.
+
+Additional workspace checkouts omit work/ and archive/ through per-worktree Git
+sparse checkout. Shared tracking stays in the complete registered workspace;
+independent project repositories keep their normal layouts.

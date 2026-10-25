@@ -496,7 +496,10 @@ module WorkspaceCoordination
       unless File.directory?(directory)
         FileUtils.mkdir_p(File.dirname(directory), mode: 0o700)
         engine.with_merge_hooks('hookArtifact' => hooks && hooks['id']) do
-          engine.capture('git', '-C', path, 'worktree', 'add', '--detach', directory, head)
+          common = engine.capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
+          sparse = WorkspaceSourceCheckout.workspace?(common, engine.workspace)
+          engine.capture('git', '-C', path, 'worktree', 'add', '--detach', *(sparse ? ['--no-checkout'] : []), directory, head)
+          WorkspaceSourceCheckout.configure(directory, ->(argv, **options) { engine.capture(*argv, **options) }, initialize_index: true) if sparse
         end
       end
       raise Error.new('prepared refresh has conflicts or dirty files; review before resuming', 4) unless engine.capture('git', '-C', directory, 'status', '--porcelain').empty?

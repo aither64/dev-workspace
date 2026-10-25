@@ -3,6 +3,7 @@
 require_relative 'workspace-coordination'
 require_relative 'workspace-coordination-gc'
 require_relative 'workspace-integration-certification'
+require_relative 'workspace-source-checkout'
 
 module WorkspaceCoordination
   class Engine
@@ -206,13 +207,19 @@ module WorkspaceCoordination
       destination = File.join(store.root, 'sources', revision)
       source = File.join(destination, 'checkout')
       FileUtils.mkdir_p(destination, mode: 0o700)
+      common = capture('git', '-C', path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip
+      sparse = WorkspaceSourceCheckout.workspace?(common, workspace)
       fresh = !File.directory?(source)
       if fresh
-        if block_given?
+        if block_given? || sparse
           # Materialize the exact tree before initializing dependencies, then
           # run the ordinary checkout hook in its prepared environment below.
           capture('git', '-C', path, 'worktree', 'add', '--detach', '--no-checkout', source, revision)
-          capture('git', '-C', source, 'read-tree', '-mu', revision)
+          if sparse
+            WorkspaceSourceCheckout.configure(source, ->(argv, **options) { capture(*argv, **options) }, initialize_index: true)
+          else
+            capture('git', '-C', source, 'read-tree', '-mu', revision)
+          end
         else
           capture('git', '-C', path, 'worktree', 'add', '--detach', source, revision)
         end

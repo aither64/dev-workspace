@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'workspace-source-checkout'
+
 module DevSession
   # File and index recovery for explicit archival. This storage is private and
   # local; Git branches and object refs are retained without publication checks.
@@ -251,6 +253,9 @@ module DevSession
       # Restoration owns this newly created checkout. Replacing its files never
       # resets another user's checkout or a shared repository index.
       if saved['kind'] == 'committed'
+        if record['project'] == 'workspace'
+          WorkspaceSourceCheckout.configure(target, ->(argv, **options) { @commands.capture(argv, **options) }, initialize_index: true)
+        end
         # The restoration intent owns this new checkout until its receipt.
         # No predecessor index, conflict state or ignored files are restored.
         git(saved, 'reset', '--hard', saved.fetch('head'), checkout: target)

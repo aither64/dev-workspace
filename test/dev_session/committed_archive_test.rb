@@ -106,6 +106,34 @@ class DevSessionTest < Minitest::Test
       assert_empty WorkspaceTrackingSummaries.prune(tracking, apply: true)
     end
   end
+  def test_workspace_sparse_checkout_omits_tracking_before_materialization
+    with_workspace do |workspace|
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      FileUtils.mkdir_p(File.join(workspace, 'archive', 'old'))
+      FileUtils.mkdir_p(File.join(workspace, 'work', 'active'))
+      File.write(File.join(workspace, 'archive', 'old', 'raw.log'), 'bulk')
+      File.write(File.join(workspace, 'work', 'active', 'state.md'), 'tracking')
+      File.write(File.join(workspace, 'flake.nix'), '{}')
+      assert_git_success('git', '-C', workspace, 'add', '.')
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'sparse fixture')
+      target = File.join(workspace, 'feature')
+      assert_git_success('git', '-C', workspace, 'worktree', 'add', '--no-checkout', '--detach', target, 'HEAD')
+      commands = DevSession::CommandRunner.new(out: StringIO.new, err: StringIO.new)
+      WorkspaceSourceCheckout.configure(target, ->(argv, **options) { commands.capture(argv, **options) }, initialize_index: true)
+      assert File.file?(File.join(target, 'flake.nix'))
+      refute File.exist?(File.join(target, 'archive'))
+      refute File.exist?(File.join(target, 'work'))
+      assert_empty git_capture_success('git', '-C', target, 'status', '--porcelain')
+      assert File.file?(File.join(workspace, 'archive', 'old', 'raw.log'))
+      File.write(File.join(target, 'flake.nix'), '{ changed = true; }')
+      assert_git_success('git', '-C', target, 'add', 'flake.nix')
+      before = git_capture_success('git', '-C', target, 'ls-files', '--stage')
+      WorkspaceSourceCheckout.configure(target, ->(argv, **options) { commands.capture(argv, **options) })
+      assert_equal before, git_capture_success('git', '-C', target, 'ls-files', '--stage')
+      assert_equal '{ changed = true; }', File.read(File.join(target, 'flake.nix'))
+    end
+  end
 
   def test_completed_legacy_archive_compacts_before_discarding_file_payloads
     with_archive_cleanup_fixture do |runner, workspace, slug, _common, checkout|
@@ -140,6 +168,29 @@ class DevSessionTest < Minitest::Test
       assert_equal advanced.strip, git_capture_success('git', "--git-dir=#{common}", 'rev-parse', branch).strip
       _out, _error, status = Open3.capture3('git', '-C', checkout, 'symbolic-ref', '--quiet', 'HEAD')
       refute status.success?
+    end
+  end
+
+  def test_committed_workspace_revival_keeps_tracking_out_of_the_checkout
+    with_workspace do |workspace|
+      slug = '2026-06-06-compact-workspace'
+      runner = archive_runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      commit_archive_fixture(workspace, slug, lifecycle: 'active')
+      FileUtils.mkdir_p(File.join(workspace, 'archive', 'historical'))
+      File.write(File.join(workspace, 'archive', 'historical', 'raw.log'), 'historical bulk')
+      File.write(File.join(workspace, 'flake.nix'), '{}')
+      assert_git_success('git', '-C', workspace, 'add', 'archive', 'flake.nix')
+      assert_git_success('git', '-C', workspace, 'commit', '-m', 'workspace source fixture')
+      configure_workspace_origin(workspace)
+      runner.worktree_add(slug, 'workspace', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+      checkout = File.join(workspace, 'worktrees', slug, 'workspace')
+      runner.archive(slug, as_is: true, explicit: true)
+      runner.revive(slug, as_is: true)
+      assert File.file?(File.join(checkout, 'flake.nix'))
+      refute File.exist?(File.join(checkout, 'work'))
+      refute File.exist?(File.join(checkout, 'archive'))
+      assert File.file?(File.join(workspace, 'archive', 'historical', 'raw.log'))
     end
   end
 
