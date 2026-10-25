@@ -661,7 +661,8 @@ socket generation or explicit stop also clears a pending decision. A lost
 activation response retains the same receipt for retry.
 
 Native connection failures and request deadlines cross the helper boundary as
-`transport_unavailable` observations or exit status 75. The recovery coordinator
+`transport_unavailable` observations or exit status 75. Busy session or creation
+locks during `dev-session resume` also return exit status 75. The recovery coordinator
 retries them after its backoff. Identity, lifecycle and malformed-state refusals
 require explicit Retry after repair.
 

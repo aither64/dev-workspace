@@ -1424,6 +1424,10 @@ module DevSession
           @out.puts "session restored; saved work is waiting: #{slug}"
         end
       end
+    rescue SessionBusyError => e
+      # Recovery retries ordinary admission contention through exit 75 rather
+      # than retaining it as an identity failure that requires manual repair.
+      raise TemporaryRecoveryError, e.message
     end
 
     def require_recovery_transport!(observation)

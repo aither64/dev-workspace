@@ -191,6 +191,35 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_cold_resume_retries_lock_contention_without_changing_retained_identity
+    [File::LOCK_SH, File::LOCK_EX].each do |mode|
+      with_workspace do |workspace|
+        slug = '2026-06-06-cold-contended'
+        runner, calls, = ordinary_retained_runner_fixture(workspace, slug)
+        manifest = File.join(workspace, 'work', slug, 'portal.yml')
+        before = File.binread(manifest)
+        lock_path = runner.send(:session_lock_file, slug)
+        File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |holder|
+          assert(holder.flock(mode | File::LOCK_NB))
+          error = assert_raises(DevSession::TemporaryRecoveryError) do
+            runner.resume(slug, as_is: true)
+          end
+          assert_includes(error.message, 'another dev-session command is changing')
+          assert_equal(before, File.binread(manifest))
+          refute(File.exist?(runner.send(:start_journal_file, slug)))
+          refute(File.exist?(File.join(workspace, 'authority', slug + '.json')))
+          refute(File.exist?(calls), 'contention reached a native operation')
+          holder.flock(File::LOCK_UN)
+          runner.resume(slug, as_is: true)
+        end
+        authority = JSON.parse(File.read(File.join(workspace, 'authority', slug + '.json')))
+        assert_equal('ready', authority.fetch('state'))
+        assert_equal('retained-root', authority.fetch('codex_thread_id'))
+        refute(File.exist?(runner.send(:start_journal_file, slug)))
+      end
+    end
+  end
+
   def test_creationless_revive_preserves_root_scope_and_absence_of_creation
     skip 'git is not available' unless command_available?('git')
 
