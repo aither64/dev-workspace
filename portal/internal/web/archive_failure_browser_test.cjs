@@ -4,8 +4,9 @@ const {chromium, firefox, expect} = require("@playwright/test");
 (async () => {
   for (const engine of [chromium, firefox]) {
     const browser = await engine.launch({headless: true, ...(engine === chromium ? {channel: "chromium"} : {})});
+    let page;
     try {
-      const page = await browser.newPage({ignoreHTTPSErrors: true});
+      page = await browser.newPage({ignoreHTTPSErrors: true});
       const errors = [];
       page.on("pageerror", error => { errors.push(error.message); console.error("Page error:", error.stack); });
       page.on("requestfailed", request => console.error("Request failed:", request.url(), request.failure()));
@@ -17,6 +18,7 @@ const {chromium, firefox, expect} = require("@playwright/test");
       let reads = 0, offline = false, held = false, release;
       let detailsMode = "actual", mutations = 0;
       let operationReads = 0, holdOperation = false, releaseOperation;
+      let racingRead = 0, releaseBackground, releaseDetails, holdRetryDetails = false;
       let documents = 0, clearNextDocument = false;
       let operation = {kind: "archive", state: "paused", phase: "tracking_committed", receiptId: "receipt-1",
         startedAt: "2026-09-16T13:02:17Z", updatedAt: "2026-09-16T13:02:17Z",
@@ -47,8 +49,16 @@ const {chromium, firefox, expect} = require("@playwright/test");
           else payload.pendingLifecycle = "";
           return json(payload);
         }
+        if (method === "details" && holdRetryDetails) {
+          holdRetryDetails = false;
+          await new Promise(resolve => { releaseDetails = resolve; });
+        }
         if (method === "operation") {
           operationReads++;
+          if (racingRead && operationReads === racingRead) {
+            await new Promise(resolve => { releaseBackground = resolve; });
+            return json({...operation, error: "Background status refreshed"});
+          }
           if (holdOperation) {
             holdOperation = false;
             await new Promise(resolve => { releaseOperation = resolve; });
@@ -249,6 +259,37 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await expect.poll(() => operationReads).toBeGreaterThanOrEqual(4);
       await expect(page.locator("#lifecycle-operation-retry")).toBeHidden();
       assert.equal(mutations, 0, "completed archive issued a mutation");
+
+      // A background refresh of the same receipt must not cancel Retry's
+      // in-flight journal check. A different receipt must still cancel it.
+      for (const changedReceipt of [false, true]) {
+        detailsMode = "actual";
+        clearNextDocument = false;
+        operation = {kind: "archive", state: "failed", receiptId: "receipt-1",
+          options: {journalId: "a".repeat(64), journalExpected: true}};
+        operationReads = 0;
+        racingRead = 2;
+        releaseBackground = releaseDetails = null;
+        await page.goto(process.argv[2] + "/example/");
+        await expect(page.locator("#lifecycle-operation-retry")).toBeVisible();
+        await expect.poll(() => Boolean(releaseBackground)).toBe(true);
+        holdRetryDetails = true;
+        await page.locator("#lifecycle-operation-retry").click();
+        await expect.poll(() => Boolean(releaseDetails)).toBe(true);
+        if (changedReceipt) operation = {...operation, receiptId: "receipt-2"};
+        releaseBackground();
+        await expect(operationDetail).toContainText("Background status refreshed");
+        releaseDetails();
+        if (changedReceipt) {
+          await expect(page.locator("#archive-session-open")).toBeEnabled();
+          assert.equal(mutations, 0, "changed receipt issued a mutation");
+        } else {
+          await expect.poll(() => mutations).toBe(1);
+          await expect(page.locator("#archive-session-open")).toBeEnabled();
+          mutations = 0;
+        }
+        racingRead = 0;
+      }
       await page.route("**/api/index-status*", async route => {
         const response = await route.fetch(), payload = await response.json();
         payload.authoritative = true;
@@ -260,6 +301,9 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await expect(page.locator('[data-session-slug="example"] [data-session-lifecycle]')).toBeHidden();
       assert.deepEqual(errors, []);
       console.log(engine.name() + ": archive diagnostics, throttling, recovery and read-only state passed");
-    } finally { await browser.close(); }
+    } finally {
+      await page?.unrouteAll({behavior: "ignoreErrors"});
+      await browser.close();
+    }
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

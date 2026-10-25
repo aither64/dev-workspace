@@ -3036,6 +3036,10 @@
   let lifecyclePollTimer = null;
   let lastLifecycleOperation = {state: pendingLifecycle ? "idle" : "idle"};
   let archivePageReloading = false, archiveCompletionRead = null;
+  // Polling decodes a new object even for the same retry authority. Diagnostic
+  // text/timestamps may refresh while the journal check is in flight.
+  const lifecycleRetryState = ({kind, receiptId, state, phase, code, options, currentTarget}) =>
+    JSON.stringify({kind, receiptId, state, phase, code, options, currentTarget});
   const reconcileCompletedArchive = payload => {
     if (archivePageReloading) return true;
     const target = payload?.currentTarget;
@@ -3056,10 +3060,10 @@
     if (pendingLifecycle !== "archive") return false;
     if (pageReads.paused || pageLeaving) throw new DOMException("Archive status check was canceled.", "AbortError");
     if (!archiveCompletionRead) {
-      const observedOperation = lastLifecycleOperation;
+      const observedOperation = lifecycleRetryState(lastLifecycleOperation);
       const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
       archiveCompletionRead = client.details({signal: read.signal}).then(payload => {
-        if (!read.isCurrent() || lastLifecycleOperation !== observedOperation) {
+        if (!read.isCurrent() || lifecycleRetryState(lastLifecycleOperation) !== observedOperation) {
           throw new DOMException("Archive status check was canceled.", "AbortError");
         }
         return reconcileCompletedArchive(payload);

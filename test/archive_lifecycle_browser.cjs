@@ -65,7 +65,7 @@ assert(["archive", "revive", "retry"].includes(action));
     assert.deepEqual(errors, []);
     process.stdout.write(JSON.stringify(operation) + "\n");
   } catch (error) {
-    const controls = page ? await page.locator("#archive-session-open, #revive-session-open, " +
+    const controls = page ? await page.locator("#archive-session-open, #revive-session-open, #lifecycle-operation-retry, " +
       "#lifecycle-operation-status, #session-details-warning, dialog[open]")
       .evaluateAll(elements => elements.map(element => element.outerHTML.slice(0, 1200))) : [];
     console.error(JSON.stringify({phase, errors, requests: requests.slice(-40), controls}));
