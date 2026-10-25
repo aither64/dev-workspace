@@ -110,10 +110,14 @@ module DevSession
       manifest = load_portal_manifest(File.join(archive_dir(slug), PORTAL_MANIFEST), required: true, expected_slug: slug)
       return false if manifest['archive_operation_id'] && manifest['archive_operation_id'] != receipt['operation_id']
 
-      unless tracking_tree_matches?(archive_dir(slug), receipt.fetch('target_sha256'))
-        raise Error, "locally archived tracking changed: #{slug}"
-      end
-      true
+      return true if tracking_tree_matches?(archive_dir(slug), receipt.fetch('target_sha256'))
+
+      # Completed receipts describe their original transition. Later committed
+      # archive maintenance must prove its current bytes through ordinary Git
+      # validation; an unfinished local transition still requires its digest.
+      return false if receipt['state'] == 'synced'
+
+      raise Error, "locally archived tracking changed: #{slug}"
     end
 
     def discard_tracking_sync!(slug)

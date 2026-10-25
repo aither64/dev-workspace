@@ -207,6 +207,34 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_committed_archive_inventory_requires_policy_three
+    with_transition_host do |host, paths|
+      package = make_package(paths.fetch(:root), 'committed-archive-contract')
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path))
+      state = host.instance_variable_get(:@state)
+      record = File.join(state, 'archived-worktrees', 'workspace', 'session', 'operation', 'inventory.json')
+      FileUtils.mkdir_p(File.dirname(record))
+      File.write(record, JSON.generate('schema' => 3))
+      contract['archiveRecoveryPolicy'] = 2
+      File.write(path, JSON.generate(contract))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_archive_recovery!, package) }
+      contract['archiveRecoveryPolicy'] = 3
+      File.write(path, JSON.generate(contract))
+      host.send(:require_compatible_archive_recovery!, package)
+      File.write(record, JSON.generate('schema' => 2))
+      host.send(:require_compatible_archive_recovery!, package)
+      partial = File.join(File.dirname(record), 'checkout', 'record.json')
+      FileUtils.mkdir_p(File.dirname(partial))
+      File.write(partial, JSON.generate('format' => 3))
+      contract['archiveRecoveryPolicy'] = 2
+      File.write(path, JSON.generate(contract))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_archive_recovery!, package) }
+      File.unlink(record)
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_archive_recovery!, package) }
+    end
+  end
+
   def test_sensitive_sessions_require_a_capable_candidate
     with_transition_host do |host, paths|
       old = make_package(paths.fetch(:root), 'without-sensitive-support')

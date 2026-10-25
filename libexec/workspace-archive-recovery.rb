@@ -13,7 +13,38 @@ module DevSession
       @progress = progress
     end
 
+    # Existing partial captures keep their original policy. Fresh archives keep
+    # only committed objects; ignored build output is deliberately disposable.
     def capture!(records)
+      legacy = File.file?(File.join(@root, 'inventory.json')) &&
+        JSON.parse(File.binread(File.join(@root, 'inventory.json')))['schema'] != 3
+      legacy ||= Dir[File.join(@root, '*', 'record.json')].any? do |path|
+        JSON.parse(File.binread(path))['format'] != 3
+      end
+      return capture_legacy!(records) if legacy
+
+      FileUtils.mkdir_p(@root, mode: 0o700)
+      File.chmod(0o700, @root)
+      records.each do |record|
+        destination = File.join(@root, Digest::SHA256.hexdigest(record.fetch('path')))
+        if File.file?(File.join(destination, 'record.json'))
+          verify_checkout!(record)
+          next
+        end
+        FileUtils.mkdir_p(destination, mode: 0o700)
+        ref = "refs/dev-session-archives/#{File.basename(@root)}/#{File.basename(destination)}/head"
+        git(record, 'update-ref', ref, record.fetch('head'))
+        saved = record.slice('path', 'common_dir', 'head', 'branch').merge(
+          'format' => 3, 'kind' => 'committed', 'head_ref' => ref
+        )
+        verify_snapshot!(saved, destination)
+        write_json(File.join(destination, 'record.json'), saved)
+        verify_checkout!(record)
+      end
+      write_json(File.join(@root, 'inventory.json'), { 'schema' => 3, 'worktrees' => records })
+    end
+
+    def capture_legacy!(records)
       FileUtils.mkdir_p(@root, mode: 0o700)
       File.chmod(0o700, @root)
       records.each do |record|
@@ -84,9 +115,39 @@ module DevSession
       write_json(File.join(@root, 'inventory.json'), { 'schema' => 2, 'worktrees' => records })
     end
 
+    # Explicit maintenance of an already completed archive. The caller excludes
+    # lifecycle writers. Publish committed recovery before removing old payloads,
+    # so interruption leaves either the old restore or the new committed restore.
+    def compact!
+      inventory = JSON.parse(File.binread(File.join(@root, 'inventory.json')))
+      unless [1, 2, 3].include?(inventory['schema']) && inventory['worktrees'].is_a?(Array)
+        raise Error, 'invalid archive recovery inventory'
+      end
+      prepared = inventory.fetch('worktrees').map do |record|
+        saved, destination = read_record(record)
+        ref = saved['head_ref'] || "refs/dev-session-archives/#{File.basename(@root)}/#{File.basename(destination)}/head"
+        git(record, 'update-ref', ref, record.fetch('head'))
+        compact = record.slice('path', 'common_dir', 'head', 'branch').merge(
+          'format' => 3, 'kind' => 'committed', 'head_ref' => ref
+        )
+        verify_snapshot!(compact, destination)
+        [destination, compact]
+      end
+      # Publish the capability requirement first. A partial conversion may still
+      # contain old records, which policy 3 can restore; policy 2 must refuse it.
+      write_json(File.join(@root, 'inventory.json'), inventory.merge('schema' => 3))
+      prepared.each { |destination, compact| write_json(File.join(destination, 'record.json'), compact) }
+      inventory.fetch('worktrees').each do |record|
+        _saved, destination = read_record(record)
+        Dir.children(destination).each do |name|
+          FileUtils.rm_rf(File.join(destination, name)) unless name == 'record.json'
+        end
+      end
+    end
+
     def records
       inventory = JSON.parse(File.binread(File.join(@root, 'inventory.json')))
-      unless [1, 2].include?(inventory['schema']) && inventory['worktrees'].is_a?(Array)
+      unless [1, 2, 3].include?(inventory['schema']) && inventory['worktrees'].is_a?(Array)
         raise Error, 'invalid archive recovery inventory'
       end
       inventory.fetch('worktrees').each do |record|
@@ -105,6 +166,13 @@ module DevSession
       @progress&.call('verifying checkout', record.fetch('path'))
       saved, destination = read_record(record)
       source = File.join(@group, record.fetch('path'))
+      if saved['kind'] == 'committed'
+        unless capture(['git', '-C', source, 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip == saved.fetch('common_dir') &&
+               capture(['git', '-C', source, 'rev-parse', 'HEAD']).strip == saved.fetch('head')
+          raise Error, "archive committed checkout changed: #{source}"
+        end
+        return verify_snapshot!(saved, destination)
+      end
       unless tree_digest(source, excludes: ['.git']) == saved.fetch('files_sha256') &&
              tree_digest(record.fetch('admin_dir'), excludes: ADMIN_EXCLUDES) == saved.fetch('admin_sha256')
         raise Error, "worktree changed after archive recovery capture: #{source}"
@@ -118,6 +186,12 @@ module DevSession
     end
 
     def verify_snapshot!(saved, destination)
+      if saved['kind'] == 'committed'
+        unless git(saved, '--no-replace-objects', 'rev-parse', '--verify', saved.fetch('head_ref')).strip == saved.fetch('head')
+          raise Error, "archive committed head changed: #{destination}"
+        end
+        return verify_git_objects!(saved)
+      end
       files_match = if saved['kind'] == 'git'
                       git(saved, '--no-replace-objects', 'rev-parse', '--verify', saved.fetch('head_ref')).strip == saved.fetch('head') &&
                         verify_git_objects!(saved)
@@ -176,7 +250,12 @@ module DevSession
       admin = File.realpath(File.expand_path(capture(['git', '-C', target, 'rev-parse', '--git-dir']).strip, target))
       # Restoration owns this newly created checkout. Replacing its files never
       # resets another user's checkout or a shared repository index.
-      if saved['kind'] == 'git'
+      if saved['kind'] == 'committed'
+        # The restoration intent owns this new checkout until its receipt.
+        # No predecessor index, conflict state or ignored files are restored.
+        git(saved, 'reset', '--hard', saved.fetch('head'), checkout: target)
+        git(saved, 'clean', '-ffdx', checkout: target)
+      elsif saved['kind'] == 'git'
         # The private intent owns this incomplete checkout until restored.json.
         # Rebuild raw bytes on every retry, independent of checkout filters.
         Dir.children(target).each { |name| FileUtils.rm_rf(File.join(target, name)) unless name == '.git' }
@@ -186,13 +265,13 @@ module DevSession
         Dir.children(target).each { |name| FileUtils.rm_rf(File.join(target, name)) unless name == '.git' }
         copy_contents(File.join(destination, 'files'), target)
       end
-      copy_contents(File.join(destination, 'admin'), admin)
+      copy_contents(File.join(destination, 'admin'), admin) unless saved['kind'] == 'committed'
       unless restored?(record, saved)
         raise Error, "archive recovery restore verification failed: #{target}"
       end
       sync_tree(target, excludes: ['.git'])
       sync_tree(admin, excludes: ADMIN_EXCLUDES)
-      write_json(receipt, { 'path' => record.fetch('path'), 'files_sha256' => saved.fetch('files_sha256') })
+      write_json(receipt, { 'path' => record.fetch('path'), 'files_sha256' => saved['files_sha256'] })
       File.unlink(restoring)
       File.open(destination, File::RDONLY) { |directory| directory.fsync }
     end
@@ -339,6 +418,10 @@ module DevSession
       target = File.join(@group, record.fetch('path'))
       return false unless File.directory?(target) && !File.symlink?(target)
 
+      if saved['kind'] == 'committed'
+        return capture(['git', '-C', target, 'rev-parse', 'HEAD']).strip == record.fetch('head') &&
+          capture(['git', '-C', target, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching']).empty?
+      end
       admin = File.realpath(File.expand_path(capture(['git', '-C', target, 'rev-parse', '--git-dir']).strip, target))
       capture(['git', '-C', target, 'rev-parse', 'HEAD']).strip == record.fetch('head') &&
         tree_digest(target, excludes: ['.git']) == saved.fetch('files_sha256') &&
@@ -348,7 +431,7 @@ module DevSession
     def read_record(record)
       destination = File.join(@root, Digest::SHA256.hexdigest(record.fetch('path')))
       saved = JSON.parse(File.binread(File.join(destination, 'record.json')))
-      if saved.key?('format') && (saved['format'] != 2 || !%w[git files].include?(saved['kind']))
+      if saved.key?('format') && !((saved['format'] == 2 && %w[git files].include?(saved['kind'])) || (saved['format'] == 3 && saved['kind'] == 'committed'))
         raise Error, 'unsupported archive recovery record format'
       end
       if saved['kind'] == 'git' && !saved['permissions'].is_a?(Hash)

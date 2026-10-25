@@ -21,6 +21,7 @@ require_relative 'workspace-auto-archive'
 require_relative 'workspace-archive-cleanup'
 require_relative 'workspace-archive-recovery'
 require_relative 'workspace-tracking-sync'
+require_relative 'workspace-tracking-summaries'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -2081,6 +2082,9 @@ module DevSession
               )
               announce_lifecycle_phase('archive', 'prepared')
             else
+              # Archive projection changes activity dimensions. Apply it only
+              # after the final eligibility guard, before sealing tracking.
+              WorkspaceTrackingSummaries.prune(work_dir(slug), apply: true)
               journal = prepare_archive_journal!(
                 slug, mode, proven_heads, plan, operation_id:, cleanup:, inventory:
               )
@@ -8025,7 +8029,7 @@ module DevSession
                           when 'abandoned'
                             "Record the explicitly abandoned session and retire its active tracking.\n"
                           when 'archived'
-                            "Record the explicitly archived session and retain local work for revival.\n"
+                            "Record the explicitly archived session and retain committed heads for revival.\n"
                           else
                             "Record the completed session after verifying its feature heads are merged.\n"
                           end)
@@ -10250,7 +10254,7 @@ module DevSession
         warnings = if opts.fetch(:abandoned)
                      ['This explicitly discards the initiative without requiring merged feature heads.']
                    else
-                     ['Local changes are saved for revival; owned worktrees are removed and active agents are stopped.']
+                     ['Uncommitted changes and build output are deleted. Committed Git heads are retained for revival; active agents are stopped.']
                    end
         authorize_yes_no!(
           slug,

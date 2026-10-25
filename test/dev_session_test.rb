@@ -30,3 +30,5 @@ require_relative 'dev_session/ordinary_readiness_test'
 require_relative 'dev_session/sensitive_test'
 
 require_relative 'dev_session/lifecycle_access_test'
+
+require_relative 'dev_session/committed_archive_test'

@@ -8,7 +8,7 @@
   "sessionRecoveryPolicy": 1,
   "turnRetryStateSchema": 1,
   "turnRetrySessionPolicy": 1,
-  "archiveRecoveryPolicy": 2,
+  "archiveRecoveryPolicy": 3,
   "trackingSyncPolicy": 1,
   "archiveExecutionPolicy": 1,
   "codexProviderStateSchema": 1,

@@ -31,6 +31,24 @@ journal after closing the terminal from which it was invoked; closed-terminal
 status output does not interrupt completion.
 
 Git-registered checkouts beneath the exact session group belong to canonical bare
+repositories or the shared workspace repository. Explicit archival pins their
+committed heads under `refs/dev-session-archives/` and removes the checkouts,
+including staged, unstaged, untracked and ignored files. Commit changes before
+archiving if they must survive. Branches remain available. A small schema-3
+inventory records repository, checkout, branch and committed head for revival;
+there are no file or index snapshots. Revival recreates a clean checkout at that
+head, attaching an unchanged branch or using a detached head if the branch moved.
+
+Tracking retains Markdown files and portal.yml manifests. Other files and their
+artifact registrations are removed before a fresh operation seals its tracking
+checksum. Existing sealed operations keep their original contents and policy.
+
+### Predecessor file-snapshot archives
+
+The following file/index capture behavior applies only to inventories written
+by predecessor packages and their interrupted operations.
+
+Git-registered checkouts beneath the exact session group belong to canonical bare
 repositories or the shared workspace repository. This includes nested containers
 and detached or locked checkouts. Explicit archival does not fetch, compare published heads,
 require merged work or require clean checkouts. It pins checkout heads and index
@@ -51,19 +69,22 @@ Stop external editors and builds before archival: session locks cannot stop an
 unmanaged writer. A failed filesystem copy or removal leaves the operation
 retryable with its recovery contents retained.
 
+### Journals and revival
+
 Installed workspaces write schema-4 archive journals and schema-3 cleanup
 sidecars. Their `tracking_saved` phase proves a durable local tracking transition;
 Git synchronization runs separately. Schema-2/3 archive journals keep their
-commit prerequisite. Recovery inventories accept full-copy schema 1 and schema 2,
-whose records distinguish Git reconstruction from full copies. Finalized
-manifests remain schema 3. The manifest's `archive_operation_id` selects private
+commit prerequisite. Recovery inventories accept predecessor schemas 1 and 2,
+whose records distinguish Git reconstruction from full copies, and committed-only
+schema 3. Finalized manifests remain schema 3. The manifest's `archive_operation_id` selects private
 recovery without exposing local storage paths. A registration with no available
 local head stays recorded without an invented final SHA. Existing schema-2
 complete/abandoned journals keep their saved policy on retry.
 
 Installed workspaces write schema-5 revival journals with the same local tracking
 milestone. Older schema-3/4 journals retain synchronous bookkeeping. Before starting the retained
-conversation, it recreates each saved checkout and restores its files and Git
+conversation, it recreates each saved checkout. Schema-3 inventories restore
+committed content only; predecessor inventories restore their saved files and Git
 index. An unchanged retained branch is attached again; an advanced or missing
 branch produces a detached checkout at the saved head without resetting a shared
 ref. Restoration has private intent and completion receipts and can resume after
@@ -180,7 +201,9 @@ backoff and release lifecycle locks. Revival coalesces the receipt under the
 session lock; deletion removes it after its own transition finishes. Sensitive
 sessions do not enqueue Git tracking.
 
-New capture and receipt formats require the matching `archiveRecoveryPolicy`,
+Committed-only inventories require `archiveRecoveryPolicy: 3`; this reader
+also supports predecessor inventories. New capture and receipt formats require
+the matching `archiveRecoveryPolicy`,
 `trackingSyncPolicy` and `archiveExecutionPolicy` runtime capabilities. Package
 selection and activation refuse a target that cannot read retained state. Keep
 recovery and receipts when recovering forward; do not remove them to select an

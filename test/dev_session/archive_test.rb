@@ -69,7 +69,7 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-threadless-residue'
       runner = archive_runner_for(workspace)
       runner.ensure_tracking_files(slug)
-      File.write(File.join(workspace, 'work', slug, 'conversation-residue'), 'unknown native conversation fixture')
+      File.write(File.join(workspace, slug + '.conversation-residue'), 'unknown native conversation fixture')
       commit_archive_fixture(workspace, slug, lifecycle: 'active')
       configure_workspace_origin(workspace)
       assert_raises(WorkspaceAutoArchive::ObservationFailure) { runner.archive(slug, as_is: true) }
@@ -90,7 +90,7 @@ class DevSessionTest < Minitest::Test
           FileUtils.mkdir_p(File.dirname(roster))
           File.write(roster, '{}')
         else
-          File.write(File.join(workspace, 'work', slug, 'conversation-residue'), 'loaded conversation')
+          File.write(File.join(workspace, slug + '.conversation-residue'), 'loaded conversation')
         end
         commit_archive_fixture(workspace, slug, lifecycle: 'active')
         configure_workspace_origin(workspace)

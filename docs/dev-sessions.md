@@ -741,10 +741,12 @@ dev-session archive api-token-rotation
 The CLI asks for one yes/no confirmation; the browser has one Archive action.
 Explicit archival writes `lifecycle: archived`. It stops active owned agents,
 pauses active goals, saves queued prompt records, releases development clusters,
-saves local checkout contents for revival, removes owned worktrees, moves tracking
+retains committed Git heads, deletes local checkout contents, moves tracking
 into `archive/`, and retires the session runtime. It preserves conversations and
 Git branches. Unmerged, unpublished, detached and dirty work do not prevent
-explicit closure. Snapshot capture and verified ownership protect local recovery.
+explicit closure. Staged, unstaged, untracked and ignored files are deleted.
+Commit any work that must survive before confirming Archive. Tracking retains
+Markdown explanations and portal.yml manifests; raw supporting artifacts are removed.
 
 Plan and state need an earlier tracking commit. Stop external editors and builds
 that can still write into a worktree. In an installed workspace, archival finishes
@@ -870,7 +872,8 @@ and Codex identity.
 
 When the archive retains a Codex thread, revive restores and starts that exact
 conversation without forking it or resending the initial request. Explicit
-archives restore their saved worktrees and local changes before starting it.
+archives recreate clean worktrees at their retained committed heads before
+starting it. Earlier file-snapshot archives retain their recorded restoration policy.
 Older complete/abandoned archives do not recreate worktrees. Creation-less ordinary archives preserve the same root and do
 not gain invented creation/goal evidence. Verified threadless archives revive
 without creating a conversation. Unknown historical bases remain omitted;

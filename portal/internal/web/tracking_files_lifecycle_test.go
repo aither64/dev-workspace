@@ -74,6 +74,12 @@ func TestTrackingFilesArchiveRevive(t *testing.T) {
 				}
 			}
 			for name, data := range fixtures {
+				if phase != "active" && !strings.HasSuffix(name, ".md") {
+					if listed[name] {
+						t.Fatalf("%s retained disposable artifact %s", phase, name)
+					}
+					continue
+				}
 				if !listed[name] {
 					t.Fatalf("%s missing %s", phase, name)
 				}

@@ -377,6 +377,10 @@ buildGoModule {
       "$out/libexec/workspace-archive-recovery.rb"
     ln -s ../workspace-archive-recovery.rb \
       "$out/libexec/workspace-portal/workspace-archive-recovery.rb"
+    for name in workspace-tracking-summaries; do
+      install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
+      ln -s "../$name.rb" "$out/libexec/workspace-portal/$name.rb"
+    done
     install -Dm644 ${src}/libexec/workspace-tracking-sync.rb \
       "$out/libexec/workspace-tracking-sync.rb"
     ln -s ../workspace-tracking-sync.rb \

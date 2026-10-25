@@ -40,7 +40,7 @@ class DevSessionTest < Minitest::Test
           file.puts JSON.generate('args' => ARGV, 'tracking' => cwd,
             'journal_present' => File.exist?(File.join(workspace, 'worktrees', '.locks', slug + '.archive.json')))
         end
-        abort 'unknown conversation fixture' if File.exist?(File.join(cwd, 'conversation-residue'))
+        abort 'unknown conversation fixture' if File.exist?(File.join(workspace, slug + '.conversation-residue'))
         stat = File.lstat(cwd)
         identity = Digest::SHA256.hexdigest(JSON.generate(['session-observation-v1', workspace, slug, stat.dev, stat.ino, nil]))
         puts JSON.generate('schema' => 1, 'workspace' => workspace, 'slug' => slug, 'identity' => identity,

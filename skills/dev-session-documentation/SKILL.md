@@ -26,8 +26,9 @@ point.
 
 Save useful session files beneath `work/<slug>/` and link them from the session
 records. They appear automatically in Files, including Git-ignored and
-unregistered regular files. After archival, Files uses the preserved
-`archive/<slug>/` root with the same session-relative URLs. File registration is
+unregistered regular files. After archival, Files uses `archive/<slug>/` with the same session-relative URLs
+for retained Markdown files and portal.yml. Raw logs, generated clients and other
+supporting artifacts are disposable and are removed during archival. File registration is
 unnecessary; `dev-session artifact add` only prints a notice and changes no files.
 
 For a sensitive session, keep its plan, state, notes, review evidence and handoff

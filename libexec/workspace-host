@@ -2962,18 +2962,24 @@ module DevWorkspaceHost
     def require_compatible_archive_recovery!(package)
       tracking = Dir.glob(File.join(@state, 'tracking-sync', '*', '*.json'))
       inventories = Dir.glob(File.join(@state, 'archived-worktrees', '*', '*', '*', 'inventory.json'))
-      git_recovery = inventories.any? do |path|
+      recovery_schemas = inventories.map do |path|
         value = parse_strict_json_object(File.binread(path), 'archive recovery inventory', 8 * 1024 * 1024)
-        value['schema'] == 2
+        value['schema']
       end
+      git_recovery = recovery_schemas.include?(2)
+      committed_recovery = recovery_schemas.include?(3) ||
+        Dir.glob(File.join(@state, 'archived-worktrees', '*', '*', '*', '*', 'record.json')).any? do |path|
+          parse_strict_json_object(File.binread(path), 'archive recovery record', 8 * 1024 * 1024)['format'] == 3
+        end
       execution = Dir.glob(File.join(@state, 'portal', '*', 'lifecycle-operations.json')).any? do |path|
         parse_strict_json_object(File.binread(path), 'portal lifecycle receipts', 256 * 1024)['schema'] == 2
       end
-      return if tracking.empty? && !git_recovery && !execution
+      return if tracking.empty? && !git_recovery && !committed_recovery && !execution
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'archive recovery contract', 64 * 1024)
-      unless (!git_recovery || contract['archiveRecoveryPolicy'] == 2) &&
+      unless (!git_recovery || [2, 3].include?(contract['archiveRecoveryPolicy'])) &&
+             (!committed_recovery || contract['archiveRecoveryPolicy'] == 3) &&
              (tracking.empty? || contract['trackingSyncPolicy'] == 1) &&
              (!execution || contract['archiveExecutionPolicy'] == 1)
         raise Error, 'target workspace package cannot preserve local archive recovery and pending tracking'

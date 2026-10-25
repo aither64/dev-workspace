@@ -148,8 +148,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_git_archive_restore_repopulates_interrupted_checkout_without_filters
+  def test_legacy_git_archive_restore_repopulates_interrupted_checkout_without_filters
     with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      enable_legacy_archive_capture(runner)
       File.write(File.join(checkout, '.gitattributes'), "README.md filter=changed\n")
       assert_git_success('git', '-C', checkout, 'add', '.gitattributes')
       assert_git_success('git', '-C', checkout, 'commit', '-m', 'raw clean fixture')
@@ -262,8 +263,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_clean_archive_uses_git_recovery_and_preserves_permissions_and_empty_directories
+  def test_legacy_clean_archive_uses_git_recovery_and_preserves_permissions_and_empty_directories
     with_archive_cleanup_fixture do |runner, workspace, slug, common, _feature|
+      enable_legacy_archive_capture(runner)
       checkout = File.join(workspace, 'worktrees', slug, 'sample')
       file = Dir.glob(File.join(checkout, '*')).find { |path| File.file?(path) }
       File.chmod(0o640, file)
@@ -299,8 +301,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_explicit_archive_retains_conflicted_index_and_working_contents
+  def test_legacy_explicit_archive_retains_conflicted_index_and_working_contents
     with_archive_cleanup_fixture do |runner, _workspace, slug, _common, checkout|
+      enable_legacy_archive_capture(runner)
       objects = %w[base ours theirs].map do |content|
         stdout, stderr, status = Open3.capture3('git', '-C', checkout, 'hash-object', '-w', '--stdin', stdin_data: content)
         assert(status.success?, stderr)
@@ -320,8 +323,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_git_clean_filtered_content_keeps_a_full_recovery_snapshot
+  def test_legacy_git_clean_filtered_content_keeps_a_full_recovery_snapshot
     with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
+      enable_legacy_archive_capture(runner)
       clean = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('working', 'stored'))"].shelljoin
       smudge = [RbConfig.ruby, '-e', "STDOUT.write(STDIN.read.gsub('stored', 'working'))"].shelljoin
       assert_git_success('git', '-C', checkout, 'config', 'filter.example.clean', clean)
@@ -1014,8 +1018,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_explicit_archive_recovers_dirty_unpublished_checkout_and_detached_auxiliary
+  def test_legacy_explicit_archive_recovers_dirty_unpublished_checkout_and_detached_auxiliary
     with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
+      enable_legacy_archive_capture(runner)
       File.write(File.join(feature, 'staged'), "staged content\n")
       assert_git_success('git', '-C', feature, 'add', 'staged')
       File.write(File.join(feature, 'staged'), "working content\n")
@@ -1048,9 +1053,10 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_explicit_archive_retry_preserves_saved_policy_after_forced_removal
+  def test_legacy_explicit_archive_retry_preserves_saved_policy_after_forced_removal
     %w[active complete].each do |lifecycle|
       with_archive_cleanup_fixture(lifecycle:) do |runner, workspace, slug, _common, feature|
+        enable_legacy_archive_capture(runner)
         File.write(File.join(feature, 'untracked'), 'recover me')
         runner.define_singleton_method(:commit_tracking_transition!) { |*, **| raise DevSession::Error, 'pause before commit' }
         error = assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
@@ -1075,9 +1081,10 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_explicit_archive_revives_completed_and_abandoned_sources_with_local_changes
+  def test_legacy_explicit_archive_revives_completed_and_abandoned_sources_with_local_changes
     %w[complete abandoned].each do |lifecycle|
       with_archive_cleanup_fixture(lifecycle:) do |runner, workspace, slug, common, feature|
+        enable_legacy_archive_capture(runner)
         branch = git_capture_success('git', '-C', feature, 'symbolic-ref', 'HEAD').strip
         head = git_capture_success('git', '-C', feature, 'rev-parse', 'HEAD').strip
         File.write(File.join(feature, 'staged'), "staged content\n")
@@ -1109,6 +1116,8 @@ class DevSessionTest < Minitest::Test
     [false, true].each do |edited|
       with_archive_cleanup_fixture do |runner, workspace, slug, _common, feature|
         File.write(File.join(feature, 'local'), 'saved content')
+        assert_git_success('git', '-C', feature, 'add', 'local')
+        assert_git_success('git', '-C', feature, 'commit', '-m', 'committed restore sentinel')
         runner.archive(slug, as_is: true, explicit: true)
         manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
         recovery = runner.archive_cleanup_recovery(slug, manifest.fetch('archive_operation_id'))
@@ -1163,8 +1172,9 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_git_symlink_placeholders_use_full_copy_without_changing_external_permissions
+  def test_legacy_git_symlink_placeholders_use_full_copy_without_changing_external_permissions
     with_archive_cleanup_fixture do |runner, workspace, slug, _common, checkout|
+      enable_legacy_archive_capture(runner)
       sentinel = File.join(workspace, 'outside-sentinel')
       File.write(sentinel, 'external contents')
       File.chmod(0o640, sentinel)
@@ -1200,6 +1210,16 @@ class DevSessionTest < Minitest::Test
     yield
   ensure
     DevSession::ArchiveCleanup.define_singleton_method(:new, original)
+  end
+
+  # These cases retain coverage of accepted predecessor operations. New
+  # committed-only archives have independent destructive-policy tests.
+  def enable_legacy_archive_capture(runner)
+    runner.define_singleton_method(:archive_cleanup_recovery) do |*arguments|
+      recovery = super(*arguments)
+      recovery.define_singleton_method(:capture!) { |records| capture_legacy!(records) }
+      recovery
+    end
   end
 
   def with_archive_cleanup_fixture(lifecycle: 'active')

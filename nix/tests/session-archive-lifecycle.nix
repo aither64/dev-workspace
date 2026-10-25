@@ -90,10 +90,10 @@ pkgs.testers.runNixOSTest {
         return checkout
 
     def assert_restored(slug, checkout):
-        assert user("cat " + checkout + "/tracked.txt") == "unstaged"
-        assert user("git -C " + checkout + " show :tracked.txt") == "staged"
-        assert user("cat " + checkout + "/untracked.txt") == "untracked"
-        assert user("cat " + checkout + "/ignored.tmp") == "ignored"
+        assert user("cat " + checkout + "/tracked.txt") == "base"
+        assert user("git -C " + checkout + " show :tracked.txt") == "base"
+        user("test ! -e " + checkout + "/untracked.txt && test ! -e " + checkout + "/ignored.tmp")
+        assert user("git -C " + checkout + " status --porcelain --ignored=matching").strip() == ""
         assert user("git -C " + checkout + " symbolic-ref --short HEAD").strip() == slug
 
     def archived(slug, checkout):
@@ -145,7 +145,7 @@ pkgs.testers.runNixOSTest {
         user("systemctl --user stop workspace-tracking-sync@fixture.timer")
 
     try:
-        with subtest("browser archive and revive preserve dirty files and index"):
+        with subtest("browser archive discards local files and revival restores committed content"):
             slug = "2026-10-17-roundtrip"
             checkout = fixture(slug)
             accepted = browser(slug, "archive")
@@ -214,7 +214,7 @@ pkgs.testers.runNixOSTest {
             archived(slug, checkout)
             revive(slug, checkout)
 
-        with subtest("retry after checkout removal keeps the recovery snapshot"):
+        with subtest("retry after checkout removal keeps committed recovery metadata"):
             slug = "2026-10-17-recovery"
             checkout = fixture(slug)
             user("chmod 0500 " + root + "/archive")
