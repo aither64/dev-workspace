@@ -137,6 +137,7 @@ pkgs.testers.runNixOSTest {
       pkgs.curl
       pkgs.nodejs
       pkgs.chromium
+      pkgs.strace
       python
     ];
     virtualisation = {
@@ -163,6 +164,47 @@ pkgs.testers.runNixOSTest {
     runtime = "/run/user/1000/dev-workspaces/fixture"
     portal_state = state + "/portal/workspace-" + hashlib.sha256(root.encode()).hexdigest()[:16]
     user_prefix = "runuser -u developer -- env XDG_RUNTIME_DIR=/run/user/1000 "
+    observer_generation = [0]
+
+    def stop_observer():
+        try:
+            machine.succeed("systemctl stop creation-lock-observer.service")
+        except Exception:
+            print('{"creationLockDiagnostics":"observer-stop-unavailable"}')
+
+    def start_observer():
+        try:
+            pid = int(user("systemctl --user show workspace-portal@fixture.service -p MainPID --value"))
+            assert pid > 1
+            if observer_generation[0] == 4:
+                print('{"creationLockDiagnostics":"observer-generation-cap"}')
+                return
+            output = "/tmp/creation-evidence/lock-observer-" + str(observer_generation[0]) + ".json"
+            observer_generation[0] += 1
+            # Attach externally to the real service; do not replace its launcher,
+            # MainPID, lock calls or operation sequence. Failure is evidence only.
+            machine.succeed("systemd-run --collect --unit=creation-lock-observer "
+                "--property=KillMode=mixed --property=TimeoutStopSec=3s "
+                "${python}/bin/python ${../../test/support/creation_refusal_diagnostics.py} "
+                "--strace ${pkgs.strace}/bin/strace --pid " + str(pid) + " --uid 1000 "
+                "--authority " + runtime + "/authority "
+                "--context /tmp/creation-diagnostics-context.json --output " + output)
+        except Exception:
+            print('{"creationLockDiagnostics":"observer-start-unavailable"}')
+
+    def emit_observer():
+        try:
+            # Only sanitized helper bundles, never raw trace/proc/HTTP dumps.
+            print(machine.succeed("${python}/bin/python -c " + shlex.quote(
+                "import glob,json\nremaining=1048576\n"
+                "for p in sorted(glob.glob('/tmp/creation-evidence/lock-observer-*.json'))[:4]:\n"
+                " data=open(p,'rb').read(262145)\n"
+                " if len(data)>262144 or len(data)+128>remaining:\n"
+                "  print('{\"creationLockDiagnostics\":\"bundle-truncated\"}'); break\n"
+                " remaining-=len(data)+128\n"
+                " print(json.dumps({'creationLockDiagnostics':json.loads(data)},separators=(',',':')))")))
+        except Exception:
+            print('{"creationLockDiagnostics":"bundle-unavailable"}')
 
     def user(command):
         return machine.succeed(user_prefix + "sh -c " + shlex.quote(command))
@@ -184,10 +226,12 @@ pkgs.testers.runNixOSTest {
             + "http://localhost/api/session-creations/" + request))
 
     def restart():
+        stop_observer()
         user("systemctl --user kill --signal=SIGKILL --kill-whom=all workspace-portal@fixture.service")
         user("systemctl --user restart workspace-portal@fixture.service")
         machine.wait_until_succeeds(user_prefix + "curl -fsS --unix-socket " + runtime
             + "/portal.sock http://localhost/ >/dev/null")
+        start_observer()
 
     def native(identity):
         return json.loads(user("${python}/bin/python ${../../test/creation_transport.py} read "
@@ -311,6 +355,7 @@ pkgs.testers.runNixOSTest {
         for service in ["workspace-codex@fixture", "workspace-portal@fixture", "workspace-tmux@fixture", "workspace-router"]:
             machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + service)
 
+    start_observer()
     try:
         with subtest("custom explicit default provider, solo, notifications, attachment and follow-up"):
             browser("create", "explicit", provider="primary", attachment=True)
@@ -455,6 +500,8 @@ pkgs.testers.runNixOSTest {
             browser("delete-stale", "alternate")
             user("test ! -e " + root + "/work/" + record["slug"])
     except Exception:
+        stop_observer()
+        emit_observer()
         print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
         print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
         print(user("${python}/bin/python -c " + shlex.quote(
@@ -466,6 +513,12 @@ pkgs.testers.runNixOSTest {
             "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")))
         raise
     finally:
+        stop_observer()
+        try:
+            machine.succeed("find /tmp -maxdepth 1 -name 'creation-chronology-*.json' "
+                "-exec cp {} /tmp/creation-evidence/ \\;")
+        except Exception:
+            print('{"creationChronology":"retention-unavailable"}')
         machine.copy_from_vm("/tmp/creation-evidence", "creation-evidence")
         machine.copy_from_vm("/tmp/creation-model", "creation-model")
   '';

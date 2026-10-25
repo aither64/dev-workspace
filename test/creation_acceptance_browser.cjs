@@ -3,14 +3,63 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {randomUUID} = require("node:crypto");
-const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
 const [action, name, optionsJSON = "{}"] = process.argv.slice(2);
 const options = JSON.parse(optionsJSON);
 const origin = "https://fixture.workspace.example.test";
 const filename = `/tmp/creation-${name}.json`;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// This bundle contains only chronology, never HTTP payloads or arbitrary errors.
+// Existing first-failure assertions and diagnostic output below remain intact.
+function creationChronology(scenario, correlation, writeContext = () => {}) {
+  const events = [], started = process.hrtime.bigint();
+  let phase = "unknown", dropped = 0, diagnosticErrors = 0, sourceSlug;
+  const token = value => /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : "unknown";
+  scenario = token(scenario); correlation = token(correlation);
+  const now = () => Number(process.hrtime.bigint() - started) / 1e6;
+  const retain = event => {
+    if (events.length === 128) { events.shift(); dropped++; }
+    events.push(event);
+  };
+  const safePath = value => {
+    try {
+      const url = new URL(value, origin);
+      return url.origin === origin && url.pathname.length <= 512 &&
+        /^[A-Za-z0-9_./%-]*$/.test(url.pathname) ? url.pathname : "unavailable";
+    } catch { return "unavailable"; }
+  };
+  const emit = (kind, request, status) => {
+    try {
+      const method = request.method();
+      retain({kind, phase, monotonicMs: now(),
+        method: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].includes(method) ? method : "other",
+        path: safePath(request.url()), ...(Number.isInteger(status) ? {status} : {})});
+    } catch { diagnosticErrors++; }
+  };
+  return {
+    phase(value, source) {
+      phase = typeof value === "string" && /^[A-Za-z -]{1,64}$/.test(value) ? value : "unknown";
+      if (source) sourceSlug = token(source);
+      retain({kind: "phase", phase, monotonicMs: now()});
+      try { writeContext({scenario, correlation, phase, ...(sourceSlug ? {sourceSlug} : {})}); }
+      catch { diagnosticErrors++; }
+    },
+    emit,
+    bundle: () => ({schema: 1, scenario, correlation, phase, clock: "browser-process-monotonic-relative",
+      events, dropped, diagnosticErrors}),
+  };
+}
+module.exports = {creationChronology};
+
 (async () => {
+  if (require.main !== module) return;
+  const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
+  const chronology = creationChronology(`${action}-${name}`, randomUUID(), value => {
+    const target = "/tmp/creation-diagnostics-context.json";
+    fs.writeFileSync(target + ".pending", JSON.stringify(value), {mode: 0o600});
+    fs.renameSync(target + ".pending", target);
+  });
+  chronology.phase(action);
   const browser = await chromium.launch({executablePath: process.env.CHROMIUM_EXECUTABLE,
     headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"]});
   const context = await browser.newContext({ignoreHTTPSErrors: true,
@@ -19,11 +68,24 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
       "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
   const page = await context.newPage(), errors = [], requests = [];
   page.on("pageerror", error => errors.push(error.message));
-  page.on("response", response => requests.push({path: new URL(response.url()).pathname,
-    method: response.request().method(), status: response.status()}));
+  page.on("request", request => chronology.emit("request-start", request));
+  page.on("requestfinished", request => chronology.emit("request-finished", request));
+  page.on("requestfailed", request => chronology.emit("request-failed", request));
+  page.on("response", response => {
+    chronology.emit("response", response.request(), response.status());
+    if (requests.length === 128) requests.shift();
+    requests.push({path: new URL(response.url()).pathname,
+      method: response.request().method(), status: response.status()});
+  });
   let record, phase = action;
+  const markPhase = value => { phase = value; chronology.phase(value, record?.source?.slug); };
   const get = async path => {
-    const response = await context.request.get(origin + path);
+    const request = {method: () => "GET", url: () => origin + path};
+    chronology.emit("api-request-start", request);
+    let response;
+    try { response = await context.request.get(origin + path); }
+    catch (error) { chronology.emit("api-request-failed", request); throw error; }
+    chronology.emit("api-response", request, response.status());
     assert(response.ok(), `${path}: ${response.status()} ${await response.text()}`);
     return response.json();
   };
@@ -40,7 +102,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     assert(hydrated.ok());
   }
   async function terminal(wanted = "ready") {
-    phase = "wait for " + wanted;
+    markPhase("wait for " + wanted);
     const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {
       const status = await get(statusPath());
@@ -66,7 +128,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     await form.locator("[name=browserNotificationsEnabled]").setChecked(options.notifications !== false);
   }
   async function followup(marker) {
-    phase = "follow-up exchange";
+    markPhase("follow-up exchange");
     const before = await get(`/api/sessions/${record.slug}/thread`);
     assert(!before.entries.some(entry => entry.kind === "userMessage" && entry.text === marker),
       "follow-up marker already exists before send");
@@ -88,7 +150,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   }
   async function usable() {
     await terminal();
-    phase = "canonical redirect and transcript";
+    markPhase("canonical redirect and transcript");
     const destination = record.requestId ? record.canonicalUrl : record.url;
     assert.equal(destination, `/${record.slug}/`);
     record.destination = destination;
@@ -141,14 +203,14 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
           form.locator("#creation-uploads").getByText("Ready", {exact: false}).first().waitFor()]);
       }
       // Exercise the shipped draft serializer before actual admission.
-      phase = "draft restoration after reload";
+      markPhase("draft restoration after reload");
       await page.reload();
       await form.locator("[name=provider]:not([disabled])").waitFor();
       assert.equal(await form.locator("[name=goal]").inputValue(), marker);
       assert.equal(await form.locator("[name=provider]").inputValue(), options.provider || "");
       assert.equal(await form.locator("[name=sensitive]").isChecked(), Boolean(options.sensitive));
       assert.equal(await form.locator("[name=browserNotificationsEnabled]").isChecked(), options.notifications !== false);
-      phase = "admit creation";
+      markPhase("admit creation");
       const [accepted] = await Promise.all([
         page.waitForResponse(r => new URL(r.url()).pathname === "/sessions" && r.request().method() === "POST"),
         form.locator("button[type=submit]:not([disabled])").click(),
@@ -240,6 +302,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
         assert(completed[counter] > previous[counter]);
       } else if (["fork", "plan"].includes(action)) {
         const source = {...record};
+        chronology.phase(phase, source.slug);
         await openConversation(source.destination, source.slug);
         if (action === "plan") {
           await page.locator("#codex-mode").getByRole("button", {name: "Plan", exact: true}).click();
@@ -293,6 +356,11 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     console.log(JSON.stringify({action, name, requestId: record.requestId, receiptId: record.receiptId,
       slug: record.slug, threadId: record.threadId, state: record.state}));
   } catch (error) {
+    try {
+      const bundle = chronology.bundle();
+      fs.writeFileSync(`/tmp/creation-chronology-${action}-${name}.json`, JSON.stringify(bundle), {mode: 0o600});
+      console.error(JSON.stringify({creationChronology: bundle}));
+    } catch { console.error('{"creationChronology":"diagnostics-unavailable"}'); }
     console.error(JSON.stringify({phase, record, errors, requests: requests.slice(-30),
       body: await page.locator("body").innerText().catch(() => "unavailable")}));
     throw error;
