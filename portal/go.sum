@@ -1,15 +1,7 @@
 github.com/SherClockHolmes/webpush-go v1.4.0 h1:ocnzNKWN23T9nvHi6IfyrQjkIc0oJWv1B1pULsf9i3s=
 github.com/SherClockHolmes/webpush-go v1.4.0/go.mod h1:XSq8pKX11vNV8MJEMwjrlTkxhAj1zKfxmyhdV7Pd6UA=
-github.com/aither64/codex-web v0.0.0-20261024144044-11ec57d2203f h1:cod93lovFHu5adtEqQy7QyE1E5YIFJrTkCnjB3phFgw=
-github.com/aither64/codex-web v0.0.0-20261024144044-11ec57d2203f/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
-github.com/aither64/codex-web v0.0.0-20261024201627-2c4c3460ac6d h1:5QRHQQChPDfuvnEXpP85vZOpdj8xwOF7/iPbHhNBB6Q=
-github.com/aither64/codex-web v0.0.0-20261024201627-2c4c3460ac6d/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
-github.com/aither64/codex-web v0.0.0-20261024202908-f66a8b2f46a6 h1:UKy5CIX7oicjMmgZNFGlULDXI/IErdi+NzNIcz6ITKQ=
-github.com/aither64/codex-web v0.0.0-20261024202908-f66a8b2f46a6/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
-github.com/aither64/codex-web v0.0.0-20261024204045-57dd01b1d860 h1:m5HUBBlwDj+7zDlHSHAYCKv2tJzPLr9OaeVBD3EhEfg=
-github.com/aither64/codex-web v0.0.0-20261024204045-57dd01b1d860/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
-github.com/aither64/codex-web v0.0.0-20261024211748-872c7ad3962f h1:wmdiSxsh28nUy8cXRGLbXnqxngnT4nfJKpOHixhyE40=
-github.com/aither64/codex-web v0.0.0-20261024211748-872c7ad3962f/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
+github.com/aither64/codex-web v0.0.0-20261025080000-801099102ef9 h1:p3NcpKoo9hFcnoW4/QQn5e6fcUgu3SeDg1gY8VNYiOM=
+github.com/aither64/codex-web v0.0.0-20261025080000-801099102ef9/go.mod h1:SfoFFfEnXQusGm701eWJpCbrkwia5g1biF5KD9RIqr0=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

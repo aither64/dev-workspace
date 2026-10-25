@@ -273,7 +273,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-pwhugcE157fcMSD9Lk48P2QTQLy6jeye+/rycQM6+7A=";
+  vendorHash = "sha256-Zp42oaLBpFXcdzZNo8jdNJOGuVxDojvYugf/7sm3SeI=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}
