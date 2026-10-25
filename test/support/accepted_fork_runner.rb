@@ -75,6 +75,12 @@ module AcceptedForkFixture
           sourceThread: option(argv, '--thread-id'), fresh: argv.include?('--fresh'),
           model: option(argv, '--model'), effort: option(argv, '--effort'))
         output = JSON.generate('threadId' => 'thread-fork')
+      elsif argv[0, 3] == ['fixture-portal', 'thread', 'create']
+        AcceptedForkFixture.event(argv.include?('--recover-creating') ? 'native_recover' : 'native_start',
+          slug: option(argv, '--session-slug'))
+        output = JSON.generate('threadId' => 'thread-fork')
+      elsif argv[0, 3] == ['fixture-portal', 'thread', 'ensure-initial']
+        AcceptedForkFixture.event('native_send', goal: File.read(option(argv, '--input-file')))
       elsif argv[0, 3] == ['fixture-portal', 'thread', 'require-materialized']
         AcceptedForkFixture.event('native_materialization', threadId: option(argv, '--thread-id'))
       elsif argv[0, 3] == ['fixture-portal', 'thread', 'set-name']
@@ -190,7 +196,7 @@ module AcceptedForkFixture
       super(path, description, **options, &block)
     end
 
-    def create_tmux_session(slug, run_codex:, thread_id:, identity_token:, model:, effort:, launch_codex: run_codex)
+    def create_tmux_session(slug, run_codex:, thread_id:, identity_token:, model: nil, effort: nil, launch_codex: run_codex)
       AcceptedForkFixture.event('tmux_attempt', slug:)
       raise DevSession::Error, 'fixture terminal interruption' if ACCEPTED_FORK_CONFIG.fetch('failTerminal')
       raise DevSession::Error, 'fixture terminal must run Codex' unless run_codex
