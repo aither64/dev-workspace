@@ -53,27 +53,25 @@ func (c *Client) QuiesceExplicitArchive(ctx context.Context, thread, cwd string)
 	}
 	// Preserve this conversation's durable receipts before retirement clears them.
 	if c.submissionLedgerPath != "" {
-		data, err := os.ReadFile(c.submissionLedgerPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		data, err := c.ExportSubmissionAttempts(thread)
+		if err != nil {
 			return err
 		}
-		if err == nil {
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(data, &fields); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return err
+		}
+		for _, key := range []string{"attempts", "sends", "deletions"} {
+			if len(fields[key]) == 0 {
+				continue
+			}
+			// Each field is a thread-to-attempt mapping.
+			var scoped map[string]json.RawMessage
+			if err := json.Unmarshal(fields[key], &scoped); err != nil {
 				return err
 			}
-			for _, key := range []string{"attempts", "sends", "deletions"} {
-				if len(fields[key]) == 0 {
-					continue
-				}
-				// Each field is a thread-to-attempt mapping.
-				var scoped map[string]json.RawMessage
-				if err := json.Unmarshal(fields[key], &scoped); err != nil {
-					return err
-				}
-				if len(scoped[thread]) != 0 {
-					record.Attempts[key] = scoped[thread]
-				}
+			if len(scoped[thread]) != 0 {
+				record.Attempts[key] = scoped[thread]
 			}
 		}
 	}

@@ -6926,7 +6926,9 @@ module DevSession
         '--cwd',
         work_dir(slug),
         '--socket',
-        @codex_socket
+        @codex_socket,
+        '--workspace', workspace,
+        '--user-state-root', @workspace_state_root
       ]
       command += ['--thread-id', known_thread] unless known_thread.empty?
       command << '--force' if force
@@ -9208,7 +9210,9 @@ module DevSession
         '--thread-id',
         thread_id,
         '--cwd',
-        cwd
+        cwd,
+        '--workspace', workspace,
+        '--user-state-root', @workspace_state_root
       ]
       command += ['--socket', @codex_socket]
       @command_runner.capture(command)

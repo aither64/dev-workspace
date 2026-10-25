@@ -50,10 +50,12 @@ func newCodexClientWithHistory(socket, workspace string, history codex.HistoryRe
 	}
 	ledgerPath := socket + ".submission-attempts-v3.json"
 	legacyPath := ""
+	databasePath := ""
 	if stateRoot != "" {
 		legacyPath = ledgerPath
 		identity := sha256.Sum256([]byte(socket))
 		ledgerPath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".json")
+		databasePath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".sqlite")
 	}
 	client := workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
 		HistoryReader: history,
@@ -64,6 +66,8 @@ func newCodexClientWithHistory(socket, workspace string, history codex.HistoryRe
 		PreserveThreadInstructionsOnResume: true,
 		// Keep the deployed retry identity while making storage ownership explicit.
 		SubmissionLedgerPath: ledgerPath, LegacySubmissionLedgerPath: legacyPath,
+		SubmissionDatabasePath: databasePath,
+		DeliveryObserver:       deliveryDiagnostics,
 	})
 	client.RecoveryRoot = stateRoot
 	if executable, err := os.Executable(); err == nil {
@@ -115,6 +119,12 @@ func newCodexClientWithHistory(socket, workspace string, history codex.HistoryRe
 		return codex.ThreadPolicy{}, errors.New("managed admission is outside the retained team")
 	}
 	return client
+}
+
+func deliveryDiagnostics(event codex.DeliveryEvent) {
+	if event.Failed || event.Duration >= 250*time.Millisecond || os.Getenv("DEV_WORKSPACE_DELIVERY_TRACE") == "1" {
+		log.Printf("delivery stage=%s thread=%s attempt=%s duration=%s failed=%t", event.Stage, event.ThreadID, event.ClientUserMessageID, event.Duration, event.Failed)
+	}
 }
 
 func rootThreadSettings(model, effort, slug, workspace, leadInstructions string) codex.ThreadSettings {

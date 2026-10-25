@@ -3,6 +3,28 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_transactional_submission_store_requires_reader_and_policy_support
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'submission-store')
+      state = File.join(host.instance_variable_get(:@state), 'submissions', 'scope.sqlite')
+      FileUtils.mkdir_p(File.dirname(state))
+      File.binwrite(state, 'retained database bytes')
+      contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      %w[submissionStoreSchema submissionStorePolicy].each { |field| contract[field] = 1 }
+      %w[submissionStoreSchema submissionStorePolicy].each do |field|
+        [nil, false, true, 0, 2, '1', 1.0].each do |unsupported|
+          value = contract.merge(field => unsupported)
+          File.write(contract_path, JSON.generate(value))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+          assert_equal('retained database bytes', File.binread(state))
+        end
+      end
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:require_compatible_session_recovery!, candidate)
+    end
+  end
+
   def test_retry_policy_presence_requires_exact_integer_capability_without_parsing_payloads
     with_transition_host do |host, paths|
       candidate = make_package(paths.fetch(:root), 'session-retry-policy')

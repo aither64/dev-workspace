@@ -277,8 +277,10 @@ class DevSessionTest < Minitest::Test
       File.chmod(0o755, codex)
       File.write(portal, <<~RUBY)
         #!/usr/bin/env ruby
-        if ARGV.include?('require-idle') && File.exist?(#{active.dump})
-          abort 'turn became active while terminal was quiesced'
+        if ARGV.include?('require-idle')
+          abort 'idle check lost selected state root' unless ARGV.include?('--user-state-root') && ARGV.fetch(ARGV.index('--user-state-root') + 1) == #{File.join(workspace, 'selected-state').dump}
+          abort 'idle check lost workspace owner' unless ARGV.include?('--workspace') && ARGV.fetch(ARGV.index('--workspace') + 1) == #{workspace.dump}
+          abort 'turn became active while terminal was quiesced' if File.exist?(#{active.dump})
         end
       RUBY
       File.chmod(0o755, portal)
@@ -304,7 +306,7 @@ class DevSessionTest < Minitest::Test
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
-        env: {}
+        env: { 'DEV_WORKSPACES_STATE' => File.join(workspace, 'selected-state') }
       )
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)

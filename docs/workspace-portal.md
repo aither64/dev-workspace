@@ -454,7 +454,11 @@ restore a stale composer error. Sending revised wording creates a separate
 attempt and does not resolve the earlier one.
 
 **Not sent.** means the server established that the message was not dispatched.
-**Retry original** reuses that attempt. An **Outcome unknown.** receipt also
+Transient **Not sent.** failures retry automatically with the original ID, text
+and attachments. Retries back off to five seconds and wait while the page is
+hidden, offline or busy with another operation. Reload restores saved transient
+retries. **Implement here** follows the same delivery and recovery rules.
+**Retry original** remains available. An **Outcome unknown.** receipt also
 offers **Send another copy…**. The portal checks the original again first; if
 delivery is still unknown, it asks you to confirm that the original might still
 arrive. The new copy has its own saved ID. Its retries reuse that ID across page
@@ -609,13 +613,26 @@ generation and identity locks. Automatic restoration has two concurrent slots.
 Timeouts or a missing socket may retry; identity and lifecycle refusals remain
 visible for manual Retry after repair.
 
-All portal, CLI and observation clients share schema-3 submission receipts at
-`$DEV_WORKSPACES_STATE/submissions/<socket-path-sha256>.json`. The first read
-imports the previous socket-adjacent ledger under both interprocess locks when
-the persistent ledger is absent. The old ledger remains in place. Stop old
-writers before changing paths; mixed writers using different paths are not
-supported. Queued Send retries reconcile their queue/history receipt and never
-fall through to a second turn or steer.
+All portal, CLI, provider and observation clients share a transactional SQLite
+submission store at `$DEV_WORKSPACES_STATE/submissions/<socket-path-sha256>.sqlite`.
+The first access imports the persistent schema-3 JSON ledger, or its older
+socket-adjacent fallback, under the predecessor locks. It retains private backups
+and fences both JSON paths before accepting database writes. Interrupted import
+publication resumes on retry. Archive recovery exports one thread through the
+client API and preserves the existing held-prompt format.
+
+The runtime contract declares `submissionStoreSchema: 1` and
+`submissionStorePolicy: 1`. Once a database or its sidecars exist, package
+transitions require both capabilities. Stop predecessor application writers
+through the coordinated profile transition before migration; native turns can
+continue running. Recover forward with a compatible package. Do not restore a
+JSON backup over newer submission records. The generic
+[storage guide](https://github.com/aither64/codex-web/blob/master/docs/submission-storage.md)
+owns import and delivery semantics.
+
+Slow or failed delivery stages appear in the portal journal with the stage,
+thread, browser attempt ID and duration. They contain no prompt text or options.
+`DEV_WORKSPACE_DELIVERY_TRACE=1` logs every stage for a controlled diagnostic run.
 
 The runtime contract declares `sessionRecoveryPolicy: 1`. Once recovery records
 or persistent receipts exist, normal package switches refuse a target without

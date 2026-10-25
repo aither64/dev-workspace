@@ -14,6 +14,12 @@ import (
 )
 
 func TestExplicitArchiveHoldsFullQueueBeforeDeletingAndPausesActiveWork(t *testing.T) {
+	testExplicitArchiveRecovery(t, false)
+}
+
+func TestArchiveSQLiteRecovery(t *testing.T) { testExplicitArchiveRecovery(t, true) }
+
+func testExplicitArchiveRecovery(t *testing.T, database bool) {
 	for _, lostReply := range []bool{false, true} {
 		t.Run(fmt.Sprint("lost_delete_reply=", lostReply), func(t *testing.T) {
 			root := t.TempDir()
@@ -88,7 +94,17 @@ func TestExplicitArchiveHoldsFullQueueBeforeDeletingAndPausesActiveWork(t *testi
 					}
 				}
 			})
-			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			options := codex.ClientOptions{}
+			if database {
+				options.SubmissionLedgerPath = filepath.Join(root, "receipts.json")
+				options.SubmissionDatabasePath = filepath.Join(root, "receipts.sqlite")
+			}
+			client := NewWithOptions(socket, "/workspace", options)
+			if database {
+				if err := client.PrepareSend("thread-1", "held input", "held-message", "", false); err != nil {
+					t.Fatal(err)
+				}
+			}
 			client.RecoveryRoot = root
 			defer client.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -113,6 +129,9 @@ func TestExplicitArchiveHoldsFullQueueBeforeDeletingAndPausesActiveWork(t *testi
 			var saved heldPrompts
 			if err := json.Unmarshal(data, &saved); err != nil {
 				t.Fatal(err)
+			}
+			if database && len(saved.Attempts["sends"]) == 0 {
+				t.Fatal("archive dropped transactional send receipts")
 			}
 			var entry struct {
 				Input []map[string]any `json:"input"`

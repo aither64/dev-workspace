@@ -6,6 +6,8 @@
   "livePackageSwitchPolicy": 1,
   "workspaceReportingPolicy": 1,
   "sessionRecoveryPolicy": 1,
+  "submissionStoreSchema": 1,
+  "submissionStorePolicy": 1,
   "turnRetryStateSchema": 1,
   "turnRetrySessionPolicy": 1,
   "archiveRecoveryPolicy": 3,

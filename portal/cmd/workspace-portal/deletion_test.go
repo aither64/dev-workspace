@@ -160,6 +160,8 @@ File.write(wrapper, <<~RUBY)
     roster.fetch('members').find { |member| member.fetch('address') == 'implementer0' }['state'] = 'archived'
     File.write(roster_path, JSON.generate(roster))
   elsif ARGV[0,2] == ['thread', 'retire']
+    abort 'retirement lost selected state root' unless ARGV.include?('--user-state-root') && ARGV.fetch(ARGV.index('--user-state-root') + 1) == state
+    abort 'retirement lost workspace owner' unless ARGV.include?('--workspace') && ARGV.fetch(ARGV.index('--workspace') + 1) == workspace
     abort 'root retired before known member' unless roster.fetch('members').first.fetch('state') == 'archived'
     File.open(#{calls.dump}, 'a') { |file| file.puts 'retire root' }
   else

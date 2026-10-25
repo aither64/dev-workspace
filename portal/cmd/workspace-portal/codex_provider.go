@@ -90,6 +90,7 @@ func codexProviderCommand(args []string) error {
 		PreserveThreadInstructionsOnResume: true,
 		AllowImplicitResume:                func(string) bool { return false },
 		SubmissionLedgerPath:               filepath.Join(*stateRoot, "submissions", hex.EncodeToString(identity[:])+".json"),
+		SubmissionDatabasePath:             filepath.Join(*stateRoot, "submissions", hex.EncodeToString(identity[:])+".sqlite"),
 		LegacySubmissionLedgerPath:         *socket + ".submission-attempts-v3.json",
 	}), CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME")}
 	// No watches or automatic question answers are installed. Omit the ordinary
