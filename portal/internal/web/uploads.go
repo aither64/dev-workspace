@@ -19,7 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (s *Server) initUploads() error {
+func (s *Server) initUploads(ctx context.Context) error {
 	store, err := uploads.New(filepath.Join(s.operationStore.directory, "uploads"), s.config.Workspace)
 	if err != nil {
 		return err
@@ -32,7 +32,7 @@ func (s *Server) initUploads() error {
 		return err
 	}
 	s.uploadHandler = handler
-	return s.retainCreationUploads(s.operationContext)
+	return s.retainCreationUploads(ctx)
 }
 
 func (s *Server) sessionUploads(ctx context.Context, slug, thread string, readOnly bool) (*uploads.Backend, error) {

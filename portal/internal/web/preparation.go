@@ -859,8 +859,8 @@ func (s *Server) setPreparationName(w http.ResponseWriter, r *http.Request, id s
 	s.writeJSON(w, http.StatusAccepted, status)
 }
 
-func (s *Server) reconcilePreparations() error {
-	_, unlock, err := s.acquireTransitionContext(s.operationContext, unix.LOCK_SH)
+func (s *Server) reconcilePreparations(ctx context.Context) error {
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
 		return err
 	}
@@ -868,17 +868,20 @@ func (s *Server) reconcilePreparations() error {
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
-	if err := s.uploadCreationMu.Lock(s.operationContext); err != nil {
+	if err := s.uploadCreationMu.Lock(ctx); err != nil {
 		return err
 	}
 	defer s.uploadCreationMu.Unlock()
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
-	return s.reconcilePreparationsLocked(s.operationContext)
+	return s.reconcilePreparationsLocked(ctx)
 }
 
 func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 	for _, record := range s.preparations {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := s.confirmPreparationLocked(record.RequestID); err != nil {
 			return err
 		}
@@ -910,6 +913,9 @@ func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 		}
 		if record.State == "accepting" {
 			if err := s.finishAcceptingPreparationLocked(ctx, &record); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
 				if errors.Is(err, errPreparationPersistenceUnconfirmed) || errors.Is(err, uploads.ErrPersistenceUnconfirmed) {
 					return err
 				}
@@ -923,6 +929,9 @@ func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 		if record.State != "accepting" && record.Snapshot.Goal != "" && len(record.Snapshot.Input.Attachments) > 0 {
 			input := record.Snapshot.Input
 			goal, err := s.uploadStore.ClaimPreparation(ctx, record.RequestID, input.UploadScope, input.RawPrompt, input.Attachments)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			if errors.Is(err, uploads.ErrPersistenceUnconfirmed) {
 				return err
 			}
@@ -944,7 +953,7 @@ func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 				if err := s.savePreparation(record); err != nil {
 					return err
 				}
-				if err := s.compactPreparationsLocked(receipt); err != nil {
+				if err := s.compactPreparationsLocked(ctx, receipt); err != nil {
 					return err
 				}
 			}
@@ -953,7 +962,7 @@ func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) compactPreparationsLocked(receipt creationReceipt) error {
+func (s *Server) compactPreparationsLocked(ctx context.Context, receipt creationReceipt) error {
 	if receipt.State != "ready" && receipt.State != "conflict" && receipt.State != "cancelled" {
 		return nil
 	}
@@ -967,8 +976,8 @@ func (s *Server) compactPreparationsLocked(receipt creationReceipt) error {
 	if !related {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	admission, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	_, unlock, err := s.acquireTransitionContext(admission, unix.LOCK_SH)
 	cancel()
 	if err != nil {
 		return err
@@ -993,7 +1002,7 @@ func (s *Server) compactPreparationsLocked(receipt creationReceipt) error {
 			if err := s.proveCreation(receipt); err != nil {
 				return err
 			}
-			if err := s.bindCreationUploads(s.operationContext, receipt); err != nil {
+			if err := s.bindCreationUploads(ctx, receipt); err != nil {
 				return err
 			}
 		}

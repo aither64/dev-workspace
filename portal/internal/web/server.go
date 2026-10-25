@@ -358,6 +358,15 @@ type agentTeamRow struct {
 }
 
 func New(config Config) (*Server, error) {
+	return NewContext(context.Background(), config)
+}
+
+// NewContext permits canceling initialization while a package transition owns
+// admission. After initialization, Close owns worker shutdown and its ordering.
+func NewContext(ctx context.Context, config Config) (*Server, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if config.RecoverSessions && (config.UserStateRoot == "" || config.AuthorityDir == "" || config.DevSession == "" || config.Codex == nil) {
 		return nil, errors.New("session recovery requires complete private runtime configuration")
 	}
@@ -518,12 +527,16 @@ func New(config Config) (*Server, error) {
 		return nil, err
 	}
 	server.conversation = conversationHandler
-	if err := server.initUploads(); err != nil {
+	if err := server.initUploads(ctx); err != nil {
 		cancelOperations()
 		return nil, err
 	}
 	server.initNotifications()
-	if err := server.reconcilePreparations(); err != nil {
+	if err := server.reconcilePreparations(ctx); err != nil {
+		cancelOperations()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		cancelOperations()
 		return nil, err
 	}

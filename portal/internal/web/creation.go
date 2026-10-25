@@ -779,7 +779,7 @@ func (s *Server) updateCreation(receipt creationReceipt) error {
 		return err
 	}
 	s.creations[receipt.Request.Slug] = receipt
-	return s.compactPreparationsLocked(receipt)
+	return s.compactPreparationsLocked(s.operationContext, receipt)
 }
 
 func creationPhase(event creationprogress.Event) string {

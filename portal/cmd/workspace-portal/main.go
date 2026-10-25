@@ -387,7 +387,7 @@ func serve(args []string) error {
 		codexClient.RetryCatalog = installed.Catalog
 	}
 	defer codexClient.Close()
-	application, err := portalweb.New(portalweb.Config{
+	application, err := portalweb.NewContext(stopContext, portalweb.Config{
 		ObserveActivity: true,
 		HistoryReader:   history,
 		CollectUploads:  true,
@@ -404,6 +404,9 @@ func serve(args []string) error {
 		Logger:           logger, Codex: codexClient,
 	})
 	if err != nil {
+		if stopContext.Err() != nil && errors.Is(err, stopContext.Err()) {
+			return nil
+		}
 		return err
 	}
 	defer application.Close()

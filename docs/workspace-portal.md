@@ -681,6 +681,11 @@ an older package; recover by repeating the same switch or selecting a newer
 package. Commands waiting on a transition lock reject a generation change and
 must be run again.
 
+Portal initialization waits for shared transition admission before reconciling
+creation records. SIGTERM cancels that wait, so a profile switch can stop a
+portal that has not begun serving HTTP. After initialization, normal shutdown
+parks archive preparation before canceling operational workers.
+
 Profile activation also refreshes existing systemd instance and enablement links
 that point into older dev-workspace packages. They follow the stable profile or
 local unit template, so collecting an older package does not shadow the current

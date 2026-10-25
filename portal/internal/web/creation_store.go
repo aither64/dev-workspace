@@ -203,7 +203,7 @@ func (s *Server) retireCreation(receipt creationReceipt) error {
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
-	if err := s.compactPreparationsLocked(receipt); err != nil {
+	if err := s.compactPreparationsLocked(s.operationContext, receipt); err != nil {
 		return err
 	}
 	for _, path := range []string{s.creationEvidencePath(receipt) + ".request", s.creationEvidencePath(receipt), s.creationPath(receipt.Request.Slug)} {

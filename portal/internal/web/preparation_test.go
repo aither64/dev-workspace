@@ -1298,7 +1298,7 @@ func TestSessionPreparationPublishedAdmissionConfirmationDispatchesOnce(t *testi
 			html := httptest.NewRecorder()
 			server.Handler().ServeHTTP(html, r)
 			assertPreparationUnconfirmed(t, html, id)
-			if err := server.reconcilePreparations(); !errors.Is(err, errPreparationPersistenceUnconfirmed) {
+			if err := server.reconcilePreparations(server.operationContext); !errors.Is(err, errPreparationPersistenceUnconfirmed) {
 				t.Fatalf("collection barrier=%v", err)
 			}
 			if calls.Load() != 0 {
@@ -1306,7 +1306,7 @@ func TestSessionPreparationPublishedAdmissionConfirmationDispatchesOnce(t *testi
 			}
 			fault.Store(false)
 			// Collection may confirm bytes, but retains the pending launch for POST.
-			if err := server.reconcilePreparations(); err != nil {
+			if err := server.reconcilePreparations(server.operationContext); err != nil {
 				t.Fatal(err)
 			}
 			if calls.Load() != 0 {

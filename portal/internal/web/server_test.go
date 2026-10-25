@@ -98,6 +98,26 @@ func TestTransitionLockBlocksPortalMutationsDuringHostChanges(t *testing.T) {
 	}
 }
 
+func TestStartupContextLeavesWorkerShutdownToClose(t *testing.T) {
+	fixture := newTestServer(t)
+	fixture.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, err := NewContext(ctx, fixture.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	cancel()
+	if err := server.operationContext.Err(); err != nil {
+		t.Fatal("startup context canceled operational workers before Close", err)
+	}
+	server.Close()
+	if !errors.Is(server.operationContext.Err(), context.Canceled) {
+		t.Fatal("Close did not cancel operational workers")
+	}
+}
+
 func TestDirectThreadPageShowsLifecycleAndTeamControls(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()
