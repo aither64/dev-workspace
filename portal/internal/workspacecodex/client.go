@@ -616,7 +616,7 @@ func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force b
 	}
 	loadedDiscovery := !found && (archiveState == ArchiveFresh || archiveState == ArchiveActive)
 	if loadedDiscovery {
-		candidate, found, err = c.loadedRetirementCandidate(ctx, threadID, cwd)
+		candidate, found, err = loadedRetirementCandidate(ctx, c, threadID, cwd)
 		if err != nil {
 			return err
 		}
@@ -799,11 +799,21 @@ func (c *Client) provePersistedRetirementCandidate(ctx context.Context, metadata
 	return ctx.Err()
 }
 
+type loadedRetirementReader interface {
+	ThreadMetadataReader
+	LoadedThreadIDs(context.Context) ([]string, error)
+}
+
 // An empty index can omit a loaded root. Exact archive proof still owns the
 // root identity; loaded metadata must prove it is the only matching thread.
-func (c *Client) loadedRetirementCandidate(ctx context.Context, threadID, cwd string) (codex.ThreadMetadata, bool, error) {
+func loadedRetirementCandidate(ctx context.Context, c loadedRetirementReader, threadID, cwd string) (codex.ThreadMetadata, bool, error) {
 	loaded, err := c.LoadedThreadIDs(ctx)
 	if err != nil {
+		// A canceled read can race a disconnect. Preserve both causes without
+		// changing successful observations or any mutation receipt handling.
+		if cause := ctx.Err(); cause != nil {
+			err = errors.Join(err, cause)
+		}
 		return codex.ThreadMetadata{}, false, err
 	}
 	var candidate codex.ThreadMetadata
@@ -811,6 +821,9 @@ func (c *Client) loadedRetirementCandidate(ctx context.Context, threadID, cwd st
 	for _, id := range loaded {
 		metadata, err := c.ReadThreadMetadata(ctx, id, true)
 		if err != nil {
+			if cause := ctx.Err(); cause != nil {
+				err = errors.Join(err, cause)
+			}
 			return codex.ThreadMetadata{}, false, err
 		}
 		if !canonicalArchivePath(metadata.Cwd) || metadata.Source == nil {
