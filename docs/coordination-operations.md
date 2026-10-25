@@ -240,9 +240,9 @@ artifacts and shared references. An operation succeeding does not retire a
 reservation still held for deployment review. The selected workspace profile,
 its predecessor and generations required by live work keep their package roots.
 
-A preparation not submitted within seven days expires. A new preparation renews
+A preparation not submitted within 24 hours expires. A new preparation renews
 its lease; status and collection previews do not. Older unused preparations and
-unsealed interrupted payloads receive a seven-day grace period at first applied
+unsealed interrupted payloads receive a 24-hour grace period at first applied
 collection. Submitted snapshots stop independently pinning payloads after their
 jobs/recovery obligations end. Fresh submission of an expired/consumed snapshot
 without a live job reference requires preparation; an exact completed request
@@ -266,7 +266,9 @@ interrupted worktree removal resumes from its recorded exact path/common Git
 directory. Do not hand-edit the bookkeeping to bypass a preservation reason.
 
 Collection also takes each integration driver's existing lock without waiting.
-An active driver postpones the sweep; unfinished journals retain hook dependencies
+A busy driver protects its own payloads and dependencies while the collector
+continues with unrelated completed integrations. Shared retained sources also
+remain protected while a legacy driver may still reuse an unrecorded head; unfinished journals retain hook dependencies
 for their source heads between invocations. Once an integration is complete,
 its registered, detached scratch worktrees below `integrations/<UUID>/` become
 eligible. Collection verifies the recorded repository, workspace ownership,
@@ -313,6 +315,21 @@ on active work. A live operation, held checkout, retained feature worktree or
 running process can still keep an old closure. Nix GC decides when store paths
 are reclaimable. Bulk archives included in a workspace Git input still multiply
 its size until their copies and package roots become unreferenced.
+
+### Storage inspection and explicit expiration
+
+`workspace-host coordination gc --dry-run --json --sizes` reports allocated
+payload bytes and preservation reasons. Adoption-grace rows include their expiry.
+The preparations list reports saved lease deadlines.
+Size reporting walks payload contents and is optional; routine collection avoids
+that cost. Preview does not renew leases or write retention bookkeeping.
+
+For a one-time cleanup, add `--expire-unused` to preview expiration of unused
+preparation leases and orphan grace periods, then add `--apply` to perform it.
+Queued jobs, live attempts, reservations, unfinished journals and explicit holds
+still protect their dependencies. Expired unsubmitted requests need preparation
+again; exact completed-request retries retain their saved receipt behavior.
+Existing lease deadlines remain valid unless this explicit expiration is used.
 
 Additional workspace checkouts omit work/ and archive/ through per-worktree Git
 sparse checkout. Shared tracking stays in the complete registered workspace;

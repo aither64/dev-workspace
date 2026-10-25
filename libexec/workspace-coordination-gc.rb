@@ -6,7 +6,7 @@ module WorkspaceCoordination
   # Separate bookkeeping leaves immutable snapshot IDs and the ledger readable
   # by earlier generations. Inspection never extends a preparation's lifetime.
   class Retention
-    TTL = 7 * 86_400
+    TTL = 86_400
 
     def initialize(store)
       @store = store
@@ -84,7 +84,9 @@ module WorkspaceCoordination
       @sources = File.join(@store.root, 'sources')
     end
 
-    def call(apply: false)
+    def call(apply: false, expire_unused: false, sizes: false)
+      @expire_unused, @sizes = expire_unused, sizes
+      @busy_integrations = Set.new
       @notification_locks = Set.new
       with_integration_exclusion(Dir[File.join(@store.root, 'integrations', '*.json')].sort, apply: apply) do
         with_notification_exclusion(@store.read['owners'].keys.sort) { sweep(apply: apply) }
@@ -110,8 +112,10 @@ module WorkspaceCoordination
       result = @store.lock("integration-#{id}", nonblock: true) do
         with_integration_exclusion(paths.drop(1), apply: apply, &block)
       end
-      result || {'schema' => 1, 'mode' => apply ? 'apply' : 'dry-run', 'actions' => [], 'removed' => [],
-        'preserved' => [{'path' => paths.first, 'reason' => 'integration driver is running'}], 'retry' => true}
+      return result if result
+
+      @busy_integrations << id
+      with_integration_exclusion(paths.drop(1), apply: apply, &block)
     end
 
     def sweep(apply: false)
@@ -122,7 +126,8 @@ module WorkspaceCoordination
         @metadata, @snapshots = {}, {}
         @payloads, @live_payloads, @live_ids, @live_paths = {}, Set.new, Set.new, Set.new
         @journals = @store.integration_journals.to_h { |run| [run['id'], run] }
-        @skipped, @actions = [], []
+        @skipped = @busy_integrations.map { |id| {'path' => File.join(@store.root, 'integrations', "#{id}.json"), 'reason' => 'integration driver is running'} }
+        @actions = []
         preparing = preparation_processes
         unless preparing.empty?
           return {'schema' => 1, 'mode' => apply ? 'apply' : 'dry-run', 'actions' => [], 'removed' => [],
@@ -133,8 +138,13 @@ module WorkspaceCoordination
         recover_pending
         recover_integration_pending
         adopt_preparations
+        if @expire_unused
+          mark_live(preparations: false)
+          expire_unused_leases
+        end
         mark_live
         plan
+        report_sizes if @sizes
         @retention.write(@book) if apply
         removed = []
         @actions.each do |action|
@@ -151,7 +161,8 @@ module WorkspaceCoordination
         end
         {'schema' => 1, 'mode' => apply ? 'apply' : 'dry-run', 'actions' => @actions,
          'removed' => removed, 'preserved' => @skipped,
-         'retry' => @store.read['revision'] != @ledger['revision']}
+         'preparations' => @book['preparations'].map { |id, item| {'id' => id, 'expiresAt' => item['expiresAt']} },
+         'retry' => @store.read['revision'] != @ledger['revision'] || !@busy_integrations.empty?}
       end
     end
 
@@ -321,6 +332,30 @@ module WorkspaceCoordination
       end
     end
 
+    # Submitted jobs, reservations and journals are marked independently below;
+    # expiring unused preparation leases cannot release their dependency roots.
+    def expire_unused_leases
+      @book['preparations'].each do |id, item|
+        item['expiresAt'] = [item['expiresAt'], Time.now.to_i].min unless @live_ids.include?(id)
+      end
+      @book['orphans'].transform_values! { |expiry| [expiry, Time.now.to_i].min }
+    end
+
+    def report_sizes
+      (@actions + @skipped).each do |action|
+        path = action['path']
+        next unless path && File.exist?(path) && !File.symlink?(path)
+        bytes = 0
+        walk = lambda do |entry|
+          stat = File.lstat(entry)
+          bytes += stat.blocks * 512
+          Dir.each_child(entry) { |name| walk.call(File.join(entry, name)) } if stat.directory? && !stat.symlink?
+        end
+        walk.call(path)
+        action['allocatedBytes'] = bytes
+      end
+    end
+
     def mark(value)
       case value
       when Hash then value.each_value { |item| mark(item) }
@@ -353,7 +388,7 @@ module WorkspaceCoordination
       !@engine.instance_variable_get(:@fixtures) && @engine.attempt_service_running?(attempt)
     end
 
-    def mark_live
+    def mark_live(preparations: true)
       @live_attempts = Set.new
       @known_attempts = Set.new
       @ledger['jobs'].each_value do |job|
@@ -370,10 +405,10 @@ module WorkspaceCoordination
       @snapshots.each do |id, value|
         owner = @ledger['owners'][value['ownerId']]
         closed = owner && owner['fence'] && owner['fence']['completed']
-        mark(value) if !closed && @retention.live?(id, @ledger, @book)
+        mark(value) if preparations && !closed && @retention.live?(id, @ledger, @book)
       end
       @journals.each_value do |value|
-        next if integration_finished?(value)
+        next if integration_finished?(value) && !@busy_integrations.include?(value['id'])
         mark(value)
         # Existing journals bind source heads, but do not record hook artifact
         # IDs. Derive those dependencies from the sealed merge-hook artifacts.
@@ -391,14 +426,26 @@ module WorkspaceCoordination
         path = action['path']
         key = path.delete_prefix(@sources + '/')
         unless action['integration'] || all_metadata.include?(path) || all_metadata.include?(action['source']) || @book['pending'].key?(key)
-          @book['orphans'][key] ||= Time.now.to_i + Retention::TTL
+          @book['orphans'][key] ||= Time.now.to_i + (@expire_unused ? 0 : Retention::TTL)
           unless @book['orphans'][key].is_a?(Integer)
             raise Error, 'invalid orphan retention age'
           end
           if @book['orphans'][key] > Time.now.to_i
-            @skipped << {'path' => path, 'reason' => 'unsubmitted payload adoption grace'}
+            @skipped << {'path' => path, 'reason' => 'unsubmitted payload adoption grace', 'expiresAt' => @book['orphans'][key]}
             next
           end
+        end
+        if !action['integration'] && !@busy_integrations.empty?
+          # Legacy drivers can reuse a retained source before recording its
+          # next head. Hold shared sources, but collect unrelated run scratch.
+          protect_payload(action)
+          @skipped << {'path' => path, 'reason' => 'running integration may reuse retained source'}
+          next
+        end
+        if action['integration'] && @busy_integrations.include?(action['integration'])
+          protect_payload(action)
+          @skipped << {'path' => path, 'reason' => 'integration driver is running'}
+          next
         end
         if File.exist?(File.join(path, '.keep')) || File.symlink?(File.join(path, '.keep'))
           protect_payload(action)
@@ -511,7 +558,7 @@ module WorkspaceCoordination
       live = if kind == 'notification'
         !@notification_locks.include?(id) || service_running?("workspace-notifications-#{id}.service")
       else
-        !integration_finished?(@journals.fetch(id)) || service_running?("workspace-integration-#{id}.service")
+        @busy_integrations.include?(id) || !integration_finished?(@journals.fetch(id)) || service_running?("workspace-integration-#{id}.service")
       end
       if live
         @skipped << {'path' => path, 'reason' => 'worker is running or integration is unfinished'}

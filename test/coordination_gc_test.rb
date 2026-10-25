@@ -648,4 +648,39 @@ class CoordinationGcTest < Minitest::Test
     assert_equal 12345, result['preserved'].first['pid']
   end
 
+  def test_unused_preparation_expires_after_twenty_four_hours
+    _person, snapshot = prepare('one-day')
+    with_time(Time.now + 23 * 3600) { assert_empty collect(apply: true)['removed'] }
+    assert File.directory?(source(snapshot))
+    with_time(Time.now + 25 * 3600) { refute_empty collect(apply: true)['removed'] }
+    refute File.exist?(source(snapshot))
+  end
+
+  def test_explicit_expiration_previews_without_writes_and_preserves_live_jobs
+    _unused, snapshot = prepare('expire-unused')
+    person, live = prepare('expire-live')
+    submit(person, live)
+    book = File.join(@engine.store.root, 'retention.json')
+    before = File.binread(book)
+    preview = WorkspaceCoordination::Collector.new(@engine).call(expire_unused: true, sizes: true)
+    assert_equal before, File.binread(book)
+    assert preview['actions'].any? { |item| item['path'] == source(snapshot) && item['allocatedBytes'].positive? }
+    assert File.directory?(source(snapshot))
+    WorkspaceCoordination::Collector.new(@engine).call(apply: true, expire_unused: true)
+    refute File.exist?(snapshot.dig('operation', 'targetCheckout'))
+    assert File.directory?(source(live))
+  end
+
+  def test_busy_integration_does_not_block_unrelated_completed_scratch
+    person = owner('independent-scratch')
+    busy, busy_path = integration_scratch(person)
+    _finished, finished_path = integration_scratch(person)
+    @engine.store.lock("integration-#{busy['id']}") do
+      result = Thread.new { collect(apply: true) }.value
+      assert result['retry']
+      assert File.directory?(busy_path)
+      refute File.exist?(finished_path)
+    end
+  end
+
 end

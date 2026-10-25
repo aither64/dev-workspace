@@ -283,8 +283,10 @@ module DevWorkspaceHost
     end
 
     def coordination_collect_command(argv)
-      options = {apply: false, json: false}
+      options = {apply: false, json: false, expire_unused: false, sizes: false}
       OptionParser.new do |opts|
+        opts.on('--expire-unused') { options[:expire_unused] = true }
+        opts.on('--sizes') { options[:sizes] = true }
         opts.on('--dry-run') { options[:apply] = false }
         opts.on('--apply') { options[:apply] = true }
         opts.on('--json') { options[:json] = true }
@@ -293,12 +295,12 @@ module DevWorkspaceHost
       entry = registry.entries.first || raise(WorkspaceCoordination::Error, 'no registered workspace')
       with_current_generation_lock(mode: File::LOCK_SH) do
         coordination_store.lock('preparation') do
-          result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply])
+          result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply], expire_unused: options[:expire_unused], sizes: options[:sizes])
           if options[:json]
             @out.puts JSON.generate(result)
           else
             @out.puts "#{result['mode']}: #{result['actions'].length} collectible payloads/roots; #{result['removed'].length} removed"
-            result['actions'].each { |item| @out.puts "#{item['kind']}: #{item['path']}" }
+            result['actions'].each { |item| @out.puts "#{item['kind']}: #{item['path']}#{item['allocatedBytes'] ? " (#{item['allocatedBytes']} allocated bytes)" : ''}" }
             @out.puts 'Ledger changed; the next sweep will revalidate remaining work.' if result['retry']
           end
         end

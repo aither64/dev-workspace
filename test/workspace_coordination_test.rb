@@ -27,7 +27,8 @@ class WorkspaceCoordinationTest < Minitest::Test
       release_preparation.pop
     end
     collector = Object.new
-    collector.define_singleton_method(:call) do |apply:|
+    collector.define_singleton_method(:call) do |apply:, expire_unused: false, sizes: false|
+      raise 'unexpected explicit collection flags' if expire_unused || sizes
       collecting << true
       release_collection.pop
       {'mode' => apply ? 'apply' : 'dry-run', 'actions' => [], 'removed' => [], 'preserved' => []}
