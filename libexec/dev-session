@@ -1445,7 +1445,7 @@ module DevSession
       journal = load_fork_journal(destination_slug)
       require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:) if journal
       provider = journal['provider'] if journal
-      verify_creation_source!(receipt) if receipt && receipt['source'] && journal.nil?
+      verify_creation_source!(receipt, wait: true) if receipt && receipt['source'] && journal.nil?
       with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
@@ -1492,7 +1492,7 @@ module DevSession
       source_manifest = if journal
                           { 'codex' => { 'thread_id' => journal.fetch('source_thread_id') } }
                         else
-                          with_slug_lock(source_slug) do
+                          with_slug_lock(source_slug, wait: !receipt.nil?) do
                             select_tmux_for_slug!(source_slug)
                             reject_conflicting_lifecycle_journal!(source_slug)
                             manifest = load_portal_manifest(portal_file(source_slug), required: true)
@@ -4051,9 +4051,11 @@ module DevSession
       end
     end
 
-    def verify_creation_source!(receipt)
+    def verify_creation_source!(receipt, wait: false)
       slug = receipt.fetch('source')
-      with_slug_lock(slug) do
+      # Only fork opts into waiting, before destination/provider admission.
+      # Plan creation retains its existing nonblocking check under that admission.
+      with_slug_lock(slug, wait:) do
         reject_conflicting_lifecycle_journal!(slug)
         manifest = load_portal_manifest(portal_file(slug), required: true)
         require_expected_creation_source!(receipt, slug, manifest)
@@ -8276,13 +8278,13 @@ module DevSession
       end
     end
 
-    def with_slug_lock(slug, &block)
+    def with_slug_lock(slug, wait: false, &block)
       authority = load_session_authority(slug, required: false) if @authority_dir
       path = session_lock_file(slug)
       with_host_lock(
         path,
         "development session lock for #{slug}",
-        wait: lifecycle_access_wait?(slug) || (!@lifecycle_access && authority&.fetch('state', nil) == 'creating'),
+        wait: wait || lifecycle_access_wait?(slug) || (!@lifecycle_access && authority&.fetch('state', nil) == 'creating'),
         on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|

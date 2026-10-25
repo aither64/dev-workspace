@@ -161,7 +161,7 @@ module AcceptedForkFixture
       @fixture_source_acquisitions = 0
     end
 
-    def with_slug_lock(slug, &block)
+    def with_slug_lock(slug, **options, &block)
       return super unless slug == ACCEPTED_FORK_CONFIG.fetch('source')
 
       @fixture_source_acquisitions += 1
@@ -169,7 +169,7 @@ module AcceptedForkFixture
       stat = File.stat(session_lock_file(slug))
       details = { stage:, mode: 'EX', device: stat.dev, inode: stat.ino }
       AcceptedForkFixture.event('source_attempt', **details)
-      super(slug) do
+      super(slug, **options) do
         AcceptedForkFixture.event('source_acquired', **details)
         block.call
       end
@@ -177,6 +177,17 @@ module AcceptedForkFixture
       raise unless slug == ACCEPTED_FORK_CONFIG.fetch('source')
       AcceptedForkFixture.event('source_refused', **details)
       raise
+    end
+
+    def with_host_lock(path, description, **options, &block)
+      if path == session_lock_file(ACCEPTED_FORK_CONFIG.fetch('source'))
+        previous = options[:on_wait]
+        options[:on_wait] = lambda do
+          AcceptedForkFixture.event('source_waiting', stage: @fixture_source_acquisitions)
+          previous&.call
+        end
+      end
+      super(path, description, **options, &block)
     end
 
     def create_tmux_session(slug, run_codex:, thread_id:, identity_token:, model:, effort:, launch_codex: run_codex)

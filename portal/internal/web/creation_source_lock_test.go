@@ -22,14 +22,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This is controlled evidence of current accepted-fork refusal and recovery,
-// not evidence identifying the holder in an unrelated CI failure. The Go
-// Handler and Ruby CLI use their real receipts, source checks and flock path.
-func TestAcceptedForkSourceSharedLockRefusalAndReceiptRecovery(t *testing.T) {
+// Exercise the real accepted Go/Ruby path against an identified external SH
+// holder. Both source EX stages wait without retaining destination locks.
+func TestAcceptedForkWaitsForSourceReadersAndRevalidates(t *testing.T) {
 	for _, stage := range []int{1, 2} {
 		for _, replaceSource := range []bool{false, true} {
-			name := fmt.Sprintf("source_ex_%d/replacement=%t", stage, replaceSource)
-			t.Run(name, func(t *testing.T) {
+			t.Run(fmt.Sprintf("source_ex_%d/replacement=%t", stage, replaceSource), func(t *testing.T) {
 				fixture := newAcceptedForkFixture(t, stage)
 				var holder *acceptedForkHolder
 				if stage == 1 {
@@ -37,85 +35,67 @@ func TestAcceptedForkSourceSharedLockRefusalAndReceiptRecovery(t *testing.T) {
 				}
 				accepted := fixture.accept(t)
 				barrier := fixture.sourceBarrier(t)
-				accepted = fixture.receipt(t)
-				if !accepted.Validated || accepted.State != "running" {
-					t.Fatal("source EX observer did not follow real Go validation")
-				}
 				if barrier.event.Stage != stage || barrier.event.Device != fixture.device || barrier.event.Inode != fixture.inode {
-					t.Fatalf("wrong real source lock: %+v", barrier.event)
+					t.Fatalf("wrong source lock: %+v", barrier.event)
 				}
 				if holder == nil {
 					holder = fixture.holdSource(t)
 				}
-				if barrier.event.PID == holder.command.Process.Pid || barrier.event.PID == os.Getpid() {
-					t.Fatal("holder and initializer must be separate processes")
-				}
-				fixture.assertNoNativeEffects(t)
-				bindingPath := fixture.server.creationEvidencePath(accepted) + ".request"
-				var binding []byte
-				if stage == 1 {
-					assertAcceptedForkAbsent(t, bindingPath)
-				} else {
-					binding = acceptedForkRead(t, bindingPath)
-					if ok, err := fixture.server.readCreationBinding(accepted); err != nil || !ok {
-						t.Fatalf("second source EX has no exact binding: %t %v", ok, err)
-					}
-					fixture.assertDestinationUnlocked(t, accepted.Request.Slug)
-				}
-				// The socket acknowledgement permits super -> real EX|NB while
-				// the separate Ruby process still owns SH on this device/inode.
 				barrier.release(t)
-				fixture.wait(t)
-				failed := fixture.receipt(t)
-				if failed.State != "failed" || failed.Attempt != 1 || !failed.Validated ||
-					!strings.Contains(failed.Error, "another dev-session command is changing source") {
-					t.Fatalf("expected exact accepted source-lock refusal: state=%s attempt=%d validated=%t error=%q events=%s",
-						failed.State, failed.Attempt, failed.Validated, failed.Error, fixture.events(t))
+				deadline := time.Now().Add(5 * time.Second)
+				for fixture.count(t, "source_waiting") == 0 && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
 				}
-				t.Logf("accepted receipt state=%s attempt=%d validated=%t", failed.State, failed.Attempt, failed.Validated)
-				fixture.assertSameRequest(t, accepted, failed)
-				fixture.assertSourceStages(t, stage)
+				if fixture.count(t, "source_waiting") != 1 || fixture.receipt(t).State != "running" {
+					t.Fatalf("accepted fork did not wait: events=%s receipt=%+v", fixture.events(t), fixture.receipt(t))
+				}
+				fixture.assertDestinationUnlocked(t, accepted.Request.Slug)
 				fixture.assertNoNativeEffects(t)
-				assertAcceptedForkAbsent(t, fixture.journal(failed.Request.Slug))
-				assertAcceptedForkAbsent(t, filepath.Join(fixture.server.config.Workspace, "work", failed.Request.Slug))
-				assertAcceptedForkAbsent(t, fixture.server.creationEvidencePath(failed))
-				if stage == 1 {
-					assertAcceptedForkAbsent(t, bindingPath)
-				} else if !bytes.Equal(binding, acceptedForkRead(t, bindingPath)) {
-					t.Fatal("source refusal changed the destination request binding")
-				}
-				holder.release(t)
-				fixture.config["pauseStage"] = 0
-				fixture.writeConfig(t)
 				if replaceSource {
 					fixture.replaceSource(t)
-					fixture.retry(t, failed, http.StatusAccepted)
-					fixture.wait(t)
-					rejected := fixture.receipt(t)
-					if rejected.State != "failed" || rejected.Attempt != 2 ||
-						!strings.Contains(rejected.Error, "source session changed") {
-						t.Fatalf("replacement adopted or wrong refusal: state=%s attempt=%d error=%q events=%s",
-							rejected.State, rejected.Attempt, rejected.Error, fixture.events(t))
+				}
+				holder.release(t)
+				fixture.wait(t)
+				if replaceSource {
+					failed := fixture.receipt(t)
+					if failed.State != "failed" || !strings.Contains(failed.Error, "source session changed") {
+						t.Fatalf("changed source adopted: %+v events=%s", failed, fixture.events(t))
 					}
-					t.Logf("replacement refusal state=%s attempt=%d", rejected.State, rejected.Attempt)
-					fixture.assertSameRequest(t, failed, rejected)
+					fixture.assertSameRequest(t, accepted, failed)
 					fixture.assertNoNativeEffects(t)
 					assertAcceptedForkAbsent(t, fixture.journal(failed.Request.Slug))
-					assertAcceptedForkAbsent(t, fixture.server.creationEvidencePath(failed))
-					assertAcceptedForkAbsent(t, filepath.Join(fixture.server.config.Workspace, "work", failed.Request.Slug))
-					if stage == 2 && !bytes.Equal(binding, acceptedForkRead(t, bindingPath)) {
-						t.Fatal("replacement rebound the original request")
-					}
-					return
+				} else {
+					ready := fixture.assertReady(t, accepted, accepted.Attempt)
+					fixture.assertOneFork(t, ready, 0)
+					fixture.assertReplay(t, ready)
 				}
-				fixture.retry(t, failed, http.StatusAccepted)
-				fixture.wait(t)
-				ready := fixture.assertReady(t, failed)
-				fixture.assertOneFork(t, ready, 0)
-				fixture.assertReplay(t, ready)
+				if fixture.count(t, "source_refused") != 0 {
+					t.Fatal("waiting source was refused")
+				}
 			})
 		}
 	}
+
+	t.Run("cancellation_while_waiting_has_no_native_effects", func(t *testing.T) {
+		fixture := newAcceptedForkFixture(t, 1)
+		holder := fixture.holdSource(t)
+		accepted := fixture.accept(t)
+		barrier := fixture.sourceBarrier(t)
+		barrier.release(t)
+		deadline := time.Now().Add(5 * time.Second)
+		for fixture.count(t, "source_waiting") == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if fixture.count(t, "source_waiting") != 1 {
+			t.Fatal("initializer never waited")
+		}
+		fixture.assertDestinationUnlocked(t, accepted.Request.Slug)
+		fixture.server.cancelOperations()
+		fixture.wait(t)
+		fixture.assertNoNativeEffects(t)
+		assertAcceptedForkAbsent(t, fixture.journal(accepted.Request.Slug))
+		holder.release(t)
+	})
 
 	t.Run("journal_bound_recovery_keeps_created_fork_without_source", func(t *testing.T) {
 		fixture := newAcceptedForkFixture(t, 0)
@@ -389,10 +369,14 @@ func (f *acceptedForkFixture) replaceSource(t *testing.T) {
 	}
 }
 
-func (f *acceptedForkFixture) assertReady(t *testing.T, previous creationReceipt) creationReceipt {
+func (f *acceptedForkFixture) assertReady(t *testing.T, previous creationReceipt, attempt ...int) creationReceipt {
 	t.Helper()
 	ready := f.receipt(t)
-	if ready.State != "ready" || ready.Attempt != previous.Attempt+1 || ready.Error != "" || ready.Model != "model-1" || ready.Effort != "high" {
+	wantAttempt := previous.Attempt + 1
+	if len(attempt) > 0 {
+		wantAttempt = attempt[0]
+	}
+	if ready.State != "ready" || ready.Attempt != wantAttempt || ready.Error != "" || ready.Model != "model-1" || ready.Effort != "high" {
 		t.Fatalf("retry not ready: state=%s attempt=%d model=%s effort=%s error=%q events=%s",
 			ready.State, ready.Attempt, ready.Model, ready.Effort, ready.Error, f.events(t))
 	}

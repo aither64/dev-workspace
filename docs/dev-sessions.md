@@ -1040,6 +1040,13 @@ replacement of its missing root. Unknown same-directory project threads remain
 root candidates. Existing roots retain their captured settings and the durable
 initial-goal attempt marker; only a proven different replacement resets it.
 
+Accepted browser forks wait for source readers before checking the exact
+source identity. Both source checks run without destination locks; the portal's
+worker deadline and process-group cancellation bound the wait. A source changed
+during the wait is rejected before native creation. Direct CLI forks retain
+nonblocking source admission. Accepted plan sessions also retain their
+nonblocking source check under destination/provider admission.
+
 Fork creation uses the same identity rule through a short-lived fork journal.
 It records the validated source thread before creating destination tracking, so
 an interrupted fork can resume without source tracking and can adopt or remove
