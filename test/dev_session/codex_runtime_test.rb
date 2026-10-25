@@ -293,6 +293,8 @@ class DevSessionTest < Minitest::Test
         today: TODAY
       )
 
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug, tracking_only: true)
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
 
       session_env = tmux_capture(socket, 'show-environment', '-t', slug)
