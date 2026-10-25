@@ -16,7 +16,7 @@ function fixture(attachmentIds = []) {
     ready: () => true, ids() {return [...this.values];}, clear() {this.values = [];}, lock(value) {this.locked = value;}};
   let resolve, reject;
   const client = {message(...args) {calls.push(json(args)); return new Promise((yes, no) => {resolve = yes; reject = no;});}};
-  const context = vm.createContext({crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
+  const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client, interactive: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false,
     form, textarea, composerUploads: uploads, pendingMessages, inFlightMessageIDs: new Set(),
     queueAttemptStorage: {}, sendAttemptStorage: {}, conversationAssets: {sameAttachments: helpersSameAttachments},

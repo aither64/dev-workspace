@@ -34,7 +34,7 @@ func TestBrowserAssetVersionsForRetryAndQuestionUI(t *testing.T) {
 	// for five minutes and lack the current retry notice presentation.
 	// A fresh page must select a new module URL even after an older page
 	// warmed that cache. Do not replace this with a missing-export fallback.
-	versionAfter(read("static/app.js"), "/codex/assets/conversation.js", 24)
+	versionAfter(read("static/app.js"), "/codex/assets/conversation.js", 25)
 	session := read("templates/session.html")
 	versionAfter(session, "/codex/assets/conversation.css", 11)
 	versionAfter(session, "/static/style.css", 24)
@@ -42,7 +42,7 @@ func TestBrowserAssetVersionsForRetryAndQuestionUI(t *testing.T) {
 	// bytes, including navigation from index/archival to the conversation.
 	var appVersion int
 	for _, name := range []string{"session.html", "index.html", "automatic-archival.html"} {
-		version := versionAfter(read("templates/"+name), "/static/app.js", 58)
+		version := versionAfter(read("templates/"+name), "/static/app.js", 59)
 		if appVersion != 0 && version != appVersion {
 			t.Fatalf("%s selects app v%d, expected v%d", name, version, appVersion)
 		}

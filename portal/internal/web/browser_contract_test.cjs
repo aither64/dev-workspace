@@ -1247,6 +1247,13 @@ if (!unitOnly) {
   assert.match(events.headers.get("content-type"), /^text\/event-stream/);
   assert.match(await events.text(), /event: ready\ndata: \{"heartbeatIntervalMs":20000\}/);
 }
+  const deliveryRequest = createRequest(async () => ({ok: false, status: 503,
+    json: async () => ({error: "The message was not sent.", code: "message_not_sent", notSent: true, retryable: true})}));
+  await assert.rejects(deliveryRequest("/plan", {method: "POST"}), error =>
+    error.code === "message_not_sent" && error.notSent === true && error.retryable === true);
+  const transientAttempt = {id: "00000000-0000-4000-8000-000000000099", message: "saved", context: "", steered: false, state: "unsent", retryable: true};
+  assert.equal(storeSendAttempt(storage, "auto-retry", "thread-1", transientAttempt), true);
+  assert.equal(loadSendAttempts(storage, "auto-retry", "thread-1")[0].retryable, true);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

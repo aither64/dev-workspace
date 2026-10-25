@@ -420,7 +420,7 @@ func TestPlanDeliverySubmittingAndAcceptedSaveRecovery(t *testing.T) {
 			f.wire.failReceiptSave = !lost
 			f.wire.mu.Unlock()
 			first := f.request(context.Background(), planDeliveryID, "plan-turn", "same")
-			if first.Code != http.StatusServiceUnavailable {
+			if first.Code != http.StatusConflict || !strings.Contains(first.Body.String(), `"code":"message_delivery_unknown"`) {
 				t.Fatal("uncertainty hidden", first.Code, first.Body.String())
 			}
 			paths, _ := filepath.Glob(filepath.Join(f.client.RecoveryRoot, "turn-retries", "*", "example"))
@@ -432,7 +432,7 @@ func TestPlanDeliverySubmittingAndAcceptedSaveRecovery(t *testing.T) {
 			f.restart(t)
 			if lost {
 				unknown := f.request(context.Background(), planDeliveryID, "plan-turn", "same")
-				if unknown.Code != http.StatusServiceUnavailable {
+				if unknown.Code != http.StatusConflict {
 					t.Fatal("unknown was replayed", unknown.Code)
 				}
 			}

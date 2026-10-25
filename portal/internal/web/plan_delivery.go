@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -42,7 +43,7 @@ func (s *Server) reconcilePlanDelivery(w http.ResponseWriter, r *http.Request, s
 		return nil, false
 	}
 	fail := func(err error) (*workspacecodex.PreparedSend, bool) {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		s.writeMessageDeliveryError(w, err)
 		return nil, true
 	}
 	ctx := r.Context()
@@ -94,6 +95,29 @@ func (s *Server) reconcilePlanDelivery(w http.ResponseWriter, r *http.Request, s
 		return p, false
 	}
 	return nil, false
+}
+
+func (s *Server) admittedMessageContext(parent context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := parent.Deadline()
+	if !ok {
+		deadline = time.Now().Add(20 * time.Second)
+	}
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(parent), deadline)
+	stop := context.AfterFunc(s.operationContext, cancel)
+	return ctx, func() { stop(); cancel() }
+}
+
+func (s *Server) writeMessageDeliveryError(w http.ResponseWriter, err error) {
+	var unsent *codex.MessageNotSentError
+	var unknown *codex.UnknownSendOutcomeError
+	switch {
+	case errors.As(err, &unsent):
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable": unsent.Retryable})
+	case errors.As(err, &unknown):
+		s.writeJSON(w, http.StatusConflict, map[string]any{"error": "Message delivery could not be confirmed.", "code": "message_delivery_unknown", "notSent": false})
+	default:
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+	}
 }
 
 func (s *Server) requirePlanDeliveryIdentity(ctx context.Context, expected *session.Summary) error {

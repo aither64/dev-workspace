@@ -2673,6 +2673,11 @@ func (s *Server) implementPlanRequest(w http.ResponseWriter, r *http.Request, su
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Codex is still working on this plan"})
 		return
 	}
+	// The exact plan and authority are now validated. Finish the mutation and
+	// receipt even if its browser connection disappears during dispatch.
+	dispatch, stopDispatch := s.admittedMessageContext(ctx)
+	defer stopDispatch()
+	ctx = dispatch
 	if transcript.CollaborationMode == "plan" {
 		if err := s.config.Codex.PrepareSend(
 			summary.Codex.ThreadID, implementationMessage,
@@ -2715,7 +2720,7 @@ func (s *Server) implementPlanRequest(w http.ResponseWriter, r *http.Request, su
 		body.ClientUserMessageID, actionContext,
 	)
 	if err != nil {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		s.writeMessageDeliveryError(w, err)
 		return
 	}
 	s.writeJSON(w, http.StatusAccepted, receipt)

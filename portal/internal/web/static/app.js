@@ -17,7 +17,7 @@
       data = {};
     }
     options.signal?.throwIfAborted();
-    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; throw error; }
+    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; error.notSent = data.notSent === true; error.retryable = data.retryable === true; throw error; }
     return data;
   };
   const createSessionClient = (slug, request, conversation, selectedMember = "") => ({
@@ -818,6 +818,7 @@
           context: value.context || "",
           ...(value.dismissed === true ? {dismissed: true} : {}),
           ...(["accepted", "observed", "unsent"].includes(value.state) ? {state: value.state} : {}),
+          ...(value.state === "unsent" && value.retryable === true ? {retryable: true} : {}),
           ...(typeof value.replacementId === "string" ? {replacementId: value.replacementId} : {}),
           ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
@@ -827,6 +828,7 @@
         context: typeof attempt.context === "string" ? attempt.context : "",
         ...(attempt.dismissed === true ? {dismissed: true} : {}),
         ...(["accepted", "observed", "unsent"].includes(attempt.state) ? {state: attempt.state} : {}),
+        ...(attempt.state === "unsent" && attempt.retryable === true ? {retryable: true} : {}),
         ...(typeof attempt.replacementId === "string" ? {replacementId: attempt.replacementId} : {}),
         ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
       }),
@@ -1210,7 +1212,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=25");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=26");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -3913,6 +3915,7 @@
   let dismissedPlanIdentity = "";
   let planImplementationInFlight = false;
   const pendingMessages = new Map();
+  let deliveryRetries = null;
   const inFlightMessageIDs = new Set();
   const requestInputDrafts = new Map(), promptStatuses = new Map(), respondingPrompts = new Set(), answeredOffers = new Set();
   let currentPrompts = [];
@@ -4042,6 +4045,7 @@
     if (!entries) return;
     for (const entry of entries) {
       pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
+      if (entry.state === "unsent" && entry.retryable) deliveryRetries?.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
     }
   };
 
@@ -5391,13 +5395,15 @@
   const markMessageOutcomeUnknown = (id, error) => {
     const entry = pendingMessages.get(id);
     if (!entry || entry.state === "observed" || entry.state === "accepted") return;
-    const updated = {...entry, state: error?.notSent === true ? "unsent" : "unknown"};
+    const updated = {...entry, state: error?.notSent === true ? "unsent" : "unknown", retryable: error?.retryable === true};
     pendingMessages.set(id, updated);
     storeSendAttempt(sendAttemptStorage, slug, currentThreadId, updated);
+    deliveryRetries?.schedule(id, error);
     renderMessageReceipts();
     scheduleRefresh(0);
   };
   const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId, operation = null) => {
+    deliveryRetries?.stop(attempt.id);
     if (threadID === currentThreadId) optionalQuestions?.ordinaryAccepted();
     const current = threadID === currentThreadId ? pendingMessages.get(attempt.id) : null;
     const accepted = {
@@ -5687,58 +5693,67 @@
     ++planRenderGeneration;
     composerView.setPlanVisible(false, true);
   });
-  document.getElementById("plan-implement-same")?.addEventListener("click", async (event) => {
-    const button = event.currentTarget;
+  async function retryPlanImplementation(id) {
+    const attempt = pendingMessages.get(id);
+    const match = /^plan:([^:]+):([0-9a-f]{64})$/.exec(attempt?.context || "");
+    if (!attempt || !match || !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
+    const threadID = currentThreadId, sendingClient = client;
+    if (!storeSendAttempt(sendAttemptStorage, slug, threadID, {...attempt, state: "unknown", retryable: false})) {
+      showSubmissionFailure(new Error("Browser storage is unavailable; the request was not sent."), submissionIdentity(threadID, id));
+      return;
+    }
+    inFlightMessageIDs.add(id);
+    pendingMessages.set(id, {...attempt, state: "sending"});
+    planImplementationInFlight = true;
+    ++planRenderGeneration;
+    renderMessageReceipts();
+    try {
+      const receipt = await sendingClient.implementPlan({action: "same", planContextVersion: 2,
+        planTurnId: match[1], planSha256: match[2], clientUserMessageId: id});
+      acceptMessageReceipt(attempt, receipt, threadID);
+      if (threadID === currentThreadId) {
+        recordSettingsWrite(); confirmMode("default"); followTranscript();
+        dismissedPlanIdentity = planIdentity(match[1], match[2]);
+        applyCurrentSettings(); scheduleRefresh(0);
+      }
+    } catch (error) {
+      if (threadID === currentThreadId) {
+        markMessageOutcomeUnknown(id, error);
+        showSubmissionFailure(error, submissionIdentity(threadID, id));
+      }
+    } finally {
+      planImplementationInFlight = false;
+      inFlightMessageIDs.delete(id);
+      renderMessageReceipts(); scheduleRefresh(0);
+    }
+  }
+
+  document.getElementById("plan-implement-same")?.addEventListener("click", async () => {
     const message = "Implement the plan.";
     const context = planActionContext(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
     if (attempts === null) {
-      alert("Browser storage is unavailable; messages cannot be submitted safely.");
+      showSubmissionFailure(new Error("Browser storage is unavailable; messages cannot be submitted safely."), submissionIdentity(currentThreadId, null));
       return;
     }
     let attempt = matchingSendAttempt(attempts, message, context);
     if (!attempt) {
-      attempt = {id: crypto.randomUUID(), message, steered: false, context};
-      if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt)) {
-        alert("Browser storage is unavailable; messages cannot be submitted safely.");
-        return;
-      }
+      attempt = {id: crypto.randomUUID(), message, steered: false, context, state: "unsent"};
+      if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt)) return;
     }
-    const id = attempt.id;
-    inFlightMessageIDs.add(id);
-    pendingMessages.set(id, {...attempt, state: attempt.state || "sending"});
-    renderMessageReceipts();
-    button.disabled = true;
-    planImplementationInFlight = true;
-    ++planRenderGeneration;
-    const implementingIdentity = planIdentity(planActions.dataset.planTurnId, planActions.dataset.planSha256);
-    try {
-      const receipt = await client.implementPlan({
-        action: "same",
-        planContextVersion: 2,
-        planTurnId: planActions.dataset.planTurnId,
-        planSha256: planActions.dataset.planSha256,
-        clientUserMessageId: id,
-      });
-      acceptMessageReceipt(attempt, receipt);
-      recordSettingsWrite();
-      confirmMode("default");
-      followTranscript();
-      dismissedPlanIdentity = implementingIdentity;
-      renderMessageReceipts();
-      applyCurrentSettings();
-      scheduleRefresh(0);
-    } catch (error) {
-      markMessageOutcomeUnknown(id);
-      button.disabled = false;
-      alert(error.message);
-    } finally {
-      planImplementationInFlight = false;
-      button.disabled = false;
-      inFlightMessageIDs.delete(id);
-      scheduleRefresh(0);
-    }
+    pendingMessages.set(attempt.id, attempt);
+    await retryPlanImplementation(attempt.id);
   });
+
+  deliveryRetries = conversationAssets.createDeliveryRetryScheduler({
+    isCurrent: id => pendingMessages.has(id) && !["accepted", "observed"].includes(pendingMessages.get(id).state),
+    canRetry: () => interactive && !executionHeld && !document.hidden && navigator.onLine !== false &&
+      !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight,
+    retry: id => pendingMessages.get(id)?.context ? retryPlanImplementation(id) : retryMessageReceipt(id),
+  });
+  for (const entry of pendingMessages.values()) {
+    if (entry.state === "unsent" && entry.retryable) deliveryRetries.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
+  }
 
   const planSessionDialog = document.getElementById("plan-session-dialog");
   const planSessionForm = document.getElementById("plan-session-form");

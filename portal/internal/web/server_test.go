@@ -3065,7 +3065,7 @@ func TestImplementPlanKeepsDefaultModeAndReconcilesAnUnknownSend(t *testing.T) {
 	server.implementPlan(first, httptest.NewRequest(
 		http.MethodPost, "/", strings.NewReader(body),
 	), summary)
-	if first.Code != http.StatusServiceUnavailable {
+	if first.Code != http.StatusConflict {
 		t.Fatalf("unknown plan response = %d %q", first.Code, first.Body.String())
 	}
 	if controller.settings.CollaborationMode != "default" {
@@ -4148,7 +4148,7 @@ func TestShippedBrowserClientMatchesSessionAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	modulePath := filepath.Join(t.TempDir(), "conversation.mjs")
-	for _, name := range []string{"uploads.js", "sync.js", "refresh.js", "questions.js", "citations.js", "retry.js", "retry_activity.js"} {
+	for _, name := range []string{"uploads.js", "sync.js", "refresh.js", "questions.js", "citations.js", "retry.js", "retry_activity.js", "delivery_retry.js"} {
 		dependency, err := http.Get(httpServer.URL + "/codex/assets/" + name)
 		if err != nil {
 			t.Fatal(err)
