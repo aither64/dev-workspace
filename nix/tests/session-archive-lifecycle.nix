@@ -170,9 +170,10 @@ pkgs.testers.runNixOSTest {
                 "puts JSON.generate(YAML.safe_load(File.read(ARGV.fetch(0))))") + " " + root + "/work/" + slug + "/portal.yml"))
             thread = manifest["codex"]["thread_id"]
             socket = manifest["codex"]["socket_path"]
+            # Direct helpers share the portal's selected submission database.
             machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
                 package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
-                + " --cwd " + root + "/work/" + slug))
+                + " --cwd " + root + "/work/" + slug + " --user-state-root " + state))
             cache = root + "/worktrees/" + slug + "/.hook-cache"
             user("mkdir -p " + cache + "/bin && printf generated > " + cache + "/bin/overcommit")
             repair = "mv " + shlex.quote(cache) + " " + shlex.quote(checkout + "/.gems-archive-cache")
