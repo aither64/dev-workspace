@@ -1562,6 +1562,13 @@ runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
 						t.Fatal("deleted request cache was retained")
 					}
 				}
+				// Fresh admission below intentionally starts a creation worker.
+				// Check reconciliation before that legitimate dispatch can occur.
+				if dispatchMarker != "" {
+					if _, err := os.Stat(dispatchMarker); !os.IsNotExist(err) {
+						t.Fatal("receipt reconciliation dispatched creation", err)
+					}
+				}
 				fresh, err := restored.acceptCreation(creationRequest{Kind: "new", Slug: receipt.Request.Slug, Goal: "Fresh request"})
 				if err != nil {
 					t.Fatal(err)
@@ -1572,11 +1579,6 @@ runner.send(:write_removal_metadata!, removal.fetch('recovery'), removal)
 				stale = postCreation(t, restored, "/api/sessions/"+receipt.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":1}`, receipt.ReceiptID), "application/json")
 				if stale.Code != http.StatusConflict {
 					t.Fatal("old retry targeted the new request")
-				}
-				if dispatchMarker != "" {
-					if _, err := os.Stat(dispatchMarker); !os.IsNotExist(err) {
-						t.Fatal("receipt reconciliation dispatched creation", err)
-					}
 				}
 			})
 		}
