@@ -95,92 +95,100 @@ func TestColdAssignmentRetryPreservesPersistedHotSendOutcome(t *testing.T) {
 	}
 }
 
-func TestColdAssignmentReceiptRemainsKnownAfterExecutionWithoutBrowser(t *testing.T) {
-	workspace := t.TempDir()
-	cwd := filepath.Join(workspace, "work", "example")
-	if err := os.MkdirAll(cwd, 0700); err != nil {
-		t.Fatal(err)
-	}
-	queued, started, resumes := false, false, 0
-	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
-		if err := handshake(connection); err != nil {
-			return err
-		}
-		for {
-			request, err := readObject(connection)
-			if err != nil {
-				return nil
+func TestColdAssignmentAndProgressReceiptsRemainKnownAfterExecutionWithoutBrowser(t *testing.T) {
+	for _, progress := range []bool{false, true} {
+		t.Run(fmt.Sprint("progress=", progress), func(t *testing.T) {
+			workspace := t.TempDir()
+			cwd := filepath.Join(workspace, "work", "example")
+			if err := os.MkdirAll(cwd, 0700); err != nil {
+				t.Fatal(err)
 			}
-			var result any
-			switch request["method"] {
-			case "thread/read":
-				result = map[string]any{"thread": map[string]any{"id": "member", "cwd": cwd, "source": "vscode", "updatedAt": time.Now().Unix(), "status": map[string]any{"type": "notLoaded"}, "turns": []any{}}}
-			case "thread/queue/add":
-				queued = true
-				result = map[string]any{"queuedSubmission": map[string]any{"id": "queued", "clientUserMessageId": "assignment-id", "input": []any{map[string]any{"type": "text", "text": "saved assignment"}}}}
-			case "thread/queue/list":
-				data := []any{}
-				if queued {
-					data = append(data, map[string]any{"id": "queued", "clientUserMessageId": "assignment-id", "input": []any{map[string]any{"type": "text", "text": "saved assignment"}}})
+			queued, started, resumes := false, false, 0
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
 				}
-				result = map[string]any{"data": data, "nextCursor": nil}
-			case "thread/resume":
-				resumes++
-				queued, started = false, true
-				result = map[string]any{"thread": map[string]any{"id": "member"}}
-			case "thread/turns/list":
-				data := []any{}
-				if started {
-					data = append(data, map[string]any{"id": "turn", "status": "completed"})
+				for {
+					request, err := readObject(connection)
+					if err != nil {
+						return nil
+					}
+					var result any
+					switch request["method"] {
+					case "thread/read":
+						result = map[string]any{"thread": map[string]any{"id": "member", "cwd": cwd, "source": "vscode", "updatedAt": time.Now().Unix(), "status": map[string]any{"type": "notLoaded"}, "turns": []any{}}}
+					case "thread/queue/add":
+						queued = true
+						result = map[string]any{"queuedSubmission": map[string]any{"id": "queued", "clientUserMessageId": "assignment-id", "input": []any{map[string]any{"type": "text", "text": "saved assignment"}}}}
+					case "thread/queue/list":
+						data := []any{}
+						if queued {
+							data = append(data, map[string]any{"id": "queued", "clientUserMessageId": "assignment-id", "input": []any{map[string]any{"type": "text", "text": "saved assignment"}}})
+						}
+						result = map[string]any{"data": data, "nextCursor": nil}
+					case "thread/resume":
+						resumes++
+						queued, started = false, true
+						result = map[string]any{"thread": map[string]any{"id": "member"}}
+					case "thread/turns/list":
+						data := []any{}
+						if started {
+							data = append(data, map[string]any{"id": "turn", "status": "completed"})
+						}
+						result = map[string]any{"data": data, "nextCursor": nil}
+					case "thread/items/list":
+						data := []any{}
+						if started {
+							data = append(data, map[string]any{"turnId": "turn", "item": map[string]any{"id": "item", "type": "userMessage", "clientId": "assignment-id", "content": []any{map[string]any{"type": "text", "text": "saved assignment"}}}})
+						}
+						result = map[string]any{"data": data, "nextCursor": nil}
+					default:
+						return fmt.Errorf("assignment unexpectedly used %v", request["method"])
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return nil
+					}
 				}
-				result = map[string]any{"data": data, "nextCursor": nil}
-			case "thread/items/list":
-				data := []any{}
-				if started {
-					data = append(data, map[string]any{"turnId": "turn", "item": map[string]any{"id": "item", "type": "userMessage", "clientId": "assignment-id", "content": []any{map[string]any{"type": "text", "text": "saved assignment"}}}})
+			})
+			for name, body := range map[string]string{"plan.md": "# Plan\n", "state.md": "---\nlifecycle: active\n---\n", "portal.yml": "schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: root\n  socket_path: " + socket + "\n  client_version: 0.160.0\n"} {
+				if err := os.WriteFile(filepath.Join(cwd, name), []byte(body), 0600); err != nil {
+					t.Fatal(err)
 				}
-				result = map[string]any{"data": data, "nextCursor": nil}
-			default:
-				return fmt.Errorf("assignment unexpectedly used %v", request["method"])
 			}
-			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
-				return nil
+			state := filepath.Join(workspace, "state")
+			store := session.RecoveryStore{Root: state, Workspace: workspace}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := store.Set(ctx, "example", "root", socket, true, false); err != nil {
+				t.Fatal(err)
 			}
-		}
-	})
-	for name, body := range map[string]string{"plan.md": "# Plan\n", "state.md": "---\nlifecycle: active\n---\n", "portal.yml": "schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: root\n  socket_path: " + socket + "\n  client_version: 0.160.0\n"} {
-		if err := os.WriteFile(filepath.Join(cwd, name), []byte(body), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	state := filepath.Join(workspace, "state")
-	store := session.RecoveryStore{Root: state, Workspace: workspace}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := store.Set(ctx, "example", "root", socket, true, false); err != nil {
-		t.Fatal(err)
-	}
-	client := NewWithOptions(socket, workspace, codex.ClientOptions{SubmissionLedgerPath: filepath.Join(state, "receipts.json")})
-	client.RecoveryRoot = state
-	defer client.Close()
-	options := codex.TurnOptions{Model: "saved-model", ReasoningEffort: "low"}
-	if _, err := client.SendWithOptions(ctx, "member", "saved assignment", "assignment-id", "assignment", options); err != nil {
-		t.Fatal(err)
-	}
-	observation, err := client.ObserveThreadIdentity(ctx, "member", cwd, "", ArchiveActive)
-	if err != nil || !observation.ActivityKnown || !observation.Idle {
-		t.Fatal("assignment blocked later observation", observation, err)
-	}
-	if err := client.RequireSubmissionAttemptsResolved(ctx, "member"); err != nil {
-		t.Fatal("assignment blocked lifecycle", err)
-	}
-	if _, err := client.SendWithOptions(ctx, "member", "saved assignment", "assignment-id", "assignment", options); err != nil {
-		t.Fatal(err)
-	}
-	if resumes != 1 {
-		t.Fatal("retry loaded duplicate work", resumes)
-	}
-	if store.AllowsImplicitResume(socket, "root") || !store.AllowsImplicitResume(socket, "member") {
-		t.Fatal("assignment released another recipient")
+			client := NewWithOptions(socket, workspace, codex.ClientOptions{SubmissionLedgerPath: filepath.Join(state, "receipts.json")})
+			client.RecoveryRoot = state
+			defer client.Close()
+			options := codex.TurnOptions{Model: "saved-model", ReasoningEffort: "low"}
+			send, action := client.SendWithOptions, "assignment"
+			if progress {
+				send, action = client.SendProgressCheck, "progress:example:check"
+			}
+			if _, err := send(ctx, "member", "saved assignment", "assignment-id", action, options); err != nil {
+				t.Fatal(err)
+			}
+			observation, err := client.ObserveThreadIdentity(ctx, "member", cwd, "", ArchiveActive)
+			if err != nil || !observation.ActivityKnown || !observation.Idle {
+				t.Fatal("assignment blocked later observation", observation, err)
+			}
+			if err := client.RequireSubmissionAttemptsResolved(ctx, "member"); err != nil {
+				t.Fatal("assignment blocked lifecycle", err)
+			}
+			if _, err := send(ctx, "member", "saved assignment", "assignment-id", action, options); err != nil {
+				t.Fatal(err)
+			}
+			if resumes != 1 {
+				t.Fatal("retry loaded duplicate work", resumes)
+			}
+			if store.AllowsImplicitResume(socket, "root") || !store.AllowsImplicitResume(socket, "member") {
+				t.Fatal("assignment released another recipient")
+			}
+		})
 	}
 }

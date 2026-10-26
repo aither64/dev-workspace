@@ -235,7 +235,9 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 			return err
 		}
 		member := progressMember(roster)
-		if member == nil || s.recoveryHeld(fresh.Slug, member.Thread) {
+		// A ready member may never have run. SendProgressCheck durably queues
+		// its request before activating that exact cold recipient.
+		if member == nil {
 			return nil
 		}
 		state, err = s.progressStore().Load(fresh.Codex.ThreadID)

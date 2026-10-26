@@ -465,6 +465,8 @@ Existing sessions opt in by adding the role through the Team tab or
 `dev-session team add <slug> observer --as-is`. Adding it uses the installed
 catalog; other retained members keep their saved settings. The Team tab can
 pause automatic checks. Removing the observer stops them.
+A newly added observer starts automatically when a check is due; it does not
+need a manual assignment or an earlier activation.
 
 The portal checks progress every 15 minutes while the lead or another development
 member is actively working. Fully idle sessions, including sessions that recently

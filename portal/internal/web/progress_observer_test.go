@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -127,6 +128,51 @@ func TestProgressIdleSessionsNeverWake(t *testing.T) {
 		t.Fatal("observer activity sustained idle session")
 	}
 }
+func TestProgressColdObserverCanBeScheduled(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(map[bool]string{false: "idle", true: "working"}[active], func(t *testing.T) {
+			s, c, summary, now := progressFixture(t)
+			socket := filepath.Join(t.TempDir(), "codex.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			path := filepath.Join(s.config.Workspace, "work", "example", "portal.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(strings.ReplaceAll(string(data), s.config.CodexSocket, socket)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			s.config.CodexSocket, s.config.RecoverSessions = socket, true
+			writeWebRuntimeAuthority(t, s, "example")
+			if err := s.recoveryStore().Set(context.Background(), "example", "thread-1", socket, true, true); err != nil {
+				t.Fatal(err)
+			}
+			if !s.recoveryHeld("example", "observer-thread") {
+				t.Fatal("observer fixture is already active")
+			}
+			if !active {
+				root := c.transcripts["thread-1"]
+				root.Status = "idle"
+				c.transcripts["thread-1"] = root
+			}
+			if err := s.stepProgressObserver(context.Background(), summary, now); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if active {
+				want = 1
+			}
+			if len(c.sends) != want {
+				t.Fatalf("cold observer sends=%d, want %d", len(c.sends), want)
+			}
+		})
+	}
+}
+
 func TestProgressQuietSuccessAndRestartSettlement(t *testing.T) {
 	s, c, summary, now := progressFixture(t)
 	if err := s.stepProgressObserver(context.Background(), summary, now); err != nil {
