@@ -57,6 +57,25 @@ not acquire an outer roster or conversation lock. The retry scheduler waits for
 its next scheduled attempt outside these locks. Two scheduler workers serve
 retained roots and ready team members without requiring a browser connection.
 
+The one-second scheduler can skip full admission for an unchanged conversation
+after a successful admitted step has settled it. A process-local token records
+the exact retry state, relevant session/thread policy content, native turn
+observation, tracking incarnation, runtime/roster identity and socket generation.
+Every probe reloads these inputs and reads fresh passive native turn state;
+cached activity summaries do not establish a match. Tokens are captured at the
+successful final policy checkpoint while the step still holds admission, rather
+than by sampling state after its lock has been released. Enrollment, dispatch,
+errors and ambiguous checkpoint ordering do not establish settlement.
+
+Missing state, enrollment, policy or thread policy follows the full path,
+including conservative policy bootstrap. Unreadable or malformed records remain
+errors. Changed inputs and due deadlines also take full admission. Uncertain
+submissions always retain their receipt-only reconciliation path, including
+after cancellation or a preference is disabled. Actual execution retains both
+pre-lock and post-lock authority checks. Tokens grant no execution permission,
+are pruned when candidates retire, and disappear on restart without changing
+any persisted record or recovery contract.
+
 Session preferences and optional activity checkpoints live separately at
 `$DEV_WORKSPACES_STATE/turn-retry-policy/<workspace-sha256>/<slug>.json`.
 This strict schema-1 sidecar is limited to 1 MiB and 128 thread entries. Its

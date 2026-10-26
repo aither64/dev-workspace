@@ -120,6 +120,7 @@ func (s *Server) startTurnRetries() {
 		defer s.operationWG.Done()
 		ctx := s.operationContext
 		queue := retryJobs{jobs: make(chan string, 2), active: make(map[string]bool)}
+		settled := &retryIdleGate{}
 		var workers sync.WaitGroup
 		var diagnostics sync.Mutex
 		lastFailure := map[string]time.Time{}
@@ -129,7 +130,7 @@ func (s *Server) startTurnRetries() {
 				defer workers.Done()
 				for id := range queue.jobs {
 					attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
-					err := s.stepTurnRetry(attempt, client, id)
+					err := s.stepTurnRetrySettled(attempt, client, id, settled, time.Now())
 					diagnostics.Lock()
 					if err != nil && time.Since(lastFailure[id]) > time.Minute {
 						s.config.Logger.Printf("automatic retry observation or admission unavailable for %s", id)
@@ -170,6 +171,7 @@ func (s *Server) startTurnRetries() {
 					}
 				}
 			}
+			settled.prune(ids)
 			if len(ids) > 0 {
 				start := next
 				for count := 0; count < len(ids); count++ {
@@ -191,6 +193,10 @@ func (s *Server) startTurnRetries() {
 }
 
 func (s *Server) stepTurnRetry(ctx context.Context, client turnRetryClient, id string) error {
+	return s.stepTurnRetryCapturing(ctx, client, id, nil)
+}
+
+func (s *Server) stepTurnRetryCapturing(ctx context.Context, client turnRetryClient, id string, settlement *retrySettlement) error {
 	if err := s.reconcileTurnRetry(ctx, client, id); err != nil {
 		return err
 	}
@@ -232,8 +238,18 @@ func (s *Server) stepTurnRetry(ctx context.Context, client turnRetryClient, id s
 	if err != nil {
 		return err
 	}
-	controller := turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Random: rand.Float64, Policy: turnretry.SessionPolicy{Store: policyStore(client), Scope: policyIdentity}}
-	return controller.Step(ctx, scope)
+	policy := turnretry.SessionPolicy{Store: policyStore(client), Scope: policyIdentity}
+	var authority turnretry.PolicyAuthority = policy
+	if settlement != nil {
+		settlement.SessionPolicy = policy
+		authority = settlement
+	}
+	controller := turnretry.Controller{Store: client.RetryStore(), Backend: client.RetryBackend(), Random: rand.Float64, Policy: authority}
+	err = controller.Step(ctx, scope)
+	if err != nil && settlement != nil {
+		settlement.token = nil
+	}
+	return err
 }
 
 // Reconciliation has no execution capability. In particular, the semantic
