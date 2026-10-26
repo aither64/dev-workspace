@@ -93,7 +93,7 @@ func namingTestWait(t *testing.T, path string) []byte {
 }
 
 func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
-	for _, mode := range []string{"hold", "bad version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
+	for _, mode := range []string{"hold", "bad version", "predecessor version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			home := t.TempDir()
@@ -115,12 +115,14 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal(err)
 			}
 			childMode := mode
-			if mode == "bad version" {
+			if mode == "bad version" || mode == "predecessor version" {
 				childMode = "hold"
 			}
-			version := "codex-cli 0.163.0"
+			version := "codex-cli 0.164.0"
 			if mode == "bad version" {
-				version = "codex-cli 0.163.1"
+				version = "codex-cli 0.164.1"
+			} else if mode == "predecessor version" {
+				version = "codex-cli 0.163.0"
 			}
 			// Only a synthetic test executable runs; no Codex/provider is contacted.
 			script := "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' " + strconv.Quote(version) + "; exit 0; fi\nprintf 'started\\n' >> \"$NAMING_TEST_COUNT\"\nexec " + strconv.Quote(os.Args[0]) + " -test.run=^TestNamingRuntimeChildFixture$ -- \"$@\"\n"
@@ -205,7 +207,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if _, err := os.Stat(owner.directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("owned lifetime directory retained", err)
 			}
-			if mode == "bad version" || strings.Contains(mode, "provider") {
+			if mode == "bad version" || mode == "predecessor version" || strings.Contains(mode, "provider") {
 				if _, err := os.Stat(count); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("failed prerequisite started native child")
 				}
@@ -278,7 +280,7 @@ func TestNamingRuntimeConstructorFailureClosesOwnedLifetime(t *testing.T) {
 	catalog := filepath.Join(root, "share/workspace-portal/codex-models.json")
 	os.MkdirAll(filepath.Dir(native), 0700)
 	os.MkdirAll(filepath.Dir(catalog), 0700)
-	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.163.0'\n"), 0700); err != nil {
+	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.164.0'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(catalog, []byte("synthetic"), 0444); err != nil {

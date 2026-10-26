@@ -284,7 +284,7 @@ pkgs.testers.runNixOSTest {
         user("printf fixture-private-token > ~/.codex/fixture.token && chmod 0600 ~/.codex/fixture.token")
         # Alternate exists only in the host catalog. Naming must import that
         # definition rather than relying on this global primary configuration.
-        config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n'
+        config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nstream_max_retries=2\nrequest_max_retries=0\n[model_providers.alternate]\nname="Alternate fixture"\nstream_max_retries=0\nrequest_max_retries=0\n'
         user("printf %s " + shlex.quote(config) + " > ~/.codex/config.toml")
         user("systemd-run --user --unit=creation-model ${python}/bin/python ${../../test/creation_model.py}")
         machine.wait_until_succeeds("curl -fsS http://127.0.0.1:2455/primary/v1/models")
@@ -357,7 +357,7 @@ pkgs.testers.runNixOSTest {
                 "--portal-base-url", "https://fixture.workspace.example.test",
                 "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
                 "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
-                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.163.0",
+                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.164.0",
                 "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
             wrong = args.copy()
             wrong[wrong.index("--cwd") + 1] += "-foreign"
@@ -367,21 +367,53 @@ pkgs.testers.runNixOSTest {
             assert restored == {"model": "gpt-5.5", "reasoningEffort": "high"}, restored
             proof("explicit-fork", "alternate")
 
-        with subtest("failed naming creates usable sessions with distinct fallback names"):
+        with subtest("native naming retry reaches success without manual choice"):
+            user("printf 2 > /tmp/creation-model/naming-overloads")
+            user("touch /tmp/creation-model/naming-retry-advice")
+            browser("create", "naming-native-retry", auto=True, provider="primary")
+            proof("naming-native-retry", "primary")
+            naming_proof("naming-native-retry", "primary", attempts=3)
+            assert checkpoint("naming-native-retry")["preparationAttempt"] == 1
+            user("rm /tmp/creation-model/naming-overloads")
+            user("rm /tmp/creation-model/naming-retry-advice")
+
+        with subtest("settled terminal transient naming error permits one fresh call"):
+            user("printf 1 > /tmp/creation-model/naming-overloads")
+            browser("create", "naming-fresh-retry", auto=True, provider="alternate")
+            proof("naming-fresh-retry", "alternate")
+            naming_proof("naming-fresh-retry", "alternate", attempts=2)
+            assert checkpoint("naming-fresh-retry")["preparationAttempt"] == 1
+            user("rm /tmp/creation-model/naming-overloads")
+
+        with subtest("persistent transient naming error stops after two utility calls"):
+            user("printf 100 > /tmp/creation-model/naming-overloads")
+            browser("admit", "naming-persistent", auto=True, provider="alternate")
+            browser("failed", "naming-persistent")
+            stopped = status("naming-persistent")
+            assert stopped["canSetName"] and not stopped.get("slug"), stopped
+            naming_proof("naming-persistent", "alternate", attempts=2)
+            assert user("cat /tmp/creation-model/naming-overloads").strip() == "98"
+            browser("name", "naming-persistent", customName="provider-recovery")
+            proof("naming-persistent", "alternate")
+            user("rm /tmp/creation-model/naming-overloads")
+
+        with subtest("failed naming stops before reservation and keeps manual recovery"):
             user("touch /tmp/creation-model/bad-name")
-            browser("create", "naming-error", auto=True, provider="alternate", attachment=True)
+            browser("admit", "naming-error", auto=True, provider="alternate", attachment=True)
+            browser("failed", "naming-error")
+            stopped = status("naming-error")
+            assert stopped["canSetName"] and not stopped.get("slug"), stopped
+            assert not stopped.get("canonicalUrl"), stopped
+            mapping = json.loads(user("cat " + portal_state + "/session-preparations/"
+                + checkpoint("naming-error")["requestId"] + ".json"))
+            assert not mapping.get("base") and not mapping.get("slug") and not mapping.get("handoff"), mapping
+            browser("name", "naming-error", customName="php-upload-progress-mitigation")
             proof("naming-error", "alternate")
             naming_proof("naming-error", "alternate")
             first = checkpoint("naming-error")
-            assert first["slug"].endswith("-development-session"), first
+            assert first["slug"].endswith("-php-upload-progress-mitigation"), first
             initial = [entry for entry in first["transcript"]["entries"] if first["marker"] in entry.get("text", "")]
             assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
-            browser("create", "naming-collision", auto=True)
-            proof("naming-collision", "primary")
-            naming_proof("naming-collision", "primary")
-            second = checkpoint("naming-collision")
-            assert second["slug"].startswith(first["slug"] + "-"), second
-            assert first["threadId"] != second["threadId"], (first, second)
             user("rm /tmp/creation-model/bad-name")
 
         # Transport faults forward only real native responses. The application
@@ -425,6 +457,13 @@ pkgs.testers.runNixOSTest {
     except Exception:
         print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
         print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
+        print(user("${python}/bin/python -c " + shlex.quote(
+            "import json,pathlib; root=pathlib.Path('/tmp/creation-model'); "
+            "rows=[json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines() if line]; "
+            "print(json.dumps({'namingResponses':[{k:row.get(k) for k in ['index','provider','overload','retryAdvice']} "
+            "for row in rows if row['body'].get('model')=='gpt-6-luna'], "
+            "'overloadsRemaining':(root/'naming-overloads').read_text() if (root/'naming-overloads').exists() else None, "
+            "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")))
         raise
     finally:
         machine.copy_from_vm("/tmp/creation-evidence", "creation-evidence")

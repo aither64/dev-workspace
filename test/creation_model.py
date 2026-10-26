@@ -49,10 +49,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         index = next(sequence)
         provider = self.path.split("/")[1]
+        naming = request.get("model") == "gpt-6-luna"
+        overload = False
+        retry_advice = naming and (ROOT / "naming-retry-advice").exists()
+        if naming:
+            # ServerOverloaded is terminal without structured server advice.
+            # The labelled native-progress case supplies advice and a ceiling.
+            failures = ROOT / "naming-overloads"
+            with lock:
+                remaining = int(failures.read_text()) if failures.exists() else 0
+                if remaining:
+                    failures.write_text(str(remaining - 1))
+                    overload = True
         with lock:
             with (ROOT / "requests.jsonl").open("a") as log:
-                log.write(json.dumps({"index": index, "provider": provider, "body": request}) + "\n")
-        naming = request.get("model") == "gpt-6-luna"
+                log.write(json.dumps({"index": index, "provider": provider, "body": request,
+                    "overload": overload, "retryAdvice": retry_advice}) + "\n")
         inputs = request.get("input", [])
         last_user = next((item for item in reversed(inputs)
                           if isinstance(item, dict) and item.get("role") == "user"), {})
@@ -94,11 +106,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
         def event(value):
-            self.wfile.write(("data: " + json.dumps(value) + "\n\n").encode())
+            self.wfile.write(("event: " + value["type"] + "\ndata: " + json.dumps(value) + "\n\n").encode())
             self.wfile.flush()
 
         try:
             identity = "response-" + str(index)
+            if overload:
+                failure = {"code": "server_is_overloaded", "message": "fixture overload"}
+                if retry_advice:
+                    failure["headers"] = {"retry-after": "1"}
+                event({"type": "response.failed", "response": {"id": identity,
+                    "status": "failed", "error": failure}})
+                return
             event({"type": "response.created", "response": {"id": identity}})
             event({"type": "response.output_item.done", "item": repair_tool or {
                 "type": "message", "role": "assistant", "id": "answer-" + identity,

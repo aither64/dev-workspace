@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
@@ -45,8 +46,13 @@ func TestSessionPreparationOccupiedConversationDoesNotBlockNameSelection(t *test
 			const occupied = "2026-10-03-development-session"
 			prepareInteractiveConversation(t, s, occupied)
 			s.config.Codex = &browserContractCodex{transcript: codex.Transcript{ThreadID: "thread-1", Status: "idle"}}
-			s.config.NamingSocket = filepath.Join(t.TempDir(), "missing.sock")
-			s.config.SessionNamer = s.normalSessionName
+			// This collision fixture starts with a successful generated name;
+			// naming backend failures have their own refusal coverage.
+			var namingCalls atomic.Int32
+			s.config.SessionNamer = func(context.Context, string, string) (string, error) {
+				namingCalls.Add(1)
+				return `{"name":"development-session"}`, nil
+			}
 			release := holdCreationConversation(t, s, occupied)
 			defer release()
 			name := ""
@@ -62,10 +68,16 @@ func TestSessionPreparationOccupiedConversationDoesNotBlockNameSelection(t *test
 				if result.State != "failed" || result.Slug != "" || result.Error != errPreparationOccupied.Error() {
 					t.Fatalf("custom collision changed meaning: %+v", result)
 				}
+				if namingCalls.Load() != 0 {
+					t.Fatal("custom collision called automatic naming")
+				}
 				return
 			}
 			if result.Slug != occupied+"-2" || result.Handoff == nil || result.Attempt != 1 || result.Error != "" {
-				t.Fatalf("occupied conversation blocked fallback suffix selection: %+v", result)
+				t.Fatalf("occupied conversation blocked generated-name suffix selection: %+v", result)
+			}
+			if result.Base != "development-session" || result.NamingOutcome != "model" || namingCalls.Load() != 1 {
+				t.Fatalf("collision did not retain one generated name: %+v calls=%d", result, namingCalls.Load())
 			}
 			if result.Snapshot.Input.RawPrompt != "Preserve this accepted request" {
 				t.Fatal("collision changed the accepted request")
@@ -76,6 +88,9 @@ func TestSessionPreparationOccupiedConversationDoesNotBlockNameSelection(t *test
 			}
 			if replay := awaitPreparation(t, s, id); replay.ReceiptID != before || replay.Slug != result.Slug || replay.Attempt != result.Attempt {
 				t.Fatal("collision replay changed the reservation")
+			}
+			if namingCalls.Load() != 1 {
+				t.Fatal("collision replay called automatic naming again")
 			}
 		})
 	}

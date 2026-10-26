@@ -70,7 +70,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName string, logger 
 		probe.Stderr = io.Discard
 		probeErr := runNamingProcess(probeCtx, probe, 0)
 		stop()
-		if probeErr != nil || version.text != "codex-cli 0.163.0\n" || version.overflow {
+		if probeErr != nil || version.text != "codex-cli 0.164.0\n" || version.overflow {
 			logger.Print("session naming version prerequisite unavailable")
 			return
 		}

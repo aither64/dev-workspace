@@ -56,7 +56,7 @@ existing public interfaces. Missing required executables fail assembly.
 The manifest contains `layoutVersion = 1`, the input's `version`, the host Rust
 `target`, `variant = "codex"`, `entrypoint = "bin/codex"`,
 `resourcesDir = "codex-resources"` and `pathDir = "codex-path"`. This follows
-the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.163.0/scripts/codex_package/README.md).
+the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.164.0/scripts/codex_package/README.md).
 
 The runtime root retains resources supplied by the input. File and directory
 links are dereferenced during copying; no symlinks remain anywhere below
@@ -130,33 +130,41 @@ any changed invocation require idle sessions; see
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with
-exact `gpt-6-luna`/`low`. The package installs codex-web's derived Luna catalog as
-`share/workspace-portal/codex-models.json`. The
+exact Codex 0.164.0 and `gpt-6-luna`/`low` through codex-web's
+`RunPromptedEphemeralTurn`. The package installs codex-web's derived Luna catalog
+as `share/workspace-portal/codex-models.json`. The
 [preparation contract](session-preparations.md#naming-and-reservation) defines
-the profile's tool restrictions, disabled Responses Lite mode and startup
+the fixed restrictions, disabled Responses Lite mode and startup
 catalog checks, and links to codex-web's exact metadata contract. A startup CLI
 override selects the native static models manager for this child; the ordinary
 App Server retains its dynamic catalog. The helper checks the immutable file
 and startup `sessionFlags` origin before inference. It does not patch Codex or
 rewrite shared Codex home.
-Global user instructions remain trusted serving-instance policy. File/network
-action tools and project/workspace/team/skill injection must be excluded;
-questions fail immediately. The supported Direct profile exposes no model tools.
-CodeModeOnly models are unsupported because yielded cells can survive completed
-turns without a supported scoped stop/join operation.
+Naming instructions tell the model to treat the request as data and avoid tools,
+files, commands, browsing, delegation and questions. The private call retains
+its fixed restrictions and rejects interactive requests, but native tools can
+remain available. The prompted contract makes no guarantee about native tool
+registration, tool attempts or their effects. Global user instructions remain
+trusted serving-instance policy. CodeModeOnly models are unsupported because
+yielded cells can survive completed turns without a supported scoped stop/join
+operation. Codex-web's strict `RunEphemeralTurn` API retains its separate
+supported 0.163 contract. Both releases use identical immutable Luna catalog
+bytes, which do not establish native version or tool isolation.
 
 Before enabling a candidate deployment, run the codex-web protocol corpus and
 fixed restriction-key/type validator against that candidate's generated App
 Server schema and `core/config.schema.json`. After mandatory review, run the
 tagged exact-binary mock-provider fixture described in codex-web's technical
 reference. Record the exact native binary hash, assembled package/profile and
-supported catalog metadata, actual advertised tool schemas, forbidden dispatch,
+supported catalog metadata, actual advertised tool schemas, dispatch behavior,
 question rejection and ephemeral teardown evidence. Include the startup
 catalog path/origin, local-only child launch and actual managed-service
-start/loss/stop/forced-exit checks with ordinary-daemon continuity. The real
-positive naming canary must use this same child profile and obtain a valid model
-result within the ten-second budget. Missing prerequisites or unsupported
-behavior block release. Naming errors must stop preparation before reservation
+start/loss/stop/forced-exit checks with ordinary-daemon continuity when those
+contracts change. Synthetic tests do not establish real-provider adherence to
+the instructions or naming latency. A real positive naming canary is optional,
+separately authorized validation using the same child, packaged instructions and
+model within the thirty-second budget. Failed required checks or unsupported
+runtime behavior block release. Naming errors stop preparation before reservation
 and preserve the request for retry or a custom name.
 
 The child reads the existing host-selected account/provider configuration and
@@ -165,7 +173,7 @@ into a new home or passed in argv. The portal owns its process group and join,
 including early child exit and portal failure. Native ephemeral storage excludes
 resumable conversations but its separate SQLite diagnostics can retain input
 and identity in plaintext. The existing local logger remains enabled, and its
-startup pruning does not guarantee an erasure deadline. See the
+periodic pruning does not guarantee an erasure deadline. See the
 [preparation contract](session-preparations.md#naming-and-reservation) for runtime
 ownership, naming-input bounds and native logging semantics.
 
