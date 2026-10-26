@@ -8,6 +8,9 @@ import (
 	"github.com/aither64/codex-web/codex"
 )
 
+// This refusal proves that no progress submission was attempted.
+var ErrProgressCheckDeferred = errors.New("observer has pending manual retry work")
+
 // SendProgressCheck retains ordinary submission/recovery identity but deliberately
 // creates no automatic-retry admission snapshot. Only the progress scheduler may
 // decide to start another observation, under its activity gate and deadline.
@@ -23,7 +26,7 @@ func (c *Client) SendProgressCheck(ctx context.Context, thread, text, id, action
 	if tx != nil {
 		defer tx.Close()
 		if tx.State.Owned() {
-			return codex.SendReceipt{}, errors.New("observer has pending manual retry work")
+			return codex.SendReceipt{}, ErrProgressCheckDeferred
 		}
 		// Hold the same retry admission lock across dispatch. A background retry
 		// cannot acquire this observer between the ownership check and submission.

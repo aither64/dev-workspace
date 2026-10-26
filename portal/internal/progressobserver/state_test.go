@@ -51,6 +51,20 @@ func TestProgressConcernRecurrenceAndResponse(t *testing.T) {
 		t.Fatal("resolved concern retained warning")
 	}
 }
+
+func TestProgressSessionIntervals(t *testing.T) {
+	now := time.Now()
+	for _, minutes := range []int{1, 7, 60, 1440} {
+		s := State{IntervalMinutes: minutes, LastCheck: now}
+		at := now.Add(time.Duration(minutes) * time.Minute)
+		if s.Due(at.Add(-time.Second), true) || !s.Due(at, true) || s.Due(at, false) {
+			t.Fatal("interval or idle gate ignored", minutes)
+		}
+	}
+	if (State{}).CheckInterval() != Interval {
+		t.Fatal("old records lost default interval")
+	}
+}
 func TestProgressResultValidation(t *testing.T) {
 	for _, text := range []string{`{"status":"on_track"}`, `{"status":"concern","key":"loop","summary":"Evidence repeated.","recommendation":"Run the acceptance check once."}`} {
 		if _, err := ParseResult(text); err != nil {
@@ -71,11 +85,12 @@ func TestProgressStoreRetainsPendingIdentityAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Pending = &Pending{ID: ID("check"), Thread: "observer", Message: "bounded original packet", Model: "saved-model", Effort: "xhigh", StartedAt: time.Now()}
+	s.IntervalMinutes = 7
 	if err := store.Save(s); err != nil {
 		t.Fatal(err)
 	}
 	restarted, err := NewStore(root, "workspace").Load("lead")
-	if err != nil || restarted.Pending.ID != s.Pending.ID || restarted.Pending.Message != s.Pending.Message {
+	if err != nil || restarted.Pending.ID != s.Pending.ID || restarted.Pending.Message != s.Pending.Message || restarted.IntervalMinutes != 7 {
 		t.Fatal(restarted, err)
 	}
 	other, err := store.Load("another-lead")

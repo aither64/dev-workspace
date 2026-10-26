@@ -88,6 +88,16 @@
           <label class="retry-policy-switch"><span><strong>Retry cybersecurity errors</strong><span class="muted">Up to 30 automatic retries in five minutes.</span></span><input id="retry-cybersecurity" type="checkbox" role="switch" aria-describedby="session-retry-scope" disabled></label>
           <p id="session-retry-policy-status" class="muted" role="status" aria-live="polite"></p>
         </section>
+        <section id="progress-observer" class="panel">
+          <h3>Progress checks</h3>
+          <label class="retry-policy-switch"><span><strong>Automatic progress checks</strong><span class="muted">Independent advice while someone is working.</span></span><input id="progress-observer-enabled" type="checkbox" role="switch" disabled></label>
+          <form id="progress-observer-interval-form">
+            <label>Check every (minutes)<div class="copy-row"><input id="progress-observer-interval" type="number" min="1" max="1440" step="1" value="15" required disabled><button id="progress-observer-save" type="submit" class="quiet" disabled>Save interval</button></div></label>
+          </form>
+          <button id="progress-observer-now" type="button" class="quiet" disabled>Check now</button>
+          <p id="progress-observer-status" class="muted" role="status" aria-live="polite">Loading progress status…</p>
+          <p id="progress-observer-concern" class="notice" hidden></p>
+        </section>
         {{end}}
         <section class="panel">
           <h3>Session attention</h3>
@@ -175,12 +185,6 @@
 
       {{if .Session.Codex.ThreadID}}
       <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
-        <section id="progress-observer" class="panel">
-          <h3>Progress checks</h3>
-          <label class="retry-policy-switch"><span><strong>Automatic progress checks</strong><span class="muted">Independent advice while someone is working.</span></span><input id="progress-observer-enabled" type="checkbox" role="switch" disabled></label>
-          <p id="progress-observer-status" class="muted" role="status" aria-live="polite">Loading progress status…</p>
-          <p id="progress-observer-concern" class="notice" hidden></p>
-        </section>
         <div id="team-member-status">{{template "member-status" .}}</div>
         {{if not .Session.Archived}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
           <div class="section-heading"><h2 id="team-settings-title">Member settings</h2><button id="team-settings-close" type="button" class="quiet">Close</button></div>

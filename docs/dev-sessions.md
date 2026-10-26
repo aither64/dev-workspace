@@ -463,14 +463,18 @@ A site can include a read-only general-purpose `observer` role in its team
 catalog. A ready observer enables automatic progress checks for that session.
 Existing sessions opt in by adding the role through the Team tab or
 `dev-session team add <slug> observer --as-is`. Adding it uses the installed
-catalog; other retained members keep their saved settings. The Team tab can
-pause automatic checks. Removing the observer stops them.
-A newly added observer starts automatically when a check is due; it does not
-need a manual assignment or an earlier activation.
+catalog; other retained members keep their saved settings. The Settings tab can
+pause automatic checks and set their interval from 1 to 1440 whole minutes.
+The default is 15 minutes. Use Check now for a single check, including while
+automatic checks are paused or the session is idle. It does not unpause checks
+or wake an idle lead. A pending check or other active observer work prevents
+another check. Removing the observer stops automatic checks.
 
-The portal checks progress every 15 minutes while the lead or another development
-member is actively working. Fully idle sessions, including sessions that recently
-finished work, do not start model calls. Waiting for user input or approval does
+The portal schedules checks at the session’s chosen interval while the lead or
+another development member is actively working. A background worker checks
+eligibility once per minute. A newly added observer starts automatically when
+a check is due; it does not need a manual assignment or an earlier activation. Fully idle sessions, including sessions that recently
+finished work, do not start automatic model calls. Waiting for user input or approval does
 not count as work; waiting for a running tool or development member can. The
 observer's own activity does not count. Scheduling runs in the portal service
 and does not require an open browser or a request from the lead.

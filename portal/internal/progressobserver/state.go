@@ -42,14 +42,15 @@ type Notice struct {
 	Message string `json:"message"`
 }
 type State struct {
-	Schema      int       `json:"schema"`
-	Root        string    `json:"root"`
-	Paused      bool      `json:"paused"`
-	LastCheck   time.Time `json:"lastCheck"`
-	Pending     *Pending  `json:"pending,omitempty"`
-	Concern     *Concern  `json:"concern,omitempty"`
-	Notice      *Notice   `json:"notice,omitempty"`
-	Unavailable string    `json:"unavailable,omitempty"`
+	Schema          int       `json:"schema"`
+	Root            string    `json:"root"`
+	Paused          bool      `json:"paused"`
+	IntervalMinutes int       `json:"intervalMinutes,omitempty"`
+	LastCheck       time.Time `json:"lastCheck"`
+	Pending         *Pending  `json:"pending,omitempty"`
+	Concern         *Concern  `json:"concern,omitempty"`
+	Notice          *Notice   `json:"notice,omitempty"`
+	Unavailable     string    `json:"unavailable,omitempty"`
 }
 type Result struct {
 	Status         string `json:"status"`
@@ -83,7 +84,15 @@ func ParseResult(text string) (Result, error) {
 // Due requires current development work. Recent activity in an idle session
 // cannot start inference; long-running active work can still be observed.
 func (s State) Due(now time.Time, active bool) bool {
-	return !s.Paused && s.Pending == nil && !now.Before(s.LastCheck.Add(Interval)) && active
+	return !s.Paused && s.Pending == nil && !now.Before(s.LastCheck.Add(s.CheckInterval())) && active
+}
+
+// Zero preserves the default for progress records written by older packages.
+func (s State) CheckInterval() time.Duration {
+	if s.IntervalMinutes < 1 || s.IntervalMinutes > 1440 {
+		return Interval
+	}
+	return time.Duration(s.IntervalMinutes) * time.Minute
 }
 func (s *State) Apply(r Result) bool {
 	s.Pending, s.Unavailable = nil, ""

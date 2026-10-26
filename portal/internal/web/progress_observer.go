@@ -17,6 +17,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
 func (s *Server) progressStore() progressobserver.Store {
@@ -186,6 +187,10 @@ func (s *Server) startProgressObservers() {
 }
 
 func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summary, now time.Time) error {
+	return s.checkProgress(ctx, summary, now, false)
+}
+
+func (s *Server) checkProgress(ctx context.Context, summary *session.Summary, now time.Time, requested bool) error {
 	generation, err := s.lockTransitionContext(ctx)
 	if err != nil {
 		return err
@@ -203,6 +208,9 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 	defer lock.Close()
 	owner, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil || owner != "" {
+		if err == nil && requested {
+			return errors.New("A session operation is in progress.")
+		}
 		return err
 	}
 	fresh, err := session.Find(s.config.Workspace, summary.Slug)
@@ -210,12 +218,18 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 		return err
 	}
 	if fresh.Archived || fresh.Codex.ThreadID != summary.Codex.ThreadID {
+		if requested {
+			return errors.New("The session changed.")
+		}
 		return nil
 	}
 	if err := s.requireProviderAdmission(fresh.Slug); err != nil {
 		return err
 	}
 	if receipt, ok := s.currentCreation(fresh.Slug); ok && receipt.blocksSession() {
+		if requested {
+			return errors.New("Session creation is still in progress.")
+		}
 		return nil
 	}
 	service, err := s.teamService(fresh.Slug)
@@ -238,6 +252,9 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 		// A ready member may never have run. SendProgressCheck durably queues
 		// its request before activating that exact cold recipient.
 		if member == nil {
+			if requested {
+				return errors.New("Add an observer member before requesting a progress check.")
+			}
 			return nil
 		}
 		state, err = s.progressStore().Load(fresh.Codex.ThreadID)
@@ -250,6 +267,9 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 			return err
 		}
 		hadPending := state.Pending != nil
+		if requested && hadPending {
+			return errors.New("A progress check is already pending.")
+		}
 		if p := state.Pending; p != nil {
 			if p.Thread != member.Thread || p.Address != member.Address {
 				retired := false
@@ -281,14 +301,17 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 				return err
 			}
 		}
-		if state.Paused && state.Pending == nil {
+		if !requested && state.Paused && state.Pending == nil {
 			return nil
 		}
-		if !hadPending && state.Notice == nil && !state.LastCheck.IsZero() && now.Before(state.LastCheck.Add(progressobserver.Interval)) {
+		if !requested && !hadPending && state.Notice == nil && !state.LastCheck.IsZero() && now.Before(state.LastCheck.Add(state.CheckInterval())) {
 			return nil
 		}
 		s.normalizeInteractivity(ctx, fresh)
 		if !fresh.Interactive || fresh.ExecutionHeld || s.requireOrdinaryRetainedMutation(ctx, fresh) != nil {
+			if requested {
+				return errors.New("The session is not ready for a progress check.")
+			}
 			return nil
 		}
 		cwd := filepath.Join(s.config.Workspace, "work", fresh.Slug)
@@ -330,18 +353,18 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 				if member.Model != state.Pending.Model || member.Effort != state.Pending.Effort {
 					return fail(errors.New("scheduled observer settings changed"))
 				}
-				return s.sendProgressCheck(ctx, service, member, fresh.Slug, &state, fail)
+				return s.sendProgressCheck(ctx, service, member, fresh.Slug, &state, false, fail)
 			}
 			return s.progressStore().Save(state)
 		}
-		if state.LastCheck.IsZero() {
+		if !requested && state.LastCheck.IsZero() {
 			if !active {
 				return nil
 			}
 			state.LastCheck = now
 			return s.progressStore().Save(state)
 		}
-		if !state.Due(now, active) {
+		if !requested && !state.Due(now, active) {
 			if active && state.Concern != nil {
 				return s.progressStore().Save(state)
 			}
@@ -353,6 +376,9 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 			return fail(err)
 		}
 		if observer.Status == "active" {
+			if requested {
+				return errors.New("The observer is already working on another request.")
+			}
 			return nil
 		}
 		prompt := progressPrompt(cwd, snapshot, state.Concern)
@@ -361,7 +387,7 @@ func (s *Server) stepProgressObserver(ctx context.Context, summary *session.Summ
 		if err := s.progressStore().Save(state); err != nil {
 			return err
 		}
-		return s.sendProgressCheck(ctx, service, member, fresh.Slug, &state, fail)
+		return s.sendProgressCheck(ctx, service, member, fresh.Slug, &state, true, fail)
 	}()
 	if err != nil {
 		return err
@@ -436,7 +462,7 @@ func (s *Server) settleProgressCheck(ctx context.Context, state *progressobserve
 	return s.progressStore().Save(*state)
 }
 
-func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Service, member *teamruntime.Member, slug string, state *progressobserver.State, fail func(error) error) error {
+func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Service, member *teamruntime.Member, slug string, state *progressobserver.State, firstAttempt bool, fail func(error) error) error {
 	p := state.Pending
 	policy, err := service.MemberTurnPolicy(slug, state.Root, *member)
 	if err != nil {
@@ -453,6 +479,11 @@ func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Serv
 	}
 	receipt, err := sender.SendProgressCheck(ctx, p.Thread, p.Message, p.ID, "progress:"+slug+":check", codex.TurnOptions{Model: p.Model, ReasoningEffort: p.Effort, ThreadPolicy: policy})
 	if err != nil {
+		if firstAttempt && errors.Is(err, workspacecodex.ErrProgressCheckDeferred) {
+			// Retry admission refused before dispatch. There is no uncertain
+			// submission to retain, and manual work keeps its own ownership.
+			state.Pending = nil
+		}
 		return fail(err)
 	}
 	p.Turn = receipt.TurnID
@@ -466,6 +497,33 @@ Goal/plan:
 }
 
 func (s *Server) progressAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	var body struct {
+		Enabled         *bool `json:"enabled"`
+		IntervalMinutes *int  `json:"intervalMinutes"`
+		CheckNow        bool  `json:"checkNow"`
+	}
+	if r.Method == http.MethodPost {
+		if !s.decodeJSON(w, r, &body) {
+			return
+		}
+		if body.CheckNow {
+			if body.Enabled != nil || body.IntervalMinutes != nil {
+				s.writeError(w, r, 400, "Save settings separately from requesting a check.")
+				return
+			}
+			if err := s.checkProgress(r.Context(), summary, time.Now(), true); err != nil {
+				s.writeError(w, r, 409, err.Error())
+				return
+			}
+		} else if body.Enabled == nil && body.IntervalMinutes == nil {
+			s.writeError(w, r, 400, "Choose progress settings or request a check.")
+			return
+		}
+		if body.IntervalMinutes != nil && (*body.IntervalMinutes < 1 || *body.IntervalMinutes > 1440) {
+			s.writeError(w, r, 400, "Choose an interval from 1 to 1440 minutes.")
+			return
+		}
+	}
 	s.progressMu.Lock()
 	defer s.progressMu.Unlock()
 	roster, err := s.loadTeamRoster(summary)
@@ -479,7 +537,7 @@ func (s *Server) progressAPI(w http.ResponseWriter, r *http.Request, summary *se
 		s.writeError(w, r, 503, "Progress status is unavailable.")
 		return
 	}
-	if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost && !body.CheckNow {
 		lock, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
 		if err != nil {
 			s.writeError(w, r, 409, err.Error())
@@ -501,25 +559,20 @@ func (s *Server) progressAPI(w http.ResponseWriter, r *http.Request, summary *se
 			s.writeError(w, r, 409, "Progress checks require an active observer member.")
 			return
 		}
-		var body struct {
-			Enabled *bool `json:"enabled"`
+		if body.Enabled != nil {
+			state.Paused = !*body.Enabled
 		}
-		if !s.decodeJSON(w, r, &body) {
-			return
+		if body.IntervalMinutes != nil {
+			state.IntervalMinutes = *body.IntervalMinutes
 		}
-		if body.Enabled == nil {
-			s.writeError(w, r, 400, "Choose whether progress checks are enabled.")
-			return
-		}
-		state.Paused = !*body.Enabled
 		if err := s.progressStore().Save(state); err != nil {
 			s.writeError(w, r, 503, "Progress settings could not be saved.")
 			return
 		}
-	} else if r.Method != http.MethodGet {
+	} else if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		s.writeError(w, r, 405, "Unsupported progress operation.")
 		return
 	}
-	s.writeJSON(w, 200, map[string]any{"available": member != nil, "enabled": member != nil && !state.Paused, "lastCheck": state.LastCheck, "running": state.Pending != nil, "concern": state.Concern, "warning": state.Warning(), "unavailable": state.Unavailable})
+	s.writeJSON(w, 200, map[string]any{"available": member != nil, "enabled": member != nil && !state.Paused, "intervalMinutes": int(state.CheckInterval() / time.Minute), "lastCheck": state.LastCheck, "running": state.Pending != nil, "concern": state.Concern, "warning": state.Warning(), "unavailable": state.Unavailable})
 }

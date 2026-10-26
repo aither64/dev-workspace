@@ -30,6 +30,7 @@ type progressTestClient struct {
 	sends       []progressSend
 	interrupts  []string
 	unknown     bool
+	deferred    bool
 }
 
 func (c *progressTestClient) VerifyThread(_ context.Context, thread, _ string) error {
@@ -61,6 +62,9 @@ func (c *progressTestClient) SendWithOptions(_ context.Context, thread, message,
 	return codex.SendReceipt{TurnID: "scheduled-turn", ClientUserMessageID: id}, nil
 }
 func (c *progressTestClient) SendProgressCheck(ctx context.Context, thread, message, id, action string, opts codex.TurnOptions) (codex.SendReceipt, error) {
+	if c.deferred {
+		return codex.SendReceipt{}, workspacecodex.ErrProgressCheckDeferred
+	}
 	return c.SendWithOptions(ctx, thread, message, id, action, opts)
 }
 func (c *progressTestClient) Request(_ context.Context, method string, params, output any) error {
@@ -128,6 +132,7 @@ func TestProgressIdleSessionsNeverWake(t *testing.T) {
 		t.Fatal("observer activity sustained idle session")
 	}
 }
+
 func TestProgressColdObserverCanBeScheduled(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		t.Run(map[bool]string{false: "idle", true: "working"}[active], func(t *testing.T) {
@@ -173,6 +178,83 @@ func TestProgressColdObserverCanBeScheduled(t *testing.T) {
 	}
 }
 
+func TestProgressCheckNowRunsOnceWhilePausedAndIdle(t *testing.T) {
+	s, c, summary, now := progressFixture(t)
+	root := c.transcripts["thread-1"]
+	root.Status = "idle"
+	c.transcripts["thread-1"] = root
+	state, _ := s.progressStore().Load("thread-1")
+	state.Paused = true
+	state.IntervalMinutes = 60
+	if err := s.progressStore().Save(state); err != nil {
+		t.Fatal(err)
+	}
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/sessions/example/progress", strings.NewReader(`{"checkNow":true}`))
+		r.Header.Set("Origin", s.config.BaseURL)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if w := request(); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if len(c.sends) != 1 {
+		t.Fatal("manual check did not dispatch once", c.sends)
+	}
+	if w := request(); w.Code != 409 {
+		t.Fatal("overlapping manual check accepted", w.Code, w.Body.String())
+	}
+	progressComplete(c, `{"status":"concern","key":"loop","summary":"Repeated checks.","recommendation":"Deliver the result."}`)
+	if err := s.stepProgressObserver(context.Background(), summary, now); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = s.progressStore().Load("thread-1")
+	if !state.Paused || state.IntervalMinutes != 60 || state.Pending != nil || state.Concern == nil || len(c.sends) != 1 {
+		t.Fatal("manual check changed automatic settings or woke idle lead", state, c.sends)
+	}
+}
+
+func TestProgressUndispatchedManualRetryDeferralCanBeRequestedAgain(t *testing.T) {
+	s, c, summary, now := progressFixture(t)
+	state, _ := s.progressStore().Load("thread-1")
+	state.Paused = true
+	if err := s.progressStore().Save(state); err != nil {
+		t.Fatal(err)
+	}
+	c.deferred = true
+	if err := s.checkProgress(context.Background(), summary, now, true); !errors.Is(err, workspacecodex.ErrProgressCheckDeferred) {
+		t.Fatal("manual retry ownership did not defer progress", err)
+	}
+	state, _ = s.progressStore().Load("thread-1")
+	if state.Pending != nil || len(c.sends) != 0 {
+		t.Fatal("undispatched check left pending ownership", state, c.sends)
+	}
+	c.deferred = false
+	if err := s.checkProgress(context.Background(), summary, now.Add(progressobserver.Deadline+time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.sends) != 1 {
+		t.Fatal("deferred check could not be requested again", c.sends)
+	}
+}
+
+func TestProgressLaterRetryDeferralPreservesUnknownSubmission(t *testing.T) {
+	s, c, summary, now := progressFixture(t)
+	state, _ := s.progressStore().Load("thread-1")
+	state.Pending = &progressobserver.Pending{ID: "retained-unknown", Thread: "observer-thread", Address: "observer0", Model: "retained-observer", Effort: "xhigh", Message: "original", StartedAt: now}
+	if err := s.progressStore().Save(state); err != nil {
+		t.Fatal(err)
+	}
+	c.deferred = true
+	if err := s.stepProgressObserver(context.Background(), summary, now.Add(time.Minute)); !errors.Is(err, workspacecodex.ErrProgressCheckDeferred) {
+		t.Fatal(err)
+	}
+	state, _ = s.progressStore().Load("thread-1")
+	if state.Pending == nil || state.Pending.ID != "retained-unknown" {
+		t.Fatal("later refusal discarded an earlier uncertain send", state)
+	}
+}
 func TestProgressQuietSuccessAndRestartSettlement(t *testing.T) {
 	s, c, summary, now := progressFixture(t)
 	if err := s.stepProgressObserver(context.Background(), summary, now); err != nil {
@@ -284,7 +366,7 @@ func TestProgressAPIControlsAndIsolation(t *testing.T) {
 	if w := request("POST", "https://foreign.example", `{"enabled":false}`); w.Code != 403 {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	if w := request("POST", s.config.BaseURL, `{"enabled":false}`); w.Code != 200 {
+	if w := request("POST", s.config.BaseURL, `{"enabled":false,"intervalMinutes":7}`); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	w := request("GET", "", "")
@@ -292,12 +374,20 @@ func TestProgressAPIControlsAndIsolation(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &value); err != nil {
 		t.Fatal(err)
 	}
-	if value["enabled"] != false || value["available"] != true {
+	if value["enabled"] != false || value["available"] != true || value["intervalMinutes"] != float64(7) {
 		t.Fatal(value)
 	}
 	other, err := s.progressStore().Load("foreign-root")
 	if err != nil || other.Paused {
 		t.Fatal("cross-session write", other, err)
+	}
+	if other.CheckInterval() != progressobserver.Interval {
+		t.Fatal("cross-session interval changed")
+	}
+	for _, body := range []string{`{"intervalMinutes":0}`, `{"intervalMinutes":1441}`, `{"intervalMinutes":1.5}`, `{"checkNow":true,"enabled":false}`} {
+		if w := request("POST", s.config.BaseURL, body); w.Code != 400 {
+			t.Fatal(body, w.Code, w.Body.String())
+		}
 	}
 }
 func TestProgressResultRequiresScheduledCompletedTurn(t *testing.T) {

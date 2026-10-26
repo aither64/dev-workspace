@@ -1681,17 +1681,23 @@ not change persisted conversations or require a Codex version upgrade.
 
 ## Progress status
 
-The Team tab shows automatic progress checks, the current concern and the lead's
-response. Its switch pauses or resumes checks for an existing observer member.
+The Settings tab shows automatic progress checks, their interval, the current
+concern and the lead's response. Its switch pauses or resumes automatic checks
+for an existing observer member. Save interval sets a per-session interval from
+1 to 1440 whole minutes; the default is 15. Check now requests one check even
+while idle or paused, without enabling automatic checks or waking an idle lead.
 Add or remove the member through the usual team controls. Recurring concerns
 also appear above the Codex conversation, so they remain visible without opening
-the Team tab. Messages use plain text; observer output cannot add HTML.
+Settings. Messages use plain text; observer output cannot add HTML.
 
 `GET /api/sessions/<slug>/progress` returns observer availability, enabled/running
-status, the last check time, the concern and response, its warning state and any
-observation failure. `POST` with `{ "enabled": true }` or
-`{ "enabled": false }` changes scheduling only. It requires the normal exact
-origin, current package generation and live session mutation admission. It does
+status, effective `intervalMinutes`, the last check time, the concern and
+response, its warning state and any observation failure. `POST` accepts
+`enabled` and/or `intervalMinutes` to change scheduling. A separate POST with
+`{ "checkNow": true }` requests one check using the same ownership and deadline
+rules. It refuses an already pending check or another active observer turn.
+Writes require the normal exact origin, current package generation and live
+session mutation admission. It does
 not create a member. Status reads do not start model calls or enroll a session.
 See [independent progress checks](dev-sessions.md#independent-progress-checks)
 for scheduling, advisory authority and restart behavior.

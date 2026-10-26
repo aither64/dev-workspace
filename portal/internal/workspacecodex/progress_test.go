@@ -2,6 +2,7 @@ package workspacecodex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -88,7 +89,7 @@ func TestProgressPreservesPendingManualObserverRetry(t *testing.T) {
 		t.Fatal("manual retry was not scheduled", before, err)
 	}
 	count := transport.count()
-	if _, err := wire.client.SendProgressCheck(ctx, wire.thread, "Automatic progress check", "00000000-0000-4000-8000-000000009102", "progress:example:check", codex.TurnOptions{Model: wire.model, ReasoningEffort: wire.effort, ThreadPolicy: wire.policy}); err == nil {
+	if _, err := wire.client.SendProgressCheck(ctx, wire.thread, "Automatic progress check", "00000000-0000-4000-8000-000000009102", "progress:example:check", codex.TurnOptions{Model: wire.model, ReasoningEffort: wire.effort, ThreadPolicy: wire.policy}); !errors.Is(err, ErrProgressCheckDeferred) {
 		t.Fatal("progress displaced manual retry")
 	}
 	after, err := wire.client.RetryStore().Load(wire.scope)
