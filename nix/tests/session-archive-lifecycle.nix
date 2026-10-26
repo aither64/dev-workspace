@@ -164,7 +164,6 @@ pkgs.testers.runNixOSTest {
             user("printf ARCHIVE_PREPARATION_FIXTURE > /tmp/archive-goal")
             user("cd " + root + " && " + cli + " start " + slug + " --as-is --no-attach "
                  "--model gpt-5.5 --effort high --goal-file /tmp/archive-goal")
-            user("cd " + root + " && " + cli + " worktree add " + slug + " project --as-is")
             checkout = root + "/worktrees/" + slug + "/project"
             manifest = json.loads(user("${pkgs.ruby}/bin/ruby -ryaml -rjson -e " + shlex.quote(
                 "puts JSON.generate(YAML.safe_load(File.read(ARGV.fetch(0))))") + " " + root + "/work/" + slug + "/portal.yml"))
@@ -174,6 +173,14 @@ pkgs.testers.runNixOSTest {
             machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
                 package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
                 + " --cwd " + root + "/work/" + slug + " --user-state-root " + state))
+            # Initial retry-policy bootstrap takes EX; finish that checkpoint
+            # before worktree registration, which must still refuse writers.
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                "curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
+                + "http://localhost/api/sessions/" + slug + "/retry-policy"))
+            user("${pkgs.util-linux}/bin/flock -s -w 30 /run/user/1000/dev-workspaces/fixture/authority/"
+                 + slug + ".lock ${pkgs.coreutils}/bin/true")
+            user("cd " + root + " && " + cli + " worktree add " + slug + " project --as-is")
             cache = root + "/worktrees/" + slug + "/.hook-cache"
             user("mkdir -p " + cache + "/bin && printf generated > " + cache + "/bin/overcommit")
             repair = "mv " + shlex.quote(cache) + " " + shlex.quote(checkout + "/.gems-archive-cache")
